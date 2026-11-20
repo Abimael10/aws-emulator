@@ -40,24 +40,24 @@ use service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam;
 use service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts;
 
 /// The Region every row signs for, and a second one for the rows about a statement's scope.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 const OTHER_REGION: &str = "eu-west-3";
 
 /// An access key id neither store holds a record for: the account's own published
 /// credential, which holds no IAM policy — the account owner of the recorded check.
-const AMBIENT_KEY_ID: &str = "AKIDEXAMPLE";
+pub(crate) const AMBIENT_KEY_ID: &str = "AKIDEXAMPLE";
 
 /// The assumed-role session the policy rows sign with: its access key id, the role it is
 /// assumed from and the session's own name. The role name appears nowhere in the key's text,
 /// so an identity synthesised from that text cannot pass a row.
-const SESSION_KEY_ID: &str = "ASIAEXAMPLEAGENTCORE1";
-const ROLE: &str = "agentcore-team";
-const SESSION: &str = "team-session";
+pub(crate) const SESSION_KEY_ID: &str = "ASIAEXAMPLEAGENTCORE1";
+pub(crate) const ROLE: &str = "agentcore-team";
+pub(crate) const SESSION: &str = "team-session";
 
 /// The TWIN session: the same policy plus one added allow of the listing under test, which
 /// is the only variable between the two.
-const TWIN_KEY_ID: &str = "ASIAEXAMPLEAGENTCORE2";
-const TWIN_ROLE: &str = "agentcore-team-twin";
+pub(crate) const TWIN_KEY_ID: &str = "ASIAEXAMPLEAGENTCORE2";
+pub(crate) const TWIN_ROLE: &str = "agentcore-team-twin";
 
 /// The name of the inline policy the rows put in force on a role.
 const POLICY_NAME: &str = "inline";
@@ -67,29 +67,33 @@ const SESSION_SECONDS: i32 = 3_600;
 
 /// The error code `restJson1` carries in `__type` and in `x-amzn-errortype`, at the status
 /// the model gives it (`AccessDeniedException`, `httpError` 403).
-const ACCESS_DENIED: &str = "AccessDeniedException";
-const ACCESS_DENIED_STATUS: u16 = 403;
+pub(crate) const ACCESS_DENIED: &str = "AccessDeniedException";
+pub(crate) const ACCESS_DENIED_STATUS: u16 = 403;
 
 /// A `roleArn` inside `RoleArn`'s pattern, for the runtime the disclosure row creates.
 const VALID_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/ProbeRuntimeRole";
 
 /// One answer: the status, the error code, the `message` and the whole body.
-struct Answer {
-    status: u16,
-    code: String,
-    message: String,
-    body: Value,
+///
+/// Visible to the crate's other suites, which read the same four things out of an answer:
+/// `tests/all/unnamed_resource_authorization.rs` drives the calls whose RESOURCE this
+/// endpoint names no ARN for through this same harness rather than a second copy of it.
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) code: String,
+    pub(crate) message: String,
+    pub(crate) body: Value,
 }
 
 /// One router over one engine: the control plane under test, plus the IAM and STS stores of
 /// that same engine, which this suite seeds directly.
-struct Harness {
+pub(crate) struct Harness {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Harness {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         // One family in the table below — the registry — is an ENTITLED plane, refused
         // before any handler runs for an account that does not hold the AgentCore Registry
@@ -106,7 +110,7 @@ impl Harness {
     }
 
     /// Send one call signed with `access_key_id` for `region`.
-    async fn send_as(
+    pub(crate) async fn send_as(
         &self,
         access_key_id: &str,
         region: &str,
@@ -181,7 +185,12 @@ impl Harness {
     /// Record the role `name` and the assumed-role session `access_key_id` speaks for, as
     /// `iam:CreateRole` and `sts:AssumeRole` record them, and answer the session's principal
     /// ARN — what a refusal of its calls must name.
-    fn given_session(&self, name: &str, session_name: &str, access_key_id: &str) -> String {
+    pub(crate) fn given_session(
+        &self,
+        name: &str,
+        session_name: &str,
+        access_key_id: &str,
+    ) -> String {
         let role_arn = role_arn(name);
         let iam_store = iam::service_state(&*self.engine).expect("the IAM store");
         iam_store.lock().roles.insert(
@@ -225,7 +234,7 @@ impl Harness {
     /// Put `document` in force as that role's inline policy, replacing whatever it carried —
     /// what `iam:PutRolePolicy` does. `None` takes every policy off it, as the matching
     /// delete does.
-    fn given_role_policy(&self, role: &str, document: Option<&str>) {
+    pub(crate) fn given_role_policy(&self, role: &str, document: Option<&str>) {
         let store = iam::service_state(&*self.engine).expect("the IAM store");
         let mut store = store.lock();
         let key = iam::name_key(role);
@@ -246,7 +255,7 @@ impl Harness {
 }
 
 /// A SigV4 `Authorization` header for this service, signed with `access_key_id` in `region`.
-fn authorization(access_key_id: &str, region: &str) -> String {
+pub(crate) fn authorization(access_key_id: &str, region: &str) -> String {
     format!(
         "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{region}/bedrock-agentcore/\
          aws4_request, SignedHeaders=host, Signature=abc"
@@ -255,7 +264,7 @@ fn authorization(access_key_id: &str, region: &str) -> String {
 
 /// The ARN the account holds the role under — the identity whose policies an assumed-role
 /// session's request is judged on.
-fn role_arn(role: &str) -> String {
+pub(crate) fn role_arn(role: &str) -> String {
     format!(
         "arn:aws:iam::{}:role/{role}",
         ::engine::emulator_account_id()
@@ -263,7 +272,7 @@ fn role_arn(role: &str) -> String {
 }
 
 /// The principal ARN a session of `role` named `session` speaks for.
-fn session_arn(role: &str, session: &str) -> String {
+pub(crate) fn session_arn(role: &str, session: &str) -> String {
     format!(
         "arn:aws:sts::{}:assumed-role/{role}/{session}",
         ::engine::emulator_account_id()
@@ -281,17 +290,17 @@ fn collection(region: &str, resource_type: &str) -> String {
 
 /// The IAM action a listing is performed under: this endpoint's own namespace
 /// (`sigv4Name` / `awsService.arnNamespace`, `smithy_query(query="service_info")`).
-fn action_for(operation: &str) -> String {
+pub(crate) fn action_for(operation: &str) -> String {
     format!("bedrock-agentcore:{operation}")
 }
 
 /// The reason clause of a listing no readable statement allows — IAM's default deny.
-fn no_policy_allows(action: &str) -> String {
+pub(crate) fn no_policy_allows(action: &str) -> String {
     format!("because no identity-based policy allows the {action} action")
 }
 
 /// The reason clause of a listing an explicit `Deny` in the principal's own document covers.
-const EXPLICIT_DENY: &str = "with an explicit deny in an identity-based policy";
+pub(crate) const EXPLICIT_DENY: &str = "with an explicit deny in an identity-based policy";
 
 /// The sentence a refused listing states.
 fn not_authorized(principal: &str, action: &str, resource: &str, reason: &str) -> String {
@@ -302,7 +311,7 @@ fn not_authorized(principal: &str, action: &str, resource: &str, reason: &str) -
 }
 
 /// A policy document granting `actions` on `resources`, as `iam:PutRolePolicy` takes one.
-fn allow(actions: &str, resources: &str) -> String {
+pub(crate) fn allow(actions: &str, resources: &str) -> String {
     format!(
         r#"{{"Version":"2012-10-17","Statement":[
          {{"Effect":"Allow","Action":{actions},"Resource":{resources}}}]}}"#
@@ -311,7 +320,7 @@ fn allow(actions: &str, resources: &str) -> String {
 
 /// The agent policy the recorded check grants its team role: reads of ANOTHER action
 /// namespace (Agents for Bedrock), which grants nothing on this endpoint.
-fn another_namespace_only() -> String {
+pub(crate) fn another_namespace_only() -> String {
     allow(
         r#"["bedrock-agent:ListAgents","bedrock-agent:GetAgent"]"#,
         r#""*""#,

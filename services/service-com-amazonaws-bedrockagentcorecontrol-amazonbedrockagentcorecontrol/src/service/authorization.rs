@@ -39,12 +39,11 @@
 //! `bedrock-agentcore-control`.
 //!
 //! The resource a statement names for one of these calls is the ARN of the resource the
-//! request addresses, so the decision can only be taken where this layer can name that ARN
-//! from the request line — before any input is deserialized. There are two such kinds of
-//! request, and a request of neither kind falls through this gate untouched: a resource
-//! family whose ARN this layer cannot name from the request line is not one it may guess
-//! at, since judging an action against the wrong resource would refuse a call a scoped
-//! statement allows.
+//! request addresses, so the decision is taken against that ARN wherever this layer can name
+//! it from the request line — before any input is deserialized. There are two such kinds of
+//! request, and a third kind whose ARN this layer cannot name: EVERY request is judged, none
+//! falls through this gate unjudged, because the grant is a fact about the calling principal
+//! rather than about the resource the request happened to address.
 //!
 //! **One MEMBER of a resource family**: a route whose modelled `@http` URI carries an
 //! identifier label, where the member's ARN is that family's ARN type carrying the
@@ -62,11 +61,23 @@
 //! addresses the family — so the resource it is judged against is the family's collection:
 //! the family's own ARN with [`ANY_RESOURCE_OF_THE_FAMILY`] in place of the identifier,
 //! named by the ROUTE rather than by anything the caller carried ([`collection_arn`]), which
-//! is the resource AWS's own recorded refusal of a create of this endpoint names. A route of
-//! a family this layer cannot name one ARN for — one addressed under two ARN types (a
-//! built-in browser or code interpreter beside a customer-created one), or one nested under
-//! a parent the route does not name — resolves to no resource here, like every other unnamed
-//! family.
+//! is the resource AWS's own recorded refusal of a create of this endpoint names.
+//!
+//! **A request whose resource this layer cannot NAME**: a route of a family addressed under
+//! two ARN types (a built-in browser or code interpreter beside a customer-created one), one
+//! whose resources hang off a parent the route does not name (the identity plane's token
+//! vault, its credential providers, its workload identities and its consent portals), or one
+//! this crate builds no ARN type for at all. Guessing an ARN for such a request is what this
+//! layer must not do — judging an action against the WRONG resource would refuse a call a
+//! scoped statement allows — so the question asked for it is the weaker one IAM's own
+//! evaluation states for a gate that does not know the resource ARN
+//! ([`::service_common::iam_authorization::identity_may_allow_action`]): whether any readable
+//! `Allow` covers the ACTION at all, over whichever resource. A principal whose documents say
+//! nothing about the action is refused — IAM's default deny, which is the decision AWS takes
+//! for such a call too — while a grant scoped to particular ARNs reaches the operation,
+//! because refusing it on a resource element this layer never read would deny calls AWS
+//! permits. The DENY half is decided the same way round: an explicit `Deny` about the action
+//! over every resource refuses the request here ([`EVERY_RESOURCE`]).
 //!
 //! ## How the refusal is worded
 //!
@@ -76,7 +87,10 @@
 //! the route's own, so the sentence names it and the rule, which is the recorded refusal of a
 //! listing and of a create of this endpoint; a member's is named the same way, except for the
 //! families whose own recorded refusal closes at the action
-//! ([`ACTION_ONLY_REFUSAL_FAMILIES`], [`not_authorized`]).
+//! ([`ACTION_ONLY_REFUSAL_FAMILIES`], [`not_authorized`]). A request whose resource this
+//! layer did not name states the principal, the action and the rule and no resource clause:
+//! the decision was not taken on a resource, so there is none to name — which is how AWS
+//! words the refusal of a call it judges over every resource.
 //!
 //! ## The callers the decision cannot refuse
 //!
@@ -125,6 +139,12 @@ const EXPIRED_CREDENTIAL_PRINCIPAL: &str = "an expired session credential";
 /// The identifier a family's COLLECTION is named by: the any-resource wildcard, which is what
 /// a listing addresses rather than one resource of the family (see the module docs).
 const ANY_RESOURCE_OF_THE_FAMILY: &str = "*";
+
+/// The resource a request whose own resource ARN this layer did not name is judged over, as
+/// IAM writes it for such a request: every resource (see the module docs). IAM spells "every
+/// resource" and "every resource of this family" with the same wildcard, so this is stated as
+/// that one, and the two cannot drift apart.
+const EVERY_RESOURCE: &str = ANY_RESOURCE_OF_THE_FAMILY;
 
 /// The resource families whose refusal of a call naming ONE MEMBER closes at the ACTION,
 /// stating neither the resource nor the rule that withheld the grant.
@@ -182,8 +202,11 @@ pub fn request_principal<Eng: Send + Sync + 'static>(
 }
 
 /// The refusal a request to `operation` gets when the calling principal's IAM policies do
-/// not allow it, and `None` when they do — and for every request whose resource this layer
-/// cannot name from the request line (see the module docs).
+/// not allow it, and `None` when they do.
+///
+/// EVERY request is judged: one addressing a resource this layer can name from the request
+/// line is judged against that ARN, and one whose resource it cannot name is judged on the
+/// action alone, over every resource (see the module docs).
 ///
 /// IAM's order: an explicit `Deny` in a document that CAN be read refuses the request
 /// whatever else the principal carries; otherwise a grant is needed, which a caller this
@@ -201,7 +224,7 @@ pub fn refusal<Eng: Send + Sync + 'static>(
     operation: &str,
     input_schema: &Schema,
 ) -> Option<Refused> {
-    let addressed = addressed(ctx, input_schema)?;
+    let addressed = addressed(ctx, input_schema).unwrap_or(Addressed::EveryResource);
     let caller = caller(engine, ctx);
     // Nothing this gate can read bears on the request: there is no document that could deny
     // it, no boundary that could cap it, and the credential is one the gate does not bound.
@@ -213,7 +236,7 @@ pub fn refusal<Eng: Send + Sync + 'static>(
     // An identity-based document states no `Principal` element, so the decision rests on
     // the action and the resource the request addressed.
     let request = iam::Request::new(&action, addressed.arn(), &[]);
-    let withheld = withheld(&caller, &request, &action)?;
+    let withheld = withheld(&caller, &request, &action, addressed.scope())?;
     ::tracing::info!(
         operation = %operation,
         action = %action,
@@ -229,26 +252,63 @@ pub fn refusal<Eng: Send + Sync + 'static>(
 /// Which of IAM's rules withheld the grant for `request`, and `None` when IAM allows it — in
 /// IAM's own evaluation order (see [`refusal`]).
 ///
+/// `scope` says which GRANT question the request is decided by: one judged against the ARN it
+/// addresses needs a statement whose resource element covers that ARN, while one judged over
+/// every resource takes the weaker question ([`grant_scoped_elsewhere`]), so a grant scoped to
+/// resources this layer did not read still reaches the operation. A `Deny` is decided against
+/// the request either way.
+///
 /// The clauses are the shared ones the tree states once, so the rule a refusal reports is
 /// worded the same way wherever the same rule withheld the grant.
-fn withheld(caller: &Caller, request: &iam::Request<'_>, action: &str) -> Option<String> {
-    let said = iam::identity_decision(&caller.documents, request);
+fn withheld(
+    caller: &Caller,
+    request: &iam::Request<'_>,
+    action: &str,
+    scope: Scope,
+) -> Option<String> {
+    // Each document is read ONCE per decision: the identity-based question, the grant
+    // question below it and the boundary's own reading all take the prepared form.
+    let documents = iam::prepare_documents(&caller.documents);
+    let said = iam::identity_decision_prepared(&documents, request);
     if said == Decision::Denied {
         return Some(iam::IDENTITY_POLICY_EXPLICIT_DENY.to_string());
     }
-    if !(iam::is_allowed(said, Decision::NotStated) || caller.identity_is_unbounded()) {
+    if !(iam::is_allowed(said, Decision::NotStated)
+        || caller.identity_is_unbounded()
+        || grant_scoped_elsewhere(&documents, action, scope))
+    {
         return Some(iam::no_identity_policy_allows(action));
     }
     match caller.boundary.as_ref() {
         None => None,
         Some(boundary) => {
-            match iam::identity_decision(::std::slice::from_ref(boundary), request) {
+            let boundary = iam::prepare_documents(::std::slice::from_ref(boundary));
+            match iam::identity_decision_prepared(&boundary, request) {
                 Decision::Allowed => None,
                 Decision::Denied => Some(iam::PERMISSIONS_BOUNDARY_EXPLICIT_DENY.to_string()),
+                _ if grant_scoped_elsewhere(&boundary, action, scope) => None,
                 _ => Some(iam::no_permissions_boundary_allows(action)),
             }
         }
     }
+}
+
+/// Whether `documents` hold an `Allow` of `action` whose resource element this decision never
+/// read — which is a grant only for a request judged over every resource ([`Scope`]).
+///
+/// The weaker question IAM's own evaluation states for a gate that does not know the resource
+/// ARN a request addresses: the resource element cannot be matched, so withholding the grant
+/// on it would refuse a call a resource-scoped statement permits, while a principal whose
+/// documents hold no `Allow` of the action at all is refused by IAM's default deny whatever
+/// resource the call named. For a request judged against the ARN it addresses this answers
+/// `false`: there the resource element WAS read, and a statement that does not cover that ARN
+/// grants nothing.
+fn grant_scoped_elsewhere(
+    documents: &[iam::PreparedDocument],
+    action: &str,
+    scope: Scope,
+) -> bool {
+    scope == Scope::EveryResource && iam::identity_may_allow_action(documents, action)
 }
 
 /// The sentence this endpoint refuses an unauthorized call addressing ONE MEMBER of a
@@ -268,7 +328,8 @@ pub fn not_authorized(principal: &str, action: &str) -> String {
 }
 
 /// The ARN of the resource this request addresses, when this layer can name it from the
-/// request line, and `None` for every other request (see the module docs).
+/// request line, and `None` for every other request — which its caller judges over every
+/// resource rather than leaving unjudged (see the module docs).
 ///
 /// Read off the operation's OWN modelled `@http` URI rather than off a list of operation
 /// names, so every route of a family this layer names an ARN type for is judged, and one
@@ -285,26 +346,34 @@ pub fn not_authorized(principal: &str, action: &str) -> String {
 /// * a template carrying NO label addresses the family as a whole — a create, or the
 ///   family's listing — and is judged against that family's collection
 ///   ([`collection_arn`]).
+///
+/// Which of the two questions a request is decided by ([`Scope`]) is therefore a property of
+/// the ROUTE and of the families this crate names an ARN type for, never of the shape of the
+/// path a caller sent: a request carrying no identifier at the label's segment still
+/// addresses the family the route names, so it is judged against that family's collection
+/// rather than falling to the action alone.
 fn addressed(ctx: &OperationContext<'_>, input_schema: &Schema) -> Option<Addressed> {
     let parts = ctx.parts();
     let region = crate::state::request_region(parts);
     let template = input_schema.http().map(|http| http.uri())?;
     let family = path_segment(template, 0)?;
+    let collection = || collection_arn(family, &region).map(Addressed::Collection);
     let Some((index, label)) = first_label(template) else {
-        return collection_arn(family, &region).map(Addressed::Collection);
+        return collection();
     };
     let uri = parts.uri.to_string();
-    let carried = ::service_common::percent_decode_path_label(path_segment(
-        ::service_common::uri_path(&uri),
-        index,
-    )?);
-    (!carried.is_empty())
-        .then(|| member_arn(label, &carried, &region))
-        .flatten()
-        .map(|arn| Addressed::Member {
-            arn,
-            states_resource: !ACTION_ONLY_REFUSAL_FAMILIES.contains(&family),
-        })
+    let carried = path_segment(::service_common::uri_path(&uri), index)
+        .map(::service_common::percent_decode_path_label)
+        .filter(|carried| !carried.is_empty());
+    let Some(carried) = carried else {
+        return collection();
+    };
+    // A family this layer names no ARN type for answers `None` here, and is judged on its
+    // action alone by the caller of this reading.
+    member_arn(label, &carried, &region).map(|arn| Addressed::Member {
+        arn,
+        states_resource: !ACTION_ONLY_REFUSAL_FAMILIES.contains(&family),
+    })
 }
 
 /// The `index`-th non-empty segment of a path, which for an `@http` URI template is the
@@ -346,9 +415,10 @@ fn first_label(template: &str) -> Option<(usize, &str)> {
 ///
 /// The labels left out name families this layer must not guess an ARN for: a browser and a
 /// code interpreter are each addressed under two ARN types (built-in and customer-created),
-/// and an evaluator has no ARN type in this crate at all. A request of one of those falls
-/// through the gate untouched, as every unnamed resource does — judging an action against
-/// the wrong resource would refuse a call a scoped statement allows.
+/// and an evaluator has no ARN type in this crate at all. A request of one of those is judged
+/// on its ACTION over every resource instead, as every request whose resource this layer
+/// cannot name is — judging an action against the wrong resource would refuse a call a scoped
+/// statement allows.
 fn member_arn(label: &str, id: &str, region: &str) -> Option<String> {
     Some(match label {
         "agentRuntimeId" => crate::state::runtime_arn(region, id),
@@ -382,7 +452,8 @@ fn member_arn(label: &str, id: &str, region: &str) -> Option<String> {
 /// The families left out are the ones with no single ARN type (`browsers`,
 /// `code-interpreters`), the ones whose resources are nested under a parent the route does
 /// not name (`identities`, whose providers hang off a token vault) and the ones this crate
-/// builds no ARN for (`evaluators`).
+/// builds no ARN for (`evaluators`). A request of one of those is judged on its ACTION over
+/// every resource instead (see the module docs).
 fn collection_arn(family: &str, region: &str) -> Option<String> {
     let any = ANY_RESOURCE_OF_THE_FAMILY;
     Some(match family {
@@ -417,6 +488,21 @@ enum Addressed {
     },
     /// A resource family's WHOLE collection, named by the route the request came in on.
     Collection(String),
+    /// A request whose own resource ARN this layer did not name, judged over every resource
+    /// on the action alone (see the module docs).
+    EveryResource,
+}
+
+/// Which GRANT question a request is decided by, which follows the resource the decision is
+/// taken against ([`Addressed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    /// The ARN the request addresses: a statement grants only when its resource element
+    /// covers that ARN.
+    Resource,
+    /// Every resource: an `Allow` of the action grants whatever resource element it carries
+    /// ([`grant_scoped_elsewhere`]).
+    EveryResource,
 }
 
 impl Addressed {
@@ -424,6 +510,15 @@ impl Addressed {
     fn arn(&self) -> &str {
         match self {
             Self::Member { arn, .. } | Self::Collection(arn) => arn,
+            Self::EveryResource => EVERY_RESOURCE,
+        }
+    }
+
+    /// Which grant question decides this request ([`Scope`]).
+    fn scope(&self) -> Scope {
+        match self {
+            Self::Member { .. } | Self::Collection(_) => Scope::Resource,
+            Self::EveryResource => Scope::EveryResource,
         }
     }
 
@@ -431,12 +526,18 @@ impl Addressed {
     /// action it asked for, and — for every resource but a member of a family whose own
     /// backend closes at the action — the resource and `withheld`, the rule that withheld
     /// the grant.
+    ///
+    /// A request judged over every resource names no resource, since the decision was not
+    /// taken on one, and goes on to state the rule.
     fn refused(&self, principal: &str, action: &str, withheld: &str) -> String {
         match self {
             Self::Member {
                 states_resource: false,
                 ..
             } => not_authorized(principal, action),
+            Self::EveryResource => {
+                format!("{} {withheld}", not_authorized(principal, action))
+            }
             Self::Member { arn, .. } | Self::Collection(arn) => {
                 iam::not_authorized_by_identity_policy(principal, action, arn, withheld)
             }
@@ -829,6 +930,142 @@ mod tests {
         assert_eq!(
             named, expected,
             "case \"a gateway member's refusal\": expected {expected:?}, got {named:?}"
+        );
+    }
+
+    /// A principal holding `documents` as its identity-based policies and `boundary` as its
+    /// ceiling, and nothing else.
+    fn principal(documents: &[&str], boundary: Option<&str>) -> Caller {
+        Caller {
+            arn: "arn:aws:sts::000000000000:assumed-role/probe/session-1".to_string(),
+            documents: documents.iter().map(|held| (*held).to_string()).collect(),
+            boundary: boundary.map(str::to_string),
+            ..Caller::default()
+        }
+    }
+
+    /// RULE: a request whose resource this layer did not name is decided on its ACTION over
+    /// every resource — an `Allow` of the action grants it whatever resources that statement
+    /// is scoped to, because the decision never read a resource element, while a principal
+    /// whose documents hold no `Allow` of it falls to IAM's default deny and an explicit
+    /// `Deny` of it still refuses. The same documents judged AGAINST a resource ARN are read
+    /// with the resource element, where a statement scoped elsewhere grants nothing.
+    #[test]
+    fn a_request_whose_resource_is_unnamed_is_decided_on_its_action_alone() {
+        let action = action_for("ListBrowsers");
+        // The statements below are scoped to ONE resource, and the resource-scoped half of
+        // each row is decided against ANOTHER one, which no statement covers.
+        let scoped_to = crate::state::gateway_arn("us-east-1", "probe-abcdefghij");
+        let addressed = crate::state::runtime_arn("us-east-1", "probeRuntime-abcdefghij");
+        let scoped_allow = format!(
+            r#"{{"Statement":[{{"Effect":"Allow","Action":"{action}","Resource":"{scoped_to}"}}]}}"#
+        );
+        let deny_the_namespace = r#"{"Statement":[
+             {"Effect":"Allow","Action":"bedrock-agentcore:*","Resource":"*"},
+             {"Effect":"Deny","Action":"bedrock-agentcore:*","Resource":"*"}]}"#;
+        let allow_everything = r#"{"Statement":[{"Effect":"Allow","Action":"bedrock-agentcore:*",
+             "Resource":"*"}]}"#;
+
+        // What one principal's documents withhold, each clause `None` when IAM allows the
+        // call.
+        struct Row<'a> {
+            case: &'a str,
+            /// The identity-based documents in force on the principal.
+            documents: Vec<&'a str>,
+            /// The ceiling in force on it, when it carries one.
+            boundary: Option<&'a str>,
+            /// The clause withheld when the decision is taken over EVERY resource.
+            over_every_resource: Option<String>,
+            /// The clause withheld when it is taken against a resource ARN the statements
+            /// do not cover.
+            against_an_arn: Option<String>,
+        }
+        let rows: Vec<Row<'_>> = vec![
+            Row {
+                case: "no document at all",
+                documents: Vec::new(),
+                boundary: None,
+                over_every_resource: Some(iam::no_identity_policy_allows(&action)),
+                against_an_arn: Some(iam::no_identity_policy_allows(&action)),
+            },
+            Row {
+                case: "an allow of the action scoped to another resource",
+                documents: vec![&scoped_allow],
+                boundary: None,
+                over_every_resource: None,
+                against_an_arn: Some(iam::no_identity_policy_allows(&action)),
+            },
+            Row {
+                case: "an explicit deny of the namespace beside an allow of it",
+                documents: vec![deny_the_namespace],
+                boundary: None,
+                over_every_resource: Some(iam::IDENTITY_POLICY_EXPLICIT_DENY.to_string()),
+                against_an_arn: Some(iam::IDENTITY_POLICY_EXPLICIT_DENY.to_string()),
+            },
+            Row {
+                case: "a boundary scoped to another resource, capping an allow of everything",
+                documents: vec![allow_everything],
+                boundary: Some(&scoped_allow),
+                over_every_resource: None,
+                against_an_arn: Some(iam::no_permissions_boundary_allows(&action)),
+            },
+            Row {
+                case: "a boundary that states nothing about the action",
+                documents: vec![allow_everything],
+                boundary: Some(
+                    r#"{"Statement":[{"Effect":"Allow","Action":"bedrock:*","Resource":"*"}]}"#,
+                ),
+                over_every_resource: Some(iam::no_permissions_boundary_allows(&action)),
+                against_an_arn: Some(iam::no_permissions_boundary_allows(&action)),
+            },
+        ];
+
+        for row in rows {
+            let caller = principal(&row.documents, row.boundary);
+            // (which resource the decision is taken against, which grant question it asks,
+            // the clause expected)
+            let decided: [(&str, &str, Scope, Option<String>); 2] = [
+                (
+                    "over every resource",
+                    EVERY_RESOURCE,
+                    Scope::EveryResource,
+                    row.over_every_resource,
+                ),
+                (
+                    "against one resource ARN the statements do not cover",
+                    &addressed,
+                    Scope::Resource,
+                    row.against_an_arn,
+                ),
+            ];
+            for (judged, resource, scope, expected) in decided {
+                let request = iam::Request::new(&action, resource, &[]);
+                let reached = withheld(&caller, &request, &action, scope);
+                assert_eq!(
+                    reached, expected,
+                    "case {:?} judged {judged}: expected {expected:?}, got {reached:?}",
+                    row.case
+                );
+            }
+        }
+    }
+
+    /// RULE: a refusal of a request whose resource this layer did not name states the
+    /// principal, the action and the rule that withheld the grant, and names no resource —
+    /// the decision was not taken on one.
+    #[test]
+    fn the_refusal_of_an_unnamed_resource_names_the_action_and_the_rule() {
+        let principal = "arn:aws:sts::000000000000:assumed-role/reader/session-1";
+        let action = action_for("ListBrowsers");
+        let withheld = iam::no_identity_policy_allows(&action);
+        let sentence = Addressed::EveryResource.refused(principal, &action, &withheld);
+        let expected = format!(
+            "User: {principal} is not authorized to perform: {action} because no \
+             identity-based policy allows the {action} action"
+        );
+        assert_eq!(
+            sentence, expected,
+            "case \"an unnamed resource's refusal\": expected {expected:?}, got {sentence:?}"
         );
     }
 }
