@@ -7,8 +7,9 @@
 //! "For a specified resource ID, this API operation returns a list of compliance statuses for
 //! different resource types": what the store holds
 //! ([`crate::state::compliance_items`]) is one item per patch a patching operation reported
-//! for a node — the `Patch` compliance of that node — in ascending `(node id, item id)`
-//! order, narrowed by every filter the request carries and served one page at a time.
+//! for a node — the `Patch` compliance of that node — beside the items a caller wrote itself
+//! through `PutComplianceItems`, narrowed by every filter the request carries and served one
+//! page at a time in the store's own total order.
 //!
 //! A read: nothing is written beyond the compliance a finished State Manager association run
 //! already owed the nodes it applied the patch-baseline document on, which was due at the same
@@ -21,7 +22,9 @@
 //!   none of the modelled ones, or that carries no value to search for (`InvalidFilter`);
 //! * a `ResourceIds` entry that is not shaped like a managed-node id (`InvalidResourceId`);
 //! * a `ResourceTypes` entry other than `ManagedInstance`, "currently the only supported
-//!   resource type" (`InvalidResourceType`);
+//!   resource type", refused with the sentence this service words that refusal with
+//!   ([`crate::state::compliance_items::unsupported_resource_type_message`], the same one the
+//!   write answers) — `InvalidResourceType`;
 //! * a `NextToken` that is not a token this read hands out (`InvalidNextToken`).
 //!
 //! ## Shape of an operation
@@ -174,9 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use crate::state::compliance_items::{
-            compliance_filter_rejection, compliance_page_size, RESOURCE_TYPE_MANAGED_INSTANCE,
-        };
+        use crate::state::compliance_items as compliance;
         use crate::state::{managed_node_id_is_well_formed, request_region, INVALID_NEXT_TOKEN};
 
         // The `ResourceIds` and `ResourceTypes` list lengths and the `MaxResults` range are
@@ -208,18 +209,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // "Currently, the only supported resource type is ManagedInstance": a request naming
         // another kind of resource asks about compliance of a kind this service reports none
-        // of. `InvalidResourceType` carries no message member either.
-        if input
-            .resource_types
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .any(|kind| kind != RESOURCE_TYPE_MANAGED_INSTANCE)
-        {
-            return Err(
-                ListComplianceItemsErrorModeled::InvalidResourceType(InvalidResourceType {})
-                    .into(),
-            );
+        // of. The modelled `InvalidResourceType` declares no message member, yet this service
+        // words that refusal — naming the rejected type and the ones it supports — so the
+        // sentence travels through the service's own channel for exactly that case, the same
+        // one `PutComplianceItems` answers with.
+        for resource_type in input.resource_types.as_deref().unwrap_or_default() {
+            if !compliance::is_supported_resource_type(resource_type) {
+                return Err(crate::scaffolded::Scaffolded::invalid_resource_type(
+                    compliance::unsupported_resource_type_message(resource_type),
+                ));
+            }
         }
 
         // A filter compares one member of a compliance item against the values it carries,
@@ -228,7 +227,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut filters: Vec<(String, Vec<String>, String)> = Vec::new();
         for filter in input.filters.as_deref().unwrap_or_default() {
             let values = filter.values.clone().unwrap_or_default();
-            if let Some(why) = compliance_filter_rejection(
+            if let Some(why) = compliance::compliance_filter_rejection(
                 filter.key.as_deref(),
                 &values,
                 filter.r#type.as_deref(),
@@ -247,34 +246,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .r#type
                 .clone()
                 .filter(|operator| !operator.is_empty())
-                .unwrap_or_else(|| {
-                    crate::state::compliance_items::OPERATOR_EQUAL.to_string()
-                });
+                .unwrap_or_else(|| compliance::OPERATOR_EQUAL.to_string());
             filters.push((key, values, operator));
         }
 
-        let page_size = compliance_page_size(input.max_results)
+        let page_size = compliance::compliance_page_size(input.max_results)
             .map_err(crate::scaffolded::Scaffolded::validation)?;
-
-        // The token this read hands out is the item the next page starts at, written as the
-        // node id and the item id it is keyed by — so a token carrying no such pair was never
-        // one of ours.
-        let resume_from = match input.next_token.as_deref() {
-            None | Some("") => None,
-            Some(token) => match token.split_once(TOKEN_SEPARATOR) {
-                Some((node, id)) if managed_node_id_is_well_formed(node) && !id.is_empty() => {
-                    Some((node.to_string(), id.to_string()))
-                }
-                _ => {
-                    return Err(ListComplianceItemsErrorModeled::InvalidNextToken(
-                        InvalidNextToken {
-                            message: Some(INVALID_NEXT_TOKEN.to_string()),
-                        },
-                    )
-                    .into())
-                }
-            },
-        };
 
         // Systems Manager is regional: the compliance of a node is reached through the
         // endpoint of the Region that node is registered with, which is the Region this
@@ -290,12 +267,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
         );
         let store = state.lock();
+
+        // The token names the position this read stopped at, authenticated under this store's
+        // own key: a value it did not mint is refused rather than served a page it never
+        // offered.
+        let resume_after = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => match compliance::page_cursor(&store.page_token_key(), token) {
+                Some(position) => Some(position),
+                None => {
+                    return Err(ListComplianceItemsErrorModeled::InvalidNextToken(
+                        InvalidNextToken {
+                            message: Some(INVALID_NEXT_TOKEN.to_string()),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
         let mut compliance_items = Vec::new();
         let mut next_token = None;
+        let mut last_served: Option<String> = None;
         for item in store.compliance_items(&region, &resource_ids) {
-            if resume_from
-                .as_ref()
-                .is_some_and(|(node, id)| (&item.resource_id, &item.id) < (node, id))
+            let position = compliance::item_position(&item);
+            // The page resumes STRICTLY after the position the previous page's token named, so
+            // nothing it reported is reported twice and an item the store gained past that cut
+            // is still reported.
+            if resume_after
+                .as_deref()
+                .is_some_and(|cut| position.as_str() <= cut)
             {
                 continue;
             }
@@ -308,15 +309,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             }
             if compliance_items.len() == page_size {
-                // The page is full and an item is still waiting: hand the caller the item it
-                // resumes at, so the next request continues where this one stopped.
-                next_token = Some(format!(
-                    "{}{TOKEN_SEPARATOR}{}",
-                    item.resource_id, item.id
-                ));
+                // The page is full and an item is still waiting: hand the caller the position
+                // this page stopped at, so the next request continues where it left off.
+                next_token = last_served
+                    .as_deref()
+                    .map(|served| compliance::page_token(&store.page_token_key(), served));
                 break;
             }
             compliance_items.push(item.to_compliance_item());
+            last_served = Some(position);
         }
 
         Ok(ListComplianceItemsOutput {
@@ -325,7 +326,3 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
-
-/// What a page token writes between the node id and the item id it resumes at: a managed-node
-/// id carries no `/`, so the two halves of a token this read hands out are always told apart.
-const TOKEN_SEPARATOR: char = '/';

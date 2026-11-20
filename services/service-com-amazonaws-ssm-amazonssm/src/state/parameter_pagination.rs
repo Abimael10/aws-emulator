@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The continuation tokens Parameter Store's paginated reads hand out.
+//! The continuation tokens this service's paginated reads hand out.
+//!
+//! Parameter Store's reads are where this lives (their own [`PagedRead`] scopes are below),
+//! and the mint and decode of an authenticated cursor are written here ONCE
+//! ([`scoped_page_token`], [`scoped_page_cursor`]) for every plane of this service that hands
+//! one out — the compliance read of [`super::compliance_items`] among them — so two reads
+//! cannot disagree about a token's form.
 //!
 //! A `NextToken` is opaque: the position travels INSIDE the token, and there is no page
 //! kept on the side to look it up in. A read that only checks the token's SHAPE therefore
@@ -20,7 +26,7 @@ pub use ::service_common::page_tokens::PageTokenKey;
 /// The byte a cursor puts between the read it was minted for and the position it names. A
 /// unit separator is in no parameter name (a name carries only `a-zA-Z0-9_.-` and the `/`
 /// separator) and in no version number, so it splits a cursor exactly once.
-const CURSOR_SEPARATOR: char = '\u{1f}';
+pub const CURSOR_SEPARATOR: char = '\u{1f}';
 
 /// Which paginated read of Parameter Store a token was minted for.
 ///
@@ -59,7 +65,19 @@ impl PagedRead {
 /// nothing about it has to be: what a caller cannot do is produce the authenticator for a
 /// position of its own.
 pub fn page_token(key: &PageTokenKey, read: PagedRead, resume_after: &str) -> String {
-    ::hex::encode(key.mint(&format!("{}{CURSOR_SEPARATOR}{resume_after}", read.scope())))
+    scoped_page_token(key, read.scope(), resume_after)
+}
+
+/// The `NextToken` that resumes the read named `scope` AFTER `resume_after`: the
+/// authenticated bytes of the cursor, hex-encoded.
+///
+/// THE ONE mint of an authenticated cursor in this crate, which [`page_token`] and the
+/// paginated reads of the other planes of this service (the compliance read,
+/// [`super::compliance_items`]) both go through: the separator, the scope and the rendering
+/// are written once, so two reads cannot disagree about the form of a token or about what
+/// their scopes mean.
+pub fn scoped_page_token(key: &PageTokenKey, scope: &str, resume_after: &str) -> String {
+    ::hex::encode(key.mint(&format!("{scope}{CURSOR_SEPARATOR}{resume_after}")))
 }
 
 /// Whether `position` is one a resume after `resume_after` has already served, so the walk
@@ -84,9 +102,16 @@ pub fn already_served<T: PartialOrd + ?Sized>(resume_after: Option<&T>, position
 /// whose authenticator does not match the cursor it travels with, and one minted for
 /// another read.
 pub fn page_cursor(key: &PageTokenKey, read: PagedRead, token: &str) -> Option<String> {
+    scoped_page_cursor(key, read.scope(), token)
+}
+
+/// The position a `NextToken` resumes the read named `scope` at, or `None` for any value THIS
+/// store did not mint for THAT scope — the decode half of [`scoped_page_token`], and the one
+/// place a token of this crate is read.
+pub fn scoped_page_cursor(key: &PageTokenKey, scope: &str, token: &str) -> Option<String> {
     let cursor = key.cursor_of(&::hex::decode(token).ok()?)?;
-    let (scope, position) = cursor.split_once(CURSOR_SEPARATOR)?;
-    (scope == read.scope()).then(|| position.to_string())
+    let (minted_for, position) = cursor.split_once(CURSOR_SEPARATOR)?;
+    (minted_for == scope).then(|| position.to_string())
 }
 
 #[cfg(test)]

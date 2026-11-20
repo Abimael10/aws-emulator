@@ -535,14 +535,14 @@ async fn an_update_resolves_both_ids_against_the_regions_records() {
             REGION,
             here.as_str(),
             UNKNOWN_TARGET_ID,
-            format!("Maintenance window {here} has no target {UNKNOWN_TARGET_ID}"),
+            format!("Maintenance window target {UNKNOWN_TARGET_ID} does not exist"),
         ),
         (
             "a target of another window of this Region",
             REGION,
             other_window.as_str(),
             id.as_str(),
-            format!("Maintenance window {other_window} has no target {id}"),
+            format!("Maintenance window target {id} does not exist"),
         ),
         (
             "this Region's target at the other endpoint",

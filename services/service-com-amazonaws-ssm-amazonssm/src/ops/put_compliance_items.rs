@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutComplianceItems
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutComplianceItems`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutComplianceItems::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Registers a compliance type and other compliance details on a designated resource. This
+//! operation lets you register custom compliance details with a resource."
+//!
+//! WHAT THIS WRITES. The items the put carries become the compliance `ResourceId` holds under
+//! the put's one `ComplianceType`, in the store this service's compliance plane owns
+//! ([`crate::state::compliance_items`]) and `ListComplianceItems` reads back — "this call
+//! overwrites existing compliance information on the resource, so you must provide a full list
+//! of compliance items each time that you send the request", which the `UploadType` qualifies
+//! (COMPLETE replaces every item of that compliance type, PARTIAL only the ones the put
+//! names). A put whose `ItemContentHash` matches the one the resource already holds is
+//! ignored, the way the API documents.
+//!
+//! WHAT IT REFUSES, in the order AWS decides them: the caller's own identity-based policies
+//! decide the call before anything is resolved (`AccessDeniedException`, widened in below);
+//! `ManagedInstance` is "currently the only supported resource type", so any other is
+//! `InvalidResourceType` naming the rejected type; a `ResourceId` naming no managed node of
+//! the Region is `InvalidResourceId`; an eleventh custom compliance type on one resource is
+//! `ComplianceTypeCountLimitExceededException`; and a put past the emulator's own item
+//! ceiling is `TotalSizeLimitExceededException`. Each of them writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -131,9 +142,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ssm-amazonssm.json");
 // here — hence the `PutComplianceItemsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ssm#PutComplianceItems")]
+// The operation's MODELED errors, plus the refusal a caller holding no grant gets:
+// `AccessDeniedException` is a shape this SERVICE models ("the requester doesn't have
+// permissions to perform the requested operation") that this operation's own `errors` list
+// omits, so it is widened in through `extra_errors` rather than answered as some other
+// status — an identity-based policy decides a signed call before the service resolves
+// anything the request names, the way the sibling write of this crate does
+// (`crate::ops::put_inventory`).
+#[smithy_macros::operation_error(
+    "com.amazonaws.ssm#PutComplianceItems",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum PutComplianceItemsErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     ComplianceTypeCountLimitExceededException(ComplianceTypeCountLimitExceededException),
     InternalServerError(InternalServerError),
     InvalidItemContentException(InvalidItemContentException),
@@ -194,18 +216,176 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutComplianceItems` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutComplianceItemsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutComplianceItems"))
+        use crate::state::compliance_items as compliance;
+
+        // Both ids' lengths, the compliance type's pattern, the `Items` list's length and
+        // every item's required `Severity` and `Status` — each one of the modelled enum's
+        // values — are MODELLED constraints the centralized walk has already refused anything
+        // outside of, so reaching here means the input satisfies every one of them.
+        let region = crate::state::request_region(ctx.parts());
+
+        // The caller's own identity-based policies decide this call before the resource is
+        // resolved. The resource is the node the request NAMED, built from the id it carried
+        // rather than from anything looked up, so a caller holding no grant cannot learn from
+        // the refusal whether that node exists.
+        if let Some(message) = crate::state::identity_authorization::refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::identity_authorization::instance_resource(&region, &input.resource_id),
+        ) {
+            return Err(
+                PutComplianceItemsErrorModeled::AccessDeniedException(AccessDeniedException {
+                    message,
+                })
+                .into(),
+            );
+        }
+
+        // "ManagedInstance is currently the only supported resource type": a type outside the
+        // supported set names nothing compliance can be reported about, which is decided
+        // before the store is read so a refused put leaves every resource's compliance as it
+        // was. The modelled `InvalidResourceType` declares no message member, so the sentence
+        // travels through the service's own channel for exactly that case.
+        if !compliance::is_supported_resource_type(&input.resource_type) {
+            return Err(crate::scaffolded::Scaffolded::invalid_resource_type(
+                compliance::unsupported_resource_type_message(&input.resource_type),
+            ));
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutComplianceItemsError::from(PutComplianceItemsErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the compliance store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        // The registration an instance of this Region had already made by now was owed at the
+        // same instant whether or not anybody called, so it is materialised before the node
+        // store is read — with no guard of it held.
+        crate::state::node_registration::settle_registrations(&*self.engine, &region);
+
+        let mut store = state.lock();
+
+        // Compliance is reported ABOUT a managed node, so an id naming none of this Region's
+        // nodes names no resource to report it about: "the resource ID isn't valid. Verify
+        // that you entered the correct ID and try again" is the whole of what
+        // `InvalidResourceId` says, since the modelled shape carries no message member at
+        // all.
+        if store.managed_node(&region, &input.resource_id).is_none() {
+            return Err(
+                PutComplianceItemsErrorModeled::InvalidResourceId(InvalidResourceId {}).into(),
+            );
+        }
+
+        // "In PARTIAL mode, the system overwrites compliance information for a specific
+        // association"; "by default, all requests use COMPLETE mode", which overwrites every
+        // item the resource holds of this compliance type.
+        let partial = input.upload_type.as_deref() == Some(compliance::UPLOAD_TYPE_PARTIAL);
+
+        // "You specified too many custom compliance types. You can specify a maximum of 10
+        // different types": what the ceiling counts is the CUSTOM types one resource holds
+        // reports of, so a put under a type it already holds is admitted whatever the count
+        // stands at, and the predefined types this service reports under do not count.
+        let mut custom_types = store.custom_compliance_types_of(
+            &region,
+            &input.resource_type,
+            &input.resource_id,
+        );
+        if compliance::is_custom_compliance_type(&input.compliance_type) {
+            custom_types.insert(input.compliance_type.as_str());
+        }
+        if custom_types.len() > compliance::MAX_CUSTOM_COMPLIANCE_TYPES {
+            return Err(
+                PutComplianceItemsErrorModeled::ComplianceTypeCountLimitExceededException(
+                    ComplianceTypeCountLimitExceededException {
+                        message: Some(compliance::compliance_type_ceiling_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The emulator's own ceiling on the one map a put grows, asked before the first item
+        // is written so a refused put writes nothing.
+        if store.compliance_items_after_put(
+            &region,
+            &input.resource_type,
+            &input.resource_id,
+            &input.compliance_type,
+            input.items.len(),
+            partial,
+        ) > compliance::MAX_COMPLIANCE_ITEMS
+        {
+            return Err(
+                PutComplianceItemsErrorModeled::TotalSizeLimitExceededException(
+                    TotalSizeLimitExceededException {
+                        message: Some(compliance::item_ceiling_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The content hash is used to determine if existing information should be
+        // overwritten or ignored. If the content hashes match, the request to put compliance
+        // information is ignored": the put is accepted and the resource keeps the items it
+        // holds, so nothing is written and the 200 is the whole answer.
+        let held_hash = store.compliance_content_hash(
+            &region,
+            &input.resource_type,
+            &input.resource_id,
+            &input.compliance_type,
+        );
+        if let (Some(submitted), Some(held)) = (input.item_content_hash.as_deref(), held_hash) {
+            if submitted == held {
+                return Ok(PutComplianceItemsOutput {});
+            }
+        }
+
+        // Every item is persisted as the put supplied it — the execution summary it was
+        // reported under is the put's, not the instant this call arrived — so a read reports
+        // what was written. The `Details` are held in ascending key order, the one order the
+        // items of this store are held in.
+        let items: Vec<compliance::ComplianceItemRecord> = input
+            .items
+            .iter()
+            .enumerate()
+            .map(|(position, item)| compliance::ComplianceItemRecord {
+                resource_type: input.resource_type.clone(),
+                resource_id: input.resource_id.clone(),
+                compliance_type: input.compliance_type.clone(),
+                position,
+                item_id: item.id.clone(),
+                title: item.title.clone(),
+                severity: item.severity.clone(),
+                status: item.status.clone(),
+                details: item.details.as_ref().map(|details| {
+                    let mut entries: Vec<(String, String)> = details
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect();
+                    entries.sort();
+                    entries
+                }),
+                execution_summary: input.execution_summary.clone(),
+                source: compliance::ComplianceSource::Written,
+            })
+            .collect();
+        store.put_compliance_items(
+            &compliance::CompliancePut {
+                region: &region,
+                resource_type: &input.resource_type,
+                resource_id: &input.resource_id,
+                compliance_type: &input.compliance_type,
+                partial,
+                content_hash: input.item_content_hash.as_deref(),
+            },
+            items,
+        );
+
+        // `PutComplianceItemsResult` declares no member at all: the 200 is the whole answer.
+        Ok(PutComplianceItemsOutput {})
     }
 }

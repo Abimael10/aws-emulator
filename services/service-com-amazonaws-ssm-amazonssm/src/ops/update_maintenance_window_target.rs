@@ -243,7 +243,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     DoesNotExistException {
                         message: Some(
                             crate::state::maintenance_window_targets::target_not_found_message(
-                                &input.window_id,
                                 &input.window_target_id,
                             ),
                         ),

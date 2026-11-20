@@ -360,7 +360,8 @@ pub mod custom_inventory;
 pub mod instance_patches;
 
 /// The compliance items a managed node holds — the projection of the patch rows a patching
-/// operation left, which `ListComplianceItems` reports.
+/// operation left and the items a caller's own `PutComplianceItems` wrote, which
+/// `ListComplianceItems` reports.
 pub mod compliance_items;
 
 /// The patch-baseline run Patch Manager performs on a managed node when the document it
@@ -2209,6 +2210,26 @@ pub struct ComAmazonawsSsmAmazonssmState {
     pub inventory_deletions:
         BTreeMap<(String, String), custom_inventory::InventoryDeletionRecord>,
 
+    /// Every compliance item a caller reported through `PutComplianceItems`, keyed by
+    /// `(region, resource type, resource id, compliance type, position)`: a put states one
+    /// resource and ONE compliance type and carries the full list of items for it, so the
+    /// position is the item's place in that list. A `BTreeMap` so a listing walks a stable,
+    /// total order. The compliance Patch Manager GATHERED holds no entry here and is
+    /// projected from the patch reports instead ([`Self::compliance_items`], which reports
+    /// both). See [`compliance_items`].
+    pub written_compliance_items:
+        BTreeMap<compliance_items::ComplianceItemKey, compliance_items::ComplianceItemRecord>,
+
+    /// The `ItemContentHash` the last `PutComplianceItems` carried for each `(region, resource
+    /// type, resource id, compliance type)`: "the content hash is used to determine if
+    /// existing information should be overwritten or ignored. If the content hashes match, the
+    /// request to put compliance information is ignored", so the hash belongs to the PUT
+    /// rather than to one of the items it wrote. Held only for a pair that holds items, so
+    /// this map is a subset of the one above and the ceiling on that one bounds both. See
+    /// [`compliance_items`].
+    pub compliance_content_hashes:
+        BTreeMap<compliance_items::ComplianceContentHashKey, String>,
+
     /// Every service setting an account has MODIFIED, keyed by `(region, setting id)`: a
     /// setting is reached through one Region's endpoint and its ARN names that Region. A
     /// setting nobody has modified holds no entry and is reported from the catalogue
@@ -2381,6 +2402,8 @@ impl Default for ComAmazonawsSsmAmazonssmState {
             custom_inventory: BTreeMap::new(),
             custom_inventory_types: BTreeSet::new(),
             inventory_deletions: BTreeMap::new(),
+            written_compliance_items: BTreeMap::new(),
+            compliance_content_hashes: BTreeMap::new(),
             service_settings: BTreeMap::new(),
             created_at: SystemTime::now(),
             resource_policies: resource_policies::ResourcePolicyStore::default(),

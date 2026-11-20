@@ -63,9 +63,17 @@ pub fn target_ceiling_message(window_id: &str) -> String {
 /// How this service reports a `WindowTargetId` that names no target of the window the
 /// request addressed, through `DoesNotExistException` — whose own account of its class is
 /// "the specified resource, such as a maintenance window or patch baseline, doesn't exist".
+///
+/// RECORDED BEHAVIOUR (corpus `simparity-behavioral-aws-v1`, unit
+/// `ssm.maintenance-window-target-rejects-unknown-id-after-deregister`): the sentence names
+/// the TARGET and nothing else — `Maintenance window target <WindowTargetId> does not
+/// exist` — so the window the request addressed is not in it. The missing entity is the
+/// target, which is what the refusal says; a window the Region holds none of is the separate
+/// [`super::maintenance_windows::maintenance_window_not_found_message`], and the two
+/// conditions stay distinguishable because each names the entity that is missing.
 #[must_use]
-pub fn target_not_found_message(window_id: &str, window_target_id: &str) -> String {
-    format!("Maintenance window {window_id} has no target {window_target_id}")
+pub fn target_not_found_message(window_target_id: &str) -> String {
+    format!("Maintenance window target {window_target_id} does not exist")
 }
 
 /// The page size a target describe serves (see `super::page_size`).
