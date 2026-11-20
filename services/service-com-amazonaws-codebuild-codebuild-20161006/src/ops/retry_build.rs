@@ -177,215 +177,225 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // where the object store those runs reach can be reached, so the record this
         // retry is derived from is the one the clock already owes.
         crate::state::settle_due_builds(ctx.callback(), &*self.engine, &state, &region).await;
-        let mut guard = state.lock();
+        // The whole of the retry is one critical section, taken as a BLOCK so the guard is
+        // released at its end — before the publication below, which reaches another
+        // service. It answers the build this call minted.
+        let build = {
+            let mut guard = state.lock();
 
-        // A build id is `<projectName>:<uuid>`, so it names the PROJECT the build
-        // belongs to as well as the build: that project is what a retry runs again, and
-        // it is therefore the first precondition this call resolves. A build cannot
-        // belong to a project this account does not hold, so a request naming an absent
-        // project is answered on the project — which is the resource the caller has to
-        // re-create — and the build record is never consulted for it.
-        if let Some(named_project) = crate::state::project_name_from_resource_id(&build_id)
-            .filter(|named_project| !guard.projects.contains_key(*named_project))
-        {
-            return Err(project_not_found(&crate::state::project_arn(
-                &region,
-                named_project,
-            )));
-        }
+            // A build id is `<projectName>:<uuid>`, so it names the PROJECT the build
+            // belongs to as well as the build: that project is what a retry runs again, and
+            // it is therefore the first precondition this call resolves. A build cannot
+            // belong to a project this account does not hold, so a request naming an absent
+            // project is answered on the project — which is the resource the caller has to
+            // re-create — and the build record is never consulted for it.
+            if let Some(named_project) = crate::state::project_name_from_resource_id(&build_id)
+                .filter(|named_project| !guard.projects.contains_key(*named_project))
+            {
+                return Err(project_not_found(&crate::state::project_arn(
+                    &region,
+                    named_project,
+                )));
+            }
 
-        // The retried build is read through `settled_build`, so the record this
-        // retry is derived from is the one the clock already owes — a build whose
-        // span has elapsed is reported, and copied, as finished.
-        let Some((retried, retried_artifacts, retried_secondary_artifacts)) = guard
-            .settled_build(&build_id, now)
-            .map(|stored| {
-                (
-                    stored.build.clone(),
-                    stored.artifacts.clone(),
-                    stored.secondary_artifacts.clone(),
+            // The retried build is read through `settled_build`, so the record this
+            // retry is derived from is the one the clock already owes — a build whose
+            // span has elapsed is reported, and copied, as finished.
+            let Some((retried, retried_artifacts, retried_secondary_artifacts)) = guard
+                .settled_build(&build_id, now)
+                .map(|stored| {
+                    (
+                        stored.build.clone(),
+                        stored.artifacts.clone(),
+                        stored.secondary_artifacts.clone(),
+                    )
+                })
+            else {
+                return Err(RetryBuildErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Build cannot be found: {}",
+                            crate::state::build_arn(&region, &build_id)
+                        )),
+                    },
                 )
-            })
-        else {
-            return Err(RetryBuildErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Build cannot be found: {}",
-                        crate::state::build_arn(&region, &build_id)
-                    )),
-                },
-            )
-            .into());
-        };
+                .into());
+            };
 
-        // Every build this service mints belongs to a project: the project is what
-        // the new build's number is allocated under and what a later
-        // `ListBuildsForProject` finds it by. Unreachable by construction for a
-        // build this service wrote (`StartBuild` and the retry below always set
-        // `projectName`); it is here so a record without one cannot be retried into
-        // a build that belongs to nothing.
-        let Some(project_name) = retried.project_name.clone() else {
-            return Err(RetryBuildErrorModeled::InvalidInputException(
-                InvalidInputException {
-                    message: Some(format!(
-                        "Build {build_id} is not associated with a build project and \
-                         cannot be retried"
-                    )),
-                },
-            )
-            .into());
-        };
-        // A retry runs the project's build again, so there has to be a project to
-        // run. Reached only for a record whose own `projectName` differs from the
-        // project half of the id it is keyed by — the id's project was resolved
-        // above — and it reports the same refusal on the same project ARN.
-        if !guard.projects.contains_key(&project_name) {
-            return Err(project_not_found(&crate::state::project_arn(
-                &region,
-                &project_name,
-            )));
-        }
+            // Every build this service mints belongs to a project: the project is what
+            // the new build's number is allocated under and what a later
+            // `ListBuildsForProject` finds it by. Unreachable by construction for a
+            // build this service wrote (`StartBuild` and the retry below always set
+            // `projectName`); it is here so a record without one cannot be retried into
+            // a build that belongs to nothing.
+            let Some(project_name) = retried.project_name.clone() else {
+                return Err(RetryBuildErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!(
+                            "Build {build_id} is not associated with a build project and \
+                             cannot be retried"
+                        )),
+                    },
+                )
+                .into());
+            };
+            // A retry runs the project's build again, so there has to be a project to
+            // run. Reached only for a record whose own `projectName` differs from the
+            // project half of the id it is keyed by — the id's project was resolved
+            // above — and it reports the same refusal on the same project ARN.
+            if !guard.projects.contains_key(&project_name) {
+                return Err(project_not_found(&crate::state::project_arn(
+                    &region,
+                    &project_name,
+                )));
+            }
 
-        // The token is resolved and recorded in `RetryBuild`'s OWN store (the
-        // crate's convention: see `crate::state::BuildTokenStore`), so a token a
-        // `StartBuild` issued never resolves a retry and vice versa.
-        //
-        // Resolved AFTER the build and project checks, the way `StartBuild` resolves
-        // it after its project check: a request naming a build this service no longer
-        // holds is answered on what it asked for, not on a token it carried. The two
-        // only differ for a replay whose build was evicted or whose project was
-        // deleted meanwhile, which is the same answer a first request would get now.
-        let token_key = input
-            .idempotency_token
-            .clone()
-            .map(|token| (project_name.clone(), token));
-        if let Some(build) = guard
-            .resolve_idempotency_token(
-                crate::state::BuildTokenStore::RetryBuild,
-                token_key.as_ref(),
-                &fingerprint,
-                now,
-            )
-            .map_err(|_| parameter_mismatch())?
-        {
-            return Ok(RetryBuildOutput { build: Some(build) });
-        }
+            // The token is resolved and recorded in `RetryBuild`'s OWN store (the
+            // crate's convention: see `crate::state::BuildTokenStore`), so a token a
+            // `StartBuild` issued never resolves a retry and vice versa.
+            //
+            // Resolved AFTER the build and project checks, the way `StartBuild` resolves
+            // it after its project check: a request naming a build this service no longer
+            // holds is answered on what it asked for, not on a token it carried. The two
+            // only differ for a replay whose build was evicted or whose project was
+            // deleted meanwhile, which is the same answer a first request would get now.
+            let token_key = input
+                .idempotency_token
+                .clone()
+                .map(|token| (project_name.clone(), token));
+            if let Some(build) = guard
+                .resolve_idempotency_token(
+                    crate::state::BuildTokenStore::RetryBuild,
+                    token_key.as_ref(),
+                    &fingerprint,
+                    now,
+                )
+                .map_err(|_| parameter_mismatch())?
+            {
+                return Ok(RetryBuildOutput { build: Some(build) });
+            }
 
-        let build_number = guard.allocate_build_number(&project_name);
-        let id = format!(
-            "{project_name}:{}",
-            crate::state::build_uuid(&project_name, build_number, now)
-        );
-        let arn = crate::state::build_arn(&region, &id);
-        // "The number of times that the build has been retried. The initial build
-        // will have an auto-retry number of 0" — so a retry of a build that has been
-        // retried `n` times is the (n + 1)th.
-        let retry_number = retried
-            .auto_retry_config
-            .as_ref()
-            .and_then(|config| config.auto_retry_number)
-            .unwrap_or(0)
-            .saturating_add(1);
-        // The limit governs how many retries CodeBuild makes on its own; it is
-        // carried forward, and a caller's explicit RetryBuild is not counted against
-        // it, because the caller is the one asking.
-        let auto_retry_limit = retried
-            .auto_retry_config
-            .as_ref()
-            .and_then(|config| config.auto_retry_limit);
-        // "The build ARN of the build that triggered the current auto-retry build."
-        let previous_auto_retry = retried
-            .arn
-            .clone()
-            .or_else(|| Some(crate::state::build_arn(&region, &build_id)));
-
-        // Every other member comes from the retried build's own record — the
-        // settings it resolved when it was started, which is what "restarts a build"
-        // runs again — never from this request, which carries no settings at all.
-        //
-        // The delivery of its output is one of those settings, and the retry is its OWN
-        // build: it runs under the retried build's log configuration and writes the
-        // stream its own id names (`crate::state::build_logs_location`).
-        let retried_logs_config = retried.logs.as_ref().map(|logs| LogsConfig {
-            cloud_watch_logs: logs.cloud_watch_logs.clone(),
-            s3_logs: logs.s3_logs.clone(),
-        });
-        // The environment the retry was STARTED with, which is the retried build's own
-        // configuration without what the retried build's RUN added to it: no environment
-        // has been provisioned for this build yet.
-        let environment = retried.environment.clone().map(|mut environment| {
-            environment.custom_entrypoint = None;
-            environment
-        });
-        let build = Build {
-            id: Some(id.clone()),
-            arn: Some(arn.clone()),
-            build_number: Some(build_number),
-            start_time: Some(crate::state::datetime(now)),
-            end_time: None,
-            current_phase: Some("QUEUED".to_string()),
-            build_status: Some("IN_PROGRESS".to_string()),
-            environment,
-            // Nothing clones a repository here, so the retry has no resolved
-            // revision of its own yet.
-            resolved_source_version: None,
-            phases: Some(crate::state::in_progress_phases(now)),
-            logs: Some(crate::state::build_logs_location(
-                &region,
-                &project_name,
-                &id,
-                retried_logs_config.as_ref(),
-            )),
-            build_complete: false,
-            initiator: Some(initiator),
-            // Allocated when a build container joins the project's VPC; no container
-            // is provisioned here.
-            network_interface: None,
-            // Exported by a buildspec's `env/exported-variables` while it runs, and
-            // reports and artifacts are produced by a running build.
-            exported_environment_variables: None,
-            report_arns: None,
-            // A retry is its own build: it is not a member of the batch the retried
-            // build may have belonged to (`RetryBuildBatch` retries a batch).
-            build_batch_arn: None,
-            auto_retry_config: Some(AutoRetryConfig {
-                auto_retry_limit,
-                auto_retry_number: Some(retry_number),
-                next_auto_retry: None,
-                previous_auto_retry,
-            }),
-            ..retried
-        };
-
-        // The retried build keeps everything else it reported and gains the forward
-        // half of the link: "the build ARN of the auto-retried build triggered by
-        // the current build".
-        guard.link_next_auto_retry(&build_id, arn);
-        guard.insert_build(
-            id.clone(),
-            crate::state::StoredBuild {
-                build: build.clone(),
-                start_millis: now,
-                settle_due_millis: now + crate::state::BUILD_SETTLE_MILLIS,
-                // A retry "restarts a build", so it uploads to the destinations the
-                // build it retries was started with, exactly as it runs that build's
-                // source and specification again.
-                artifacts: retried_artifacts,
-                secondary_artifacts: retried_secondary_artifacts,
-                run_claimed: false,
-            },
-        );
-        if let Some(key) = token_key {
-            guard.record_retry_build_token(
-                key,
-                crate::state::StartBuildToken {
-                    build_id: id,
-                    request_fingerprint: fingerprint,
-                    issued_millis: now,
-                },
-                now,
+            let build_number = guard.allocate_build_number(&project_name);
+            let id = format!(
+                "{project_name}:{}",
+                crate::state::build_uuid(&project_name, build_number, now)
             );
-        }
+            let arn = crate::state::build_arn(&region, &id);
+            // "The number of times that the build has been retried. The initial build
+            // will have an auto-retry number of 0" — so a retry of a build that has been
+            // retried `n` times is the (n + 1)th.
+            let retry_number = retried
+                .auto_retry_config
+                .as_ref()
+                .and_then(|config| config.auto_retry_number)
+                .unwrap_or(0)
+                .saturating_add(1);
+            // The limit governs how many retries CodeBuild makes on its own; it is
+            // carried forward, and a caller's explicit RetryBuild is not counted against
+            // it, because the caller is the one asking.
+            let auto_retry_limit = retried
+                .auto_retry_config
+                .as_ref()
+                .and_then(|config| config.auto_retry_limit);
+            // "The build ARN of the build that triggered the current auto-retry build."
+            let previous_auto_retry = retried
+                .arn
+                .clone()
+                .or_else(|| Some(crate::state::build_arn(&region, &build_id)));
+
+            // Every other member comes from the retried build's own record — the
+            // settings it resolved when it was started, which is what "restarts a build"
+            // runs again — never from this request, which carries no settings at all.
+            //
+            // The delivery of its output is one of those settings, and the retry is its OWN
+            // build: it runs under the retried build's log configuration and writes the
+            // stream its own id names (`crate::state::build_logs_location`).
+            let retried_logs_config = retried.logs.as_ref().map(|logs| LogsConfig {
+                cloud_watch_logs: logs.cloud_watch_logs.clone(),
+                s3_logs: logs.s3_logs.clone(),
+            });
+            // The environment the retry was STARTED with, which is the retried build's own
+            // configuration without what the retried build's RUN added to it: no
+            // environment has been provisioned for this build yet.
+            let environment = retried.environment.clone().map(|mut environment| {
+                environment.custom_entrypoint = None;
+                environment
+            });
+            let build = Build {
+                id: Some(id.clone()),
+                arn: Some(arn.clone()),
+                build_number: Some(build_number),
+                start_time: Some(crate::state::datetime(now)),
+                end_time: None,
+                current_phase: Some("QUEUED".to_string()),
+                build_status: Some("IN_PROGRESS".to_string()),
+                environment,
+                // Nothing clones a repository here, so the retry has no resolved
+                // revision of its own yet.
+                resolved_source_version: None,
+                phases: Some(crate::state::in_progress_phases(now)),
+                logs: Some(crate::state::build_logs_location(
+                    &region,
+                    &project_name,
+                    &id,
+                    retried_logs_config.as_ref(),
+                )),
+                build_complete: false,
+                initiator: Some(initiator),
+                // Allocated when a build container joins the project's VPC; no container
+                // is provisioned here.
+                network_interface: None,
+                // Exported by a buildspec's `env/exported-variables` while it runs, and
+                // reports and artifacts are produced by a running build.
+                exported_environment_variables: None,
+                report_arns: None,
+                // A retry is its own build: it is not a member of the batch the retried
+                // build may have belonged to (`RetryBuildBatch` retries a batch).
+                build_batch_arn: None,
+                auto_retry_config: Some(AutoRetryConfig {
+                    auto_retry_limit,
+                    auto_retry_number: Some(retry_number),
+                    next_auto_retry: None,
+                    previous_auto_retry,
+                }),
+                ..retried
+            };
+
+            // The retried build keeps everything else it reported and gains the forward
+            // half of the link: "the build ARN of the auto-retried build triggered by
+            // the current build".
+            guard.link_next_auto_retry(&build_id, arn);
+            guard.insert_build(
+                id.clone(),
+                crate::state::StoredBuild {
+                    build: build.clone(),
+                    start_millis: now,
+                    settle_due_millis: now + crate::state::BUILD_SETTLE_MILLIS,
+                    // A retry "restarts a build", so it uploads to the destinations the
+                    // build it retries was started with, exactly as it runs that build's
+                    // source and specification again.
+                    artifacts: retried_artifacts,
+                    secondary_artifacts: retried_secondary_artifacts,
+                    run_claimed: false,
+                },
+            );
+            if let Some(key) = token_key {
+                guard.record_retry_build_token(
+                    key,
+                    crate::state::StartBuildToken {
+                        build_id: id,
+                        request_fingerprint: fingerprint,
+                        issued_millis: now,
+                    },
+                    now,
+                );
+            }
+            build
+        };
+        // The retry is a build in progress, which is a state change a client watching
+        // CodeBuild through EventBridge reacts to: published with the guard no longer held
+        // (`crate::state::build_events`).
+        crate::state::publish_build_state_changes(ctx.callback(), &state, &region).await;
 
         Ok(RetryBuildOutput { build: Some(build) })
     }

@@ -87,6 +87,12 @@ aws-sdk-ecr = { version = "1", default-features = false }
 # codecs, both pure Rust.
 tar = "0.4"
 flate2 = "1"
+# The AWS SDK for EventBridge, driven over the in-process callback: every change of a
+# build's state is published onto the account's default event bus
+# (`crate::state::build_events`), which is that service's `PutEvents`. Only the generated
+# client is needed — the emulator supplies the transport, so the SDK's own HTTPS stack is
+# left out and the client can reach nothing off this process.
+aws-sdk-eventbridge = { version = "1", default-features = false }
 # `roxmltree`: the test-result and code-coverage files a build's `reports` sections declare
 # are XML documents the build's own commands wrote (JUnit, NUnit, TestNG, Visual Studio,
 # JaCoCo, Cobertura, Clover), and roxmltree is the pure-Rust, read-only XML reader this
@@ -113,6 +119,12 @@ service-com-amazonaws-ecr-amazonec2containerregistry-v20150921 = { workspace = t
 # a build's output is delivered to CloudWatch Logs, so what the group and stream a build
 # reports hold afterwards is read through that service's own reads.
 service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
+# The suite that reads a build's own state-change events back mounts the two services that
+# carry them: EventBridge holds the bus and the rules the events are routed by, and Amazon
+# SQS holds the queue a rule's target delivers to. Test-only: the service code publishes
+# through the AWS SDK over the in-process callback, never through these crates.
+service-com-amazonaws-eventbridge-awsevents = { workspace = true }
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 
 [lints]
 workspace = true

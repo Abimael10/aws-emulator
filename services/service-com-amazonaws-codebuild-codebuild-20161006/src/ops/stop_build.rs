@@ -146,51 +146,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &crate::state::request_region(ctx.parts()),
         )
         .await;
-        let mut guard = state.lock();
+        // The stop itself is one critical section, taken as a BLOCK so the guard is
+        // released at its end — before the publications below, which reach other services.
+        let (build, stopped) = {
+            let mut guard = state.lock();
 
-        let Some(stored) = guard.builds.get_mut(&input.id) else {
-            return Err(StopBuildErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    // CodeBuild names an absent build by the id the request gave,
-                    // exactly as given — the same text `BatchDeleteBuilds` reports in
-                    // `BuildNotDeleted$statusCode` for an id it holds no record of.
-                    message: Some(format!("Build {} does not exist", input.id)),
-                },
-            )
-            .into());
+            let Some(stored) = guard.builds.get_mut(&input.id) else {
+                return Err(StopBuildErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        // CodeBuild names an absent build by the id the request gave,
+                        // exactly as given — the same text `BatchDeleteBuilds` reports in
+                        // `BuildNotDeleted$statusCode` for an id it holds no record of.
+                        message: Some(format!("Build {} does not exist", input.id)),
+                    },
+                )
+                .into());
+            };
+
+            // A build the clock already finished keeps the outcome it reached: stopping
+            // is only possible while it is still in progress, and the run the clock owed it
+            // was performed above.
+            let now = crate::state::now_millis();
+            let mut stopped = None;
+            if !stored.build.build_complete {
+                stored.build.build_status = Some("STOPPED".to_string());
+                stored.build.current_phase = Some("COMPLETED".to_string());
+                stored.build.build_complete = true;
+                stored.build.end_time = Some(crate::state::datetime(now));
+                stored.build.phases =
+                    Some(crate::state::stopped_phases(stored.start_millis, now));
+                stopped = Some(stored.completed_build(
+                    // A build is keyed by `<projectName>:<uuid>`, so the project it belongs
+                    // to is known from the key even for a record that states none.
+                    &stored
+                        .build
+                        .project_name
+                        .clone()
+                        .or_else(|| {
+                            crate::state::project_name_from_resource_id(&input.id)
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_default(),
+                    now,
+                ));
+            }
+            (stored.build.clone(), stopped)
         };
-
-        // A build the clock already finished keeps the outcome it reached: stopping
-        // is only possible while it is still in progress, and the run the clock owed it
-        // was performed above.
-        let now = crate::state::now_millis();
-        let mut stopped = None;
-        if !stored.build.build_complete {
-            stored.build.build_status = Some("STOPPED".to_string());
-            stored.build.current_phase = Some("COMPLETED".to_string());
-            stored.build.build_complete = true;
-            stored.build.end_time = Some(crate::state::datetime(now));
-            stored.build.phases = Some(crate::state::stopped_phases(stored.start_millis, now));
-            stopped = Some(stored.completed_build(
-                // A build is keyed by `<projectName>:<uuid>`, so the project it belongs to
-                // is known from the key even for a record that states none.
-                &stored
-                    .build
-                    .project_name
-                    .clone()
-                    .or_else(|| {
-                        crate::state::project_name_from_resource_id(&input.id).map(str::to_string)
-                    })
-                    .unwrap_or_default(),
-                now,
-            ));
-        }
-
-        let build = stored.build.clone();
-        // The store's guard is released before the metrics this stopped build is counted in
-        // are published: the publication takes the CloudWatch store's own lock.
-        drop(guard);
+        // The metrics this stopped build is counted in are published with the store's guard
+        // released: the publication takes the CloudWatch store's own lock.
         crate::state::publish_completed_builds(&*self.engine, stopped.as_slice());
+        // The status this call moved the build into is published onto the account's default
+        // event bus, with the guard no longer held (`crate::state::build_events`).
+        crate::state::publish_build_state_changes(
+            ctx.callback(),
+            &state,
+            &crate::state::request_region(ctx.parts()),
+        )
+        .await;
 
         Ok(StopBuildOutput { build: Some(build) })
     }

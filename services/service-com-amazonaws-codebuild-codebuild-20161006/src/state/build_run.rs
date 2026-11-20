@@ -108,6 +108,11 @@ pub async fn settle_due_builds<Eng: Send + Sync + 'static>(
     // health over time reads that series rather than the build record
     // ([`super::build_metrics`]).
     super::build_metrics::publish_completed_builds(engine, &completed);
+    // Every build state change the runs above materialised — and any a concurrent call left
+    // unpublished — goes onto the account's default EventBridge bus, with this service's own
+    // store no longer held: a client that gates on build state reads the events rather than
+    // the build record ([`super::build_events`]).
+    super::build_events::publish_build_state_changes(callback, state, region).await;
 }
 
 /// What one build's run came to, as the store records it.

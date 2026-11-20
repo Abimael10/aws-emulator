@@ -536,77 +536,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // WRITE PASS: one critical section that re-asserts what the read pass saw and
         // then does every write together, so allocating the build number, inserting
-        // the build and recording the token are atomic with respect to each other.
-        let mut guard = state.lock();
-        if !guard.projects.contains_key(&input.project_name) {
-            // The project was deleted while this request was resolving: no build is
-            // persisted for a project that no longer exists.
-            return Err(StartBuildErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Project cannot be found: {}",
-                        crate::state::project_arn(&region, &input.project_name)
-                    )),
-                },
-            )
-            .into());
-        }
-        // A concurrent request carrying the same token may have won the race; it is
-        // the same request, so it resolves to the build that one started.
-        if let Some(build) = guard
-            .resolve_idempotency_token(
-                crate::state::BuildTokenStore::StartBuild,
-                token_key.as_ref(),
-                &fingerprint,
-                now,
-            )
-            .map_err(|_| parameter_mismatch())?
+        // the build and recording the token are atomic with respect to each other. It is
+        // a BLOCK, so the guard is released at its end — before the publication below,
+        // which reaches another service.
         {
-            return Ok(StartBuildOutput { build: Some(build) });
-        }
-        let build_number = guard.allocate_build_number(&input.project_name);
-        let id = format!(
-            "{}:{}",
-            input.project_name,
-            crate::state::build_uuid(&input.project_name, build_number, now)
-        );
-        build.build_number = Some(build_number);
-        build.id = Some(id.clone());
-        build.arn = Some(crate::state::build_arn(&region, &id));
-        // The group and stream this build's output is delivered to, under the log
-        // configuration it runs with (`crate::state::build_logs_location`).
-        build.logs = Some(crate::state::build_logs_location(
-            &region,
-            &input.project_name,
-            &id,
-            logs_config.as_ref(),
-        ));
-        guard.insert_build(
-            id.clone(),
-            crate::state::StoredBuild {
-                build: build.clone(),
-                start_millis: now,
-                settle_due_millis: now + crate::state::BUILD_SETTLE_MILLIS,
-                // The destinations this build UPLOADS to, kept as the artifacts they were
-                // resolved from: the modelled, upper-case type is what says whether there
-                // is a destination at all, and the `BuildArtifacts` the record reports
-                // carries the wire form of it.
-                artifacts: artifacts_destination.clone(),
-                secondary_artifacts: secondary_destinations.clone().unwrap_or_default(),
-                run_claimed: false,
-            },
-        );
-        if let Some(key) = token_key {
-            guard.record_start_build_token(
-                key,
-                crate::state::StartBuildToken {
-                    build_id: id,
-                    request_fingerprint: fingerprint,
-                    issued_millis: now,
-                },
-                now,
+            let mut guard = state.lock();
+            if !guard.projects.contains_key(&input.project_name) {
+                // The project was deleted while this request was resolving: no build is
+                // persisted for a project that no longer exists.
+                return Err(StartBuildErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Project cannot be found: {}",
+                            crate::state::project_arn(&region, &input.project_name)
+                        )),
+                    },
+                )
+                .into());
+            }
+            // A concurrent request carrying the same token may have won the race; it is
+            // the same request, so it resolves to the build that one started.
+            if let Some(build) = guard
+                .resolve_idempotency_token(
+                    crate::state::BuildTokenStore::StartBuild,
+                    token_key.as_ref(),
+                    &fingerprint,
+                    now,
+                )
+                .map_err(|_| parameter_mismatch())?
+            {
+                return Ok(StartBuildOutput { build: Some(build) });
+            }
+            let build_number = guard.allocate_build_number(&input.project_name);
+            let id = format!(
+                "{}:{}",
+                input.project_name,
+                crate::state::build_uuid(&input.project_name, build_number, now)
             );
+            build.build_number = Some(build_number);
+            build.id = Some(id.clone());
+            build.arn = Some(crate::state::build_arn(&region, &id));
+            // The group and stream this build's output is delivered to, under the log
+            // configuration it runs with (`crate::state::build_logs_location`).
+            build.logs = Some(crate::state::build_logs_location(
+                &region,
+                &input.project_name,
+                &id,
+                logs_config.as_ref(),
+            ));
+            guard.insert_build(
+                id.clone(),
+                crate::state::StoredBuild {
+                    build: build.clone(),
+                    start_millis: now,
+                    settle_due_millis: now + crate::state::BUILD_SETTLE_MILLIS,
+                    // The destinations this build UPLOADS to, kept as the artifacts they
+                    // were resolved from: the modelled, upper-case type is what says
+                    // whether there is a destination at all, and the `BuildArtifacts` the
+                    // record reports carries the wire form of it.
+                    artifacts: artifacts_destination.clone(),
+                    secondary_artifacts: secondary_destinations.clone().unwrap_or_default(),
+                    run_claimed: false,
+                },
+            );
+            if let Some(key) = token_key {
+                guard.record_start_build_token(
+                    key,
+                    crate::state::StartBuildToken {
+                        build_id: id,
+                        request_fingerprint: fingerprint,
+                        issued_millis: now,
+                    },
+                    now,
+                );
+            }
         }
+        // The build is in progress from here, and that is a state change a client watching
+        // CodeBuild through EventBridge reacts to: it is published with the store's guard no
+        // longer held (`crate::state::build_events`), because the publication reaches another
+        // service.
+        crate::state::publish_build_state_changes(ctx.callback(), &state, &region).await;
 
         Ok(StartBuildOutput { build: Some(build) })
     }

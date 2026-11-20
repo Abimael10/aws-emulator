@@ -530,156 +530,166 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // WRITE PASS: one critical section that re-asserts what the read pass saw and
         // then does every write together, so allocating the batch number, inserting
         // the batch build and recording the token are atomic with respect to each
-        // other.
-        let mut guard = state.lock();
-        if !guard.projects.contains_key(&input.project_name) {
-            // The project was deleted while this request was resolving: no batch build
-            // is persisted for a project that no longer exists.
-            return Err(StartBuildBatchErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Project cannot be found: {}",
-                        crate::state::project_arn(&region, &input.project_name)
-                    )),
-                },
-            )
-            .into());
-        }
-        // A concurrent request carrying the same token may have won the race; it is
-        // the same request, so it resolves to the batch build that one started.
-        if let Some(build_batch) =
-            resolve_idempotency_token(&mut guard, token_key.as_ref(), &fingerprint, now)?
+        // other. It is a BLOCK, so the guard is released at its end — before the
+        // publication below, which reaches another service.
         {
-            return Ok(StartBuildBatchOutput {
-                build_batch: Some(build_batch),
-            });
-        }
-        let build_batch_number = guard.allocate_build_batch_number(&input.project_name);
-        let id = format!(
-            "{}:{}",
-            input.project_name,
-            crate::state::build_batch_uuid(&input.project_name, build_batch_number, now)
-        );
-        build_batch.build_batch_number = Some(build_batch_number);
-        build_batch.id = Some(id.clone());
-        build_batch.arn = Some(crate::state::build_batch_arn(&region, &id));
-
-        // The batch FANS OUT: the source download CodeBuild runs for the batch itself
-        // (`crate::state::source_download_declaration`) and then one build per identifier
-        // the batchspec declared, started by the service with no further call, each a
-        // build of this project that `BatchGetBuilds` resolves on its own and that
-        // carries the batch's ARN back (`Build$buildBatchArn`). The groups are published
-        // on the batch (`BuildGroup$currentBuildSummary`), which is how a client finds
-        // the builds of a batch. Independent groups start together and a group waits one
-        // span per level of the dependency graph it sits under
-        // (`crate::state::declaration_levels`) — every declared group behind the source
-        // download, which is the level they all build from — so the batch itself finishes
-        // a span after its deepest level does.
-        //
-        // BOUNDED, which is what lets this run inside the critical section: the loop
-        // runs at most `MAX_BATCH_BUILD_GROUPS` times plus the batch's own download
-        // group (a batchspec declaring more was refused above, before the lock), and each
-        // record it builds is a copy of a configuration whose own size is bounded — the
-        // batchspec is only read at all up to `crate::state`'s batchspec byte ceiling, so
-        // a buildspec larger than that declares nothing and fans out into no builds.
-        //
-        // The plan itself — which groups run and which level each waits behind — is the
-        // store's one reading of a batch's fan-out (`crate::state::batch_fan_out`), shared
-        // with `crate::ops::retry_build_batch`, which runs the groups of a failed batch
-        // again. A batch that declared nothing fans out into nothing at all, not even the
-        // source download, since there is no build to download a source for.
-        let fan_out = crate::state::batch_fan_out(&declarations);
-        let mut build_groups: Vec<BuildGroup> = Vec::with_capacity(fan_out.planned.len());
-        let mut group_builds: Vec<(String, crate::state::StoredBuild)> =
-            Vec::with_capacity(fan_out.planned.len());
-        for (declaration, level) in &fan_out.planned {
-            let build_number = guard.allocate_build_number(&input.project_name);
-            let build_id = format!(
+            let mut guard = state.lock();
+            if !guard.projects.contains_key(&input.project_name) {
+                // The project was deleted while this request was resolving: no batch build
+                // is persisted for a project that no longer exists.
+                return Err(StartBuildBatchErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Project cannot be found: {}",
+                            crate::state::project_arn(&region, &input.project_name)
+                        )),
+                    },
+                )
+                .into());
+            }
+            // A concurrent request carrying the same token may have won the race; it is
+            // the same request, so it resolves to the batch build that one started.
+            if let Some(build_batch) =
+                resolve_idempotency_token(&mut guard, token_key.as_ref(), &fingerprint, now)?
+            {
+                return Ok(StartBuildBatchOutput {
+                    build_batch: Some(build_batch),
+                });
+            }
+            let build_batch_number = guard.allocate_build_batch_number(&input.project_name);
+            let id = format!(
                 "{}:{}",
                 input.project_name,
-                crate::state::build_uuid(&input.project_name, build_number, now)
+                crate::state::build_batch_uuid(&input.project_name, build_batch_number, now)
             );
-            let build = crate::state::batch_group_build(
-                &build_batch,
-                &build_artifacts,
-                declaration,
-                &build_id,
-                &region,
-                build_number,
-                now,
-            );
-            build_groups.push(BuildGroup {
-                identifier: Some(declaration.identifier.clone()),
-                // Always stated, `[]` for a group that waits for nothing: a client
-                // reading the graph off the answer must find a list there.
-                depends_on: Some(declaration.depends_on.clone()),
-                ignore_failure: declaration.ignore_failure,
-                current_build_summary: Some(BuildSummary {
-                    arn: build.arn.clone(),
-                    requested_on: Some(crate::state::datetime(now)),
-                    build_status: build.build_status.clone(),
-                    // Resolved from the artifacts the build deployed, of which a build
-                    // that has not finished has deployed none
-                    // (`crate::state::StoredBuildBatch::refresh_group_summaries` fills
-                    // these in once it has).
-                    primary_artifact: None,
-                    secondary_artifacts: None,
-                }),
-                // No earlier attempt of this group has been retained: this batch has
-                // run each group exactly once.
-                prior_build_summary_list: Some(Vec::new()),
-            });
-            group_builds.push((
-                build_id,
-                crate::state::StoredBuild {
-                    build,
-                    start_millis: now,
-                    settle_due_millis: crate::state::batch_group_settle_due_millis(now, *level),
-                    // Every build of the batch uploads to the destination the batch
-                    // resolved, which is the one its own group's resolved artifacts are
-                    // then read from.
-                    artifacts: configured_artifacts.clone(),
-                    secondary_artifacts: configured_secondary_artifacts
-                        .clone()
-                        .unwrap_or_default(),
-                    run_claimed: false,
-                },
-            ));
-        }
-        // A batch that declared nothing carries no build group at all, rather than an
-        // empty one: there was no batchspec to fan out.
-        if !build_groups.is_empty() {
-            build_batch.build_groups = Some(build_groups);
-        }
-        for (build_id, stored) in group_builds {
-            guard.insert_build(build_id, stored);
-        }
+            build_batch.build_batch_number = Some(build_batch_number);
+            build_batch.id = Some(id.clone());
+            build_batch.arn = Some(crate::state::build_batch_arn(&region, &id));
 
-        guard.insert_build_batch(
-            id.clone(),
-            crate::state::StoredBuildBatch {
-                build_batch: build_batch.clone(),
-                start_millis: now,
-                // The same chosen span a build's owed transition uses, once per level
-                // of the batch's dependency graph and once more for the batch's own
-                // completion: the batch's move out of `IN_PROGRESS` falls due at this
-                // instant whether or not anybody calls again, and is never slept on.
-                settle_due_millis: now
-                    + crate::state::BUILD_SETTLE_MILLIS
-                        * i64::try_from(fan_out.spans).unwrap_or(1),
-            },
-        );
-        if let Some(key) = token_key {
-            guard.record_start_build_batch_token(
-                key,
-                crate::state::StartBuildToken {
-                    build_id: id,
-                    request_fingerprint: fingerprint,
-                    issued_millis: now,
+            // The batch FANS OUT: the source download CodeBuild runs for the batch itself
+            // (`crate::state::source_download_declaration`) and then one build per
+            // identifier the batchspec declared, started by the service with no further
+            // call, each a build of this project that `BatchGetBuilds` resolves on its own
+            // and that carries the batch's ARN back (`Build$buildBatchArn`). The groups are
+            // published on the batch (`BuildGroup$currentBuildSummary`), which is how a
+            // client finds the builds of a batch. Independent groups start together and a
+            // group waits one span per level of the dependency graph it sits under
+            // (`crate::state::declaration_levels`) — every declared group behind the source
+            // download, which is the level they all build from — so the batch itself
+            // finishes a span after its deepest level does.
+            //
+            // BOUNDED, which is what lets this run inside the critical section: the loop
+            // runs at most `MAX_BATCH_BUILD_GROUPS` times plus the batch's own download
+            // group (a batchspec declaring more was refused above, before the lock), and
+            // each record it builds is a copy of a configuration whose own size is bounded
+            // — the batchspec is only read at all up to `crate::state`'s batchspec byte
+            // ceiling, so a buildspec larger than that declares nothing and fans out into
+            // no builds.
+            //
+            // The plan itself — which groups run and which level each waits behind — is the
+            // store's one reading of a batch's fan-out (`crate::state::batch_fan_out`),
+            // shared with `crate::ops::retry_build_batch`, which runs the groups of a failed
+            // batch again. A batch that declared nothing fans out into nothing at all, not
+            // even the source download, since there is no build to download a source for.
+            let fan_out = crate::state::batch_fan_out(&declarations);
+            let mut build_groups: Vec<BuildGroup> = Vec::with_capacity(fan_out.planned.len());
+            let mut group_builds: Vec<(String, crate::state::StoredBuild)> =
+                Vec::with_capacity(fan_out.planned.len());
+            for (declaration, level) in &fan_out.planned {
+                let build_number = guard.allocate_build_number(&input.project_name);
+                let build_id = format!(
+                    "{}:{}",
+                    input.project_name,
+                    crate::state::build_uuid(&input.project_name, build_number, now)
+                );
+                let build = crate::state::batch_group_build(
+                    &build_batch,
+                    &build_artifacts,
+                    declaration,
+                    &build_id,
+                    &region,
+                    build_number,
+                    now,
+                );
+                build_groups.push(BuildGroup {
+                    identifier: Some(declaration.identifier.clone()),
+                    // Always stated, `[]` for a group that waits for nothing: a client
+                    // reading the graph off the answer must find a list there.
+                    depends_on: Some(declaration.depends_on.clone()),
+                    ignore_failure: declaration.ignore_failure,
+                    current_build_summary: Some(BuildSummary {
+                        arn: build.arn.clone(),
+                        requested_on: Some(crate::state::datetime(now)),
+                        build_status: build.build_status.clone(),
+                        // Resolved from the artifacts the build deployed, of which a build
+                        // that has not finished has deployed none
+                        // (`crate::state::StoredBuildBatch::refresh_group_summaries` fills
+                        // these in once it has).
+                        primary_artifact: None,
+                        secondary_artifacts: None,
+                    }),
+                    // No earlier attempt of this group has been retained: this batch has
+                    // run each group exactly once.
+                    prior_build_summary_list: Some(Vec::new()),
+                });
+                group_builds.push((
+                    build_id,
+                    crate::state::StoredBuild {
+                        build,
+                        start_millis: now,
+                        settle_due_millis: crate::state::batch_group_settle_due_millis(
+                            now, *level,
+                        ),
+                        // Every build of the batch uploads to the destination the batch
+                        // resolved, which is the one its own group's resolved artifacts are
+                        // then read from.
+                        artifacts: configured_artifacts.clone(),
+                        secondary_artifacts: configured_secondary_artifacts
+                            .clone()
+                            .unwrap_or_default(),
+                        run_claimed: false,
+                    },
+                ));
+            }
+            // A batch that declared nothing carries no build group at all, rather than an
+            // empty one: there was no batchspec to fan out.
+            if !build_groups.is_empty() {
+                build_batch.build_groups = Some(build_groups);
+            }
+            for (build_id, stored) in group_builds {
+                guard.insert_build(build_id, stored);
+            }
+
+            guard.insert_build_batch(
+                id.clone(),
+                crate::state::StoredBuildBatch {
+                    build_batch: build_batch.clone(),
+                    start_millis: now,
+                    // The same chosen span a build's owed transition uses, once per level
+                    // of the batch's dependency graph and once more for the batch's own
+                    // completion: the batch's move out of `IN_PROGRESS` falls due at this
+                    // instant whether or not anybody calls again, and is never slept on.
+                    settle_due_millis: now
+                        + crate::state::BUILD_SETTLE_MILLIS
+                            * i64::try_from(fan_out.spans).unwrap_or(1),
                 },
-                now,
             );
+            if let Some(key) = token_key {
+                guard.record_start_build_batch_token(
+                    key,
+                    crate::state::StartBuildToken {
+                        build_id: id,
+                        request_fingerprint: fingerprint,
+                        issued_millis: now,
+                    },
+                    now,
+                );
+            }
         }
+        // Each build this batch fanned out into is in progress from here, and each is a
+        // build whose state changes a client watching CodeBuild through EventBridge reacts
+        // to: published with the guard no longer held (`crate::state::build_events`).
+        crate::state::publish_build_state_changes(ctx.callback(), &state, &region).await;
 
         Ok(StartBuildBatchOutput {
             build_batch: Some(build_batch),
