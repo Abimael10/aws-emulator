@@ -180,9 +180,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !crate::state::is_distribution_id(marker) {
                 return Err(ListDistributionsByRealtimeLogConfigErrorModeled::InvalidArgument(
                     InvalidArgument {
-                        message: Some(format!(
-                            "Marker {marker} is not a distribution id returned by \
-                             ListDistributionsByRealtimeLogConfig"
+                        message: Some(crate::state::invalid_marker_message(
+                            crate::state::DISTRIBUTION_MARKER_KIND,
                         )),
                     },
                 )

@@ -7,19 +7,22 @@
 //! member targets in the order this API publishes that enum's values — a property of the
 //! enum shape, not of the request that broke it — inside the fixed template "`N` validation
 //! error[s] detected: Value '<value>' at '<member>' failed to satisfy constraint: Member
-//! must satisfy enum value set: [<values>]", under HTTP 400 and `MalformedXML`.
+//! must satisfy enum value set: [<values>]", under HTTP 400 and `MalformedXML`. The set the
+//! sentence states is the set the request boundary enforces: every value it lists is admitted,
+//! and every value outside it is refused.
 //!
 //! The rows span what the rule generalises over:
 //!
-//! * the ENUM, which is what the order belongs to: `FunctionStage`, `CachePolicyType` and
-//!   `OriginAccessControlSigningBehaviors`, whose published orders are not the orders the
-//!   schema declares, and `IpAddressType` and `OriginAccessControlSigningProtocols`, which
-//!   this API publishes in the order it declares them;
+//! * the ENUM, which is what the order belongs to: `FunctionStage`, `CachePolicyType`,
+//!   `OriginAccessControlSigningBehaviors` and `OriginAccessControlOriginTypes`, whose
+//!   published orders are not the orders the schema declares, and `IpAddressType` and
+//!   `OriginAccessControlSigningProtocols`, which this API publishes in the order it declares
+//!   them;
 //! * the OPERATION and the BINDING the value travelled in — a member of a request document,
 //!   a member nested inside a payload, a query parameter on a collection route and one
 //!   beside a path label — which say nothing about the value set, so the same enum is listed
 //!   alike in each and all of them answer the one code;
-//! * the value set's SIZE (two, three and four values);
+//! * the value set's SIZE (two, three, four and five values);
 //! * the form the inadmissible value takes (another word, an admitted value in the wrong
 //!   case, an admitted value with trailing text, the empty value), which the sentence
 //!   echoes but which never changes the set.
@@ -57,6 +60,13 @@ const SIGNING_PROTOCOL_SET: &str = "sigv4, sigv4a";
 /// first.
 const SIGNING_BEHAVIOR_SET: &str = "always-amz-auth, never, always, no-override";
 
+/// `OriginAccessControlOriginTypes` admits s3, execute-api, mediastore, mediapackagev2 and
+/// lambda, in that order
+/// (`smithy_query(query="shape",shape="OriginAccessControlOriginTypes")`) — each value is the
+/// signing name of the service the origin belongs to — and is listed with the object store
+/// first and then the compute and media origins.
+const ORIGIN_TYPE_SET: &str = "s3, execute-api, lambda, mediastore, mediapackagev2";
+
 /// One case: an operation, the binding its enum-constrained member travels in, and what the
 /// refusal must say about it.
 struct Case {
@@ -92,6 +102,9 @@ enum Binding {
     /// `CreateOriginAccessControl`: a second member nested inside that same payload, whose
     /// enum this API publishes in an order of its own.
     CreateOriginAccessControlSigningBehavior,
+    /// `CreateOriginAccessControl`: a third member of that payload, whose five-value set this
+    /// API publishes in an order of its own.
+    CreateOriginAccessControlOriginType,
 }
 
 /// Every case the rule is asserted over.
@@ -145,6 +158,13 @@ fn cases() -> Vec<Case> {
             member: "originAccessControlConfig.signingBehavior",
             values: SIGNING_BEHAVIOR_SET,
             binding: Binding::CreateOriginAccessControlSigningBehavior,
+        },
+        Case {
+            case: "an origin type nested in a payload",
+            admitted: "s3",
+            member: "originAccessControlConfig.originAccessControlOriginType",
+            values: ORIGIN_TYPE_SET,
+            binding: Binding::CreateOriginAccessControlOriginType,
         },
     ]
 }
@@ -267,6 +287,25 @@ async fn refuse(router: &MultiServiceRouter, binding: &Binding, value: &str) -> 
             )
             .await
         }
+        Binding::CreateOriginAccessControlOriginType => {
+            let body = format!(
+                "<OriginAccessControlConfig \
+                 xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
+                 <Name>enum-value-set-origin-type</Name>\
+                 <SigningProtocol>sigv4</SigningProtocol>\
+                 <SigningBehavior>always</SigningBehavior>\
+                 <OriginAccessControlOriginType>{value}</OriginAccessControlOriginType>\
+                 </OriginAccessControlConfig>"
+            );
+            call(
+                router,
+                "POST",
+                &format!("/{API_VERSION}/origin-access-control"),
+                Some(&body),
+                None,
+            )
+            .await
+        }
     }
 }
 
@@ -336,6 +375,53 @@ async fn a_value_each_enum_admits_is_not_refused_over_its_value_set() {
             case.case,
             case.admitted,
             answer.status
+        );
+    }
+}
+
+/// The set a refusal STATES is the set the request boundary ENFORCES: every value the sentence
+/// lists is admitted for the member it was stated about, so a caller that reads the refusal and
+/// retries with one of the values it names is served rather than refused again.
+///
+/// Driven over the origin type — this suite's five-value set, and the one whose values name
+/// whole services — with the rows read off the stated set itself rather than written out a
+/// second time, and each create carrying a name of its own so nothing but the value under test
+/// decides the answer.
+#[tokio::test]
+async fn every_value_the_stated_set_lists_is_admitted_for_its_member() {
+    let router = emulator();
+
+    for (index, origin_type) in ORIGIN_TYPE_SET.split(", ").enumerate() {
+        let body = format!(
+            "<OriginAccessControlConfig \
+             xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
+             <Name>stated-set-{index}</Name><SigningProtocol>sigv4</SigningProtocol>\
+             <SigningBehavior>always</SigningBehavior>\
+             <OriginAccessControlOriginType>{origin_type}</OriginAccessControlOriginType>\
+             </OriginAccessControlConfig>"
+        );
+        let answer = call(
+            &router,
+            "POST",
+            &format!("/{API_VERSION}/origin-access-control"),
+            Some(&body),
+            None,
+        )
+        .await;
+        assert_eq!(
+            answer.status, 201,
+            "case {origin_type:?}: a value the stated set lists must be admitted, got {} with {}",
+            answer.status, answer.raw
+        );
+        let reported = answer
+            .root()
+            .find_text("OriginAccessControlOriginType")
+            .unwrap_or_default();
+        assert_eq!(
+            reported, origin_type,
+            "case {origin_type:?}: expected the stored origin type to be reported back, got \
+             {reported:?} in {}",
+            answer.raw
         );
     }
 }

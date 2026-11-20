@@ -4339,3 +4339,10 @@ pub use key_group_config::*;
 mod config_members;
 pub use config_members::*;
 
+/// The ONE sentence every listing of this service refuses a `Marker` that is no resume point
+/// with: the constraint on the parameter, carrying nothing from the request and nothing from
+/// the store. A SUBMODULE for the same reason [`functions`] is one; `pub use` keeps every name
+/// reachable as `crate::state::<name>`.
+mod pagination_markers;
+pub use pagination_markers::*;
+

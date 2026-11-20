@@ -180,9 +180,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !crate::state::is_minted_uuid(marker) {
                 return Err(ListContinuousDeploymentPoliciesErrorModeled::InvalidArgument(
                     InvalidArgument {
-                        message: Some(format!(
-                            "Marker {marker} is not a continuous deployment policy id returned \
-                             by ListContinuousDeploymentPolicies"
+                        message: Some(crate::state::invalid_marker_message(
+                            crate::state::CONTINUOUS_DEPLOYMENT_POLICY_MARKER_KIND,
                         )),
                     },
                 )

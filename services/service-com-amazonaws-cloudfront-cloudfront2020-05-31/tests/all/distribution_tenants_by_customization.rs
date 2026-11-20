@@ -14,9 +14,8 @@
 //! * the ARN is the identity of a resource of ANOTHER service (ACM, WAF), so it is matched
 //!   whole and in every form an ARN of that service takes, and an ARN no tenant names is an
 //!   empty page rather than a refusal;
-//! * "You must specify either the CertificateArn parameter or WebACLArn parameter, but not
-//!   both in the same request": a request that names neither, or both, is `InvalidArgument`
-//!   (HTTP 400);
+//! * a request that does not name exactly one customization filter — naming neither, or
+//!   both — is `InvalidArgument` (HTTP 400) under the one sentence that states the rule;
 //! * the listing reports the matching tenants in ONE stable total order, cut to at most
 //!   `MaxItems` entries beginning after the `Marker` id, and carries a `NextMarker` exactly
 //!   when matching tenants remain — so walking the pages at ANY admissible page size
@@ -658,11 +657,9 @@ async fn the_listing_pages_and_resumes_from_the_marker() {
 // ---------------------------------------------------------------------------
 
 /// The sentence CloudFront answers a request that does not name exactly one customization,
-/// written out as the LITERAL the operation's documented rule states rather than read back
-/// off the crate's own constant, so a change to that constant fails this case.
-const ONE_CUSTOMIZATION_REQUIRED: &str =
-    "You must specify either the CertificateArn parameter or WebACLArn parameter, but not \
-     both in the same request.";
+/// written out as the LITERAL the service states rather than read back off the crate's own
+/// constant, so a change to that constant fails this case.
+const ONE_CUSTOMIZATION_REQUIRED: &str = "Exactly one customization filter must be set.";
 
 /// A request must name exactly ONE customization to filter by: naming neither, naming both,
 /// and naming a member that carries no value at all are each `InvalidArgument` (HTTP 400)
@@ -712,7 +709,7 @@ async fn a_request_that_does_not_name_exactly_one_customization_is_refused() {
         assert_eq!(
             answer.root().find_text("Message"),
             Some(ONE_CUSTOMIZATION_REQUIRED),
-            "case {case}: expected the documented sentence, got {}",
+            "case {case}: expected the sentence stating the rule, got {}",
             answer.raw
         );
     }

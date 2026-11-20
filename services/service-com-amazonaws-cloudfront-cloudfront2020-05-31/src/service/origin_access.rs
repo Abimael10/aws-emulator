@@ -106,11 +106,13 @@ const SIGNS_EVERY_REQUEST: [&str; 2] = ["always", "always-amz-auth"];
 const SIGNS_UNLESS_THE_VIEWER_PRESENTED_ONE: &str = "no-override";
 
 /// The signing name of the service each `OriginAccessControlOriginType` names
-/// (`smithy_query(query="shape",shape="OriginAccessControlOriginTypes")`: `s3`, `mediastore`,
-/// `mediapackagev2`, `lambda`) — the service the origin belongs to, which is the name the
-/// origin request's own credential scope carries.
-const ORIGIN_TYPE_SIGNING_NAMES: [(&str, &str); 4] = [
+/// (`smithy_query(query="shape",shape="OriginAccessControlOriginTypes")`: `s3`, `execute-api`,
+/// `mediastore`, `mediapackagev2`, `lambda`) — the service the origin belongs to, which is the
+/// name the origin request's own credential scope carries. Each origin type IS that signing
+/// name, which is how this API publishes the member.
+const ORIGIN_TYPE_SIGNING_NAMES: [(&str, &str); 5] = [
     ("s3", "s3"),
+    ("execute-api", "execute-api"),
     ("mediastore", "mediastore"),
     ("mediapackagev2", "mediapackagev2"),
     ("lambda", "lambda"),

@@ -2236,7 +2236,7 @@ pub const MINIMUM_PROTOCOL_VERSION_VALUES: &[&str] = &["SSLv3", "TLSv1", "TLSv1.
 
 
 /// The values `OriginAccessControlOriginTypes` accepts on the wire.
-pub const ORIGIN_ACCESS_CONTROL_ORIGIN_TYPES_VALUES: &[&str] = &["lambda", "mediapackagev2", "mediastore", "s3"];
+pub const ORIGIN_ACCESS_CONTROL_ORIGIN_TYPES_VALUES: &[&str] = &["execute-api", "lambda", "mediapackagev2", "mediastore", "s3"];
 
 
 /// The values `OriginAccessControlSigningBehaviors` accepts on the wire.

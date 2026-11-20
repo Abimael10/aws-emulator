@@ -173,9 +173,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !crate::state::is_distribution_id(marker) {
                 return Err(ListDistributionsByConnectionFunctionErrorModeled::InvalidArgument(
                     InvalidArgument {
-                        message: Some(format!(
-                            "Marker {marker} is not a distribution id returned by \
-                             ListDistributionsByConnectionFunction"
+                        message: Some(crate::state::invalid_marker_message(
+                            crate::state::DISTRIBUTION_MARKER_KIND,
                         )),
                     },
                 )

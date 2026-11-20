@@ -180,9 +180,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !crate::state::is_origin_access_control_id(marker) {
                 return Err(ListOriginAccessControlsErrorModeled::InvalidArgument(
                     InvalidArgument {
-                        message: Some(format!(
-                            "Marker {marker} is not an origin access control id returned by \
-                             ListOriginAccessControls"
+                        message: Some(crate::state::invalid_marker_message(
+                            crate::state::ORIGIN_ACCESS_CONTROL_MARKER_KIND,
                         )),
                     },
                 )

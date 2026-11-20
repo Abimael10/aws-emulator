@@ -114,12 +114,15 @@ impl From<ListDistributionTenantsByCustomizationErrorModeled> for ListDistributi
     }
 }
 
-/// The sentence CloudFront answers a request that does not name exactly one customization
-/// to filter by: the operation's own documented rule, which states the condition and
-/// echoes no part of the request.
-const ONE_CUSTOMIZATION_REQUIRED_MESSAGE: &str =
-    "You must specify either the CertificateArn parameter or WebACLArn parameter, but not \
-     both in the same request.";
+/// The sentence CloudFront answers a request that does not name exactly one customization to
+/// filter by, on the wire.
+///
+/// FIXED text, and ONE sentence for both ways the rule is broken: the listing is about ONE
+/// customization, so what the refusal states is that exactly one filter has to be set — which
+/// covers a request that set NEITHER as squarely as one that set both, and describes the
+/// mistake of each. Nothing from the request belongs in it, since the rule is a property of
+/// the parameters rather than of the values submitted.
+pub const ONE_CUSTOMIZATION_REQUIRED_MESSAGE: &str = "Exactly one customization filter must be set.";
 
 /// The `ListDistributionTenantsByCustomization` operation.
 ///
@@ -179,7 +182,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not both in the same request": the listing is about ONE customization, so a
         // request that names neither describes no filter and one that names both describes
         // two. A member carrying no value names nothing, so it does not specify a
-        // customization either.
+        // customization either. Both ways of breaking the rule are the same refusal
+        // ([`ONE_CUSTOMIZATION_REQUIRED_MESSAGE`]), which states the rule rather than which
+        // of the two ways this request broke it.
         let certificate_arn = input
             .certificate_arn
             .as_deref()
@@ -214,9 +219,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     ListDistributionTenantsByCustomizationErrorModeled::InvalidArgument(
                         InvalidArgument {
-                            message: Some(format!(
-                                "Marker {marker} is not a distribution tenant id returned by \
-                                 ListDistributionTenantsByCustomization"
+                            message: Some(crate::state::invalid_marker_message(
+                                crate::state::DISTRIBUTION_TENANT_MARKER_KIND,
                             )),
                         },
                     )

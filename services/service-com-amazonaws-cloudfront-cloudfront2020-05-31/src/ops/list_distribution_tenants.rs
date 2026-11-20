@@ -236,9 +236,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !crate::state::is_distribution_tenant_id(marker) {
                 return Err(ListDistributionTenantsErrorModeled::InvalidArgument(
                     InvalidArgument {
-                        message: Some(format!(
-                            "Marker {marker} is not a distribution tenant id returned by \
-                             ListDistributionTenants"
+                        message: Some(crate::state::invalid_marker_message(
+                            crate::state::DISTRIBUTION_TENANT_MARKER_KIND,
                         )),
                     },
                 )

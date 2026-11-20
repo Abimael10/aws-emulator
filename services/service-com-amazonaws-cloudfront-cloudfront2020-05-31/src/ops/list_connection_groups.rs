@@ -200,9 +200,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !crate::state::is_connection_group_id(marker) {
                 return Err(ListConnectionGroupsErrorModeled::InvalidArgument(
                     InvalidArgument {
-                        message: Some(format!(
-                            "Marker {marker} is not a connection group id returned by \
-                             ListConnectionGroups"
+                        message: Some(crate::state::invalid_marker_message(
+                            crate::state::CONNECTION_GROUP_MARKER_KIND,
                         )),
                     },
                 )

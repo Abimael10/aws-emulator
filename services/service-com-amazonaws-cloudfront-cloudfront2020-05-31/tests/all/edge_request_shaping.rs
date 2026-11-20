@@ -540,9 +540,10 @@ async fn the_origin_sees_only_the_query_strings_the_policies_name() {
             );
         } else {
             // The origin refused the marker, which is the only way its answer could be this:
-            // the parameter reached it.
+            // the parameter reached it. The refusal states the constraint on the parameter
+            // rather than echoing the value, so the sentence is what identifies it.
             assert!(
-                body.contains("not-a-distribution-id"),
+                body.contains("Marker must be a valid Distribution Id"),
                 "case {case:?}: expected the origin's own refusal of the marker, got {body}"
             );
         }

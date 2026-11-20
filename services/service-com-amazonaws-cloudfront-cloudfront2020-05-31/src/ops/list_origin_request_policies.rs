@@ -210,9 +210,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !crate::state::is_minted_uuid(marker) {
                 return Err(ListOriginRequestPoliciesErrorModeled::InvalidArgument(
                     InvalidArgument {
-                        message: Some(format!(
-                            "Marker {marker} is not an origin request policy id returned by \
-                             ListOriginRequestPolicies"
+                        message: Some(crate::state::invalid_marker_message(
+                            crate::state::ORIGIN_REQUEST_POLICY_MARKER_KIND,
                         )),
                     },
                 )

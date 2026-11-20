@@ -207,10 +207,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             page_size,
         ) else {
             return Err(ListInvalidationsErrorModeled::InvalidArgument(InvalidArgument {
-                message: Some(format!(
-                    "Marker {} is not the id of an invalidation of distribution {}",
-                    input.marker.unwrap_or_default(),
-                    input.distribution_id
+                message: Some(crate::state::invalid_marker_message(
+                    crate::state::INVALIDATION_MARKER_KIND,
                 )),
             })
             .into());

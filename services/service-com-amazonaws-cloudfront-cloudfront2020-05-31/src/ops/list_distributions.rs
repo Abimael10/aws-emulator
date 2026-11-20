@@ -162,8 +162,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(marker) = input.marker.as_deref() {
             if !crate::state::is_distribution_id(marker) {
                 return Err(ListDistributionsErrorModeled::InvalidArgument(InvalidArgument {
-                    message: Some(format!(
-                        "Marker {marker} is not a distribution id returned by ListDistributions"
+                    message: Some(crate::state::invalid_marker_message(
+                        crate::state::DISTRIBUTION_MARKER_KIND,
                     )),
                 })
                 .into());

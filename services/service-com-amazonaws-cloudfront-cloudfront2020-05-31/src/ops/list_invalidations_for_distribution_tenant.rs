@@ -228,11 +228,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 ListInvalidationsForDistributionTenantErrorModeled::InvalidArgument(
                     InvalidArgument {
-                        message: Some(format!(
-                            "Marker {} is not the id of an invalidation of distribution \
-                             tenant {}",
-                            input.marker.unwrap_or_default(),
-                            input.id
+                        message: Some(crate::state::invalid_marker_message(
+                            crate::state::INVALIDATION_MARKER_KIND,
                         )),
                     },
                 )

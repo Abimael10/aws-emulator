@@ -523,6 +523,13 @@ const STATED_VALUE_ORDERS: &[&[&str]] = &[
     // (`smithy_query(query="shape",shape="OriginAccessControlSigningBehaviors")` -> never,
     // always, no-override, always-amz-auth).
     &["always-amz-auth", "never", "always", "no-override"],
+    // `OriginAccessControlOriginTypes`, the kind of origin an origin access control signs
+    // requests to, which this API publishes as the signing name of that origin's own service:
+    // the service lists the object store first and then the compute and media origins, which is
+    // not the order the schema declares
+    // (`smithy_query(query="shape",shape="OriginAccessControlOriginTypes")` -> s3, execute-api,
+    // mediastore, mediapackagev2, lambda).
+    &["s3", "execute-api", "lambda", "mediastore", "mediapackagev2"],
 ];
 
 /// `refusal` with the enum's admitted values listed in the order this service publishes that
@@ -608,6 +615,9 @@ fn stated_enum_values(message: &str) -> Option<String> {
     let close = open + tail[open..].find(']')?;
     let values: Vec<&str> = tail[open + 1..close].split(',').map(str::trim).collect();
     let stated = stated_value_order(&values)?;
+    if stated == values {
+        return None;
+    }
     Some(format!(
         "{}{}{}",
         &message[..marker_at + open + 1],

@@ -182,9 +182,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     ListDistributionsByResponseHeadersPolicyIdErrorModeled::InvalidArgument(
                         InvalidArgument {
-                            message: Some(format!(
-                                "Marker {marker} is not a distribution id returned by \
-                                 ListDistributionsByResponseHeadersPolicyId"
+                            message: Some(crate::state::invalid_marker_message(
+                                crate::state::DISTRIBUTION_MARKER_KIND,
                             )),
                         },
                     )
