@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyIntegration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyIntegration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Modifies a zero-ETL integration this service holds: the members the request carries
+//! replace what the integration stores for them, and every member it does not carry is left
+//! as stored. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyIntegration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Three things decide the answer, in this order: a request that names no modification at
+//! all cannot be served whatever integration it addresses; an identifier that names no
+//! integration of this account in this region is the modelled 404; and an integration that
+//! is not up — still being created, already taking another modification, or on its way out
+//! — is the modelled state fault, because the change cannot be applied to it. Only then is
+//! the modification accepted, after which the integration reports `modifying` until the
+//! clock has made its return to `active` due.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +180,147 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyIntegration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyIntegrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyIntegration"))
+        let region =
+            crate::state::request_region(ctx).map_err(ModifyIntegrationError::validation)?;
+
+        // A modification has to ask for something: with no new name, no data filter and no
+        // description the request names no member to change, and a 200 would report a
+        // modification that never happened. The request itself is what cannot be served, so
+        // this is decided before the integration it names is resolved, and answered with the
+        // Query API's `InvalidParameterCombination` — the class a request whose members
+        // cannot stand as given belongs to.
+        let new_name = input.integration_name;
+        let data_filter = input.data_filter;
+        let description = input.description;
+        if new_name.is_none() && data_filter.is_none() && description.is_none() {
+            return Err(ModifyIntegrationError::invalid_parameter_combination(
+                crate::state::NO_MODIFICATIONS_REQUESTED_MESSAGE,
+            ));
+        }
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a modification nothing applied.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // The transitions the clock already made due — owed at this instant whether or not
+        // anybody called — so the state this modification is judged against is the current
+        // one: an integration whose creation has settled is modifiable, and one whose
+        // accepted deletion has come due is gone.
+        store.settle_due_transitions(&region);
+
+        // `IntegrationIdentifier` is "the unique identifier of the integration to modify",
+        // which is either the name a create gave it or its ARN; RDS is regional, so it is
+        // resolved in the region the request was signed for, and a value that names no
+        // integration is the modelled 404 — worded the way every operation that resolves an
+        // integration words it.
+        let requested = input.integration_identifier;
+        let Some(record) = store.resolve_integration(&region, &requested) else {
+            return Err(ModifyIntegrationErrorModeled::IntegrationNotFoundFault(
+                IntegrationNotFoundFault {
+                    message: Some(crate::state::integration_not_found_message(
+                        &region,
+                        &requested,
+                    )),
+                },
+            )
+            .into());
+        };
+        // The store keys an integration by its name, so the key is where the resolved record
+        // lives now — a rename moves it, and that move is what the collision check below is
+        // about.
+        let key = (region.clone(), record.name.clone());
+        // An integration that is still being brought up, that is already applying another
+        // modification, or that a delete has been accepted for is not one this change can be
+        // applied to: that is what the modelled `InvalidIntegrationStateFault` reports, and
+        // it names the status the caller has to wait out.
+        if !record.is_active() {
+            return Err(ModifyIntegrationErrorModeled::InvalidIntegrationStateFault(
+                InvalidIntegrationStateFault {
+                    message: Some(crate::state::integration_state_message(
+                        &record.name,
+                        &record.status,
+                        "modified",
+                    )),
+                },
+            )
+            .into());
+        }
+        // One name names one integration of one account in one region, so a new name another
+        // integration already holds is a modification this service cannot apply: the
+        // operation models `IntegrationConflictOperationFault` for a request that conflicts
+        // with another against the same resources, and nothing is written for it. It models
+        // no name-already-exists fault — that one belongs to `CreateIntegration` — so the
+        // sentence this carries is the one the model publishes for the CONFLICT class and
+        // says nothing about the clash itself. A new name equal to the one the integration
+        // already has collides with nothing — it is this same record.
+        let renamed_to = match &new_name {
+            Some(name) if *name != key.1 => Some((region.clone(), name.clone())),
+            _ => None,
+        };
+        if renamed_to
+            .as_ref()
+            .is_some_and(|target| store.integrations.contains_key(target))
+        {
+            return Err(
+                ModifyIntegrationErrorModeled::IntegrationConflictOperationFault(
+                    IntegrationConflictOperationFault {
+                        message: Some(
+                            crate::state::INTEGRATION_CONFLICT_OPERATION_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The modification is accepted. The record is taken out of the store and put back
+        // under the name it carries after the change, so a rename moves it to its new key in
+        // one step and the store never holds a record under a name it no longer has. A record
+        // the resolve above found that is then gone from under its own key is an invariant of
+        // this emulator's store that cannot hold, not anything the request carries.
+        let Some(mut record) = store.integrations.remove(&key) else {
+            return Err(crate::scaffolded::Scaffolded::internal_failure(format!(
+                "integration {} is no longer in the store",
+                key.1
+            )));
+        };
+        if let Some(name) = new_name {
+            record.name = name;
+        }
+        if let Some(data_filter) = data_filter {
+            record.data_filter = Some(data_filter);
+        }
+        if let Some(description) = description {
+            record.description = Some(description);
+        }
+        // The integration reports `modifying` from now on and the clock owes it `active`:
+        // nothing sleeps, so a caller that reads it straight after this call sees the change
+        // being applied and one that waits sees it up again.
+        record.begin_modification();
+        // The answer is the stored record projected through the SAME projection
+        // `DescribeIntegrations` reports it with, so the modification's answer and the next
+        // read of the integration cannot disagree; only the output shape differs, and it
+        // carries exactly the members of `Integration`.
+        let projected = record.to_wire();
+        store
+            .integrations
+            .insert((region, record.name.clone()), record);
+        Ok(ModifyIntegrationOutput {
+            source_arn: projected.source_arn,
+            target_arn: projected.target_arn,
+            integration_name: projected.integration_name,
+            integration_arn: projected.integration_arn,
+            kms_key_id: projected.kms_key_id,
+            additional_encryption_context: projected.additional_encryption_context,
+            status: projected.status,
+            tags: projected.tags,
+            data_filter: projected.data_filter,
+            description: projected.description,
+            create_time: projected.create_time,
+            errors: projected.errors,
+        })
     }
 }

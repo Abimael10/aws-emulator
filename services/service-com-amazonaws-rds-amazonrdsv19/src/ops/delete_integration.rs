@@ -201,15 +201,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An integration that is still being brought up, or that a delete has already been
         // accepted for, is not one a delete can act on: that is what the modelled
         // `InvalidIntegrationStateFault` reports. The status the integration is in is named,
-        // because it is what the caller has to wait out.
-        if record.status != crate::state::INTEGRATION_STATUS_ACTIVE {
+        // because it is what the caller has to wait out, and the sentence is the one every
+        // operation that acts on an integration words that fault with
+        // ([`crate::state::integration_state_message`]).
+        if !record.is_active() {
             return Err(DeleteIntegrationErrorModeled::InvalidIntegrationStateFault(
                 InvalidIntegrationStateFault {
-                    message: Some(format!(
-                        "Integration {} is in {} state but must be {} to be deleted",
-                        record.name,
-                        record.status,
-                        crate::state::INTEGRATION_STATUS_ACTIVE
+                    message: Some(crate::state::integration_state_message(
+                        &record.name,
+                        &record.status,
+                        "deleted",
                     )),
                 },
             )

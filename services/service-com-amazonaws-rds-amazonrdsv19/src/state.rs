@@ -271,9 +271,10 @@ pub use export_tasks::{
 };
 pub use integrations::{
     check_integration_target_arn, check_kms_key_id, integration_not_found_message,
-    mint_integration_id, IntegrationRecord, INTEGRATION_QUOTA_PER_REGION,
+    integration_state_message, mint_integration_id, IntegrationRecord,
+    INTEGRATION_CONFLICT_OPERATION_MESSAGE, INTEGRATION_QUOTA_PER_REGION,
     INTEGRATION_STATUS_ACTIVE, INTEGRATION_STATUS_CREATING, INTEGRATION_STATUS_DELETING,
-    INVALID_TARGET_TYPE_MESSAGE,
+    INTEGRATION_STATUS_MODIFYING, INVALID_TARGET_TYPE_MESSAGE,
 };
 pub use tags::{
     added_key_count, check_tag_capacity, check_tags_to_write, merge_tags, TagTarget,

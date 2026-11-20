@@ -32,6 +32,37 @@ pub const INTEGRATION_STATUS_ACTIVE: &str = "active";
 /// for it, until the clock has made its removal from the store due.
 pub const INTEGRATION_STATUS_DELETING: &str = "deleting";
 
+/// `IntegrationStatus` — the status an integration reports while a modification this
+/// service accepted is being applied to it, until the clock has made its return to
+/// [`INTEGRATION_STATUS_ACTIVE`] due.
+pub const INTEGRATION_STATUS_MODIFYING: &str = "modifying";
+
+/// How Amazon RDS words the integration state fault: the integration is not in a status the
+/// requested action can be performed in.
+///
+/// The modelled `InvalidIntegrationStateFault` publishes "the integration is in an invalid
+/// state and can't perform the requested operation" for the class; the integration, the
+/// status it is in and the status it has to reach are the variable parts, because the status
+/// it is in is what the caller has to wait out. `action` is the past participle of the
+/// action refused (`deleted`, `modified`), so every operation that acts on an integration
+/// words the one fault the one way.
+pub fn integration_state_message(name: &str, status: &str, action: &str) -> String {
+    format!(
+        "Integration {name} is in {status} state but must be {INTEGRATION_STATUS_ACTIVE} to be \
+         {action}"
+    )
+}
+
+/// The sentence an `IntegrationConflictOperationFault` carries, as the model publishes it
+/// for the error class: a request that conflicts with another request against the same
+/// resource.
+///
+/// It names neither the integration nor the member that conflicts — the fault reports only
+/// that two requests cannot both be served — so it is a constant rather than a `format!`
+/// over the request.
+pub const INTEGRATION_CONFLICT_OPERATION_MESSAGE: &str =
+    "A conflicting conditional operation is currently in progress against this resource.";
+
 /// How Amazon RDS words the integration not-found fault.
 ///
 /// `IntegrationIdentifier` is "the unique identifier of the integration", which a request
@@ -189,6 +220,25 @@ impl IntegrationRecord {
             &self.region,
             &format!("{ARN_RESOURCE_TYPE}:{}", self.integration_id),
         )
+    }
+
+    /// Whether the integration is up, which is the status every action on it is accepted in
+    /// ([`INTEGRATION_STATUS_ACTIVE`]); any other status is the modelled
+    /// `InvalidIntegrationStateFault` for that action.
+    pub fn is_active(&self) -> bool {
+        self.status == INTEGRATION_STATUS_ACTIVE
+    }
+
+    /// Accept a modification: the integration reports [`INTEGRATION_STATUS_MODIFYING`] from
+    /// now on, and the clock owes it [`INTEGRATION_STATUS_ACTIVE`] a moment later, so a
+    /// caller that reads it straight after the call sees the modification being applied and
+    /// a caller that waits sees it up again. Nothing sleeps: the due instant is stored and
+    /// materialised by
+    /// [`super::ComAmazonawsRdsAmazonrdsv19State::settle_due_transitions`], exactly as every
+    /// other accepted modification in this store does it.
+    pub fn begin_modification(&mut self) {
+        self.status = INTEGRATION_STATUS_MODIFYING.to_string();
+        self.pending_status = Some(PendingStatus::in_a_moment(INTEGRATION_STATUS_ACTIVE));
     }
 
     /// Accept a delete: the integration reports [`INTEGRATION_STATUS_DELETING`] from now on,
