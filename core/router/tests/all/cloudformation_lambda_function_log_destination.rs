@@ -119,7 +119,10 @@ pub(crate) fn trust_policy() -> Value {
 /// What that role may do: the three CloudWatch Logs calls an invocation's log delivery makes,
 /// which is what the AWS-managed basic execution policy grants a function. A role short of
 /// them leaves nothing for a client to read, which is that rule rather than this one.
-fn logs_policy() -> Value {
+///
+/// `pub(crate)` with the suites beside it: a sibling that needs the same basic-execution grant
+/// drives THIS one rather than a second copy of it.
+pub(crate) fn logs_policy() -> Value {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
