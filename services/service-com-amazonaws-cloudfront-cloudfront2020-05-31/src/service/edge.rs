@@ -45,7 +45,10 @@
 //! 7. that behaviour's `CachedMethods` and cache policy decide whether the answer may
 //!    come from the edge cache: a cacheable method whose TTL has not run out is answered
 //!    `X-Cache: Hit from cloudfront` without touching the origin, and everything else
-//!    goes to the origin and is answered `X-Cache: Miss from cloudfront`;
+//!    goes to the origin and is answered `X-Cache: Miss from cloudfront`. An answer that
+//!    came out of the cache also states HOW LONG it has been held, in the [`AGE`] every
+//!    cache generates for a response it serves from storage, so a viewer can tell how
+//!    stale the copy it was given is;
 //! 8. only then is the ORIGIN the behaviour's `TargetOriginId` names fetched, in process,
 //!    through the emulator this service is running within — over the scheme that origin's
 //!    own `OriginProtocolPolicy` names ([`origin_uri`]), for the object the viewer's path
@@ -259,6 +262,16 @@ const CACHE_LAMBDA_EXECUTION_ERROR: &str = "LambdaExecutionError from cloudfront
 /// The response (and origin-request) header carrying the identifier of the request the
 /// edge served, from `X-Amz-Cf-Id`: "identifies the request that you're interested in".
 const X_AMZ_CF_ID: &str = "x-amz-cf-id";
+
+/// The response header a cache states the age of the response it is serving in: "the number
+/// of seconds since the response was generated or successfully validated at the origin
+/// server" (RFC 9111 §5.1), which every cache generates for a response it serves out of
+/// storage (§4.2.3).
+///
+/// So an answer this edge served from its cache carries one, counted from the instant the
+/// entry was filled, while an answer an origin produced for the request being served carries
+/// only whatever the origin itself said about its own age.
+const AGE: &str = "age";
 
 /// The `Server` of a response CloudFront generated itself, and the name its `Via` carries
 /// on an origin request — which is also how a request that has already been through an
@@ -1147,6 +1160,11 @@ struct OriginAnswer {
     /// them: the edge serves the origin's own headers to the viewer, except the ones
     /// [`RESPONSE_HEADERS_NEVER_SERVED`] names.
     headers: Vec<(String, String)>,
+    /// How long the edge cache has HELD this answer, for one it is serving out of that cache,
+    /// and `None` for one the origin produced for the request being served — which is what
+    /// decides whether the answer carries an [`AGE`] of this cache's own
+    /// ([`served_origin_answer`]).
+    age: Option<Duration>,
 }
 
 /// One origin fetch the edge is to make, and what to do with what comes back.
@@ -2179,6 +2197,11 @@ fn plan_resolved(
                     content_type: entry.content_type.clone(),
                     content_encoding: entry.content_encoding.clone(),
                     headers: entry.headers.clone(),
+                    // How long this entry has been resident, from the instant the origin
+                    // fetch filled it: what the answer's [`AGE`] is counted from. A clock
+                    // that went backwards between the two leaves no span, which reads as an
+                    // entry filled now.
+                    age: Some(now.duration_since(entry.stored_at).unwrap_or_default()),
                 },
                 encode,
             };
@@ -2897,6 +2920,9 @@ async fn fetch_origin<Eng: Send + Sync + 'static>(
         content_type,
         content_encoding,
         headers,
+        // The origin produced this answer for the request being served, so this cache has
+        // held it for no time at all and states no age of its own about it.
+        age: None,
     };
     if let Some(directive) = fetch.cache {
         // How long this answer is held: the behaviour's own TTL for an answer the edge may
@@ -3097,6 +3123,22 @@ fn served_origin_answer(
         let _ = response
             .headers_mut()
             .try_append(name.clone(), value.clone());
+    }
+    // An answer served out of the cache states its AGE, as every cache states one for a
+    // response it serves from storage: the seconds since the response was generated at the
+    // origin, which is the span this entry has been resident plus whatever age the origin
+    // itself stated about the bytes when they were fetched (a cache in front of the origin had
+    // held them that long already). Stated after the origin's own headers, so what the viewer
+    // reads is this cache's own count rather than the one the entry holds.
+    if let Some(held) = answer.age {
+        let at_origin = answer
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(AGE))
+            .and_then(|(_, value)| value.trim().parse::<u64>().ok())
+            .unwrap_or_default();
+        let age = at_origin.saturating_add(held.as_secs());
+        let _ = response.headers_mut().try_insert(AGE, age.to_string());
     }
     if let Some(content_type) = content_type {
         let _ = response
