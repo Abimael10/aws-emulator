@@ -120,22 +120,61 @@ pub fn invalid_gateway_id_not_found<E>(gateway_id: &str) -> Scaffolded<E> {
     super::id_not_found(INVALID_GATEWAY_ID_NOT_FOUND, "gateway ID", gateway_id)
 }
 
+/// How the route operations name a VPC ENDPOINT target in a refusal: the request member's own
+/// name followed by ` ID`, beside [`invalid_gateway_id_not_found`]'s "gateway ID" and
+/// [`invalid_route_table_id_not_found`]'s "routeTable ID".
+///
+/// The ONE spelling of that noun, so the two sentences a target the route operations cannot
+/// resolve carries — one for a value that is no endpoint id, one for an id no endpoint of the
+/// account answers to — name the same thing. NOT [`super::VPC_ENDPOINT_ID_KIND`], which is how
+/// the operations that resolve a `VpcEndpointId` as the SUBJECT of the call name the resource.
+const VPC_ENDPOINT_ROUTE_TARGET_KIND: &str = "vpcEndpoint ID";
+
 /// Refuse a ROUTE TARGET that names a VPC endpoint id this account holds no endpoint for:
 /// HTTP 400 [`super::INVALID_VPC_ENDPOINT_ID_NOT_FOUND`], the endpoint's OWN not-found code —
 /// a target is a resource, and an unknown one is refused with that resource's code rather
 /// than with the gateway's.
 ///
-/// Worded the way the route operations word an unknown target: the request member's own name
-/// followed by ` ID`, beside [`invalid_gateway_id_not_found`]'s "gateway ID" and
-/// [`invalid_route_table_id_not_found`]'s "routeTable ID". NOT
-/// [`super::invalid_vpc_endpoint_id_not_found`], which is the refusal of the operations that
-/// resolve a `VpcEndpointId` as the SUBJECT of the call and names the resource as
-/// [`super::VPC_ENDPOINT_ID_KIND`] spells it.
+/// Worded the way the route operations word an unknown target
+/// ([`VPC_ENDPOINT_ROUTE_TARGET_KIND`]). NOT [`super::invalid_vpc_endpoint_id_not_found`],
+/// which is the refusal of the operations that resolve a `VpcEndpointId` as the SUBJECT of the
+/// call.
 pub fn invalid_vpc_endpoint_route_target_not_found<E>(vpc_endpoint_id: &str) -> Scaffolded<E> {
     super::id_not_found(
         super::INVALID_VPC_ENDPOINT_ID_NOT_FOUND,
-        "vpcEndpoint ID",
+        VPC_ENDPOINT_ROUTE_TARGET_KIND,
         vpc_endpoint_id,
+    )
+}
+
+/// Refuse a ROUTE TARGET whose value is no VPC endpoint id at all: HTTP 400
+/// [`super::INVALID_VPC_ENDPOINT_ID_MALFORMED`], the endpoint id's own `Malformed` code, in the
+/// sentence the route operations' own recorded refusal carries — `The <kind> ID '<value>' is
+/// malformed`, around the value the REQUEST sent (bounded by [`super::echoed_resource_id`]).
+///
+/// NOT [`super::invalid_id_message`]'s `Invalid id: "<value>"`, which is what the operations
+/// resolving a `VpcEndpointId` as the SUBJECT of the call were recorded answering and keep. The
+/// sentence an operation answers is a fact of THAT operation's validator, read off its own
+/// recorded refusal — the same split this crate already carries for a local gateway route table
+/// ([`invalid_local_gateway_route_table_id_malformed`] beside
+/// [`invalid_route_table_id_for_create`], whose doc states the rule) and, under one code, for an
+/// AMI id ([`super::invalid_ami_id_malformed`] beside
+/// [`super::invalid_ami_id_malformed_expecting_ami`]). Replaying the route-target step with
+/// `Invalid id: "<value>"` leaves the recorded message diverging; this sentence is what makes it
+/// match, so it is the route operations' own.
+///
+/// The not-found sentence's own noun ([`VPC_ENDPOINT_ROUTE_TARGET_KIND`]) and its own quoting,
+/// so the two answers about one target read as one pair. Asked BEFORE the account is looked
+/// at, so "this is not an endpoint id" is never reported as "this account holds no such
+/// endpoint" ([`invalid_vpc_endpoint_route_target_not_found`]).
+pub fn invalid_vpc_endpoint_route_target_malformed<E>(value: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        super::INVALID_VPC_ENDPOINT_ID_MALFORMED,
+        400,
+        format!(
+            "The {VPC_ENDPOINT_ROUTE_TARGET_KIND} '{}' is malformed",
+            super::echoed_resource_id(value)
+        ),
     )
 }
 

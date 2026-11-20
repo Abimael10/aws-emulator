@@ -302,21 +302,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .collect();
         let Some(&(target_member, target_value)) = targets.first() else {
             return Err(state::missing_parameter(
-                "The request must contain exactly one of the parameters gatewayId, \
-                 natGatewayId, instanceId, networkInterfaceId, transitGatewayId, \
-                 localGatewayId, carrierGatewayId, vpcPeeringConnectionId, vpcEndpointId, \
-                 egressOnlyInternetGatewayId, coreNetworkArn or odbNetworkArn",
+                crate::ops::create_route::EXACTLY_ONE_TARGET,
             ));
         };
         if targets.len() > 1 {
-            return Err(state::invalid_parameter_combination(format!(
-                "The parameters {named} cannot be used together",
-                named = targets
-                    .iter()
-                    .map(|(member, _)| *member)
-                    .collect::<Vec<&str>>()
-                    .join(", "),
-            )));
+            return Err(state::invalid_parameter_combination(
+                crate::ops::create_route::EXACTLY_ONE_TARGET,
+            ));
         }
         // Two targets this emulator holds no resource for at all, so a 501 ("nobody has
         // written this yet") is the honest answer rather than a refusal that blames the

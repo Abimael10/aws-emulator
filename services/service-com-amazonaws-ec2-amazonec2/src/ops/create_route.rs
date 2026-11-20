@@ -97,6 +97,21 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The sentence EC2 refuses a route whose request does not name EXACTLY ONE target with.
+///
+/// "You must also specify exactly one of the resources from the parameter list"
+/// (`CreateRoute`): the target members are alternatives, so naming none and naming several
+/// break ONE rule, and EC2 states that rule in one fixed sentence — the enumeration of the
+/// target members, interpolating nothing from the request. The two refusals keep their own
+/// codes (a request that names none is missing a parameter; one that names several carries a
+/// combination), and say the same thing.
+///
+/// Shared with [`crate::ops::replace_route`], which resolves a route's target by the same
+/// rule, so the two operations cannot word it two ways.
+pub(crate) const EXACTLY_ONE_TARGET: &str = "The request must contain exactly one of gatewayId, \
+     localGatewayId, carrierGatewayId, natGatewayId, networkInterfaceId, vpcPeeringConnectionId, \
+     egressOnlyInternetGatewayId, transitGatewayId, vpcEndpointId, coreNetworkArn or instanceId";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -264,22 +279,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
         .collect();
         let Some(&(target_member, target_value)) = targets.first() else {
-            return Err(state::missing_parameter(
-                "The request must contain exactly one of the parameters gatewayId, \
-                 natGatewayId, instanceId, networkInterfaceId, transitGatewayId, \
-                 localGatewayId, carrierGatewayId, vpcPeeringConnectionId, vpcEndpointId, \
-                 egressOnlyInternetGatewayId, coreNetworkArn or odbNetworkArn",
-            ));
+            return Err(state::missing_parameter(EXACTLY_ONE_TARGET));
         };
         if targets.len() > 1 {
-            return Err(state::invalid_parameter_combination(format!(
-                "The parameters {named} cannot be used together",
-                named = targets
-                    .iter()
-                    .map(|(member, _)| *member)
-                    .collect::<Vec<&str>>()
-                    .join(", "),
-            )));
+            return Err(state::invalid_parameter_combination(EXACTLY_ONE_TARGET));
         }
         // Two targets this emulator holds no resource for at all, so a 501 ("nobody has
         // written this yet") is the honest answer rather than a refusal that blames the
@@ -400,7 +403,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 ///
 /// Each member resolves against the ONE resource kind it documents, and against no other: a
 /// value that names a resource of a different kind names nothing this member could have meant,
-/// so it is refused with that member's own not-found rather than resolved through a neighbouring
+/// so it is refused with that member's own refusal rather than resolved through a neighbouring
 /// member's store. That is what lets a caller tell the two forms of a target apart — the same
 /// VPC endpoint id is a route's target under `vpcEndpointId` and no gateway at all under
 /// `gatewayId`.
@@ -432,13 +435,9 @@ pub(crate) fn resolve_target<E>(
             // An internet gateway or a virtual private gateway: the two kinds this member
             // documents, told apart by the id form each kind carries. No OTHER resource is
             // reachable through this member — "the ID of an internet gateway or virtual
-            // private gateway attached to your VPC"
-            // (`CreateRouteRequest$GatewayId`) — so an id of any other kind, a VPC endpoint's
-            // among them, names no gateway of this account and is refused as such. A VPC
-            // endpoint target has its own member (`$VpcEndpointId`), which is where an
-            // endpoint is named; that the stored route REPORTS it in `Route$GatewayId` is
-            // about the modelled `Route` having no member of its own for an endpoint, and
-            // says nothing about which member a request may name it in.
+            // private gateway attached to your VPC" (`CreateRouteRequest$GatewayId`) — so an
+            // id of any other kind, a VPC endpoint's among them, names no gateway of this
+            // account and is refused as such.
             let attached_vpc = if store.internet_gateways.contains_key(value) {
                 store.internet_gateway_attached_vpc(value)
             } else if let Some(vpn_gateway) = store.vpn_gateways.get(value) {
@@ -461,25 +460,12 @@ pub(crate) fn resolve_target<E>(
             }
             Ok(RouteTarget::Gateway(value.to_string()))
         }
-        "vpcEndpointId" => {
-            // A target is a RESOURCE, and this member names a VPC ENDPOINT — so an id this
-            // account holds no endpoint for is refused with the ENDPOINT's own not-found code
-            // and the way the route operations word an unknown target
-            // ([`state::invalid_vpc_endpoint_route_target_not_found`]), not with the gateway's
-            // code and noun for a resource the caller never named.
-            let Some(endpoint) = store.vpc_endpoints.get(value) else {
-                return Err(state::invalid_vpc_endpoint_route_target_not_found(value));
-            };
-            if endpoint.vpc_id.as_deref() != Some(vpc_id) {
-                return Err(belongs_to_another_network(
-                    route_table_id,
-                    &endpoint_target_noun(endpoint, value),
-                ));
-            }
-            // An endpoint target is reported in `Route$GatewayId`, the modelled `Route`
-            // carrying no member of its own for a VPC endpoint.
-            Ok(RouteTarget::Gateway(value.to_string()))
-        }
+        // "The ID of a VPC endpoint. Supported for Gateway Load Balancer endpoints only"
+        // (`CreateRouteRequest$VpcEndpointId`): the endpoint target has its own member, which
+        // is where an endpoint is named. That the stored route REPORTS it in `Route$GatewayId`
+        // is about the modelled `Route` having no member of its own for an endpoint, and says
+        // nothing about which member a request may name it in.
+        "vpcEndpointId" => resolve_vpc_endpoint_target(store, value, route_table_id, vpc_id),
         "natGatewayId" => {
             // A target the account does not hold is reported by the member that carried it,
             // in the route family's own code for an unresolvable NAT gateway target
@@ -567,6 +553,89 @@ pub(crate) fn resolve_target<E>(
     }
 }
 
+/// Whether `value` is under the VPC ENDPOINT's own resource id form: that prefix, a `-`, and a
+/// non-empty suffix of lowercase hexadecimal digits.
+///
+/// The reading [`crate::state::prefixed_id_is_well_formed`] makes, minus ONE clause: that
+/// function also holds the suffix to the digit counts EC2 ISSUES, which is the reading the
+/// operations resolving a `VpcEndpointId` as the SUBJECT of the call were recorded answering
+/// `InvalidVpcEndpointId.Malformed` for ([`crate::state::vpc_endpoint_id_is_well_formed`], used
+/// by the describes, the delete, the modify and the connection operations). The ROUTE
+/// operations' own recorded refusals answer a value under this prefix whose suffix is not a
+/// length EC2 issues with the endpoint's NOT-FOUND sentence instead — replaying a route-target
+/// step under the stricter reading makes that recorded step diverge — so which reading an
+/// operation applies is a fact of that operation's validator, read off its own recorded
+/// refusal. That is the same per-operation split this crate already documents for an AMI id,
+/// where the launch path decodes the id EC2 could have issued and the describes keep the wider
+/// reading ([`crate::state::issued_image_id_is_well_formed`]).
+///
+/// The HEX suffix is what separates an endpoint id from the ids of the other resources whose
+/// own prefixes extend it — an endpoint service's and a connection's carry `svc-` or `conn-`
+/// first ([`crate::state::vpc_endpoint_id_is_well_formed`]'s doc) — so a value of those
+/// families is no endpoint id here either, exactly as it is none there.
+fn carries_vpc_endpoint_prefix(value: &str) -> bool {
+    value
+        .strip_prefix(crate::state::VPC_ENDPOINT_ID_PREFIX)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .is_some_and(|suffix| {
+            !suffix.is_empty()
+                && suffix
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        })
+}
+
+/// The VPC ENDPOINT the `vpcEndpointId` target member names, resolved against the endpoints
+/// this account holds.
+///
+/// "The ID of a VPC endpoint. Supported for Gateway Load Balancer endpoints only"
+/// (`CreateRouteRequest$VpcEndpointId`): the ONE endpoint type a route may point at is the
+/// Gateway Load Balancer endpoint, so this resolves an endpoint target against that type
+/// alone. An endpoint of any other type is no more a target than an id nothing minted — a
+/// gateway endpoint is reached through the route EC2 maintains in the tables the endpoint
+/// names rather than through one a caller writes — so both answer the one refusal this service
+/// words an unresolvable endpoint target with: the ENDPOINT's own not-found code and sentence
+/// ([`crate::state::invalid_vpc_endpoint_route_target_not_found`]), carrying the id the REQUEST
+/// named. Which is also why a resolved endpoint always holds the network interface the
+/// cross-network refusal names ([`endpoint_target_noun`]).
+///
+/// Shared by [`crate::ops::replace_route`] through [`resolve_target`], so pointing a route at
+/// an endpoint and re-pointing one answer the same way.
+fn resolve_vpc_endpoint_target<E>(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+    value: &str,
+    route_table_id: &str,
+    vpc_id: &str,
+) -> Result<crate::state::RouteTarget, crate::scaffolded::Scaffolded<E>> {
+    use crate::state::{self, RouteTarget};
+    // A value that is not under the VPC endpoint's own resource prefix is no endpoint id at
+    // all, so it is refused for its FORM before the account is asked whether it holds such an
+    // endpoint: under the endpoint id's own `Malformed` code, in the sentence the route
+    // operations' recorded refusal carries
+    // ([`state::invalid_vpc_endpoint_route_target_malformed`]). That keeps "this is not an
+    // endpoint id" apart from "this account holds no such endpoint", which is the difference a
+    // caller that mistyped a target has to be able to read. Why the suffix is read the way
+    // [`carries_vpc_endpoint_prefix`] reads it is that function's own doc.
+    if !carries_vpc_endpoint_prefix(value) {
+        return Err(state::invalid_vpc_endpoint_route_target_malformed(value));
+    }
+    let endpoint = store.vpc_endpoints.get(value).filter(|endpoint| {
+        endpoint.vpc_endpoint_type.as_deref() == Some(state::VPC_ENDPOINT_TYPE_GATEWAY_LOAD_BALANCER)
+    });
+    let Some(endpoint) = endpoint else {
+        return Err(state::invalid_vpc_endpoint_route_target_not_found(value));
+    };
+    if endpoint.vpc_id.as_deref() != Some(vpc_id) {
+        return Err(belongs_to_another_network(
+            route_table_id,
+            &endpoint_target_noun(endpoint, value),
+        ));
+    }
+    // An endpoint target is reported in `Route$GatewayId`, the modelled `Route` carrying no
+    // member of its own for a VPC endpoint.
+    Ok(RouteTarget::Gateway(value.to_string()))
+}
+
 /// Refuse a route whose target is not reachable from the VPC the route table routes for: HTTP
 /// 400 `InvalidParameterValue`, naming the table and the target.
 ///
@@ -607,8 +676,7 @@ fn network_gateway_noun(gateway_id: &str) -> String {
 /// (`CreateRouteRequest$VpcEndpointId`) — is created in a single subnet and so holds a single
 /// interface.
 ///
-/// An endpoint that holds no interface at all is a GATEWAY endpoint, which is reached through
-/// the route EC2 maintains in the tables the endpoint names rather than through an interface, so
+/// An endpoint that holds no interface at all — one placed in no subnet — has none to name, so
 /// it falls back to the gateway noun under the endpoint's own id.
 fn endpoint_target_noun(endpoint: &VpcEndpoint, endpoint_id: &str) -> String {
     let Some(interface_id) = endpoint

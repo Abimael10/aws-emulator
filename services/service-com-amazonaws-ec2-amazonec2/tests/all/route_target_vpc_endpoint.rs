@@ -18,7 +18,9 @@
 //! both published id lengths, and the well-formed ids inside the long form that resolve to no
 //! endpoint. The endpoint the account DOES hold is a row too — the same resolution that refuses
 //! the others accepts it, reported in the route's `GatewayId`, the member the modelled `Route`
-//! carries a VPC endpoint under.
+//! carries a VPC endpoint under. It is a GATEWAY LOAD BALANCER endpoint, the one type that
+//! member names; which TYPES resolve, and which values are no endpoint id at all, is
+//! [`super::route_target_endpoint_type_and_form`]'s rule.
 //!
 //! The endpoint-target slice of the route operations. [`super::replace_route`] drives the
 //! replacement itself, [`super::vpc_internet_path`] the create, and
@@ -38,8 +40,11 @@ const REGION: &str = "us-east-1";
 /// The block the VPC the routes belong to is created with.
 const VPC_CIDR: &str = "10.94.0.0/16";
 
-/// The gateway endpoint service the held endpoint is created for — one the Region publishes.
-const ENDPOINT_SERVICE: &str = "com.amazonaws.us-east-1.s3";
+/// The endpoint service the held endpoint is created for: one of the PARTNER family
+/// (`com.amazonaws.vpce.<region>.<service-id>`), the family a Gateway Load Balancer endpoint is
+/// created to — "supported for Gateway Load Balancer endpoints only"
+/// (`CreateRouteRequest$VpcEndpointId`) being the one endpoint type a route may name.
+const ENDPOINT_SERVICE: &str = "com.amazonaws.vpce.us-east-1.vpce-svc-0123456789abcdef0";
 
 /// The emulator the tests drive, as [`super::ec2_query::emulator`] builds it.
 fn emulator() -> MultiServiceRouter {
@@ -91,6 +96,18 @@ async fn estate(router: &MultiServiceRouter) -> Estate {
     let case = "the estate the endpoint targets are named to";
     let vpc = ok(case, router, "CreateVpc", &[param("CidrBlock", VPC_CIDR)]).await;
     let vpc_id = member(case, &vpc, "vpcId");
+    let subnet = ok(
+        case,
+        router,
+        "CreateSubnet",
+        &[
+            param("VpcId", &vpc_id),
+            param("CidrBlock", "10.94.1.0/24"),
+            param("AvailabilityZone", &format!("{REGION}a")),
+        ],
+    )
+    .await;
+    let subnet_id = member(case, &subnet, "subnetId");
     let gateway = ok(case, router, "CreateInternetGateway", &[]).await;
     let internet_gateway_id = member(case, &gateway, "internetGatewayId");
     ok(
@@ -103,8 +120,8 @@ async fn estate(router: &MultiServiceRouter) -> Estate {
         ],
     )
     .await;
-    // A gateway endpoint of this VPC named by no route table of its own, so it is a target
-    // these rows point a route at rather than one that wrote routes itself.
+    // An endpoint of this VPC named by no route table of its own, so it is a target these rows
+    // point a route at rather than one that wrote routes itself.
     let endpoint = ok(
         case,
         router,
@@ -112,7 +129,8 @@ async fn estate(router: &MultiServiceRouter) -> Estate {
         &[
             param("VpcId", &vpc_id),
             param("ServiceName", ENDPOINT_SERVICE),
-            param("VpcEndpointType", "Gateway"),
+            param("VpcEndpointType", "GatewayLoadBalancer"),
+            param("SubnetId.1", &subnet_id),
         ],
     )
     .await;
