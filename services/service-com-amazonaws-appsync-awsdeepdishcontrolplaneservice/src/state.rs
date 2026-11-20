@@ -117,6 +117,10 @@ pub use introspected_cluster::*;
 /// name the domain is created under, read in the services that hold a certificate for this
 /// account.
 mod domain_certificate;
+/// The two forms a request can name a GraphQL API by — the `apiId` AppSync minted and the
+/// ARN built on it — and the lookups that resolve either form to the one API.
+mod api_reference;
+pub use api_reference::*;
 pub use domain_certificate::*;
 
 use crate::ops::types::{
@@ -1830,9 +1834,9 @@ impl SourceApiAssociationRecord {
 /// request.
 #[derive(Debug, Clone)]
 pub struct SourceApiAssociationRequest {
-    /// The Merged API side, in either accepted form ([`is_api_identifier`]).
+    /// The Merged API side, in either accepted form ([`is_api_id`]).
     pub merged_api_identifier: String,
-    /// The source API side, in either accepted form ([`is_api_identifier`]).
+    /// The source API side, in either accepted form ([`is_api_id`]).
     pub source_api_identifier: String,
     pub description: Option<String>,
     /// The `mergeType` the request's `sourceApiAssociationConfig` named, or `None` when
@@ -1936,7 +1940,7 @@ pub fn create_source_api_association(
         &request.merged_api_identifier,
         &request.source_api_identifier,
     ] {
-        if !is_api_identifier(identifier) {
+        if !is_api_id(identifier) {
             return Err(AssociationRefusal::BadRequest(invalid_api_id_message(
                 identifier,
             )));
@@ -1948,8 +1952,7 @@ pub fn create_source_api_association(
     // caller left behind.
     state.settle_associations(now);
 
-    let Some(merged) = api_by_identifier(&state.graphql_apis, &request.merged_api_identifier)
-    else {
+    let Some(merged) = state.graphql_apis.get(&request.merged_api_identifier) else {
         return Err(AssociationRefusal::NotFound(
             API_NOT_FOUND_MESSAGE.to_string(),
         ));
@@ -1958,8 +1961,7 @@ pub fn create_source_api_association(
     let merged_api_arn = merged.arn.clone();
     let merged_api_type = merged.api_type.clone();
 
-    let Some(source) = api_by_identifier(&state.graphql_apis, &request.source_api_identifier)
-    else {
+    let Some(source) = state.graphql_apis.get(&request.source_api_identifier) else {
         return Err(AssociationRefusal::NotFound(
             API_NOT_FOUND_MESSAGE.to_string(),
         ));
@@ -2077,7 +2079,7 @@ impl AssociationSide {
 pub struct SourceApiDisassociationRequest {
     /// Which side of the association the path addressed.
     pub side: AssociationSide,
-    /// That side's API, in either accepted form ([`is_api_identifier`]).
+    /// That side's API, in either accepted form ([`is_api_id`]).
     pub api_identifier: String,
     /// The `associationId` AppSync generated for the association.
     pub association_id: String,
@@ -2109,7 +2111,7 @@ pub fn delete_source_api_association(
     request: SourceApiDisassociationRequest,
     now: SystemTime,
 ) -> Result<String, AssociationRefusal> {
-    if !is_api_identifier(&request.api_identifier) {
+    if !is_api_id(&request.api_identifier) {
         return Err(AssociationRefusal::BadRequest(invalid_api_id_message(
             &request.api_identifier,
         )));
@@ -2126,7 +2128,7 @@ pub fn delete_source_api_association(
     // gone before it can be deleted again.
     state.settle_associations(now);
 
-    let Some(api) = api_by_identifier(&state.graphql_apis, &request.api_identifier) else {
+    let Some(api) = state.graphql_apis.get(&request.api_identifier) else {
         return Err(AssociationRefusal::NotFound(
             API_NOT_FOUND_MESSAGE.to_string(),
         ));
@@ -2159,12 +2161,13 @@ pub fn delete_source_api_association(
 /// Per-service state for com-amazonaws-appsync-awsdeepdishcontrolplaneservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
-    /// Every created GraphQL API, keyed by its minted `apiId`.
-    pub graphql_apis: BTreeMap<String, GraphqlApiRecord>,
+    /// Every created GraphQL API, keyed by its minted `apiId` and reached by either form a
+    /// request can name one ([`ApiStore`]).
+    pub graphql_apis: ApiStore<GraphqlApiRecord>,
     /// Every created `Api` (an API with an Event API configuration), keyed by its
-    /// minted `apiId`. A separate resource from [`Self::graphql_apis`]: the two are
-    /// created and addressed by different operations.
-    pub event_apis: BTreeMap<String, EventApiRecord>,
+    /// minted `apiId` and reached the same way. A separate resource from
+    /// [`Self::graphql_apis`]: the two are created and addressed by different operations.
+    pub event_apis: ApiStore<EventApiRecord>,
     /// Every source-API association, keyed by its minted `associationId`.
     pub source_api_associations: BTreeMap<String, SourceApiAssociationRecord>,
     /// Every data source introspection this service has run, keyed by its minted
@@ -2295,7 +2298,7 @@ impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
         merged_api_identifier: &str,
         association_id: &str,
     ) -> Result<&SourceApiAssociationRecord, AssociationLookupRefusal> {
-        if !is_api_identifier(merged_api_identifier) {
+        if !is_api_id(merged_api_identifier) {
             return Err(AssociationLookupRefusal::BadRequest(invalid_api_id_message(
                 merged_api_identifier,
             )));
@@ -2307,9 +2310,12 @@ impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
             ));
         }
 
-        let merged = api_by_identifier(&self.graphql_apis, merged_api_identifier).ok_or_else(
-            || AssociationLookupRefusal::NotFound(API_NOT_FOUND_MESSAGE.to_string()),
-        )?;
+        let merged = self
+            .graphql_apis
+            .get(merged_api_identifier)
+            .ok_or_else(|| {
+                AssociationLookupRefusal::NotFound(API_NOT_FOUND_MESSAGE.to_string())
+            })?;
 
         self.source_api_associations
             .get(association_id)
@@ -2356,22 +2362,30 @@ impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
     /// `Api` are created by operations of their own, but either is given its keys
     /// through the same `/v1/apis/{apiId}/apikeys` path. So an `apiId` is resolved
     /// against both stores here — the single lookup every API-key operation uses —
-    /// and only an id that names no API at all is a not-found.
-    pub fn api_keys_of(&self, api_id: &str) -> Option<&BTreeMap<String, ApiKeyRecord>> {
+    /// and only a reference that names no API at all is a not-found. Either form the
+    /// reference can take resolves ([`ApiStore`]), so a caller that holds the
+    /// API's ARN reaches the same keys as one that holds its id.
+    pub fn api_keys_of(&self, api_identifier: &str) -> Option<&BTreeMap<String, ApiKeyRecord>> {
         self.graphql_apis
-            .get(api_id)
+            .get(api_identifier)
             .map(|api| &api.api_keys)
-            .or_else(|| self.event_apis.get(api_id).map(|api| &api.api_keys))
+            .or_else(|| self.event_apis.get(api_identifier).map(|api| &api.api_keys))
     }
 
     /// The API keys the API `api_id` holds, for a call that writes one.
     ///
     /// Resolves `api_id` exactly as [`Self::api_keys_of`] does, so a write and a read
     /// of the same API's keys can never disagree about which APIs exist.
-    pub fn api_keys_of_mut(&mut self, api_id: &str) -> Option<&mut BTreeMap<String, ApiKeyRecord>> {
-        match self.graphql_apis.get_mut(api_id) {
+    pub fn api_keys_of_mut(
+        &mut self,
+        api_identifier: &str,
+    ) -> Option<&mut BTreeMap<String, ApiKeyRecord>> {
+        match self.graphql_apis.get_mut(api_identifier) {
             Some(api) => Some(&mut api.api_keys),
-            None => self.event_apis.get_mut(api_id).map(|api| &mut api.api_keys),
+            None => self
+                .event_apis
+                .get_mut(api_identifier)
+                .map(|api| &mut api.api_keys),
         }
     }
 
@@ -2467,41 +2481,6 @@ impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
         self.seq_counter = self.seq_counter.wrapping_add(1);
         self.seq_counter
     }
-}
-
-/// The number of characters an AppSync API id has.
-///
-/// The ids this service mints are 26 base-32 characters ([`mint_id`]), the shape
-/// AppSync's own `apiId` takes. The model types every `apiId` member as a plain
-/// `String`, so nothing refuses a longer one at the boundary; [`is_api_id`] is where
-/// this service refuses it.
-///
-/// [`mint_id`]: ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState::mint_id
-pub const API_ID_LEN: usize = 26;
-
-/// Whether `candidate` is syntactically an AppSync API id, i.e. whether it could name
-/// an API at all.
-///
-/// The test is on LENGTH only: an id longer than [`API_ID_LEN`] holds more characters
-/// than an AppSync API id has, so it names no API and the call is a bad request, while
-/// a shorter one is simply an id this account does not hold and the call is a
-/// not-found. The alphabet is deliberately NOT part of the test: AppSync answers
-/// not-found for a short id drawn from outside the id alphabet, so a character outside
-/// it does not make the request malformed.
-///
-/// This is NOT the test for the form of an id the service ISSUES ([`is_opaque_id`]),
-/// which reads the length and the alphabet both: the two are deliberately different
-/// tests, because the operations that classify an `apiId` by the form of the reference
-/// rather than by its length are refused differently. Neither is a worse copy of the
-/// other, so they are not to be unified.
-pub fn is_api_id(candidate: &str) -> bool {
-    !candidate.is_empty() && candidate.chars().count() <= API_ID_LEN
-}
-
-/// AppSync's refusal text for an `apiId` that is not an API id ([`is_api_id`]): the
-/// rejected id, so the caller can see which value was refused.
-pub fn invalid_api_id_message(api_id: &str) -> String {
-    format!("Invalid API ID {api_id}")
 }
 
 /// `ownerContact`'s documented maximum length: "This field accepts any string input
@@ -3335,30 +3314,6 @@ pub fn data_source_service_role(
 ) -> Option<String> {
     service_role_arn
         .filter(|_| data_source_needs_service_role(data_source_type, iam_authorized))
-}
-
-/// Whether `candidate` could identify an API at all: an API id ([`is_api_id`]) or a
-/// full resource ARN.
-///
-/// Those are the two forms every `sourceApiIdentifier` / `mergedApiIdentifier` member
-/// documents — "only require the API ID value or ARN of the \[…\] API" — so a value
-/// that is neither names no API and the call is a bad request rather than a not-found.
-pub fn is_api_identifier(candidate: &str) -> bool {
-    candidate.starts_with(ARN_PREFIX) || is_api_id(candidate)
-}
-
-/// The stored API `identifier` names, in either accepted form ([`is_api_identifier`]):
-/// an ARN is matched against the API's own ARN, anything else against its `apiId`.
-/// `None` when this account holds no such API.
-pub fn api_by_identifier<'a>(
-    apis: &'a BTreeMap<String, GraphqlApiRecord>,
-    identifier: &str,
-) -> Option<&'a GraphqlApiRecord> {
-    if identifier.starts_with(ARN_PREFIX) {
-        apis.values().find(|record| record.arn == identifier)
-    } else {
-        apis.get(identifier)
-    }
 }
 
 /// The region the caller addressed, read from the request's SigV4 credential scope.

@@ -150,8 +150,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // An `apiId` that is not an API id at all is a malformed request, not a
-        // missing resource (see `crate::state::is_api_id`).
+        // An `apiId` that names no API at all — neither the id AppSync minted nor the ARN
+        // built on it — is a malformed request, not a missing resource
+        // (see `crate::state::is_api_id`).
         if !crate::state::is_api_id(&input.api_id) {
             return Err(DeleteApiErrorModeled::BadRequestException(BadRequestException {
                 message: Some(crate::state::invalid_api_id_message(&input.api_id)),
@@ -167,17 +168,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a GraphQL API is a resource of its own with a delete of its own, so its id
         // names no `Api` and this call is a not-found.
         let mut guard = state.lock();
-        if guard.event_apis.remove(&input.api_id).is_none() {
+        // Resolved to the API's OWN id, the id its record and its data plane are keyed by,
+        // so a delete addressed by the API's ARN removes what one addressed by its id
+        // removes.
+        let Some(api_id) = guard.event_apis.api_id_of(&input.api_id) else {
             return Err(DeleteApiErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
             })
             .into());
-        }
+        };
+        guard.event_apis.remove(&api_id);
         // The API's data plane goes with the record: dropping the listener handles closes
         // both endpoints' ports and severs every realtime connection open on them, so a
         // deleted API stops answering where it used to
         // ([`crate::state::event_data_plane`]).
-        guard.event_data_plane.forget_api(&input.api_id);
+        guard.event_data_plane.forget_api(&api_id);
 
         Ok(DeleteApiOutput {})
     }

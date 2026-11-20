@@ -198,8 +198,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // An `apiId` that is not an API id at all is a malformed request, not a
-        // missing resource (see `crate::state::is_api_id`).
+        // An `apiId` that names no API at all — neither the id AppSync minted nor the ARN
+        // built on it — is a malformed request, not a missing resource
+        // (see `crate::state::is_api_id`).
         if !crate::state::is_api_id(&input.api_id) {
             return Err(UpdateGraphqlApiErrorModeled::BadRequestException(BadRequestException {
                 message: Some(crate::state::invalid_api_id_message(&input.api_id)),
@@ -278,6 +279,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ListGraphqlApis` answer with afterwards — minus the API's `dns` records,
         // which this reply does not carry (`crate::state::GraphqlApiRecord::to_updated_graphql_api`).
         let graphql_api = record.to_updated_graphql_api();
+        // The API's OWN id, which is what the log group is provisioned under whichever
+        // form the request addressed the API in.
+        let api_id = record.api_id.clone();
         let logs_configured = graphql_api.log_config.is_some();
         drop(guard);
 
@@ -289,7 +293,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::service::graphql_api::field_logs::provisioned(
                 &*self.engine,
                 &crate::state::request_region(ctx),
-                &input.api_id,
+                &api_id,
             );
         }
 

@@ -50,6 +50,11 @@ use super::PlaneContext;
 use crate::ops::evaluate_code::appsync_js::{self, Outcome};
 use crate::state::{DataSourceRecord, GraphqlApiRecord, ResolverRecord};
 
+/// The stage that validates one request's document against the schema the API SERVES,
+/// before any field of it is dispatched.
+mod schema_validation;
+use schema_validation::schema_validation_errors;
+
 /// The GraphQL request a client POSTs: "a JSON object with a `query`", with the operation to
 /// run and the variables its document is parameterised by.
 #[derive(Debug, Clone, Default)]
@@ -418,6 +423,18 @@ pub async fn execute(context: &PlaneContext, request: &GraphqlRequest) -> Answer
     };
     if kind == OperationKind::Subscription {
         return Answer::refused(SUBSCRIPTIONS_ARE_REALTIME.to_string());
+    }
+    // The document is validated against the API's ACTIVE schema BEFORE any field of it is
+    // dispatched, the way AppSync validates one: a selection the schema does not declare
+    // is a validation failure of the request rather than a field that resolves to nothing,
+    // so the request is answered with those errors and no `data` at all.
+    let invalid = schema_validation_errors(context, &root_type, &fields);
+    if !invalid.is_empty() {
+        return Answer {
+            data: None,
+            errors: invalid,
+            traces: Vec::new(),
+        };
     }
     let mut execution = Execution {
         context,

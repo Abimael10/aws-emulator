@@ -160,14 +160,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Submitting a document is addressed at an API by its id, and the two grounds an
         // `apiId` fails on are kept apart: a value whose FORM is none this service could
-        // ever have issued (`crate::state::is_opaque_id`) names no API at all, so the
+        // ever have issued for an API (`crate::state::is_issued_api_reference` — neither
+        // the opaque id it mints nor the ARN built on one) names no API at all, so the
         // request itself is malformed and the refusal carries the rejected value; a value
-        // of the form the service issues is a reference it could have handed out, so the
+        // of a form the service issues is a reference it could have handed out, so the
         // request is well formed and an API this account no longer holds — one deleted
         // earlier, say — is the missing resource it is, reported with the fixed sentence
         // every operation resolving an `apiId` states it with. This test is on the form of
         // the reference alone, so it is answered before the store is consulted.
-        if !crate::state::is_opaque_id(&input.api_id) {
+        if !crate::state::is_issued_api_reference(&input.api_id) {
             return Err(StartSchemaCreationErrorModeled::BadRequestException(
                 BadRequestException {
                     message: Some(crate::state::invalid_api_id_message(&input.api_id)),
@@ -188,9 +189,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // left behind.
         guard.settle_schema_creations(now);
 
-        // The form of the id was settled above, so a miss here is an API this account
-        // does not hold: the resource is absent, not the request malformed.
-        let Some(api) = guard.graphql_apis.get(&input.api_id) else {
+        // The form of the reference was settled above, so a miss here is an API this
+        // account does not hold: the resource is absent, not the request malformed. The
+        // API's OWN id is what the types this creation installs are named under, whichever
+        // form the request addressed it in.
+        let Some(api_id) = guard.graphql_apis.api_id_of(&input.api_id) else {
+            return Err(StartSchemaCreationErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+        let Some(api) = guard.graphql_apis.get(&api_id) else {
             return Err(StartSchemaCreationErrorModeled::NotFoundException(
                 NotFoundException {
                     message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
@@ -236,7 +247,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             arn: ::engine::emulator_arn(
                                 crate::state::ARN_SERVICE,
                                 &region,
-                                &crate::state::type_resource(&input.api_id, &parsed.name),
+                                &crate::state::type_resource(&api_id, &parsed.name),
                             ),
                             definition,
                             parsed,
@@ -251,11 +262,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The operation is asynchronous, so the call SCHEDULES the creation and answers
         // the non-terminal state the API is left in; the clock performs it, and
         // `GetSchemaCreationStatus` is what reports that it has.
-        let Some(api) = guard.graphql_apis.get_mut(&input.api_id) else {
+        let Some(api) = guard.graphql_apis.get_mut(&api_id) else {
             // Unreachable: the lookup above resolved this very key under the same lock.
             return Err(StartSchemaCreationErrorModeled::InternalFailureException(
                 InternalFailureException {
-                    message: Some(format!("the appsync store lost API {}", input.api_id)),
+                    message: Some(format!("the appsync store lost API {api_id}")),
                 },
             )
             .into());

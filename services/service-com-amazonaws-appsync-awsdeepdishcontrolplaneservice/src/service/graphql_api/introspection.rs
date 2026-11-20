@@ -56,6 +56,17 @@ pub fn is_introspection_type(type_name: &str) -> bool {
     )
 }
 
+/// Whether `field_name` is a field the INTROSPECTION SYSTEM adds rather than one a schema
+/// declares: GraphQL reserves every name beginning with [`RESERVED_PREFIX`] for that system,
+/// so no schema declares one and a document selecting one is selecting no field of the
+/// API's own type system.
+pub fn is_introspection_field(field_name: &str) -> bool {
+    field_name.starts_with(RESERVED_PREFIX)
+}
+
+/// The prefix GraphQL reserves for the names its type and introspection systems define.
+const RESERVED_PREFIX: &str = "__";
+
 /// The type one field of an introspection type resolves to, as GraphQL's introspection
 /// schema declares it, or `None` for a field that resolves to a scalar (or for a type this
 /// is not asked about) — which carries no sub-selection and so needs no type to project it

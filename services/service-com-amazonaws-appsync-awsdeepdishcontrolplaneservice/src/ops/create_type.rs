@@ -156,8 +156,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // An `apiId` that is not an API id at all is a malformed request, not a
-        // missing resource (see `crate::state::is_api_id`).
+        // An `apiId` that names no API at all — neither the id AppSync minted nor the ARN
+        // built on it — is a malformed request, not a missing resource
+        // (see `crate::state::is_api_id`).
         if !crate::state::is_api_id(&input.api_id) {
             return Err(CreateTypeErrorModeled::BadRequestException(BadRequestException {
                 message: Some(crate::state::invalid_api_id_message(&input.api_id)),
@@ -236,12 +237,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let name = parsed.name.clone();
+        // The type's ARN is built under the API's OWN id, whichever form the request
+        // addressed the API in.
+        let api_id = api.api_id.clone();
         let record = crate::state::TypeRecord {
             seq,
             arn: ::engine::emulator_arn(
                 crate::state::ARN_SERVICE,
                 &region,
-                &crate::state::type_resource(&input.api_id, &name),
+                &crate::state::type_resource(&api_id, &name),
             ),
             // The SDL the caller wrote is kept as it arrived, so an SDL report answers
             // the definition that was created rather than a re-spelling of it.

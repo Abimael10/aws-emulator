@@ -168,25 +168,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rather than on the domain the path addresses.
         // An `apiId` is ONE identifier space over both API resource families — a
         // `GraphqlApi` and an `Api` are created by operations of their own — and either
-        // is mapped onto a custom domain through this same path, so the id is resolved
-        // against both stores and only an id that names no API at all is absent.
-        let visibility = guard
-            .graphql_apis
-            .get(&input.api_id)
-            .map(|api| api.visibility.clone());
-        let api_exists = visibility.is_some() || guard.event_apis.contains_key(&input.api_id);
+        // is mapped onto a custom domain through this same path, so the reference is
+        // resolved against both stores, in either form AppSync publishes an API's
+        // identity in (its id and the ARN built on it), and only a reference that names
+        // no API at all is absent.
+        let graphql_api = guard.graphql_apis.get(&input.api_id);
+        let visibility = graphql_api.map(|api| api.visibility.clone());
+        // The mapping records the API's OWN id, so the association reads back the same
+        // way whichever form the request named the API in.
+        let associated_api_id = graphql_api
+            .map(|api| api.api_id.clone())
+            .or_else(|| {
+                guard
+                    .event_apis
+                    .get(&input.api_id)
+                    .map(|api| api.api_id.clone())
+            });
 
         // An `apiId` that resolves to no API is not a missing resource on this
         // operation: the mapping asks for an API this account does not hold, which is
         // the malformed request `BadRequestException` states, naming the value that was
         // refused. This operation's `NotFoundException` is the custom domain's.
-        if !api_exists {
+        let Some(associated_api_id) = associated_api_id else {
             return Err(AssociateApiErrorModeled::BadRequestException(BadRequestException {
                 message: Some(crate::state::invalid_api_id_message(&input.api_id)),
                 ..Default::default()
             })
             .into());
-        }
+        };
         // "Private APIs can not be associated with custom domains"
         // (`AssociateApiRequest$apiId`): an API reachable only from inside a VPC is not
         // served through a custom domain, so the mapping is refused rather than stored.
@@ -227,7 +236,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the domain carried: a custom domain is mapped onto one API at a time, and
         // deploying the new mapping is what the status reports.
         domain.api_association = Some(crate::state::ApiAssociationRecord::new(
-            input.api_id.clone(),
+            associated_api_id,
             now,
         ));
 

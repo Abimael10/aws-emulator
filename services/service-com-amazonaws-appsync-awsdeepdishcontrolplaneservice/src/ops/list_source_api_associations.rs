@@ -162,10 +162,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // An `apiId` that is not an API id at all is a malformed request, not a missing
-        // resource: it is refused BEFORE the lookup, with the modelled
-        // `BadRequestException` (400). `NotFoundException` (404) is reserved for an id
-        // that could name an API but names none.
+        // An `apiId` that names no API at all — neither the id AppSync minted nor the ARN
+        // built on it — is a malformed request, not a missing resource: it is refused
+        // BEFORE the lookup, with the modelled `BadRequestException` (400).
+        // `NotFoundException` (404) is reserved for a reference that could name an API but
+        // names none.
         if !crate::state::is_api_id(&input.api_id) {
             return Err(ListSourceApiAssociationsErrorModeled::BadRequestException(
                 BadRequestException {
@@ -184,16 +185,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and the merge state reported here is the one every other reader sees.
         guard.settle_associations(std::time::SystemTime::now());
 
-        if !guard.graphql_apis.contains_key(&input.api_id) {
+        // Resolved to the API's OWN id, which is the id its associations name it by, so a
+        // call addressed by the API's ARN lists what one addressed by its id lists.
+        let Some(api_id) = guard.graphql_apis.api_id_of(&input.api_id) else {
             return Err(ListSourceApiAssociationsErrorModeled::NotFoundException(
                 NotFoundException {
                     message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());
-        }
+        };
 
-        let ordered = guard.associations_of_api(&input.api_id);
+        let ordered = guard.associations_of_api(&api_id);
         let Some(page) = crate::state::paginate(
             &ordered,
             |association| association.association_id.as_str(),

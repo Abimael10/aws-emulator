@@ -159,8 +159,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // An `apiId` that is not an API id at all is a malformed request, not a
-        // missing resource (see `crate::state::is_api_id`).
+        // An `apiId` that names no API at all — neither the id AppSync minted nor the ARN
+        // built on it — is a malformed request, not a missing resource
+        // (see `crate::state::is_api_id`).
         if !crate::state::is_api_id(&input.api_id) {
             return Err(DeleteGraphqlApiErrorModeled::BadRequestException(BadRequestException {
                 message: Some(crate::state::invalid_api_id_message(&input.api_id)),
@@ -176,18 +177,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Decide against the association state of THIS instant: an association whose
         // deletion the clock has already made due holds nothing any more.
         guard.settle_associations(std::time::SystemTime::now());
-        if !guard.graphql_apis.contains_key(&input.api_id) {
+        // Resolved to the API's OWN id, the id every record held under the API is keyed
+        // by, so a delete addressed by the API's ARN removes exactly what one addressed
+        // by its id removes.
+        let Some(api_id) = guard.graphql_apis.api_id_of(&input.api_id) else {
             return Err(DeleteGraphqlApiErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
             })
             .into());
-        }
+        };
 
         // An association cannot outlive either side, and AppSync will not leave a
         // Merged API pointing at a source API that is gone: while this API is still a
         // source API of a Merged API, the deletion is refused and the caller is left to
         // disassociate it first.
-        if guard.is_source_api_of_a_merged_api(&input.api_id) {
+        if guard.is_source_api_of_a_merged_api(&api_id) {
             return Err(DeleteGraphqlApiErrorModeled::BadRequestException(BadRequestException {
                 message: Some(crate::state::API_ASSOCIATED_TO_MERGED_API_MESSAGE.to_string()),
                 ..Default::default()
@@ -195,16 +199,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        guard.graphql_apis.remove(&input.api_id);
-        guard.remove_api_associations(&input.api_id);
+        guard.graphql_apis.remove(&api_id);
+        guard.remove_api_associations(&api_id);
         // The socket the API's real-time endpoint was served on goes with the record:
         // dropping the listener closes the port and severs every connection on it, which
         // is what makes a deleted API stop answering where it published
         // ([`crate::service::graphql_api`]).
-        guard.graphql_data_plane.forget_api(&input.api_id);
+        guard.graphql_data_plane.forget_api(&api_id);
         // And so do the authorization decisions its Lambda authorizer had taken: an API that
         // is gone decides nothing, so no window of one of its decisions outlives it.
-        guard.lambda_authorizer_cache.forget_api(&input.api_id);
+        guard.lambda_authorizer_cache.forget_api(&api_id);
 
         Ok(DeleteGraphqlApiOutput {})
     }

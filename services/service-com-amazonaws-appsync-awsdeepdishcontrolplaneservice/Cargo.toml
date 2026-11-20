@@ -191,6 +191,10 @@ aws-sdk-secretsmanager = { version = "1", default-features = false, features = [
 # Certificate Manager, so a case's expectation rests on a certificate whose subject
 # alternative names that service really holds rather than on a hand-written record.
 rcgen = "0.13"
+# RFC 3986 percent-encoding, so the API-identifier suite can put a whole API ARN in the
+# single non-greedy `{apiId}` path segment the way an AWS SDK does, rather than escaping it
+# by hand.
+percent-encoding = "2.3"
 # The owners of what an `AMAZON_EVENTBRIDGE` data source publishes onto, mounted beside this
 # service in the EventBridge data-source suite: EventBridge holds the bus and the rules that
 # route each event, and Amazon SQS the queue a rule targets — which is where a case reads a

@@ -412,7 +412,7 @@ fn addressed(
             })
         }
         // One side's API, named by either form its `…Identifier` label admits
-        // ([`crate::state::is_api_identifier`]): an ARN is already the whole resource, an
+        // ([`crate::state::is_api_id`]): an ARN is already the whole resource, an
         // API id is the resource portion of one.
         Some("mergedApis" | "sourceApis") => match segment(2) {
             Some(identifier) if identifier.starts_with(crate::state::ARN_PREFIX) => {
