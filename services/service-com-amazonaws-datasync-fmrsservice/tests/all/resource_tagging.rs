@@ -7,7 +7,8 @@
 //! put them there, a create that carried `Tags` or a later `TagResource` — `TagResource`
 //! applies tags by KEY (a key already held has its value replaced, never repeated),
 //! `UntagResource` removes the keys it names and nothing else, and an ARN that resolves to
-//! no resource this account holds is refused rather than answered.
+//! no resource this account holds is refused rather than answered — by this surface's one
+//! generic not-found class and fixed wording, whatever kind of resource the ARN addresses.
 //!
 //! Every case goes through the same front door a client uses: `POST /` with
 //! `X-Amz-Target: FmrsService.<Operation>` and an `awsJson1_1` body, dispatched by the
@@ -23,11 +24,21 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The region every request in this suite signs for.
 const SIGNED_REGION: &str = "us-west-2";
 
-/// The class a refusal naming a transfer location this account does not hold carries.
-const LOCATION_NOT_FOUND: &str = "LocationNotFound";
+/// The class a refusal of the TAGGING surface naming a resource this account does not hold
+/// carries, whatever kind of resource the ARN addresses.
+const NOT_FOUND: &str = "NotFound";
 
-/// The class a refusal naming a transfer task this account does not hold carries.
+/// The whole message that refusal is worded with: fixed text, with no variable slot — it
+/// names neither the ARN the request carried nor the kind of resource it addresses.
+const NOT_FOUND_MESSAGE: &str = "Not found";
+
+/// The class an operation of the TASK surface — one whose own addressed resource is the
+/// task — reports for a task this account does not hold, which is NOT the tagging surface's
+/// generic class.
 const SYNC_SET_NOT_FOUND: &str = "SyncSetNotFound";
+
+/// The same, for an operation of the LOCATION surface.
+const LOCATION_NOT_FOUND: &str = "LocationNotFound";
 
 /// The most tags one resource holds, the ceiling a tagging call is refused past.
 const MAX_TAGS_PER_RESOURCE: usize = 50;
@@ -546,99 +557,194 @@ async fn list_tags_for_resource_pages_in_application_order() {
     }
 }
 
-/// RULE: a tagging call reports STATE — an ARN that resolves to no resource this account
-/// holds is refused by all three tagging operations, under the class the kind of resource it
-/// addresses has, and a resource resolves until it is deleted.
+/// Every tagging operation, with a body naming `arn` as its `ResourceArn`.
+fn tagging_calls(arn: &str) -> [(&'static str, Value); 3] {
+    [
+        ("ListTagsForResource", json!({ "ResourceArn": arn })),
+        (
+            "TagResource",
+            json!({ "ResourceArn": arn, "Tags": tag_list(&[("stage", "canary")]) }),
+        ),
+        (
+            "UntagResource",
+            json!({ "ResourceArn": arn, "Keys": ["stage"] }),
+        ),
+    ]
+}
+
+/// RULE: the tagging surface addresses every kind of resource through one `ResourceArn`, so
+/// an ARN that resolves to no resource this account holds earns ONE generic refusal from all
+/// three tagging operations — the same class in both code members and the same fixed
+/// message — whatever kind of resource the ARN addresses.
 ///
-/// The rows span the kinds of resource the modelled `TaggableResourceArn` admits: a
-/// location, a task, an execution nested under its task, and an agent — a kind this service
-/// holds no record of at all.
+/// The rows span the kinds the modelled `TaggableResourceArn` pattern admits within its
+/// 128-character ceiling (a location, a task, an execution nested under its task, an agent
+/// and a storage system — the last two kinds this service holds no record of at all), which
+/// ids they name, and which account the ARN is of.
 #[tokio::test]
-async fn tagging_refuses_an_arn_that_resolves_to_no_held_resource() {
+async fn tagging_refuses_every_unheld_resource_kind_with_one_generic_not_found() {
     let router = service();
 
-    // (case, the ARN the request carries, the class, the noun the message names)
-    let rows: [(&str, String, Option<&str>, &str); 5] = [
+    // (case, the ARN the request carries)
+    let rows: [(&str, String); 7] = [
         (
             "an unheld location",
             never_minted("location/loc-0abcdef1234567890"),
-            Some(LOCATION_NOT_FOUND),
-            "Location",
         ),
         (
             "another unheld location",
             never_minted("location/loc-1234567890abcdef0"),
-            Some(LOCATION_NOT_FOUND),
-            "Location",
         ),
         (
             "an unheld task",
             never_minted("task/task-0abcdef1234567890"),
-            Some(SYNC_SET_NOT_FOUND),
-            "Task",
         ),
         (
             "an unheld execution of an unheld task",
             never_minted("task/task-0abcdef1234567890/execution/exec-0123456789abcdef0"),
-            None,
-            "Task execution",
         ),
         (
             "an agent, a kind this service holds none of",
             never_minted("agent/agent-0abcdef1234567890"),
-            None,
-            "Agent",
+        ),
+        (
+            "a storage system, a kind this service holds none of",
+            never_minted("system/storage-system-0123abcd-4567-89ef-0123-456789abcdef"),
+        ),
+        (
+            "a task of another account",
+            format!(
+                "arn:aws:datasync:{SIGNED_REGION}:210987654321:task/task-0abcdef1234567890"
+            ),
         ),
     ];
 
-    for (case, arn, class, noun) in &rows {
-        let message = format!("{noun} {arn} is not found.");
-        for (operation, body) in [
-            ("ListTagsForResource", json!({ "ResourceArn": arn })),
-            (
-                "TagResource",
-                json!({ "ResourceArn": arn, "Tags": tag_list(&[("stage", "canary")]) }),
-            ),
-            (
-                "UntagResource",
-                json!({ "ResourceArn": arn, "Keys": ["stage"] }),
-            ),
-        ] {
-            refused(&router, operation, body, *class, &message, case).await;
+    for (case, arn) in &rows {
+        for (operation, body) in tagging_calls(arn) {
+            refused(
+                &router,
+                operation,
+                body,
+                Some(NOT_FOUND),
+                NOT_FOUND_MESSAGE,
+                case,
+            )
+            .await;
         }
     }
+}
 
-    // A location this service minted resolves, and stops resolving once it is deleted —
-    // along with the tags it held.
-    let arn = given_s3_location(
+/// RULE: the same refusal reports STATE, not the shape of an ARN — a resource this service
+/// minted is tagged and read, and the SAME ARN earns the generic not-found refusal from
+/// every tagging operation once the resource is deleted, while an operation of the surface
+/// that OWNS that kind of resource keeps reporting its own class for it.
+///
+/// The rows differ along the kind of resource deleted — a transfer location and a transfer
+/// task — and so along which owning surface's class the contrast is drawn against.
+#[tokio::test]
+async fn tagging_refuses_a_deleted_resource_generically_whatever_its_own_surface_reports() {
+    let router = service();
+
+    let location = given_s3_location(
         &router,
         "tagging-deleted",
         tag_list(&[("environment", "staging")]),
         "a deleted location",
     )
     .await;
-    let listed = tags_of(&router, &arn, "a deleted location").await;
-    assert_eq!(
-        listed,
-        vec![("environment".to_string(), "staging".to_string())],
-        "case \"a deleted location\": expected the tag the create carried, got {listed:?}"
-    );
-    ok(
+    let task = given_task(
         &router,
-        "DeleteLocation",
-        json!({ "LocationArn": &arn }),
-        "a deleted location",
+        "tagging-deleted-task",
+        tag_list(&[("tier", "gold")]),
+        "a deleted task",
     )
     .await;
-    refused(
-        &router,
-        "ListTagsForResource",
-        json!({ "ResourceArn": &arn }),
-        Some(LOCATION_NOT_FOUND),
-        &format!("Location {arn} is not found."),
-        "a deleted location",
-    )
-    .await;
+
+    // One resource of a kind this service holds, with the surface that owns that kind.
+    struct Deleted<'a> {
+        case: &'a str,
+        arn: &'a str,
+        /// The one tag the create carried, which the first read must report.
+        created: (&'a str, &'a str),
+        /// The delete that removes it: its operation and the member naming the resource.
+        deleting: (&'a str, &'a str),
+        /// A read of the surface that owns the kind, the same way.
+        reading: (&'a str, &'a str),
+        /// The class and whole wording THAT surface reports once the resource is gone.
+        own_class: &'a str,
+        own_message: String,
+    }
+
+    let rows: [Deleted; 2] = [
+        Deleted {
+            case: "a deleted location",
+            arn: &location,
+            created: ("environment", "staging"),
+            deleting: ("DeleteLocation", "LocationArn"),
+            reading: ("DescribeLocationS3", "LocationArn"),
+            own_class: LOCATION_NOT_FOUND,
+            own_message: format!("Location {location} is not found."),
+        },
+        Deleted {
+            case: "a deleted task",
+            arn: &task,
+            created: ("tier", "gold"),
+            deleting: ("DeleteTask", "TaskArn"),
+            reading: ("DescribeTask", "TaskArn"),
+            own_class: SYNC_SET_NOT_FOUND,
+            own_message: format!(
+                "Task {} is not found.",
+                task.rsplit('/').next().unwrap_or(task.as_str())
+            ),
+        },
+    ];
+
+    for row in &rows {
+        let case = row.case;
+        // While the resource is held, its tags read back and a tagging call is served.
+        let listed = tags_of(&router, row.arn, case).await;
+        assert_eq!(
+            listed,
+            vec![(row.created.0.to_string(), row.created.1.to_string())],
+            "case {case:?}: expected the tag the create carried, got {listed:?}"
+        );
+
+        let (delete_operation, delete_member) = row.deleting;
+        ok(
+            &router,
+            delete_operation,
+            json!({ delete_member: row.arn }),
+            case,
+        )
+        .await;
+
+        // Deleting it is what makes the refusal due, and every tagging operation reports it
+        // in the one generic class and wording.
+        for (operation, body) in tagging_calls(row.arn) {
+            refused(
+                &router,
+                operation,
+                body,
+                Some(NOT_FOUND),
+                NOT_FOUND_MESSAGE,
+                case,
+            )
+            .await;
+        }
+
+        // The surface that owns the kind of resource still reports its own class for the
+        // same ARN: the generic class belongs to the tagging surface, not to the state.
+        let (read_operation, read_member) = row.reading;
+        refused(
+            &router,
+            read_operation,
+            json!({ read_member: row.arn }),
+            Some(row.own_class),
+            &row.own_message,
+            case,
+        )
+        .await;
+    }
 }
 
 /// RULE: one resource's tag list is bounded, so a call that would take it past the ceiling

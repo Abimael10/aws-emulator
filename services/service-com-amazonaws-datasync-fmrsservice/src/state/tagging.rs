@@ -20,9 +20,24 @@
 
 use crate::ops::types::{InvalidRequestException, TagListEntry};
 
-use super::{
-    ComAmazonawsDatasyncFmrsserviceState, LOCATION_NOT_FOUND_CODE, SYNC_SET_NOT_FOUND_CODE,
-};
+use super::ComAmazonawsDatasyncFmrsserviceState;
+
+/// The class discriminator the TAGGING surface reports for a `ResourceArn` that resolves to
+/// no resource this account holds.
+///
+/// That surface addresses every kind of this service's resources through one member of one
+/// shape, and knows a resource only as "the thing this ARN names", so its not-found refusal
+/// is the generic one: one class and one wording whatever kind the ARN addresses, where an
+/// operation whose own addressed resource is a task or a location reports that surface's own
+/// class instead ([`super::SYNC_SET_NOT_FOUND_CODE`],
+/// [`super::LOCATION_NOT_FOUND_CODE`]). Carried by both code members of the modelled client
+/// error, like every other refusal class of this service.
+pub const NOT_FOUND_CODE: &str = "NotFound";
+
+/// How the tagging surface words that refusal: fixed text with no variable part, naming
+/// neither the ARN the request carried, the kind of resource it addresses, nor the request
+/// member that held it.
+pub const NOT_FOUND_MESSAGE: &str = "Not found";
 
 /// A RESOURCE GUARD on one resource's tag list, and the published ceiling the modelled
 /// shapes agree with: `InputTagList` admits at most 50 entries in one `TagResource`
@@ -72,28 +87,6 @@ impl TaggableKind {
             Self::Agent
         }
     }
-
-    /// How a refusal names this kind of resource.
-    fn described(self) -> &'static str {
-        match self {
-            Self::Agent => "Agent",
-            Self::Location => "Location",
-            Self::Task => "Task",
-            Self::TaskExecution => "Task execution",
-            Self::StorageSystem => "Storage system",
-            Self::DiscoveryJob => "Discovery job",
-        }
-    }
-
-    /// The class discriminator a refusal naming a resource of this kind the account does
-    /// not hold carries, where this service has one for the kind.
-    fn not_found_code(self) -> Option<&'static str> {
-        match self {
-            Self::Location => Some(LOCATION_NOT_FOUND_CODE),
-            Self::Task => Some(SYNC_SET_NOT_FOUND_CODE),
-            _ => None,
-        }
-    }
 }
 
 /// Why a tagging call against this service's state was refused.
@@ -111,16 +104,14 @@ pub struct TagRefusal {
 impl TagRefusal {
     /// The refusal a `ResourceArn` that names no resource this account holds earns.
     ///
-    /// The tagging surface addresses ANY kind of this service's resources, by the ARN
-    /// the request carried, so that is what the message names — and the class is the one
-    /// the kind of resource the ARN addresses has.
-    pub fn not_found(kind: TaggableKind, arn: &str) -> Self {
+    /// The tagging surface addresses ANY kind of this service's resources through the one
+    /// `ResourceArn` member, so it does not report on a kind of resource at all: the
+    /// refusal is the one generic not-found class, worded the same whichever kind the ARN
+    /// addresses and naming neither the kind nor the ARN.
+    pub fn not_found() -> Self {
         Self {
-            message: format!(
-                "{described} {arn} is not found.",
-                described = kind.described()
-            ),
-            error_code: kind.not_found_code().map(str::to_string),
+            message: NOT_FOUND_MESSAGE.to_string(),
+            error_code: Some(NOT_FOUND_CODE.to_string()),
         }
     }
 
@@ -162,8 +153,7 @@ impl ComAmazonawsDatasyncFmrsserviceState {
             // No store holds a resource of these kinds, so no ARN of one resolves.
             TaggableKind::StorageSystem | TaggableKind::DiscoveryJob => None,
         };
-        held.map(Vec::as_slice)
-            .ok_or_else(|| TagRefusal::not_found(kind, arn))
+        held.map(Vec::as_slice).ok_or_else(TagRefusal::not_found)
     }
 
     /// Those same tags, borrowed for a tagging call to write — refused in the same words
@@ -184,7 +174,7 @@ impl ComAmazonawsDatasyncFmrsserviceState {
                 .map(|execution| &mut execution.tags),
             TaggableKind::StorageSystem | TaggableKind::DiscoveryJob => None,
         };
-        held.ok_or_else(|| TagRefusal::not_found(kind, arn))
+        held.ok_or_else(TagRefusal::not_found)
     }
 }
 
