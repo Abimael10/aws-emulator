@@ -125,8 +125,21 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
             security_group_ids: new.security_group_ids,
             subnet_ids: new.subnet_ids,
             user_group_id: new.user_group_id,
-            snapshot_retention_limit: new.snapshot_retention_limit,
-            daily_snapshot_time: new.daily_snapshot_time,
+            // The snapshot posture is part of the cache the create built, so a
+            // request that configured none is stored with the service's own
+            // defaults rather than with nothing: automatic backups disabled
+            // ([`DEFAULT_SNAPSHOT_RETENTION_LIMIT`]) at the time ElastiCache
+            // assigns ([`DEFAULT_DAILY_SNAPSHOT_TIME`]). Both are then reported
+            // on the create and on every read, so a client can tell "no
+            // automatic snapshots" from a member the service did not report.
+            snapshot_retention_limit: Some(
+                new.snapshot_retention_limit
+                    .unwrap_or(DEFAULT_SNAPSHOT_RETENTION_LIMIT),
+            ),
+            daily_snapshot_time: Some(
+                new.daily_snapshot_time
+                    .unwrap_or_else(|| DEFAULT_DAILY_SNAPSHOT_TIME.to_string()),
+            ),
             network_type: new.network_type,
             connection_type: new.connection_type,
             endpoint_address,

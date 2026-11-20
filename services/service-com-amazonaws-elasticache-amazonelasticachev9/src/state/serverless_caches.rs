@@ -105,6 +105,21 @@ pub const SERVERLESS_SNAPSHOT_MAX_RESULTS_MAX: i32 = 50;
 /// value allowed is 35 days."
 pub const MAX_SNAPSHOT_RETENTION_LIMIT: i32 = 35;
 
+/// The `DailySnapshotTime` a serverless cache is created with when the request
+/// names none.
+///
+/// A cache that configures no snapshots still carries a time of day for them —
+/// the recorded create answers with one — and ElastiCache assigns it: "If you do
+/// not specify this parameter, ElastiCache automatically chooses an appropriate
+/// time range" (`SnapshotWindow`). The emulator assigns one FIXED time instead
+/// of inventing a per-cache random one, the same way
+/// [`DEFAULT_MAINTENANCE_WINDOW`] is chosen, and this is the hour that member's
+/// own example (`05:00-09:00`) starts at. It is stored on the record the create
+/// writes, so a client reading `ServerlessCache$DailySnapshotTime` back gets
+/// what the create answered with; a time the request names itself is its own
+/// wall clock's ([`is_daily_snapshot_time`]).
+pub const DEFAULT_DAILY_SNAPSHOT_TIME: &str = "05:00";
+
 /// The bounds a `DataStorage` limit must be within, and the value that removes
 /// the limit instead.
 ///
@@ -567,12 +582,21 @@ pub struct ServerlessCacheRecord {
     /// `sse-kms` for a customer-managed key, else `sse-elasticache`; see
     /// [`STORAGE_ENCRYPTION_SSE_ELASTICACHE`].
     pub storage_encryption_type: String,
+    /// The VPC security groups that guard the cache's endpoint: the ones the
+    /// request named, or — "if no other information is given this will be the
+    /// VPC's Default Security Group that is associated with the cluster VPC
+    /// end-point" (`CreateServerlessCache$SecurityGroupIds`) — the default group
+    /// of the VPC the cache is placed in, as EC2 reports it.
     pub security_group_ids: Vec<String>,
     /// The subnets the cache's VPC endpoint is deployed in: the ones the request
     /// named, or the defaults ElastiCache selects; see [`DEFAULT_SUBNETS`].
     pub subnet_ids: Vec<String>,
     pub user_group_id: Option<String>,
+    /// The cache's snapshot posture, as the create stored it: the retention the
+    /// request named or [`DEFAULT_SNAPSHOT_RETENTION_LIMIT`].
     pub snapshot_retention_limit: Option<i32>,
+    /// See [`snapshot_retention_limit`](Self::snapshot_retention_limit): the
+    /// daily time the request named, or [`DEFAULT_DAILY_SNAPSHOT_TIME`].
     pub daily_snapshot_time: Option<String>,
     pub network_type: String,
     pub connection_type: String,

@@ -85,9 +85,10 @@ async fn describe_cache(emulator: &Emulator, name: &str) -> Reply {
 }
 
 /// Assert `reply` reports `case`'s resource, naming the case and the actual
-/// value on every failure. `where_from` says which response is under test, and
+/// value on every failure. `where_from` says which response is under test,
 /// `account_subnets` are the subnets the account HAS in the Region the row was
-/// created in, in Availability Zone order, as the owner of subnets reports them.
+/// created in, in Availability Zone order, as the owner of subnets reports them,
+/// and `security_groups` are the groups that must guard the cache.
 fn assert_reports_case(
     case: &CacheCase,
     where_from: &str,
@@ -202,9 +203,11 @@ fn assert_reports_case(
              {reported_subnets:?}"
         );
     }
-    // The security groups a cache reports are the ones the request named, which
-    // are groups the account HAS — their ids come from EC2, the service that owns
-    // security groups.
+    // The security groups a cache reports are the ones that guard it: the groups
+    // the request named, or — "if no other information is given this will be the
+    // VPC's Default Security Group" — the default group of the VPC it is placed
+    // in. Either way their ids come from EC2, the service that owns security
+    // groups.
     let expected_groups: Vec<&str> = security_groups.iter().map(String::as_str).collect();
     assert_eq!(
         reply.all("SecurityGroupIds/SecurityGroupId"),
@@ -334,11 +337,20 @@ async fn a_created_serverless_cache_is_read_back_from_persisted_state() {
         let emulator = Emulator::new();
         // A row that names subnets names the account's own: those are the only
         // ids `CreateServerlessCache` accepts.
-        let account_subnets: Vec<String> = emulator
+        let default_subnets: Vec<_> = emulator
             .account_subnets()
             .await
             .into_iter()
             .filter(|subnet| subnet.default_for_az)
+            .collect();
+        // The VPC the placement is in, as the owner of subnets reports it: the
+        // VPC whose default security group guards a cache that names none.
+        let placement_vpc = default_subnets
+            .first()
+            .map(|subnet| subnet.vpc.clone())
+            .expect("the account must have a default subnet to place a cache in");
+        let account_subnets: Vec<String> = default_subnets
+            .into_iter()
             .map(|subnet| subnet.id)
             .collect();
         let mut extra = params(case.extra);
@@ -364,6 +376,14 @@ async fn a_created_serverless_cache_is_read_back_from_persisted_state() {
                 id.clone(),
             )
         }));
+        // What must guard the cache: the groups the row named, or the default
+        // group of the VPC it is placed in when it named none — asked of EC2, so
+        // the expectation is the owner's id and not one written down here.
+        let expected_groups = if security_groups.is_empty() {
+            vec![emulator.default_security_group_of(&placement_vpc).await]
+        } else {
+            security_groups.clone()
+        };
         let created = create_cache_with(&emulator, case.name, &extra).await;
         assert_eq!(
             created.status,
@@ -379,7 +399,7 @@ async fn a_created_serverless_cache_is_read_back_from_persisted_state() {
             &created,
             state::SERVERLESS_STATUS_CREATING,
             &account_subnets,
-            &security_groups,
+            &expected_groups,
         );
         assert_eq!(
             created.text("ServerlessCache/ARN"),
@@ -422,7 +442,7 @@ async fn a_created_serverless_cache_is_read_back_from_persisted_state() {
             &described,
             state::SERVERLESS_STATUS_AVAILABLE,
             &account_subnets,
-            &security_groups,
+            &expected_groups,
         );
         assert!(
             described.text("CreateTime").is_some(),

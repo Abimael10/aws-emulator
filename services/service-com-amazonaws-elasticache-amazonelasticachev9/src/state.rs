@@ -330,6 +330,11 @@ pub const DEFAULT_NUM_CACHE_NODES: i32 = 1;
 /// when the request names none: the member documents "Default: 0 (i.e.,
 /// automatic backups are disabled for this cache cluster)". It is "only valid if
 /// the Engine parameter is redis", so a Memcached cluster carries none.
+///
+/// A SERVERLESS cache takes the same default whatever its engine, because
+/// snapshots there are "available for Valkey, Redis OSS and Serverless
+/// Memcached" (`CreateServerlessCache$SnapshotRetentionLimit`); see
+/// [`ComAmazonawsElasticacheAmazonelasticachev9State::insert_serverless_cache`].
 pub const DEFAULT_SNAPSHOT_RETENTION_LIMIT: i32 = 0;
 
 /// The weekly maintenance window a cluster is created with when the request

@@ -467,19 +467,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // account's Region, as EC2 reports them, so a later read reports subnets
         // that exist and a request may name them itself. Resolved before the
         // store is locked, because asking EC2 is a call out of this handler.
-        let selected_subnets = if requested_subnets.is_empty() {
-            crate::state::ec2_subnets::default_subnets(
+        // The VPC comes off the same records, because the placement decides
+        // which VPC's groups may guard this cache.
+        let (selected_subnets, placement_vpc): (Vec<String>, String) = if requested_subnets
+            .is_empty()
+        {
+            let selected = crate::state::ec2_subnets::default_subnets(
                 ctx,
                 &region,
                 crate::state::default_subnet_count(&region),
             )
-            .await
-            .into_iter()
-            .map(|subnet| subnet.subnet_id)
-            .collect()
+            .await;
+            let vpc = selected
+                .first()
+                .map(|subnet| subnet.vpc_id.clone())
+                .unwrap_or_default();
+            (
+                selected.into_iter().map(|subnet| subnet.subnet_id).collect(),
+                vpc,
+            )
         } else {
-            requested_subnets
+            let vpc = resolved
+                .first()
+                .map(|subnet| subnet.vpc_id.clone())
+                .unwrap_or_default();
+            (requested_subnets, vpc)
         };
+
+        // "A list of the one or more VPC security groups to be associated with
+        // the serverless cache. … If no other information is given this will be
+        // the VPC's Default Security Group that is associated with the cluster
+        // VPC end-point" (`CreateServerlessCache$SecurityGroupIds`): a cache the
+        // request names no group for is guarded by the default group of the VPC
+        // it is placed in, which is EC2's to report — so what this cache reports
+        // is the set of groups that really guards it, whether the request chose
+        // it or the service did. The groups a request DID name are stored as it
+        // named them; they were resolved against EC2 above.
+        //
+        // Nothing is invented when that question cannot be answered — no VPC on
+        // the placement's records, or EC2 not reachable to be asked: the cache
+        // then reports no group rather than an identifier nothing guards it by,
+        // which is the same fail-closed reading the resolution above takes. The
+        // request is NOT refused for it, because it named no group to refuse:
+        // `SecurityGroupIds` is optional, and the refusals this operation models
+        // are for a group the request named that the account does not have.
+        let mut security_group_ids = input.security_group_ids.unwrap_or_default();
+        if security_group_ids.is_empty() && !placement_vpc.is_empty() {
+            security_group_ids.extend(
+                crate::state::ec2_security_groups::default_security_group(
+                    ctx,
+                    &region,
+                    &placement_vpc,
+                )
+                .await,
+            );
+        }
 
         let now = ::std::time::SystemTime::now();
         // `KmsKeyId` is the "ARN of the customer managed key for encrypting the
@@ -585,7 +627,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             major_engine_version,
             cache_usage_limits: input.cache_usage_limits,
             kms_key_id,
-            security_group_ids: input.security_group_ids.unwrap_or_default(),
+            security_group_ids,
             subnet_ids: selected_subnets,
             user_group_id: input.user_group_id,
             snapshot_retention_limit: input.snapshot_retention_limit,

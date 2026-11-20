@@ -630,6 +630,40 @@ impl Emulator {
         self.security_group_named_in(REGION, name).await
     }
 
+    /// The id of the DEFAULT security group of `vpc` in `region` — the one EC2 creates with
+    /// every VPC ("your VPC automatically comes with a default security group").
+    ///
+    /// A suite asserting which groups guard a resource whose request named none asks the
+    /// OWNER which group that is, exactly where the service under test looks for it, rather
+    /// than writing an id down.
+    pub async fn default_security_group_of_in(&self, region: &str, vpc: &str) -> String {
+        let in_vpc = ::aws_sdk_ec2::types::Filter::builder()
+            .name("vpc-id")
+            .values(vpc)
+            .build();
+        let named_default = ::aws_sdk_ec2::types::Filter::builder()
+            .name("group-name")
+            .values("default")
+            .build();
+        self.ec2(region)
+            .describe_security_groups()
+            .filters(in_vpc)
+            .filters(named_default)
+            .send()
+            .await
+            .expect("EC2 must report the account's security groups")
+            .security_groups()
+            .iter()
+            .find_map(::aws_sdk_ec2::types::SecurityGroup::group_id)
+            .unwrap_or_else(|| panic!("the VPC {vpc} must come with a default security group"))
+            .to_string()
+    }
+
+    /// [`Self::default_security_group_of_in`] for [`REGION`].
+    pub async fn default_security_group_of(&self, vpc: &str) -> String {
+        self.default_security_group_of_in(REGION, vpc).await
+    }
+
     /// Delete the security group `group_id` through `ec2:DeleteSecurityGroup`, so the id
     /// becomes one the account HELD and holds no longer.
     pub async fn delete_security_group(&self, group_id: &str) {

@@ -24,6 +24,10 @@
 //! established must not be reported as attached, because the caller would then believe its
 //! cache is reachable only from a group that does not guard it.
 //!
+//! EC2 is also the answer to WHICH group guards a resource whose request named none: every
+//! VPC comes with a default security group, and that is the group such a placement gets
+//! ([`default_security_group`]).
+//!
 //! Nothing is cached: a group created a moment ago resolves at once, and one that was
 //! deleted stops resolving at once.
 
@@ -209,6 +213,65 @@ pub async fn resolved_or_refusal(
     resolve_requested_security_groups(ctx, region, &requested)
         .await
         .map_err(|unresolved| unrecognized_message(&unresolved))
+}
+
+/// The name EC2 gives the security group every VPC comes with: "your VPC automatically comes
+/// with a default security group" named `default` (Amazon VPC User Guide, "Default security
+/// groups for your VPCs"). It is the group a resource whose request names none is guarded
+/// by.
+const DEFAULT_SECURITY_GROUP_NAME: &str = "default";
+
+/// The `DescribeSecurityGroups` filters that select the DEFAULT group of ONE VPC (`vpc-id`
+/// and `group-name`, both listed by that operation's own `Filters` documentation).
+const VPC_ID_FILTER: &str = "vpc-id";
+/// See [`VPC_ID_FILTER`].
+const GROUP_NAME_FILTER: &str = "group-name";
+
+/// The id of the default security group of `vpc_id`, or `None` when EC2 reports none or
+/// could not be asked.
+///
+/// `CreateServerlessCache$SecurityGroupIds` publishes this selection — "if no other
+/// information is given this will be the VPC's Default Security Group that is associated
+/// with the cluster VPC end-point" — so a resource the request names no group for is guarded
+/// by that one, and the identifier is read off EC2's own record like every other group here
+/// rather than built from the VPC id. Nothing is reported for a VPC whose groups cannot be
+/// resolved: a group that cannot be shown to be the account's is not one a resource is
+/// guarded by.
+pub async fn default_security_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    vpc_id: &str,
+) -> Option<String> {
+    let client = super::ec2_client::ec2(ctx, region)?;
+    let in_vpc = ::aws_sdk_ec2::types::Filter::builder()
+        .name(VPC_ID_FILTER)
+        .values(vpc_id)
+        .build();
+    let named_default = ::aws_sdk_ec2::types::Filter::builder()
+        .name(GROUP_NAME_FILTER)
+        .values(DEFAULT_SECURITY_GROUP_NAME)
+        .build();
+    match client
+        .describe_security_groups()
+        .filters(in_vpc)
+        .filters(named_default)
+        .send()
+        .await
+    {
+        Ok(output) => output
+            .security_groups()
+            .iter()
+            .find_map(|group| group.group_id().map(str::to_string)),
+        Err(error) => {
+            ::tracing::warn!(
+                %region,
+                %vpc_id,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the default security group of the VPC could not be resolved against EC2"
+            );
+            None
+        }
+    }
 }
 
 /// How ElastiCache words a request naming security groups the account does not have:
