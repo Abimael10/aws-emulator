@@ -14,9 +14,12 @@
 //! through `DescribeAlarms`, and every refused one is shown to be absent from it.
 //!
 //! Every ACCEPTED row's actions name the Region its request is signed for, because an action
-//! in another Region is refused on its own account (`alarm_action_region.rs`); the refused
-//! rows show this precondition is reported first, including for an action in another partition
-//! and Region.
+//! in another Region is refused on its own account (`alarm_action_region.rs`), and every
+//! action of a vendor whose actions CloudWatch carries out itself names one of that vendor's
+//! own actions, because a relative id naming none of them is refused on its own account too
+//! (`alarm_action_relative_id.rs`). Both are read off the action ARN alone, so they are
+//! answered ahead of this precondition; the refused rows here keep the action ARN valid and
+//! vary what the alarm watches, including an action in another PARTITION.
 
 use crate::harness::{build_router, call, error_code, ok};
 use serde_json::{json, Value};
@@ -179,11 +182,11 @@ async fn an_ec2_instance_action_is_refused_when_the_metric_is_not_per_instance()
             }),
         ),
         (
-            "an EC2 action in another partition and region".to_string(),
+            "an EC2 action in another partition".to_string(),
             json!({
                 "Namespace": "AWS/EC2",
                 "MetricName": "CPUUtilization",
-                "AlarmActions": ["arn:aws-us-gov:automate:us-gov-west-1:ec2:stop"],
+                "AlarmActions": ["arn:aws-us-gov:automate:us-east-1:ec2:stop"],
             }),
         ),
         (
@@ -317,13 +320,11 @@ async fn an_alarm_whose_metrics_name_an_instance_keeps_its_ec2_actions() {
             }),
         ),
         (
-            "an SWF action that is not an EC2 instance action".to_string(),
+            "an SSM OpsItem action on a metric with no InstanceId dimension".to_string(),
             json!({
                 "Namespace": "Custom",
                 "MetricName": "Depth",
-                "AlarmActions": [
-                    "arn:aws:swf:us-east-1:123456789012:action/actions/AWS_SNS.Publish/1.0"
-                ],
+                "AlarmActions": ["arn:aws:ssm:us-east-1:123456789012:opsitem:3"],
             }),
         ),
         (

@@ -14,6 +14,12 @@
 //! which the alarm writers read the same ARNs with) and the one place that performs it
 //! ([`execute`]).
 //!
+//! Because an ARN of either of those two vendors names an OPERATION out of that fixed set
+//! rather than a resource the caller created, an ARN whose relative id names none of the four
+//! names nothing that could ever be carried out: [`unknown_relative_id_error`] is the one
+//! reading that says so, and the alarm writer refuses such a request rather than storing an
+//! action that can never run.
+//!
 //! WHICH instance is read off the alarm's own metric: an EC2 instance action is accepted only
 //! on an alarm every one of whose watched metrics is dimensioned by
 //! [`INSTANCE_ID_DIMENSION`] (`crate::ops::put_metric_alarm`), so the instance the action acts
@@ -69,22 +75,33 @@ pub enum Ec2InstanceAction {
     Recover,
 }
 
-/// The four actions beside the verb each is written with, which is both what an ARN is read
-/// against and what one is reported by.
-const EC2_INSTANCE_ACTIONS: [(&str, Ec2InstanceAction); 4] = [
-    ("stop", Ec2InstanceAction::Stop),
-    ("terminate", Ec2InstanceAction::Terminate),
-    ("reboot", Ec2InstanceAction::Reboot),
-    ("recover", Ec2InstanceAction::Recover),
+/// The four actions, in the order a refusal that names the whole set LISTS them, which is the
+/// order the service lists them in. The ONE enumeration of the four: what an ARN's relative id
+/// is read against, and what a refusal reports, both come from here.
+const EC2_INSTANCE_ACTIONS: [Ec2InstanceAction; 4] = [
+    Ec2InstanceAction::Stop,
+    Ec2InstanceAction::Terminate,
+    Ec2InstanceAction::Recover,
+    Ec2InstanceAction::Reboot,
 ];
 
 impl Ec2InstanceAction {
     /// The action `verb` names, or `None` when it names none of the four.
     fn of_verb(verb: &str) -> Option<Self> {
         EC2_INSTANCE_ACTIONS
-            .iter()
-            .find(|(known, _)| verb.eq_ignore_ascii_case(known))
-            .map(|(_, action)| *action)
+            .into_iter()
+            .find(|action| verb.eq_ignore_ascii_case(action.name()))
+    }
+
+    /// The name this action is written with, as the documented action values spell it: the
+    /// Simple Workflow form's spelling, which the `automate` form writes in lower case.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Stop => "Stop",
+            Self::Terminate => "Terminate",
+            Self::Reboot => "Reboot",
+            Self::Recover => "Recover",
+        }
     }
 }
 
@@ -108,26 +125,119 @@ struct Named<'arn> {
 
 /// `arn` read as an EC2 instance action: which action, and the region segment it names.
 fn named(arn: &str) -> Option<Named<'_>> {
-    // `arn:<partition>:<vendor>:<region>:<account>:<resource>`, resource last so a resource
-    // carrying `:` stays whole.
-    let mut segments = arn.splitn(6, ':');
-    if segments.next() != Some("arn") {
+    // Read through the ONE ARN parse this emulator has
+    // (`arn:<partition>:<vendor>:<region>:<account>:<resource>`, the resource keeping every
+    // colon it carries), so the vendor and the relative id this module judges are the fields
+    // every other reader of an ARN sees.
+    let parsed = ::service_common::arn::parse(arn)?;
+    let vendor = ActionVendor::of_vendor(parsed.vendor)?;
+    let action = vendor.action_of(&parsed)?;
+    Some(Named {
+        action,
+        region: parsed.region,
+    })
+}
+
+/// A vendor whose actions CloudWatch CARRIES OUT itself instead of delivering a message to a
+/// target resource, so an ARN of that vendor names an operation out of a fixed set rather than
+/// a resource the caller created.
+///
+/// Both forms of the four EC2 instance actions are written this way
+/// (`PutMetricAlarmInput$AlarmActions`), so the relative id of such an ARN is read — and
+/// judged — against the set of relative ids the vendor publishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionVendor {
+    /// `arn:aws:automate:<region>:ec2:<verb>`.
+    Automate,
+    /// `arn:aws:swf:<region>:<account-id>:action/actions/AWS_EC2.InstanceId.<Action>/1.0`.
+    Swf,
+}
+
+impl ActionVendor {
+    /// The vendor `vendor` names, or `None` when actions of that vendor are messages to a
+    /// target rather than operations of a fixed set.
+    fn of_vendor(vendor: &str) -> Option<Self> {
+        match vendor {
+            AUTOMATE_ARN_VENDOR => Some(Self::Automate),
+            SWF_ARN_VENDOR => Some(Self::Swf),
+            _ => None,
+        }
+    }
+
+    /// The vendor as its own ARN field, which is how a refusal names it.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Automate => AUTOMATE_ARN_VENDOR,
+            Self::Swf => SWF_ARN_VENDOR,
+        }
+    }
+
+    /// Which EC2 instance action the relative id of `arn` names under this vendor's form, or
+    /// `None` when it names none of the four.
+    fn action_of(self, arn: &::service_common::arn::Arn<'_>) -> Option<Ec2InstanceAction> {
+        match self {
+            Self::Automate => {
+                if arn.account != EC2_ARN_NAMESPACE {
+                    return None;
+                }
+                Ec2InstanceAction::of_verb(arn.resource)
+            }
+            Self::Swf => arn
+                .resource
+                .strip_prefix(SWF_EC2_ACTION_PREFIX)
+                .and_then(|rest| rest.strip_suffix(SWF_EC2_ACTION_SUFFIX))
+                .and_then(Ec2InstanceAction::of_verb),
+        }
+    }
+
+    /// The relative id `action` is written with under this vendor's form: one entry of the set
+    /// an action of this vendor has to name.
+    fn relative_id_of(self, action: Ec2InstanceAction) -> String {
+        match self {
+            Self::Automate => {
+                format!("{EC2_ARN_NAMESPACE}:{}", action.name().to_ascii_lowercase())
+            }
+            Self::Swf => format!(
+                "{SWF_EC2_ACTION_PREFIX}{}{SWF_EC2_ACTION_SUFFIX}",
+                action.name()
+            ),
+        }
+    }
+
+    /// How this vendor words the refusal's verb phrase.
+    fn cannot(self) -> &'static str {
+        match self {
+            Self::Automate => "cannot",
+            Self::Swf => "can not",
+        }
+    }
+}
+
+/// Why no alarm can carry the action `arn`: it names a vendor whose actions are operations of a
+/// fixed set, with a relative id naming none of them — `None` when `arn` names some other
+/// vendor's resource, or an action of the set.
+///
+/// The one reading of the relative id, shared with the reading an EXECUTION does
+/// ([`ActionVendor::action_of`]), so an action an alarm is allowed to carry is exactly one this
+/// module can then perform. The refusal names the RELATIVE ID the request sent — the resource
+/// field, everything the ARN names after its account, which is the part that says which action
+/// is being asked for — and the set of relative ids the vendor publishes.
+#[must_use]
+pub fn unknown_relative_id_error(arn: &str) -> Option<String> {
+    let parsed = ::service_common::arn::parse(arn)?;
+    let vendor = ActionVendor::of_vendor(parsed.vendor)?;
+    if vendor.action_of(&parsed).is_some() {
         return None;
     }
-    let _partition = segments.next();
-    let vendor = segments.next().unwrap_or_default();
-    let region = segments.next().unwrap_or_default();
-    let account = segments.next().unwrap_or_default();
-    let resource = segments.next().unwrap_or_default();
-    let action = match vendor {
-        AUTOMATE_ARN_VENDOR if account == EC2_ARN_NAMESPACE => Ec2InstanceAction::of_verb(resource),
-        SWF_ARN_VENDOR => resource
-            .strip_prefix(SWF_EC2_ACTION_PREFIX)
-            .and_then(|rest| rest.strip_suffix(SWF_EC2_ACTION_SUFFIX))
-            .and_then(Ec2InstanceAction::of_verb),
-        _ => None,
-    }?;
-    Some(Named { action, region })
+    let allowed = EC2_INSTANCE_ACTIONS
+        .map(|action| vendor.relative_id_of(action))
+        .join(", ");
+    Some(format!(
+        "The vendor \"{}\" {} be used with relative id {}. Allowed relative IDs are {allowed}",
+        vendor.label(),
+        vendor.cannot(),
+        parsed.resource,
+    ))
 }
 
 /// The instance `dimensions` names: the value of its [`INSTANCE_ID_DIMENSION`] dimension.

@@ -9,6 +9,11 @@
 //! by `InstanceId`; any other request carrying one is refused with HTTP 400
 //! `ValidationError` and stores nothing.
 //!
+//! Each action ARN is judged before that: an action naming a Region other than the alarm's own,
+//! and an action of a vendor whose actions CloudWatch carries out ITSELF
+//! (`automate`, `swf`) whose relative id names none of that vendor's actions, are both refused
+//! the same way, off the ARN alone and whatever the alarm's metric watches.
+//!
 //! The same refusal answers a configuration CloudWatch would not create: a `Period` it does
 //! not evaluate on (10, 20, 30 or a multiple of 60), a total evaluation period
 //! (`Period` x `EvaluationPeriods`) past the published ceiling, a `Period` no clock boundary
@@ -350,6 +355,33 @@ fn carries_unsatisfiable_ec2_action(input: &PutMetricAlarmInput) -> bool {
     .flatten()
     .flatten()
     .any(|arn| is_ec2_instance_action(arn))
+}
+
+/// The three action lists a request configures, in the order a refusal reads them.
+///
+/// Each one's documentation lists the same action values, so every rule that judges an action
+/// ARN judges all three — and reads them off ONE place, so two such rules cannot come to read
+/// different lists.
+fn configured_action_lists(input: &PutMetricAlarmInput) -> [Option<&[String]>; 3] {
+    [
+        input.ok_actions.as_deref(),
+        input.alarm_actions.as_deref(),
+        input.insufficient_data_actions.as_deref(),
+    ]
+}
+
+/// Why one of this request's actions names a vendor whose own actions CloudWatch carries out,
+/// with a relative id that vendor has no action for — `None` when every action names a
+/// resource of some other vendor, or an action of the set.
+///
+/// All three action lists count. Read through the one reading of those ARNs this crate has, so
+/// an action an alarm may carry is exactly one the execution can then perform.
+fn unknown_action_relative_id(input: &PutMetricAlarmInput) -> Option<String> {
+    configured_action_lists(input)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .find_map(|action| ec2_instance_actions::unknown_relative_id_error(action))
 }
 
 /// The sub-minute `Period` values an ALARM is evaluated on: "Valid values are 10, 20, 30, and
@@ -987,6 +1019,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        let region = crate::state::request_region(ctx.parts());
+        // Each action ARN is judged BEFORE the members of the request are weighed against one
+        // another: an action is executed in the Region the alarm lives in, so one naming
+        // another Region could never run, and an action of a vendor whose actions CloudWatch
+        // carries out itself has to name one of that vendor's own actions. Both are read off
+        // the ARN alone, so neither waits on what the alarm watches — the refusal answers a
+        // request whose metric already names an instance exactly as it answers one whose
+        // metric does not. Refused before the write, so nothing is created and an alarm this
+        // call would have replaced keeps the actions it already had.
+        if let Some(message) =
+            crate::state::foreign_action_region_error(configured_action_lists(&input), &region)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(message));
+        }
+
+        if let Some(message) = unknown_action_relative_id(&input) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(message));
+        }
+
         // An EC2 instance action executes against the instance the alarm's metric names, so
         // an alarm whose metric is not dimensioned by `InstanceId` could never carry one
         // out. CloudWatch refuses such a request outright rather than storing an alarm with
@@ -1012,22 +1063,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stand together at all. Refused before the write, like every precondition here.
         if let Some(refusal) = unsupported_extended_statistic(&input) {
             return Err(refusal);
-        }
-
-        let region = crate::state::request_region(ctx.parts());
-        // An alarm's actions are executed in the Region the alarm lives in, so one naming
-        // another Region could never run. Refused before the write, like the preconditions
-        // above, so nothing is created and an alarm this call would have replaced keeps the
-        // actions it already had.
-        if let Some(message) = crate::state::foreign_action_region_error(
-            [
-                input.ok_actions.as_deref(),
-                input.alarm_actions.as_deref(),
-                input.insufficient_data_actions.as_deref(),
-            ],
-            &region,
-        ) {
-            return Err(crate::scaffolded::Scaffolded::validation_error(message));
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {

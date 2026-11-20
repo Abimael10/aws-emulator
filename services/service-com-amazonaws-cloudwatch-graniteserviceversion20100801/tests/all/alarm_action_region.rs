@@ -9,7 +9,8 @@
 //! the Region the request is signed for, which of the three action-list members carries the
 //! action, which Region the action names, and which of the action forms this operation
 //! documents the ARN takes (SNS, Lambda in its three forms, Auto Scaling, SSM OpsItem, Amazon
-//! Q, Simple Workflow, and the EC2 instance action, whose own precondition is reported first).
+//! Q, Simple Workflow, and the EC2 instance action, whose own precondition this rule is
+//! reported ahead of).
 //! The same rule is driven through `PutCompositeAlarm` and `PutLogAlarm`, which carry the same
 //! three action lists, and the accepted tables show a co-regional action — and the action ARN
 //! that names NO Region — stored and read back through `DescribeAlarms`.
@@ -60,14 +61,23 @@ fn regional_action_forms(region: &str) -> Vec<(String, String)> {
             "an Amazon Q operational investigation group",
             format!("arn:aws:aiops:{region}:{ACCOUNT}:investigation-group:workloads"),
         ),
-        (
-            "a Simple Workflow action that is not an EC2 instance action",
-            format!("arn:aws:swf:{region}:{ACCOUNT}:action/actions/AWS_SNS.Publish/1.0"),
-        ),
     ]
     .into_iter()
     .map(|(form, arn)| (form.to_string(), arn))
     .collect()
+}
+
+/// A Simple Workflow action that is not one of the four EC2 instance actions, in `region`.
+///
+/// Its relative id names no action of that vendor, so it is refused on that account when it is
+/// co-regional (`alarm_action_relative_id.rs`) — but the REGION is judged off the ARN first, so
+/// an action in another Region is answered with the Region refusal whatever its relative id
+/// names.
+fn swf_action_that_is_not_an_ec2_instance_action(region: &str) -> (String, String) {
+    (
+        "a Simple Workflow action that is not an EC2 instance action".to_string(),
+        format!("arn:aws:swf:{region}:{ACCOUNT}:action/actions/AWS_SNS.Publish/1.0"),
+    )
 }
 
 /// The one documented action form whose ARN names NO Region at all — "arn:aws:ssm-incidents::
@@ -230,7 +240,12 @@ async fn a_metric_alarm_action_in_another_region_is_refused_and_stores_nothing()
     for alarm_region in ALARM_REGIONS {
         let foreign = another_region(alarm_region);
         for member in ACTION_MEMBERS {
-            for (form, arn) in regional_action_forms(foreign) {
+            // The Region is judged off the action ARN alone, so the rows include the one form
+            // whose relative id would be refused on its own account when it is co-regional.
+            let forms = regional_action_forms(foreign)
+                .into_iter()
+                .chain([swf_action_that_is_not_an_ec2_instance_action(foreign)]);
+            for (form, arn) in forms {
                 let name = format!("refused-{index}");
                 index += 1;
                 let case = format!("{form} in {foreign} on an alarm in {alarm_region}, {member}");
