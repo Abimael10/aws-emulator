@@ -4,9 +4,15 @@
 //! IMPLEMENTED: a pure READ of the routing controls this cluster endpoint serves —
 //! the control plane's registry joined with this service's switches, through
 //! `crate::state`. It reports the control's CURRENT state and never writes; an ARN no
-//! control-plane routing control was minted for is a `ResourceNotFoundException`
-//! (404), never a state the caller never set. This is the ONLY file to touch for this
+//! control-plane routing control was minted for is a `ResourceNotFoundException`, never a
+//! state the caller never set. This is the ONLY file to touch for this
 //! operation.
+//!
+//! WHETHER the request names a routing control at all is settled before that lookup, by
+//! [`crate::service::resource_arn`]: a `RoutingControlArn` that is not a well-formed ARN of
+//! a routing control is invalid INPUT — `ValidationException` (400) — and never the
+//! not-found class. The status either refusal is stated at is this API's
+//! ([`crate::service::error_status`]).
 //!
 //! WHO may read it is decided first, by [`crate::service::authorization`]: a caller whose
 //! identity-based policies do not allow this action is answered `AccessDeniedException`
@@ -170,6 +176,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // A value that is not the ARN of a routing control names none to look up, so it is
+        // refused on the INPUT — where the modelled pattern's own refusal is answered —
+        // rather than falling out of the registry as a resource that happens to be missing.
+        crate::service::resource_arn::check(
+            crate::service::resource_arn::ROUTING_CONTROL,
+            [input.routing_control_arn.as_str()],
+        )
+        .map_err(GetRoutingControlStateErrorModeled::ValidationException)?;
+
         // IAM decides before the registry is looked at, so a caller whose identity-based
         // policies do not allow this action is told only that it is not authorized —
         // never whether the routing control it named exists.

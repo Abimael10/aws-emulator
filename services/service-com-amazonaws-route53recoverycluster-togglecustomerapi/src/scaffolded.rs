@@ -245,10 +245,12 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
     }
 }
 
-/// Every `OperationError` method delegates to the modeled error, so wrapping an
+/// Every `OperationError` method but one delegates to the modeled error, so wrapping an
 /// implemented operation's error channel changes NOTHING about how that error is
-/// rendered. Only the synthetic variant behaves differently — and it is the one that
-/// must answer 501.
+/// rendered. Two variants behave differently: the synthetic one, which must answer 501,
+/// and the STATUS, which this service states for itself
+/// ([`crate::service::error_status`]) because the status a service answers an error with is
+/// what its clients see, not the figure the model documents for the shape.
 impl<E: OperationError> OperationError for Scaffolded<E> {
     fn as_serializable(&self) -> &dyn SerializableStruct {
         match self {
@@ -282,10 +284,14 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
     ///
     /// Keep it 501 and not a 5xx server fault: SDK retry classifiers treat those as
     /// retryable, so a client would retry an operation that can never succeed.
+    ///
+    /// A modeled error is answered with the status THIS API states for its shape
+    /// ([`crate::service::error_status::of`]), which is the model's own for every shape
+    /// this API has not been observed to answer differently.
     fn http_status(&self) -> u16 {
         match self {
             Self::NotImplemented(_) => 501,
-            Self::Modeled(e) => e.http_status(),
+            Self::Modeled(e) => crate::service::error_status::of(e.shape_name(), e.http_status()),
             Self::ValidationException(_) => 400,
         }
     }

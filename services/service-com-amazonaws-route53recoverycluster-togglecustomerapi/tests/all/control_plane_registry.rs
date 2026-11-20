@@ -14,13 +14,13 @@ use serde_json::{json, Value};
 use super::common::{
     call, control_plane, create_cluster, create_control_panel, create_routing_control,
     delete_control_panel, delete_routing_control, emulator, encode_arn, error_code, error_message,
-    get_state, list_all_pages, listed_arns, unknown_arn_like,
+    get_state, list_all_pages, listed_arns, unknown_arn_like, RESOURCE_NOT_FOUND_STATUS,
 };
 
 /// RULE: a routing control is addressable by the data plane exactly while the control
 /// plane holds it — `GetRoutingControlState`, `UpdateRoutingControlState` and
 /// `ListRoutingControls` serve one the control plane created, and answer
-/// `ResourceNotFoundException` (404) for one it deleted.
+/// `ResourceNotFoundException` for one it deleted.
 ///
 /// The rows differ in the control panel a control is created in (the panel the cluster
 /// was created with, which the request names implicitly, and a panel the caller created),
@@ -144,8 +144,9 @@ async fn a_control_plane_create_is_what_the_data_plane_serves() {
     ] {
         let (status, answered) = call(&router, operation, &body).await;
         assert_eq!(
-            status, 404,
-            "case a deleted routing control via {operation}: expected 404, got {status} with {answered}"
+            status, RESOURCE_NOT_FOUND_STATUS,
+            "case a deleted routing control via {operation}: expected \
+             {RESOURCE_NOT_FOUND_STATUS}, got {status} with {answered}"
         );
         assert_eq!(
             error_code(&answered),
@@ -168,8 +169,9 @@ async fn a_control_plane_create_is_what_the_data_plane_serves() {
     )
     .await;
     assert_eq!(
-        status, 404,
-        "case a deleted control panel: expected 404, got {status} with {body}"
+        status, RESOURCE_NOT_FOUND_STATUS,
+        "case a deleted control panel: expected {RESOURCE_NOT_FOUND_STATUS}, got {status} with \
+         {body}"
     );
 
     // Nothing the data plane did changed what the control plane reports.
@@ -194,13 +196,14 @@ async fn a_control_plane_create_is_what_the_data_plane_serves() {
 }
 
 /// RULE: the data plane serves ONLY what the control plane holds — a well-formed ARN no
-/// create minted is `ResourceNotFoundException` (404), worded as Route 53 ARC words it:
+/// create minted is `ResourceNotFoundException`, worded as Route 53 ARC words it:
 /// `Routing Control '<arn>' not found` for a `RoutingControlArn`, and
 /// `Control panel not found: '<arn>'` for a `ControlPanelArn` filter.
 ///
 /// The rows differ in how the unknown ARN is formed: one hex digit of a real id changed,
-/// a fresh id of the same shape, a resource under a panel that does not exist, and an
-/// ARN of another resource kind.
+/// a fresh id of the same shape, a resource under a panel that does not exist, and an id of
+/// another form. An ARN of another resource KIND is not a not-found at all but a validation
+/// refusal (`crate::malformed_arn_refusal`), so no row here carries one.
 #[tokio::test]
 async fn an_arn_no_create_minted_is_not_found_with_the_services_own_wording() {
     let router = emulator();
@@ -224,7 +227,10 @@ async fn an_arn_no_create_minted_is_not_found_with_the_services_own_wording() {
             "a routing control under a panel that does not exist",
             format!("{}/routingcontrol/{fresh_id}", unknown_arn_like(&panel.arn)),
         ),
-        ("a cluster ARN where a routing control ARN belongs", cluster),
+        (
+            "a routing control id of another form",
+            format!("{}/routingcontrol/0", panel.arn),
+        ),
     ];
 
     for (case, arn) in &unknown_controls {
@@ -236,8 +242,9 @@ async fn an_arn_no_create_minted_is_not_found_with_the_services_own_wording() {
             }
             let (status, answered) = call(&router, operation, &Value::Object(body)).await;
             assert_eq!(
-                status, 404,
-                "case {case} via {operation}: expected 404, got {status} with {answered}"
+                status, RESOURCE_NOT_FOUND_STATUS,
+                "case {case} via {operation}: expected {RESOURCE_NOT_FOUND_STATUS}, got {status} \
+                 with {answered}"
             );
             assert_eq!(
                 error_code(&answered),
@@ -267,8 +274,9 @@ async fn an_arn_no_create_minted_is_not_found_with_the_services_own_wording() {
     )
     .await;
     assert_eq!(
-        status, 404,
-        "case an unknown entry in a batch: expected 404, got {status} with {answered}"
+        status, RESOURCE_NOT_FOUND_STATUS,
+        "case an unknown entry in a batch: expected {RESOURCE_NOT_FOUND_STATUS}, got {status} \
+         with {answered}"
     );
     assert_eq!(
         error_message(&answered),
@@ -292,7 +300,17 @@ async fn an_arn_no_create_minted_is_not_found_with_the_services_own_wording() {
                     .unwrap_or_default()
             ),
         ),
-        ("a routing control ARN where a panel ARN belongs", control.arn),
+        (
+            "a control panel id of another form",
+            format!(
+                "{}0",
+                panel
+                    .arn
+                    .rsplit_once('/')
+                    .map(|(prefix, _)| format!("{prefix}/"))
+                    .unwrap_or_default()
+            ),
+        ),
     ];
 
     for (case, arn) in &unknown_panels {
@@ -303,8 +321,8 @@ async fn an_arn_no_create_minted_is_not_found_with_the_services_own_wording() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {case}: expected 404, got {status} with {answered}"
+            status, RESOURCE_NOT_FOUND_STATUS,
+            "case {case}: expected {RESOURCE_NOT_FOUND_STATUS}, got {status} with {answered}"
         );
         assert_eq!(
             error_code(&answered),

@@ -23,6 +23,7 @@ use service_com_amazonaws_route53recoverycluster_togglecustomerapi::state::MAX_U
 
 use super::common::{
     call, emulator, error_code, fleet, get_state, list_all_pages, listed_arns, unknown_arn_like,
+    RESOURCE_NOT_FOUND_STATUS,
     Fleet,
 };
 
@@ -159,12 +160,12 @@ async fn a_state_outside_the_modelled_value_set_is_refused() {
 }
 
 /// RULE: an ARN no control-plane routing control was minted for is
-/// `ResourceNotFoundException` (404), and a read never registers it.
+/// `ResourceNotFoundException`, and a read never registers it.
 ///
-/// The rows are well-formed-but-unknown ARNs of several shapes: an unknown control
-/// panel, an unknown control in a known panel, a control panel ARN where a routing
-/// control ARN belongs, and a one-character ARN (the shortest the model's
-/// `@length(1..255)` allows).
+/// The rows are well-formed routing control ARNs that name nothing, of several shapes: an
+/// unknown control panel, an unknown control in a known panel, and an id of another form.
+/// A value that is not the ARN of a routing control at all is a different refusal
+/// (`crate::malformed_arn_refusal`), so every row here is a routing control's ARN.
 #[tokio::test]
 async fn an_unknown_routing_control_is_not_found_and_is_not_created() {
     let router = emulator();
@@ -177,8 +178,7 @@ async fn an_unknown_routing_control_is_not_found_and_is_not_created() {
             "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         ),
         unknown_arn_like(&known.arn),
-        known.panel_arn.clone(),
-        "x".to_string(),
+        format!("{}/routingcontrol/{}", known.panel_arn, "0"),
     ];
 
     for arn in &unknown {
@@ -189,8 +189,8 @@ async fn an_unknown_routing_control_is_not_found_and_is_not_created() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {arn}: expected 404, got {status} with {body}"
+            status, RESOURCE_NOT_FOUND_STATUS,
+            "case {arn}: expected {RESOURCE_NOT_FOUND_STATUS}, got {status} with {body}"
         );
         assert_eq!(
             error_code(&body),
@@ -205,8 +205,9 @@ async fn an_unknown_routing_control_is_not_found_and_is_not_created() {
         )
         .await;
         assert_eq!(
-            update_status, 404,
-            "case update {arn}: expected 404, got {update_status} with {update_body}"
+            update_status, RESOURCE_NOT_FOUND_STATUS,
+            "case update {arn}: expected {RESOURCE_NOT_FOUND_STATUS}, got {update_status} with \
+             {update_body}"
         );
         assert_eq!(
             error_code(&update_body),
@@ -252,7 +253,7 @@ async fn list_pages_walk_the_whole_set_for_every_page_size() {
 
 /// RULE: each reported routing control carries the control panel that hosts it,
 /// and a `ControlPanelArn` filter reports exactly that panel's controls; a control
-/// panel no control-plane resource was minted for is `ResourceNotFoundException` (404).
+/// panel no control-plane resource was minted for is `ResourceNotFoundException`.
 ///
 /// The rows are every control panel of the fleet (3, one of them in a different
 /// cluster) plus an unknown panel.
@@ -311,8 +312,9 @@ async fn listing_filters_by_control_panel() {
     )
     .await;
     assert_eq!(
-        status, 404,
-        "case unknown control panel: expected 404, got {status} with {body}"
+        status, RESOURCE_NOT_FOUND_STATUS,
+        "case unknown control panel: expected {RESOURCE_NOT_FOUND_STATUS}, got {status} with \
+         {body}"
     );
     assert_eq!(
         error_code(&body),
@@ -579,7 +581,7 @@ async fn a_batch_update_applies_every_entry_or_none() {
                     }),
                 ]
             },
-            404,
+            RESOURCE_NOT_FOUND_STATUS,
             "ResourceNotFoundException",
         ),
     ];

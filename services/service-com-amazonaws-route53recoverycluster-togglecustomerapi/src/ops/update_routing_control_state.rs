@@ -6,8 +6,15 @@
 //! the ONLY file to touch for this operation.
 //!
 //! An ARN no control-plane routing control was minted for is a
-//! `ResourceNotFoundException` (404), and a state outside the modelled `On`/`Off` value
-//! set is a `ValidationException` (400).
+//! `ResourceNotFoundException`, and a state outside the modelled `On`/`Off` value
+//! set is a `ValidationException` (400). The status a refusal is stated at is this API's
+//! ([`crate::service::error_status`]).
+//!
+//! WHETHER the request names the resources it addresses at all is settled before any
+//! lookup, by [`crate::service::resource_arn`]: a `RoutingControlArn` that is not the ARN of
+//! a routing control, or an element of `SafetyRulesToOverride` that is not the ARN of a
+//! safety rule, is invalid INPUT — `ValidationException` (400) — and never the not-found
+//! class.
 //!
 //! The deployed safety rules of the control panels the change touches are evaluated
 //! BEFORE the switch moves ([`crate::state::DataPlane::safety_rule_violation`]): an
@@ -180,6 +187,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // below both read from it.
         let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
 
+        // Every ARN the request carries is read against the resource its member documents
+        // before anything else looks at it: a value that names no such resource is refused
+        // on the INPUT — where the modelled pattern's own refusal is answered — rather than
+        // falling out of the registry as a resource that happens to be missing.
+        crate::service::resource_arn::check(
+            crate::service::resource_arn::ROUTING_CONTROL,
+            [input.routing_control_arn.as_str()],
+        )
+        .map_err(UpdateRoutingControlStateErrorModeled::ValidationException)?;
+        crate::service::resource_arn::check(
+            crate::service::resource_arn::SAFETY_RULE,
+            input
+                .safety_rules_to_override
+                .iter()
+                .flatten()
+                .map(String::as_str),
+        )
+        .map_err(UpdateRoutingControlStateErrorModeled::ValidationException)?;
+
         // IAM decides before anything is read or written, so a caller whose identity-based
         // policies do not allow this action changes nothing and learns nothing about the
         // routing control it named.
@@ -275,7 +301,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The modelled `ResourceNotFoundException` (404) for a `RoutingControlArn` the control
+/// The modelled `ResourceNotFoundException` for a `RoutingControlArn` the control
 /// plane minted no routing control for, worded in the one place this service words it.
 fn not_found(routing_control_arn: &str) -> UpdateRoutingControlStateError {
     UpdateRoutingControlStateErrorModeled::ResourceNotFoundException(ResourceNotFoundException {

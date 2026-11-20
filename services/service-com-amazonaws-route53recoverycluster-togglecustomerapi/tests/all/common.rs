@@ -201,6 +201,15 @@ pub fn error_message(body: &Value) -> String {
         .to_string()
 }
 
+/// The HTTP status this API answers its `ResourceNotFoundException` with.
+///
+/// On `awsJson1_0` the class of a failure travels in the body's `__type`, and Route 53 ARC's
+/// cluster API answers a routing control or control panel it does not serve with the
+/// client-error status its validation refusals also carry, not the `@httpError` 404 its model
+/// documents for the shape. Spelled out here independently of the emulator's own constant,
+/// so a change to that constant has to agree with this figure rather than redefine it.
+pub const RESOURCE_NOT_FOUND_STATUS: u16 = 400;
+
 /// A routing control of a fleet, as the control plane minted it.
 #[derive(Debug, Clone)]
 pub struct Control {

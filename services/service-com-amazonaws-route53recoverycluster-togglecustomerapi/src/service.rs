@@ -48,8 +48,12 @@ use std::sync::Arc;
 /// Whether IAM lets a request perform the action it asks for: the decision every operation
 /// of this API takes before it reads a routing control or moves a switch.
 pub mod authorization;
+/// The HTTP status this API answers a modelled failure with.
+pub mod error_status;
 /// How this service words a request the framework refused before any handler ran.
 pub mod refusal;
+/// The ARN form every handler holds a caller-supplied ARN to before it consults any store.
+pub mod resource_arn;
 
 /// The `com-amazonaws-route53recoverycluster-togglecustomerapi` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.

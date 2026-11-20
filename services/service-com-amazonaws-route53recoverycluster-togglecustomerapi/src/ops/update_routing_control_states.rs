@@ -10,7 +10,14 @@
 //! `ServiceLimitExceededException` (402); a duplicate ARN in one batch, entries spanning
 //! more than one cluster, or a state outside the modelled `On`/`Off` value set is a
 //! `ValidationException` (400); an ARN no control-plane routing control was minted for is
-//! a `ResourceNotFoundException` (404).
+//! a `ResourceNotFoundException`. The status a refusal is stated at is this API's
+//! ([`crate::service::error_status`]).
+//!
+//! WHETHER the batch names the resources it addresses at all is settled before any of that,
+//! by [`crate::service::resource_arn`]: an entry's `RoutingControlArn` that is not the ARN
+//! of a routing control, or an element of `SafetyRulesToOverride` that is not the ARN of a
+//! safety rule, is invalid INPUT — `ValidationException` (400) — and never the not-found
+//! class.
 //!
 //! WHO may move the switches is decided first, by [`crate::service::authorization`], over
 //! EVERY routing control the batch would move: a caller whose identity-based policies do
@@ -190,6 +197,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
 
         let entries = &input.update_routing_control_state_entries;
+
+        // Every ARN the batch carries is read against the resource its member documents
+        // before anything else looks at it: a value that names no such resource is refused
+        // on the INPUT — where the modelled pattern's own refusal is answered — rather than
+        // falling out of the registry as a resource that happens to be missing. One entry
+        // that names no routing control refuses the whole batch, so nothing is written for
+        // the entries beside it either.
+        crate::service::resource_arn::check(
+            crate::service::resource_arn::ROUTING_CONTROL,
+            entries
+                .iter()
+                .map(|entry| entry.routing_control_arn.as_str()),
+        )
+        .map_err(UpdateRoutingControlStatesErrorModeled::ValidationException)?;
+        crate::service::resource_arn::check(
+            crate::service::resource_arn::SAFETY_RULE,
+            input
+                .safety_rules_to_override
+                .iter()
+                .flatten()
+                .map(String::as_str),
+        )
+        .map_err(UpdateRoutingControlStatesErrorModeled::ValidationException)?;
 
         // IAM decides before anything is read or written, and each entry's own routing
         // control is a resource of its own: a batch is permitted only where every control

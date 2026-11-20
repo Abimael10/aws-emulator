@@ -10,8 +10,14 @@
 //! encoding of the filter it was issued for plus the routing control the next page
 //! starts at, so issuing a page writes no state and the pages walk the whole set
 //! without repeats or omissions. A `ControlPanelArn` no control panel was minted for is
-//! a `ResourceNotFoundException` (404); a token this service did not issue is a
-//! `ValidationException` (400).
+//! a `ResourceNotFoundException`; a token this service did not issue is a
+//! `ValidationException` (400). The status a refusal is stated at is this API's
+//! ([`crate::service::error_status`]).
+//!
+//! WHETHER the filter names a control panel at all is settled before that lookup, by
+//! [`crate::service::resource_arn`]: a `ControlPanelArn` that is not a well-formed ARN of a
+//! control panel is invalid INPUT — `ValidationException` (400) — and never the not-found
+//! class.
 //!
 //! WHO may read the set is decided first, by [`crate::service::authorization`]: a caller
 //! whose identity-based policies do not allow this action is answered
@@ -227,6 +233,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // A filter that is not the ARN of a control panel names none to resolve, so it is
+        // refused on the INPUT — where the modelled pattern's own refusal is answered —
+        // rather than falling out of the registry as a panel that happens to be missing.
+        crate::service::resource_arn::check(
+            crate::service::resource_arn::CONTROL_PANEL,
+            input.control_panel_arn.as_deref(),
+        )
+        .map_err(ListRoutingControlsErrorModeled::ValidationException)?;
+
         // IAM decides before the registry is looked at: the resource a listing addresses is
         // the control panel it is filtered by, and every routing control the endpoint
         // serves when it carries no filter.
