@@ -242,6 +242,19 @@ impl SerializableStruct for AccessDeniedException {
     }
 }
 
+/// The shape id DynamoDB names the VALIDATION class by on the wire.
+///
+/// A refusal of a request's own contents is decided by the service framework's validation
+/// layer rather than by the DynamoDB API model — which declares no `ValidationException`
+/// at all — so the id the error body carries is that layer's own, fully qualified
+/// (`<its namespace>#ValidationException`) exactly as every other shape id this service
+/// puts on the wire is. A client that classifies an error by the body's `__type` matches
+/// the WHOLE id, so the bare local name is an id it cannot place.
+///
+/// Shared with [`crate::service`], which answers the same class for a request refused
+/// AHEAD of any operation, so one spelling reaches the wire from every layer.
+pub(crate) const VALIDATION_SHAPE_ID: &str = "com.amazon.coral.validate#ValidationException";
+
 /// The namespace a DynamoDB error body names its shape in.
 ///
 /// It is the API-VERSION-qualified form of the model's namespace
@@ -392,9 +405,10 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
     ///
     /// A MODELED error is named by its API-version-qualified shape id — the form this
     /// awsJson service puts in the error body, so a client or proxy that classifies an
-    /// error by the body's `__type` rather than by a header reads the whole shape id.
-    /// The three synthetic shapes below are not in the model, so they carry no shape id
-    /// to qualify and keep their bare names.
+    /// error by the body's `__type` rather than by a header reads the whole shape id. The
+    /// validation class is qualified too, in the namespace the framework that decides it
+    /// owns ([`VALIDATION_SHAPE_ID`]); the two remaining synthetic shapes are not in any
+    /// namespace this service puts on the wire and keep their bare names.
     ///
     /// Keep the literals as they are: changing one changes the wire error code clients
     /// match on. They are intentionally not tied to the Rust variant names.
@@ -402,7 +416,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => qualified_shape_id(e.shape_name()),
-            Self::ValidationException(_) => "ValidationException",
+            Self::ValidationException(_) => VALIDATION_SHAPE_ID,
             Self::AccessDenied(_) => "AccessDeniedException",
         }
     }

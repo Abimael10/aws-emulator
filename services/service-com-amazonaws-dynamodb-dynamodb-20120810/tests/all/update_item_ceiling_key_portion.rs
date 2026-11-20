@@ -176,8 +176,8 @@ async fn the_update_ceiling_is_the_quota_less_what_the_key_portion_is_charged() 
 }
 
 /// RULE: `TransactWriteItems`' `Update` is bound by the standalone `UpdateItem`'s ceiling, and
-/// states a change past it as the CALL's own `ValidationException` rather than as a per-item
-/// cancellation.
+/// states a change past it as that ACTION's cancellation reason — the sentence the single-item
+/// path states, carried by the action that stated the change.
 #[tokio::test]
 async fn a_transactional_update_shares_the_single_item_ceiling() {
     let router = emulator();
@@ -208,11 +208,18 @@ async fn a_transactional_update_shares_the_single_item_ceiling() {
             transact(&table, shape, largest + 1),
         )
         .await;
+        // The ceiling is measured against the item the update would leave on the STORED one,
+        // so one byte past it is this action's own failure: the transaction is cancelled and
+        // the reason carries the single-item path's sentence.
         assert_eq!(
-            (status, message(&body).as_str()),
-            (400, UPDATE_TOO_BIG),
-            "case {:?}: expected the call itself to be refused one byte past the ceiling, got \
-             {status} with {body}",
+            (
+                status,
+                body["CancellationReasons"][0]["Code"].as_str(),
+                body["CancellationReasons"][0]["Message"].as_str(),
+            ),
+            (400, Some("ValidationError"), Some(UPDATE_TOO_BIG)),
+            "case {:?}: expected the action cancelled one byte past the ceiling, got {status} \
+             with {body}",
             shape.case
         );
         let stored = stored_length(&router, &table, shape).await;

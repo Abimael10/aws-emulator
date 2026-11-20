@@ -692,11 +692,11 @@ async fn a_value_a_legacy_condition_compares_against_is_held_to_the_value_rules(
 }
 
 #[tokio::test]
-async fn a_batch_read_that_mixes_the_two_generations_across_its_entries_is_refused() {
+async fn a_batch_read_states_each_entrys_projection_in_one_generation() {
     let router = seeded().await;
     // A second table, so the two generations can sit in two DIFFERENT entries of one
-    // request: the rule is about the REQUEST, so it holds across its entries exactly as
-    // it holds inside one.
+    // request: each `RequestItems` entry states the projection of ITS table, so the rule
+    // holds inside one entry and leaves the entries beside it alone.
     let other = "LegacyConditionsToo";
     ok(
         &router,
@@ -720,8 +720,50 @@ async fn a_batch_read_that_mixes_the_two_generations_across_its_entries_is_refus
     let expected = "Can not use both expression and non-expression parameters in the same \
                     request: Non-expression parameters: {AttributesToGet} Expression parameters: \
                     {ProjectionExpression}";
-    // The rows differ in WHICH entry states which generation, and in whether one entry
-    // states both: every arrangement names the same two members.
+    // ONE ENTRY stating the same ask both ways is the mixing the rule is about, whichever
+    // entry of the batch it is.
+    for (case, request) in [
+        (
+            "the first entry stating both generations",
+            json!({
+                "RequestItems": {
+                    TABLE: {"Keys": [{"pk": {"S": "k1"}, "sk": {"S": "s1"}}],
+                            "AttributesToGet": ["a"], "ProjectionExpression": "a"},
+                    other: {"Keys": [{"pk": {"S": "k1"}}]},
+                },
+            }),
+        ),
+        (
+            "the second entry stating both generations",
+            json!({
+                "RequestItems": {
+                    TABLE: {"Keys": [{"pk": {"S": "k1"}, "sk": {"S": "s1"}}]},
+                    other: {"Keys": [{"pk": {"S": "k1"}}],
+                            "AttributesToGet": ["c"], "ProjectionExpression": "c"},
+                },
+            }),
+        ),
+        (
+            "the only entry stating both generations",
+            json!({
+                "RequestItems": {
+                    TABLE: {"Keys": [{"pk": {"S": "k1"}, "sk": {"S": "s1"}}],
+                            "AttributesToGet": ["a"], "ProjectionExpression": "a"},
+                },
+            }),
+        ),
+    ] {
+        let (status, answered) = call(&router, "BatchGetItem", request).await;
+        assert_eq!(
+            (status, error_code(&answered).as_str(), message(&answered)),
+            (400, "ValidationException", expected.to_string()),
+            "case {case:?}: expected {expected:?}, got {status} with {answered}"
+        );
+    }
+
+    // Each entry states its own table's projection, so a batch whose entries state it in
+    // DIFFERENT generations states each ask exactly once and is served — which is what makes
+    // the rows above the mixing inside ONE entry being refused.
     for (case, request) in [
         (
             "the legacy member in the first entry and the expression member in the second",
@@ -743,27 +785,6 @@ async fn a_batch_read_that_mixes_the_two_generations_across_its_entries_is_refus
                 },
             }),
         ),
-        (
-            "one entry stating both generations",
-            json!({
-                "RequestItems": {
-                    TABLE: {"Keys": [{"pk": {"S": "k1"}, "sk": {"S": "s1"}}],
-                            "AttributesToGet": ["a"], "ProjectionExpression": "a"},
-                },
-            }),
-        ),
-    ] {
-        let (status, answered) = call(&router, "BatchGetItem", request).await;
-        assert_eq!(
-            (status, error_code(&answered).as_str(), message(&answered)),
-            (400, "ValidationException", expected.to_string()),
-            "case {case:?}: expected {expected:?}, got {status} with {answered}"
-        );
-    }
-
-    // ONE generation across both entries is served, so the rows above are the mixing
-    // being refused rather than either member being rejected.
-    for (case, request) in [
         (
             "both entries stating the legacy member",
             json!({

@@ -1307,18 +1307,19 @@ impl WriteLedger {
         }
     }
 
-    /// Scale every figure by `factor` — what a TRANSACTIONAL write consumes relative to
-    /// the same single-item write ([`TRANSACTIONAL_CAPACITY_FACTOR`]).
-    pub fn scale(&mut self, factor: f64) {
+    /// Scale the TABLE's own figure by `factor` — what a TRANSACTIONAL write consumes
+    /// relative to the same single-item write ([`TRANSACTIONAL_CAPACITY_FACTOR`]).
+    ///
+    /// The factor is the cost of the ITEM write: "transactional write requests require two
+    /// write capacity units to perform one write per second for items up to 1 KB" ("Read/write
+    /// capacity mode", Amazon DynamoDB Developer Guide) — a statement about the item, so the
+    /// secondary-index entries the same write projects are charged what one write of them
+    /// costs and are left as they were recorded. It is the same half of the breakdown the
+    /// factor is applied to when a transactional write is REFUSED
+    /// ([`crate::state::charge_refused_transactional_write`]).
+    pub fn scale_table_units(&mut self, factor: f64) {
         for capacity in self.capacity.values_mut() {
             capacity.table *= factor;
-            for units in capacity
-                .local_secondary_indexes
-                .values_mut()
-                .chain(capacity.global_secondary_indexes.values_mut())
-            {
-                *units *= factor;
-            }
         }
     }
 

@@ -23,7 +23,9 @@
 //! * "Each read statement in a BatchExecuteStatement must specify an equality
 //!   condition on all key attributes. This enforces that each SELECT statement in a
 //!   batch returns at most a single item" — so a batch `SELECT` addresses ONE item of
-//!   the table by its whole primary key. One that pins less than that, or that reads a
+//!   the table by its whole primary key. One that pins less than that, one whose clause
+//!   states a term that is no equality condition at all (a boolean function, a comparison
+//!   that is not `=`, a range, a branch of an `OR`), or that reads a
 //!   secondary index (which is not keyed by the table's primary key), reports
 //!   `ValidationError` in its own slot.
 //! * "The entire batch must consist of either read statements or write statements, you
@@ -649,6 +651,19 @@ fn read_item(
     let Some(filter) = select.filter.as_ref() else {
         return Err(SlotFailure::validation(KEY_EQUALITY_MESSAGE));
     };
+    // "Each read statement in a BatchExecuteStatement must specify an equality condition
+    // on all key attributes. This enforces that each SELECT statement in a batch returns
+    // at most a single item" (the operation's doc): the clause states equality conditions,
+    // so a term that is no equality — a boolean function, a comparison that is not `=`, a
+    // membership test, a range, a branch of an `OR` — is no equality condition on a key
+    // attribute and the statement asks for a read no single-item plan serves. It is
+    // reported in this slot, with the sentence the rule is stated in
+    // ([`crate::state::states_equalities_only`]), rather than applied as a filter over the
+    // item the equalities beside it address: a statement this batch cannot serve must not
+    // read as one that matched nothing.
+    if !crate::state::states_equalities_only(filter) {
+        return Err(SlotFailure::validation(KEY_EQUALITY_MESSAGE));
+    }
     let condition = crate::state::parsed_condition(filter)?;
     let table = store.active_table(region, name, now)?;
     let key = addressed_key(table, filter)?;

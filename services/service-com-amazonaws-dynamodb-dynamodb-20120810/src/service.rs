@@ -216,9 +216,11 @@ fn reported(
 
 /// The error code this service answers an input-constraint violation with: the
 /// `ValidationException` (HTTP 400) every DynamoDB operation refuses a malformed
-/// request with. Restated here because `override_refusal` replaces the code and
-/// the message together.
-const VALIDATION_EXCEPTION: &str = "ValidationException";
+/// request with, named by the shape id the wire carries for that class
+/// ([`crate::scaffolded::VALIDATION_SHAPE_ID`] — the same id an operation's own
+/// refusal names, because it is the same class whichever layer decided it). Restated
+/// here because `override_refusal` replaces the code and the message together.
+const VALIDATION_EXCEPTION: &str = crate::scaffolded::VALIDATION_SHAPE_ID;
 
 /// The path segment the framework contributes when it steps from a collection
 /// into one of its elements (`RequestItems.<table>.member.Keys`). It is a fixed

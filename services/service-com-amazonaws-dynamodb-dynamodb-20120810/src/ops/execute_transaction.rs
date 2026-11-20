@@ -1044,7 +1044,7 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
             };
             let mut per_statement = crate::state::WriteLedger::default();
             per_statement.record(&statement.table, &capacity);
-            per_statement.scale(crate::state::TRANSACTIONAL_CAPACITY_FACTOR);
+            per_statement.scale_table_units(crate::state::TRANSACTIONAL_CAPACITY_FACTOR);
             consumed.extend(
                 per_statement
                     .consumed_capacity(
@@ -1090,7 +1090,7 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                 // in its own entry.
                 let mut per_statement = crate::state::WriteLedger::default();
                 per_statement.record(&statement.table, &capacity);
-                per_statement.scale(crate::state::TRANSACTIONAL_CAPACITY_FACTOR);
+                per_statement.scale_table_units(crate::state::TRANSACTIONAL_CAPACITY_FACTOR);
                 consumed.extend(
                     per_statement
                         .consumed_capacity(
@@ -1135,7 +1135,7 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
         return Err(refused);
     }
 
-    recorded.scale(crate::state::TRANSACTIONAL_CAPACITY_FACTOR);
+    recorded.scale_table_units(crate::state::TRANSACTIONAL_CAPACITY_FACTOR);
     // The transactional cost this statement set consumed is what the tables' throughput
     // series carry for it, the same figures the entries above report
     // ([`crate::state::charge_reported_ledger`]).

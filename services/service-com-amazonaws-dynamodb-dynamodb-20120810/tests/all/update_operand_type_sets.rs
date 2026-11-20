@@ -227,9 +227,9 @@ async fn the_refusal_does_not_depend_on_the_item_or_the_operation() {
     }
 
     // The same expression inside a transaction is read by the same expression reader, so
-    // it states the same clause — behind the per-element wrapper that operation reports
-    // its refusals through, which is why the clause is matched rather than the whole
-    // message.
+    // it states the same clause — carried by the CANCELLATION REASON of the action that
+    // stated it, which is how a transaction reports a failure its own action earned, which
+    // is why the clause is matched rather than the whole message.
     let (status, body) = call(
         &router,
         "TransactWriteItems",
@@ -241,11 +241,18 @@ async fn the_refusal_does_not_depend_on_the_item_or_the_operation() {
         }}]}),
     )
     .await;
-    let stated = message(&body);
+    let stated = body["CancellationReasons"][0]["Message"]
+        .as_str()
+        .unwrap_or("<no reason>")
+        .to_string();
     assert_eq!(
-        (status, error_code(&body).as_str()),
-        (400, "ValidationException"),
-        "case a transactional ADD of a string: expected 400 ValidationException, got {status} \
+        (
+            status,
+            error_code(&body).as_str(),
+            body["CancellationReasons"][0]["Code"].as_str(),
+        ),
+        (400, "TransactionCanceledException", Some("ValidationError")),
+        "case a transactional ADD of a string: expected the action cancelled, got {status} \
          with {body}"
     );
     assert!(

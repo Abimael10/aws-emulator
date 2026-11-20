@@ -1046,12 +1046,12 @@ impl<'a> Substitutions<'a> {
     /// expression it did not state or for the entries that expression would not have
     /// referenced.
     ///
-    /// A `BatchGetItem` entry is NOT such an element: the members of one `RequestItems`
-    /// entry are the whole of that table's read — its projection, the legacy list that
-    /// states the same ask and the names table that resolves the projection's aliases —
-    /// so the entry is held to the WHOLE rule, through
-    /// [`Substitutions::check_all_referenced`], exactly as a single-table read's members
-    /// are.
+    /// A `BatchGetItem` entry is such an element too: the members of one `RequestItems`
+    /// entry are that table's own read — its projection, the legacy list that states the
+    /// same ask and the names table that resolves the projection's aliases — and they are
+    /// members of the ENTRY rather than of the call, so the entry is held to the element
+    /// scope through [`Substitutions::check_all_referenced_in_element`] exactly as a
+    /// transactional action's are.
     pub(super) fn check_referenced_within_element(
         &self,
         expressions: &[(&str, Option<&str>)],

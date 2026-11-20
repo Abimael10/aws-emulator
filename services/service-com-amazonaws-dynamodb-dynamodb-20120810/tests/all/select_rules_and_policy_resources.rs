@@ -409,8 +409,9 @@ async fn a_substitution_table_with_no_expression_names_the_member_that_needs_one
         );
     }
 
-    // A `RequestItems` entry of a BATCHED read carries the whole projection ask, so the
-    // entry is held to the same rule a single-table read's members are.
+    // A `RequestItems` entry of a BATCHED read is one ELEMENT of the batch: its projection
+    // members sit inside that entry rather than beside the call's own, so it is held to the
+    // element scope and an entry that states its projection another way, or none, is SERVED.
     let (status, answered) = call(
         &router,
         "BatchGetItem",
@@ -420,13 +421,15 @@ async fn a_substitution_table_with_no_expression_names_the_member_that_needs_one
     )
     .await;
     assert_eq!(
-        (status, message(&answered).as_str()),
-        (
-            400,
-            "ExpressionAttributeNames can only be specified when using expressions"
-        ),
-        "case a batch read: the entry is told to add an expression, got {status} with \
-         {answered}"
+        (status, answered["Responses"][table][0]["label"].clone()),
+        (200, json!({"S": "first"})),
+        "case a batch read: an entry's tables are held to the entry's own projection, so the \
+         whole addressed item is served, got {status} with {answered}"
+    );
+    assert_eq!(
+        answered["UnprocessedKeys"],
+        json!({}),
+        "case a batch read: every key the request addressed was read, got {answered}"
     );
 
     // The BOUNDARY: a TRANSACTIONAL element's tables sit beside that element's own

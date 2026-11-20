@@ -50,7 +50,8 @@ const SEEDED: &str = "start";
 enum Surface {
     /// The single-item update.
     UpdateItem,
-    /// The `Update` action of a transaction, whose over-ceiling element fails the CALL.
+    /// The `Update` action of a transaction, whose over-ceiling action cancels the
+    /// transaction and states the sentence in that action's reason.
     TransactWriteItems,
     /// A PartiQL `UPDATE` run on its own.
     ExecuteStatement,
@@ -349,8 +350,9 @@ fn assert_served(
 }
 
 /// Assert the change one byte past the boundary was REFUSED with the update path's sentence:
-/// as the CALL's own failure on every surface but the batch, which answers 200 and states it
-/// in the slot that carried the statement.
+/// as the CALL's own failure on the single-item and PartiQL surfaces, as the cancellation
+/// reason of the ACTION that stated it on the transactional one, and as the slot's own error
+/// in a batch, which answers 200.
 fn assert_refused(case: &str, surface: Surface, answered: &(u16, Value)) {
     let (status, body) = answered;
     if surface == Surface::BatchExecuteStatement {
@@ -363,6 +365,19 @@ fn assert_refused(case: &str, surface: Surface, answered: &(u16, Value)) {
             Some(UPDATE_TOO_BIG),
             "case {case:?}: expected the slot to state the update-path ceiling refusal, got {}",
             body["Responses"][0]
+        );
+        return;
+    }
+    if surface == Surface::TransactWriteItems {
+        assert_eq!(
+            (
+                *status,
+                body["CancellationReasons"][0]["Code"].as_str(),
+                body["CancellationReasons"][0]["Message"].as_str(),
+            ),
+            (400, Some("ValidationError"), Some(UPDATE_TOO_BIG)),
+            "case {case:?}: expected the action's cancellation reason to state the update-path \
+             ceiling refusal, got {status} with {body}"
         );
         return;
     }

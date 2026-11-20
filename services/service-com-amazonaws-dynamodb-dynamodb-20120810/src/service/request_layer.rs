@@ -442,8 +442,228 @@ pub fn body_reading<Eng: Send + Sync + 'static>(
     if !document.is_object() {
         return BodyReading::Unreadable(None);
     }
-    let stated = StatedAbsences::of::<Eng>(key, protocol, req, body, document);
-    stated.reading::<Eng>()
+    // TEXT that spells a boolean, standing where a boolean is modelled, is READ as that
+    // boolean, so what the layers below read is the body this protocol reads
+    // ([`boolean_texts_read`]). It is applied first, because the absences below are a fact of
+    // that same body.
+    match boolean_texts_read::<Eng>(key, protocol, req, &document) {
+        Some(read) => {
+            let Some(served) = rebuilt(req, &read) else {
+                return BodyReading::AsSent;
+            };
+            let Some(body) = served.body().bytes().map(<[u8]>::to_vec) else {
+                return BodyReading::AsSent;
+            };
+            let stated = StatedAbsences::of::<Eng>(key, protocol, &served, &body, read);
+            match stated.reading::<Eng>() {
+                // The body was rewritten for the booleans it spells even where it states no
+                // absence, so the request the operation is served is that one.
+                BodyReading::AsSent => BodyReading::Absences(Box::new(served)),
+                reading => reading,
+            }
+        }
+        None => {
+            let stated = StatedAbsences::of::<Eng>(key, protocol, req, body, document);
+            stated.reading::<Eng>()
+        }
+    }
+}
+
+/// How much JSON this layer may read to ASK which of a body's boolean SPELLINGS stands where
+/// a boolean is modelled.
+///
+/// The question is asked of the framework's own deserializer, one read of the whole body per
+/// spelling the body carries ([`boolean_texts_read`]), so the cost is the product of the two
+/// — both a caller's choice, which is why the bound is on their product. Past it the body is
+/// served exactly as it arrived, which leaves such a request the refusal its text earns
+/// today.
+const MOST_JSON_READ_FOR_BOOLEAN_TEXTS: usize = 4 << 20;
+
+/// `document` with every piece of TEXT that spells a boolean and stands where a boolean is
+/// MODELLED read as that boolean — or `None` when the body carries none, which is every body
+/// that spells no boolean in text.
+///
+/// Why the body is rewritten rather than the read being widened: the codec reads the body
+/// (`vendor/`, read-only from here), and a read that refuses a value has already consumed it,
+/// so the conversion has to happen in the body the codec is handed.
+///
+/// WHICH text stands where a boolean is modelled is not written down here, for the same
+/// reason nothing else about the model is ([`probe`]): each spelling is converted and the
+/// framework's OWN deserializer is asked about the result. A conversion is kept when the body
+/// it leaves carries no value of the boolean class the model cannot read — so text standing
+/// where a string, a number or an enumerated value is modelled (an attribute's `S`, a table
+/// name, a capacity level that happens to spell a boolean) is left exactly as it was sent,
+/// and only text the model does read as a boolean is read as one.
+///
+/// The spellings are walked in the order the body carries them, which is the order the codec
+/// reads them in, so a spelling the model DOES read as a boolean stops being a defect before
+/// the next one is asked about. That leaves one case where an answer could be read wrong — a
+/// defect EARLIER in the body that is no boolean spelling at all (a number where a string is
+/// modelled, say) masks the defect a later conversion would cause — and in that case the body
+/// is refused for that earlier defect either way, with the same sentence, so the conversion
+/// changes no answer.
+fn boolean_texts_read<Eng: Send + Sync + 'static>(
+    key: &str,
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+    document: &Value,
+) -> Option<Value> {
+    // The bound is applied BEFORE a single path is materialised, exactly as the absence
+    // path applies its own ([`StatedAbsences::of`]): how many spellings a body carries is
+    // counted over the document alone, allocating nothing, so neither the paths nor the
+    // probes they drive can be grown past the cap by the request that asks for them.
+    let stated = boolean_spellings_stated(document);
+    if stated == 0 {
+        return None;
+    }
+    let body = ::serde_json::to_vec(document).ok()?.len();
+    if stated.saturating_mul(body) > MOST_JSON_READ_FOR_BOOLEAN_TEXTS {
+        return None;
+    }
+    let spelled = boolean_spellings(document);
+    let mut read = document.clone();
+    let mut applied = false;
+    for at in &spelled {
+        let attempt = as_boolean(&read, at);
+        if reads_a_boolean_nowhere::<Eng>(key, protocol, req, &attempt) {
+            read = attempt;
+            applied = true;
+        }
+    }
+    applied.then_some(read)
+}
+
+/// How many boolean SPELLINGS `document` carries — the cheap count the bound above is
+/// applied to, which allocates nothing and visits the document once, as
+/// [`absences_stated`] does for the absences a body states.
+fn boolean_spellings_stated(document: &Value) -> usize {
+    match document {
+        Value::Object(members) => members.values().map(boolean_spellings_stated).sum(),
+        Value::Array(elements) => elements.iter().map(boolean_spellings_stated).sum(),
+        Value::String(text) => usize::from(boolean_text(text).is_some()),
+        _ => 0,
+    }
+}
+
+/// Whether the framework's own deserializer reads `document` without stopping at a value of
+/// the BOOLEAN class: the question one converted spelling is kept or dropped on.
+///
+/// A body it stops at for any other reason is left to the refusal that reason earns — the
+/// conversion neither caused it nor hides it.
+fn reads_a_boolean_nowhere<Eng: Send + Sync + 'static>(
+    key: &str,
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+    document: &Value,
+) -> bool {
+    let Some(probe) = rebuilt(req, document) else {
+        return false;
+    };
+    match unreadable_value::<Eng>(key, protocol, &probe) {
+        Some(Unreadable::Class { class, .. }) => {
+            class != service_common::json_wire_values::BOOLEAN_VALUE
+        }
+        _ => true,
+    }
+}
+
+/// Where `document` carries TEXT that spells a boolean, in the order the body carries it.
+///
+/// The two spellings are the protocol's own literals, which is what a value that travelled
+/// through something carrying every value as text is written as; nothing else is a boolean's
+/// text ([`boolean_text`]). Built only for a body inside
+/// [`MOST_JSON_READ_FOR_BOOLEAN_TEXTS`], which is what bounds what these paths cost to hold.
+fn boolean_spellings(document: &Value) -> Vec<Vec<Step>> {
+    let mut found = Vec::new();
+    descend_boolean_texts(document, &mut Vec::new(), &mut found);
+    found
+}
+
+/// Collect the boolean spellings `value` carries, `at` being the path it stands at.
+///
+/// The recursion is as deep as the document, which is as deep as the reader that produced it
+/// descended — a bound that reader holds, not one a request chooses ([`nests_too_deep`]).
+fn descend_boolean_texts(value: &Value, at: &mut Vec<Step>, found: &mut Vec<Vec<Step>>) {
+    match value {
+        Value::Object(members) => {
+            for (name, held) in members {
+                at.push(Step::Member(name.clone()));
+                descend_boolean_texts(held, at, found);
+                at.pop();
+            }
+        }
+        Value::Array(elements) => {
+            for (index, held) in elements.iter().enumerate() {
+                at.push(Step::Element(index));
+                descend_boolean_texts(held, at, found);
+                at.pop();
+            }
+        }
+        Value::String(text) if boolean_text(text).is_some() => found.push(at.clone()),
+        _ => {}
+    }
+}
+
+/// `document` with the text at `at` read as the boolean it spells, and everything else
+/// exactly as it was.
+///
+/// A path that names no value leaves the document unchanged: it was read off this same
+/// document, so that cannot happen, and inventing a member for it would send the codec a body
+/// the caller did not write.
+fn as_boolean(document: &Value, at: &[Step]) -> Value {
+    let Some((step, rest)) = at.split_first() else {
+        return match document.as_str().and_then(boolean_text) {
+            Some(flag) => Value::Bool(flag),
+            None => document.clone(),
+        };
+    };
+    match (step, document) {
+        (Step::Member(name), Value::Object(members)) => {
+            let mut read = members.clone();
+            if let Some(held) = members.get(name) {
+                read.insert(name.clone(), as_boolean(held, rest));
+            }
+            Value::Object(read)
+        }
+        (Step::Element(index), Value::Array(elements)) => Value::Array(
+            elements
+                .iter()
+                .enumerate()
+                .map(|(held, value)| {
+                    if held == *index {
+                        as_boolean(value, rest)
+                    } else {
+                        value.clone()
+                    }
+                })
+                .collect(),
+        ),
+        _ => document.clone(),
+    }
+}
+
+/// The boolean a piece of TEXT standing where a boolean is modelled spells, or `None` when it
+/// spells neither.
+///
+/// The two spellings are the protocol's own literals: this is the text a caller writes when
+/// the value travelled through something that carries every value as text (a form field, a
+/// shell variable, a template parameter), and the two words are exactly the ones the JSON
+/// literals are written with. Nothing else is a boolean — text that spells no boolean is
+/// refused as the unconvertible value it is.
+///
+/// NOT `service_common::query_boolean_values::boolean_spelled`, which is the lexical space of
+/// an XML Schema boolean (`true`/`false`/`1`/`0`, whitespace collapsed) because that is what
+/// the QUERY protocols carry a boolean in, and whose reader can decide a boolean IN THE READ
+/// because a form field is positional — read it as text, then as a boolean, same value. This
+/// protocol carries a boolean as a JSON literal, so the text that spells one is that
+/// literal's own spelling and nothing wider; the numerals are a number in this wire's
+/// vocabulary, which is a value no boolean member admits.
+fn boolean_text(text: &str) -> Option<bool> {
+    match text {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
 }
 
 /// Whether the JSON reader stopped because the document nests deeper than it descends,

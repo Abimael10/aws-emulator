@@ -108,3 +108,22 @@ Cause 8 — expected ConsumedCapacity[0].CapacityUnits/WriteCapacityUnits=3.0 an
 6. Cause 5: ExecuteStatement with an UPDATE … SET … WHERE on a seeded item, then GetItem.
 7. Causes 6-7: seed ten items with distinct numeric (then string) hash keys and Scan with no filter; compare Items order.
 8. Cause 8: TransactWriteItems with ReturnConsumedCapacity=INDEXES on a table with an LSI.
+
+## Resolution
+
+Causes 1, 2, 3, 4, 5 and 8 are FIXED: the transactional per-action cancellation reasons, the
+qualified wire id of the validation class, the per-statement error of a batch SELECT whose
+clause states more than equalities, the well-formed BatchGetItem (a boolean table option sent
+as text is read as the boolean it spells, and each `RequestItems` entry is held to its own
+projection), the PartiQL write whose source is stated first in a `FROM` clause, and the
+transactional capacity factor applying to the table's units alone.
+
+Causes 6 and 7 (the unfiltered `Scan` order over a numeric and over a string hash key, replay
+keys `dynamodb|Scan|2xx->2xx|$.Items[*].pk.N` and `dynamodb|Scan|2xx->2xx|$.Items[*].pk.S`) are
+NOT fixed and are left for a maintainer to judge: `ScanOutput$Items` is modelled as "an array
+of item attributes that match the scan criteria" with no ordering, and the recorded sequence is
+the placement DynamoDB's internal, unpublished hash function gives one key set — no rule in the
+model or the documentation produces it, so serving it would mean writing that recorded sequence
+(or a hash chosen to reproduce it) into the emulator. No substitute order was invented either:
+in this crate the stored key order is also the order `Query` reports and `ExclusiveStartKey`
+resumes from.

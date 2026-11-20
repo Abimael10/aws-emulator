@@ -1213,6 +1213,24 @@ pub enum Predicate {
     Exists(StatementPath, bool),
 }
 
+/// HOW a write stated the source it addresses, which is what decides where the clauses
+/// around it may stand.
+///
+/// The dialect admits two orders for one write. The verb names the target and the
+/// statement reads as SQL does — `UPDATE source SET … WHERE …`, the actions after the
+/// target and the predicate last — while a source stated first in its own `FROM` clause
+/// reads as the language's own order: the source clause and the predicate name the items
+/// (`FROM source WHERE … SET …`), and the action clauses then change them. Both state the
+/// same write and run as the same one; what differs is where the predicate stands, and a
+/// clause outside the order its form states is a token past a complete statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatedSource {
+    /// `UPDATE source SET … WHERE …`.
+    Verb,
+    /// `FROM source WHERE … SET …`.
+    FromClause,
+}
+
 /// One clause of an `UPDATE`.
 #[derive(Debug, Clone)]
 pub enum UpdateClause {
@@ -1790,10 +1808,33 @@ impl StatementParser<'_> {
             return self.insert().map(PartiqlStatement::Insert);
         }
         if self.accept_word("update") {
-            return self.update().map(PartiqlStatement::Update);
+            // The verb names the target, so the actions it applies stand right after it:
+            // the predicate is the clause that closes the statement
+            // ([`StatedSource::Verb`]).
+            return self.update(StatedSource::Verb).map(PartiqlStatement::Update);
         }
         if self.accept_word("delete") {
             return self.delete().map(PartiqlStatement::Delete);
+        }
+        // The language's OWN order for the same write: the source stated FIRST, in a
+        // `FROM` clause, with the predicate that names the items and then the clauses that
+        // change them (`FROM source WHERE predicate SET path = value`). It states exactly
+        // what the `UPDATE` order states — one source, the item to change and the actions
+        // to apply — so it is READ as that statement and runs as the write it is.
+        //
+        // What makes it that statement is an ACTION clause after the source, on either
+        // side of the predicate: a `FROM` clause followed by no action at all is the
+        // language's other statement form, a query, which manipulates no data and is read
+        // as one below. Where the predicate may stand is then [`StatedSource`]'s business.
+        if self.peek_word("from") {
+            let opens_at = self.at;
+            self.at += 1;
+            if self.opens_a_from_first_write() {
+                return self
+                    .update(StatedSource::FromClause)
+                    .map(PartiqlStatement::Update);
+            }
+            self.at = opens_at;
         }
         // `EXISTS(<select>)` is the language's CHECK statement: it states no manipulation
         // of data and reads one item to say whether it is there, which is what a
@@ -2025,21 +2066,31 @@ impl StatementParser<'_> {
     }
 
     /// `UPDATE source (SET assignment | REMOVE path)+ WHERE predicate
-    /// [RETURNING values]`.
+    /// [RETURNING values]`, and the same statement with its source stated first
+    /// (`FROM source …`, read by [`Self::statement`]).
     ///
     /// Each clause states ONE action, and several actions are stated by repeating the
     /// keyword — "UPDATE "Music" SET AwardsWon=1 SET AwardDetail={…} WHERE …" is how the
     /// dialect spells two of them. A comma after a complete assignment or path is
     /// therefore a token the grammar has no place for, and the statement is refused as
     /// one token past its expression rather than read as a list.
-    fn update(&mut self) -> Result<UpdateStatement, RequestError> {
-        let (components, _at) = self.write_target(&["set", "remove"])?;
+    ///
+    /// WHERE the predicate may stand follows how the source was stated
+    /// ([`StatedSource`]); a clause past what the statement may carry is a token after a
+    /// complete statement ([`ParseDefect::TrailingToken`], raised where the whole text is
+    /// read).
+    fn update(&mut self, source: StatedSource) -> Result<UpdateStatement, RequestError> {
+        let (components, _at) = self.write_target(&["set", "remove", "where", "returning"])?;
         let [table] = components.as_slice() else {
             // The target an `UPDATE` names carries no clause around it, so a qualifier on
             // it asks for the update through an index.
             return Err(unsupported_on_an_index());
         };
         let table = table.clone();
+        let stated_first = match source {
+            StatedSource::FromClause => self.where_clause()?,
+            StatedSource::Verb => None,
+        };
         let mut clauses = Vec::new();
         loop {
             if self.accept_word("set") {
@@ -2060,7 +2111,19 @@ impl StatementParser<'_> {
             // is refused as the parse defect it is rather than with a rule of its own.
             return Err(statement_parse_error(ParseDefect::NotDataManipulation));
         }
-        let filter = self.required_where_clause()?;
+        let filter = match stated_first {
+            Some(filter) => filter,
+            None => {
+                if source == StatedSource::FromClause && self.peek_word("where") {
+                    // In this order the predicate stands BEFORE the actions — the source
+                    // clause and the predicate name the items, and the action clauses then
+                    // change them — so a predicate after them belongs to no clause of this
+                    // statement and is a token past a complete one.
+                    return Err(unexpected_token_after_statement());
+                }
+                self.required_where_clause()?
+            }
+        };
         let returning = self.returning()?;
         Ok(UpdateStatement {
             table,
@@ -2068,6 +2131,35 @@ impl StatementParser<'_> {
             filter,
             returning,
         })
+    }
+
+    /// Whether the `FROM` clause just read opens a WRITE: an action clause stands after
+    /// the source it names, on whichever side of the predicate the statement states it.
+    ///
+    /// The cursor is left exactly where it was, so the statement is read once, by
+    /// [`Self::update`], whichever this answers.
+    fn opens_a_from_first_write(&mut self) -> bool {
+        let at = self.at;
+        let aliased = self.aliased;
+        // The markers a probe READS are markers the statement has not bound yet: the count
+        // of bound parameters is restored with the cursor, so the one read below is the
+        // parse's own ("the parameters for the PartiQL statement" are counted against the
+        // statement that runs).
+        let used = self.used_parameters;
+        let mut opens = self
+            .write_target(&["set", "remove", "where", "returning"])
+            .is_ok();
+        if opens && !(self.peek_word("set") || self.peek_word("remove")) {
+            // A predicate before the actions is the other order this form may come in;
+            // text whose predicate does not read at all states no action after it either,
+            // and is left to the defect the whole text earns.
+            opens = self.where_clause().is_ok()
+                && (self.peek_word("set") || self.peek_word("remove"));
+        }
+        self.at = at;
+        self.aliased = aliased;
+        self.used_parameters = used;
+        opens
     }
 
     /// `DELETE FROM source WHERE predicate [RETURNING values]`.
@@ -3337,6 +3429,23 @@ pub fn pinned_equalities(predicate: &Predicate) -> HashMap<String, AttributeValu
         }
     }
     pinned
+}
+
+/// Whether this `WHERE` predicate states EQUALITIES AND NOTHING ELSE: a conjunction of
+/// `attribute = value` comparisons, each on a whole top-level attribute.
+///
+/// What a read that must address ONE item is addressed BY is the equalities on its key
+/// attributes ([`pinned_equalities`] reads them), so a term that is no such equality — a
+/// boolean function, a comparison that is not `=`, a membership test, a range, a branch of
+/// an `OR`, a negation, a comparison of two paths or one against a document path — states a
+/// condition that addresses no single item. A clause carrying one asks for a read no
+/// single-item plan can serve.
+pub fn states_equalities_only(predicate: &Predicate) -> bool {
+    match predicate {
+        Predicate::All(branches) => branches.iter().all(states_equalities_only),
+        Predicate::Compare(left, CompareOp::Equal, right) => equality(left, right).is_some(),
+        _ => false,
+    }
 }
 
 /// The attribute and value one `=` comparison pins, whichever side the path is on.

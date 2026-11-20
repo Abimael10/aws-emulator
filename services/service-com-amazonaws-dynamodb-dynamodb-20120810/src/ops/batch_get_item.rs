@@ -271,29 +271,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut addressed: Vec<(&String, &KeysAndAttributes)> =
             input.request_items.iter().collect();
         addressed.sort_by(|left, right| left.0.cmp(right.0));
-        // A request states its intent through the expression members or through the
-        // legacy ones they replaced, never through both — a rule about the REQUEST, so
-        // the two sides are collected over EVERY table's entry: a batch that projects one
-        // table the legacy way and another the expression way states its intent two ways
-        // at once, exactly as one entry carrying both members does.
-        crate::state::check_expression_parameter_mix(
-            &[crate::state::stated_legacy(
-                "AttributesToGet",
-                addressed.iter().any(|(_, keys)| {
-                    keys.attributes_to_get
-                        .as_ref()
-                        .is_some_and(|names| !names.is_empty())
-                }),
-                PROJECTION_ASK,
-            )],
-            &[(
-                PROJECTION_EXPRESSION,
-                addressed
-                    .iter()
-                    .any(|(_, keys)| keys.projection_expression.is_some()),
-            )],
-        )
-        .map_err(lift)?;
         // What each table's entry REPORTS of the items it addresses, settled before the
         // store is reached: a projection the service would refuse is refused whatever
         // the tables hold. Read by the one reader every read of this service reads it
@@ -302,6 +279,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut projections: std::collections::HashMap<&String, Vec<crate::state::DocumentPath>> =
             std::collections::HashMap::new();
         for (table_name, keys) in &addressed {
+            // An ask is stated through the expression member or through the legacy one it
+            // replaced, never through both. What states this batch's ask is ONE table's
+            // entry: "RequestItems — a map of one or more table names [...] and, for each
+            // table, a map that describes one or more items to retrieve from that table"
+            // (`BatchGetItem$RequestItems`), and the projection members sit INSIDE that
+            // per-table map, so each entry states its own projection and is held to the
+            // rule on its own ([`crate::state::check_expression_parameter_mix`]) — a batch
+            // that projects one table the legacy way and another the expression way states
+            // each of its asks exactly once and is served.
+            crate::state::check_expression_parameter_mix(
+                &[crate::state::stated_legacy(
+                    "AttributesToGet",
+                    keys.attributes_to_get
+                        .as_ref()
+                        .is_some_and(|names| !names.is_empty()),
+                    PROJECTION_ASK,
+                )],
+                &[(PROJECTION_EXPRESSION, keys.projection_expression.is_some())],
+            )
+            .map_err(lift)?;
             // The projection first: a projection this service cannot apply is the defect
             // the entry is refused for, whatever else it also got wrong.
             let read = crate::state::requested_projection(
@@ -312,20 +309,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .map_err(lift)?;
             // Then this entry's substitution table against this entry's projection. A
-            // `RequestItems` entry carries the whole projection ask — the expression
-            // member, the legacy list and the names table that resolves the expression's
-            // aliases are all members of the ENTRY — so the entry is the scope those
-            // members are held to each other in, and it is held to the WHOLE rule a
-            // single-table read's members are: a names table sent with no projection to be
-            // substituted into has nothing to go into, which is a different defect from
-            // entries a projection that IS present does not reference, and AWS words the
-            // two differently ([`crate::state::Substitutions::check_all_referenced`]). The
-            // refusal is that ENTRY's, so it is stated on its own, and it is earned
-            // whichever generation the batch's OTHER entries stated their projection in:
-            // the request-wide hold on mixing generations is settled above, over members
-            // this one does not carry.
+            // `RequestItems` entry is one ELEMENT of the batch: the projection member, the
+            // legacy list that states the same ask and the names table that resolves the
+            // projection's aliases are all members of the ENTRY, so what each table SAYS is
+            // held to the element's own scope — its keys are substitution tokens, it is not
+            // empty, and every token its projection dereferences is defined
+            // ([`crate::state::Substitutions::check_all_referenced_in_element`]). The one
+            // rule that is the REQUEST's — that a substitution table was sent with an
+            // expression to be substituted into at all — is the request validator's over a
+            // call's OWN expression members, and this entry's members are not those, so an
+            // entry that carries a names table and states its projection another way, or
+            // none, is served. The refusal is that entry's, so it is stated on its own, and
+            // it is earned whichever generation the batch's OTHER entries stated their
+            // projection in — which is the scope the generation rule above is held in too.
             crate::state::Substitutions::new(keys.expression_attribute_names.as_ref(), None)
-                .check_all_referenced(&[(
+                .check_all_referenced_in_element(&[(
                     PROJECTION_EXPRESSION,
                     keys.projection_expression.as_deref(),
                 )])

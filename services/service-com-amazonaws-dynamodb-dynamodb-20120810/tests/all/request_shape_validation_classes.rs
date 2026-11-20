@@ -778,18 +778,6 @@ async fn a_substitution_table_with_no_expression_is_told_to_add_one() {
                    "ExpressionAttributeValues": {":v": {"S": "active"}}}),
             only_with_expressions_bare("ExpressionAttributeValues"),
         ),
-        // A `RequestItems` entry of a batched read carries the whole projection ask — the
-        // expression member, the legacy list and the names table that resolves the
-        // expression's aliases are all members of the ENTRY — so the entry is held to the
-        // same rule a single-table read's members are.
-        (
-            "names, on one entry of a batched read",
-            "BatchGetItem",
-            json!({"RequestItems": {SUBSTITUTED: {
-                "Keys": [key.clone()],
-                "ExpressionAttributeNames": {"#s": "status"}}}}),
-            only_with_expressions_bare("ExpressionAttributeNames"),
-        ),
     ];
 
     for (case, operation, request, expected) in rows {
@@ -808,9 +796,10 @@ async fn a_substitution_table_with_no_expression_is_told_to_add_one() {
     }
 
     // The BOUNDARY: this rule is held over the members ONE ASK is stated through. The
-    // substitution tables of an element of a TRANSACTIONAL call sit beside the expression
-    // members of that element, so they are held to the element's OWN expressions — and an
-    // element that states no expression has none to hold them to, so the call is SERVED.
+    // substitution tables of an element of a TRANSACTIONAL call, and of one `RequestItems`
+    // entry of a BATCHED read, sit beside the expression members of that element, so they
+    // are held to the element's OWN expressions — and an element that states no expression
+    // has none to hold them to, so the call is SERVED.
     for (case, operation, request) in [
         (
             "names, on one element of a transactional read",
@@ -826,6 +815,13 @@ async fn a_substitution_table_with_no_expression_is_told_to_add_one() {
                 "TableName": SUBSTITUTED,
                 "Key": {"pk": {"S": "item-3"}},
                 "ExpressionAttributeValues": {":v": {"S": "paused"}}}}]}),
+        ),
+        (
+            "names, on one entry of a batched read",
+            "BatchGetItem",
+            json!({"RequestItems": {SUBSTITUTED: {
+                "Keys": [key.clone()],
+                "ExpressionAttributeNames": {"#s": "status"}}}}),
         ),
     ] {
         let (status, body) = call(&router, operation, request).await;
@@ -1916,6 +1912,11 @@ const UNEXPECTED_FIELD_TYPE: &str = "Unexpected field type";
 /// element of a list or the value of a map entry — which no modelled member names.
 const UNEXPECTED_VALUE_TYPE: &str = "Unexpected value type in payload";
 
+/// The error class a value that WAS read and then broke a rule the model declares is refused
+/// with, as the wire spells it: the absolute id of the shape the validating framework owns,
+/// which is the other side of this rule's boundary.
+const VALIDATION_EXCEPTION: &str = "com.amazon.coral.validate#ValidationException";
+
 /// The one assertion both halves of the class boundary are read through: the status, the
 /// error class as the wire spells it, and which body member carries the prose.
 ///
@@ -2017,7 +2018,7 @@ async fn a_value_that_could_not_be_read_is_refused_as_a_serialization_failure() 
         (
             "text where a read mode is a boolean",
             "Scan",
-            json!({"TableName": "Tagged", "ConsistentRead": "true"}),
+            json!({"TableName": "Tagged", "ConsistentRead": "maybe"}),
             "STRING_VALUE cannot be converted to Boolean".to_string(),
         ),
         (
@@ -2172,7 +2173,7 @@ async fn a_value_that_could_not_be_read_is_refused_as_a_serialization_failure() 
         ),
     ] {
         let (status, answered) = call(&router, operation, body).await;
-        refused_as(case, status, &answered, "ValidationException", sentence);
+        refused_as(case, status, &answered, VALIDATION_EXCEPTION, sentence);
     }
     for (case, operation, body) in [
         ("a page size inside its range", "ListTables", json!({"Limit": 10})),

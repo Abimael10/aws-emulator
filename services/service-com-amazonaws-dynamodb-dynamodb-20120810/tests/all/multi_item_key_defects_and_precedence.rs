@@ -723,6 +723,11 @@ async fn a_transactional_update_of_a_key_attribute_cancels_the_transaction() {
     let key = json!({"pk": {"S": "t1"}, "sk": {"S": "s"}});
     let other = json!({"Put": {"TableName": TABLE,
                                "Item": {"pk": {"S": "t9"}, "sk": {"S": "s"}}}});
+    // A second element nothing is wrong with, addressing its OWN item: "transaction
+    // requests cannot include multiple operations on one item", so an element that repeated
+    // the one above would be that refusal rather than this rule.
+    let another = json!({"Put": {"TableName": TABLE,
+                                 "Item": {"pk": {"S": "t8"}, "sk": {"S": "s"}}}});
     let moves_sort = json!({"Update": {
         "TableName": TABLE, "Key": key.clone(),
         "UpdateExpression": "SET sk = :v",
@@ -770,7 +775,7 @@ async fn a_transactional_update_of_a_key_attribute_cancels_the_transaction() {
         ),
         (
             "the middle of three elements",
-            json!([other.clone(), moves_partition.clone(), other.clone()]),
+            json!([other.clone(), moves_partition.clone(), another.clone()]),
             1,
             "pk",
             vec!["None", "ValidationError", "None"],

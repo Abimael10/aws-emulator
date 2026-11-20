@@ -553,7 +553,14 @@ async fn a_refused_call_fails_the_task_with_the_services_own_error() {
             ),
             input: json!({}),
             owed: Duration::ZERO,
-            expected: Err("DynamoDB.ValidationException"),
+            // A parameter-level refusal is raised by the request framework that fronts the
+            // service rather than by its API, so the shape it names belongs to no DynamoDB
+            // model (that service answers the validation class under the framework's own
+            // namespace, `com.amazon.coral.validate#ValidationException`). No SDK carries a
+            // class for it, so the client deserializes it into the service's BASE exception,
+            // which is the error name the task reports — with the code itself in the cause,
+            // where the SDK's own message puts it.
+            expected: Err("DynamoDB.AmazonDynamoDBException"),
         },
         FailureCase {
             case: "a Catch on the service's own error takes the failure over",

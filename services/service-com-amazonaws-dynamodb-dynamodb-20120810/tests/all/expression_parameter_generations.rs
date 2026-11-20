@@ -331,17 +331,18 @@ async fn a_legacy_member_beside_any_expression_member_is_refused() {
             "ConditionalOperator",
             "ConditionExpression",
         ),
-        // The rule is about the REQUEST, so a batch states its generation once across
-        // every entry: one entry projecting the legacy way and another the expression way
-        // mixes them exactly as one entry carrying both members does.
+        // A `RequestItems` entry states the projection of ITS table, so the rule is held
+        // inside one entry: an entry carrying both members mixes them exactly as a
+        // single-table read does, and the entries beside it are left alone.
         (
-            "a BatchGetItem whose entries project in different generations",
+            "a BatchGetItem entry projecting both ways",
             "BatchGetItem",
             json!({
                 "RequestItems": {
                     TABLE: {
                         "Keys": [{"pk": {"S": "k1"}, "sk": {"S": "s1"}}],
                         "AttributesToGet": ["a"],
+                        "ProjectionExpression": "a",
                     },
                     OTHER_TABLE: {
                         "Keys": [{"pk": {"S": "k1"}}],
