@@ -310,7 +310,12 @@ impl Emulator {
     }
 
     /// The address the cluster `arn` publishes under the bootstrap member `member`, once
-    /// it publishes one.
+    /// it publishes one: the FIRST `host:port` pair of that member's string.
+    ///
+    /// A bootstrap string carries one pair per broker node of the cluster, and a client
+    /// bootstraps against any one of them, so this answers the first — the one address
+    /// every data-plane suite of this crate dials its socket from. The CARDINALITY of the
+    /// string is the subject of `bootstrap_broker_cardinality`.
     ///
     /// `GetBootstrapBrokers` refuses while the cluster is still `CREATING`, so this LOOKS
     /// AGAIN until the address is published rather than waiting out a span — the one
@@ -321,7 +326,12 @@ impl Emulator {
         loop {
             let reply = self.bootstrap_brokers(arn).await;
             if let Some(address) = reply.body.get(member).and_then(Value::as_str) {
-                return address.to_string();
+                return address
+                    .split(',')
+                    .next()
+                    .unwrap_or(address)
+                    .trim()
+                    .to_string();
             }
             assert!(
                 Instant::now() < deadline,

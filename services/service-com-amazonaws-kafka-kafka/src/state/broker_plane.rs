@@ -13,7 +13,9 @@
 //! lifetime hangs off ([`ClusterEndpoint`]) together with the state the protocol
 //! answers from.
 //!
-//! ONE socket per access path a cluster enables. A Kafka
+//! ONE socket per BROKER NODE of each access path a cluster enables, so the bootstrap
+//! string of an N-broker cluster carries N distinct `host:port` pairs, one per node, and
+//! the `Metadata` answer reports each node at its own address. A Kafka
 //! request frame begins with its length, so its first byte is never the `0x16` a TLS
 //! record opens with: the connection's first byte says whether the client dialled the
 //! encrypted half or the plaintext one ([`::service_common::in_band_tls`]), which is
@@ -368,14 +370,14 @@ impl AccessPath {
     }
 }
 
-/// The socket one access path of one cluster is served on, and the address it landed
-/// on.
+/// The socket one BROKER NODE of one access path of one cluster is served on, and the
+/// address it landed on.
 ///
 /// The store OWNS the listener: dropping it closes the port and severs every
 /// connection on it, so it must outlive every bootstrap string handed out — which is
 /// as long as the cluster is in the registry.
 pub struct ClusterEndpoint {
-    /// `host:port`, the authority the bootstrap strings of this path carry.
+    /// `host:port`, this node's own pair in the bootstrap strings of this path.
     authority: String,
     /// Held only to keep the port open; the core owns the socket and its lifetime.
     _listener: ::emulator_server::ResourceListener,
@@ -407,8 +409,40 @@ impl ClusterEndpoint {
     }
 }
 
-/// The `host:port` the cluster `cluster_arn` names answers `path` connections on,
-/// opening the socket on first use.
+/// The `host:port` pairs the cluster `cluster_arn` names answers `path` connections on:
+/// ONE per broker node the cluster holds, in broker-id order, each a distinct address.
+///
+/// A bootstrap string "contains one or more hostname:port pairs"
+/// (`GetBootstrapBrokers`), one per broker node — so a client that splits it to size its
+/// connection pool, to pin a replication factor to the broker count or to fail over to
+/// another broker sees the cluster the control plane reports. A cluster that publishes no
+/// broker nodes of its own stands behind one ([`BROKER_NODE_ID`]), so its string carries
+/// exactly one pair.
+///
+/// `None` when any one of those sockets could not be opened — the caller then answers
+/// with a modelled error rather than announcing a broker list with an address nothing
+/// serves in it.
+pub async fn ensure_cluster_endpoints<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    cluster_arn: &str,
+    path: AccessPath,
+) -> Option<Vec<String>> {
+    let state = super::service_state(engine)?;
+    // The nodes are read off the store under a guard of its own, dropped before the
+    // awaits below: a lock held across an await would make this future non-`Send`.
+    let nodes = state.lock().broker_node_ids(region, cluster_arn);
+    let mut announced = Vec::with_capacity(nodes.len());
+    for node_id in nodes {
+        announced
+            .push(ensure_broker_endpoint(engine, ctx, region, cluster_arn, path, node_id).await?);
+    }
+    (!announced.is_empty()).then_some(announced)
+}
+
+/// The `host:port` the broker node `node_id` of the cluster `cluster_arn` answers `path`
+/// connections on, opening the socket on first use.
 ///
 /// `None` when this service was mounted on an engine with no listener surface or no
 /// store, when the store holds no cluster under that ARN in this Region, when this
@@ -417,19 +451,20 @@ impl ClusterEndpoint {
 /// nothing serves. A socket is opened only for a cluster the store HOLDS, so no request
 /// can make the process bind one for an ARN it invented.
 ///
-/// Idempotent: the first socket opened for a cluster's path is kept, so every later
+/// Idempotent: the first socket opened for a broker node's path is kept, so every later
 /// `GetBootstrapBrokers` answers the same address and a client may key a connection
 /// on it. It is released when the cluster leaves the registry
 /// ([`ComAmazonawsKafkaKafkaState::unregister_cluster`]), which closes the port.
-pub async fn ensure_cluster_endpoint<Eng: Send + Sync + 'static>(
+async fn ensure_broker_endpoint<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     region: &str,
     cluster_arn: &str,
     path: AccessPath,
+    node_id: i32,
 ) -> Option<String> {
     let state = super::service_state(engine)?;
-    let key = (cluster_arn.to_string(), path);
+    let key = (cluster_arn.to_string(), path, node_id);
     // Everything read off the store is read under ONE guard, taken and dropped before
     // the awaits below: a lock held across an await would make this future non-`Send`.
     let held = {
@@ -450,17 +485,23 @@ pub async fn ensure_cluster_endpoint<Eng: Send + Sync + 'static>(
     let listeners = (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()?
         .listeners();
-    // ONE broker per access path, served at BOTH ends of its address: the socket the core
-    // accepts a client's connections on, and the connections an IN-PROCESS client of this
-    // emulator opens to the address `GetBootstrapBrokers` publishes
+    // ONE broker per broker node per access path, served at BOTH ends of its address: the
+    // socket the core accepts a client's connections on, and the connections an IN-PROCESS
+    // client of this emulator opens to the address `GetBootstrapBrokers` publishes
     // (`service_common::dialable_data_planes`). A bootstrap address of a cluster in a VPC is
     // reachable only from inside that VPC, so the client that reads it out of the control
     // plane and dials it is code this emulator itself runs — a function attached to that VPC
     // — and both ends are the same broker over the same log.
     let served = ::std::sync::Arc::new(wire::ClusterBroker::new(
-        cluster_arn.to_string(),
-        region.to_string(),
-        path,
+        wire::ServedNode {
+            cluster_arn: cluster_arn.to_string(),
+            region: region.to_string(),
+            path,
+            // WHICH broker node of the cluster answers here, which is the node a client
+            // reaching this address is talking to: the id it reports itself under in
+            // `Metadata` and as the coordinator of a group it holds.
+            node_id,
+        },
         state.clone(),
         // The core's own TLS server, for a client that dialled one of the
         // encrypted paths. A core that cannot prepare one leaves this `None`, and
@@ -511,20 +552,22 @@ pub async fn ensure_cluster_endpoint<Eng: Send + Sync + 'static>(
         %cluster_arn,
         %authority,
         ?path,
-        "opened a cluster's Apache Kafka endpoint"
+        node_id,
+        "opened a broker node's Apache Kafka endpoint"
     );
     Some(authority)
 }
 
 /// The most Apache Kafka endpoints this emulator holds open at once, across every
-/// cluster and access path.
+/// cluster, access path and broker node.
 ///
 /// CHOSEN as a process-safety bound, not an Amazon MSK limit: each endpoint owns a
 /// listening socket and its file descriptor for as long as its cluster is in the
-/// registry, and how many clusters a caller creates is the caller's choice. Sized well
-/// above the four paths of the clusters an emulator is driven with
-/// ([`super::MAX_CLUSTERS_PER_REGION`] clusters times four paths would be the ceiling of
-/// a run that bootstrapped every path of every cluster).
+/// registry, and how many clusters a caller creates is the caller's choice. One is opened
+/// per BROKER NODE of each path a cluster enables, so it is sized well above the broker
+/// nodes of the clusters an emulator is driven with — a cluster that bootstrapped every
+/// path of every one of its [`super::MAX_BROKER_NODES_PER_CLUSTER`] nodes would hold
+/// sixty.
 pub const MAX_CLUSTER_ENDPOINTS: usize = 512;
 
 impl ComAmazonawsKafkaKafkaState {

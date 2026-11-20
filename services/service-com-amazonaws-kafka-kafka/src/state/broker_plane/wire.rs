@@ -309,15 +309,30 @@ fn carried<Request: Message, Response: Message>(min: i16, max: i16) -> Option<(i
     (min <= max).then_some((min, max))
 }
 
-/// One access path of one cluster's Apache Kafka endpoint.
-pub struct ClusterBroker {
+/// WHICH broker one endpoint IS: the cluster whose brokers it serves, the Region that
+/// cluster lives in, the access path the socket is for and the broker node that answers
+/// on it. One value rather than four parameters, so the identity of an endpoint travels
+/// as a whole.
+#[derive(Debug, Clone)]
+pub struct ServedNode {
     /// The cluster whose brokers this endpoint is: every answer is computed from THIS
     /// cluster's record, its topics and its logs.
-    cluster_arn: String,
+    pub cluster_arn: String,
     /// The Region the cluster lives in, which a SASL/IAM credential is scoped to.
-    region: String,
+    pub region: String,
     /// The access path this socket serves, which is what it requires of a client.
-    path: AccessPath,
+    pub path: AccessPath,
+    /// WHICH broker node of the cluster answers on this socket: the id it reports itself
+    /// under in `Metadata`, and the node it names as the coordinator of a group a client
+    /// asks it for. Every node of a cluster here reads and writes the same log, so which
+    /// one a client reached decides only the identity it is answered with.
+    pub node_id: i32,
+}
+
+/// One broker node of one access path of one cluster's Apache Kafka endpoint.
+pub struct ClusterBroker {
+    /// Which broker of which cluster this endpoint is.
+    node: ServedNode,
     /// This service's store — the same one the control plane writes.
     state: ::engine::ServiceState<crate::state::ComAmazonawsKafkaKafkaState>,
     /// The core's TLS server, for a client that dialled one of the encrypted paths.
@@ -332,21 +347,17 @@ pub struct ClusterBroker {
 }
 
 impl ClusterBroker {
-    /// The endpoint of one cluster's access path, over the store and the emulator that
-    /// announced it.
+    /// The endpoint of one broker node of one cluster's access path, over the store and
+    /// the emulator that announced it.
     pub fn new(
-        cluster_arn: String,
-        region: String,
-        path: AccessPath,
+        node: ServedNode,
         state: ::engine::ServiceState<crate::state::ComAmazonawsKafkaKafkaState>,
         upgrader: Option<TlsUpgrader>,
         emulator: EmbeddedEmulator,
         policies: iam_access::PolicySource,
     ) -> Self {
         Self {
-            cluster_arn,
-            region,
-            path,
+            node,
             state,
             upgrader,
             emulator,
@@ -360,9 +371,10 @@ impl NativeHandler for ClusterBroker {
     /// own future, which is what the core's `'static` handler contract asks for.
     fn serve(&self, conn: ListenerConn) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let broker = Broker {
-            cluster_arn: self.cluster_arn.clone(),
-            region: self.region.clone(),
-            path: self.path,
+            cluster_arn: self.node.cluster_arn.clone(),
+            region: self.node.region.clone(),
+            path: self.node.path,
+            node_id: self.node.node_id,
             state: self.state.clone(),
             emulator: self.emulator.clone(),
             policies: self.policies.clone(),
@@ -388,6 +400,7 @@ struct Broker {
     cluster_arn: String,
     region: String,
     path: AccessPath,
+    node_id: i32,
     state: ::engine::ServiceState<crate::state::ComAmazonawsKafkaKafkaState>,
     emulator: EmbeddedEmulator,
     policies: iam_access::PolicySource,
@@ -864,13 +877,13 @@ impl Broker {
             .collect()
     }
 
-    /// The authority the core bound for this path, which is the address a client
-    /// reaches this cluster's brokers at.
+    /// The authority the core bound for THIS broker node of this path, which is the
+    /// address a client on this connection reached it at.
     fn authority(&self) -> String {
         self.state
             .lock()
             .cluster_endpoints
-            .get(&(self.cluster_arn.clone(), self.path))
+            .get(&(self.cluster_arn.clone(), self.path, self.node_id))
             .map(|endpoint| endpoint.authority().to_string())
             .unwrap_or_default()
     }
@@ -1447,20 +1460,40 @@ impl Broker {
     /// asked about.
     ///
     /// Every broker node the cluster holds is reported, each at the address the CORE
-    /// bound for this path — so a client that asks one node for its configuration, or
-    /// re-resolves the cluster from its metadata, reaches this emulator rather than a
-    /// name nothing serves. Each partition is placed on as many of those nodes as the
+    /// bound for THAT node on this path — one address per node, so a client that sizes
+    /// its connection pool from the broker list, or re-resolves the cluster from its
+    /// metadata, reaches this emulator's own socket for each of them rather than a name
+    /// nothing serves. Each partition is placed on as many of those nodes as the
     /// topic's replication factor, starting at the node its own index falls on, and led
     /// by the first of them — the placement Apache Kafka lays a topic out with, so a
     /// client reads back the replication the topic was created with.
     fn metadata(&self, request: &MetadataRequest) -> MetadataResponse {
         let now = SystemTime::now();
-        let (host, port) = split_authority(&self.authority());
-        let (held, broker_ids) = {
+        let (held, brokers) = {
             let mut store = self.state.lock();
             let ids = store.broker_node_ids(&self.region, &self.cluster_arn);
-            (store.data_plane_topics(&self.cluster_arn, now), ids)
+            // A node whose socket this emulator has not opened is reported at the one
+            // this connection arrived on: that address does serve the cluster, where a
+            // node's own unopened one would serve nothing.
+            let own = store
+                .cluster_endpoints
+                .get(&(self.cluster_arn.clone(), self.path, self.node_id))
+                .map(|endpoint| endpoint.authority().to_string())
+                .unwrap_or_default();
+            let brokers: Vec<(i32, String)> = ids
+                .iter()
+                .map(|node_id| {
+                    let authority = store
+                        .cluster_endpoints
+                        .get(&(self.cluster_arn.clone(), self.path, *node_id))
+                        .map(|endpoint| endpoint.authority().to_string())
+                        .unwrap_or_else(|| own.clone());
+                    (*node_id, authority)
+                })
+                .collect();
+            (store.data_plane_topics(&self.cluster_arn, now), brokers)
         };
+        let broker_ids: Vec<i32> = brokers.iter().map(|(node_id, _)| *node_id).collect();
         // A request naming no topic list at all asks for every topic of the cluster,
         // which is what a null list means in this API.
         let wanted: Option<Vec<String>> = request.topics.as_ref().map(|topics| {
@@ -1494,12 +1527,13 @@ impl Broker {
         };
         MetadataResponse::default()
             .with_brokers(
-                broker_ids
+                brokers
                     .iter()
-                    .map(|node_id| {
+                    .map(|(node_id, authority)| {
+                        let (host, port) = split_authority(authority);
                         MetadataResponseBroker::default()
                             .with_node_id(BrokerId(*node_id))
-                            .with_host(StrBytes::from_string(host.clone()))
+                            .with_host(StrBytes::from_string(host))
                             .with_port(port)
                     })
                     .collect(),
@@ -1872,7 +1906,9 @@ impl Broker {
     }
 
     /// `FindCoordinator`: the broker that coordinates the group or transaction a client
-    /// named — this endpoint, which is the broker that holds the group.
+    /// named — this broker node, which holds the group; every node of the cluster reads
+    /// the same group state, so the node a client already has a connection to is the one
+    /// it is sent back to.
     ///
     /// Answered in the shape the NEGOTIATED version has: the single coordinator a request
     /// up to version 3 asks about, carried in the response's own members, and from
@@ -1883,7 +1919,7 @@ impl Broker {
         api_version: i16,
     ) -> FindCoordinatorResponse {
         let (host, port) = split_authority(&self.authority());
-        let node_id = BROKER_NODE_ID;
+        let node_id = self.node_id;
         if api_version >= 4 {
             return FindCoordinatorResponse::default().with_coordinators(
                 request

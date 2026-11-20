@@ -2952,15 +2952,16 @@ pub struct ComAmazonawsKafkaKafkaState {
     /// Monotonic counter feeding each VPC connection's ARN, so each one gets a
     /// distinct identity.
     pub next_vpc_connection_suffix: u64,
-    /// The socket each cluster's brokers are reached on, keyed by (cluster ARN, access
-    /// path), and the address `GetBootstrapBrokers` announces for it
-    /// ([`broker_plane::ClusterEndpoint`]). Opened on the first bootstrap read of a
-    /// cluster the registry HOLDS, bounded by
+    /// The socket each broker node of each cluster is reached on, keyed by (cluster ARN,
+    /// access path, broker node id), and the address `GetBootstrapBrokers` announces for
+    /// it ([`broker_plane::ClusterEndpoint`]). One per BROKER NODE, because a bootstrap
+    /// string carries one `host:port` pair per node of the cluster. Opened on the first
+    /// bootstrap read of a cluster the registry HOLDS, bounded by
     /// [`broker_plane::MAX_CLUSTER_ENDPOINTS`] entries, and held for as long as that
     /// cluster is in the registry, so an announced address never moves under a client;
     /// dropped when the cluster is unregistered, which closes the port.
     pub cluster_endpoints:
-        HashMap<(String, broker_plane::AccessPath), broker_plane::ClusterEndpoint>,
+        HashMap<(String, broker_plane::AccessPath, i32), broker_plane::ClusterEndpoint>,
     /// The records each partition of each topic holds, keyed by (cluster ARN, topic
     /// name, partition index): what a `Produce` on that cluster's endpoint appends
     /// and a `Fetch` reads, with the records the topic's `retention.ms` has aged out

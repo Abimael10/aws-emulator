@@ -584,8 +584,13 @@ pub(crate) async fn given_topic(
     std::thread::sleep(Duration::from_millis(750));
 }
 
-/// The bootstrap strings a cluster publishes, member by member.
-async fn published(emulator: &Emulator, cluster: &str, case: &str) -> BTreeMap<String, String> {
+/// Every `host:port` pair of every bootstrap string a cluster publishes, member by
+/// member: one pair per broker node of the cluster, in the order the string lists them.
+async fn published_pairs(
+    emulator: &Emulator,
+    cluster: &str,
+    case: &str,
+) -> BTreeMap<String, Vec<String>> {
     let reply = emulator.bootstrap_brokers(cluster).await;
     assert_eq!(
         reply.status, 200,
@@ -599,10 +604,27 @@ async fn published(emulator: &Emulator, cluster: &str, case: &str) -> BTreeMap<S
         .unwrap_or_default()
         .into_iter()
         .filter_map(|(member, value)| {
-            value
-                .as_str()
-                .map(|address| (member, address.to_string()))
+            value.as_str().map(|published| {
+                (
+                    member,
+                    published
+                        .split(',')
+                        .map(|pair| pair.trim().to_string())
+                        .collect(),
+                )
+            })
         })
+        .collect()
+}
+
+/// The FIRST `host:port` pair of each bootstrap string a cluster publishes, member by
+/// member: a client bootstraps against any one of the brokers the string lists, and this
+/// is the one the suites below dial.
+async fn published(emulator: &Emulator, cluster: &str, case: &str) -> BTreeMap<String, String> {
+    published_pairs(emulator, cluster, case)
+        .await
+        .into_iter()
+        .filter_map(|(member, pairs)| pairs.into_iter().next().map(|first| (member, first)))
         .collect()
 }
 
@@ -665,12 +687,17 @@ async fn every_published_bootstrap_address_answers_the_kafka_protocol() {
         }
         given_topic(&emulator, &cluster, "orders", 1, None).await;
 
-        let addresses = published(&emulator, &cluster, case).await;
+        let addresses = published_pairs(&emulator, &cluster, case).await;
         assert!(
             !addresses.is_empty(),
             "case {case:?}: a cluster with brokers must publish a bootstrap string"
         );
-        for (member, authority) in &addresses {
+        for (member, pairs) in &addresses {
+            // The FIRST broker of the member's string is the one dialled here; that every
+            // pair of it is dialable is `bootstrap_broker_cardinality`'s subject.
+            let authority = pairs
+                .first()
+                .unwrap_or_else(|| panic!("case {case:?}: {member} carries no host:port pair"));
             let probe = format!("{case} / {member}");
             // Every published member is dialled, and the ones a client of AWS reaches
             // over TLS are dialled over TLS.
@@ -712,6 +739,13 @@ async fn every_published_bootstrap_address_answers_the_kafka_protocol() {
                 brokers.contains(authority),
                 "case {probe:?}: Metadata must report the address the client dialled \
                  ({authority}), got {brokers:?}"
+            );
+            // And it reports every OTHER pair of the same string too: the brokers the
+            // cluster holds are one list, whichever of them the client reached.
+            assert!(
+                pairs.iter().all(|pair| brokers.contains(pair)),
+                "case {probe:?}: Metadata must report every published broker {pairs:?}, got \
+                 {brokers:?}"
             );
             let topics: Vec<String> = metadata
                 .topics
@@ -791,9 +825,9 @@ async fn every_published_bootstrap_address_answers_the_kafka_protocol() {
 }
 
 /// RULE: the brokers a client learns from `Metadata` are the broker nodes the cluster
-/// holds — one entry per node, each at the address the bootstrap string publishes, with
-/// the first of them the controller — so a client sent to any node of the cluster reaches
-/// the endpoint this emulator serves it on.
+/// holds — one entry per node, each at its OWN address, the one the bootstrap string
+/// publishes for that node, with the first of them the controller — so a client sent to
+/// any node of the cluster reaches the endpoint this emulator serves that node on.
 ///
 /// The rows differ along the number of brokers the cluster holds, which is what the rule
 /// counts over.
@@ -815,9 +849,14 @@ async fn metadata_reports_every_broker_node_the_cluster_holds() {
                 ..ClusterRequest::named(&format!("plane-brokers-{brokers}"))
             })
             .await;
-        // The address the cluster publishes once it has settled, and the nodes the
-        // control plane then reports for it — the ones a client must be told about.
+        // The addresses the cluster publishes once it has settled — one per broker node —
+        // and the nodes the control plane then reports for it, the ones a client must be
+        // told about.
         let authority = published_address(&emulator, &cluster, "bootstrapBrokerString", case).await;
+        let pairs = published_pairs(&emulator, &cluster, case)
+            .await
+            .remove("bootstrapBrokerString")
+            .unwrap_or_else(|| panic!("case {case:?}: the cluster published no plaintext string"));
         let nodes = emulator
             .call(
                 "GET",
@@ -857,14 +896,19 @@ async fn metadata_reports_every_broker_node_the_cluster_holds() {
             "case {case:?}: Metadata must report the cluster's own broker nodes, got \
              {reported:?} for {node_ids:?}"
         );
-        for broker in metadata.brokers.iter() {
-            assert_eq!(
-                format!("{}:{}", broker.host.as_str(), broker.port),
-                authority,
-                "case {case:?}: node {} must be reachable at the published address",
-                broker.node_id.0
-            );
-        }
+        // Each node at the pair the bootstrap string publishes for it, in the same order:
+        // the string lists one address per node, so the two readings of the cluster's
+        // brokers name the same addresses.
+        let addressed: Vec<String> = metadata
+            .brokers
+            .iter()
+            .map(|broker| format!("{}:{}", broker.host.as_str(), broker.port))
+            .collect();
+        assert_eq!(
+            addressed, pairs,
+            "case {case:?}: each broker node must be reachable at its own published \
+             address {pairs:?}, got {addressed:?}"
+        );
         assert_eq!(
             i64::from(metadata.controller_id.0),
             node_ids.first().copied().unwrap_or_default(),

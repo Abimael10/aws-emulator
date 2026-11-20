@@ -41,8 +41,9 @@ const CLIENT_ID: &str = "in-process-client";
 /// own SigV4 signing name (`sigv4Name` `kafka`).
 const SERVED_BY: &str = "kafka";
 
-/// The bootstrap strings a cluster publishes, member by member.
-async fn published(emulator: &Emulator, cluster: &str, case: &str) -> BTreeMap<String, String> {
+/// The bootstrap strings a cluster publishes, member by member: every `host:port` pair of
+/// each, one per broker node of the cluster.
+async fn published(emulator: &Emulator, cluster: &str, case: &str) -> BTreeMap<String, Vec<String>> {
     let reply = emulator.bootstrap_brokers(cluster).await;
     assert_eq!(
         reply.status, 200,
@@ -55,7 +56,17 @@ async fn published(emulator: &Emulator, cluster: &str, case: &str) -> BTreeMap<S
         .cloned()
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|(member, value)| value.as_str().map(|address| (member, address.to_string())))
+        .filter_map(|(member, value)| {
+            value.as_str().map(|published| {
+                (
+                    member,
+                    published
+                        .split(',')
+                        .map(|pair| pair.trim().to_string())
+                        .collect(),
+                )
+            })
+        })
         .collect()
 }
 
@@ -168,9 +179,10 @@ impl Session {
 }
 
 /// RULE: every address `GetBootstrapBrokers` publishes resolves, in the register of the planes
-/// this emulator serves in process, to a plane of this service — and a connection opened on the
-/// one published for the plaintext path carries a real Kafka session, answered by the same
-/// broker a client of the socket reaches, which reports the published address as its own.
+/// this emulator serves in process, to a plane of this service — one per broker node of the
+/// cluster — and a connection opened on any of those published for the plaintext path carries a
+/// real Kafka session, answered by the same broker a client of the socket reaches, which
+/// reports every published address of the path as the cluster's brokers.
 #[tokio::test]
 async fn a_published_bootstrap_address_is_reachable_by_an_in_process_client() {
     // The rows differ along the access paths the cluster enables, which is what decides WHICH
@@ -200,59 +212,66 @@ async fn a_published_bootstrap_address_is_reachable_by_an_in_process_client() {
         );
         let planes = DialablePlanes::of(&*emulator.engine)
             .expect("the engine vends the register of the planes it serves");
-        for (member, authority) in &addresses {
-            let probe = format!("{case} / {member}");
-            // Reachable: the address resolves to a plane this service opened, whichever access
-            // path the member names.
-            let mut session = Session::opened(&planes, authority, &probe).await;
-            if member.contains("Tls") || member.contains("Sasl") {
-                // A client of an encrypted path opens a TLS handshake on the connection
-                // instead of a Kafka frame, which is the wire that path is served on; what
-                // this row asserts is that the address is reachable at all.
-                continue;
+        for (member, pairs) in &addresses {
+            for authority in pairs {
+                let probe = format!("{case} / {member} / {authority}");
+                // Reachable: every pair of the string resolves to a plane this service opened,
+                // whichever access path the member names.
+                let mut session = Session::opened(&planes, authority, &probe).await;
+                if member.contains("Tls") || member.contains("Sasl") {
+                    // A client of an encrypted path opens a TLS handshake on the connection
+                    // instead of a Kafka frame, which is the wire that path is served on; what
+                    // this row asserts is that the address is reachable at all.
+                    continue;
+                }
+                let versions: ApiVersionsResponse = session
+                    .call(
+                        &probe,
+                        ApiKey::ApiVersions,
+                        3,
+                        &ApiVersionsRequest::default()
+                            .with_client_software_name(StrBytes::from_static_str(CLIENT_ID))
+                            .with_client_software_version(StrBytes::from_static_str("1")),
+                    )
+                    .await;
+                assert_eq!(
+                    versions.error_code, 0,
+                    "case {probe:?}: expected the broker to answer ApiVersions, got error code {}",
+                    versions.error_code
+                );
+                assert!(
+                    !versions.api_keys.is_empty(),
+                    "case {probe:?}: expected the broker to report the APIs it serves"
+                );
+                // And the brokers it reports are the addresses the control plane published for
+                // this path, so a client that re-resolves the cluster from its metadata keeps
+                // talking to this same plane.
+                let metadata: MetadataResponse = session
+                    .call(
+                        &probe,
+                        ApiKey::Metadata,
+                        9,
+                        &MetadataRequest::default().with_topics(None),
+                    )
+                    .await;
+                let reported: Vec<String> = metadata
+                    .brokers
+                    .iter()
+                    .map(|broker| format!("{}:{}", broker.host.as_str(), broker.port))
+                    .collect();
+                let expected: Vec<String> = pairs
+                    .iter()
+                    .map(|pair| {
+                        let (host, port) = split(pair, &probe);
+                        format!("{host}:{port}")
+                    })
+                    .collect();
+                assert_eq!(
+                    reported, expected,
+                    "case {probe:?}: expected the brokers reported to be the published addresses \
+                     {expected:?}, got {reported:?}"
+                );
             }
-            let versions: ApiVersionsResponse = session
-                .call(
-                    &probe,
-                    ApiKey::ApiVersions,
-                    3,
-                    &ApiVersionsRequest::default()
-                        .with_client_software_name(StrBytes::from_static_str(CLIENT_ID))
-                        .with_client_software_version(StrBytes::from_static_str("1")),
-                )
-                .await;
-            assert_eq!(
-                versions.error_code, 0,
-                "case {probe:?}: expected the broker to answer ApiVersions, got error code {}",
-                versions.error_code
-            );
-            assert!(
-                !versions.api_keys.is_empty(),
-                "case {probe:?}: expected the broker to report the APIs it serves"
-            );
-            // And the broker it reports itself as is the address the control plane published,
-            // so a client that re-resolves the cluster from its metadata keeps talking to this
-            // same plane.
-            let metadata: MetadataResponse = session
-                .call(
-                    &probe,
-                    ApiKey::Metadata,
-                    9,
-                    &MetadataRequest::default().with_topics(None),
-                )
-                .await;
-            let (host, port) = split(authority, &probe);
-            let reported: Vec<String> = metadata
-                .brokers
-                .iter()
-                .map(|broker| format!("{}:{}", broker.host.as_str(), broker.port))
-                .collect();
-            let expected = format!("{host}:{port}");
-            assert!(
-                !reported.is_empty() && reported.iter().all(|broker| *broker == expected),
-                "case {probe:?}: expected every broker reported to be the published address \
-                 {expected}, got {reported:?}"
-            );
         }
     }
 }
@@ -271,17 +290,26 @@ async fn an_address_no_cluster_was_opened_at_resolves_to_nothing() {
     let addresses = published(&emulator, &cluster, case).await;
     let published_authority = addresses
         .values()
+        .flatten()
         .next()
         .unwrap_or_else(|| panic!("case {case:?}: a cluster with brokers publishes an address"));
     let (host, port) = split(published_authority, case);
+    // Every port this cluster's planes were opened at, so the row below names one that is
+    // NOT one of them: a cluster publishes a pair per broker node, so the next port up
+    // can belong to another of its brokers.
+    let opened: Vec<u16> = addresses
+        .values()
+        .flatten()
+        .map(|authority| split(authority, case).1)
+        .collect();
+    let unopened = (1_u16..=u16::MAX)
+        .rev()
+        .find(|candidate| !opened.contains(candidate))
+        .unwrap_or(port);
     let planes = DialablePlanes::of(&*emulator.engine)
         .expect("the engine vends the register of the planes it serves");
     let rows: Vec<(&str, String, u16)> = vec![
-        (
-            "another port of the same host",
-            host.clone(),
-            port.checked_add(1).unwrap_or(port - 1),
-        ),
+        ("another port of the same host", host.clone(), unopened),
         ("a host nothing was opened at", "10.0.7.9".to_string(), port),
         (
             "a name of AWS's own broker naming",
@@ -318,6 +346,7 @@ async fn the_published_address_is_withdrawn_with_the_cluster() {
     let addresses = published(&emulator, &cluster, case).await;
     let authority = addresses
         .values()
+        .flatten()
         .next()
         .unwrap_or_else(|| panic!("case {case:?}: a cluster with brokers publishes an address"))
         .clone();

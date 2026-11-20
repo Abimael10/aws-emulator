@@ -452,11 +452,12 @@ async fn ec2_network(router: &MultiServiceRouter) -> Network {
 }
 
 /// Create the cluster in that network, wait until MSK reports it `ACTIVE`, and answer every
-/// bootstrap string it publishes, member by member.
+/// bootstrap string it publishes, member by member — each as the `host:port` pairs it carries,
+/// one per broker node of the cluster.
 async fn plant_the_cluster(
     router: &MultiServiceRouter,
     network: &Network,
-) -> BTreeMap<String, String> {
+) -> BTreeMap<String, Vec<String>> {
     let (status, created) = kafka(
         router,
         "POST",
@@ -517,7 +518,17 @@ async fn plant_the_cluster(
         .cloned()
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|(member, value)| value.as_str().map(|address| (member, address.to_string())))
+        .filter_map(|(member, value)| {
+            value.as_str().map(|address| {
+                (
+                    member,
+                    address
+                        .split(',')
+                        .map(|pair| pair.trim().to_string())
+                        .collect(),
+                )
+            })
+        })
         .collect()
 }
 
@@ -776,68 +787,73 @@ async fn an_in_vpc_function_speaks_kafka_with_the_address_msk_published() {
         "expected a name of another zone to be a server failure, got {resolved}"
     );
 
-    // THEN the data plane itself, at every address the control plane published.
-    for (member, authority) in &published {
-        let case = format!("the address published as {member}");
-        let encrypted = member.contains("Tls") || member.contains("Sasl");
-        let report = probe(
-            &router,
-            &case,
-            &json!({ "broker": authority, "tls": encrypted }),
-        )
-        .await;
-        let broker = report.get("broker").cloned().unwrap_or(Value::Null);
-        assert!(
-            report.get("broker_error").is_none(),
-            "case {case:?}: the published address {authority} must be reachable from inside the \
-             VPC, got {report}"
-        );
-        assert_eq!(
-            broker.pointer("/api_versions/error_code").and_then(Value::as_i64),
-            Some(0),
-            "case {case:?}: expected the broker to answer ApiVersions, got {report}"
-        );
-        assert_eq!(
-            broker.pointer("/api_versions/correlation").and_then(Value::as_i64),
-            Some(11),
-            "case {case:?}: expected the answer to carry the request's own correlation id, got \
-             {report}"
-        );
-        assert_eq!(
-            broker.pointer("/api_versions/serves_metadata").and_then(Value::as_bool),
-            Some(true),
-            "case {case:?}: expected the broker to report that it serves Metadata, got {report}"
-        );
-        // The broker it reports itself as is the address the control plane published, so a
-        // client that re-resolves the cluster from its metadata keeps talking to this plane.
-        let reported: Vec<String> = broker
-            .pointer("/metadata/brokers")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-            .iter()
-            .map(|broker| {
-                format!(
-                    "{}:{}",
-                    broker.get("host").and_then(Value::as_str).unwrap_or_default(),
-                    broker.get("port").and_then(Value::as_i64).unwrap_or_default()
-                )
-            })
-            .collect();
-        assert!(
-            !reported.is_empty() && reported.iter().all(|broker| broker == authority),
-            "case {case:?}: expected every broker reported to be the published address \
-             {authority}, got {report}"
-        );
-        if encrypted {
+    // THEN the data plane itself, at every address the control plane published — one per
+    // broker node of the cluster, each a plane of its own.
+    for (member, pairs) in &published {
+        for authority in pairs {
+            let case = format!("the address published as {member} / {authority}");
+            let encrypted = member.contains("Tls") || member.contains("Sasl");
+            let report = probe(
+                &router,
+                &case,
+                &json!({ "broker": authority, "tls": encrypted }),
+            )
+            .await;
+            let broker = report.get("broker").cloned().unwrap_or(Value::Null);
             assert!(
-                broker
-                    .get("tls_version")
-                    .and_then(Value::as_str)
-                    .is_some_and(|version| version.starts_with("TLS")),
-                "case {case:?}: expected the session to be the one the handshake negotiated, got \
+                report.get("broker_error").is_none(),
+                "case {case:?}: the published address {authority} must be reachable from inside \
+                 the VPC, got {report}"
+            );
+            assert_eq!(
+                broker.pointer("/api_versions/error_code").and_then(Value::as_i64),
+                Some(0),
+                "case {case:?}: expected the broker to answer ApiVersions, got {report}"
+            );
+            assert_eq!(
+                broker.pointer("/api_versions/correlation").and_then(Value::as_i64),
+                Some(11),
+                "case {case:?}: expected the answer to carry the request's own correlation id, \
+                 got {report}"
+            );
+            assert_eq!(
+                broker.pointer("/api_versions/serves_metadata").and_then(Value::as_bool),
+                Some(true),
+                "case {case:?}: expected the broker to report that it serves Metadata, got \
                  {report}"
             );
+            // The brokers it reports are the addresses the control plane published for this
+            // path, so a client that re-resolves the cluster from its metadata keeps talking to
+            // this plane — and sizes its pool at the brokers the cluster really has.
+            let reported: Vec<String> = broker
+                .pointer("/metadata/brokers")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .map(|broker| {
+                    format!(
+                        "{}:{}",
+                        broker.get("host").and_then(Value::as_str).unwrap_or_default(),
+                        broker.get("port").and_then(Value::as_i64).unwrap_or_default()
+                    )
+                })
+                .collect();
+            assert_eq!(
+                &reported, pairs,
+                "case {case:?}: expected the brokers reported to be the published addresses \
+                 {pairs:?}, got {report}"
+            );
+            if encrypted {
+                assert!(
+                    broker
+                        .get("tls_version")
+                        .and_then(Value::as_str)
+                        .is_some_and(|version| version.starts_with("TLS")),
+                    "case {case:?}: expected the session to be the one the handshake negotiated, \
+                     got {report}"
+                );
+            }
         }
     }
 
@@ -846,6 +862,7 @@ async fn an_in_vpc_function_speaks_kafka_with_the_address_msk_published() {
     // outside the VPC.
     let authority = published
         .values()
+        .flatten()
         .next()
         .expect("a cluster with brokers publishes an address");
     let host = authority

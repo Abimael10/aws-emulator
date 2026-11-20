@@ -2,8 +2,12 @@
 
 //! @op GetBootstrapBrokers
 //! Renders the cluster's bootstrap-broker strings from its persisted access settings:
-//! one string per access path the cluster actually enables, each naming the address
-//! THIS emulator accepts an Apache Kafka connection on for that path. A path the
+//! one string per access path the cluster actually enables, each carrying one
+//! `hostname:port` pair per broker node the cluster holds — the address THIS emulator
+//! accepts an Apache Kafka connection on for that node on that path, so a client that
+//! splits the string to size its connection pool, to pin a replication factor to the
+//! broker count or to fail over to another broker sees the cluster `DescribeCluster`
+//! reports. A path the
 //! cluster does not enable has no string at all — a member is populated exactly when
 //! the cluster's encryption-in-transit setting AND its client authentication admit a
 //! client arriving on that path's connection scheme (and, for the public, multi-VPC
@@ -14,12 +18,12 @@
 //! is refused with `BadRequestException` rather than answered with endpoints nothing
 //! serves on.
 //!
-//! The address is a socket the CORE owns, opened for the cluster on the first read of
-//! its endpoints and kept for as long as the store lives
-//! ([`crate::state::broker_plane::ensure_cluster_endpoint`]) — so every later read
-//! answers the same address, and the broker behind it serves the protocol a client
-//! takes the string to: the SASL exchange the path requires, the topic configuration
-//! the control plane stored, and the records a client produces and fetches.
+//! The address is a socket the CORE owns, opened per broker node for the cluster on the
+//! first read of its endpoints and kept for as long as the store lives
+//! ([`crate::state::broker_plane::ensure_cluster_endpoints`]) — so every later read
+//! answers the same addresses, and the broker behind each of them serves the protocol a
+//! client takes the string to: the SASL exchange the path requires, the topic
+//! configuration the control plane stored, and the records a client produces and fetches.
 //!
 //! Authentication is NOT this handler's business: the emulator verifies every
 //! request signature centrally (see `AGENTS.md`), so the modelled
@@ -337,12 +341,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         };
 
-        // The ADDRESS each path is announced at is the one the emulator ANSWERS Apache
-        // Kafka connections on: the core binds a socket per path on this emulator's own
-        // interface and this service serves the Kafka wire protocol there
-        // ([`crate::state::broker_plane`]), so a client that takes a bootstrap string
-        // verbatim reaches a broker. A path whose socket could not be opened is
-        // reported as a server fault rather than announced as an address nothing
+        // The ADDRESSES each path is announced at are the ones the emulator ANSWERS Apache
+        // Kafka connections on: the core binds a socket per broker node of each path on
+        // this emulator's own interface and this service serves the Kafka wire protocol
+        // there ([`crate::state::broker_plane`]), so a client that takes any pair of a
+        // bootstrap string verbatim reaches a broker. A path whose sockets could not be
+        // opened is reported as a server fault rather than announced as an address nothing
         // serves.
         let mut announced: Vec<(state::broker_plane::AccessPath, Option<String>)> = Vec::new();
         for path in [
@@ -361,7 +365,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 announced.push((path, None));
                 continue;
             }
-            let Some(authority) = state::broker_plane::ensure_cluster_endpoint(
+            let Some(authorities) = state::broker_plane::ensure_cluster_endpoints(
                 &*self.engine,
                 ctx,
                 &region,
@@ -383,7 +387,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             };
-            announced.push((path, Some(authority)));
+            // "A string containing one or more hostname:port pairs": one pair per broker
+            // node of the cluster, comma-separated, which is how a client splits the
+            // string into the brokers it may bootstrap against.
+            announced.push((path, Some(authorities.join(","))));
         }
         let endpoint = |path: state::broker_plane::AccessPath| -> Option<String> {
             announced
@@ -402,8 +409,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
-        // One string per access path the cluster enables, each naming the address that
-        // path is served at. `when` keeps a path's member absent rather than empty when
+        // One string per access path the cluster enables, each naming every broker node's
+        // address on that path. `when` keeps a path's member absent rather than empty when
         // the cluster does not offer it.
         let when = |enabled: bool, path: state::broker_plane::AccessPath| {
             enabled.then(|| endpoint(path)).flatten()
