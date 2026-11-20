@@ -636,9 +636,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The object's plaintext comes of the CUSTOMER-PROVIDED key it was stored under, when
         // it was stored under one: a read presenting none cannot be served it, and one
-        // presenting a key that is not the object's is refused the way any caller not
-        // authorized for its bytes is ([`crate::state::sse_customer::read_refusal`] holds the
-        // rule, and every call of this service that touches such an object is decided by it).
+        // presenting a key that is not the object's is refused 403 with the sentence that
+        // names the secret key as what was wrong ([`crate::state::sse_customer::read_refusal`]
+        // holds the rule, and every call of this service that touches such an object is
+        // decided by it).
         // Judged against the version the address resolved to, before anything about the
         // object is reported.
         if let Some(refusal) =

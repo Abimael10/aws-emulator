@@ -23,11 +23,11 @@
 //!
 //! And three conditions decide a READ of an object stored this way ([`read_refusal`]): a read
 //! presenting no key cannot be served at all, a read presenting a key whose digest is not the
-//! object's is refused the way S3 refuses a caller that is not authorized for the object's
-//! plaintext, and a read presenting a key for an object stored under some OTHER form of
-//! encryption names parameters that do not apply to it. The decision is the digest the object
-//! carries against the digest of the key the request carried, which is the only comparison S3
-//! itself can make either.
+//! object's is refused the authorization status with the SSE-C sentence that names the secret
+//! key as what was wrong, and a read presenting a key for an object stored under some OTHER
+//! form of encryption names parameters that do not apply to it. The decision is the digest the
+//! object carries against the digest of the key the request carried, which is the only
+//! comparison S3 itself can make either.
 //!
 //! What is NOT here: any cryptography. This emulator holds an object's bytes in this
 //! process's memory and encrypts nothing (the same stance [`super::ObjectEncryption`] records
@@ -97,6 +97,17 @@ const INVALID_DIGEST_CODE: &str = "InvalidDigest";
 const KEY_REQUIRED_MESSAGE: &str =
     "The object was stored using a form of Server Side Encryption. The correct parameters \
      must be provided to retrieve the object.";
+
+/// The sentence S3 answers a request that presents a well-formed customer-provided key that is
+/// NOT the one the object (or the upload) was stored under: the parameters are usable, the key
+/// is simply not the right one, which is a statement about the SECRET KEY and not about the
+/// caller's permissions — the generic authorization sentence would say nothing about SSE-C and
+/// would be indistinguishable from a caller lacking the grant for the object, which has a
+/// completely different fix. Fixed text, naming neither the key nor any other value the
+/// request carried.
+const WRONG_KEY_MESSAGE: &str =
+    "Requests specifying Server Side Encryption with Customer provided keys must provide the \
+     correct secret key.";
 
 /// The sentence S3 answers a read that presents a customer key for an object stored under
 /// some OTHER form of encryption: the parameters are well formed and name a key the object
@@ -256,9 +267,11 @@ pub struct ReadRefusal {
 /// 1. the object was stored under a customer key and the read presents NONE — the plaintext
 ///    comes of that key, so there is nothing to serve;
 /// 2. it presents a key whose DIGEST is not the object's — the key cannot open the object,
-///    which S3 answers the way it answers any caller not authorized for its plaintext
-///    ([`super::ACCESS_DENIED_CODE`], HTTP 403): the refusal says nothing about the key it
-///    was given;
+///    which S3 answers with the authorization code and status
+///    ([`super::ACCESS_DENIED_CODE`], HTTP 403) and the SSE-C sentence that names the secret
+///    key as what was wrong ([`WRONG_KEY_MESSAGE`]), so a client can tell this apart from a
+///    caller that lacks the grant for the object; the refusal states no value the request
+///    carried;
 /// 3. the object was stored under some other form of encryption and the read presents a key
 ///    — well-formed parameters that do not apply to this object.
 pub fn read_refusal(
@@ -287,7 +300,7 @@ pub fn read_refusal(
         (Some(stored), Some(presented)) if stored != presented.key_md5 => refusal(
             super::ACCESS_DENIED_CODE,
             super::ACCESS_DENIED_STATUS,
-            super::ACCESS_DENIED_MESSAGE,
+            WRONG_KEY_MESSAGE,
         ),
         (Some(_), Some(_)) => None,
     }
@@ -493,36 +506,53 @@ mod tests {
             algorithm: SSE_CUSTOMER_ALGORITHM.to_string(),
             key_md5: md5.to_string(),
         };
-        // (case, the object's encryption, the key the read presents, the code expected)
-        let rows: [(&str, &super::super::ObjectEncryption, Option<CustomerKey>, Option<&str>); 5] = [
+        // (case, the object's encryption, the key the read presents, the code and the sentence
+        // expected)
+        type ReadRow<'a> = (
+            &'a str,
+            &'a super::super::ObjectEncryption,
+            Option<CustomerKey>,
+            Option<(&'a str, &'a str)>,
+        );
+        let rows: [ReadRow<'_>; 5] = [
             ("the key it was stored with", &stored, Some(key(&digest)), None),
             (
                 "another key",
                 &stored,
                 Some(key(&other_digest)),
-                Some(super::super::ACCESS_DENIED_CODE),
+                Some((super::super::ACCESS_DENIED_CODE, WRONG_KEY_MESSAGE)),
             ),
             (
                 "no key at all",
                 &stored,
                 None,
-                Some(super::super::INVALID_REQUEST_CODE),
+                Some((super::super::INVALID_REQUEST_CODE, KEY_REQUIRED_MESSAGE)),
             ),
             (
                 "a key for an object stored without one",
                 &managed,
                 Some(key(&digest)),
-                Some(super::super::INVALID_REQUEST_CODE),
+                Some((
+                    super::super::INVALID_REQUEST_CODE,
+                    KEY_NOT_APPLICABLE_MESSAGE,
+                )),
             ),
             ("no key for an object stored without one", &managed, None, None),
         ];
         for (case, encryption, presented, expected) in rows {
             let refusal = read_refusal(encryption, presented.as_ref());
             assert_eq!(
-                refusal.map(|refusal| refusal.code),
+                refusal.map(|refusal| (refusal.code, refusal.message)),
                 expected,
                 "case {case:?}: expected {expected:?}, got {refusal:?}"
             );
         }
+        // The wrong-key refusal is NOT the generic authorization sentence: a client must be
+        // able to tell a bad secret key from a missing grant for the object.
+        assert_ne!(
+            WRONG_KEY_MESSAGE,
+            super::super::ACCESS_DENIED_MESSAGE,
+            "case \"another key\": the wrong-key refusal must carry its own sentence"
+        );
     }
 }

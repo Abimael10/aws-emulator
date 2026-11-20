@@ -17,7 +17,9 @@
 //!    and that digest and nothing else about the key.
 //! 2. The object's bytes come of that key, so a read is decided by the key it presents,
 //!    against the digest the object carries: the SAME key is served the object, ANOTHER key is
-//!    refused the way any caller not authorized for its plaintext is (403 `AccessDenied`), and
+//!    refused 403 `AccessDenied` with the sentence that names the SECRET KEY as what was wrong
+//!    ([`WRONG_SECRET_KEY_MESSAGE`], pinned over the whole class of SSE-C objects and calls by
+//!    the last two tests of this suite), and
 //!    NO key cannot be served at all (400 `InvalidRequest`). A read presenting a key for an
 //!    object stored under some other form of encryption names parameters that do not apply to
 //!    it.
@@ -76,6 +78,26 @@ const INVALID_DIGEST: &str = "InvalidDigest";
 const KEY_REQUIRED_MESSAGE: &str =
     "The object was stored using a form of Server Side Encryption. The correct parameters \
      must be provided to retrieve the object.";
+
+/// The sentence Amazon S3 answers a request whose customer-provided key is well formed but is
+/// NOT the one the object (or the upload) was stored under — spelled out here rather than read
+/// from the crate, so this suite pins the wording a client branches on and not merely that the
+/// handler and the test agree.
+///
+/// Fixed text: it names the SECRET KEY as what was wrong and interpolates nothing of the
+/// request. The model states no message text
+/// (`smithy_query(query="operation",operation="GetObject")` binds `SSECustomerAlgorithm`,
+/// `SSECustomerKey` and `SSECustomerKeyMD5` and names no wording), so the sentence is recorded
+/// Amazon S3 behaviour.
+const WRONG_SECRET_KEY_MESSAGE: &str =
+    "Requests specifying Server Side Encryption with Customer provided keys must provide the \
+     correct secret key.";
+
+/// The GENERIC authorization sentence, which the refusal above is NOT: "AccessDenied — Access
+/// Denied" (Amazon S3 "Error responses", list of error codes) is what a caller lacking the
+/// object's grant is told, and the two have completely different fixes — so a client, or an
+/// operator reading a log, must be able to tell them apart.
+const GENERIC_ACCESS_DENIED_MESSAGE: &str = "Access Denied";
 
 /// The IAM action a write — and a multipart initiation — is authorized under.
 const PUT_OBJECT_ACTION: &str = "s3:PutObject";
@@ -297,6 +319,12 @@ async fn an_object_stored_under_a_customer_key_is_served_only_to_that_key() {
             ACCESS_DENIED,
             "case {case:?}: expected the {ACCESS_DENIED} code, got {:?}",
             wrong.error_code()
+        );
+        assert_eq!(
+            wrong.error_message(),
+            WRONG_SECRET_KEY_MESSAGE,
+            "case {case:?}: expected AWS's sentence for a wrong secret key, got {:?}",
+            wrong.error_message()
         );
         let wrong_head =
             head_object(&router, "sse-c-bucket", object_key, &borrowed(&other)).await;
@@ -575,6 +603,13 @@ async fn a_multipart_upload_under_a_customer_key_is_carried_out_with_that_key() 
          with status {}",
         wrong_completion.error_code(),
         wrong_completion.status
+    );
+    assert_eq!(
+        wrong_completion.error_message(),
+        WRONG_SECRET_KEY_MESSAGE,
+        "case \"a completion under another key\": expected AWS's sentence for a wrong secret \
+         key, got {:?}",
+        wrong_completion.error_message()
     );
 
     let completed = send(
@@ -904,7 +939,7 @@ async fn a_part_copy_re_keys_an_ssec_source_into_an_ssec_upload() {
             "another key for the source",
             Some(source_seed.wrapping_add(7)),
             Some(upload_seed),
-            Some((403, ACCESS_DENIED, "Access Denied")),
+            Some((403, ACCESS_DENIED, WRONG_SECRET_KEY_MESSAGE)),
         ),
     ];
     for (case, source, upload, refused) in rows {
@@ -1021,8 +1056,16 @@ async fn a_part_copy_re_keys_an_ssec_source_into_an_ssec_upload() {
     )
     .await;
     assert_eq!(
-        (with_source_key.status, with_source_key.error_code()),
-        (403, ACCESS_DENIED.to_string()),
+        (
+            with_source_key.status,
+            with_source_key.error_code(),
+            with_source_key.error_message()
+        ),
+        (
+            403,
+            ACCESS_DENIED.to_string(),
+            WRONG_SECRET_KEY_MESSAGE.to_string()
+        ),
         "the re-keyed object must not open with the SOURCE's key, got {} with body {:?}",
         with_source_key.status,
         text(&with_source_key)
@@ -1179,5 +1222,452 @@ async fn a_directory_bucket_does_not_serve_a_customer_provided_key() {
          under, got {} with status {}",
         String::from_utf8_lossy(&read.body),
         read.status
+    );
+}
+
+/// The bucket the wrong-key tables below store their objects in.
+const WRONG_KEY_BUCKET: &str = "sse-c-wrong-key";
+
+/// One object stored under a customer-provided key: the case, its key in the bucket, the key
+/// material it was stored under, and the well-formed keys that are NOT its own.
+struct WrongKeyTarget {
+    case: &'static str,
+    object_key: &'static str,
+    key: String,
+    wrong: Vec<String>,
+    /// Whether a RANGED read of it names a satisfiable span: an EMPTY object has none, and a
+    /// range over it is refused `InvalidRange` by the rule that suite
+    /// ([`super::object_partial_reads`]) owns, which is not the rule under test here.
+    ranged: bool,
+}
+
+/// The two wrong keys a row presents, derived from the row's own seed so that no two rows
+/// present the same material and none presents the object's own key.
+fn wrong_keys(seed: u8) -> Vec<String> {
+    vec![
+        customer_key(seed.wrapping_add(100)),
+        customer_key(seed.wrapping_add(37)),
+    ]
+}
+
+/// `PUT /<bucket>/<key>` under the customer key `key`, asserted served.
+async fn stored_in_one_shot(
+    router: &MultiServiceRouter,
+    object_key: &str,
+    key: &str,
+    body: &[u8],
+) {
+    let headers = presenting(key);
+    let written = put_object(
+        router,
+        WRONG_KEY_BUCKET,
+        object_key,
+        body,
+        &borrowed(&headers),
+    )
+    .await;
+    assert_eq!(
+        written.status, 200,
+        "object {object_key:?}: the write under its own key must be served, got {} with body \
+         {:?}",
+        written.status,
+        text(&written)
+    );
+}
+
+/// `POST /<bucket>/<key>?uploadId=<id>` naming the one part `etag` and presenting `key`,
+/// asserted served.
+async fn completed_under(
+    router: &MultiServiceRouter,
+    object_key: &str,
+    upload_id: &str,
+    etag: &str,
+    key: &str,
+) {
+    let headers = presenting(key);
+    let answer = send(
+        router,
+        "POST",
+        &format!("/{WRONG_KEY_BUCKET}/{object_key}?uploadId={upload_id}"),
+        &borrowed(&headers),
+        &format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag>\
+             </Part></CompleteMultipartUpload>"
+        ),
+    )
+    .await;
+    assert_eq!(
+        answer.status, 200,
+        "object {object_key:?}: the completion under the upload's key must be served, got {} \
+         with body {:?}",
+        answer.status,
+        text(&answer)
+    );
+}
+
+/// An object ASSEMBLED by a multipart upload initiated under the customer key `key`: the
+/// initiation, one part and the completion, each presenting that key.
+async fn assembled_by_multipart(
+    router: &MultiServiceRouter,
+    object_key: &str,
+    key: &str,
+    body: &[u8],
+) {
+    let headers = presenting(key);
+    let initiated = send_bytes(
+        router,
+        "POST",
+        &format!("/{WRONG_KEY_BUCKET}/{object_key}?uploads"),
+        &borrowed(&headers),
+        b"",
+    )
+    .await;
+    assert_eq!(
+        initiated.status, 200,
+        "object {object_key:?}: the initiation under its own key must be served, got {} with \
+         body {:?}",
+        initiated.status,
+        text(&initiated)
+    );
+    let upload_id = initiated
+        .element("UploadId")
+        .expect("an initiation must report an UploadId");
+    let part = send_bytes(
+        router,
+        "PUT",
+        &format!("/{WRONG_KEY_BUCKET}/{object_key}?partNumber=1&uploadId={upload_id}"),
+        &borrowed(&headers),
+        body,
+    )
+    .await;
+    assert_eq!(
+        part.status, 200,
+        "object {object_key:?}: the part under the upload's key must be served, got {} with \
+         body {:?}",
+        part.status,
+        text(&part)
+    );
+    let etag = part
+        .header("etag")
+        .expect("a part upload must report an ETag header");
+    completed_under(router, object_key, &upload_id, &etag, key).await;
+}
+
+/// An object RE-KEYED by `UploadPartCopy`: a source stored under `source_key`, copied into a
+/// multipart upload initiated under `upload_key`, so the finished object opens with the
+/// upload's key alone and the SOURCE's key is one of the keys that are not its own.
+async fn rekeyed_by_part_copy(
+    router: &MultiServiceRouter,
+    source_object: &str,
+    object_key: &str,
+    source_key: &str,
+    upload_key: &str,
+    body: &[u8],
+) {
+    stored_in_one_shot(router, source_object, source_key, body).await;
+    let initiated = send_bytes(
+        router,
+        "POST",
+        &format!("/{WRONG_KEY_BUCKET}/{object_key}?uploads"),
+        &borrowed(&presenting(upload_key)),
+        b"",
+    )
+    .await;
+    assert_eq!(
+        initiated.status, 200,
+        "object {object_key:?}: the initiation under the upload's key must be served, got {} \
+         with body {:?}",
+        initiated.status,
+        text(&initiated)
+    );
+    let upload_id = initiated
+        .element("UploadId")
+        .expect("an initiation must report an UploadId");
+    let mut both = presenting_source(source_key);
+    both.extend(presenting(upload_key));
+    let copied = upload_part_copy(
+        router,
+        WRONG_KEY_BUCKET,
+        object_key,
+        &upload_id,
+        1,
+        &format!("{WRONG_KEY_BUCKET}/{source_object}"),
+        &borrowed(&both),
+    )
+    .await;
+    assert_eq!(
+        copied.status, 200,
+        "object {object_key:?}: the copy presenting both keys must be served, got {} with body \
+         {:?}",
+        copied.status,
+        text(&copied)
+    );
+    let etag = copied
+        .element("ETag")
+        .expect("a part copy must report the part's ETag");
+    completed_under(router, object_key, &upload_id, &etag, upload_key).await;
+}
+
+/// RULE 2's SENTENCE: a read presenting a well-formed customer key that is not the object's is
+/// refused 403 `AccessDenied` with [`WRONG_SECRET_KEY_MESSAGE`] — and never with the generic
+/// authorization sentence, which says nothing about SSE-C.
+///
+/// The rows differ along what the rule generalises over: the SHAPE of the stored object (a
+/// one-shot write, an object key with `/` separators, an empty object, an object assembled by a
+/// MULTIPART upload, and one re-keyed into a multipart upload by `UploadPartCopy` and read with
+/// the SOURCE's key), the KEY MATERIAL presented (two distinct wrong 256-bit keys per object),
+/// and the CALL presenting it (a whole-object read, a RANGED read and a metadata read).
+#[tokio::test]
+async fn a_wrong_customer_key_is_refused_with_the_secret_key_sentence() {
+    let router = router();
+    bucket(&router, WRONG_KEY_BUCKET).await;
+
+    // A one-shot write, a nested object key and an empty object: the shapes a plain SSE-C
+    // object comes in.
+    stored_in_one_shot(&router, "plain.bin", &customer_key(51), b"the stored bytes").await;
+    stored_in_one_shot(&router, "deep/dir/nested.bin", &customer_key(52), &[0x5A; 4_096]).await;
+    stored_in_one_shot(&router, "empty.bin", &customer_key(53), b"").await;
+    // An object assembled by a multipart upload, and one re-keyed from an SSE-C source.
+    assembled_by_multipart(&router, "assembled.bin", &customer_key(54), &[0xA5; 2_048]).await;
+    rekeyed_by_part_copy(
+        &router,
+        "copy-source.bin",
+        "rekeyed.bin",
+        &customer_key(56),
+        &customer_key(55),
+        &[0x3C; 1_024],
+    )
+    .await;
+
+    // The re-keyed object's wrong keys include the SOURCE's own: the part was stored under the
+    // UPLOAD's key, so reading it with the key the source was written under is exactly this
+    // refusal.
+    let mut rekeyed_wrong = wrong_keys(55);
+    rekeyed_wrong.push(customer_key(56));
+    let targets = [
+        WrongKeyTarget {
+            case: "a one-shot write",
+            object_key: "plain.bin",
+            key: customer_key(51),
+            wrong: wrong_keys(51),
+            ranged: true,
+        },
+        WrongKeyTarget {
+            case: "an object key with / separators",
+            object_key: "deep/dir/nested.bin",
+            key: customer_key(52),
+            wrong: wrong_keys(52),
+            ranged: true,
+        },
+        WrongKeyTarget {
+            case: "an empty object",
+            object_key: "empty.bin",
+            key: customer_key(53),
+            wrong: wrong_keys(53),
+            ranged: false,
+        },
+        WrongKeyTarget {
+            case: "an object assembled by a multipart upload",
+            object_key: "assembled.bin",
+            key: customer_key(54),
+            wrong: wrong_keys(54),
+            ranged: true,
+        },
+        WrongKeyTarget {
+            case: "an object re-keyed by a part copy",
+            object_key: "rekeyed.bin",
+            key: customer_key(55),
+            wrong: rekeyed_wrong,
+            ranged: true,
+        },
+    ];
+
+    for WrongKeyTarget {
+        case,
+        object_key,
+        key,
+        wrong,
+        ranged: ranged_rows,
+    } in &targets
+    {
+        // The object's own key is served it, so every row below is about the WRONG key and not
+        // about an object no key can open.
+        let served = get_object(
+            &router,
+            WRONG_KEY_BUCKET,
+            object_key,
+            "",
+            &borrowed(&presenting(key)),
+        )
+        .await;
+        assert_eq!(
+            served.status, 200,
+            "case {case:?}: the object's own key must be served it, got {} with body {:?}",
+            served.status,
+            text(&served)
+        );
+
+        for other in wrong {
+            assert_ne!(
+                other, key,
+                "case {case:?}: a wrong-key row must present material that is not the object's"
+            );
+            let headers = presenting(other);
+            // A whole-object read.
+            let refused = get_object(
+                &router,
+                WRONG_KEY_BUCKET,
+                object_key,
+                "",
+                &borrowed(&headers),
+            )
+            .await;
+            assert_eq!(
+                (
+                    refused.status,
+                    refused.error_code(),
+                    refused.error_message()
+                ),
+                (
+                    403,
+                    ACCESS_DENIED.to_string(),
+                    WRONG_SECRET_KEY_MESSAGE.to_string()
+                ),
+                "case {case:?}: expected 403 {ACCESS_DENIED:?} with the secret-key sentence, \
+                 got {} with body {:?}",
+                refused.status,
+                text(&refused)
+            );
+            assert_ne!(
+                refused.error_message(),
+                GENERIC_ACCESS_DENIED_MESSAGE,
+                "case {case:?}: the wrong-key refusal must not read as the generic \
+                 authorization refusal"
+            );
+            // A RANGED read of the same object is decided alike, wherever the object has a
+            // span to serve at all.
+            if *ranged_rows {
+                let mut ranged_headers = borrowed(&headers);
+                ranged_headers.push(("range", "bytes=0-0"));
+                let ranged =
+                    get_object(&router, WRONG_KEY_BUCKET, object_key, "", &ranged_headers).await;
+                assert_eq!(
+                    (ranged.status, ranged.error_code(), ranged.error_message()),
+                    (
+                        403,
+                        ACCESS_DENIED.to_string(),
+                        WRONG_SECRET_KEY_MESSAGE.to_string()
+                    ),
+                    "case {case:?} (a ranged read): expected 403 {ACCESS_DENIED:?} with the \
+                     secret-key sentence, got {} with body {:?}",
+                    ranged.status,
+                    text(&ranged)
+                );
+            }
+            // And a metadata read, which answers no body at all, carries the same status.
+            let described =
+                head_object(&router, WRONG_KEY_BUCKET, object_key, &borrowed(&headers)).await;
+            assert_eq!(
+                described.status, 403,
+                "case {case:?} (a metadata read): expected 403, got {}",
+                described.status
+            );
+        }
+    }
+}
+
+/// THE SAME SENTENCE for the call that presents a key for a SOURCE object rather than for a
+/// plain read: a part copy whose `x-amz-copy-source-` key is not the source object's.
+#[tokio::test]
+async fn a_part_copy_presenting_another_source_key_is_refused_the_secret_key_sentence() {
+    let router = router();
+    bucket(&router, "sse-c-wrong-source-key").await;
+    let source_key = customer_key(61);
+    let upload_key = customer_key(62);
+    let body = vec![0x17_u8; 512];
+
+    let stored = send_bytes(
+        &router,
+        "PUT",
+        "/sse-c-wrong-source-key/source.bin",
+        &borrowed(&presenting(&source_key)),
+        &body,
+    )
+    .await;
+    assert_eq!(
+        stored.status, 200,
+        "the source object must be stored under its key, got {} with body {:?}",
+        stored.status,
+        text(&stored)
+    );
+    let initiated = send_bytes(
+        &router,
+        "POST",
+        "/sse-c-wrong-source-key/target.bin?uploads",
+        &borrowed(&presenting(&upload_key)),
+        b"",
+    )
+    .await;
+    assert_eq!(
+        initiated.status, 200,
+        "the upload must be initiated under its key, got {} with body {:?}",
+        initiated.status,
+        text(&initiated)
+    );
+    let upload_id = initiated
+        .element("UploadId")
+        .expect("an initiation must report an UploadId");
+
+    // The rows differ along WHICH wrong key the copy presents for the source: the upload's own
+    // key, and a key neither half was written under.
+    for (case, wrong_source) in [
+        ("the upload's key for the source", upload_key.clone()),
+        ("a third key for the source", customer_key(63)),
+    ] {
+        let mut headers = presenting_source(&wrong_source);
+        headers.extend(presenting(&upload_key));
+        let copied = upload_part_copy(
+            &router,
+            "sse-c-wrong-source-key",
+            "target.bin",
+            &upload_id,
+            1,
+            "sse-c-wrong-source-key/source.bin",
+            &borrowed(&headers),
+        )
+        .await;
+        assert_eq!(
+            (copied.status, copied.error_code(), copied.error_message()),
+            (
+                403,
+                ACCESS_DENIED.to_string(),
+                WRONG_SECRET_KEY_MESSAGE.to_string()
+            ),
+            "case {case:?}: expected 403 {ACCESS_DENIED:?} with the secret-key sentence, got {} \
+             with body {:?}",
+            copied.status,
+            text(&copied)
+        );
+    }
+
+    // And the copy presenting the source's own key is served, so the refusals above turned
+    // nothing else away.
+    let mut both = presenting_source(&source_key);
+    both.extend(presenting(&upload_key));
+    let served = upload_part_copy(
+        &router,
+        "sse-c-wrong-source-key",
+        "target.bin",
+        &upload_id,
+        1,
+        "sse-c-wrong-source-key/source.bin",
+        &borrowed(&both),
+    )
+    .await;
+    assert_eq!(
+        served.status, 200,
+        "the copy presenting both keys must be served, got {} with body {:?}",
+        served.status,
+        text(&served)
     );
 }
