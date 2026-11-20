@@ -49,9 +49,12 @@ impl ComAmazonawsEc2Amazonec2State {
     /// The stores walked are the ones [`taggable_tag_list_stores`] names, plus the two whose
     /// records keep their tags in a shape of their own — an instance's tag MAP and a network
     /// interface's `TagSet` — which is the same set
-    /// [`ComAmazonawsEc2Amazonec2State::resource_tags_mut`] resolves an id against. A tag
-    /// list entry carrying no key names no tag, so it is not reported; an entry with no value
-    /// reads as the empty value, which is the value a tag given without one is stored with.
+    /// [`ComAmazonawsEc2Amazonec2State::resource_tags_mut`] resolves an id against, plus the
+    /// tags of the security-group rules a delete orphaned
+    /// ([`ComAmazonawsEc2Amazonec2State::orphaned_security_group_rule_tags`]), which outlive
+    /// the rules they were written on. A tag list entry carrying no key names no tag, so it
+    /// is not reported; an entry with no value reads as the empty value, which is the value a
+    /// tag given without one is stored with.
     pub fn tag_descriptions(&self) -> Vec<TagDescription> {
         let mut described: Vec<TagDescription> = Vec::new();
         {
@@ -94,6 +97,15 @@ impl ComAmazonawsEc2Amazonec2State {
                 );
             }
             taggable_tag_list_stores!(resource_tag_descriptions[store, report]);
+            // The tags of the security-group rules a delete orphaned: held by the tagging
+            // surface under the rule's id rather than by a rule record
+            // ([`ComAmazonawsEc2Amazonec2State::orphaned_security_group_rule_tags`]), so
+            // they are reported beside the rules that still exist and under the same
+            // `ResourceType`. A rule id is either held or orphaned and never both, so no
+            // tag can be reported twice.
+            for (resource_id, tags) in &store.orphaned_security_group_rule_tags {
+                report(resource_id, RESOURCE_TYPE_SECURITY_GROUP_RULE, tags);
+            }
         }
 
         // The report's own stable order, which the page cursor names a position in. "The

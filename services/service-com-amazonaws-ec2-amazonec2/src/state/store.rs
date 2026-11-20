@@ -2421,6 +2421,31 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// of a group gives back. Ordered by id, which is the order
     /// `DescribeSecurityGroupRules` reports and pages over.
     pub security_group_rules: BTreeMap<String, SecurityGroupRuleRecord>,
+    /// The tags of the security-group rules a delete ORPHANED, by rule id: the tag records
+    /// that outlived the rules they were written on.
+    ///
+    /// A tag of a security-group rule is held by the TAGGING surface under the rule's id
+    /// rather than by the rule record, so removing the container a rule belongs to — its
+    /// group, or a VPC that takes its groups with it — removes the rules and the deleted
+    /// resources' OWN tags, and leaves the orphaned rules' tags reported
+    /// ([`ComAmazonawsEc2Amazonec2State::remove_security_group`] is the one writer, and
+    /// `DescribeTags` reports them through
+    /// [`ComAmazonawsEc2Amazonec2State::tag_descriptions`]). Deleting a RULE — a revoke, or
+    /// a modify that replaces one — takes its tags with it, because that call deletes the
+    /// rule itself rather than orphaning it.
+    ///
+    /// Report-only: the rule is gone, so a tagging call naming the id is refused the way
+    /// every other id that names no resource is
+    /// ([`ComAmazonawsEc2Amazonec2State::resource_tags_mut`] resolves no entry here). Nothing
+    /// reclaims this store, so the writer holds it to BOTH ceilings such a store is held to:
+    /// the per-store record count ([`MAX_STORED_RECORDS_PER_STORE`]) and the byte budget
+    /// ([`MAX_STORED_BYTES`]), which each retained record is charged a stored record's
+    /// overhead plus its tags against — past either, a removed rule's tags go with it rather
+    /// than growing this process. Ordered by rule id, the order `DescribeTags` sorts its
+    /// report in anyway.
+    ///
+    /// Starts EMPTY: a fresh account has deleted nothing, so no rule has been orphaned.
+    pub orphaned_security_group_rule_tags: BTreeMap<String, Vec<Tag>>,
     /// Every association between one of the account's security groups and a VPC it was not
     /// created in, by the (`GroupId`, `VpcId`) pair the association IS — see
     /// [`SecurityGroupVpcAssociationRecord`] and the module docs. One entry per pair,
@@ -3972,6 +3997,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             iam_instance_profile_association_by_instance: BTreeMap::new(),
             iam_instance_profile_association_due_at: BTreeMap::new(),
             security_group_rules: BTreeMap::new(),
+            // A fresh account has deleted nothing, so no security-group rule is orphaned.
+            orphaned_security_group_rule_tags: BTreeMap::new(),
             // A fresh account has associated no security group with a second VPC.
             security_group_vpc_associations: BTreeMap::new(),
             launch_templates: BTreeMap::new(),

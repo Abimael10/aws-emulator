@@ -18,7 +18,9 @@
 //! 3. a required FILTER LIST — the member an operation selects what it reports with — states
 //!    that member's own non-empty rule, `Filters cannot be null or empty`, for a list that is
 //!    absent and for one that arrives empty alike (ec2Query carries a list as indexed
-//!    `Filter.N.*` fields, so only the absent half is reachable over the wire).
+//!    `Filter.N.*` fields, so only the absent half is reachable over the wire);
+//! 4. the members EC2 refuses by naming the WIRE PARAMETER GROUP it reads the value under and
+//!    nothing else — the whole message is that name, with no sentence around it.
 //!
 //! The rows span both surfaces, every member KIND the model declares a required member with
 //! (an integer, a string id, a list of ids, an enum), SEVERAL required members of one
@@ -55,6 +57,15 @@ fn must_include(member: &str) -> String {
 
 /// Rule 3's sentence: a required filter list is neither null nor empty.
 const FILTERS_CANNOT_BE_NULL_OR_EMPTY: &str = "Filters cannot be null or empty";
+
+/// The form-field prefix ec2Query flattens `ModifyReservedInstancesRequest$TargetConfigurations`
+/// into: the member's `@xmlName`
+/// (`smithy_query(query="operation",operation="ModifyReservedInstances")`).
+const TARGET_CONFIGURATIONS: &str = "ReservedInstancesConfigurationSetItemType";
+
+/// A well-formed Reserved Instances id — the hyphenated UUID form — the store holds no
+/// purchase under.
+const RESERVED_INSTANCES_ID: &str = "1a2b3c4d-1234-5678-9abc-1234567890ab";
 
 /// One row: the case's name, the operation, the form fields it sends (every required member
 /// except the one under test), and the sentence the refusal has to carry.
@@ -184,6 +195,30 @@ fn rows() -> Vec<Row> {
             params: vec![p("TransitGatewayRouteTableId", ROUTE_TABLE_ID)],
             message: FILTERS_CANNOT_BE_NULL_OR_EMPTY.to_string(),
         },
+        // --- Rule 4: the parameter GROUP alone, with no sentence around it. The Reserved
+        // Instances modify reads its target configurations under the
+        // `TargetReservedInstancesConfigurationSet` group, which is what the refusal states;
+        // the other required member of the SAME operation has no recorded group, so it keeps
+        // its surface's sentence — which is what makes rule 4 keyed to the member and not to
+        // the operation.
+        Row {
+            case: "the target configurations a Reserved Instances modify moves to",
+            action: "ModifyReservedInstances",
+            params: indexed("ReservedInstancesId", &[RESERVED_INSTANCES_ID]),
+            message: "TargetReservedInstancesConfigurationSet".to_string(),
+        },
+        Row {
+            case: "the purchases a Reserved Instances modify acts on",
+            action: "ModifyReservedInstances",
+            params: vec![
+                p(&format!("{TARGET_CONFIGURATIONS}.1.InstanceCount"), "1"),
+                p(
+                    &format!("{TARGET_CONFIGURATIONS}.1.AvailabilityZone"),
+                    "us-east-1a",
+                ),
+            ],
+            message: must_include("ReservedInstancesIds"),
+        },
     ]
 }
 
@@ -241,6 +276,19 @@ fn complete_requests() -> Vec<CompleteRequest> {
             params.extend(filters(&[("type", &["static"])]));
             params
         }),
+        (
+            "a complete Reserved Instances modify",
+            "ModifyReservedInstances",
+            {
+                let mut params = indexed("ReservedInstancesId", &[RESERVED_INSTANCES_ID]);
+                params.push(p(&format!("{TARGET_CONFIGURATIONS}.1.InstanceCount"), "1"));
+                params.push(p(
+                    &format!("{TARGET_CONFIGURATIONS}.1.AvailabilityZone"),
+                    "us-east-1a",
+                ));
+                params
+            },
+        ),
     ]
 }
 

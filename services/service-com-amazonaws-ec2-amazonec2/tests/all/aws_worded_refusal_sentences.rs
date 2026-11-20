@@ -922,14 +922,28 @@ async fn a_page_size_outside_the_published_range_is_refused_in_aws_words() {
             "The number of requested max results must be between 100 and 1000.".to_string(),
         ),
         (
-            "past the BYOIP ceiling, in the sentence every paged read whose own wording is \
-             not recorded answers",
+            "past the BYOIP ceiling, which names the member and the bound it may not pass",
             "DescribeByoipCidrs",
             vec![param("MaxResults", "101")],
             "InvalidMaxResults",
-            "Value ( 101 ) for parameter maxResults is invalid. Expecting a value smaller \
-             than or equal to 100."
-                .to_string(),
+            "The MaxResults parameter cannot be larger than 100.".to_string(),
+        ),
+        (
+            "far past the BYOIP ceiling, in the same sentence",
+            "DescribeByoipCidrs",
+            vec![param("MaxResults", "1000")],
+            "InvalidMaxResults",
+            "The MaxResults parameter cannot be larger than 100.".to_string(),
+        ),
+        (
+            // The same sentence on the other side of the published range, which varies only
+            // the word that relates the value to the bound — as every other page-size
+            // sentence of this service does.
+            "below the BYOIP floor, in the same sentence against the other bound",
+            "DescribeByoipCidrs",
+            vec![param("MaxResults", "0")],
+            "InvalidMaxResults",
+            "The MaxResults parameter cannot be smaller than 1.".to_string(),
         ),
         (
             "past the security group ceiling, whose own sentence excludes the bound",
@@ -963,6 +977,11 @@ async fn a_page_size_outside_the_published_range_is_refused_in_aws_words() {
             "the BYOIP ceiling itself",
             "DescribeByoipCidrs",
             vec![param("MaxResults", "100")],
+        ),
+        (
+            "the BYOIP floor itself",
+            "DescribeByoipCidrs",
+            vec![param("MaxResults", "1")],
         ),
         (
             "the transit gateway route table floor itself",

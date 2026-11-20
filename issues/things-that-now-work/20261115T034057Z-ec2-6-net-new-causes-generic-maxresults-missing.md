@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: ec2.describe-managed-prefix-lists-contract ec2.describe-network-insights-paths-contract ec2.op-contract-describe-byoip-cidrs-duplicate ec2.op-contract-modify-reserved-instances-required-params-rejected ec2.ec2-delete-vpc-removes-own-and-default-resource-tags ec2.dasgrefresh-instance-refresh-replaces-every-guest-with-the-new-launch-template-version ec2.shutdown-api-termination-disabled-rejects-terminate-but-still-permits-stop ec2.timesync-chrony-in-the-guest-locks-onto-the-link-local-amazon-time-sync-source ec2.timesync-guest-clock-agrees-with-the-aws-api-date-header-inside-two-seconds ec2.shutdown-in-guest-halt-with-stop-behavior-leaves-it-stopped-and-restartable ec2.shutdown-in-guest-halt-with-terminate-behavior-terminates-the-instance
+Issue-Trace-Ids: ec2.describe-managed-prefix-lists-contract ec2.describe-network-insights-paths-contract ec2.op-contract-describe-byoip-cidrs-duplicate ec2.op-contract-modify-reserved-instances-required-params-rejected ec2.ec2-delete-vpc-removes-own-and-default-resource-tags ec2.dasgrefresh-instance-refresh-replaces-every-guest-with-the-new-launch-template-version
 Issue-Shape-Id: com.amazonaws.ec2#AmazonEC2
 Issue-Key: ec2.describe-managed-prefix-lists-contract|run#12|AssertionError|assert message == expected_message, f"expected {expected_message!r}, got {message!r}"
 Issue-Key: ec2.describe-network-insights-paths-contract|run#10|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
@@ -9,16 +9,13 @@ Issue-Key: ec2|DescribeByoipCidrs|InvalidMaxResults
 Issue-Key: ec2.op-contract-modify-reserved-instances-required-params-rejected|run#6|AssertionError|assert message == "TargetReservedInstancesConfigurationSet", message
 Issue-Key: ec2.ec2-delete-vpc-removes-own-and-default-resource-tags|run#24|AssertionError|assert len(rule_tags) == 1 and rule_tags[0]["Value"] == tag_value, (
 Issue-Key: ec2.dasgrefresh-instance-refresh-replaces-every-guest-with-the-new-launch-template-version|run#66|AssertionError|assert over.get("Message") == over_message, (
-Issue-Key: ec2.shutdown-api-termination-disabled-rejects-terminate-but-still-permits-stop|run#24|ValueError|assert float(after_refusal["uptime"]) > float(before["uptime"]), (
-Issue-Key: ec2.timesync-chrony-in-the-guest-locks-onto-the-link-local-amazon-time-sync-source|run#24|AssertionError|assert "waitsync_rc=0" in waitsync, (
-Issue-Key: ec2.timesync-guest-clock-agrees-with-the-aws-api-date-header-inside-two-seconds|run#25|AssertionError|assert "waitsync_rc=0" in sec.get("WAITSYNC", ""), (
-Issue-Key: ec2.shutdown-in-guest-halt-with-stop-behavior-leaves-it-stopped-and-restartable|_wait_stopped_without_terminating#24|Timeout|assert state not in ("shutting-down", "terminated", "__gone__"), (
-Issue-Key: ec2.shutdown-in-guest-halt-with-terminate-behavior-terminates-the-instance|_wait_terminated_without_stopping#25|Timeout|return seen
 Issue-Commit: 2bc939698b9a959721d42e691c2ca676c39ad8ba
 
-# ec2: 6 net-new causes — generic MaxResults/missing-parameter refusal prose, DeleteVpc wipes orphaned security-group-rule tags, SetDesiredCapacity message appends the group name, and guests observe nothing
+# ec2: 6 net-new causes — generic MaxResults/missing-parameter refusal prose, DeleteVpc wipes orphaned security-group-rule tags, and SetDesiredCapacity message appends the group name
 
 > _Note: this issue was identified against the code base at commit `2bc939698b9a959721d42e691c2ca676c39ad8ba`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+> _Causes 1-4 are FIXED and their replay keys pass; this report carries only those keys. Causes 5 and 6 are NOT: they are re-filed, with the blocker they are on, as `issues/things-that-do-not-work/20261115T034057Z-ec2-2-of-the-6-causes-remain-open-guests-observe-nothing.md`, which carries their five replay keys so they are not recorded as working._
 
 ## Operation
 DescribeManagedPrefixLists
@@ -54,14 +51,14 @@ Why: a client matching the documented refusal text (or comparing refusals across
 Fix: the SetDesiredCapacity bounds validation's refusal renderer must terminate the sentence after `AutoScalingGroup.` and not interpolate the group name.
 Traces: ec2.dasgrefresh-instance-refresh-replaces-every-guest-with-the-new-launch-template-version.
 
-=== Cause 5 of 6: in-guest commands return no output, so nothing about a running guest can be observed ===
+=== Cause 5 of 6: in-guest commands return no output, so nothing about a running guest can be observed === (RE-FILED, NOT FIXED: `issues/things-that-do-not-work/20261115T034057Z-ec2-2-of-the-6-causes-remain-open-guests-observe-nothing.md` carries this cause and its replay keys)
 AWS: recorded behavior only. A launched instance runs a real guest; a command executed in it (here `uptime`, and `chronyc waitsync` / `chronyc sources` against the link-local Amazon Time Sync service at 169.254.169.123) writes its result to stdout, and that stdout is what the caller reads back.
 Emulator: every such command yields an empty string. `uptime` returns `''`, so the check comparing uptime before and after a refused terminate fails with `ValueError: could not convert string to float: ''`; `chronyc waitsync` returns `''`, reported as "`chronyc waitsync` did not report success, so the guest never synchronised to any time source: ''". No non-empty guest stdout is produced on any of these paths.
 Why: a client cannot verify anything that is only observable inside the instance — that a refused TerminateInstances left the guest running and ticking, or that the guest's clock is driven by the link-local time source and agrees with the service's own Date header. Every in-guest assertion silently has nothing to assert on. The open issue 20261115T003554Z-ec2-guests-observe-nothing-in-guest-commands-exit.md records the same symptom for other checks but does not carry these keys.
 Fix: the guest execution path of the ec2 service's data plane must run the command in the instance and return its real stdout, and must present the link-local time source the guest's NTP client synchronises against.
 Traces: ec2.shutdown-api-termination-disabled-rejects-terminate-but-still-permits-stop, ec2.timesync-chrony-in-the-guest-locks-onto-the-link-local-amazon-time-sync-source, ec2.timesync-guest-clock-agrees-with-the-aws-api-date-header-inside-two-seconds.
 
-=== Cause 6 of 6: a guest-initiated shutdown never moves the instance per InstanceInitiatedShutdownBehavior ===
+=== Cause 6 of 6: a guest-initiated shutdown never moves the instance per InstanceInitiatedShutdownBehavior === (RE-FILED, NOT FIXED: same report as cause 5)
 AWS: recorded behavior only. When the guest halts itself, the instance follows the InstanceInitiatedShutdownBehavior attribute: with `stop` it settles in `stopped` and can be started again; with `terminate` it settles in `terminated`. DescribeInstances reflects that final state within a client's polling budget.
 Emulator: neither transition is ever produced — both checks are killed with `Check timed out after 60.0s` without reaching a verdict, so the instance stays in its pre-shutdown state and the attribute has no effect.
 Why: a client relying on guest-initiated shutdown (an instance that powers itself off at the end of a job, the standard pattern for self-terminating workers) sees an instance that never leaves `running`, so neither the stop-and-restart nor the self-terminate lifecycle can be exercised or relied on.

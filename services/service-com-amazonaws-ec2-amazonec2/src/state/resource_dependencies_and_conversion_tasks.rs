@@ -466,7 +466,12 @@ impl ComAmazonawsEc2Amazonec2State {
     ///
     /// The group's RULES go with it — a rule of a group that no longer exists is a rule of
     /// nothing — and the bytes each of them retained go back to the budget they were taken
-    /// from when the rule was stored.
+    /// from when the rule was stored. Their TAGS do not: a security-group rule's tags are
+    /// held by the tagging surface under the rule's id, so a rule this removal ORPHANS
+    /// keeps its tag record ([`Self::orphaned_security_group_rule_tags`]), which
+    /// `DescribeTags` goes on reporting, while the group's own tags go with the group.
+    /// Deleting a rule — a revoke, or a modify that replaces one
+    /// ([`Self::remove_security_group_rules`]) — takes its tags with it.
     pub fn remove_security_group(&mut self, group_id: &str) -> Option<SecurityGroup> {
         let was_default = self.is_default_security_group(group_id);
         let group = self.security_groups.remove(group_id)?;
@@ -482,7 +487,39 @@ impl ComAmazonawsEc2Amazonec2State {
             .collect();
         for rule_id in rule_ids {
             if let Some(record) = self.security_group_rules.remove(&rule_id) {
+                // The bytes the record held go back to the budget whole: what outlives it is
+                // charged on its own terms below, so the two accountings cannot overlap.
                 self.release_stored_bytes(record.payload_bytes);
+                // The rule's TAGS are not the rule: they are held by the tagging surface
+                // under the rule's id, so removing the container the rule belongs to
+                // orphans the rule and leaves its tag record reported
+                // ([`Self::orphaned_security_group_rule_tags`]). A rule carrying no tag
+                // leaves nothing behind.
+                let tags: Vec<Tag> = record.rule.tags.clone().unwrap_or_default();
+                if tags.is_empty() {
+                    continue;
+                }
+                // What is retained costs the store a record of its own, so it is charged
+                // like one: the fixed per-record overhead every store of this crate charges
+                // plus the tags it holds. A rule the SERVICE wrote — a default group's —
+                // was charged nothing, and this charges it all the same, because the bytes
+                // are held either way.
+                //
+                // Nothing reclaims this store, so it is held to BOTH ceilings a store like
+                // that is held to: the per-store record count
+                // ([`MAX_STORED_RECORDS_PER_STORE`]) and the byte budget
+                // ([`MAX_STORED_BYTES`]). Past either, the tags go with the rule rather than
+                // growing this process without bound — repeated create/tag/delete cycles
+                // therefore stop retaining instead of accumulating.
+                let charge = STORED_RECORD_OVERHEAD_BYTES.saturating_add(tag_list_bytes(&tags));
+                if self.orphaned_security_group_rule_tags.len() >= MAX_STORED_RECORDS_PER_STORE
+                    || self.would_exceed_stored_bytes(charge)
+                {
+                    continue;
+                }
+                self.add_stored_bytes(charge);
+                self.orphaned_security_group_rule_tags
+                    .insert(rule_id.clone(), tags);
             }
         }
         if !was_default {

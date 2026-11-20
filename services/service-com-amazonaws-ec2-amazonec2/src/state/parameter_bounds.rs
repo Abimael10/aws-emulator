@@ -149,14 +149,50 @@ pub fn wire_parameter_name(input_shape: Option<&str>, path: &str) -> String {
         )
 }
 
+/// The wire parameter GROUP EC2 names a member under where the whole refusal is that name:
+/// `(input shape, member path, parameter group)`.
+///
+/// EC2's query validator refuses some absent members by stating the parameter group it reads
+/// the value under and NOTHING else — no sentence around it — which is the third of the three
+/// answers [`absent_required_member_message`] gives. The group is not a spelling of the
+/// member: `ModifyReservedInstancesRequest$TargetConfigurations` is read under the
+/// `TargetReservedInstancesConfigurationSet` group, where the model declares the member's
+/// `xmlName` as the list's ITEM type
+/// (`smithy_query(query="operation",operation="ModifyReservedInstances")`), so the group a
+/// member belongs to is recorded here rather than derived.
+///
+/// Keyed on `(input shape, member path)` — the one key that names a member of ONE operation —
+/// because both the group's name and the fact that this surface states it alone are facts of
+/// that operation recorded by its callers, exactly as the page-size wordings are
+/// ([`RECORDED_PAGE_SIZE_WORDINGS`]). A member not named here keeps the sentence its surface
+/// words, so nothing is answered with a group name this service has not recorded.
+pub const RECORDED_PARAMETER_GROUP_ONLY_REFUSALS: &[(&str, &str, &str)] = &[(
+    "ModifyReservedInstancesRequest",
+    "targetConfigurations",
+    "TargetReservedInstancesConfigurationSet",
+)];
+
+/// The parameter group EC2 answers as the WHOLE message for the absent member at `path` of
+/// `input_shape`, or `None` when that member's refusal is a sentence
+/// ([`RECORDED_PARAMETER_GROUP_ONLY_REFUSALS`]).
+pub fn parameter_group_only_refusal(input_shape: Option<&str>, path: &str) -> Option<&'static str> {
+    RECORDED_PARAMETER_GROUP_ONLY_REFUSALS
+        .iter()
+        .find(|(shape, member, _)| Some(*shape) == input_shape && *member == path)
+        .map(|(_, _, parameter)| *parameter)
+}
+
 /// The sentence EC2 refuses a request that left out the `@required` member at `path` of
 /// `input_shape` with, under the one code it answers that refusal with
 /// ([`MISSING_PARAMETER`]).
 ///
-/// Three answers, read off the member and the surface rather than off the request:
+/// Four answers, read off the member and the surface rather than off the request:
 ///
 /// * a required FILTER LIST is [`FILTERS_CANNOT_BE_NULL_OR_EMPTY`], the sentence EC2 states
 ///   that member's own non-empty rule in, whichever operation carries it;
+/// * a member whose refusal EC2 states as the WIRE PARAMETER GROUP ALONE
+///   ([`RECORDED_PARAMETER_GROUP_ONLY_REFUSALS`]) is that group's name and nothing else, with
+///   no sentence around it;
 /// * an operation of a surface the core parameter validator refuses
 ///   ([`CORE_PARAMETER_VALIDATOR_INPUT_SHAPES`]) answers
 ///   [`missing_wire_parameter_message`], naming the parameter as the wire spells it;
@@ -168,6 +204,9 @@ pub fn wire_parameter_name(input_shape: Option<&str>, path: &str) -> String {
 pub fn absent_required_member_message(input_shape: Option<&str>, path: &str) -> String {
     if path == FILTERS_MEMBER_PATH {
         return FILTERS_CANNOT_BE_NULL_OR_EMPTY.to_string();
+    }
+    if let Some(parameter) = parameter_group_only_refusal(input_shape, path) {
+        return parameter.to_string();
     }
     if input_shape.is_some_and(|shape| CORE_PARAMETER_VALIDATOR_INPUT_SHAPES.contains(&shape)) {
         return missing_wire_parameter_message(&wire_parameter_name(input_shape, path));
@@ -205,6 +244,10 @@ pub enum PageSizeWording {
         /// (`smithy_query(query="operation", …)` reports it on `MaxResults`).
         published: (i32, i32),
     },
+    /// `The MaxResults parameter cannot be larger than <bound>.` — the sentence that names
+    /// the member and states the bound as a limit the parameter may not pass, rather than
+    /// stating the value the request sent.
+    ParameterAgainstBound,
     /// `The number of requested max results must be between <minimum> and <maximum>.` — the
     /// same rule stated of the COUNT of results, which is how the IPAM surface words it.
     CountWithinRange {
@@ -239,6 +282,10 @@ impl PageSizeWording {
             Self::WithinRange {
                 published: (minimum, maximum),
             } => format!("MaxResults must be between {minimum} and {maximum}"),
+            Self::ParameterAgainstBound => format!(
+                "The MaxResults parameter cannot be {relation} than {bound}.",
+                relation = outside.relation(),
+            ),
             Self::CountWithinRange {
                 published: (minimum, maximum),
             } => format!(
@@ -331,11 +378,15 @@ pub const RECORDED_PAGE_SIZE_WORDINGS: &[RecordedPageSizeRefusal] = &[
         above_largest_code: INVALID_MAX_RESULTS,
         wording: PageSizeWording::AgainstLimit,
     },
-    // `DescribeByoipCidrs` is NOT named here: its recorded refusal of a page size past its
-    // ceiling carries [`INVALID_MAX_RESULTS`], which is what the default already answers, so
-    // it keeps the code and the sentence every paged operation whose own wording is not
-    // recorded answers.
-    //
+    // The BYOIP CIDR describe states the bound its `MaxResults` may not pass
+    // (`DescribeByoipCidrsMaxResults`, `@range` 1..100), naming the member as the model
+    // declares it and the value not at all, under EC2's own [`INVALID_MAX_RESULTS`].
+    RecordedPageSizeRefusal {
+        input_shape: "DescribeByoipCidrsRequest",
+        below_smallest_code: INVALID_MAX_RESULTS,
+        above_largest_code: INVALID_MAX_RESULTS,
+        wording: PageSizeWording::ParameterAgainstBound,
+    },
     // The Reachability Analyzer describes state the whole range their `MaxResults`
     // publishes (`NetworkInsightsMaxResults`, `@range` 1..100).
     RecordedPageSizeRefusal {
@@ -411,8 +462,10 @@ impl PageSizeBound {
         }
     }
 
-    /// The word the sentences that state the LIMIT rather than the member put the value in
-    /// relation to it with ([`PageSizeWording::AgainstLimit`]).
+    /// The word the sentences that state the BOUND rather than the value put the value in
+    /// relation to it with: [`PageSizeWording::AgainstLimit`], which states the limit the
+    /// request overshot, and [`PageSizeWording::ParameterAgainstBound`], which states the
+    /// bound the parameter may not pass.
     fn relation(self) -> &'static str {
         match self {
             Self::Smallest => "smaller",
