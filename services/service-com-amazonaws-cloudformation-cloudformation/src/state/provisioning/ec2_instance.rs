@@ -31,9 +31,17 @@
 //! `RunInstances`'s own member list
 //! (`smithy_query(query="shape",shape="RunInstancesRequest")`). The properties below are that
 //! call's own members — most of them under the same name, the placement properties inside its
-//! `Placement` structure, the monitoring switch inside its `Monitoring` one and the instance
-//! profile inside its `IamInstanceProfile` one — and `MinCount`/`MaxCount` are
+//! `Placement` structure, the monitoring switch inside its `Monitoring` one, the instance
+//! profile inside its `IamInstanceProfile` one and the launch template inside its
+//! `LaunchTemplate` one — and `MinCount`/`MaxCount` are
 //! CloudFormation's to decide, a declaration of this type being exactly ONE instance.
+//!
+//! A declaration whose launch parameters come from a LAUNCH TEMPLATE states the template
+//! rather than restating them, and the launch carries that template: "any additional
+//! parameters that you specify for the new instance overwrite the corresponding parameters
+//! included in the launch template" (`RunInstancesRequest$LaunchTemplate`), so Amazon EC2 is
+//! the one that merges the two and the instance inherits the template's image, instance type,
+//! instance profile, security groups and metadata options ([`launch_template_parameters`]).
 //!
 //! The tag set reaches Amazon EC2 through the one call that tags a resource that exists, for
 //! the reason [`tag_resource`] records: it carries the three `aws:cloudformation:*` keys, and
@@ -42,7 +50,7 @@
 //! A declared property this module does not apply is REFUSED
 //! ([`refuse_unmapped_properties`]), so an instance is never reported created with less than
 //! its declaration asked for: a block device mapping, CPU options, a credit specification,
-//! enclave or hibernation options, a license specification, a launch template, an
+//! enclave or hibernation options, a license specification, an
 //! `SsmAssociations` entry, an attached `Volumes` entry, a `SourceDestCheck` switch (a
 //! `ModifyInstanceAttribute` this emulator does not serve) and an `Ipv6Addresses` list are each
 //! one of those.
@@ -93,6 +101,7 @@ const INSTANCE_PROPERTIES: &[&str] = &[
     "Ipv6AddressCount",
     "KernelId",
     "KeyName",
+    "LaunchTemplate",
     "Monitoring",
     "NetworkInterfaces",
     "PlacementGroupName",
@@ -147,6 +156,20 @@ const INSTANCE_LIST_MEMBERS: &[(&str, &str)] = &[
     ("SecurityGroups", "SecurityGroup"),
 ];
 
+/// The published members of the type's `LaunchTemplate` property, each the member of
+/// `RunInstances`'s own `LaunchTemplateSpecification` it travels as.
+///
+/// Source: that shape's member list
+/// (`smithy_query(query="shape",shape="LaunchTemplateSpecification")`) read against the
+/// type's `LaunchTemplateSpecification` property type — the template's id, its name and the
+/// version are the three members of both, each under the same name, so a declared member
+/// travels as [`LAUNCH_TEMPLATE`]`.<Member>`.
+const LAUNCH_TEMPLATE_MEMBERS: &[&str] = &["LaunchTemplateId", "LaunchTemplateName", "Version"];
+
+/// The property that names the launch template an instance is launched from, which is also the
+/// member `RunInstances` carries it under.
+const LAUNCH_TEMPLATE: &str = "LaunchTemplate";
+
 /// How many instances a declaration of this type is: ONE. "Ref returns the ID of the
 /// instance", singular, so the launch asks for exactly one and the resource IS that instance.
 const ONE_INSTANCE: &str = "1";
@@ -195,9 +218,12 @@ pub(super) async fn create(
 ) -> Result<Created, Refusal> {
     refuse_unmapped_properties(resource, INSTANCE_PROPERTIES)?;
     // "An AMI ID is required to launch an instance and must be specified here or in a launch
-    // template" (`RunInstancesRequest$ImageId`), and this type's declaration is the only place
-    // one can come from here — a launch template is a property this module does not apply.
-    required(resource, "ImageId")?;
+    // template" (`RunInstancesRequest$ImageId`): a declaration that names a launch template
+    // takes its image from THAT template — Amazon EC2 reads it, and refuses a launch left with
+    // no image either way — so the property is required only of a declaration that names none.
+    if declared_launch_template(resource).is_none() {
+        required(resource, "ImageId")?;
+    }
     let mut parameters: Vec<(String, String)> = vec![
         ("MinCount".to_string(), ONE_INSTANCE.to_string()),
         ("MaxCount".to_string(), ONE_INSTANCE.to_string()),
@@ -229,6 +255,11 @@ pub(super) async fn create(
     if let Some(profile) = scalar(resource, "IamInstanceProfile") {
         parameters.push(("IamInstanceProfile.Name".to_string(), profile));
     }
+    // "The launch template to use to launch the instances"
+    // (`RunInstancesRequest$LaunchTemplate`): a declaration that names one is launched FROM
+    // that template, so the launch carries it ([`launch_template_parameters`]) and Amazon EC2
+    // merges the template's parameters with the ones the declaration states itself.
+    parameters.extend(launch_template_parameters(resource)?);
     // "The network interfaces to associate with the instance": each entry is one interface of
     // `RunInstances`'s own `NetworkInterfaces` list ([`interface_parameters`]), which is how a
     // template puts an instance on a chosen subnet with chosen security groups and a public
@@ -430,6 +461,83 @@ async fn describe(
     }
 }
 
+/// The LAUNCH TEMPLATE a declaration names, or `None` for one that names none.
+///
+/// A property stated as nothing (`null`, or an empty structure) names no template, so such a
+/// declaration is read as the declaration that states none at all: it is launched from the
+/// parameters it spells out itself.
+fn declared_launch_template(resource: &StoredResource) -> Option<&::serde_json::Map<String, Value>>
+{
+    resource
+        .properties
+        .get(LAUNCH_TEMPLATE)?
+        .as_object()
+        .filter(|members| !members.is_empty())
+}
+
+/// The launch template a declaration names, as the parameters `RunInstances` takes it under —
+/// and no parameters at all for a declaration that names none.
+///
+/// The template reaches the launch rather than being read here: "any additional parameters
+/// that you specify for the new instance overwrite the corresponding parameters included in
+/// the launch template" (`RunInstancesRequest$LaunchTemplate`), so Amazon EC2 resolves the
+/// version the declaration asks for and merges its parameters with the ones the declaration
+/// states itself — which is what makes the instance inherit the template's image, instance
+/// type, instance profile, security groups and metadata options, and what makes a template or
+/// version that service holds none of the RESOURCE's failure with that service's own refusal.
+///
+/// A declared member outside the property type's own three ([`LAUNCH_TEMPLATE_MEMBERS`]) is
+/// refused rather than dropped, for the reason [`refuse_unmapped_properties`] records: an
+/// instance launched from less than its declaration named is not the instance the template
+/// declared.
+fn launch_template_parameters(
+    resource: &StoredResource,
+) -> Result<Vec<(String, String)>, Refusal> {
+    let mut parameters: Vec<(String, String)> = Vec::new();
+    // A property stated as nothing (absent, `null`) names no template, so the instance is
+    // launched from the parameters the declaration spells out itself; one stated as something
+    // other than a structure is not a template specification at all, which is a declaration
+    // this launch cannot be made from.
+    let members = match resource.properties.get(LAUNCH_TEMPLATE) {
+        None | Some(Value::Null) => return Ok(parameters),
+        Some(Value::Object(members)) => members,
+        Some(_) => {
+            return Err(Refusal {
+                code: "InvalidRequest".to_string(),
+                message: format!(
+                    "the {LAUNCH_TEMPLATE} property of {} is a structure of the members its \
+                     property type publishes",
+                    resource.resource_type
+                ),
+            })
+        }
+    };
+    for (member, value) in members {
+        let Some(published) = LAUNCH_TEMPLATE_MEMBERS
+            .iter()
+            .find(|published| *published == member)
+        else {
+            return Err(Refusal {
+                code: "NotImplemented".to_string(),
+                message: format!(
+                    "this emulator does not apply the {member} member of the \
+                     {LAUNCH_TEMPLATE} property of {}",
+                    resource.resource_type
+                ),
+            });
+        };
+        let text = member_text(value);
+        // A member stated as the empty string states nothing: the launch carries the members
+        // the declaration really named, and Amazon EC2 resolves the rest ("Default: The
+        // default version of the launch template", `LaunchTemplateSpecification$Version`).
+        if text.is_empty() {
+            continue;
+        }
+        parameters.push((format!("{LAUNCH_TEMPLATE}.{published}"), text));
+    }
+    Ok(parameters)
+}
+
 /// The published members of an `AWS::EC2::Instance` `NetworkInterface` entry that are SCALAR
 /// members of `RunInstances`'s own `InstanceNetworkInterfaceSpecification`, each against the
 /// parameter name that member travels under.
@@ -496,7 +604,7 @@ fn interface_parameters(resource: &StoredResource) -> Result<Vec<(String, String
             {
                 parameters.push((
                     format!("{INTERFACE}.{position}.{scalar}"),
-                    interface_text(value),
+                    member_text(value),
                 ));
                 continue;
             }
@@ -511,7 +619,7 @@ fn interface_parameters(resource: &StoredResource) -> Result<Vec<(String, String
                 for (entry_index, entry) in entries.iter().enumerate() {
                     parameters.push((
                         format!("{INTERFACE}.{position}.{element}.{}", entry_index + 1),
-                        interface_text(entry),
+                        member_text(entry),
                     ));
                 }
                 continue;
@@ -529,10 +637,11 @@ fn interface_parameters(resource: &StoredResource) -> Result<Vec<(String, String
     Ok(parameters)
 }
 
-/// One member of an interface entry as the text an `ec2Query` parameter carries: a string as
-/// written, and a boolean or a number in its own JSON spelling, which is the reading every
-/// other declared value of this module goes through ([`scalar`]).
-fn interface_text(value: &Value) -> String {
+/// One member of a declared STRUCTURE — an interface entry, a launch template specification —
+/// as the text an `ec2Query` parameter carries: a string as written, and a boolean or a number
+/// in its own JSON spelling, which is the reading every other declared value of this module
+/// goes through ([`scalar`]).
+fn member_text(value: &Value) -> String {
     value
         .as_str()
         .map(str::to_string)

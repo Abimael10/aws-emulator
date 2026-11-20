@@ -554,6 +554,12 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
             "Ipv6AddressCount",
             "Ipv6Addresses",
             "KeyName",
+            // The launch template an instance was launched FROM is the machine it runs as: the
+            // image, the type, the profile and the interfaces the launch read out of that
+            // template version, none of which a call of that service re-reads for an instance
+            // that exists. A declaration naming another template, or another version of one,
+            // asks for an instance launched again.
+            "LaunchTemplate",
             "NetworkInterfaces",
             "PlacementGroupName",
             "PrivateIpAddress",
