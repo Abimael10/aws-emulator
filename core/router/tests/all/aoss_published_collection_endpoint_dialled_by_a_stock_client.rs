@@ -84,7 +84,11 @@ fn authorization() -> String {
 
 /// The `host:port` a published endpoint addresses — the authority a client dials, with any
 /// path dropped.
-fn authority_of(endpoint: &str) -> String {
+///
+/// `pub(crate)` because every suite that reads a published address asks the same question of
+/// it; `all/route53_arc_published_cluster_endpoints_serve_the_data_plane.rs` shares this one
+/// rather than keeping a second copy.
+pub(crate) fn authority_of(endpoint: &str) -> String {
     let after_scheme = endpoint.strip_prefix("https://").unwrap_or(endpoint);
     after_scheme
         .split('/')
