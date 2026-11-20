@@ -6,8 +6,8 @@
 //! (400), so the CLASS of a refusal travels in that error's two code members — `errorCode`
 //! and `datasyncErrorCode`, always the same value — and a resource this service holds no
 //! record of has its own class per resource kind: `LocationNotFound` for a transfer
-//! location, `SyncSetNotFound` for a transfer task, and none at all for an agent, for which
-//! this service publishes no discriminator. The message identifies the resource the
+//! location, `SyncSetNotFound` for a transfer task and `AgentNotFound` for an agent. The
+//! message identifies the resource the
 //! way the SURFACE that raised the refusal addresses one: an operation of the task surface
 //! by the bare resource id, an operation of the location surface by the ARN the request
 //! carried, an operation of the agent surface by the bare `agent-…` id and the two reasons
@@ -34,6 +34,9 @@ const LOCATION_NOT_FOUND: &str = "LocationNotFound";
 /// The class a refusal naming a transfer task this account does not hold carries. It is the
 /// name the surface holding tasks has for one, not the name the caller used.
 const SYNC_SET_NOT_FOUND: &str = "SyncSetNotFound";
+
+/// The class a refusal naming an agent this account does not hold carries.
+const AGENT_NOT_FOUND: &str = "AgentNotFound";
 
 /// A router with just this service mounted on a fresh engine.
 fn service() -> MultiServiceRouter {
@@ -365,8 +368,8 @@ async fn a_resource_resolves_until_it_is_deleted() {
 }
 
 /// A call that must be refused as naming an agent this account does not hold: HTTP 400,
-/// the one modelled client error, the agent surface's whole message, and NO class
-/// discriminator in either code member — this service publishes none for the agent kind.
+/// the one modelled client error, the agent surface's whole message, and the unknown-agent
+/// class in BOTH code members.
 async fn refused_as_absent_agent(
     router: &MultiServiceRouter,
     operation: &str,
@@ -374,36 +377,18 @@ async fn refused_as_absent_agent(
     agent_arn: &str,
     case: &str,
 ) {
-    let (status, parsed) = call(router, operation, body).await;
-    assert_eq!(
-        status, 400,
-        "case {case:?}: expected {operation} to answer 400, got {status} with {parsed}"
-    );
-    assert!(
-        parsed["__type"]
-            .as_str()
-            .unwrap_or_default()
-            .ends_with("InvalidRequestException"),
-        "case {case:?}: expected an InvalidRequestException from {operation}, got {parsed}"
-    );
-    assert_eq!(
-        parsed["message"].as_str(),
-        Some(
-            format!(
-                "{agent} does not exist or has been deleted.",
-                agent = resource_id(agent_arn)
-            )
-            .as_str()
+    refused_as_absent(
+        router,
+        operation,
+        body,
+        AGENT_NOT_FOUND,
+        &format!(
+            "{agent} does not exist or has been deleted.",
+            agent = resource_id(agent_arn)
         ),
-        "case {case:?}: wrong refusal wording from {operation}, got {parsed}"
-    );
-    for member in ["errorCode", "datasyncErrorCode"] {
-        assert!(
-            parsed[member].is_null(),
-            "case {case:?}: the agent surface publishes no not-found class, so {member} \
-             must be absent from {operation}, got {parsed}"
-        );
-    }
+        case,
+    )
+    .await;
 }
 
 /// An agent activated through `CreateAgent`, returned by ARN.
@@ -423,8 +408,9 @@ async fn given_agent(router: &MultiServiceRouter, activation_key: &str, case: &s
 
 /// RULE: an operation of the AGENT surface — one whose own addressed resource is the
 /// agent — refuses an `AgentArn` this account holds no agent for with the modelled client
-/// error (400), identifying the agent by the bare `agent-…` id the request carried and
-/// stating the two reasons it resolves to nothing.
+/// error (400) and the `AgentNotFound` class in both of that error's code members,
+/// identifying the agent by the bare `agent-…` id the request carried and stating the two
+/// reasons it resolves to nothing.
 ///
 /// The rows differ along which operation of that surface was called — a read, a rename and
 /// a delete — and which unheld agent id it named, including one of another Region.
@@ -628,4 +614,126 @@ async fn each_activated_agent_resolves_to_its_own_record() {
         "case \"the agent that stayed\": deleting one agent leaves the other resolving, \
          got {described}"
     );
+}
+
+/// RULE: the class token of a refusal is the error CLASS, not a value read off the request,
+/// so the unknown-agent class reports the same fixed literal in `errorCode` and in
+/// `datasyncErrorCode` whatever ARN the request carried — while the message's only variable
+/// part is the `agent-…` id parsed off that ARN.
+///
+/// The rows differ along what the rule generalises over: which operation of the agent
+/// surface was called, and the partition, Region, account and agent-id characters of the
+/// unheld ARN it named. Every ARN matches the modelled `AgentArn` pattern (member `AgentArn`
+/// of `DescribeAgentRequest`: `^arn:(aws|aws-cn|aws-us-gov|aws-eusc|aws-iso|aws-iso-b)
+/// :datasync:[a-z\-0-9]+:[0-9]{12}:agent/agent-[0-9a-z]{17}$`), so each is refused for its
+/// STATE and not for its shape.
+#[tokio::test]
+async fn the_unknown_agent_class_is_one_token_in_both_code_members() {
+    let router = service();
+
+    // (case, operation, the extra members the operation carries, the unheld ARN it named)
+    let rows: [(&str, &str, Value, String); 7] = [
+        (
+            "a read, digits only",
+            "DescribeAgent",
+            json!({}),
+            never_minted("agent/agent-0123456789abcdefg"),
+        ),
+        (
+            "a rename, letters only",
+            "UpdateAgent",
+            json!({ "Name": "renamed" }),
+            never_minted("agent/agent-abcdefghijklmnopq"),
+        ),
+        (
+            "a delete, mixed id",
+            "DeleteAgent",
+            json!({}),
+            never_minted("agent/agent-0a1b2c3d4e5f6g7h8"),
+        ),
+        (
+            "a read in another Region",
+            "DescribeAgent",
+            json!({}),
+            format!(
+                "arn:aws:datasync:eu-west-3:{account}:agent/agent-9z8y7x6w5v4u3t2s1",
+                account = engine::emulator_account_id()
+            ),
+        ),
+        (
+            "a read in the China partition",
+            "DescribeAgent",
+            json!({}),
+            format!(
+                "arn:aws-cn:datasync:cn-north-1:{account}:agent/agent-cn0123456789abcde",
+                account = engine::emulator_account_id()
+            ),
+        ),
+        (
+            "a read in the GovCloud partition",
+            "DescribeAgent",
+            json!({}),
+            "arn:aws-us-gov:datasync:us-gov-west-1:123456789012:agent/agent-gov0123456789abcd"
+                .to_string(),
+        ),
+        (
+            "a read for another account",
+            "DescribeAgent",
+            json!({}),
+            "arn:aws:datasync:us-west-2:210987654321:agent/agent-zyxwvutsrqponmlkj".to_string(),
+        ),
+    ];
+
+    for (case, operation, extra, arn) in rows {
+        let mut body = json!({ "AgentArn": &arn });
+        if let Some(members) = extra.as_object() {
+            for (member, value) in members {
+                body[member] = value.clone();
+            }
+        }
+        let (status, parsed) = call(&router, operation, body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected {operation} to answer 400, got {status} with {parsed}"
+        );
+        assert_eq!(
+            parsed["errorCode"].as_str(),
+            Some(AGENT_NOT_FOUND),
+            "case {case:?}: expected errorCode {AGENT_NOT_FOUND:?} from {operation}, got \
+             {parsed}"
+        );
+        assert_eq!(
+            parsed["datasyncErrorCode"].as_str(),
+            parsed["errorCode"].as_str(),
+            "case {case:?}: the two code members carry one token, got {parsed}"
+        );
+        assert_eq!(
+            parsed["message"].as_str(),
+            Some(
+                format!(
+                    "{agent} does not exist or has been deleted.",
+                    agent = resource_id(&arn)
+                )
+                .as_str()
+            ),
+            "case {case:?}: wrong refusal wording from {operation}, got {parsed}"
+        );
+    }
+
+    // The token classifies the refusal, so an agent this account DOES hold is reported
+    // without one: the class members belong to the error, not to every response.
+    let held = given_agent(&router, "PPPPP-QQQQQ-RRRRR-SSSSS-TTTTT", "a held agent").await;
+    let described = ok(
+        &router,
+        "DescribeAgent",
+        json!({ "AgentArn": &held }),
+        "a held agent",
+    )
+    .await;
+    for member in ["errorCode", "datasyncErrorCode"] {
+        assert!(
+            described[member].is_null(),
+            "case \"a held agent\": a success carries no {member}, got {described}"
+        );
+    }
 }

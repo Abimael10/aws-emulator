@@ -35,6 +35,18 @@ pub const MAX_AGENTS: usize = 10_000;
 /// afterwards, so a stored agent is the first of the two.
 pub const AGENT_STATUS_ONLINE: &str = "ONLINE";
 
+/// The class discriminator DataSync reports for an `AgentArn` that names no agent this
+/// account holds.
+///
+/// The one modelled client error of this service covers every validation it performs, so
+/// the CLASS of a refusal travels in that error's two code members rather than in its
+/// status — and the unknown-agent class is the only machine-readable statement that the
+/// agent, and not some other member of the request, is what could not be resolved. The
+/// token names the error class, so it is the same fixed literal whichever ARN the request
+/// carried, and it is carried by BOTH code members, like every other refusal class of this
+/// service.
+pub const AGENT_NOT_FOUND_CODE: &str = "AgentNotFound";
+
 /// The `EndpointType` of an agent that reaches the service over its public endpoint: the
 /// activation named no VPC service endpoint.
 pub const ENDPOINT_TYPE_PUBLIC: &str = "PUBLIC";
@@ -111,16 +123,18 @@ impl ComAmazonawsDatasyncFmrsserviceState {
 /// The agent surface identifies the agent it could not resolve by its bare resource id —
 /// the `agent-…` token of the ARN the request carried, the way this service identifies a
 /// resource in a refusal ([`resource_id`]) — and states the two reasons an id resolves to
-/// nothing: it never named an agent of this account, or the agent it named is deleted. The
-/// refusal carries no class discriminator, because this service publishes none for the
-/// agent kind (see [`super::tagging::TaggableKind`]).
+/// nothing: it never named an agent of this account, or the agent it named is deleted. Both
+/// code members of the modelled client error carry this class's discriminator
+/// ([`AGENT_NOT_FOUND_CODE`]), the way every refusal class of this service reports which
+/// validation failed.
 pub fn agent_not_found(agent_arn: &str) -> InvalidRequestException {
+    let code = Some(AGENT_NOT_FOUND_CODE.to_string());
     InvalidRequestException {
         message: Some(format!(
             "{agent} does not exist or has been deleted.",
             agent = resource_id(agent_arn)
         )),
-        error_code: None,
-        datasync_error_code: None,
+        error_code: code.clone(),
+        datasync_error_code: code,
     }
 }
