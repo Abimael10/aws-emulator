@@ -2,19 +2,22 @@
 
 //! @op ListLinuxSubscriptionInstances
 //!
-//! Reports the instances Linux subscription discovery has found for this account,
+//! Reports the running instances Linux subscription discovery has found for this account,
 //! straight from the discovered-instance store in `crate::state` — the same records
 //! `ListLinuxSubscriptions` aggregates into subscriptions, so the two lists cannot
-//! disagree.
+//! disagree: the instances reported here are exactly the ones its `InstanceCount`s count.
 //!
 //! The report MATERIALIZES the discovery pass the account's settings ask for
 //! (`crate::state::discovery`) before it reads that store, exactly as the sibling list
 //! does: discovery reads the EC2 inventory of the configured source Regions whether or not
 //! anybody calls.
 //!
-//! Every discovered record is reported, whatever its `Status`: the modelled
-//! `Instance$Status` member and the documented `Status` filter are what select an
-//! instance state, so the list itself cannot be restricted to one.
+//! WHICH of those records this list is of is settled by the model's own sentence for it: it
+//! lists the RUNNING instances, so a record discovery holds in any other EC2 instance state
+//! is not an element of this report. It stays in the store — that is what keeps the
+//! subscription it uses reported by the sibling list, with the count of running instances
+//! that subscription has — and the documented `Status` filter still selects on the
+//! `Instance$Status` the reported records carry.
 //!
 //! ## Shape of an operation
 //!
@@ -175,11 +178,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // module, and settled the same way for every request of either list.
         crate::state::discovery::materialize_for_report(&*self.engine, ctx).await;
 
-        // A pure read of the store: the page is built from the records discovery has
-        // written, and nothing here writes.
+        // A pure read of the store: the page is built from the RUNNING records discovery
+        // has written, and nothing here writes.
         let state = state.lock();
         let selected: Vec<crate::state::DiscoveredInstanceRecord> = state
-            .discovered_instances_in_order()
+            .running_discovered_instances_in_order()
             .into_iter()
             .filter(|record| {
                 // What is this list's OWN is the member each filter name addresses; how

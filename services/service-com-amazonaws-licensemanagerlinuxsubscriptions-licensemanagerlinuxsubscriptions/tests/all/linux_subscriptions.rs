@@ -9,8 +9,8 @@
 //! The rules under test, each asserted over a SET of inputs rather than one request:
 //!
 //! * both lists answer from the single shared store of discovered instances: an account
-//!   that has discovered nothing reports nothing, and what is in the store is what both
-//!   lists report;
+//!   that has discovered nothing reports nothing, the subscription list reports every
+//!   subscription the store holds, and the instance list reports the RUNNING records of it;
 //! * `ListLinuxSubscriptions` reports one `Subscription` per distinct (name, type) pair
 //!   the discovered instances carry, with `InstanceCount` counting the instances using it
 //!   that are running;
@@ -64,10 +64,10 @@ type Row = (
 
 /// The discovered instances every case below is asserted against: a table spanning what
 /// the rules generalise over — several subscriptions, ONE subscription name licensed two
-/// different ways, several instance states (so the running count is not just the record
-/// count), several Regions, accounts, AMIs and instance types, an instance carrying two
-/// product codes and one carrying none, and `DualSubscription` set on some records and
-/// unset on others.
+/// different ways, several instance states (so the instances the instance list reports are
+/// not every record and the running count is not the record count), several Regions,
+/// accounts, AMIs and instance types, an instance carrying two product codes and one
+/// carrying none, and `DualSubscription` set on some records and unset on others.
 const DISCOVERED: &[Row] = &[
     (
         "i-0a1",
@@ -158,6 +158,24 @@ const EXPECTED_SUBSCRIPTIONS: &[(&str, &str, i64)] = &[
     ("SUSE Linux Enterprise Server", TYPE_INCLUDED, 1),
     ("Ubuntu Pro", TYPE_MARKETPLACE, 0),
 ];
+
+/// The `Instance$Status` of a record the instance list reports: that list "lists the running
+/// Amazon EC2 instances that were discovered with commercial Linux subscriptions", so a
+/// record in any other instance state stays in the store — keeping the subscription it uses
+/// reported, with the count of running instances that subscription has — and is an element of
+/// no instance report. `tests/all/running_instance_report.rs` owns that rule.
+const REPORTED_STATUS: &str = "running";
+
+/// The records of [`DISCOVERED`] the instance list reports, in the instance-id order it
+/// reports them in.
+fn reported_rows() -> Vec<&'static Row> {
+    let mut rows: Vec<&'static Row> = DISCOVERED
+        .iter()
+        .filter(|row| row.4 == REPORTED_STATUS)
+        .collect();
+    rows.sort_by_key(|row| row.0);
+    rows
+}
 
 /// Put `DISCOVERED` in the store directly, through the shared harness's seeding seam:
 /// discovery reads the account's EC2 inventory, which no operation of THIS service writes,
@@ -296,18 +314,23 @@ async fn subscriptions_aggregate_the_discovered_instances() {
         "case {case:?}: expected {expected:?}, got {actual:?}"
     );
 
-    // The same store answers the instance list, so the two cannot disagree: every
-    // discovered record is reported, and the counts above are exactly its running rows.
-    let instance_case = "every discovered instance";
+    // The same store answers the instance list, so the two cannot disagree: the records it
+    // reports are the RUNNING ones, which is exactly what the counts above add up to.
+    let instance_case = "every running discovered instance";
     let reply = call(&h, INSTANCES, &json!({})).await;
     let listed = instance_ids(&reply, instance_case);
-    let mut expected_ids: Vec<String> = DISCOVERED.iter().map(|row| row.0.to_string()).collect();
-    expected_ids.sort();
+    let expected_ids: Vec<String> = reported_rows()
+        .iter()
+        .map(|row| row.0.to_string())
+        .collect();
     assert_eq!(
         listed, expected_ids,
         "case {instance_case:?}: expected {expected_ids:?}, got {listed:?}"
     );
-    let running = DISCOVERED.iter().filter(|row| row.4 == "running").count() as i64;
+    let running = DISCOVERED
+        .iter()
+        .filter(|row| row.4 == REPORTED_STATUS)
+        .count() as i64;
     let counted: i64 = actual.iter().map(|(_, _, count)| count).sum();
     assert_eq!(
         counted, running,
@@ -324,7 +347,7 @@ async fn every_member_of_a_discovered_instance_is_reported_from_state() {
     let case = "instance members";
     let reply = call(&h, INSTANCES, &json!({})).await;
     let listed = entries(&reply, "Instances", case).clone();
-    for row in DISCOVERED {
+    for row in reported_rows() {
         let (
             instance_id,
             account_id,
@@ -448,7 +471,9 @@ async fn an_instance_filter_selects_on_the_member_it_names() {
         ("AmiID", "Equal", &["ami-0003"], &["i-0e5"]),
         ("DualSubscription", "Equal", &["Yes"], &["i-0d4"]),
         ("DualSubscription", "Equal", &["No"], &["i-0a1"]),
-        ("InstanceID", "Equal", &["i-0c3"], &["i-0c3"]),
+        ("InstanceID", "Equal", &["i-0b2"], &["i-0b2"]),
+        // A record the report withholds is out of reach of its own id, too.
+        ("InstanceID", "Equal", &["i-0c3"], &[]),
         (
             "InstanceType",
             "Contains",
@@ -456,18 +481,15 @@ async fn an_instance_filter_selects_on_the_member_it_names() {
             &["i-0a1", "i-0b2", "i-0d4"],
         ),
         ("ProductCode", "Equal", &["pc-extra"], &["i-0e5"]),
-        (
-            "Region",
-            "Contains",
-            &["us-west"],
-            &["i-0a1", "i-0b2", "i-0c3"],
-        ),
-        ("Status", "NotEqual", &["running"], &["i-0c3", "i-0f6"]),
+        ("Region", "Contains", &["us-west"], &["i-0a1", "i-0b2"]),
+        // Every record the report holds is a running one, so the negation of that state
+        // selects none of them.
+        ("Status", "NotEqual", &["running"], &[]),
         (
             "UsageOperation",
             "Equal",
             &["RunInstances:0010"],
-            &["i-0a1", "i-0b2", "i-0c3"],
+            &["i-0a1", "i-0b2"],
         ),
     ];
 
@@ -567,9 +589,9 @@ async fn a_filter_cannot_select_an_instance_whose_member_holds_nothing() {
     // (the filter's Name, its Operator — `None` is an absent one, its Values, the
     // instance ids it selects in instance-id order). Only the records that HOLD a value
     // for the addressed member can be selected, whatever the operator: `i-0d4` is the
-    // only record carrying a `DualSubscription` of "Yes" and the only one whose AMI
-    // reported no product code at all, while `i-0b2`, `i-0c3`, `i-0e5` and `i-0f6` hold
-    // no `DualSubscription`.
+    // only reported record carrying a `DualSubscription` of "Yes" and the only one whose
+    // AMI reported no product code at all, while `i-0b2` and `i-0e5` hold no
+    // `DualSubscription`.
     let cases: &[FilterCase] = &[
         // A record holding nothing for the member is out of every answer, including the
         // negated one — the defect this pins: it used to be in all of them.
@@ -591,39 +613,39 @@ async fn a_filter_cannot_select_an_instance_whose_member_holds_nothing() {
             "ProductCode",
             Some("NotEqual"),
             &["pc-rhel"],
-            &["i-0e5", "i-0f6"],
+            &["i-0e5"],
         ),
         (
             "ProductCode",
             Some("NotEqual"),
             &["no-such-code"],
-            &["i-0a1", "i-0b2", "i-0c3", "i-0e5", "i-0f6"],
+            &["i-0a1", "i-0b2", "i-0e5"],
         ),
         (
             "ProductCode",
             Some("Contains"),
             &["pc-"],
-            &["i-0a1", "i-0b2", "i-0c3", "i-0e5", "i-0f6"],
+            &["i-0a1", "i-0b2", "i-0e5"],
         ),
         (
             "ProductCode",
             Some("Equal"),
             &["pc-rhel"],
-            &["i-0a1", "i-0b2", "i-0c3"],
+            &["i-0a1", "i-0b2"],
         ),
-        // A member every record holds is unaffected: a negated filter there still selects
-        // every record whose value differs.
+        // A member every record holds is unaffected: the equality there still selects every
+        // record whose value matches, which for the state the report is of is all of them.
         (
             "Status",
-            Some("NotEqual"),
+            Some("Equal"),
             &["running"],
-            &["i-0c3", "i-0f6"],
+            &["i-0a1", "i-0b2", "i-0d4", "i-0e5"],
         ),
         (
             "Region",
             Some("NotEqual"),
             &["us-west-2"],
-            &["i-0b2", "i-0d4", "i-0e5", "i-0f6"],
+            &["i-0b2", "i-0d4", "i-0e5"],
         ),
     ];
 
@@ -718,7 +740,7 @@ async fn max_results_pages_each_list_exactly_once() {
 
     for (path, key, total) in [
         (SUBSCRIPTIONS, "Subscriptions", EXPECTED_SUBSCRIPTIONS.len()),
-        (INSTANCES, "Instances", DISCOVERED.len()),
+        (INSTANCES, "Instances", reported_rows().len()),
     ] {
         // One page of everything is the reference the paged walks must reproduce.
         let case = &format!("{path} unpaged");

@@ -306,9 +306,11 @@ impl Fleet {
     /// Launch `count` instances from `image_id` in `region` and answer the ids EC2 minted,
     /// WITHOUT waiting for the state EC2's clock owes them.
     ///
-    /// Discovery records an instance in whatever state EC2 reports it in short of
-    /// `terminated`, so a case whose rule is about WHICH instances a pass writes — not what
-    /// `Status` they report — does not have to wait that span out per Region.
+    /// A pass records an instance in whatever state EC2 reports it in short of
+    /// `terminated`, so a case whose rule is about WHICH instances a pass writes does not
+    /// have to wait that span out per Region before the store holds a record for each of
+    /// them. The instance LIST is of the running ones, so a case reading it waits for the
+    /// launch to come up ([`Fleet::settled_running`]).
     pub async fn launch_now(&self, region: &str, image_id: &str, count: usize) -> Vec<String> {
         self.run(region, image_id, None, count).await
     }
@@ -369,6 +371,15 @@ impl Fleet {
             .await
             .unwrap_or_else(|error| panic!("setup: EC2 must terminate {instance_id}: {error:?}"));
         self.settled_in(region, instance_id, STATE_TERMINATED).await;
+    }
+
+    /// Wait until EC2 reports `instance_id` RUNNING.
+    ///
+    /// What a case that launched through [`Fleet::launch_now`] — because its rule is about
+    /// WHICH instances a pass writes rather than about the states they are in — waits for
+    /// before it reads the instance list, which is of the running instances.
+    pub async fn settled_running(&self, region: &str, instance_id: &str) {
+        self.settled_in(region, instance_id, STATE_RUNNING).await;
     }
 
     /// Wait until EC2 reports `instance_id` in `state`.
@@ -674,21 +685,25 @@ async fn the_count_is_the_running_instances_and_a_terminated_one_is_gone() {
         "case {case:?}: expected {expected:?}, got {actual:?}"
     );
 
+    // The instance list "lists the running Amazon EC2 instances that were discovered with
+    // commercial Linux subscriptions", so it holds the one instance EC2 reports running:
+    // the stopped one is discovered — which is what keeps the subscription above reported —
+    // without being an element of this list, and the terminated one was never recorded.
+    // `tests/all/running_instance_report.rs` owns that rule.
     let reply = fleet.instances(&json!({})).await;
     let listed = reported_instance_ids(&reply, case);
-    let expected_ids = vec![ids[0].clone(), ids[1].clone()];
+    let expected_ids = vec![ids[0].clone()];
     assert_eq!(
         listed, expected_ids,
         "case {case:?}: expected {expected_ids:?}, got {listed:?}"
     );
-    for (instance_id, expected_status) in [(&ids[0], STATE_RUNNING), (&ids[1], STATE_STOPPED)] {
-        let entry = reported_instance(&reply, instance_id, case);
-        let actual = member(&entry, "Status", case);
-        assert_eq!(
-            actual, expected_status,
-            "case {case:?}: {instance_id} Status expected {expected_status:?}, got {actual:?}"
-        );
-    }
+    let entry = reported_instance(&reply, &ids[0], case);
+    let actual = member(&entry, "Status", case);
+    assert_eq!(
+        actual, STATE_RUNNING,
+        "case {case:?}: {} Status expected {STATE_RUNNING:?}, got {actual:?}",
+        ids[0]
+    );
 }
 
 #[tokio::test]

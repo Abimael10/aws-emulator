@@ -66,7 +66,8 @@ const DISABLED: &str = "Disabled";
 
 /// An `Instance$Status` of an instance that is not running, so its subscription reports it
 /// as discovered without counting it (`Subscription$InstanceCount`: "The total amount of
-/// running instances using this subscription").
+/// running instances using this subscription") and the instance list, which is of the
+/// running instances, holds no element for it.
 const STATUS_STOPPED: &str = "stopped";
 
 /// One discovered instance a row holds: the members the two lists report it under.
@@ -291,12 +292,15 @@ async fn reported_subscriptions(h: &Harness, case: &str) -> Vec<(String, String,
 }
 
 /// What an inventory's records must be reported as while the account discovers their
-/// Regions: every instance, and one subscription per distinct (name, type) pair counting
-/// the running instances using it.
+/// Regions: the RUNNING instances — the instance list "lists the running Amazon EC2
+/// instances that were discovered with commercial Linux subscriptions"
+/// (`tests/all/running_instance_report.rs` owns that rule) — and one subscription per
+/// distinct (name, type) pair counting the running instances using it.
 fn expected_of(inventory: &Inventory) -> (Vec<String>, Vec<(String, String, i64)>) {
     let mut ids: Vec<String> = inventory
         .found
         .iter()
+        .filter(|found| found.status == INSTANCE_STATUS_RUNNING)
         .map(|found| found.instance_id.to_string())
         .collect();
     ids.sort();

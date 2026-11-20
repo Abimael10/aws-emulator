@@ -243,10 +243,14 @@ impl SubscriptionProviderRecord {
     }
 }
 
-/// The `Status` of a discovered instance that is running, and so counts towards its
-/// subscription's `InstanceCount` (`Subscription$InstanceCount`: "The total amount of
-/// running instances using this subscription"). The member carries the EC2 instance
-/// state name, which is `running` for an instance that is up.
+/// The `Status` of a discovered instance that is running — the one state the discovery
+/// reports are about: it is the instance the instance list reports ("Lists the running
+/// Amazon EC2 instances that were discovered with commercial Linux subscriptions",
+/// reporting an `Instance`, which "details discovered information about a running instance
+/// using Linux subscriptions") and the instance its subscription counts
+/// (`Subscription$InstanceCount`: "The total amount of running instances using this
+/// subscription"). The member carries the EC2 instance state name, which is `running` for
+/// an instance that is up.
 pub const INSTANCE_STATUS_RUNNING: &str = "running";
 
 /// One instance Linux subscription discovery has found, with the subscription it uses.
@@ -297,6 +301,19 @@ pub struct DiscoveredInstanceRecord {
     pub dual_subscription: Option<String>,
     /// `Instance$RegisteredWithSubscriptionProvider`.
     pub registered_with_subscription_provider: Option<String>,
+}
+
+impl DiscoveredInstanceRecord {
+    /// Whether the instance was RUNNING when discovery last read the inventory
+    /// ([`INSTANCE_STATUS_RUNNING`]).
+    ///
+    /// The one place that question is answered, so the instances the instance list reports
+    /// and the instances a subscription's `InstanceCount` counts are the same set: both are
+    /// documented as being about the running ones, and a store that answered the question
+    /// twice could report an instance the count does not count.
+    pub fn is_running(&self) -> bool {
+        self.status == INSTANCE_STATUS_RUNNING
+    }
 }
 
 /// One discovered Linux subscription: a `Subscription` as `ListLinuxSubscriptions`
@@ -530,9 +547,22 @@ impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscription
             .ok_or_else(|| StateError::NotFound(PROVIDER_NOT_FOUND_MESSAGE.to_string()))
     }
 
-    /// The discovered instances in instance-id order.
-    pub fn discovered_instances_in_order(&self) -> Vec<DiscoveredInstanceRecord> {
-        self.discovered_instances.values().cloned().collect()
+    /// The RUNNING discovered instances, in instance-id order — the instances the instance
+    /// list reports, and the order it reports and pages them in.
+    ///
+    /// A discovery pass records an instance in whatever state EC2 reports it in short of
+    /// `terminated`, because a subscription is reported for as long as the account holds an
+    /// instance using it, whether or not any of them is up. WHICH of those records a report
+    /// is of is this question: the instance report is of the running ones, so a record in
+    /// any other instance state stays in the store — where it is what keeps the
+    /// subscription it uses reported, with the count of running instances that subscription
+    /// then has — without being an element of that report.
+    pub fn running_discovered_instances_in_order(&self) -> Vec<DiscoveredInstanceRecord> {
+        self.discovered_instances
+            .values()
+            .filter(|record| record.is_running())
+            .cloned()
+            .collect()
     }
 
     /// Record what one COMPLETE discovery pass found in `region`: `found` becomes
@@ -734,7 +764,7 @@ impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscription
     pub fn discovered_subscriptions(&self) -> Vec<DiscoveredSubscription> {
         let mut counts: BTreeMap<(String, String), i64> = BTreeMap::new();
         for instance in self.discovered_instances.values() {
-            let running = i64::from(instance.status == INSTANCE_STATUS_RUNNING);
+            let running = i64::from(instance.is_running());
             *counts
                 .entry((
                     instance.subscription_name.clone(),

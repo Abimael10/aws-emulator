@@ -207,12 +207,17 @@ async fn a_settings_change_landing_mid_pass_decides_what_that_pass_writes_and_ke
     let image_id = fleet.publish_image(RHEL);
     // One instance per Region, launched through EC2 itself, so each Region the pass asks
     // about has exactly one record to discover and the store says which Region the pass has
-    // reached. Discovery records an instance in whatever state short of `terminated` EC2
-    // reports it in, so nothing here waits out EC2's own clock.
+    // reached. A pass records an instance in whatever state short of `terminated` EC2
+    // reports it in, so the launches are made without waiting; what the rows read is the
+    // instance LIST, which is of the running instances, so the fleet is then given EC2's
+    // own clock to bring every launch up — once, for all of them together.
     let mut launched: BTreeMap<String, String> = BTreeMap::new();
     for region in FLEET_REGIONS {
         let ids = fleet.launch_now(region, &image_id, 1).await;
         launched.insert((*region).to_string(), ids[0].clone());
+    }
+    for (region, instance_id) in &launched {
+        fleet.settled_running(region, instance_id).await;
     }
     let first = launched[FLEET_REGIONS[0]].clone();
     let last = launched[FLEET_REGIONS[FLEET_REGIONS.len() - 1]].clone();

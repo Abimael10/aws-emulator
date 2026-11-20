@@ -27,7 +27,7 @@
 //! another request to get the next page of items") — and refuses ONE named hop with EC2's
 //! own throttle, which is the hop that cannot be arranged from the client side of a read.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
@@ -74,6 +74,11 @@ struct InventoryHops {
     page_size: usize,
     /// The hop that is refused, counted from one; `None` refuses none of them.
     refused: Option<usize>,
+    /// Whether the inventory reads arriving now are the PASS's hops. A row's setup reads
+    /// the inventory itself — it waits for the state EC2's clock owes its launches — and
+    /// those reads are neither counted nor answered differently: until a row arms this, EC2
+    /// answers its own `DescribeInstances` whole.
+    armed: AtomicBool,
     /// How many hops have arrived so far.
     seen: AtomicUsize,
 }
@@ -83,8 +88,19 @@ impl InventoryHops {
         Self {
             page_size,
             refused,
+            armed: AtomicBool::new(false),
             seen: AtomicUsize::new(0),
         }
+    }
+
+    /// Count the inventory reads from here on as the pass's hops.
+    fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the reads arriving now are the pass's hops.
+    fn armed(&self) -> bool {
+        self.armed.load(Ordering::SeqCst)
     }
 
     /// Count one arriving hop and answer whether it is the refused one.
@@ -137,18 +153,23 @@ impl ErasedOperation for InventoryHop {
         req: &'r RtRequest,
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
-        let refused = self.hops.refuses_this_hop();
+        let armed = self.hops.armed();
+        let refused = armed && self.hops.refuses_this_hop();
         let page_size = self.hops.page_size;
         Box::pin(async move {
             if refused {
                 return throttled();
             }
-            let paged = with_page_size(req, page_size);
             let describe = svc
                 .definition()
                 .routing_table()
                 .get(DESCRIBE_INSTANCES)
                 .expect("EC2 models the inventory read");
+            if !armed {
+                // A read of the row's own setup: EC2's own answer, whole.
+                return describe.run(svc, req, ctx).await;
+            }
+            let paged = with_page_size(req, page_size);
             describe.run(svc, &paged, ctx).await
         })
     }
@@ -288,6 +309,14 @@ async fn a_pass_records_the_inventory_pages_the_owner_answered() {
         // so the sorted ids are the pages the walk reads in the order it reads them.
         let mut launched = fleet.launch_now(REGION, &image_id, FLEET).await;
         launched.sort();
+        // The instance list is of the RUNNING instances, so the fleet is given EC2's own
+        // clock to bring the launches up before the pass reads the inventory. Those reads
+        // are the row's own, not the pass's hops, which is why the paging and the refusal
+        // are armed only now.
+        for instance_id in &launched {
+            fleet.settled_running(REGION, instance_id).await;
+        }
+        hops.arm();
         fleet.set_discovery(ENABLED, &[REGION]).await;
 
         // ONE report, which materializes ONE pass.

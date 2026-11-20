@@ -80,11 +80,14 @@ struct Inventory {
 }
 
 impl Inventory {
-    /// Every instance discovery records, in the instance-id order both lists report.
+    /// Every instance the instance list reports, in the instance-id order it reports them
+    /// in: the RUNNING ones discovery recorded, because that list "lists the running Amazon
+    /// EC2 instances that were discovered with commercial Linux subscriptions" — the stopped
+    /// instance is discovered (its subscription goes on reporting, counting the running
+    /// instances using it) without being an element of this list.
     fn discovered(&self) -> Vec<String> {
         sorted(vec![
             self.typed.clone(),
-            self.stopped.clone(),
             self.elsewhere.clone(),
             self.suse.clone(),
             self.marketplace.clone(),
@@ -204,11 +207,9 @@ async fn every_documented_filter_name_selects_on_the_fact_ec2_reported() {
     let inventory = inventory().await;
     let discovered = inventory.discovered();
     let nothing: Vec<String> = Vec::new();
-    let red_hat = sorted(vec![
-        inventory.typed.clone(),
-        inventory.stopped.clone(),
-        inventory.elsewhere.clone(),
-    ]);
+    // The instances of the Red Hat AMI the list reports: the stopped one is discovered from
+    // that same AMI, and withheld from the report of running instances.
+    let red_hat = sorted(vec![inventory.typed.clone(), inventory.elsewhere.clone()]);
     let marketplace_code = ami("RHEL with HA")
         .product_code
         .expect("the Marketplace row carries a product code")
@@ -328,23 +329,32 @@ async fn every_documented_filter_name_selects_on_the_fact_ec2_reported() {
             vec!["us-".to_string()],
             discovered.clone(),
         ),
+        // Every record the report holds is one EC2 reports `running`, so that is the state
+        // the filter selects on — and the stopped instance, which the report withholds, is
+        // out of reach of the state it is really in and of the negation of `running`.
         (
             "Status",
             Some("Equal"),
             vec![STATE_RUNNING.to_string()],
-            inventory.discovered_except(&inventory.stopped),
+            discovered.clone(),
         ),
         (
             "Status",
             Some("Equal"),
             vec![STATE_STOPPED.to_string()],
-            vec![inventory.stopped.clone()],
+            nothing.clone(),
         ),
         (
             "Status",
             Some("NotEqual"),
             vec![STATE_RUNNING.to_string()],
+            nothing.clone(),
+        ),
+        (
+            "InstanceID",
+            Some("Equal"),
             vec![inventory.stopped.clone()],
+            nothing.clone(),
         ),
         (
             "UsageOperation",
@@ -383,16 +393,16 @@ async fn every_documented_filter_name_selects_on_the_fact_ec2_reported() {
     }
 
     // Several filters select what satisfies ALL of them, over that same real inventory.
-    let case = "the running instances of the Red Hat AMI";
+    let case = "the t3 instances of the Red Hat AMI";
     let reply = inventory
         .fleet
         .instances(&json!({ "Filters": [
             filter("AmiID", Some("Equal"), std::slice::from_ref(&inventory.rhel_image)),
-            filter("Status", Some("Equal"), &[STATE_RUNNING.to_string()]),
+            filter("InstanceType", Some("Equal"), &[ASKED_INSTANCE_TYPE.to_string()]),
         ] }))
         .await;
     let listed = reported_instance_ids(&reply, case);
-    let expected = sorted(vec![inventory.typed.clone(), inventory.elsewhere.clone()]);
+    let expected = vec![inventory.typed.clone()];
     assert_eq!(
         listed, expected,
         "case {case:?}: expected {expected:?}, got {listed:?}"
@@ -487,11 +497,9 @@ async fn a_subscription_filter_selects_over_what_the_discovered_fleet_aggregates
 #[tokio::test]
 async fn a_paged_walk_of_a_filtered_discovery_list_covers_that_selection_once() {
     let inventory = inventory().await;
-    let expected = sorted(vec![
-        inventory.typed.clone(),
-        inventory.stopped.clone(),
-        inventory.elsewhere.clone(),
-    ]);
+    // The Red Hat instances the list reports: the third one launched from that AMI is
+    // stopped, so the report of running instances holds two.
+    let expected = sorted(vec![inventory.typed.clone(), inventory.elsewhere.clone()]);
 
     // One record per page, over the selection the filter makes rather than over the whole
     // inventory: the walk covers exactly the instances of the Red Hat AMI, once each, in

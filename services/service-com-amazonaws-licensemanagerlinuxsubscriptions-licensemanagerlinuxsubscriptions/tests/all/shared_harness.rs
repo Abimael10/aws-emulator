@@ -94,6 +94,10 @@ type InstanceRow = (&'static str, &'static str, &'static str, &'static str);
 /// What the store holds for the two lists: one subscription used by a running and a
 /// stopped instance, and one used by a single running instance, so the counts are not the
 /// record count.
+///
+/// The stopped record is discovered without being an element of the instance report, which
+/// lists the running instances (`tests/all/running_instance_report.rs`), so the two lists
+/// are driven over a store whose records they project differently.
 const DISCOVERED: &[InstanceRow] = &[
     ("i-shared-01", "running", "RHEL", TYPE_INCLUDED),
     ("i-shared-02", "stopped", "RHEL", TYPE_INCLUDED),
@@ -104,6 +108,20 @@ const DISCOVERED: &[InstanceRow] = &[
         TYPE_BYOS,
     ),
 ];
+
+/// The `Instance$Status` of a record the instance list reports.
+const REPORTED_STATUS: &str = "running";
+
+/// The instance ids the instance list reports out of [`DISCOVERED`], in its order.
+fn reported_ids() -> Vec<String> {
+    let mut ids: Vec<String> = DISCOVERED
+        .iter()
+        .filter(|(_, status, _, _)| *status == REPORTED_STATUS)
+        .map(|(instance_id, _, _, _)| (*instance_id).to_string())
+        .collect();
+    ids.sort();
+    ids
+}
 
 /// A JSON tag map from `(key, value)` pairs.
 fn tag_map(pairs: &[(&str, &str)]) -> Value {
@@ -251,10 +269,7 @@ async fn the_shared_harness_drives_both_discovery_lists() {
         .iter()
         .map(|entry| member(entry, "InstanceID", case))
         .collect();
-    let want: Vec<String> = DISCOVERED
-        .iter()
-        .map(|(instance_id, _, _, _)| (*instance_id).to_string())
-        .collect();
+    let want: Vec<String> = reported_ids();
     assert_eq!(
         got, want,
         "case {case:?}: expected {want:?}, got {got:?}"
@@ -310,7 +325,7 @@ async fn the_shared_harness_reads_the_wire_error_code_of_every_refusal() {
     let reply = call(&h, INSTANCES, &json!({})).await;
     assert_eq!(
         entries(&reply, "Instances", case).len(),
-        DISCOVERED.len(),
+        reported_ids().len(),
         "case {case:?}: expected the store untouched, got {:?}",
         reply.body
     );

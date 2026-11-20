@@ -60,6 +60,11 @@ type Row = (
 /// instance types, states and Regions, one record carrying two product codes and one
 /// carrying none, three subscription names each licensed one way, and `DualSubscription`
 /// left unset on every record.
+///
+/// The stopped record is discovered without being an element of the instance report, which
+/// "lists the running Amazon EC2 instances that were discovered with commercial Linux
+/// subscriptions" (`tests/all/running_instance_report.rs` owns that rule); its subscription
+/// is still one of the names the sibling list reports.
 const DISCOVERED: &[Row] = &[
     (
         "i-0a1",
@@ -108,6 +113,18 @@ const DISCOVERED: &[Row] = &[
         &["pc-ubuntu"],
         "Ubuntu Pro",
         TYPE_MARKETPLACE,
+    ),
+    (
+        "i-0e5",
+        "111111111111",
+        "ami-0002",
+        "m5.large",
+        "running",
+        "us-east-1",
+        "RunInstances",
+        &[],
+        "SUSE Linux Enterprise Server",
+        TYPE_BYOS,
     ),
 ];
 
@@ -209,21 +226,21 @@ const CASES: &[Case] = &[
         listing: &INSTANCES,
         name: "Status",
         values: &["running"],
-        expected: &["i-0a1", "i-0b2", "i-0d4"],
+        expected: &["i-0a1", "i-0b2", "i-0d4", "i-0e5"],
     },
     // A scalar member, one value, selecting a strict subset.
     Case {
         listing: &INSTANCES,
         name: "AccountID",
         values: &["111111111111"],
-        expected: &["i-0c3"],
+        expected: &["i-0e5"],
     },
     // Several values compared against, as the set they are.
     Case {
         listing: &INSTANCES,
         name: "InstanceType",
         values: &["t3.micro", "m5.large"],
-        expected: &["i-0a1", "i-0c3", "i-0d4"],
+        expected: &["i-0a1", "i-0d4", "i-0e5"],
     },
     // The list member: a record satisfies the filter when ANY code it holds equals a
     // value named, and the record holding no code at all satisfies none.
@@ -237,7 +254,7 @@ const CASES: &[Case] = &[
         listing: &INSTANCES,
         name: "Region",
         values: &["us-east-1"],
-        expected: &["i-0c3", "i-0d4"],
+        expected: &["i-0d4", "i-0e5"],
     },
     // A value that is a substring of what the records hold, not what they hold: equality
     // selects nothing, which `Contains` would not.

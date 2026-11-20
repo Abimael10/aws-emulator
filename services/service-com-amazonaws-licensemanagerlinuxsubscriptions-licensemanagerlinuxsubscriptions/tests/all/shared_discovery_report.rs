@@ -456,7 +456,12 @@ fn subscription_conjunctions() -> Vec<Conjunction> {
 
 /// `ListLinuxSubscriptionInstances` documents nine `Filter$Name` values, so its rows combine
 /// filters addressing DIFFERENT members — a scalar one, the list member `ProductCode`, and
-/// one left unset on some records — under each of the three operators.
+/// one left unset on some records — under each of the three operators and an absent one.
+///
+/// A row whose filters each select something the others do not cannot be built out of the
+/// state the report is of: this list is of the running instances, so `Status` equal to that
+/// state selects the whole report and narrows nothing. It is one of the four members of the
+/// last row all the same, because it is a `Filter$Name` the list documents.
 fn instance_conjunctions() -> Vec<Conjunction> {
     vec![
         Conjunction {
@@ -470,19 +475,19 @@ fn instance_conjunctions() -> Vec<Conjunction> {
             narrowing: false,
         },
         Conjunction {
-            label: "a Region and a Status",
+            label: "a product code and an account",
             filters: vec![
-                filter("Region", Some("Contains"), &["us-west"]),
-                filter("Status", Some("Equal"), &["running"]),
+                filter("ProductCode", Some("Contains"), &["pc-"]),
+                filter("AccountID", Some("NotEqual"), &["000000000000"]),
             ],
             narrowing: true,
         },
         Conjunction {
-            label: "an instance type, a state and an account",
+            label: "an AMI, a product code and an account",
             filters: vec![
-                filter("InstanceType", Some("Contains"), &["t"]),
-                filter("Status", Some("Equal"), &["running"]),
-                filter("AccountID", None, &["000000000000"]),
+                filter("AmiID", Some("Contains"), &["ami-"]),
+                filter("ProductCode", Some("Contains"), &["pc-"]),
+                filter("AccountID", Some("NotEqual"), &["222222222222"]),
             ],
             narrowing: true,
         },
@@ -490,15 +495,15 @@ fn instance_conjunctions() -> Vec<Conjunction> {
             label: "a list member beside a scalar one",
             filters: vec![
                 filter("ProductCode", Some("Contains"), &["pc-"]),
-                filter("Status", Some("Equal"), &["running"]),
+                filter("InstanceID", Some("NotEqual"), &["i-0a1"]),
             ],
             narrowing: true,
         },
         Conjunction {
-            label: "a member some records leave unset",
+            label: "a member some records leave unset, its operator absent",
             filters: vec![
-                filter("DualSubscription", Some("Equal"), &["Yes"]),
-                filter("Status", Some("Equal"), &["running"]),
+                filter("DualSubscription", None, &["Yes", "No"]),
+                filter("InstanceID", Some("NotEqual"), &["i-0a1"]),
             ],
             narrowing: true,
         },
@@ -528,6 +533,10 @@ fn instance_conjunctions() -> Vec<Conjunction> {
 /// different ways, a record carrying two product codes and one carrying none, and
 /// `DualSubscription` set on some records and unset on others — so each row's filters select
 /// overlapping but different parts of it.
+///
+/// The instance list is of the RUNNING records of this fleet, the subscription list of
+/// everything it aggregates to, which is why each list's rows are its own
+/// (`tests/all/running_instance_report.rs` owns that rule).
 const FLEET: &[Seed] = &[
     Seed {
         instance_id: "i-0a1",
