@@ -41,6 +41,7 @@ const ACCESS_DENIED: &str = "AccessDeniedException";
 /// The IAM action each operation under test is performed under.
 const PUT_ACTION: &str = "s3tables:PutTableReplication";
 const GET_ACTION: &str = "s3tables:GetTableReplication";
+const DELETE_ACTION: &str = "s3tables:DeleteTableReplication";
 
 /// The namespace the fixture tables live in.
 const NAMESPACE: &str = "repl_auth_ns";
@@ -87,6 +88,29 @@ async fn get_as(aws: &Emulator, access_key_id: &str, table_arn: &str) -> Reply {
         &format!(
             "/table-replication{}",
             query_string(&[("tableArn", table_arn.to_string())])
+        ),
+        None,
+    )
+    .await
+}
+
+/// `DeleteTableReplication` on `table_arn`, preconditioned on `version_token`,
+/// as `access_key_id`.
+async fn delete_as(
+    aws: &Emulator,
+    access_key_id: &str,
+    table_arn: &str,
+    version_token: &str,
+) -> Reply {
+    aws.call_as(
+        access_key_id,
+        "DELETE",
+        &format!(
+            "/table-replication{}",
+            query_string(&[
+                ("tableArn", table_arn.to_string()),
+                ("versionToken", version_token.to_string()),
+            ])
         ),
         None,
     )
@@ -323,6 +347,92 @@ async fn a_refused_write_persists_nothing() {
          {actual:?}",
         actual = owner.message()
     );
+}
+
+#[tokio::test]
+async fn a_replication_delete_is_decided_the_same_way() {
+    let aws = Emulator::new();
+    let (_, tables) = fixture(&aws, "s3t-repl-auth-del", &["subject", "other"]).await;
+    let subject = tables[0].clone();
+    let other = tables[1].clone();
+    let destination = aws
+        .ok(
+            "PUT",
+            "/buckets",
+            Some(&json!({ "name": "s3t-repl-auth-del-dst" })),
+        )
+        .await
+        .text("arn");
+    let settings = configuration(&destination);
+
+    for (index, case) in cases(DELETE_ACTION, &subject, &other).iter().enumerate() {
+        // The configuration each row's delete addresses, written by the owner,
+        // so an allowed delete of the previous row leaves the next one
+        // something to remove.
+        let stored = put_as(&aws, ACCOUNT_KEY, &subject, &settings).await;
+        assert_eq!(
+            stored.status, 200,
+            "case {label:?}: the setup put must be served, got {status} {body}",
+            label = case.label,
+            status = stored.status,
+            body = stored.body
+        );
+        let token = stored.text("versionToken");
+
+        let principal =
+            assumed_role(&aws, &format!("s3t-repl-del-role-{index}"), &case.policies).await;
+        let deleted = delete_as(&aws, &principal.access_key_id, &subject, &token).await;
+        match &case.refused_because {
+            None => {
+                assert_eq!(
+                    deleted.status, 204,
+                    "case {label:?}: an allowed delete answers the modelled 204, got {status} \
+                     {body}",
+                    label = case.label,
+                    status = deleted.status,
+                    body = deleted.body
+                );
+                // The record is gone, so the owner's own read is the not-found
+                // of a table with no configuration.
+                let owner = get_as(&aws, ACCOUNT_KEY, &subject).await;
+                assert_eq!(
+                    owner.status, 404,
+                    "case {label:?}: the owner's read after an allowed delete must be 404, got \
+                     {status} {body}",
+                    label = case.label,
+                    status = owner.status,
+                    body = owner.body
+                );
+            }
+            Some(reason) => {
+                assert_refused(
+                    &deleted,
+                    case.label,
+                    &refusal_sentence(&principal.arn, DELETE_ACTION, &subject, reason),
+                );
+                // The decision precedes the write, so the refused delete
+                // removed nothing: the owner still reads the configuration the
+                // setup put stored.
+                let owner = get_as(&aws, ACCOUNT_KEY, &subject).await;
+                assert_eq!(
+                    owner.status, 200,
+                    "case {label:?}: a refused delete must leave the configuration, got {status} \
+                     {body}",
+                    label = case.label,
+                    status = owner.status,
+                    body = owner.body
+                );
+                assert_eq!(
+                    owner.text("versionToken"),
+                    token,
+                    "case {label:?}: a refused delete must leave the configuration's token as it \
+                     was, got {actual:?}",
+                    label = case.label,
+                    actual = owner.text("versionToken")
+                );
+            }
+        }
+    }
 }
 
 #[tokio::test]

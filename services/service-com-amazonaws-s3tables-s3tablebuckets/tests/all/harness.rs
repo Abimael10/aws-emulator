@@ -528,6 +528,19 @@ impl Emulator {
         .await
     }
 
+    /// `DeleteTableReplication` with whichever query members the case names, so
+    /// a suite can present a `versionToken`, present another one, or leave the
+    /// member out altogether.
+    pub async fn delete_table_replication(&self, region: &str, query: &[(&str, String)]) -> Reply {
+        self.call(
+            "DELETE",
+            &format!("/table-replication{}", query_string(query)),
+            region,
+            None,
+        )
+        .await
+    }
+
     /// `GetTableReplicationStatus`, which addresses the table by a query member
     /// on an endpoint of its own (`GET /replication-status`).
     pub async fn get_table_replication_status(&self, region: &str, table_arn: &str) -> Reply {
