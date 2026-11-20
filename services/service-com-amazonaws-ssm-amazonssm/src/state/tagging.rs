@@ -28,6 +28,12 @@
 //! separator, the name without it, or the parameter's ARN — while an id that selects one
 //! VERSION of it names no taggable resource, because the tag set belongs to the parameter.
 //!
+//! Because the resource's own record is that tag set's one home, the same records are what
+//! an account-wide, tag-driven VIEW of the account's resources is read from:
+//! [`ComAmazonawsSsmAmazonssmState::tagged_resources`] projects each resource this store
+//! holds tags for as `(ARN, tags)`, so a resource tagged here is discoverable there at once
+//! and one whose last tag was removed is gone from it with nothing to keep in step.
+//!
 //! The pair is read in two steps, and each step has its own refusal: the id is first read
 //! against the form the DECLARED type's ids are published in
 //! ([`resource_id_format_violation`]) — an id of another type's form names no resource of
@@ -250,6 +256,71 @@ pub fn remove_tags(held: &mut BTreeMap<String, String>, keys: &[String]) {
 }
 
 impl ComAmazonawsSsmAmazonssmState {
+    /// Every resource of `region` this store holds a NON-EMPTY tag set for, as
+    /// `(ARN, tags)`, in ARN order.
+    ///
+    /// The tag set a resource carries is the one this store holds ON the resource's own
+    /// record — written by the create that carried `Tags`, by `AddTagsToResource`, and
+    /// unwritten by `RemoveTagsFromResource` — so this is the projection an account-wide,
+    /// tag-driven view of the account's resources reads: a resource is keyed by the ARN
+    /// this service itself mints for it, carries the pairs that record holds (the set
+    /// [`ComAmazonawsSsmAmazonssmState::resource_tags`] reports for every type whose ids it
+    /// resolves), and leaves the projection the moment it holds no tag or this store no
+    /// longer holds it. Only resources of the Region asked for, because a resource of this
+    /// service belongs to the Region its endpoint created it through, which is the Region
+    /// its ARN carries.
+    ///
+    /// The resource types walked are the ones this store MINTS an ARN for, since the ARN is
+    /// what names a resource outside this service: a parameter, a document, an OpsItem, an
+    /// OpsMetadata object, a cloud connector and a patch baseline. A type whose records
+    /// carry a tag set but no minted ARN ([`TAGGING_TYPE_MANAGED_INSTANCE`],
+    /// [`TAGGING_TYPE_AUTOMATION`], [`TAGGING_TYPE_ASSOCIATION`],
+    /// [`TAGGING_TYPE_MAINTENANCE_WINDOW`]) has nothing to key a row by until this service
+    /// mints one, so it is not a row here.
+    pub fn tagged_resources(&self, region: &str) -> Vec<(String, BTreeMap<String, String>)> {
+        let mut found: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+        let mut record = |arn: String, tags: &BTreeMap<String, String>| {
+            // "GetResources does not return untagged resources": a resource holding no tag
+            // is not a row of a tag projection.
+            if !tags.is_empty() {
+                found.insert(arn, tags.clone());
+            }
+        };
+        for ((held, _), parameter) in &self.parameters {
+            if held == region {
+                record(parameter.arn(), &parameter.tags);
+            }
+        }
+        for ((held, _), document) in &self.documents {
+            if held == region {
+                record(document.arn(), &document.tags);
+            }
+        }
+        for ((held, _), ops_item) in &self.ops_items {
+            if held == region {
+                record(ops_item.arn(), &ops_item.tags);
+            }
+        }
+        for ((held, arn), object) in &self.ops_metadata {
+            // An OpsMetadata object is KEYED by the ARN its create minted, which is the
+            // record's own `arn`.
+            if held == region {
+                record(arn.clone(), &object.tags);
+            }
+        }
+        for ((held, _), connector) in &self.cloud_connectors {
+            if held == region {
+                record(connector.arn(), &connector.tags);
+            }
+        }
+        for ((held, _), baseline) in &self.patch_baselines {
+            if held == region {
+                record(baseline.arn(), &baseline.tags);
+            }
+        }
+        found.into_iter().collect()
+    }
+
     /// The tag set the resource `(resource_type, resource_id)` names in `region`
     /// carries, or `None` when the Region holds no such resource — which is what the tag
     /// operations refuse as an invalid resource id.

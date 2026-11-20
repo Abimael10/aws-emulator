@@ -50,7 +50,8 @@
 //! service's API is discoverable here, and one it no longer holds is gone from
 //! the projection) while an ARN in its namespace stays [`Resolution::Unowned`]
 //! for a write, which keeps [`crate::state`]'s own store the tag home for the
-//! ARNs this API is asked to tag directly. Amazon EC2 is linked that way.
+//! ARNs this API is asked to tag directly. Amazon EC2 and AWS Systems Manager are
+//! linked that way.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -73,6 +74,7 @@ use service_com_amazonaws_secretsmanager_secretsmanager as owner_secretsmanager;
 use service_com_amazonaws_sfn_awsstepfunctions as owner_sfn;
 use service_com_amazonaws_sns_amazonsimplenotificationservice as owner_sns;
 use service_com_amazonaws_sqs_amazonsqs as owner_sqs;
+use service_com_amazonaws_ssm_amazonssm as owner_ssm;
 
 use super::ParsedArn;
 use crate::ops::types::FailureInfo;
@@ -542,6 +544,22 @@ pub fn tagged_resources<Eng: Send + Sync + 'static>(
         }
         for activity in state.activities.values() {
             record(activity.arn.clone(), option_tag_pairs!(activity.tags));
+        }
+    }
+    if let Some(state) = owner_ssm::state::service_state(engine) {
+        let mut state = state.lock();
+        // Like the owners above, what the CLOCK already owes is materialised before the
+        // projection is read: an OpsItem whose delete had settled by this instant was owed
+        // its removal whether or not anybody called, so it is not reported as a resource
+        // the account still holds.
+        state.settle_ops_item_deletions_due(SystemTime::now());
+        // Every resource that service holds a tag set for and mints an ARN for, read off
+        // its own tag plane — so a resource tagged at creation or through its
+        // `AddTagsToResource` is in this projection at once, and one whose tag its
+        // `RemoveTagsFromResource` dropped is out of it. Each row is keyed by the ARN that
+        // service mints for the resource, which carries the Region the resource lives in.
+        for (arn, tags) in state.tagged_resources(region) {
+            record(arn, tags);
         }
     }
     found
