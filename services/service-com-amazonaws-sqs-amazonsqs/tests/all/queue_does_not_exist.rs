@@ -21,14 +21,25 @@
 //! names of a class on every error whatever the request asked for). The expected message is
 //! the constant exported by [`service_com_amazonaws_sqs_amazonsqs::state`], which one test
 //! pins to AWS's own sentence written out literally.
+//!
+//! The rows further span WHAT the queue was and held when it went away — nothing, messages
+//! nobody had received, a message received and still in flight (probed with the receipt
+//! handle that queue itself minted), tags and a changed attribute, a FIFO queue's message
+//! group, the dead-letter role a live source queue still redrives to — because the condition
+//! is the absence of the queue and nothing of its history or its type is part of it. And they
+//! pin the one class this sentence must NOT be collapsed into: the same error code also
+//! carries a second, distinct fixed sentence for a queue that IS there but is withheld from
+//! the caller, and no refusal of an absent queue may read it.
+
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_sqs_amazonsqs::state::QUEUE_DOES_NOT_EXIST_MESSAGE;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::support::{
-    account, call, call_in_query_mode, call_with_headers, create_ok, emulator, error_code, HOST,
-    OTHER_ACCOUNT, QUERY_ERROR_HEADER,
+    account, call, call_in_query_mode, call_with_headers, create_ok, dead_letter_queue, emulator,
+    error_code, fifo_attributes, messages, ok, send_all, HOST, OTHER_ACCOUNT, QUERY_ERROR_HEADER,
 };
 
 /// AWS's own sentence for a queue the account does not hold, written out here rather than
@@ -450,6 +461,251 @@ fn the_exported_refusal_message_is_awss_own_sentence() {
     assert_eq!(
         QUEUE_DOES_NOT_EXIST_MESSAGE, AWS_SENTENCE,
         "case the exported refusal message: expected {AWS_SENTENCE:?}, got {:?}",
+        QUEUE_DOES_NOT_EXIST_MESSAGE
+    );
+}
+
+/// The OTHER fixed sentence AWS serves under this same error code: the one for the class
+/// where the queue IS there and the caller may not address it, which names both facts
+/// without saying which holds.
+///
+/// RECORDED: it is what a delivery EventBridge makes to a queue whose own policy admits it
+/// nothing reads back from Amazon SQS, and what that dead letter reports. Written out here so
+/// the two classes of the one code stay distinguishable: every row of this suite is the
+/// ABSENCE class, so none of them may read this sentence.
+const NOT_DISCLOSED_SENTENCE: &str =
+    "The specified queue does not exist or you do not have access to it.";
+
+/// How long a row looks for the message it sent before giving up on taking a receipt handle
+/// from it. Generous: what the row needs is a handle at all, never how fast the host runs.
+const RECEIVE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// The longest one receive in that loop waits, inside the documented
+/// `ReceiveMessageRequest$WaitTimeSeconds` range ("an integer from 0 to 20").
+const RECEIVE_WAIT_SECONDS: u64 = 1;
+
+/// A receipt handle the queue at `url` minted, by receiving one of its messages and leaving
+/// it in flight — looked for in a loop until it is handed over or [`RECEIVE_DEADLINE`]
+/// passes.
+async fn outstanding_handle(router: &MultiServiceRouter, case: &str, url: &str) -> String {
+    let deadline = Instant::now() + RECEIVE_DEADLINE;
+    while Instant::now() < deadline {
+        let reply = ok(
+            router,
+            "ReceiveMessage",
+            json!({
+                "QueueUrl": url,
+                "MaxNumberOfMessages": 1,
+                "WaitTimeSeconds": RECEIVE_WAIT_SECONDS,
+            }),
+        )
+        .await;
+        if let Some(handle) = messages(&reply)
+            .first()
+            .and_then(|message| message.get("ReceiptHandle"))
+            .and_then(Value::as_str)
+        {
+            return handle.to_string();
+        }
+    }
+    panic!("case {case}: expected a message of {url} to come over so the row can keep its handle")
+}
+
+/// What a row's queue WAS, and held, at the moment it was deleted — the axis these rows span,
+/// and the one thing the refusal they then earn may not depend on.
+#[derive(Debug, Clone, Copy)]
+enum Held {
+    /// Nothing at all: created and deleted.
+    Nothing,
+    /// Messages nobody had received.
+    AvailableMessages,
+    /// One message received and not deleted, whose receipt handle the row probes with too.
+    AnInFlightMessage,
+    /// Tags and an attribute changed away from its default.
+    TagsAndAttributes,
+    /// A FIFO queue holding one message group.
+    AFifoMessageGroup,
+    /// The dead-letter target a source queue that is still there redrives to.
+    ADeadLetterRole,
+}
+
+/// A queue in the state `held` describes, as `(its url, a receipt handle it minted, the url of
+/// a queue that must still be there afterwards)`.
+async fn given_queue(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    held: Held,
+) -> (String, Option<String>, Option<String>) {
+    match held {
+        Held::Nothing => (create_ok(router, name, &json!({})).await, None, None),
+        Held::AvailableMessages => {
+            let url = create_ok(router, name, &json!({})).await;
+            send_all(router, &url, &["one".to_string(), "two".to_string()]).await;
+            (url, None, None)
+        }
+        Held::AnInFlightMessage => {
+            let url = create_ok(router, name, &json!({})).await;
+            send_all(router, &url, &["in flight".to_string()]).await;
+            let handle = outstanding_handle(router, case, &url).await;
+            (url, Some(handle), None)
+        }
+        Held::TagsAndAttributes => {
+            let url = create_ok(router, name, &json!({"VisibilityTimeout": "45"})).await;
+            ok(
+                router,
+                "TagQueue",
+                json!({"QueueUrl": &url, "Tags": {"team": "platform"}}),
+            )
+            .await;
+            (url, None, None)
+        }
+        Held::AFifoMessageGroup => {
+            let url = create_ok(
+                router,
+                name,
+                &fifo_attributes(&[("ContentBasedDeduplication", "true")]),
+            )
+            .await;
+            ok(
+                router,
+                "SendMessage",
+                json!({"QueueUrl": &url, "MessageBody": "grouped", "MessageGroupId": "one"}),
+            )
+            .await;
+            (url, None, None)
+        }
+        Held::ADeadLetterRole => {
+            let (dead_letter_url, _, source_url) = dead_letter_queue(router, name).await;
+            (dead_letter_url, None, Some(source_url))
+        }
+    }
+}
+
+/// The absence of a queue is the whole condition: every operation that resolves one refuses a
+/// queue that is gone with the one fixed sentence, whatever that queue was and held when it
+/// went away — and never with the second sentence this error code carries for a queue that is
+/// there but withheld from the caller.
+///
+/// The rows differ along what the queue held and what kind of queue it was ([`Held`]); the
+/// columns are every operation that resolves a `QueueUrl`, the one that resolves a
+/// `QueueName`, and — for the row that kept one — the operations taking the receipt handle
+/// that queue itself minted, which names an incarnation that is now gone.
+#[tokio::test]
+async fn an_absent_queue_earns_the_one_sentence_whatever_it_held() {
+    let router = emulator();
+
+    let rows: [(&str, &str, Held); 6] = [
+        ("a queue deleted while empty", "gone-empty", Held::Nothing),
+        (
+            "a queue deleted while it held messages nobody had received",
+            "gone-with-messages",
+            Held::AvailableMessages,
+        ),
+        (
+            "a queue deleted while a received message was still in flight",
+            "gone-with-inflight",
+            Held::AnInFlightMessage,
+        ),
+        (
+            "a queue deleted while it carried tags and a changed attribute",
+            "gone-with-tags",
+            Held::TagsAndAttributes,
+        ),
+        (
+            "a FIFO queue deleted while it held a message group",
+            "gone-fifo.fifo",
+            Held::AFifoMessageGroup,
+        ),
+        (
+            "a dead-letter queue deleted while its source queue is still there",
+            "gone-dead-letter",
+            Held::ADeadLetterRole,
+        ),
+    ];
+
+    for (case, name, held) in rows {
+        let (url, handle, still_there) = given_queue(&router, case, name, held).await;
+        let (status, parsed) = call(&router, "DeleteQueue", &json!({"QueueUrl": &url})).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: expected the delete of {url} to be taken, got {status} with {parsed}"
+        );
+
+        let mut probes: Vec<(&str, Value)> = url_requests(&url);
+        probes.push(("GetQueueUrl", json!({"QueueName": name})));
+        if let Some(handle) = &handle {
+            // A handle names the incarnation that minted it, so a handle of a queue that is
+            // gone addresses a queue that does not exist — the same absence, worded the same.
+            probes.push((
+                "DeleteMessage",
+                json!({"QueueUrl": &url, "ReceiptHandle": handle}),
+            ));
+            probes.push((
+                "ChangeMessageVisibility",
+                json!({"QueueUrl": &url, "ReceiptHandle": handle, "VisibilityTimeout": 30}),
+            ));
+            probes.push((
+                "DeleteMessageBatch",
+                json!({"QueueUrl": &url,
+                       "Entries": [{"Id": "one", "ReceiptHandle": handle}]}),
+            ));
+        }
+
+        for (operation, request) in &probes {
+            let (status, parsed) = call(&router, operation, request).await;
+            let message = message_of(&parsed);
+            assert_eq!(
+                (status, error_code(&parsed).as_str(), message.as_str()),
+                (400, "QueueDoesNotExist", AWS_SENTENCE),
+                "case {operation} on {case}: expected a 400 QueueDoesNotExist reading \
+                 {AWS_SENTENCE:?}, got {status} with {parsed}"
+            );
+            assert_ne!(
+                message, NOT_DISCLOSED_SENTENCE,
+                "case {operation} on {case}: the absence of a queue and a queue withheld from \
+                 the caller are two classes of this one error code and keep their own \
+                 sentences, got {message:?}"
+            );
+            assert!(
+                !message.contains(name),
+                "case {operation} on {case}: the refusal must not report the queue it was \
+                 probed with back, got {message:?}"
+            );
+        }
+
+        // The refusals above are about the queue that is gone and nothing else: a queue of the
+        // same account that is still there is still served.
+        if let Some(source_url) = &still_there {
+            let (status, parsed) = call(
+                &router,
+                "GetQueueAttributes",
+                &json!({"QueueUrl": source_url, "AttributeNames": ["All"]}),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case}: expected the source queue at {source_url} to still be served, \
+                 got {status} with {parsed}"
+            );
+        }
+    }
+}
+
+/// The two sentences this one error code carries are two values: an absent queue reads the
+/// absence sentence, and the one for a queue withheld from the caller is a different string,
+/// so a client can tell the classes apart.
+#[test]
+fn the_absence_sentence_is_not_the_one_for_a_queue_withheld_from_the_caller() {
+    assert_ne!(
+        AWS_SENTENCE, NOT_DISCLOSED_SENTENCE,
+        "case the two sentences of this error code: expected them to stay distinct, got \
+         {AWS_SENTENCE:?} for both"
+    );
+    assert_ne!(
+        QUEUE_DOES_NOT_EXIST_MESSAGE, NOT_DISCLOSED_SENTENCE,
+        "case the exported refusal message: expected the sentence for an absent queue rather \
+         than the one for a queue withheld from the caller, got {:?}",
         QUEUE_DOES_NOT_EXIST_MESSAGE
     );
 }
