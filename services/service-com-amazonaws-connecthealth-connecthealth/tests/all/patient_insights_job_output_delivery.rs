@@ -25,10 +25,10 @@
 //!    it reports it: the object at `insightsOutput.uri` exists in the configured bucket and
 //!    carries the document this emulator can establish — `TotalCount`, the `PatientId` the
 //!    job was started for and the `SummaryType` its `insightsType` names — whose one
-//!    narrative STATES that no insights were generated, which the job also reports in
-//!    `statusDetails`. That statement is FIXED: it is the same for two jobs started with
-//!    different patients, encounters and output paths, because nothing of a request goes
-//!    into it.
+//!    narrative STATES that no insights were generated. That statement is FIXED: it is the
+//!    same for two jobs started with different patients, encounters and output paths,
+//!    because nothing of a request goes into it, and what the job reports in
+//!    `statusDetails` is the document-processing report of its run.
 //! 3. Those work products sit at `<s3OutputPath>/<jobId>/<patientId>/summary.json` and
 //!    `.../processing-metadata.json`, so Amazon S3's own `GetObject` serves the summary
 //!    with the modelled 200 and the object's metadata, the summary states which job ran,
@@ -58,7 +58,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_connecthealth_connecthealth::state::{
-    DATASTORE_NOT_FOUND_MESSAGE, INSIGHTS_NOT_GENERATED_DETAIL, OUTPUT_NOT_STORED_DETAIL,
+    DATASTORE_NOT_FOUND_MESSAGE, INSIGHTS_NOT_GENERATED_NARRATIVE, OUTPUT_NOT_STORED_DETAIL,
     PATIENT_NOT_IN_DATASTORE_MESSAGE,
 };
 
@@ -437,6 +437,16 @@ async fn a_succeeded_job_has_stored_its_output_where_it_reports_it() {
              status, got {done}"
         );
         let uri = string_at(&done["insightsOutput"], "uri");
+        assert_eq!(
+            uri,
+            format!(
+                "{}/{job_id}/{}/summary.json",
+                row.s3_output_path.trim_end_matches('/'),
+                row.patient_id
+            ),
+            "case {case:?}: a completed job must report the summary object of its patient \
+             under the configured path, got {done}"
+        );
         let (bucket, key) = object_address(case, &uri);
 
         // The object the job REPORTS, read back through the service that owns it.
@@ -506,16 +516,10 @@ async fn a_succeeded_job_has_stored_its_output_where_it_reports_it() {
             "case {case:?}: at least one section must carry a non-empty clinical narrative, \
              got {document}"
         );
-        // The narrative STATES the gap rather than carrying a summary nothing produced: it
-        // is the job's own `statusDetails` text, and it carries nothing of the request or of
-        // the patient's record — which is asserted across the rows below.
+        // The narrative STATES the gap rather than carrying a summary nothing produced,
+        // and it carries nothing of the request or of the patient's record — which is
+        // asserted across the rows below.
         let joined = narratives.join(" ");
-        assert_eq!(
-            joined,
-            string_at(&done, "statusDetails"),
-            "case {case:?}: the stored narrative and the job's status detail must say the \
-             same thing, got {joined:?}"
-        );
         for leaked in [
             Some("Annual checkup"),
             row.birth_date,
@@ -533,6 +537,30 @@ async fn a_succeeded_job_has_stored_its_output_where_it_reports_it() {
             );
         }
         narrated.push(joined);
+
+        // What the job REPORTS about the run: the document-processing report, whose keys are
+        // fixed and whose counts are the ONE patient record this job summarised (this body
+        // configures two input SOURCES for reading it — a FHIR server and an S3 source — and
+        // the count follows the patient, not the sources), naming the metadata object beside
+        // the summary. The stored objects themselves are asserted by the sibling test of
+        // this suite.
+        let detail: Value = ::serde_json::from_str(&string_at(&done, "statusDetails"))
+            .unwrap_or_else(|error| {
+                panic!("case {case:?}: statusDetails must be a JSON document: {error}, got {done}")
+            });
+        assert_eq!(
+            detail,
+            json!({
+                "documentProcessing": { "total": 1, "processed": 1 },
+                "processingMetadataUri": format!(
+                    "{}/{job_id}/{}/processing-metadata.json",
+                    row.s3_output_path.trim_end_matches('/'),
+                    row.patient_id
+                ),
+            }),
+            "case {case:?}: a completed job must report the patient record it processed and \
+             where its processing metadata went, got {done}"
+        );
 
         // Reading the job again reports the same record: the delivery is made once and a
         // later read neither re-reports nor changes it.
@@ -553,7 +581,7 @@ async fn a_succeeded_job_has_stored_its_output_where_it_reports_it() {
     );
     assert_eq!(
         narrated.first().map(String::as_str),
-        Some(INSIGHTS_NOT_GENERATED_DETAIL),
+        Some(INSIGHTS_NOT_GENERATED_NARRATIVE),
         "the stored statement must be the one this service states for it, got {narrated:?}"
     );
 }

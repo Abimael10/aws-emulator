@@ -37,8 +37,10 @@
 //! none, so the summary document carries the members this service derives — which job ran,
 //! which patient it ran for, when it finished and which kind of summary was asked for —
 //! and its one narrative STATES that no insights were generated
-//! ([`INSIGHTS_NOT_GENERATED_NARRATIVE`]), which the job also reports in `statusDetails`.
-//! Nothing here composes prose that would read like a summary no model wrote.
+//! ([`INSIGHTS_NOT_GENERATED_NARRATIVE`]). Nothing here composes prose that would read like
+//! a summary no model wrote. What the job reports in `statusDetails` is the
+//! document-processing report of the run ([`processing_status_detail`]), which is what the
+//! recorded response carries there.
 //!
 //! # How it reaches them
 //!
@@ -145,7 +147,8 @@ const DELIVERY_RECLAIM_AFTER: Duration = Duration::from_secs(10);
 ///
 /// Derived once, when the job is accepted, from the output location the request configured
 /// and the job's own id, so the objects land at exactly the keys the job's own location
-/// members name.
+/// members name — the summary at `insightsOutput.uri` and the processing metadata at the
+/// `processingMetadataUri` of its `statusDetails`.
 #[derive(Debug, Clone)]
 pub struct InsightsDelivery {
     /// The Region the object store is addressed in: the Region the start was signed for.
@@ -391,7 +394,7 @@ const URI_COMPONENT: &::percent_encoding::AsciiSet = &::percent_encoding::NON_AL
 ///
 /// Called by the job's own reader before it reports: the delivery was owed from the
 /// instant the job's completion fell due, whether or not anybody polled, and making it
-/// here is what keeps the object in place by the time a read reports the job terminal. A
+/// here is what keeps both objects in place by the time a read reports the job terminal. A
 /// job that owes no delivery, has had it made, or whose delivery is held by another caller
 /// is left exactly as it was found.
 pub async fn deliver_job_output<Eng: Send + Sync + 'static>(
@@ -549,9 +552,7 @@ fn summary_type(insights_type: &str) -> String {
 /// `HccIncluded` ([`HCC_INCLUDED`]), `JobId`, `PatientId` (the id the start resolved) and
 /// `SummaryType` (from the modelled `insightsType`) — and its one narrative STATES that no
 /// insights were generated ([`INSIGHTS_NOT_GENERATED_NARRATIVE`]) rather than composing
-/// prose that would read like a summary nothing produced. The same statement is what the
-/// job reports in `statusDetails`, so a caller polling the job meets it without fetching
-/// the object.
+/// prose that would read like a summary nothing produced.
 ///
 /// The member names are RECORDED: `TotalCount`, `GeneratedAt`, `HccIncluded` and
 /// `PatientSummaries[].PatientSummary` with `JobId`, `PatientId`, `SummaryType`,
@@ -635,14 +636,56 @@ pub const INSIGHTS_NOT_GENERATED_NARRATIVE: &str =
      model, so a patient insights job stores the identity of its summary and no insights \
      content.";
 
-/// What a job that stored its output reports about its status: the same statement its
-/// stored document carries, so a caller that polls the job learns the generation gap
-/// without fetching the object.
+/// What a job that ran to completion reports about its status: a JSON document stating how
+/// much of its input it processed and where its processing metadata was written.
+///
+/// RECORDED behaviour: the keys are FIXED — `documentProcessing` with `total` and
+/// `processed`, and `processingMetadataUri` — while every value is this job's own. A job
+/// that ran to completion processed every patient record it was started for
+/// ([`PATIENTS_PER_JOB`]), and the metadata location is the one this job reports and writes
+/// ([`PatientInsightsJob::processing_metadata_uri`]).
+///
+/// `None` for a job with no metadata location to report, which is the same job that reports
+/// no output location at all (a configured path with no room for an object under it): there
+/// is nothing to state about objects that were never addressed.
 ///
 /// `statusDetails` is "information about the status of a job" and targets `NonEmptyString`
 /// (`smithy_query(query="operation",operation="GetPatientInsightsJob",model_path="services/service-com-amazonaws-connecthealth-connecthealth/smithy-model/com-amazonaws-connecthealth-connecthealth.json")`),
-/// so the text is this service's own and names nothing read off the request.
-pub const INSIGHTS_NOT_GENERATED_DETAIL: &str = INSIGHTS_NOT_GENERATED_NARRATIVE;
+/// which this document satisfies.
+///
+/// The document is rendered through a serialized STRUCT rather than a JSON map, so the
+/// members travel in the order the recorded document carries them whatever feature set the
+/// JSON crate is built with.
+pub fn processing_status_detail(job: &PatientInsightsJob) -> Option<String> {
+    let detail = ProcessingStatusDetail {
+        document_processing: DocumentProcessing {
+            total: PATIENTS_PER_JOB,
+            // A completed run processed every record it was given; a job that could not
+            // process them does not reach the success status this detail belongs to.
+            processed: PATIENTS_PER_JOB,
+        },
+        processing_metadata_uri: job.processing_metadata_uri()?,
+    };
+    // A document this service built from values it holds, so it serializes.
+    ::serde_json::to_string(&detail).ok()
+}
+
+/// The document a completed job reports in `statusDetails`, in the recorded member order.
+#[derive(Debug, ::serde::Serialize)]
+struct ProcessingStatusDetail {
+    #[serde(rename = "documentProcessing")]
+    document_processing: DocumentProcessing,
+    #[serde(rename = "processingMetadataUri")]
+    processing_metadata_uri: String,
+}
+
+/// How much of a job's input it processed, as the recorded `documentProcessing` member
+/// states it.
+#[derive(Debug, ::serde::Serialize)]
+struct DocumentProcessing {
+    total: u64,
+    processed: u64,
+}
 
 impl PatientInsightsJob {
     /// The delivery this job's completion will make: the objects it writes and where they
@@ -694,15 +737,15 @@ impl PatientInsightsJob {
                 })
     }
 
-    /// Record what this delivery established about the job's output object.
+    /// Record what this delivery established about the job's output objects.
     ///
-    /// A delivery whose object the store TOOK is MADE: the object is now where the job says
-    /// it is, the terminal success status the clock already applied stands, and
-    /// `statusDetails` states what that object does not carry
-    /// ([`INSIGHTS_NOT_GENERATED_DETAIL`]), so a caller polling the job learns that this
-    /// emulator generated no insights without fetching it. One the store REFUSED makes the
-    /// job `FAILED` and clears the output location: a job whose output object is not where
-    /// it would report it did not succeed.
+    /// A delivery whose objects the store TOOK is MADE: each object is now where the job
+    /// says it is and the terminal success status the clock already applied stands, with the
+    /// `statusDetails` that transition stated ([`processing_status_detail`]) left exactly as
+    /// it was — the delivery confirms that report rather than replacing it. One the store
+    /// REFUSED makes the job `FAILED`, restates `statusDetails` as that failure and clears
+    /// the output location: a job whose output object is not where it would report it did
+    /// not succeed.
     ///
     /// One NOTHING answered establishes nothing about the write, so it is left OWED rather
     /// than marked made: the next read of this job makes it, which is what keeps the object
@@ -721,7 +764,6 @@ impl PatientInsightsJob {
             delivery.state = DeliveryState::Done;
         }
         if stored {
-            self.status_details = Some(INSIGHTS_NOT_GENERATED_DETAIL.to_string());
             return;
         }
         self.status = JobStatus::Failed;

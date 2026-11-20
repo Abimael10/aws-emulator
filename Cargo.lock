@@ -12608,6 +12608,7 @@ dependencies = [
  "http",
  "percent-encoding",
  "regex",
+ "serde",
  "serde_json",
  "service-com-amazonaws-healthlake-healthlake",
  "service-com-amazonaws-s3-amazons3",

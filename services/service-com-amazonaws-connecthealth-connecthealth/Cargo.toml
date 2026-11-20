@@ -24,6 +24,10 @@ tokio = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
+# Renders the document-processing report a completed patient insights job states in
+# `statusDetails` through a serialized struct, so its members travel in the order the
+# recorded document carries them (`src/state/insights_run.rs`).
+serde = { workspace = true }
 tracing = { workspace = true }
 # SHA-256 over a sequence number and the clock: the id-minting digest behind every
 # `domainId` / `subscriptionId` this service hands out.

@@ -101,7 +101,8 @@
 //! them. What the summary carries is bounded
 //! by what this emulator can establish — it runs no clinical summarisation model, so the
 //! document names the patient and the kind of summary asked for and STATES that no insights
-//! were generated, which the job also reports in `statusDetails`. Every member around it is
+//! were generated. What the job reports in `statusDetails` is the document-processing
+//! report of the run. Every member around it is
 //! read out of the stored record — the identifiers, the timestamps and the status
 //! transitions.
 //!

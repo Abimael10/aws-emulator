@@ -18,13 +18,18 @@
 //!    `ResourceNotFoundException`.
 //! 3. The STATUS a get reports is the one the clock has moved the job to — never zero
 //!    milliseconds after the start, and terminal once it is terminal; a job that ran to
-//!    completion reports its output location under the path the start configured.
+//!    completion reports the per-patient summary OBJECT it wrote under the path the start
+//!    configured, and the document-processing report of that run in `statusDetails`.
 //! 4. `clientToken` is an `@idempotencyToken`, which is a rule about how an SDK FILLS
 //!    that member and not a promise that the service deduplicates on it: every accepted
 //!    start mints its own job, whatever token it carries and however many times that
 //!    token has been presented before.
 //! 5. Every value of the modelled `JobStatus` enum is projected out of state, including
 //!    the ones this emulator's own lifecycle does not reach.
+//! 6. The identifiers and instants the pair reports have the FORM the model and the
+//!    recorded wire give them: a minted `jobId` is the hyphenated 8-4-4-4-12 UUID form,
+//!    and `creationTime` / `updatedTime` are `@timestampFormat("date-time")`, so they
+//!    travel as RFC 3339 strings an SDK date-time reader parses.
 //!
 //! The constraints asserted here are the model's own
 //! (`smithy_query(query="closure", operation="GetPatientInsightsJob")`), quoted beside
@@ -49,6 +54,10 @@ use crate::domain_subscription_lifecycle::{error_code, string_at, Emulator};
 
 /// `JobId`: `@length 1..36`, with no pattern.
 const JOB_ID_LEN: (usize, usize) = (1, 36);
+/// The UUID form a minted `jobId` takes — RECORDED behaviour, the same form the sibling
+/// identifier of this service (`ScribeSessionId`, whose modelled pattern IS that form)
+/// carries: hexadecimal digits in 8-4-4-4-12 groups.
+const UUID_GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
 /// `PatientInsightsEncounterContext$encounterReason`: `@length 1..256`, pattern
 /// `^[a-zA-Z0-9 .,-]+$`.
 const ENCOUNTER_REASON_LEN: (usize, usize) = (1, 256);
@@ -74,6 +83,35 @@ fn member(case: &str, body: &Value, name: &str) -> Value {
     body.get(name)
         .cloned()
         .unwrap_or_else(|| panic!("case {case:?}: member {name} must be present in {body}"))
+}
+
+/// Whether `job_id` is the [`UUID_GROUPS`] form — matched field by field, rather than with
+/// a regex engine (the sibling suites in this workspace do the same).
+fn is_uuid_form(job_id: &str) -> bool {
+    let groups: Vec<&str> = job_id.split('-').collect();
+    groups.len() == UUID_GROUPS.len()
+        && groups.iter().map(|group| group.len()).eq(UUID_GROUPS)
+        && groups
+            .iter()
+            .all(|group| group.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// The instant a modelled `@timestampFormat("date-time")` member names, read the way an
+/// SDK deserializer generated for one reads it: the member is an RFC 3339 STRING on the
+/// wire, never the epoch-seconds number this protocol defaults to for a format-less
+/// timestamp.
+fn date_time_at(case: &str, body: &Value, name: &str) -> ::aws_smithy_types::DateTime {
+    let value = member(case, body, name);
+    let text = value.as_str().unwrap_or_else(|| {
+        panic!(
+            "case {case:?}: {name} is modelled @timestampFormat(\"date-time\"), so it must \
+             be an RFC 3339 string rather than the protocol's epoch number, got {value}"
+        )
+    });
+    ::aws_smithy_types::DateTime::from_str(text, ::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|error| {
+            panic!("case {case:?}: {name} = {text:?} must parse as an RFC 3339 date-time: {error}")
+        })
 }
 
 /// Whether `arn` is the `JobArn` of `job_id` under `domain_id`, as the modelled pattern
@@ -332,6 +370,13 @@ async fn a_started_job_is_persisted_and_read_back_member_for_member() {
             job_id.len()
         );
         assert!(
+            is_uuid_form(&job_id),
+            "case {case:?}: a minted jobId must be the {}-character 8-4-4-4-12 UUID form, \
+             got {job_id:?} ({} characters)",
+            JOB_ID_LEN.1,
+            job_id.chars().count()
+        );
+        assert!(
             minted.insert(job_id.clone()),
             "case {case:?}: every start must mint a fresh jobId, got the reused {job_id:?}"
         );
@@ -341,6 +386,9 @@ async fn a_started_job_is_persisted_and_read_back_member_for_member() {
             "case {case:?}: expected the JobArn of {job_id} under {domain_id}, got {job_arn:?}"
         );
         let creation_time = member(case, &started, "creationTime");
+        // The start's own `creationTime` is modelled `@timestampFormat("date-time")`, so it
+        // is an RFC 3339 string an SDK date-time reader parses.
+        let created_at = date_time_at(case, &started, "creationTime");
 
         let fetched = get_job(&emulator, case, &domain_id, &job_id).await;
         assert_eq!(
@@ -358,6 +406,13 @@ async fn a_started_job_is_persisted_and_read_back_member_for_member() {
             creation_time,
             "case {case:?}: the reader must report the instant the start recorded, got {fetched}"
         );
+        // And the reader's two timestamp members are date-time strings too, naming the same
+        // instant the start reported.
+        assert_eq!(
+            date_time_at(case, &fetched, "creationTime"),
+            created_at,
+            "case {case:?}: the reader must report the instant the start recorded, got {fetched}"
+        );
         // Nothing has transitioned yet: the span the clock owes is never zero, so a
         // caller reading straight after the start still sees the submitted job, whose
         // last change IS its creation.
@@ -370,6 +425,12 @@ async fn a_started_job_is_persisted_and_read_back_member_for_member() {
         assert_eq!(
             member(case, &fetched, "updatedTime"),
             creation_time,
+            "case {case:?}: a job that has not transitioned was last updated when it was \
+             created, got {fetched}"
+        );
+        assert_eq!(
+            date_time_at(case, &fetched, "updatedTime"),
+            created_at,
             "case {case:?}: a job that has not transitioned was last updated when it was \
              created, got {fetched}"
         );
@@ -411,6 +472,7 @@ async fn the_clock_moves_a_submitted_job_to_the_modelled_success_status() {
     let body = minimal_body();
     let started = start_job(&emulator, "lifecycle", &domain_id, &body).await;
     let job_id = string_at(&started, "jobId");
+    let patient_id = string_at(&body["patientContext"], "patientId");
     let creation_time = member("lifecycle", &started, "creationTime");
 
     // Zero milliseconds after the start: still SUBMITTED.
@@ -449,7 +511,11 @@ async fn the_clock_moves_a_submitted_job_to_the_modelled_success_status() {
         "SUCCEEDED",
         "a job that ran to completion must end in the modelled success status, got {done}"
     );
+    // Where the output of THIS job's patient went, spelled out here rather than read back
+    // off the service: the configured path, the job this service minted, the patient it ran
+    // for, and the summary document's own name.
     let configured = string_at(&body["outputDataConfig"], "s3OutputPath");
+    let prefix = format!("{}/{job_id}/{}", configured.trim_end_matches('/'), patient_id);
     assert_eq!(
         member("two spans in", &done, "insightsOutput"),
         json!({
@@ -462,6 +528,21 @@ async fn the_clock_moves_a_submitted_job_to_the_modelled_success_status() {
             .expect("the configured path leaves room for the object location"),
         }),
         "a completed job must report its summary object under the configured path, got {done}"
+    );
+    // And what it reports about the run: the document-processing report, whose keys are
+    // fixed and whose values are this job's own — the one patient record this job
+    // summarised, and the metadata object sitting beside the summary. Spelled out here
+    // rather than read back off the service.
+    let detail: Value = ::serde_json::from_str(&string_at(&done, "statusDetails"))
+        .unwrap_or_else(|error| panic!("statusDetails must be a JSON document: {error}, {done}"));
+    assert_eq!(
+        detail,
+        json!({
+            "documentProcessing": { "total": 1, "processed": 1 },
+            "processingMetadataUri": format!("{prefix}/processing-metadata.json"),
+        }),
+        "a completed job must report the patient record it processed and where its \
+         processing metadata went, got {done}"
     );
     assert_ne!(
         member("two spans in", &done, "updatedTime"),
@@ -795,4 +876,93 @@ async fn a_domain_at_the_job_ceiling_refuses_a_further_start() {
         detail.contains(&MAX_PATIENT_INSIGHTS_JOBS_PER_DOMAIN.to_string()),
         "the refusal must name the ceiling it enforced, got {detail:?}"
     );
+}
+
+/// RULE on the SCHEMA the two responses are serialized against: a member the model marks
+/// `@timestampFormat("date-time")` reports that format and a member the model marks with
+/// none reports none — which is what makes the codec write a string for the first kind and
+/// the protocol's own epoch number for the rest.
+///
+/// This also pins the two hand-written output schemas (see the note in
+/// `src/ops/types/start_patient_insights_job_types.rs`) against the model: every member's
+/// wire name and index, in the order
+/// `smithy_query(query="operation",operation="StartPatientInsightsJob,GetPatientInsightsJob")`
+/// lists them. The members that are not timestamps are the control rows: they must report
+/// NO format, so the assertion is about the trait rather than about every member schema.
+#[test]
+fn the_job_pairs_output_schemas_match_the_model_member_for_member() {
+    use ::aws_smithy_schema::traits::TimestampFormat;
+    use service_com_amazonaws_connecthealth_connecthealth::ops::types::{
+        GET_PATIENT_INSIGHTS_JOB_OUTPUT_SCHEMA, START_PATIENT_INSIGHTS_JOB_OUTPUT_SCHEMA,
+    };
+
+    // (wire name, whether the model marks the member @timestampFormat("date-time")).
+    let start: &[(&str, bool)] = &[("jobArn", false), ("jobId", false), ("creationTime", true)];
+    let get: &[(&str, bool)] = &[
+        ("jobId", false),
+        ("jobArn", false),
+        ("jobStatus", false),
+        ("creationTime", true),
+        ("updatedTime", true),
+        ("insightsOutput", false),
+        ("statusDetails", false),
+        ("patientContext", false),
+        ("insightsContext", false),
+        ("encounterContext", false),
+        ("userContext", false),
+        ("inputDataConfig", false),
+        ("outputDataConfig", false),
+    ];
+
+    for (shape, schema, expected) in [
+        (
+            "StartPatientInsightsJobResponse",
+            START_PATIENT_INSIGHTS_JOB_OUTPUT_SCHEMA,
+            start,
+        ),
+        (
+            "GetPatientInsightsJobResponse",
+            GET_PATIENT_INSIGHTS_JOB_OUTPUT_SCHEMA,
+            get,
+        ),
+    ] {
+        // Read off the structure's own schema rather than off the member constants, so a
+        // member left out of it is caught too.
+        let named: Vec<Option<&str>> = schema
+            .members()
+            .iter()
+            .map(|member| member.member_name())
+            .collect();
+        let wanted: Vec<Option<&str>> = expected.iter().map(|(name, _)| Some(*name)).collect();
+        assert_eq!(
+            named, wanted,
+            "case {shape:?}: the schema must name every modelled member in the model's \
+             order, got {named:?}"
+        );
+
+        for (index, (name, is_date_time)) in expected.iter().enumerate() {
+            let member = schema.members()[index];
+            assert_eq!(
+                member.member_index(),
+                Some(index),
+                "case {shape:?}/{name:?}: the member must sit at the model's index {index}, \
+                 got {:?}",
+                member.member_index()
+            );
+            let format = member.timestamp_format().map(|trait_| trait_.format());
+            match is_date_time {
+                true => assert!(
+                    matches!(format, Some(TimestampFormat::DateTime)),
+                    "case {shape:?}/{name:?}: the model marks this member \
+                     @timestampFormat(\"date-time\"), so its schema must carry that format, \
+                     got {format:?}"
+                ),
+                false => assert!(
+                    format.is_none(),
+                    "case {shape:?}/{name:?}: the model gives this member no \
+                     @timestampFormat, got {format:?}"
+                ),
+            }
+        }
+    }
 }

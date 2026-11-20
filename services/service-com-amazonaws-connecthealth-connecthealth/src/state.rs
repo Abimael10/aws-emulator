@@ -614,7 +614,8 @@ pub struct PatientInsightsJob {
     pub arn: String,
     pub status: JobStatus,
     /// The text reported for the CURRENT status; `None` while there is nothing to say
-    /// about it.
+    /// about it. A job that ran to completion reports the document-processing report of
+    /// that run ([`processing_status_detail`]).
     pub status_details: Option<String>,
     /// Where this job's insights were written: the SUMMARY object under the output path
     /// the start configured, derived once by [`patient_insights_output_uri`] when the job
@@ -628,11 +629,11 @@ pub struct PatientInsightsJob {
     /// When the next status transition the clock owes becomes due; `None` once the job is
     /// in a terminal status and owes none.
     pub next_transition_at: Option<SystemTime>,
-    /// The delivery this job's completion makes — the output object it writes into the
+    /// The delivery this job's completion makes — the output objects it writes into the
     /// location the start configured — or `None` for a job with no output location to
     /// write to. The terminal status moves WITH that delivery
     /// ([`InsightsDelivery`], [`deliver_job_output`]), so no read reports a job
-    /// successful before its output object is where the job says it is.
+    /// successful before its output objects are where the job says they are.
     pub output_delivery: Option<InsightsDelivery>,
     /// The parameters the start persisted, reported back by the reader.
     pub spec: PatientInsightsJobSpec,
@@ -680,14 +681,15 @@ impl PatientInsightsJob {
     /// rather than the instant somebody happened to look, so the record reads the same
     /// however late the first read comes.
     ///
-    /// Completing is what fills [`Self::insights_output`]: the location is this job's own
-    /// ([`Self::output_location`]), so the member the reader answers with is read out of
-    /// the record rather than recomputed per read. It is also what leaves the job's
-    /// DELIVERY due — the output object it writes at exactly that location
+    /// Completing is what fills [`Self::insights_output`] and [`Self::status_details`]: the
+    /// location is this job's own ([`Self::output_location`]) and the detail is the
+    /// document-processing report of the run that produced it
+    /// ([`processing_status_detail`]), so both members the reader answers with are read out
+    /// of the record rather than recomputed per read. It is also what leaves the job's
+    /// DELIVERY due — the objects it writes at exactly those locations
     /// ([`deliver_job_output`], which the job's own reader makes before it answers, so a
-    /// caller polling the job to completion finds that object). A delivery the object
-    /// store refuses takes the job to `FAILED`, and one it takes leaves the job stating in
-    /// `statusDetails` what that object does not carry
+    /// caller polling the job to completion finds them). A delivery the object store
+    /// refuses takes the job to `FAILED` and restates `statusDetails` as that failure
     /// ([`PatientInsightsJob::settle_delivery`]).
     fn apply_due_transitions(&mut self, now: SystemTime) {
         while let Some(due) = self.next_transition_at.filter(|due| *due <= now) {
@@ -699,6 +701,7 @@ impl PatientInsightsJob {
                 JobStatus::InProgress => {
                     self.status = JobStatus::Succeeded;
                     self.insights_output = self.output_location();
+                    self.status_details = processing_status_detail(self);
                     self.next_transition_at = None;
                 }
                 // A terminal status owes nothing; a due instant left on one is dropped
@@ -1108,13 +1111,18 @@ impl ComAmazonawsConnecthealthConnecthealthState {
         }
     }
 
-    /// Mint a `jobId` unused within `domain_id`: 32 hex characters, which is inside the
-    /// modelled `JobId` bound of 1..36 and inside the `[-a-zA-Z0-9_/.]+` segment the
-    /// `JobArn` pattern allows for a job.
+    /// Mint a `jobId` unused within `domain_id`: the UUID form ([`mint_uuid`]), which is 36
+    /// characters — the maximum of the modelled `JobId` bound of 1..36 — and inside the
+    /// `[-a-zA-Z0-9_/.]+` segment the `JobArn` pattern allows for a job.
+    ///
+    /// RECORDED behaviour: the model constrains the id by length alone, and the id this
+    /// service hands out is the UUID form AWS mints one in, the same form the sibling
+    /// identifier of this service (`ScribeSessionId`, whose modelled pattern IS that form)
+    /// takes.
     pub fn mint_patient_insights_job_id(&mut self, domain_id: &str) -> String {
         loop {
             let seq = self.next_seq();
-            let candidate = mint_id("", 32, seq);
+            let candidate = mint_uuid(seq);
             let taken = self
                 .domains
                 .get(domain_id)
@@ -1125,26 +1133,16 @@ impl ComAmazonawsConnecthealthConnecthealthState {
         }
     }
 
-    /// Mint the `requestId` a response reports for ONE call: 32 hex characters in the
-    /// hyphenated 8-4-4-4-12 form AWS request ids take, which is 36 characters and so
-    /// inside the modelled `RequestId` bound of 1..256.
+    /// Mint the `requestId` a response reports for ONE call: the UUID form
+    /// ([`mint_uuid`]), which is 36 characters and so inside the modelled `RequestId` bound
+    /// of 1..256.
     ///
     /// Per CALL, not per resource: it identifies the request, so it is minted fresh on
     /// every call and stored on nothing. The digest is the one every id this service
     /// mints comes from, so two calls of one process cannot share an id.
     pub fn mint_request_id(&mut self) -> String {
         let seq = self.next_seq();
-        let body = mint_id("", 32, seq);
-        // Hyphenated by walking the digest, so the form never depends on an index being
-        // inside it: the separators go where the 8-4-4-4-12 grouping puts them.
-        let mut request_id = String::with_capacity(36);
-        for (index, digit) in body.chars().enumerate() {
-            if matches!(index, 8 | 12 | 16 | 20) {
-                request_id.push('-');
-            }
-            request_id.push(digit);
-        }
-        request_id
+        mint_uuid(seq)
     }
 
     /// Mint the id of the Identity Center application this service creates for a
@@ -1403,6 +1401,26 @@ impl ComAmazonawsConnecthealthConnecthealthState {
             .get_mut(subscription_id)
             .filter(|subscription| subscription.is_live())
     }
+}
+
+/// Mint an identifier in the UUID form: the 16 digest bytes [`mint_id`] builds an id from,
+/// rendered as a version-4 UUID through the workspace's ONE UUID rendering
+/// ([`service_common::uuid_from_random_bytes`]), which writes the version and variant bits
+/// and the group boundaries — so this service spells out neither.
+///
+/// The unpredictability is this module's own, as that helper documents: the bytes are the
+/// digest every id of this service comes from (the caller's sequence number, this process
+/// and the current instant), so two calls of one process cannot mint the same id.
+fn mint_uuid(seq: u64) -> String {
+    // 32 hex digits are exactly the 16 bytes a UUID carries.
+    let digest = mint_id("", 32, seq);
+    let bytes: [u8; 16] = ::hex::decode(&digest)
+        .ok()
+        .and_then(|decoded| decoded.try_into().ok())
+        // The digest is hex this service just produced, so it decodes; a body that somehow
+        // did not would mint from zeroes rather than panic on a request path.
+        .unwrap_or_default();
+    ::service_common::uuid_from_random_bytes(bytes)
 }
 
 /// Mint an id: `prefix` followed by `body_len` characters of a SHA-256 digest over the

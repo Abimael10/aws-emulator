@@ -17,6 +17,9 @@
 //!    at all rather than one past that bound.
 //! 3. The location is a STORED property of the job: two reads report the same `uri`, and
 //!    two jobs sharing one configured output path report different ones.
+//! 4. A completed job reports the document-processing report of its run in
+//!    `statusDetails`: the keys are fixed, the counts are the patient record it processed,
+//!    and the processing-metadata location sits beside the summary.
 //!
 //! The harness (`Emulator`, `error_code`, `string_at`), the two routes, the reader and
 //! the minimal request body are the sibling suites': one way of driving this service,
@@ -31,7 +34,7 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 
 use service_com_amazonaws_connecthealth_connecthealth::state::{
-    MAX_S3_URI_LEN, SUMMARY_OBJECT_NAME,
+    MAX_S3_URI_LEN, PROCESSING_METADATA_OBJECT_NAME, SUMMARY_OBJECT_NAME,
 };
 
 use crate::domain_subscription_lifecycle::{error_code, string_at, Emulator};
@@ -241,16 +244,40 @@ async fn a_completed_job_reports_its_output_under_the_configured_path() {
                 "case {case:?}: a terminal job must read the same every time, got {again}"
             );
 
-            // Nothing answered the output write in this assembly — it mounts no object
-            // store — so the delivery the job's completion owes is still owed and there is
-            // nothing to report about its status. The suite that DOES mount one
-            // (`patient_insights_job_output_delivery`) is where the stored objects and the
-            // detail a made delivery states are asserted.
-            assert!(
-                fetched.get("statusDetails").is_none(),
-                "case {case:?}: a job whose output write nothing answered has no status \
-                 detail, got {fetched}"
-            );
+            // What the completed run reports about itself: the document-processing report,
+            // whose keys are fixed and whose values are this job's own — the one patient
+            // record it summarised, and the metadata object beside the summary. It is the
+            // TRANSITION that states this, so it is reported in this assembly too, which
+            // mounts no object store: the suite that DOES mount one
+            // (`patient_insights_job_output_delivery`) is where the stored objects are
+            // asserted. A row with no room for an object location has nothing to state.
+            match room {
+                true => {
+                    let detail: Value =
+                        ::serde_json::from_str(&string_at(&fetched, "statusDetails"))
+                            .unwrap_or_else(|error| {
+                                panic!("case {case:?}: statusDetails must be a JSON document: \
+                                     {error}, got {fetched}")
+                            });
+                    assert_eq!(
+                        detail,
+                        json!({
+                            "documentProcessing": { "total": 1, "processed": 1 },
+                            "processingMetadataUri": format!(
+                                "{configured}/{job_id}/{MINIMAL_PATIENT_ID}/\
+                                 {PROCESSING_METADATA_OBJECT_NAME}"
+                            ),
+                        }),
+                        "case {case:?}: a completed job must report the patient record it \
+                         processed and where its processing metadata went, got {fetched}"
+                    );
+                }
+                false => assert!(
+                    fetched.get("statusDetails").is_none(),
+                    "case {case:?}: a job with no object location to report has no status \
+                     detail either, got {fetched}"
+                ),
+            }
         }
         if configured_has_room(path, &ids[0], MINIMAL_PATIENT_ID, SUMMARY_OBJECT_NAME) {
             assert_ne!(

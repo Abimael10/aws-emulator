@@ -22,7 +22,7 @@
 //!    pair of jobs of every row that has room reports two different locations.
 //!
 //! The harness (`Emulator`, `error_code`, `string_at`), the route, the reader, the
-//! request body, the `S3Uri` check, the wait and the room rule are the sibling suites':
+//! request body, the `S3Uri` check, the poll and the room rule are the sibling suites':
 //! one way of driving this service, not two.
 //!
 //! The constraints asserted here are the model's own

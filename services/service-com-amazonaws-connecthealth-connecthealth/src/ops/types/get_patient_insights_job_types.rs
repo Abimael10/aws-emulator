@@ -18,7 +18,22 @@ pub struct GetPatientInsightsJobInput {
     pub job_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.connecthealth#GetPatientInsightsJobResponse")]
+/// `GetPatientInsightsJobResponse`, with its schema written out instead of derived.
+///
+/// WHY it is not `#[smithy_macros::smithy(shape = ...)]` like the input beside it:
+/// `creationTime` and `updatedTime` both carry `@timestampFormat("date-time")`
+/// (`smithy_query(query="operation",operation="GetPatientInsightsJob",model_path="services/service-com-amazonaws-connecthealth-connecthealth/smithy-model/com-amazonaws-connecthealth-connecthealth.json")`
+/// reports `"timestampFormat": "date-time"` on both), which the derive drops — see the note
+/// on `StartPatientInsightsJobOutput` in `super::start_patient_insights_job_types` for the
+/// whole statement, including why this service corrects the two timestamps per member
+/// rather than at the protocol seam.
+///
+/// The member schemas below are the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types, plus the `date-time` format the model declares. The
+/// constraint traits the derive also captures are deliberately NOT reproduced (the
+/// validating walk reads an operation's `INPUT_SCHEMA` only), and neither is a
+/// `DeserializableStruct` impl: this shape is an operation OUTPUT, which the server only
+/// ever serializes.
 #[derive(Debug, Clone, Default)]
 pub struct GetPatientInsightsJobOutput {
     pub job_id: String,
@@ -34,6 +49,169 @@ pub struct GetPatientInsightsJobOutput {
     pub user_context: UserContext,
     pub input_data_config: InputDataConfig,
     pub output_data_config: OutputDataConfig,
+}
+
+/// One member schema of [`GetPatientInsightsJobOutput`], at `index` in the model's member
+/// list — stated once so the thirteen below cannot spell the shape id or the namespace
+/// differently.
+const fn get_patient_insights_job_member(
+    shape_id: &'static str,
+    name: &'static str,
+    shape_type: ::aws_smithy_schema::ShapeType,
+    index: usize,
+) -> ::aws_smithy_schema::Schema {
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(shape_id, "com.amazonaws.connecthealth", name),
+        shape_type,
+        name,
+        index,
+    )
+}
+
+impl GetPatientInsightsJobOutput {
+    const M_JOB_ID: ::aws_smithy_schema::Schema = get_patient_insights_job_member(
+        "com.amazonaws.connecthealth#GetPatientInsightsJobResponse$jobId",
+        "jobId",
+        ::aws_smithy_schema::ShapeType::String,
+        0,
+    );
+    const M_JOB_ARN: ::aws_smithy_schema::Schema = get_patient_insights_job_member(
+        "com.amazonaws.connecthealth#GetPatientInsightsJobResponse$jobArn",
+        "jobArn",
+        ::aws_smithy_schema::ShapeType::String,
+        1,
+    );
+    /// `jobStatus` targets the `JobStatus` enum, which is string-encoded on the wire — the
+    /// derive classifies an enum member as a string too.
+    const M_JOB_STATUS: ::aws_smithy_schema::Schema = get_patient_insights_job_member(
+        "com.amazonaws.connecthealth#GetPatientInsightsJobResponse$jobStatus",
+        "jobStatus",
+        ::aws_smithy_schema::ShapeType::String,
+        2,
+    );
+    /// `@timestampFormat("date-time")`. THE reason this schema is hand-written.
+    const M_CREATION_TIME: ::aws_smithy_schema::Schema = get_patient_insights_job_member(
+        "com.amazonaws.connecthealth#GetPatientInsightsJobResponse$creationTime",
+        "creationTime",
+        ::aws_smithy_schema::ShapeType::Timestamp,
+        3,
+    )
+    .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    /// `@timestampFormat("date-time")`, as `creationTime` above.
+    const M_UPDATED_TIME: ::aws_smithy_schema::Schema = get_patient_insights_job_member(
+        "com.amazonaws.connecthealth#GetPatientInsightsJobResponse$updatedTime",
+        "updatedTime",
+        ::aws_smithy_schema::ShapeType::Timestamp,
+        4,
+    )
+    .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    const M_INSIGHTS_OUTPUT: ::aws_smithy_schema::Schema = get_patient_insights_job_member(
+        "com.amazonaws.connecthealth#GetPatientInsightsJobResponse$insightsOutput",
+        "insightsOutput",
+        ::aws_smithy_schema::ShapeType::Structure,
+        5,
+    );
+    const M_STATUS_DETAILS: ::aws_smithy_schema::Schema = get_patient_insights_job_member(
+        "com.amazonaws.connecthealth#GetPatientInsightsJobResponse$statusDetails",
+        "statusDetails",
+        ::aws_smithy_schema::ShapeType::String,
+        6,
+    );
+    const M_PATIENT_CONTEXT: ::aws_smithy_schema::Schema = get_patient_insights_job_member(
+        "com.amazonaws.connecthealth#GetPatientInsightsJobResponse$patientContext",
+        "patientContext",
+        ::aws_smithy_schema::ShapeType::Structure,
+        7,
+    );
+    const M_INSIGHTS_CONTEXT: ::aws_smithy_schema::Schema = get_patient_insights_job_member(
+        "com.amazonaws.connecthealth#GetPatientInsightsJobResponse$insightsContext",
+        "insightsContext",
+        ::aws_smithy_schema::ShapeType::Structure,
+        8,
+    );
+    const M_ENCOUNTER_CONTEXT: ::aws_smithy_schema::Schema = get_patient_insights_job_member(
+        "com.amazonaws.connecthealth#GetPatientInsightsJobResponse$encounterContext",
+        "encounterContext",
+        ::aws_smithy_schema::ShapeType::Structure,
+        9,
+    );
+    const M_USER_CONTEXT: ::aws_smithy_schema::Schema = get_patient_insights_job_member(
+        "com.amazonaws.connecthealth#GetPatientInsightsJobResponse$userContext",
+        "userContext",
+        ::aws_smithy_schema::ShapeType::Structure,
+        10,
+    );
+    const M_INPUT_DATA_CONFIG: ::aws_smithy_schema::Schema = get_patient_insights_job_member(
+        "com.amazonaws.connecthealth#GetPatientInsightsJobResponse$inputDataConfig",
+        "inputDataConfig",
+        ::aws_smithy_schema::ShapeType::Structure,
+        11,
+    );
+    const M_OUTPUT_DATA_CONFIG: ::aws_smithy_schema::Schema = get_patient_insights_job_member(
+        "com.amazonaws.connecthealth#GetPatientInsightsJobResponse$outputDataConfig",
+        "outputDataConfig",
+        ::aws_smithy_schema::ShapeType::Structure,
+        12,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.connecthealth#GetPatientInsightsJobResponse",
+            "com.amazonaws.connecthealth",
+            "GetPatientInsightsJobResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_JOB_ID,
+            &Self::M_JOB_ARN,
+            &Self::M_JOB_STATUS,
+            &Self::M_CREATION_TIME,
+            &Self::M_UPDATED_TIME,
+            &Self::M_INSIGHTS_OUTPUT,
+            &Self::M_STATUS_DETAILS,
+            &Self::M_PATIENT_CONTEXT,
+            &Self::M_INSIGHTS_CONTEXT,
+            &Self::M_ENCOUNTER_CONTEXT,
+            &Self::M_USER_CONTEXT,
+            &Self::M_INPUT_DATA_CONFIG,
+            &Self::M_OUTPUT_DATA_CONFIG,
+        ],
+    );
+}
+
+pub static GET_PATIENT_INSIGHTS_JOB_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &GetPatientInsightsJobOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for GetPatientInsightsJobOutput {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        // A `@required` member is written unconditionally (the derive's `is_option` split
+        // puts a non-`Option` field on that branch); an optional one only when it is set.
+        serializer.write_string(&Self::M_JOB_ID, self.job_id.as_str())?;
+        serializer.write_string(&Self::M_JOB_ARN, self.job_arn.as_str())?;
+        serializer.write_string(&Self::M_JOB_STATUS, self.job_status.as_str())?;
+        if let Some(value) = self.creation_time.as_ref() {
+            serializer.write_timestamp(&Self::M_CREATION_TIME, value)?;
+        }
+        if let Some(value) = self.updated_time.as_ref() {
+            serializer.write_timestamp(&Self::M_UPDATED_TIME, value)?;
+        }
+        if let Some(value) = self.insights_output.as_ref() {
+            serializer.write_struct(&Self::M_INSIGHTS_OUTPUT, value)?;
+        }
+        if let Some(value) = self.status_details.as_ref() {
+            serializer.write_string(&Self::M_STATUS_DETAILS, value.as_str())?;
+        }
+        serializer.write_struct(&Self::M_PATIENT_CONTEXT, &self.patient_context)?;
+        serializer.write_struct(&Self::M_INSIGHTS_CONTEXT, &self.insights_context)?;
+        serializer.write_struct(&Self::M_ENCOUNTER_CONTEXT, &self.encounter_context)?;
+        serializer.write_struct(&Self::M_USER_CONTEXT, &self.user_context)?;
+        serializer.write_struct(&Self::M_INPUT_DATA_CONFIG, &self.input_data_config)?;
+        serializer.write_struct(&Self::M_OUTPUT_DATA_CONFIG, &self.output_data_config)?;
+        Ok(())
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.connecthealth#InsightsOutput")]
