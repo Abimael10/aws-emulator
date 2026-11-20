@@ -312,6 +312,12 @@ async fn job_in_vault_once_listed(
 
 /// The one execution of the machine at `machine_arn`, waited for and then read in its terminal
 /// status.
+///
+/// The wait is for the FIRING, which falls on the schedule's own instants — a `cron` row's first
+/// firing is the first instant its expression names, so a row can have to wait out the rest of
+/// the minute it was deployed in before anything starts. That is what the shared
+/// [`executions_once_started`] already waits for, under the same generous [`RUN_BUDGET`] every
+/// other wait in this chain uses.
 async fn terminal_execution(
     router: &MultiServiceRouter,
     case: &str,

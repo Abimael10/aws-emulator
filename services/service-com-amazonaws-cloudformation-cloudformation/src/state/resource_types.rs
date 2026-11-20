@@ -412,6 +412,7 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::CodeArtifact::Domain",
     "AWS::CodeArtifact::Repository",
     // AWS CodeBuild
+    "AWS::CodeBuild::Fleet",
     "AWS::CodeBuild::Project",
     "AWS::CodeBuild::ReportGroup",
     "AWS::CodeBuild::SourceCredential",

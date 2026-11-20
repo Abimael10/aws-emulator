@@ -791,6 +791,13 @@ pub(super) enum Provisioner {
     /// removes by that name — so the project a stack reports created is one every
     /// CodeBuild read and every `StartBuild` resolves.
     CodeBuildProject,
+    /// `AWS::CodeBuild::Fleet`: a compute fleet of that same service, which `CreateFleet`
+    /// creates under the name the template decided and `DeleteFleet` removes by the ARN
+    /// CodeBuild minted for it — so the fleet a stack reports created is one `ListFleets`
+    /// reports and `BatchGetFleets` resolves ([`codebuild_fleets`]). "Ref returns the fleet
+    /// ARN", which that create answers and which carries the `<name>:<id>` identifier only
+    /// CodeBuild produces.
+    CodeBuildFleet,
     EcsCluster,
     /// `AWS::ECS::Service`: the service Amazon ECS's own `CreateService` creates on the
     /// cluster the declaration names, `UpdateService` changes and `DeleteService` removes.
@@ -1462,6 +1469,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         CODEPIPELINE_WEBHOOK => Some(Provisioner::CodePipelineWebhook),
         CODEBUILD_REPORT_GROUP => Some(Provisioner::CodeBuildReportGroup),
         CODEBUILD_PROJECT => Some(Provisioner::CodeBuildProject),
+        codebuild_fleets::CODEBUILD_FLEET => Some(Provisioner::CodeBuildFleet),
         ECS_CLUSTER => Some(Provisioner::EcsCluster),
         ECS_SERVICE => Some(Provisioner::EcsService),
         ecs_capacity_providers::ECS_CAPACITY_PROVIDER => Some(Provisioner::EcsCapacityProvider),
@@ -2351,6 +2359,12 @@ impl Provisioner {
             // CloudFormation gives it beside the ones the declaration asks for.
             Self::CodeBuildProject => {
                 create_codebuild_project(ctx, region, resource, propagated).await
+            }
+            // `AWS::CodeBuild::Fleet` publishes `Tags`, and `CreateFleet` takes a tag list
+            // of its own, so a fleet a stack creates carries the tags CloudFormation gives
+            // it beside the ones the declaration asks for.
+            Self::CodeBuildFleet => {
+                create_codebuild_fleet(ctx, region, resource, propagated).await
             }
             // `AWS::SES::ConfigurationSet` publishes `Name`, `DeliveryOptions`,
             // `ReputationOptions`, `SendingOptions`, `SuppressionOptions`,
@@ -3404,6 +3418,9 @@ impl Provisioner {
             Self::CodeBuildProject => {
                 delete_codebuild_project(ctx, region, physical_resource_id).await
             }
+            // A fleet is addressed by the ARN CodeBuild keyed it by, which this resource's
+            // own record carries as its physical id.
+            Self::CodeBuildFleet => delete_codebuild_fleet(ctx, region, resource).await,
             Self::SesConfigurationSet => {
                 delete_ses_configuration_set(ctx, region, physical_resource_id).await
             }
@@ -3801,6 +3818,12 @@ pub(super) mod memorydb_groups;
 /// that API, created by `PutWebhook` and reported by `ListWebhooks`, so its create, delete
 /// and read are their own concern.
 mod codepipeline_webhooks;
+/// The AWS CodeBuild COMPUTE FLEET arms: the fleet an `AWS::CodeBuild::Fleet` declares,
+/// created in CodeBuild itself so the ARN the stack publishes is one `ListFleets` reports.
+/// Visible to the rest of this service's state because the type's own NAME lives here, beside
+/// the arms that provision it, and the naming rules and the identity catalogue key their
+/// entries for it by that name.
+pub(in crate::state) mod codebuild_fleets;
 /// The per-type READ arm of every type here — what the owning service reports a
 /// provisioned resource's configuration to be now, which is what drift detection compares
 /// a stack's expected configuration against. One `impl Provisioner` of its own, so this
@@ -3812,6 +3835,7 @@ mod reported_configuration;
 /// types' own NAMES live here, beside the arms that provision them, and the naming rules and
 /// the return-value catalogue key their entries for them by those names.
 pub(in crate::state) mod emr_resources;
+use codebuild_fleets::*;
 /// The catalogue entries of the Amazon Bedrock AgentCore family, beside that family's own
 /// resource-type NAMES. Visible to the rest of this service's state for the reason
 /// [`emr_resources`]' are: the registry of recognised types, the return-value catalogue and

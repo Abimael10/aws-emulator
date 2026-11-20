@@ -15,6 +15,15 @@ Issue-Commit: cfbb9a1e24eec7d8c98af7d6e9e62a0e8013f018
 
 > _Split out of `issues/things-that-now-work/20261025T062553Z-codebuild-6-further-divergences-startbuildbatch-takes-no-input.md`, whose causes 1, 2 and 6 are fixed. This report carries the replay keys that do NOT pass, re-filed here so they are not recorded as working. Everything below is what that fix established about them; a later fixer starts from here rather than from scratch._
 
+> _RESOLVED, in part: cause 1 (batch builds) and cause 3 (`AWS::CodeBuild::Fleet`) now
+> replay as fixed — CloudFormation recognises that resource type and PROVISIONS it through
+> CodeBuild's own `CreateFleet`, so `ListFleets` and `BatchGetFleets` answer for the ARN the
+> stack publishes, and `DeleteFleet` releases it when the stack goes
+> (`services/service-com-amazonaws-cloudformation-cloudformation/src/state/provisioner/codebuild_fleets.rs`).
+> Cause 2 (sandbox command executions) is still blocked on the contained in-process shell
+> described below and is re-filed, with its five replay keys, as
+> `issues/things-that-do-not-work/20261027T101500Z-codebuild-sandbox-command-executions-never-run-the-command.md`._
+
 ## Operation
 StartCommandExecution
 

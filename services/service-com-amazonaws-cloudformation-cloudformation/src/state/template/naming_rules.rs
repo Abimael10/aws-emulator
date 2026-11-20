@@ -56,6 +56,13 @@ pub(super) fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // admitted, and it starts with a letter because a stack name does — but may be
         // longer than.
         CODEBUILD_PROJECT => rules(150, Characters::AsGenerated),
+        // CodeBuild `CreateFleet.name`: `FleetName`, `@length(min: 2, max: 128)` with pattern
+        // `^[A-Za-z0-9][A-Za-z0-9\-_]{1,127}$` (CodeBuild's own Smithy model), which a
+        // generated name is already inside — letters, digits and the hyphen are all admitted,
+        // and it starts with a letter because a stack name does — but may be longer than.
+        crate::state::provisioner::codebuild_fleets::CODEBUILD_FLEET => {
+            rules(128, Characters::AsGenerated)
+        }
         // CodeCommit `CreateRepository.repositoryName`: `RepositoryName`,
         // `@length(min: 1, max: 100)` with pattern `^[\w\.-]+$` (CodeCommit's own Smithy
         // model), which a generated name is already inside — letters, digits and the hyphen

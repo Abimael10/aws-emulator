@@ -534,6 +534,9 @@ impl Provisioner {
             Self::CodeBuildProject => {
                 describe_codebuild_project(ctx, region, physical_resource_id).await
             }
+            // Read back out of the batch read of fleets, by the same handle the delete
+            // addresses the fleet by.
+            Self::CodeBuildFleet => describe_codebuild_fleet(ctx, region, resource).await,
             Self::SesConfigurationSet => {
                 describe_ses_configuration_set(ctx, region, physical_resource_id).await
             }

@@ -1091,6 +1091,13 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // only what the group is created under, which is why it stays the type's name
         // property while the identifier in force is the one that service answered with.
         || resource_type == XRAY_GROUP
+        // An AWS CodeBuild COMPUTE FLEET is one more: "Ref returns the fleet ARN", and that
+        // ARN carries the `<name>:<id>` identifier CodeBuild draws per fleet (`Fleet$id`),
+        // which no naming rule here could compute. The NAME a declaration states is only what
+        // the fleet is created under, which is why it stays the type's name property while the
+        // identifier in force is the one that service answered with — the position
+        // [`XRAY_GROUP`] is in.
+        || resource_type == crate::state::provisioner::codebuild_fleets::CODEBUILD_FLEET
         // An Amazon Cognito identity pool is one more: `CreateIdentityPool` takes only the
         // pool's NAME — "a string that you provide" — and answers the `IdentityPoolId` it
         // minted (modelled `@pattern ^[\w-]+:[0-9a-f-]+$`, the `REGION:GUID` form), and "Ref
