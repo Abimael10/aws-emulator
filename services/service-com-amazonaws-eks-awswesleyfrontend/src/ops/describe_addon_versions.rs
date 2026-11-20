@@ -9,7 +9,13 @@
 //! This is a REPORTING operation: it writes nothing. The catalog is a
 //! PUBLICATION, not per-account data — "Describes the versions for an add-on" —
 //! so it is seeded once and every member of a reported `AddonInfo` comes from
-//! that seed. Which builds are OFFERED is derived per request from the clock:
+//! that seed, with ONE exception: a Marketplace add-on's
+//! `marketplaceInformation.productUrl` is an address a SUBSCRIBER FOLLOWS, so it
+//! so it names the endpoint this emulator serves its whole surface at followed by
+//! the path this emulator serves that listing's page on
+//! (`crate::state::addon_marketplace_listing`) — the listing's own product id and
+//! the unit that address carries are the seed's. Which builds are OFFERED is
+//! derived per request from the clock:
 //! a build is published alongside the Kubernetes version it supports, so a build
 //! for a Kubernetes version the calendar has not released yet is not reported,
 //! exactly as `DescribeClusterVersions` does not report that version.
@@ -176,7 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DescribeAddonVersionsError::from(DescribeAddonVersionsErrorModeled::ServerException(
@@ -200,6 +206,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // changes nothing.
         let _ = (&input.max_results, &input.next_token);
 
+        // Where a Marketplace add-on's listing is published: the one endpoint this
+        // emulator serves its whole surface at, because
+        // `marketplaceInformation.productUrl` is an address a subscriber opens and
+        // this emulator answers on no AWS Marketplace host (see
+        // `crate::state::addon_marketplace_listing`).
+        let listing_base = crate::state::announced_listing_base(ctx);
+
         let requested_name = input.addon_name.as_deref();
         let kubernetes_version = input.kubernetes_version.as_deref();
         let types = input.types.unwrap_or_default();
@@ -218,7 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|addon| keeps(&types, &addon.addon_type))
             .filter(|addon| keeps(&publishers, &addon.publisher))
             .filter(|addon| keeps(&owners, &addon.owner))
-            .filter_map(|addon| describe(addon, kubernetes_version, now))
+            .filter_map(|addon| describe(addon, kubernetes_version, now, &listing_base))
             .collect();
 
         Ok(DescribeAddonVersionsOutput {
@@ -239,7 +252,8 @@ fn describe(
     addon: &AddonCatalogRecord,
     kubernetes_version: Option<&str>,
     now: SystemTime,
+    listing_base: &str,
 ) -> Option<AddonInfo> {
     let versions = addon.to_addon_version_infos(now, kubernetes_version);
-    (!versions.is_empty()).then(|| addon.to_addon_info(versions))
+    (!versions.is_empty()).then(|| addon.to_addon_info(versions, listing_base))
 }

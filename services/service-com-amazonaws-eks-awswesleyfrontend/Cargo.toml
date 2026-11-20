@@ -104,6 +104,12 @@ http-body-util = { version = "0.1", default-features = false }
 # endpoint beside it. `tokio-rustls` drives that handshake on the core's connection.
 rustls = { workspace = true }
 tokio-rustls = "0.26"
+# `html-escape`: the AWS Marketplace listing page this emulator serves at the
+# address `DescribeAddonVersions` publishes as a Marketplace add-on's
+# `marketplaceInformation.productUrl` (`src/state/addon_marketplace_listing.rs`)
+# writes the catalog's own strings into an HTML document, so each one is escaped
+# with the crate the sibling services that serve such a page already use.
+html-escape = "0.2"
 
 [dev-dependencies]
 # The clock-owed `CREATING` -> `ACTIVE` test waits with `tokio::time::sleep`, so

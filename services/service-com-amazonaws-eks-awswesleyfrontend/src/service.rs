@@ -58,6 +58,7 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+pub mod addon_marketplace_listing_page;
 pub mod authorization;
 pub mod body_binding;
 pub mod lenient_json;
@@ -117,6 +118,14 @@ pub fn read_input<T: DeserializableStruct>(
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The shared engine, for the one address this service serves that no modelled
+    /// operation describes: the page of a Marketplace add-on's listing, which
+    /// `DescribeAddonVersions` publishes as that add-on's
+    /// `marketplaceInformation.productUrl` (see
+    /// [`addon_marketplace_listing_page`]). That answer is taken outside the
+    /// modelled dispatch, which is the one place this service is handed no
+    /// operation to read the store through.
+    engine: Arc<Eng>,
     /// What this service does with a request before a handler runs, in the order
     /// it does it: the IAM authorization decision, then the pre-dispatch
     /// contracts, then the modelled operation (see [`request_pipeline`]). Held on
@@ -140,8 +149,9 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
-            pipeline: request_pipeline::RequestPipeline::new(engine),
+            pipeline: request_pipeline::RequestPipeline::new(Arc::clone(&engine)),
             protocol: lenient_json::LenientRestJson::new(),
+            engine,
         }
     }
 }
@@ -159,8 +169,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // name. Edit this for anything the model does not express — a signing
         // name shared by several services, or access-key-id-based routing.
         match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
+            Some(key) if key == self.entry.identity().signing_name() => true,
+            // And a fetch of the page a Marketplace add-on's listing publishes: the
+            // product address this service hands back in
+            // `marketplaceInformation.productUrl` is opened by whatever browser, probe
+            // or test holds it — anonymously, with no credential scope naming this
+            // service, only the path this service itself minted under the plane segment
+            // that is this service's alone. See [`addon_marketplace_listing_page`]:
+            // without this the router answers `404 UnknownService` for an address this
+            // service published.
+            _ => addon_marketplace_listing_page::claimed(parts),
         }
     }
 
@@ -275,8 +293,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
         // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
         // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // The ONE address this service serves that no modelled operation describes:
+        // the page of a Marketplace add-on's listing, which `DescribeAddonVersions`
+        // publishes as that add-on's `marketplaceInformation.productUrl` for a
+        // subscriber to follow. It is answered here because the router consults this
+        // seam before it authenticates anything, which is how AWS serves the AWS
+        // Marketplace's own host — unauthenticated, and as a web page rather than a
+        // modelled API call.
+        addon_marketplace_listing_page::answer(&*self.engine, req)
     }
 
     fn override_framework_error(

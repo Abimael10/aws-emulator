@@ -43,7 +43,7 @@ use service_com_amazonaws_eks_awswesleyfrontend::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::marketplace_listing_reference_data::{
-    is_marketplace_product_id, marketplace_listing_path,
+    is_marketplace_product_id, marketplace_listing_unit,
 };
 use crate::wire::{call, emulator, encode_label, error_code, Answer};
 
@@ -209,8 +209,9 @@ async fn marketplace_addons_are_published_with_their_listing_and_builds() {
             "case {case}: expected the listing's Marketplace product id, got {listing:?}"
         );
         assert!(
-            marketplace_listing_path(&product_url).is_some(),
-            "case {case}: expected a Marketplace listing address, got {product_url:?}"
+            marketplace_listing_unit(&product_url).is_some(),
+            "case {case}: expected the address this emulator serves the listing at, \
+             got {product_url:?}"
         );
         assert!(
             listings.insert(product_id.clone()),

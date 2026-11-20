@@ -1470,7 +1470,13 @@ pub struct AddonCatalogRecord {
     /// The AWS Marketplace listing this add-on is subscribed through, for an
     /// add-on owned by [`ADDON_OWNER_MARKETPLACE`]; `None` for an Amazon
     /// EKS-managed one, which is not listed on Marketplace at all.
-    pub marketplace_information: Option<MarketplaceInformation>,
+    ///
+    /// The listing's own published data ([`AddonMarketplaceListing`]). The
+    /// `marketplaceInformation` a listing is REPORTED as carries the ADDRESS this
+    /// emulator serves that listing at beside it, which depends on the endpoint
+    /// the reading request arrived on and so is composed per read
+    /// ([`Self::to_addon_info`]) rather than stored.
+    pub marketplace_listing: Option<AddonMarketplaceListing>,
     /// The service accounts the add-on runs as, with the managed policies
     /// recommended for each; see [`AddonCatalogSeed::pod_identity`].
     pub pod_identity: Vec<(String, Vec<String>)>,
@@ -1502,14 +1508,30 @@ impl AddonCatalogRecord {
     }
 
     /// This add-on as the modelled `AddonInfo` shape, reporting `versions`.
-    pub fn to_addon_info(&self, versions: Vec<AddonVersionInfo>) -> AddonInfo {
+    ///
+    /// `listing_base` is the endpoint this emulator is reached at
+    /// ([`announced_listing_base`]), which is where a Marketplace add-on's
+    /// `marketplaceInformation.productUrl` leads: the address a subscriber follows
+    /// has to lead back to this emulator, so it is composed from the base the
+    /// reading request arrived on rather than copied from the AWS Marketplace host
+    /// nothing here answers (see [`addon_marketplace_listing_url`]). An add-on on
+    /// no listing reports no `marketplaceInformation` at all.
+    pub fn to_addon_info(&self, versions: Vec<AddonVersionInfo>, listing_base: &str) -> AddonInfo {
         AddonInfo {
             addon_name: Some(self.addon_name.clone()),
             r#type: Some(self.addon_type.clone()),
             addon_versions: Some(versions),
             publisher: Some(self.publisher.clone()),
             owner: Some(self.owner.clone()),
-            marketplace_information: self.marketplace_information.clone(),
+            marketplace_information: self.marketplace_listing.as_ref().map(|listing| {
+                MarketplaceInformation {
+                    product_id: Some(listing.product_id.clone()),
+                    product_url: Some(addon_marketplace_listing_url(
+                        listing_base,
+                        &listing.listing_unit,
+                    )),
+                }
+            }),
             default_namespace: Some(self.default_namespace.clone()),
         }
     }
@@ -2177,33 +2199,29 @@ pub(super) fn pod_identity_first_build(
         .map(|(_, _, release)| *release)
 }
 
-/// Where AWS Marketplace publishes the listings this catalog's Marketplace
-/// add-ons are subscribed through: the address every published
-/// `marketplaceInformation.productUrl` starts with, which each listing's own
-/// path ([`ADDON_MARKETPLACE_LISTINGS`]) completes.
-pub const MARKETPLACE_LISTING_ADDRESS: &str = "https://aws.amazon.com/marketplace/pp";
-
 /// The AWS Marketplace listing each Marketplace add-on is subscribed through, as
-/// `(the add-on's name, the listing's product id, the listing's path under
-/// [`MARKETPLACE_LISTING_ADDRESS`])`.
+/// `(the add-on's name, the listing's product id, the key the listing's page is
+/// addressed by)`.
 ///
 /// `MarketplaceInformation` is "The product ID from the Amazon Web Services
-/// Marketplace" and "The product URL from the Amazon Web Services Marketplace":
-/// both identify the LISTING, so both are reference data the catalog carries per
-/// listing — as the Kubernetes release calendar carries its dates
-/// ([`VERSION_CALENDAR`]) — and neither is computed from the name the add-on is
-/// installed by. A subscriber follows them to the seller's listing to accept its
-/// EULA, which is the step that gates installing a Marketplace add-on, so a
-/// product id or an address this table does not carry leads to no listing at
-/// all.
+/// Marketplace" and "The product URL from the Amazon Web Services Marketplace".
+/// The product id IDENTIFIES the listing, so it is reference data this table
+/// carries per listing — as the Kubernetes release calendar carries its dates
+/// ([`VERSION_CALENDAR`]) — in the `prod-` form an AWS Marketplace product
+/// identifier takes, and it is not computed from the name the add-on is installed
+/// by. The product URL is an ADDRESS a subscriber FOLLOWS to accept the seller's
+/// terms, so it leads back to this emulator and is composed per read
+/// ([`addon_marketplace_listing_url`]) rather than carried here: an address on a
+/// host this emulator does not answer on is one a client can render but never
+/// dereference.
 ///
-/// Source: the AWS Marketplace listings Amazon EKS publishes as add-ons. A
-/// product id is the `prod-` form an AWS Marketplace product identifier takes,
-/// and a listing's path is the one that listing is published at: the product view
-/// of the listing (`/prodview-<id>`), or the stock-keeping unit it is sold under
-/// (`?sku=<sku>`) for the sellers whose listings are published that way — the
-/// rebuild listings of one seller are published alongside each other, so they
-/// share the form.
+/// The third column is therefore THIS EMULATOR'S OWN key for the listing — the
+/// stock-keeping-unit segment its published page is addressed by, written in the
+/// lower-case alphanumeric form a Marketplace stock-keeping unit takes, one per
+/// listing and carrying nothing of the add-on's name or of the product id above.
+/// It is not recorded AWS data and names no address of AWS's: the page it addresses
+/// is the one this service serves
+/// ([`ComAmazonawsEksAwswesleyfrontendState::addon_marketplace_listing_page`]).
 ///
 /// Rows are in add-on NAME order, like [`ADDON_CATALOG`]. EVERY add-on the
 /// catalog publishes as owned by [`ADDON_OWNER_MARKETPLACE`] has a row here —
@@ -2211,129 +2229,153 @@ pub const MARKETPLACE_LISTING_ADDRESS: &str = "https://aws.amazon.com/marketplac
 /// listing a subscriber cannot reach — and an add-on Amazon EKS publishes itself
 /// has none, because it is not sold on AWS Marketplace at all.
 pub(super) const ADDON_MARKETPLACE_LISTINGS: &[(&str, &str, &str)] = &[
-    ("accuknox_kubearmor", "prod-6qf2hbwtzmk3d", "/prodview-vd4xqk2nhbyzg"),
-    ("akuity_akuity-agent", "prod-tn4sxcbr7jvqw", "/prodview-hs3rm7qvzb4dk"),
+    (
+        "accuknox_kubearmor",
+        "prod-6qf2hbwtzmk3d",
+        "d4hnqz7wmvbt3xkrl9jpsc26f",
+    ),
+    (
+        "akuity_akuity-agent",
+        "prod-tn4sxcbr7jvqw",
+        "g5mptz2wqvbn8xkrh4jlsd37c",
+    ),
     (
         "chainguard_aws-ebs-csi-driver-fips",
         "prod-zd93lpmkcqrvh",
-        "?sku=qf3m7kzrv5twbn28dhjxla9cs",
+        "qf3m7kzrv5twbn28dhjxla9cs",
     ),
     (
         "chainguard_aws-efs-csi-driver-fips",
         "prod-butapz3xfcrww",
-        "?sku=ev1rr6qr2ftfm4qjeljc5och7",
+        "ev1rr6qr2ftfm4qjeljc5och7",
     ),
     (
         "chainguard_cert-manager-fips",
         "prod-5wkjqtbnzmrdh",
-        "?sku=k3wfp9bzrmxq7nsvj5dah28lc",
+        "k3wfp9bzrmxq7nsvj5dah28lc",
     ),
     (
         "chainguard_coredns-fips",
         "prod-hm2qvzcrxtbkl",
-        "?sku=h8dmv2sxhlzb6rnp4kcfjw73t",
+        "h8dmv2sxhlzb6rnp4kcfjw73t",
     ),
     (
         "chainguard_external-dns-fips",
         "prod-pq8wrzbmvkjdt",
-        "?sku=m5xtqwrcz3hjb8nlpdv6fs49k",
+        "m5xtqwrcz3hjb8nlpdv6fs49k",
     ),
     (
         "chainguard_kube-proxy-fips",
         "prod-j7bqzmwrvtxkc",
-        "?sku=t7pfhzjqwm4xbs2dnvkl9c38r",
+        "t7pfhzjqwm4xbs2dnvkl9c38r",
     ),
     (
         "chainguard_kube-state-metrics-fips",
         "prod-cv6zqnbmrwkts",
-        "?sku=b4ncxqtwmzv8rjhl5psdk723f",
+        "b4ncxqtwmzv8rjhl5psdk723f",
     ),
     (
         "chainguard_metrics-server-fips",
         "prod-sw4mqzbrtvxkn",
-        "?sku=w9jmrnvqtz3hxb6klcpds42f8",
+        "w9jmrnvqtz3hxb6klcpds42f8",
     ),
     (
         "chainguard_prometheus-node-exporter-fips",
         "prod-xp3kqzrmbwtvj",
-        "?sku=f2vhqmzjwt7xnbr5kldcs986p",
+        "f2vhqmzjwt7xnbr5kldcs986p",
     ),
     (
         "chainguard_vpc-cni-fips",
         "prod-vz9kqmrbtwxjn",
-        "?sku=r6qkmzvwht4xbjn7pldcs53f9",
+        "r6qkmzvwht4xbjn7pldcs53f9",
     ),
-    ("datadog_operator", "prod-2mdqkwzbrhtvx", "/prodview-7cmbqr3xz5hdw"),
+    (
+        "datadog_operator",
+        "prod-2mdqkwzbrhtvx",
+        "h6nqtz3wrvbm9xkpl5jfsd84b",
+    ),
     (
         "dynatrace_dynatrace-operator",
         "prod-9nbkwqzxrmvht",
-        "/prodview-m2zqk8hrvwx4b",
+        "j7prvz4wtbnm2xkql6hfsd95d",
     ),
     (
         "eg-innovations_eg-universal-agent-operator",
         "prod-f5tkwqzmxrhbv",
-        "/prodview-q4wnkz8rvmh2t",
+        "k8qsvz5wtbnm3xjrl7hfpd26g",
     ),
     (
         "haproxy-technologies_kubernetes-ingress-ee",
         "prod-8gxkwmqzthrbv",
-        "/prodview-b7zqkmw3xhv5n",
+        "l9rtwz6xubnm4yjpk8hgqd37h",
     ),
-    ("kong_konnect-ri", "prod-d6vkzmqwthxrb", "/prodview-d3nhqwzk7mv8x"),
-    ("kubecost_kubecost", "prod-r4jkzwqmthxbv", "/prodview-f5cmwjzqr2bhv"),
+    (
+        "kong_konnect-ri",
+        "prod-d6vkzmqwthxrb",
+        "m2svxz7yubnp5zjqk9hgrd48j",
+    ),
+    (
+        "kubecost_kubecost",
+        "prod-r4jkzwqmthxbv",
+        "n3twxz8zucnp6ajrl2hgsd59k",
+    ),
     (
         "netapp_trident-operator",
         "prod-g7nzkwqmbhtsx",
-        "/prodview-g8tvnrwqsz4jm",
+        "p4uxyz9bvdnq7bksm3jhtd62l",
     ),
     (
         "rafay-systems_rafay-operator",
         "prod-h3plmdcsbwrqz",
-        "/prodview-h6pbqlwxzrv7s",
+        "q5vyza2cwdnr8clsn4khud73m",
     ),
-    ("solo-io_istio-distro", "prod-j8clmdsbwrqzt", "/prodview-j4mcwqszvt9nb"),
+    (
+        "solo-io_istio-distro",
+        "prod-j8clmdsbwrqzt",
+        "r6wzab3dxenq9dmsp5lhvd84n",
+    ),
     (
         "splunk_splunk-otel-collector-chart",
         "prod-k2nvbshdlqwrm",
-        "/prodview-k9fdqwrzlb2mv",
+        "s7xabc4eyfnr2ensq6mhwd95p",
     ),
     (
         "stormforge_optimize-live",
         "prod-l9vbshdnqwrmt",
-        "/prodview-l2sjqnwzrv8hk",
+        "t8ybcd5fzgns3fotr7nhxd26q",
     ),
     (
         "teleport_teleport-kube-agent",
         "prod-n5dbshvlqwrmt",
-        "/prodview-n7hwqrzmv5bjc",
+        "u9zcde6gahnt4gpus8phyd37r",
     ),
     (
         "tetrate-io_istio-distro",
         "prod-p6hbsdvlqwrnm",
-        "/prodview-p3cqzwmrv6lnt",
+        "v2adef7hbjnu5hqvt9qhzd48s",
     ),
     (
         "upbound_universal-crossplane",
         "prod-q4sbhdvlwrnmt",
-        "/prodview-r5bqzwkmv4hjs",
+        "w3befg8jcknv6irwu2rhad59t",
     ),
     (
         "upwind-security_upwind-operator",
         "prod-t8bshdvlwrnmq",
-        "/prodview-s8njqwzmv2rbf",
+        "x4cfgh9kdlnw7jsxv3shbd62u",
     ),
 ];
 
-/// The AWS Marketplace listing `addon_name` is subscribed through, as the
-/// modelled `MarketplaceInformation` — or `None` for an add-on
-/// [`ADDON_MARKETPLACE_LISTINGS`] publishes no listing for.
-pub(super) fn marketplace_listing(addon_name: &str) -> Option<MarketplaceInformation> {
+/// The AWS Marketplace listing `addon_name` is subscribed through, as the catalog
+/// holds it — or `None` for an add-on [`ADDON_MARKETPLACE_LISTINGS`] publishes no
+/// listing for.
+pub(super) fn marketplace_listing(addon_name: &str) -> Option<AddonMarketplaceListing> {
     ADDON_MARKETPLACE_LISTINGS
         .iter()
         .find(|(listed, _, _)| *listed == addon_name)
-        .map(|(_, product_id, listing_path)| MarketplaceInformation {
-            product_id: Some((*product_id).to_string()),
-            product_url: Some(format!("{MARKETPLACE_LISTING_ADDRESS}{listing_path}")),
+        .map(|(_, product_id, listing_unit)| AddonMarketplaceListing {
+            product_id: (*product_id).to_string(),
+            listing_unit: (*listing_unit).to_string(),
         })
 }
 
@@ -2482,16 +2524,15 @@ pub(super) fn seed_addon_catalog() -> Vec<AddonCatalogRecord> {
                     .map(|required| (*required).to_string())
                     .collect(),
                 admission_webhook: seed.admission_webhook,
-                marketplace_information: (seed.owner == ADDON_OWNER_MARKETPLACE)
-                    .then(|| {
-                        marketplace_listing(seed.addon_name).unwrap_or_else(|| {
-                            panic!(
-                                "the add-on catalog sells {} through AWS Marketplace with no \
-                                 listing to subscribe through",
-                                seed.addon_name
-                            )
-                        })
-                    }),
+                marketplace_listing: (seed.owner == ADDON_OWNER_MARKETPLACE).then(|| {
+                    marketplace_listing(seed.addon_name).unwrap_or_else(|| {
+                        panic!(
+                            "the add-on catalog sells {} through AWS Marketplace with no \
+                             listing to subscribe through",
+                            seed.addon_name
+                        )
+                    })
+                }),
                 pod_identity: seed
                     .pod_identity
                     .iter()

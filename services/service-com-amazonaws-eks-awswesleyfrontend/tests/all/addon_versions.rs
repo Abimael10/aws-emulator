@@ -37,7 +37,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::addon_catalog_publication::schema_root;
 use crate::cluster_lifecycle::REGION;
 use crate::marketplace_listing_reference_data::{
-    is_marketplace_product_id, marketplace_listing_path,
+    is_marketplace_product_id, marketplace_listing_unit,
 };
 use crate::wire::{call, emulator, encode_label, error_code, Answer};
 
@@ -286,8 +286,9 @@ async fn the_published_catalog_is_reported_from_state() {
                 "case {case:?}: expected the listing's Marketplace product id, got {listing:?}"
             );
             assert!(
-                marketplace_listing_path(&string_member(listing, "productUrl")).is_some(),
-                "case {case:?}: expected the listing's Marketplace URL, got {listing:?}"
+                marketplace_listing_unit(&string_member(listing, "productUrl")).is_some(),
+                "case {case:?}: expected the address this emulator serves the listing at, \
+                 got {listing:?}"
             );
         } else {
             // Amazon EKS builds and publishes the add-ons it manages and the
