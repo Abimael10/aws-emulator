@@ -5,6 +5,12 @@
 //! Replaces the `ExecutionConfiguration` of one stored DataIntegrationAssociation, so
 //! `ListDataIntegrationAssociations` reports the configuration this call persisted.
 //!
+//! The association is addressed by a PAIR of identifiers — the data integration it
+//! belongs to and the association within it — so an identifier that resolves to nothing
+//! is reported as the association not being found, with both values the request sent
+//! ([`crate::state::data_integration_association_not_found`]), whichever of the two it
+//! was.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -152,32 +158,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Both identifiers are resolved before anything is written, and the association
         // only within the integration the request named: an association of another
-        // integration is not reachable through this one.
+        // integration is not reachable through this one. The resource this call addresses
+        // is the association, so BOTH not-found branches report the association and name
+        // both identifiers — a parent that names no stored integration means this
+        // association cannot be found either, not that the caller asked about the
+        // integration.
+        let not_found = || {
+            UpdateDataIntegrationAssociationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::data_integration_association_not_found(
+                        &input.data_integration_identifier,
+                        &input.data_integration_association_identifier,
+                    )),
+                },
+            )
+        };
         let integration_id = state
             .data_integration_id(&input.data_integration_identifier)
-            .ok_or_else(|| {
-                UpdateDataIntegrationAssociationErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::data_integration_not_found(
-                            &input.data_integration_identifier,
-                        )),
-                    },
-                )
-            })?;
+            .ok_or_else(not_found)?;
         let association_id = state
             .data_integration_association_id(
                 &integration_id,
                 &input.data_integration_association_identifier,
             )
-            .ok_or_else(|| {
-                UpdateDataIntegrationAssociationErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::data_integration_association_not_found(
-                            &input.data_integration_association_identifier,
-                        )),
-                    },
-                )
-            })?;
+            .ok_or_else(not_found)?;
 
         // The same rule the create applies, so the two cannot disagree about what a
         // usable `ExecutionConfiguration` is.

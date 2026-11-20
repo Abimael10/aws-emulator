@@ -131,6 +131,14 @@ pub const ADDRESSED_BY_NAME: &str = "name";
 /// What a resource addressed by an opaque `Identifier` is called in one.
 pub const ADDRESSED_BY_IDENTIFIER: &str = "identifier";
 
+/// What the PARENT identifier of a data integration association is called in the
+/// two-part not-found message of that association (see
+/// [`data_integration_association_not_found`]).
+pub const ADDRESSED_BY_DATA_INTEGRATION_NAME: &str = "DataIntegrationName";
+
+/// What the association's OWN identifier is called in the same message.
+pub const ADDRESSED_BY_DATA_INTEGRATION_ASSOCIATION_ID: &str = "DataIntegrationAssociationId";
+
 /// AppIntegrations' wording for a resource the request named and this account does not
 /// hold: the resource TYPE, how the request addressed it, and the value it sent —
 /// `"Could not find EventIntegration with name: demo."`,
@@ -158,13 +166,49 @@ pub fn application_not_found(identifier: &str) -> String {
     not_found_message(APPLICATION_RESOURCE, ADDRESSED_BY_IDENTIFIER, identifier)
 }
 
-/// [`not_found_message`] for the data integration association `identifier` the request
-/// named.
-pub fn data_integration_association_not_found(identifier: &str) -> String {
-    not_found_message(
+/// AppIntegrations' wording for a resource the request addressed by a PAIR of
+/// identifiers and this account does not hold: the resource TYPE, then each identifier
+/// named by the member it arrived on together with the value the request sent.
+///
+/// A resource a request addresses by naming both its parent and itself is reported with
+/// BOTH values, because either of the two can be the one that resolved to nothing and
+/// the single-identifier template ([`not_found_message`]) would drop the other from the
+/// diagnostic.
+pub fn not_found_message_for_pair(
+    resource_type: &str,
+    first: (&str, &str),
+    second: (&str, &str),
+) -> String {
+    let (first_label, first_value) = first;
+    let (second_label, second_value) = second;
+    format!(
+        "Could not find {resource_type} with {first_label}: {first_value} and \
+         {second_label}: {second_value}."
+    )
+}
+
+/// [`not_found_message_for_pair`] for the data integration association a request
+/// addressed by the two identifiers its path carries: the parent data integration and
+/// the association within it.
+///
+/// The association is the resource such a call addresses, so this one sentence reports
+/// it whichever of the two identifiers resolved to nothing — a parent that names no
+/// stored integration is not reported as a missing integration, because the request
+/// asked about the association.
+pub fn data_integration_association_not_found(
+    data_integration_identifier: &str,
+    data_integration_association_identifier: &str,
+) -> String {
+    not_found_message_for_pair(
         DATA_INTEGRATION_ASSOCIATION_RESOURCE,
-        ADDRESSED_BY_IDENTIFIER,
-        identifier,
+        (
+            ADDRESSED_BY_DATA_INTEGRATION_NAME,
+            data_integration_identifier,
+        ),
+        (
+            ADDRESSED_BY_DATA_INTEGRATION_ASSOCIATION_ID,
+            data_integration_association_identifier,
+        ),
     )
 }
 
@@ -581,6 +625,37 @@ pub fn execution_configuration_problem(config: &ExecutionConfiguration) -> Optio
         )),
         Some(_) => None,
     }
+}
+
+/// The class a failed validation of a data integration association is reported under in
+/// the message of the refused create.
+const ASSOCIATION_VALIDATION_FAILURE_CLASS: &str = "DATA_INTEGRATION_ASSOCIATION_VALIDATION_EXCEPTION";
+
+/// The reason that wrapped validation failure carries. Fixed text: the service reports
+/// the validation that declined the association, which is about reaching the data source
+/// of its integration and so names no member of the request, and it reports the same
+/// reason for every association it declines. It is reached ONLY for a request this
+/// service declines ([`execution_configuration_problem`]); an association this service
+/// can act on is still created.
+const ASSOCIATION_SOURCE_ACCESS_DENIED: &str = "Access Denied to S3 Bucket";
+
+/// How AppIntegrations refuses a `CreateDataIntegrationAssociation` it will not create
+/// the association for: the failure is reported AS A FAILURE OF THAT CREATE, naming the
+/// data integration the association would belong to, and the validation that declined it
+/// is wrapped into the sentence under the class that raised it.
+///
+/// The only part taken from the request is the data integration it names, resolved to the
+/// id this service minted for it; everything else is fixed, because the service reports
+/// the validation that declined the association rather than a complaint about a single
+/// request member (the member-level detail [`execution_configuration_problem`] computes
+/// goes to the operator's log instead). The model states no cross-member rule for an
+/// `ExecutionConfiguration`, so this refusal's wording is recorded behaviour.
+pub fn data_integration_association_not_created(data_integration_id: &str) -> String {
+    format!(
+        "Failed to create DataIntegrationAssociation for DataIntegration \
+         {data_integration_id}. {ASSOCIATION_VALIDATION_FAILURE_CLASS}: \
+         {ASSOCIATION_SOURCE_ACCESS_DENIED}"
+    )
 }
 
 /// The two values `ExecutionMode` accepts, from the model's enum

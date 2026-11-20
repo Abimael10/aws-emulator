@@ -922,3 +922,234 @@ async fn the_page_controls_of_the_association_listing_follow_their_published_bou
         );
     }
 }
+
+/// The sentence `CreateDataIntegrationAssociation` answers with for an association this
+/// service will not create: the CREATE reported as failed for the data integration the
+/// request named, with the validation that declined the association wrapped into it. The
+/// integration's minted id is the only part that varies.
+fn expected_create_refusal(data_integration_id: &str) -> String {
+    format!(
+        "Failed to create DataIntegrationAssociation for DataIntegration \
+         {data_integration_id}. DATA_INTEGRATION_ASSOCIATION_VALIDATION_EXCEPTION: \
+         Access Denied to S3 Bucket"
+    )
+}
+
+/// The sentence an association-scoped operation answers with when the association the
+/// request addressed cannot be resolved: both identifiers the request sent, each named by
+/// the member it arrived on.
+fn expected_association_not_found(integration: &str, association: &str) -> String {
+    format!(
+        "Could not find DataIntegrationAssociation with DataIntegrationName: \
+         {integration} and DataIntegrationAssociationId: {association}."
+    )
+}
+
+#[tokio::test]
+async fn a_declined_association_create_reports_the_failed_create_of_its_integration() {
+    let emulator = Emulator::new();
+    let kms_key = emulator.create_kms_key(REGION).await;
+
+    // Rows differ in HOW the requested association is one this service will not create:
+    // which block the named mode is missing, which block belongs to the other mode,
+    // whether both are present, and whether an on-demand window names instants at all.
+    // The row the issue recorded is only one of them.
+    let configurations: Vec<(&str, Value)> = vec![
+        (
+            "ON_DEMAND with no block at all",
+            json!({ "ExecutionMode": "ON_DEMAND" }),
+        ),
+        (
+            "SCHEDULED with no block at all",
+            json!({ "ExecutionMode": "SCHEDULED" }),
+        ),
+        (
+            "ON_DEMAND carrying the schedule block",
+            json!({
+                "ExecutionMode": "ON_DEMAND",
+                "ScheduleConfiguration": { "ScheduleExpression": "rate(1 hour)" },
+            }),
+        ),
+        (
+            "SCHEDULED carrying the on-demand block",
+            json!({
+                "ExecutionMode": "SCHEDULED",
+                "OnDemandConfiguration": { "StartTime": "1685400000000" },
+            }),
+        ),
+        (
+            "ON_DEMAND carrying both blocks",
+            json!({
+                "ExecutionMode": "ON_DEMAND",
+                "OnDemandConfiguration": { "StartTime": "1685400000000" },
+                "ScheduleConfiguration": { "ScheduleExpression": "rate(1 hour)" },
+            }),
+        ),
+        (
+            "a StartTime that is no epoch time",
+            json!({
+                "ExecutionMode": "ON_DEMAND",
+                "OnDemandConfiguration": { "StartTime": "yesterday" },
+            }),
+        ),
+        (
+            "an EndTime before its StartTime",
+            json!({
+                "ExecutionMode": "ON_DEMAND",
+                "OnDemandConfiguration": {
+                    "StartTime": "1685400000000",
+                    "EndTime": "1685300000000",
+                },
+            }),
+        ),
+    ];
+
+    for (index, (label, configuration)) in configurations.iter().enumerate() {
+        let (integration_id, integration_arn) =
+            create_integration(&emulator, &kms_key, &format!("declined-{index}")).await;
+        // The variable part is the id this service MINTED for the integration, so the
+        // same sentence comes back whichever identifier form the request addressed it by.
+        for (form, identifier) in [
+            ("by id", integration_id.clone()),
+            ("by arn", integration_arn.clone()),
+        ] {
+            let case = format!("{label} {form}");
+            let reply = associate(
+                &emulator,
+                &identifier,
+                json!({ "ExecutionConfiguration": configuration }),
+            )
+            .await;
+            assert_eq!(
+                reply.status, 400,
+                "case {case:?}: expected HTTP 400, got {} / {}",
+                reply.status, reply.body
+            );
+            assert_eq!(
+                reply.error_type, "InvalidRequestException",
+                "case {case:?}: expected InvalidRequestException, got {:?} / {}",
+                reply.error_type, reply.body
+            );
+            let expected = expected_create_refusal(&integration_id);
+            assert_eq!(
+                reply.message().as_deref(),
+                Some(expected.as_str()),
+                "case {case:?}: expected {expected:?}, got {:?}",
+                reply.message()
+            );
+            assert_eq!(
+                page_of(&list_associations(&emulator, &integration_id, "").await),
+                Vec::<Value>::new(),
+                "case {case:?}: a declined create must persist nothing"
+            );
+        }
+    }
+
+    // A configuration this service CAN act on is still created, so the refusal is about
+    // the association that was asked for and not about every create.
+    let (fresh_id, _) = create_integration(&emulator, &kms_key, "declined-none").await;
+    let accepted = associate(
+        &emulator,
+        &fresh_id,
+        json!({ "ExecutionConfiguration": execution_configuration("ON_DEMAND") }),
+    )
+    .await;
+    assert_eq!(
+        accepted.status, 200,
+        "case \"a configuration this service can act on\": expected HTTP 200, got {} / {}",
+        accepted.status, accepted.body
+    );
+}
+
+#[tokio::test]
+async fn an_update_reports_an_unresolvable_association_with_both_identifiers() {
+    let emulator = Emulator::new();
+    let kms_key = emulator.create_kms_key(REGION).await;
+
+    let (integration_id, integration_arn) =
+        create_integration(&emulator, &kms_key, "two.part-404").await;
+    let (other_id, _) = create_integration(&emulator, &kms_key, "two.part-404-other").await;
+    let other_association_id = associate(
+        &emulator,
+        &other_id,
+        json!({ "ExecutionConfiguration": execution_configuration("SCHEDULED") }),
+    )
+    .await
+    .string("DataIntegrationAssociationId")
+    .expect("the create reported an association id");
+
+    let unminted = "00000000-0000-0000-0000-000000000000".to_string();
+    // Rows differ in WHICH of the two identifiers resolves to nothing (the association,
+    // the parent integration, both), in the form each identifier takes (an id, an ARN,
+    // and both published bounds of `Identifier`'s len 1..255), and in one case the
+    // association exists but belongs to another integration. Every row must answer the
+    // same two-part sentence carrying the values the request sent.
+    let rows: Vec<(&str, String, String)> = vec![
+        (
+            "the association was not minted",
+            integration_id.clone(),
+            unminted.clone(),
+        ),
+        (
+            "the parent integration was not minted",
+            unminted.clone(),
+            other_association_id.clone(),
+        ),
+        ("neither identifier was minted", unminted.clone(), unminted),
+        (
+            "the association belongs to another integration",
+            integration_id.clone(),
+            other_association_id,
+        ),
+        (
+            "the parent is addressed by its ARN",
+            integration_arn.clone(),
+            "11111111-1111-1111-1111-111111111111".to_string(),
+        ),
+        (
+            "an association ARN this service never minted",
+            integration_id.clone(),
+            format!(
+                "arn:aws:app-integrations:{REGION}:{ACCOUNT}:data-integration-association/\
+                 {integration_id}/22222222-2222-2222-2222-222222222222"
+            ),
+        ),
+        (
+            "identifiers at the shortest published length",
+            "i".to_string(),
+            "a".to_string(),
+        ),
+        (
+            "identifiers at the longest published length",
+            "i".repeat(255),
+            "a".repeat(255),
+        ),
+    ];
+
+    for (label, integration, association) in &rows {
+        let reply = update_association(
+            &emulator,
+            integration,
+            association,
+            json!({ "ExecutionConfiguration": execution_configuration("ON_DEMAND") }),
+        )
+        .await;
+        assert_eq!(
+            reply.status, 404,
+            "case {label:?}: expected HTTP 404, got {} / {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_type, "ResourceNotFoundException",
+            "case {label:?}: expected ResourceNotFoundException, got {:?} / {}",
+            reply.error_type, reply.body
+        );
+        let expected = expected_association_not_found(integration, association);
+        assert_eq!(
+            reply.message().as_deref(),
+            Some(expected.as_str()),
+            "case {label:?}: expected {expected:?}, got {:?}",
+            reply.message()
+        );
+    }
+}

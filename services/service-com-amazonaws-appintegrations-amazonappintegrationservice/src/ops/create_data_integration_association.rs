@@ -6,6 +6,12 @@
 //! service mints its `Id` and `Arn` and stores everything the request carried, so
 //! `ListDataIntegrationAssociations` reports what this call persisted.
 //!
+//! An association this service will not create is refused as an invalid request (HTTP
+//! 400 `InvalidRequestException`) reporting the FAILED CREATE for the DataIntegration
+//! the request named, with the validation that declined the association wrapped into
+//! the sentence ([`crate::state::data_integration_association_not_created`]); nothing
+//! is persisted.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -238,16 +244,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // How the association executes is checked before anything is written, so a
-        // configuration this service could not act on leaves no association behind.
+        // configuration this service could not act on leaves no association behind. What
+        // the caller is told is the failure of the create as a whole — the association
+        // could not be validated for the data integration it would belong to (see
+        // [`crate::state::data_integration_association_not_created`]) — and the
+        // member-level detail the shared check computed is the operator's record of WHY
+        // this service declined it rather than part of the answer.
         if let Some(problem) = input
             .execution_configuration
             .as_ref()
             .and_then(crate::state::execution_configuration_problem)
         {
+            ::tracing::info!(
+                operation = Self::NAME,
+                data_integration_id = %integration_id,
+                outcome = "rejected",
+                reason = %problem,
+                "declined a DataIntegrationAssociation this service cannot act on"
+            );
             return Err(
                 CreateDataIntegrationAssociationErrorModeled::InvalidRequestException(
                     InvalidRequestException {
-                        message: Some(problem),
+                        message: Some(crate::state::data_integration_association_not_created(
+                            &integration_id,
+                        )),
                     },
                 )
                 .into(),
