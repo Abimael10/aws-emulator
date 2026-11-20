@@ -42,6 +42,17 @@ use service_com_amazonaws_iot_awsiotservice::state::{
 use service_com_amazonaws_iot_awsiotservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+/// `UpdateFleetMetric` — what a PARTIAL write of one metric records, how
+/// `expectedVersion` is checked against the record, and what a refused update leaves
+/// behind. It is driven through this suite's own create and reader, so what the update
+/// writes and what the read reports are compared against one emulator — which is why it
+/// is a child of this suite rather than a second suite beside it. The `#[path]` is what
+/// keeps it one: this crate's `tests/all.rs` declares the suites directly under
+/// `tests/all/`, and a module of a `#[path]`-declared file resolves next to that file
+/// unless it says otherwise.
+#[path = "fleet_metrics/update_configuration.rs"]
+mod update_configuration;
+
 /// The account id every emulated ARN carries (`emulator_server::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT_ID: &str = "000000000000";
 /// The region this suite signs for; the ARN assertions read it back.
