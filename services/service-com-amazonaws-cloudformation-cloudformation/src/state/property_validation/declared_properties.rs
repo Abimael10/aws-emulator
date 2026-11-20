@@ -20,7 +20,7 @@
 
 use ::serde_json::Value;
 
-use super::{properties_path, PropertyFailure, StoredResource};
+use super::{PropertyFailure, StoredResource};
 
 /// One resource type and the properties its schema states.
 #[derive(Debug, Clone, Copy)]
@@ -251,11 +251,11 @@ pub fn unsupported_property_reason(property: &str) -> String {
 /// The path THIS validation is applied at: the property itself, under the `Properties` of the
 /// resource that declared it.
 ///
-/// `OperationEvent$ValidationPath` is "the path within the resource where the validation was
-/// applied", and what was judged here is one member of the document rather than the document
-/// as a whole — the member is what the author has to take out — so the path names it.
+/// One member of the document is what was judged here — the member is what the author has to
+/// take out — so the path names it, through the one pointer-building rule of this stage
+/// ([`super::member_path`]).
 pub fn property_path(logical_id: &str, property: &str) -> String {
-    format!("{}/{property}", properties_path(logical_id))
+    super::member_path(logical_id, &[property])
 }
 
 #[cfg(test)]

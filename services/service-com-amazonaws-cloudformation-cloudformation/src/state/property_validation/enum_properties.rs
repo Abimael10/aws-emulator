@@ -26,6 +26,13 @@
 //! INDEX under the property it sits in, which is the form a recorded refusal of a list-valued
 //! property carries ([`element_path`]).
 //!
+//! Where the schema states the `enum` on a member NESTED inside a structured property, that
+//! member is what is judged: a schema's `enum` belongs to the property it is declared on
+//! wherever that property sits in the declaration, so the stage steps down to it through the
+//! members above it and reports the refusal at that member's own place — which is why a row
+//! names the CHAIN of members from the resource's property document down to the judged value
+//! ([`EnumProperty::property`]) rather than one property name.
+//!
 //! The catalogue is the same kind as the rest of that stage's: one row per (resource type,
 //! property) whose schema-stated value set this emulator knows, so a property no row covers
 //! is left to the service that owns the resource rather than guessed at — and a value that is
@@ -34,15 +41,18 @@
 
 use ::serde_json::Value;
 
-use super::{declared_properties::property_path, PropertyFailure, StoredResource};
+use super::{member_path, PropertyFailure, StoredResource};
 
 /// One property whose admitted values its type's registry schema states as an `enum`.
 #[derive(Debug, Clone, Copy)]
 pub struct EnumProperty {
     /// The resource type the property belongs to, as a template declares it.
     pub resource_type: &'static str,
-    /// The property's name, as a template spells it.
-    pub property: &'static str,
+    /// The chain of members leading from the resource's property document down to the
+    /// property the schema states the `enum` on, each spelled as a template spells it: one
+    /// name for a property of the resource itself, and the members stepped through for one
+    /// nested inside a structured property.
+    pub property: &'static [&'static str],
     /// The values the schema states, in the order it declares them — which is also the order
     /// a refusal lists them in, since what the author has to act on is the set as the schema
     /// publishes it.
@@ -84,40 +94,69 @@ pub const LAKEFORMATION_PERMISSIONS_VALUES: &[&str] = &[
 /// property. That is the set the schema validation holds a declaration to — a value outside
 /// it never reaches the owning service at all — and it is not always the whole of the enum
 /// that service's own API publishes today ([`LAKEFORMATION_PERMISSIONS_VALUES`] says where
-/// the two differ for the row below).
+/// the two differ for the rows below).
 ///
-/// The rows are the two permission lists an
+/// The first two rows are the permission lists an
 /// `AWS::LakeFormation::PrincipalPermissions` grants with: `Permissions`, "the permissions
 /// granted … on the resource", and `PermissionsWithGrantOption`, "indicates a list of the
 /// granted permissions that the principal may pass to other users" — each a `PermissionList`
 /// of Lake Formation's own `Permission` enum
-/// ([`LAKEFORMATION_PERMISSIONS_VALUES`]).
+/// ([`LAKEFORMATION_PERMISSIONS_VALUES`]). The third is the `MergeType` of an
+/// `AWS::AppSync::SourceApiAssociation`'s merge configuration
+/// ([`APPSYNC_MERGE_TYPE_VALUES`]), a member nested one level down in that property's
+/// structure.
 pub const ENUM_PROPERTIES: &[EnumProperty] = &[
     EnumProperty {
         resource_type:
             crate::state::provisioner::lake_formation_permissions::LAKEFORMATION_PRINCIPAL_PERMISSIONS,
-        property: "Permissions",
+        property: &["Permissions"],
         values: LAKEFORMATION_PERMISSIONS_VALUES,
     },
     EnumProperty {
         resource_type:
             crate::state::provisioner::lake_formation_permissions::LAKEFORMATION_PRINCIPAL_PERMISSIONS,
-        property: "PermissionsWithGrantOption",
+        property: &["PermissionsWithGrantOption"],
         values: LAKEFORMATION_PERMISSIONS_VALUES,
     },
+    // `AWS::AppSync::SourceApiAssociation`'s merge configuration carries which merging option
+    // the link is made under, and the schema states that member's `enum`: the value set is
+    // AppSync's own `MergeType` ([`APPSYNC_MERGE_TYPE_VALUES`]), and the member sits one level
+    // down, inside the `SourceApiAssociationConfig` structure.
+    EnumProperty {
+        resource_type: crate::state::template::APPSYNC_SOURCE_API_ASSOCIATION,
+        property: &["SourceApiAssociationConfig", "MergeType"],
+        values: APPSYNC_MERGE_TYPE_VALUES,
+    },
 ];
+
+/// The `enum` the registry schema of `AWS::AppSync::SourceApiAssociation` states for the
+/// `MergeType` of its merge configuration, in the order that schema states them.
+///
+/// These are the values of AppSync's own `MergeType` (`smithy_query(query="shape",
+/// shape="MergeType")` of the `appsync` model), the enum `SourceApiAssociationConfig$mergeType`
+/// targets: "valid merge types are MANUAL_MERGE (default) and AUTO_MERGE". The type's schema
+/// states them in the order below, which is the order a refusal lists the set back in.
+pub const APPSYNC_MERGE_TYPE_VALUES: &[&str] = &["AUTO_MERGE", "MANUAL_MERGE"];
 
 /// `Some(failure)` for a resource carrying a value outside the set its type's schema states
 /// for a property ([`ENUM_PROPERTIES`]) — the first such property in the order the catalogue
 /// states them, and within a list-valued one the first element outside the set; `None` for a
 /// type with no row, for a property the declaration does not carry, and for every value the
 /// schema admits.
+///
+/// A row's chain of members is walked by the ONE walker of this crate's state that steps a
+/// declaration's property document down a nested member path
+/// ([`crate::state::template::property_at`]), so a chain that runs into a value that is no
+/// object judges nothing — the same reading an absent member gets, since neither is a value of
+/// the set.
 pub(super) fn value_outside_its_enum(resource: &StoredResource) -> Option<PropertyFailure> {
     ENUM_PROPERTIES
         .iter()
         .filter(|row| row.resource_type == resource.resource_type)
         .find_map(|row| {
-            let (at, rejected) = judged_values(resource.properties.get(row.property))
+            let declared =
+                crate::state::template::property_at(&resource.properties, row.property);
+            let (at, rejected) = judged_values(declared)
                 .into_iter()
                 .find(|(_, value)| !row.values.contains(value))?;
             Some(PropertyFailure {
@@ -132,13 +171,12 @@ pub(super) fn value_outside_its_enum(resource: &StoredResource) -> Option<Proper
 /// The path the judged value sits at: the property itself where the declaration states a
 /// single value, and the ELEMENT of it where the declaration states a list.
 ///
-/// `OperationEvent$ValidationPath` is "the path within the resource where the validation was
-/// applied", and for a list-valued property what was judged is one element of it: the index
-/// is part of the path a refusal of such a property carries
-/// (`/Resources/<LogicalId>/Properties/<Property>/<index>`), since what the author has to act
-/// on is the element they wrote and not the list.
-fn element_path(logical_id: &str, property: &str, at: Option<usize>) -> String {
-    let path = property_path(logical_id, property);
+/// The pointer of the member chain is the ONE spelling of that rule
+/// ([`super::member_path`]); what this adds is a list-valued property's INDEX, because what
+/// was judged there is one element of it and that element is what the author has to act on
+/// rather than the list.
+fn element_path(logical_id: &str, property: &[&str], at: Option<usize>) -> String {
+    let path = member_path(logical_id, property);
     match at {
         Some(at) => format!("{path}/{at}"),
         None => path,
@@ -203,19 +241,29 @@ mod tests {
     const PRINCIPAL_PERMISSIONS: &str =
         crate::state::provisioner::lake_formation_permissions::LAKEFORMATION_PRINCIPAL_PERMISSIONS;
 
+    /// The type whose nested row the table below is also about.
+    const SOURCE_API_ASSOCIATION: &str = crate::state::template::APPSYNC_SOURCE_API_ASSOCIATION;
+
     /// One row of the table: the case, the type declared, its property document, and the
-    /// `(property, index, value)` the stage must report — `None` where every judged value is
-    /// one the schema admits.
-    type EnumRow<'a> = (&'a str, &'a str, Value, Option<(&'a str, usize, &'a str)>);
+    /// `(member chain, index, value)` the stage must report — the index being `None` for a
+    /// property stating a single value — or `None` where every judged value is one the schema
+    /// admits.
+    type EnumRow<'a> = (
+        &'a str,
+        &'a str,
+        Value,
+        Option<(&'a [&'a str], Option<usize>, &'a str)>,
+    );
 
     /// RULE: a value outside the set its type's schema states for the property fails the
-    /// validation, quoting that value and that set at the path of the ELEMENT that carries it,
-    /// and a value the set admits does not — in a list-valued property, element by element.
+    /// validation, quoting that value and that set at the path of the member that carries it,
+    /// and a value the set admits does not — in a list-valued property, element by element,
+    /// and for a member nested inside a structured property, at that member's own path.
     ///
-    /// The rows span what the rule generalises over: which property carries the value, where
-    /// in the list it sits, how many values the list carries, values the set admits
-    /// (including ones the report that led here did not cite), the forms a value can take,
-    /// and a type the catalogue holds no row for.
+    /// The rows span what the rule generalises over: which property carries the value, how
+    /// deep in the declaration it sits, where in the list it sits, how many values the list
+    /// carries, values the set admits (including ones the report that led here did not cite),
+    /// the forms a value can take, and a type the catalogue holds no row for.
     #[test]
     fn a_value_outside_its_schemas_enum_fails_the_validation() {
         let rows: &[EnumRow] = &[
@@ -223,26 +271,26 @@ mod tests {
                 "the only permission granted is not one of them",
                 PRINCIPAL_PERMISSIONS,
                 json!({"Permissions": ["NOT_A_PERMISSION"]}),
-                Some(("Permissions", 0, "NOT_A_PERMISSION")),
+                Some((&["Permissions"], Some(0), "NOT_A_PERMISSION")),
             ),
             (
                 "the second of three is not one of them",
                 PRINCIPAL_PERMISSIONS,
                 json!({"Permissions": ["SELECT", "WRITE", "DESCRIBE"]}),
-                Some(("Permissions", 1, "WRITE")),
+                Some((&["Permissions"], Some(1), "WRITE")),
             ),
             (
                 "a permission that differs from one of them only in case",
                 PRINCIPAL_PERMISSIONS,
                 json!({"Permissions": ["describe"]}),
-                Some(("Permissions", 0, "describe")),
+                Some((&["Permissions"], Some(0), "describe")),
             ),
             (
                 "the grant-option list carries one that is not",
                 PRINCIPAL_PERMISSIONS,
                 json!({"Permissions": ["SELECT"],
                        "PermissionsWithGrantOption": ["SELECT", "GRANT"]}),
-                Some(("PermissionsWithGrantOption", 1, "GRANT")),
+                Some((&["PermissionsWithGrantOption"], Some(1), "GRANT")),
             ),
             (
                 "every value the set admits, in both lists",
@@ -264,7 +312,7 @@ mod tests {
                 "a permission the API has added since the type's schema was published",
                 PRINCIPAL_PERMISSIONS,
                 json!({"Permissions": ["SELECT", "SUPER_USER"]}),
-                Some(("Permissions", 1, "SUPER_USER")),
+                Some((&["Permissions"], Some(1), "SUPER_USER")),
             ),
             (
                 "an empty list, which carries no value to judge",
@@ -282,7 +330,7 @@ mod tests {
                 "a list whose first element is not text and whose second is rejected",
                 PRINCIPAL_PERMISSIONS,
                 json!({"Permissions": [{"Fn::ImportValue": "Granted"}, "NOT_A_PERMISSION"]}),
-                Some(("Permissions", 1, "NOT_A_PERMISSION")),
+                Some((&["Permissions"], Some(1), "NOT_A_PERMISSION")),
             ),
             (
                 "a property reading a value that has not landed yet",
@@ -296,6 +344,64 @@ mod tests {
                 json!({"Permissions": ["NOT_A_PERMISSION"]}),
                 None,
             ),
+            (
+                "a nested member carrying a value the schema does not state",
+                SOURCE_API_ASSOCIATION,
+                json!({"SourceApiAssociationConfig": {"MergeType": "NOT_A_MERGE_TYPE"}}),
+                Some((
+                    &["SourceApiAssociationConfig", "MergeType"],
+                    None,
+                    "NOT_A_MERGE_TYPE",
+                )),
+            ),
+            (
+                // Each value the set admits, including the one the report leading here did
+                // not cite.
+                "a nested member carrying the default the schema states",
+                SOURCE_API_ASSOCIATION,
+                json!({"SourceApiAssociationConfig": {"MergeType": "MANUAL_MERGE"}}),
+                None,
+            ),
+            (
+                "a nested member carrying the other value the schema states",
+                SOURCE_API_ASSOCIATION,
+                json!({"SourceApiAssociationConfig": {"MergeType": "AUTO_MERGE"}}),
+                None,
+            ),
+            (
+                "a nested member spelled in the owning API's own casing",
+                SOURCE_API_ASSOCIATION,
+                json!({"SourceApiAssociationConfig": {"MergeType": "auto_merge"}}),
+                Some((
+                    &["SourceApiAssociationConfig", "MergeType"],
+                    None,
+                    "auto_merge",
+                )),
+            ),
+            (
+                "a declaration stating the structure but not the nested member",
+                SOURCE_API_ASSOCIATION,
+                json!({"SourceApiAssociationConfig": {}}),
+                None,
+            ),
+            (
+                "a declaration stating none of the structure the member sits in",
+                SOURCE_API_ASSOCIATION,
+                json!({"Description": "no merge configuration at all"}),
+                None,
+            ),
+            (
+                "a structure the declaration states as an unevaluated expression",
+                SOURCE_API_ASSOCIATION,
+                json!({"SourceApiAssociationConfig": {"Fn::ImportValue": "Config"}}),
+                None,
+            ),
+            (
+                "a nested member whose value is not text",
+                SOURCE_API_ASSOCIATION,
+                json!({"SourceApiAssociationConfig": {"MergeType": {"Ref": "Merge"}}}),
+                None,
+            ),
         ];
         for (case, resource_type, properties, reported) in rows {
             let resources = vec![declared("R", resource_type, properties.clone())];
@@ -306,9 +412,10 @@ mod tests {
                     .find(|row| row.resource_type == *resource_type && row.property == property)
                     .map(|row| row.values)
                     .unwrap_or_default();
+                let at = at.map_or(String::new(), |at| format!("/{at}"));
                 (
                     enum_failure_reason(value, values),
-                    format!("/Resources/R/Properties/{property}/{at}"),
+                    format!("/Resources/R/Properties/{}{at}", property.join("/")),
                 )
             });
             assert_eq!(

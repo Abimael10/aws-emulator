@@ -429,6 +429,25 @@ pub fn properties_path(logical_id: &str) -> String {
 /// which the path above steps through.
 const PROPERTIES_SECTION: &str = "Properties";
 
+/// The path ONE MEMBER of a declaration's property document sits at: the chain of members
+/// leading to it, under the `Properties` of the resource the template declares.
+///
+/// `OperationEvent$ValidationPath` is "the path within the resource where the validation was
+/// applied", and a validation applied to one member names that member rather than the document
+/// as a whole — so the path steps through every member above it, which is the JSON pointer of
+/// the judged element in the submitted template
+/// (`/Resources/<LogicalId>/Properties/<Property>[/<Member>…]`). The ONE spelling of that rule
+/// for this stage: the questions that judge a member of the document itself
+/// ([`declared_properties::property_path`]) and one nested inside a structured property
+/// ([`enum_properties`]) both build their path here.
+pub fn member_path(logical_id: &str, property: &[&str]) -> String {
+    format!(
+        "{}/{}",
+        properties_path(logical_id),
+        property.join("/")
+    )
+}
+
 /// `Some(failure)` for the first resource of `declared` whose property document its type's
 /// contract refuses — the failure the operation reports instead of deploying anything;
 /// `None` when every resource passes what this stage can judge.
