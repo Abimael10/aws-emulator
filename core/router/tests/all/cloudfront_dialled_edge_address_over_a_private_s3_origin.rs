@@ -198,16 +198,16 @@ async fn awaited_deployment(router: &MultiServiceRouter, case: &str, id: &str) -
 
 /// What a viewer's own connection answered: the status line's code, the headers under their
 /// lowercased names, and the body the answer framed.
-struct Served {
-    status: u16,
+pub(crate) struct Served {
+    pub(crate) status: u16,
     headers: BTreeMap<String, String>,
-    body: String,
-    raw: String,
+    pub(crate) body: String,
+    pub(crate) raw: String,
 }
 
 impl Served {
     /// A response header's value, by its lowercased name.
-    fn header(&self, name: &str) -> String {
+    pub(crate) fn header(&self, name: &str) -> String {
         self.headers.get(name).cloned().unwrap_or_default()
     }
 
@@ -225,7 +225,7 @@ impl Served {
 /// `host:port`, which is exactly the set of values a client reaches without resolving a name.
 /// A name under a zone nothing here serves resolves to nothing, so a distribution reporting
 /// one would publish an address no viewer could open a connection to.
-fn is_dialable(domain: &str) -> bool {
+pub(crate) fn is_dialable(domain: &str) -> bool {
     domain.parse::<SocketAddr>().is_ok()
 }
 
@@ -239,7 +239,7 @@ fn is_dialable(domain: &str) -> bool {
 /// The dial names the LOOPBACK interface explicitly and takes only the PORT from the
 /// published authority — the caller has already held that authority to being one of this
 /// emulator's own listeners — so nothing here opens a connection anywhere else.
-async fn dial(case: &str, authority: &str, path: &str) -> Served {
+pub(crate) async fn dial(case: &str, authority: &str, path: &str) -> Served {
     let port = authority
         .parse::<SocketAddr>()
         .unwrap_or_else(|error| {

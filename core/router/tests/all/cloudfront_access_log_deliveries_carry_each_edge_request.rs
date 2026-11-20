@@ -88,7 +88,7 @@ const NOT_FOUND: &str = "ResourceNotFoundException";
 const DELIVERY_NOT_FOUND: &str = "Requested Delivery does not exist in this account.";
 
 /// The suffix `X-Cache` ends in, whichever classification it reports.
-const FROM_CLOUDFRONT: &str = " from cloudfront";
+pub(crate) const FROM_CLOUDFRONT: &str = " from cloudfront";
 
 /// How long a look for records that ARE due keeps looking, and how long it waits between
 /// looks. Generous: a loaded machine must not fail a row the delivery leg would have written.
@@ -99,7 +99,7 @@ const POLL: Duration = Duration::from_millis(25);
 /// access-log record this suite joins on, as the edge reports them (the field catalogue of
 /// `services/service-com-amazonaws-cloudfront-cloudfront2020-05-31/src/service/edge/realtime_logs.rs`,
 /// whose arms carry each field's own published definition).
-const PRIMARY_FIELDS: &[&str] = &[
+pub(crate) const PRIMARY_FIELDS: &[&str] = &[
     "date",
     "time",
     "cs-uri-stem",
@@ -111,29 +111,29 @@ const PRIMARY_FIELDS: &[&str] = &[
 /// The record layout of the BARRIER delivery on the same source: fewer fields, in another
 /// order, and one field the primary does not name at all (`cs-method`, "the HTTP method of the
 /// viewer request").
-const BARRIER_FIELDS: &[&str] = &["x-edge-request-id", "cs-method", "sc-status"];
+pub(crate) const BARRIER_FIELDS: &[&str] = &["x-edge-request-id", "cs-method", "sc-status"];
 
 /// One delivery of the wired pipeline: where its records land and the layout they land in.
 #[derive(Debug)]
-struct Wired {
-    case: &'static str,
+pub(crate) struct Wired {
+    pub(crate) case: &'static str,
     /// `Delivery$id`.
-    id: String,
+    pub(crate) id: String,
     /// The log group its destination names.
-    log_group: String,
+    pub(crate) log_group: String,
     /// `Delivery$recordFields`, in the order the delivery was created with.
-    fields: Vec<String>,
+    pub(crate) fields: Vec<String>,
     /// The ARN of the delivery destination it is paired with.
     destination_arn: String,
 }
 
 /// A whole wired pipeline: the two routers, the distribution's edge domain, and every delivery
 /// created over it.
-struct Pipeline {
-    setup: MultiServiceRouter,
+pub(crate) struct Pipeline {
+    pub(crate) setup: MultiServiceRouter,
     viewers: MultiServiceRouter,
-    domain: String,
-    deliveries: Vec<Wired>,
+    pub(crate) domain: String,
+    pub(crate) deliveries: Vec<Wired>,
 }
 
 /// The three services this suite exercises, mounted on `engine` exactly as the router mounts
@@ -168,7 +168,7 @@ fn log_group_arn(group: &str) -> String {
 /// Build the whole pipeline the rule is about: a private bucket holding `objects`, a
 /// distribution over it through an origin access control, and one delivery per entry of
 /// `layouts` — all on the SAME delivery source, which is what makes them siblings.
-async fn wire(
+pub(crate) async fn wire(
     bucket: &str,
     objects: &[(&str, &str)],
     layouts: &[(&'static str, &'static [&str])],
@@ -310,7 +310,7 @@ async fn wire(
 }
 
 /// Every record the log group `group` holds, each parsed from the event's own message.
-async fn records(router: &MultiServiceRouter, group: &str) -> Vec<Value> {
+pub(crate) async fn records(router: &MultiServiceRouter, group: &str) -> Vec<Value> {
     let (status, answered) = logs(
         router,
         "FilterLogEvents",
@@ -337,7 +337,11 @@ async fn records(router: &MultiServiceRouter, group: &str) -> Vec<Value> {
 
 /// Look for records in `group` until it holds `wanted` of them or [`DEADLINE`] passes, then
 /// answer whatever it holds. Waits on the CONDITION, never on a span.
-async fn records_until(router: &MultiServiceRouter, group: &str, wanted: usize) -> Vec<Value> {
+pub(crate) async fn records_until(
+    router: &MultiServiceRouter,
+    group: &str,
+    wanted: usize,
+) -> Vec<Value> {
     let deadline = Instant::now() + DEADLINE;
     loop {
         let held = records(router, group).await;
@@ -349,13 +353,17 @@ async fn records_until(router: &MultiServiceRouter, group: &str, wanted: usize) 
 }
 
 /// One viewer request of the table: the path dialled, and what the edge has to answer it.
-struct Row {
-    case: &'static str,
-    path: &'static str,
+///
+/// `pub(crate)` so the sibling suite that dials the published address on a socket
+/// ([`super::cloudfront_dialled_address_vends_each_access_log_record`]) declares its own
+/// requests in the same terms rather than restating them.
+pub(crate) struct Row {
+    pub(crate) case: &'static str,
+    pub(crate) path: &'static str,
     /// `sc-status` — the status the viewer was answered with.
-    status: u16,
+    pub(crate) status: u16,
     /// `x-edge-result-type` — the first word of the answer's `X-Cache`.
-    result_type: &'static str,
+    pub(crate) result_type: &'static str,
 }
 
 /// Whether `value` is written as the `date` field is ("for example, 2019-06-26") or as the
@@ -364,11 +372,13 @@ struct Row {
 /// digits and separators but no calendar date or wall-clock time is refused. It is the FORM of
 /// the two halves that is read, which is what a record states about them; neither is compared
 /// against a clock reading.
-fn is_date(value: &str) -> bool {
+/// `pub(crate)` so the sibling suite that dials the published address on a socket holds these
+/// two fields to the same written form rather than to a weaker shape of its own.
+pub(crate) fn is_date(value: &str) -> bool {
     value.len() == 10 && is_instant(&format!("{value}T00:00:00Z"))
 }
 
-fn is_time(value: &str) -> bool {
+pub(crate) fn is_time(value: &str) -> bool {
     value.len() == 8 && is_instant(&format!("1970-01-01T{value}Z"))
 }
 
@@ -379,7 +389,9 @@ fn is_instant(stamp: &str) -> bool {
 
 /// What a record of `row` must state for ONE field, for a request whose answer carried
 /// `request_id`; `None` for a field whose value is checked by its form instead.
-fn expected_value(row: &Row, request_id: &str, field: &str) -> Option<String> {
+///
+/// `pub(crate)` for the same reason [`Row`] is: one reading of what a record owes a request.
+pub(crate) fn expected_value(row: &Row, request_id: &str, field: &str) -> Option<String> {
     match field {
         "cs-uri-stem" => Some(row.path.to_string()),
         "sc-status" => Some(row.status.to_string()),
