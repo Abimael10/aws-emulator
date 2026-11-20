@@ -2247,53 +2247,126 @@ pub const INVALID_ACCESS_KEY_ID_MESSAGE: &str = "Access key ID is not valid.";
 /// policy ARNs, and session tags into a packed binary format that has a separate limit"
 /// (`PackedPolicyTooLargeException`, this service's model), so the packed state is exactly
 /// those three — the inline policy document, the managed policy ARNs the request names, and
-/// each session tag's key and value — serialized as the members that carry them, and then
-/// encoded the way a token is carried, which is the form whose length is measured.
+/// each session tag's key and value.
+///
+/// The conversion is a BINARY record stream rather than a text document: each packed element
+/// is carried as a record of its own — the element's kind, the record's length and the
+/// element's own bytes, with a session tag's key and value each framed as a field inside
+/// that tag's record — behind a fixed header stating the format version, the length of the
+/// records and how many elements of each of the three kinds they carry
+/// ([`PACKED_TOKEN_HEADER_BYTES`], [`PACKED_RECORD_HEADER_BYTES`],
+/// [`PACKED_FIELD_HEADER_BYTES`]). A token is carried as text, so the stream is coded four
+/// characters per three bytes, and the length of THAT is the size the budget is applied to
+/// and the refusal reports.
+///
+/// Framing each element in a record is what makes the measured size the size the packed
+/// binary format takes: a JSON document of the request's members would carry its member
+/// names, its quotes and its escapes into the measurement and inflate it by a margin of
+/// their own per element — and that margin lands in the figure a caller trimming its session
+/// tags computes against, and in the boundary at which a session state is refused at all.
+/// AWS documents the conversion but not the format, so what the framing widths below are
+/// fixed by is the one thing a client can observe of it: the size AWS reports for a given
+/// inline policy, policy ARN list and session tag set, which this measurement reproduces
+/// (`tests/all/packed_token_measurement.rs` states the figure per session state).
 ///
 /// Measuring the TOKEN rather than adding up the field contents is what makes the figure
-/// track the request: a serialization carries its own framing per element, so ten tags and
-/// one tag of the same total content do not pack into the same token, and a byte added to a
-/// tag value moves the measured size. The emulator compresses nothing, so no caller's
-/// session state is ever admitted because it happened to compress well.
+/// track the request: every element carries its own framing, so ten tags and one tag of the
+/// same total content do not pack into the same token, and bytes added to a tag value move
+/// the measured size. The emulator compresses nothing, so no caller's session state is ever
+/// admitted because it happened to compress well.
 ///
 /// A request that carries no policy, no policy ARN and no session tag packs NO token at all
 /// — there is no session state to serialize — so its size is zero rather than the length of
-/// an empty document.
+/// a bare header.
 #[must_use]
 pub fn packed_session_token(policy: Option<&str>, policy_arns: &[String], tags: &[Tag]) -> String {
-    let mut packed = serde_json::Map::new();
+    let mut records: Vec<u8> = Vec::new();
     if let Some(policy) = policy {
-        packed.insert(
-            "Policy".to_string(),
-            serde_json::Value::String(policy.to_string()),
-        );
+        push_packed_record(&mut records, PACKED_POLICY_KIND, policy.as_bytes());
     }
-    if !policy_arns.is_empty() {
-        packed.insert(
-            "PolicyArns".to_string(),
-            serde_json::Value::Array(
-                policy_arns
-                    .iter()
-                    .map(|arn| serde_json::json!({ "arn": arn }))
-                    .collect(),
-            ),
-        );
+    for arn in policy_arns {
+        push_packed_record(&mut records, PACKED_POLICY_ARN_KIND, arn.as_bytes());
     }
-    if !tags.is_empty() {
-        packed.insert(
-            "Tags".to_string(),
-            serde_json::Value::Array(
-                tags.iter()
-                    .map(|tag| serde_json::json!({ "Key": tag.key, "Value": tag.value }))
-                    .collect(),
-            ),
-        );
+    for tag in tags {
+        let mut body: Vec<u8> = Vec::new();
+        push_packed_field(&mut body, PACKED_TAG_KEY_FIELD, tag.key.as_bytes());
+        push_packed_field(&mut body, PACKED_TAG_VALUE_FIELD, tag.value.as_bytes());
+        push_packed_record(&mut records, PACKED_TAG_KIND, &body);
     }
-    if packed.is_empty() {
+    if records.is_empty() {
         return String::new();
     }
-    let serialized = serde_json::Value::Object(packed).to_string();
-    ::base64::Engine::encode(&PACKED_TOKEN_CODEC, serialized)
+    let mut token: Vec<u8> = Vec::with_capacity(PACKED_TOKEN_HEADER_BYTES + records.len());
+    token.push(PACKED_TOKEN_FORMAT_VERSION);
+    token.extend_from_slice(&packed_length(records.len()).to_be_bytes());
+    token.extend_from_slice(&packed_length(usize::from(policy.is_some())).to_be_bytes());
+    token.extend_from_slice(&packed_length(policy_arns.len()).to_be_bytes());
+    token.extend_from_slice(&packed_length(tags.len()).to_be_bytes());
+    token.extend_from_slice(&records);
+    ::base64::Engine::encode(&PACKED_TOKEN_CODEC, token)
+}
+
+/// The version the packed binary format opens with, so a reader of a packed token knows
+/// which framing the records behind it carry.
+const PACKED_TOKEN_FORMAT_VERSION: u8 = 1;
+
+/// The fixed head of a packed session token: the format version
+/// ([`PACKED_TOKEN_FORMAT_VERSION`], one byte) and four counts of
+/// [`PACKED_LENGTH_BYTES`] each — the length of the records that follow, and how many
+/// inline policies, managed policy ARNs and session tags they carry.
+pub const PACKED_TOKEN_HEADER_BYTES: usize = 1 + 4 * PACKED_LENGTH_BYTES;
+
+/// The head of ONE packed record: the element kind it carries (one byte) and the length of
+/// its body ([`PACKED_LENGTH_BYTES`]).
+pub const PACKED_RECORD_HEADER_BYTES: usize = 1 + PACKED_LENGTH_BYTES;
+
+/// The head of one FIELD inside a packed record — a session tag's key and its value: the
+/// field kind (one byte) and the length of its bytes ([`PACKED_FIELD_LENGTH_BYTES`]).
+pub const PACKED_FIELD_HEADER_BYTES: usize = 1 + PACKED_FIELD_LENGTH_BYTES;
+
+/// How a length is written in a packed token's header and in a record's head: a 32-bit
+/// big-endian count, which spans every token this service packs.
+const PACKED_LENGTH_BYTES: usize = 4;
+
+/// How the length of a FIELD inside a record is written: a 16-bit big-endian count, which
+/// spans a session tag's key and value (at most 128 and 256 characters, `AssumeRole$Tags`).
+const PACKED_FIELD_LENGTH_BYTES: usize = 2;
+
+/// The element kinds a packed session token frames: the inline session policy document, one
+/// managed session policy ARN, and one session tag.
+const PACKED_POLICY_KIND: u8 = 1;
+const PACKED_POLICY_ARN_KIND: u8 = 2;
+const PACKED_TAG_KIND: u8 = 3;
+
+/// The fields a session tag's record carries: its key and its value.
+const PACKED_TAG_KEY_FIELD: u8 = 1;
+const PACKED_TAG_VALUE_FIELD: u8 = 2;
+
+/// Append one record for `body`, headed by its kind and its length.
+fn push_packed_record(records: &mut Vec<u8>, kind: u8, body: &[u8]) {
+    records.push(kind);
+    records.extend_from_slice(&packed_length(body.len()).to_be_bytes());
+    records.extend_from_slice(body);
+}
+
+/// Append one field of a record's body, headed by its kind and its length.
+fn push_packed_field(body: &mut Vec<u8>, kind: u8, bytes: &[u8]) {
+    body.push(kind);
+    body.extend_from_slice(&packed_field_length(bytes.len()).to_be_bytes());
+    body.extend_from_slice(bytes);
+}
+
+/// `length` as the count a packed token's header and a record's head carry. A length past
+/// what the count spans is written at its ceiling: the record still carries every byte of
+/// the element, so the measured size stays the size of what was packed.
+fn packed_length(length: usize) -> u32 {
+    u32::try_from(length).unwrap_or(u32::MAX)
+}
+
+/// `length` as the count one FIELD of a record carries, written at its ceiling for the same
+/// reason as [`packed_length`].
+fn packed_field_length(length: usize) -> u16 {
+    u16::try_from(length).unwrap_or(u16::MAX)
 }
 
 /// The coder a packed session token is carried in: base64 as RFC 4648 §4 defines it,

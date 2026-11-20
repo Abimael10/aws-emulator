@@ -2,11 +2,13 @@
 
 //! The packed token budget one mint's session policies and session tags must fit in.
 //!
-//! RULE: a mint SERIALIZES its inline session policy, the managed policy ARNs it names and
-//! its session tags into one packed session token, and the budget of 4,096 bytes applies to
-//! the length of THAT token — the serialization's own framing per element included, so the
-//! same total content spread across a different number of tags does not pack into the same
-//! size. A request whose packed token is within the budget is served and reports its size as
+//! RULE: a mint PACKS its inline session policy, the managed policy ARNs it names and its
+//! session tags into one packed session token — one binary record per element, behind the
+//! token's own header — and the budget of 4,096 bytes applies to the length of THAT token,
+//! each element's framing included, so the same total content spread across a different
+//! number of tags does not pack into the same size. The exact byte figure every shape of
+//! session state is measured at is pinned by `packed_token_measurement`.
+//! A request whose packed token is within the budget is served and reports its size as
 //! the percentage of that budget (`PackedPolicySize`, rounded up); a request whose packed
 //! token passes the budget is refused with `PackedPolicyTooLarge` / HTTP 400, and the refusal
 //! names the two figures a caller needs to trim to fit — the size its own session state was
@@ -58,49 +60,46 @@ pub(crate) fn policy_of(bytes: usize) -> String {
     document
 }
 
+/// The head of a packed session token: its format version and the four counts behind it
+/// (the length of the records, and how many inline policies, managed policy ARNs and
+/// session tags they carry).
+pub(crate) const PACKED_TOKEN_HEADER_BYTES: usize = 17;
+
+/// The head of one packed record: the element kind it carries and the record's length.
+pub(crate) const PACKED_RECORD_HEADER_BYTES: usize = 5;
+
+/// The head of one field inside a record — a session tag's key, and its value.
+pub(crate) const PACKED_FIELD_HEADER_BYTES: usize = 3;
+
 /// The bytes the packed session token of these inputs occupies, derived from the rule rather
 /// than from the service: the session state — the inline policy, the managed policy ARNs and
-/// the session tags — serialized as the members that carry them, then coded the way a token
-/// is carried, which is four characters per three bytes of the serialization (RFC 4648 §4,
-/// the final group padded). A request that carries none of the three packs NO token, so its
-/// size is zero.
+/// the session tags — is packed as one binary record per element behind the token's own
+/// header, a session tag's key and value each framed as a field of that tag's record, and
+/// the stream is then coded the way a token is carried, four characters per three bytes
+/// (RFC 4648 §4, the final group padded). A request that carries none of the three packs NO
+/// token, so its size is zero.
 pub(crate) fn packed_token_bytes(
     policy: Option<&str>,
     policy_arns: &[String],
     tags: &[(String, String)],
 ) -> usize {
-    let mut packed = serde_json::Map::new();
+    let mut records = 0_usize;
     if let Some(policy) = policy {
-        packed.insert(
-            "Policy".to_string(),
-            serde_json::Value::String(policy.to_string()),
-        );
+        records += PACKED_RECORD_HEADER_BYTES + policy.len();
     }
-    if !policy_arns.is_empty() {
-        packed.insert(
-            "PolicyArns".to_string(),
-            serde_json::Value::Array(
-                policy_arns
-                    .iter()
-                    .map(|arn| serde_json::json!({ "arn": arn }))
-                    .collect(),
-            ),
-        );
+    for arn in policy_arns {
+        records += PACKED_RECORD_HEADER_BYTES + arn.len();
     }
-    if !tags.is_empty() {
-        packed.insert(
-            "Tags".to_string(),
-            serde_json::Value::Array(
-                tags.iter()
-                    .map(|(key, value)| serde_json::json!({ "Key": key, "Value": value }))
-                    .collect(),
-            ),
-        );
+    for (key, value) in tags {
+        records += PACKED_RECORD_HEADER_BYTES
+            + 2 * PACKED_FIELD_HEADER_BYTES
+            + key.len()
+            + value.len();
     }
-    if packed.is_empty() {
+    if records == 0 {
         return 0;
     }
-    4 * serde_json::Value::Object(packed).to_string().len().div_ceil(3)
+    4 * (PACKED_TOKEN_HEADER_BYTES + records).div_ceil(3)
 }
 
 /// The session state one row packs: the three inputs the budget is measured over, which a
@@ -218,17 +217,17 @@ async fn a_packed_token_is_measured_against_one_budget_and_the_refusal_names_bot
             SessionState::of_policy(MAX_SESSION_POLICY_PLAINTEXT_CHARS - 1),
         ),
         (
-            // Ten tags whose serialization is exactly 4,096 bytes once coded: the boundary
-            // itself, which is INSIDE the budget.
+            // Thirteen tags whose records pack into exactly 4,096 bytes once coded: the
+            // boundary itself, which is INSIDE the budget.
             "session tags exactly at the budget",
             "AssumeRole",
-            SessionState::of_tags(10, 28, 256),
+            SessionState::of_tags(13, 28, 196),
         ),
         (
             // The smallest step past that boundary the coding can take.
             "session tags one coding group over the budget",
             "AssumeRole",
-            SessionState::of_tags(8, 105, 256),
+            SessionState::of_tags(16, 20, 160),
         ),
         (
             "seventeen session tags well over the budget",
