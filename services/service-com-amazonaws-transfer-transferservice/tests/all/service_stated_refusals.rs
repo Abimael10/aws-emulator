@@ -8,7 +8,7 @@
 //! caller sent (no member name, no value, no identifier), so a client matching or
 //! logging the service's refusal recognises it.
 //!
-//! Five conditions, each asserted over a TABLE whose rows differ along what the
+//! Six conditions, each asserted over a TABLE whose rows differ along what the
 //! condition generalises over rather than along the one request a report cited:
 //!
 //! 1. a server configuration that hosts its endpoint in a VPC and names no
@@ -25,7 +25,13 @@
 //!    and mutations alike, over the agreement and the server kinds;
 //! 5. a write of a web app's customization that lost the claim — the rows span the
 //!    operation that lost, how many writers overlapped, and whether the web app held a
-//!    customization already.
+//!    customization already;
+//! 6. a connector `Url` that names no endpoint the service could reach — the rows span
+//!    WHY the value names none (a host under each top-level domain the DNS never
+//!    delegates, a value that is no absolute URL, one carrying no authority, a host no
+//!    DNS name can take the shape of), the scheme and protocol configuration it is sent
+//!    under, and the operation that writes the connector, and are bounded by the
+//!    endpoints that DO resolve and are still written.
 //!
 //! Conditions 4 and 5 are where the refusal CLASS matters as much as the wording: both
 //! answers are in the asking operation's modelled error set, so a client that branches on
@@ -40,8 +46,8 @@
 use serde_json::{json, Value};
 
 use crate::harness::{
-    custom_directories, generated_host_key, member_of, Answer, Emulator, ROLE, SSH_KEY,
-    UNMINTED_SERVER_ID,
+    custom_directories, drain_pages, generated_host_key, member_of, Answer, Emulator, ROLE,
+    SSH_KEY, UNMINTED_SERVER_ID,
 };
 use crate::web_app_customization_write_guard::{create_web_app, futures_of};
 
@@ -750,4 +756,247 @@ async fn a_customization_write_that_lost_the_claim_is_refused_with_one_fixed_tex
             "case {case:?}: expected every writer but the winner to be refused"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// 6. A connector Url that names no endpoint the service could reach
+// ---------------------------------------------------------------------------
+
+/// The text the service states for that condition.
+const URL_NOT_VALID: &str = "The specified Url is not valid";
+
+/// A connector `Url` that names no reachable endpoint, with the protocol configuration
+/// the row sends it under — the exclusivity requirement is resolved before the `Url`, so
+/// every row names exactly one configuration.
+struct UnreachableUrl {
+    case: &'static str,
+    url: &'static str,
+    config: fn() -> Value,
+}
+
+/// An AS2 configuration, for a row whose `Url` names an AS2 endpoint.
+fn as2_config() -> Value {
+    json!({"As2Config": {
+        "LocalProfileId": "p-0123456789abcdef0",
+        "PartnerProfileId": "p-00000000000000001",
+        "MdnResponse": "NONE",
+        "Compression": "DISABLED",
+        "EncryptionAlgorithm": "NONE",
+        "SigningAlgorithm": "NONE",
+    }})
+}
+
+/// An SFTP configuration, for a row whose `Url` names an SFTP endpoint.
+fn sftp_config() -> Value {
+    json!({"SftpConfig": {"UserSecretId": "sftp-partner-credentials"}})
+}
+
+/// The `Url` values that name no endpoint the service could ever connect to.
+///
+/// The rows differ along WHY the value names none — a host under each top-level domain
+/// the DNS never delegates (`.invalid`, `.test`, `.localhost`, `.local`), a value that is
+/// no absolute URL at all, a URL carrying no authority, and a host no DNS name can take
+/// the shape of — crossed with the scheme and the protocol configuration the connector
+/// would carry.
+fn unreachable_urls() -> Vec<UnreachableUrl> {
+    vec![
+        UnreachableUrl {
+            case: "an AS2 endpoint whose host is under the reserved .invalid",
+            url: "https://as2.partner.invalid/as2",
+            config: as2_config,
+        },
+        UnreachableUrl {
+            case: "an AS2 endpoint deeper under .invalid, on a port",
+            url: "http://as2.partner.example.invalid:8080/as2",
+            config: as2_config,
+        },
+        UnreachableUrl {
+            case: "an SFTP endpoint under .invalid",
+            url: "sftp://files.partner.invalid",
+            config: sftp_config,
+        },
+        UnreachableUrl {
+            case: "an SFTP endpoint under the reserved .test",
+            url: "sftp://files.partner.test:2222",
+            config: sftp_config,
+        },
+        UnreachableUrl {
+            case: "an SFTP endpoint under the reserved .localhost",
+            url: "sftp://files.partner.localhost",
+            config: sftp_config,
+        },
+        UnreachableUrl {
+            case: "an SFTP endpoint on the local link",
+            url: "sftp://files.partner.local",
+            config: sftp_config,
+        },
+        UnreachableUrl {
+            case: "a bare host name that is no absolute URL",
+            url: "ftp.example.com",
+            config: sftp_config,
+        },
+        UnreachableUrl {
+            case: "a host and a path with no scheme",
+            url: "partner.example.com/as2",
+            config: as2_config,
+        },
+        UnreachableUrl {
+            case: "a URL that carries no authority at all",
+            url: "mailto:partner@example.com",
+            config: as2_config,
+        },
+        UnreachableUrl {
+            case: "a single-label host, which the DNS root holds no address for",
+            url: "sftp://partner",
+            config: sftp_config,
+        },
+        UnreachableUrl {
+            case: "a host whose label ends in a hyphen",
+            url: "sftp://partner-.example.com",
+            config: sftp_config,
+        },
+    ]
+}
+
+/// The `Url` values that DO name an endpoint, as the control the rule is bounded by:
+/// delegated host names under every scheme a connector speaks, the documentation domain
+/// `example.com` (which is delegated and resolves, unlike `.invalid`), a host name under
+/// a reserved label that is not the top-level one, and the literals that need no
+/// resolution.
+fn reachable_urls() -> Vec<UnreachableUrl> {
+    vec![
+        UnreachableUrl {
+            case: "an https AS2 endpoint with a path",
+            url: "https://partner.example.com/as2",
+            config: as2_config,
+        },
+        UnreachableUrl {
+            case: "an http AS2 endpoint on a port",
+            url: "http://partner.example.com:8080/as2",
+            config: as2_config,
+        },
+        UnreachableUrl {
+            case: "an SFTP endpoint",
+            url: "sftp://partner.example.com",
+            config: sftp_config,
+        },
+        UnreachableUrl {
+            case: "an SFTP endpoint whose host carries the reserved label below the \
+                   top-level one",
+            url: "sftp://invalid.partner.example.com",
+            config: sftp_config,
+        },
+        UnreachableUrl {
+            case: "an SFTP endpoint addressed by an IPv4 literal",
+            url: "sftp://192.0.2.10:22",
+            config: sftp_config,
+        },
+        UnreachableUrl {
+            case: "an SFTP endpoint addressed by an IPv6 literal",
+            url: "sftp://[2001:db8::1]:22",
+            config: sftp_config,
+        },
+    ]
+}
+
+/// The request a create of `row` sends: the access role, the row's `Url`, and the row's
+/// one protocol configuration.
+fn create_request(row: &UnreachableUrl) -> Value {
+    let mut request = json!({"AccessRole": ROLE, "Url": row.url});
+    let object = request.as_object_mut().expect("the request is an object");
+    for (member, value) in (row.config)()
+        .as_object()
+        .expect("a configuration is an object")
+    {
+        object.insert(member.clone(), value.clone());
+    }
+    request
+}
+
+/// RULE: a connector `Url` that names no endpoint the service could reach — a value that
+/// is no absolute URL, or whose host can never be resolved — is refused with the
+/// service's fixed text on every operation that writes a connector, and nothing is
+/// written: the refused create mints no connector and leaks none into `ListConnectors`,
+/// and the refused update leaves the stored connector exactly as it was.
+///
+/// The rows are [`unreachable_urls`], crossed with the two operations that write a
+/// connector, and bounded by [`reachable_urls`], which the same operations must still
+/// serve.
+#[tokio::test]
+async fn a_connector_url_that_names_no_reachable_endpoint_is_refused_with_one_fixed_text() {
+    let emulator = Emulator::new();
+
+    // The connector the update rows address, written with an endpoint that does resolve.
+    let stored_url = "sftp://partner.example.com";
+    let created = emulator
+        .call(
+            "CreateConnector",
+            json!({
+                "AccessRole": ROLE,
+                "Url": stored_url,
+                "SftpConfig": {"UserSecretId": "sftp-partner-credentials"},
+            }),
+        )
+        .await;
+    let stored_id = connector_id("SFTP", &created);
+
+    for row in unreachable_urls() {
+        // CreateConnector: nothing is minted for a connector the service would refuse.
+        let case = format!("CreateConnector with {}", row.case);
+        let answer = emulator
+            .call("CreateConnector", create_request(&row))
+            .await;
+        assert_fixed_refusal(&case, &answer, URL_NOT_VALID, &[row.url, ROLE]);
+        assert!(
+            member_of(&answer.body, "ConnectorId").is_null(),
+            "case {case:?}: expected the refusal to mint no ConnectorId, got {}",
+            answer.body
+        );
+
+        // UpdateConnector: the same value is refused on the stored connector, which
+        // keeps the endpoint it was created with.
+        let case = format!("UpdateConnector with {}", row.case);
+        let answer = emulator
+            .call(
+                "UpdateConnector",
+                json!({"ConnectorId": &stored_id, "Url": row.url}),
+            )
+            .await;
+        assert_fixed_refusal(&case, &answer, URL_NOT_VALID, &[row.url, ROLE]);
+        let described = emulator
+            .call("DescribeConnector", json!({"ConnectorId": &stored_id}))
+            .await;
+        assert_eq!(
+            member_of(described.get("Connector"), "Url").as_str(),
+            Some(stored_url),
+            "case {case:?}: expected the stored connector to keep its endpoint, got {}",
+            described.body
+        );
+    }
+
+    // Every endpoint that does resolve is still written, and is the only kind the store
+    // holds: the refused creates above added nothing to the listing.
+    let mut expected_urls = vec![stored_url.to_string()];
+    for row in reachable_urls() {
+        let answer = emulator
+            .call("CreateConnector", create_request(&row))
+            .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {:?}: expected the create to be served, got {} with body {}",
+            row.case, answer.status, answer.body
+        );
+        expected_urls.push(row.url.to_string());
+    }
+
+    let (_pages, listed) =
+        drain_pages(&emulator, "ListConnectors", &json!({}), "Connectors", "Url", None).await;
+    let mut listed_sorted = listed.clone();
+    listed_sorted.sort();
+    expected_urls.sort();
+    assert_eq!(
+        listed_sorted, expected_urls,
+        "expected the store to hold only the connectors whose Url names a reachable \
+         endpoint, got {listed:?}"
+    );
 }

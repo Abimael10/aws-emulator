@@ -21558,6 +21558,7 @@ dependencies = [
  "ssh-key",
  "tokio",
  "tracing",
+ "url",
  "x509-cert",
  "zip",
 ]

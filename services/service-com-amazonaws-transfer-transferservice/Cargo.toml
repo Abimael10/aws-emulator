@@ -43,6 +43,10 @@ aws-lc-rs = "1"
 # Decodes the base64 key payload of an `SshPublicKeyBody`, which is what says whether
 # the body carries key material at all (see `src/state/ssh_public_key_body.rs`).
 base64 = "0.22"
+# Parses the `Url` a connector names its partner's AS2 or SFTP endpoint with, so the
+# forms accepted are the URL standard's rather than a hand-read prefix
+# (see `src/state/connector_endpoint_url.rs`).
+url = "2"
 # `arn::parse`: the ONE shared ARN parse, which the authorization gate reads a role
 # ARN's account and resource fields through; `iam_authorization`: the ONE shared
 # evaluation of IAM policy documents, which makes that gate's decision.

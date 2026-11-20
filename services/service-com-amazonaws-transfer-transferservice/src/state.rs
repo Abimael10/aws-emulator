@@ -64,6 +64,7 @@ pub mod home_directory_mappings;
 pub mod identity_provider;
 pub mod vended_log_group;
 pub mod connector_egress_addresses;
+pub mod connector_endpoint_url;
 pub mod connector_plane;
 pub mod connector_protocol;
 pub mod identity_center;
@@ -77,6 +78,12 @@ pub mod workflow_runs;
 mod security_policies;
 mod host_key_material;
 pub use connector_egress_addresses::service_managed_egress_ip_addresses;
+
+/// Whether the endpoint a connector's `Url` names can exist, and the fixed text the
+/// service refuses one that cannot with: their own concern, in
+/// [`connector_endpoint_url`], re-exported here beside the other connector rules the
+/// write path reads.
+pub use connector_endpoint_url::{endpoint_url_defect, URL_NOT_VALID};
 pub use host_key_material::*;
 pub use security_policies::*;
 
@@ -2526,6 +2533,10 @@ impl ConnectorConfig<'_> {
     ///   (connectors without egress configuration), you must provide a URL to specify
     ///   the remote server endpoint. For VPC Lattice type connectors, the URL must be
     ///   null."
+    /// * `Url` is also "the URL of the partner's AS2 or SFTP endpoint" — the address a
+    ///   transfer on this connector connects out to — so a value that names no endpoint
+    ///   the service could reach is refused with the service's own fixed text
+    ///   ([`endpoint_url_defect`]).
     /// * `MaxConcurrentConnections` states "The maximum values is `5`" — a bound the
     ///   member's `@range` does not carry (see [`MAX_CONCURRENT_CONNECTIONS`]).
     pub fn cross_member_violation(&self) -> Option<String> {
@@ -2559,6 +2570,18 @@ impl ConnectorConfig<'_> {
                 ))
             }
             _ => {}
+        }
+
+        // A `Url` that names an endpoint has to name one the service could reach: the
+        // member is the address a transfer on this connector connects OUT to, so a
+        // value that is no absolute URL, or whose host can never be resolved, is
+        // refused here rather than stored on a connector no transfer can complete. See
+        // [`connector_endpoint_url::endpoint_url_defect`], whose text is the service's
+        // own fixed sentence for the condition.
+        if let Some(url) = connector_url(self.url) {
+            if let Some(defect) = endpoint_url_defect(&url) {
+                return Some(defect.to_string());
+            }
         }
 
         if self
