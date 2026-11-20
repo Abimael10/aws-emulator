@@ -265,13 +265,19 @@ async fn record_reaching(
     }
 }
 
+/// An MCP server definition a supported MCP server schema version accepts: the MCP server
+/// descriptor's content is validated against that schema, so a record of this type carries a
+/// named server with a description and a version.
+const MCP_SERVER_DEFINITION: &str =
+    r#"{"name":"com.example/checkout","description":"Checkout tools","version":"1.4.2"}"#;
+
 /// A `descriptors` value per `RecordType`, so each row of a record table carries a
 /// descriptor of its own shape. Member names are `Descriptors`' own
 /// (`smithy_query(query="shape", shape="Descriptors")`).
 fn descriptors_for(record_type: &str) -> Value {
     match record_type {
         "MCP" => {
-            json!({ "mcpServer": { "data": "{\"tools\":[]}", "dataSchemaVersion": "2025-06-18" } })
+            json!({ "mcpServer": { "data": MCP_SERVER_DEFINITION, "dataSchemaVersion": "2025-06-18" } })
         }
         "AGENT" => {
             json!({ "a2aAgentCard": { "data": "{\"name\":\"checkout\"}", "dataSchemaVersion": "0.2.1" } })

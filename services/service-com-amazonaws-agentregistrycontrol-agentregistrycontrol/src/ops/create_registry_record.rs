@@ -2,9 +2,12 @@
 
 //! @op CreateRegistryRecord
 //! IMPLEMENTED: mints a record id under the parent registry, persists the whole
-//! request in [`crate::state`] and answers the record ARN and status. `customMetadata`
-//! the request SUPPLIES has to satisfy the registry's `customMetadataSchemaConfiguration`
-//! first, so metadata the schema does not admit is refused before anything is written; a
+//! request in [`crate::state`] and answers the record ARN and status. The `descriptors` the
+//! request carries have to be the content a descriptor of their type carries — JSON, and
+//! JSON a supported version of that descriptor's protocol schema accepts — and the
+//! `customMetadata` the request SUPPLIES has to satisfy the registry's
+//! `customMetadataSchemaConfiguration`, so a descriptor or metadata this service does not
+//! admit is refused before anything is written; a
 //! create that supplies none is accepted, and the record's conformity to the registry's
 //! schema is then the verdict a read reports.
 //! Creation is asynchronous, so the record is stored `CREATING` with the clock owing it
@@ -191,8 +194,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // A descriptor's content is "serialized as descriptor payload data" and validated
         // against the protocol schema of the descriptor's type, so a payload that is not
-        // even JSON is refused here — before the request is remembered for its token and
-        // before any state precondition, since what does not hold is the request itself.
+        // even JSON, and one that is JSON no supported version of that descriptor's protocol
+        // schema accepts, are both refused here — before the request is remembered for its
+        // token and before any state precondition, since what does not hold is the request
+        // itself.
         if let Some(message) = crate::state::descriptor_payload_refusal(Some(&input.descriptors)) {
             return Err(CreateRegistryRecordErrorModeled::ValidationException(
                 ValidationException {

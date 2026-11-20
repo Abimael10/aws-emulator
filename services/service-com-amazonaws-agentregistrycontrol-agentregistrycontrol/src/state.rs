@@ -20,10 +20,14 @@ use crate::ops::types::{
 
 mod custom_metadata;
 mod descriptor_payload;
+mod mcp_server_schema;
 
-/// The refusal message for a descriptor payload that is not the JSON a descriptor's content
-/// is serialized as, or `None` when every payload of the set parses. The ONE check a record
-/// write runs its descriptors through, so a create and an edit admit the same payloads.
+/// The refusal message for a descriptor payload that is not the content a descriptor carries
+/// — one that is not the JSON the content is serialized as, or one that is JSON no supported
+/// version of the descriptor's own protocol schema accepts ([`mcp_server_schema`]) — or
+/// `None` where every payload of the set is content this service admits. The ONE check a
+/// record write runs its descriptors through, so a create and an edit admit the same
+/// payloads.
 pub use descriptor_payload::refusal as descriptor_payload_refusal;
 
 /// Whether a record's custom metadata satisfies the schema its registry carries, the

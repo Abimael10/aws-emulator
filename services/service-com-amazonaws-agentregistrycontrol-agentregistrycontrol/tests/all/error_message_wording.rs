@@ -133,10 +133,16 @@ fn id_of(arn: &str) -> &str {
     arn.rsplit('/').next().unwrap_or(arn)
 }
 
+/// An MCP server definition a supported MCP server schema version accepts: the MCP server
+/// descriptor's content is validated against that schema, so a record of this type carries a
+/// named server with a description and a version.
+const MCP_SERVER_DEFINITION: &str =
+    r#"{"name":"com.example/checkout","description":"Checkout tools","version":"1.4.2"}"#;
+
 /// A `descriptors` value, whose member names are `Descriptors`' own
 /// (`smithy_query(query="shape", shape="Descriptors")`).
 fn descriptors() -> Value {
-    json!({ "mcpServer": { "data": "{\"tools\":[]}", "dataSchemaVersion": "2025-06-18" } })
+    json!({ "mcpServer": { "data": MCP_SERVER_DEFINITION, "dataSchemaVersion": "2025-06-18" } })
 }
 
 fn create_record_body(name: &str) -> Value {

@@ -1,14 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Whether a registry record's descriptor payloads are the JSON this service requires, and
-//! how it words a refusal of one that is not.
+//! Whether a registry record's descriptor payloads are the content this service requires,
+//! and how it words a refusal of one that is not.
 //!
 //! Every descriptor of the typed set carries its content in a `data` member of
 //! `DescriptorData`, documented as the descriptor content "serialized as descriptor payload
 //! data" and validated by the service against the protocol schema of the descriptor's own
-//! type. Content that is not even JSON cannot be a payload of any of those schemas, so it is
-//! refused before the record is written rather than stored and served back as if it
-//! described something.
+//! type. So a write of a descriptor is refused, before the record is written rather than
+//! stored and served back as if it described something, on two counts:
+//!
+//! * content that is not even JSON cannot be a payload of any of those schemas, so it is
+//!   refused by the parse below, which states where it stopped parsing; and
+//! * content that IS JSON but that no supported version of the descriptor's own protocol
+//!   schema accepts is refused by the schema that applies to it — for the MCP server
+//!   descriptor, [`super::mcp_server_schema`].
+//!
+//! The parse comes first, for every payload of the set: a payload that is no JSON document
+//! matches no version of any schema either, and what a caller has to be told about it is
+//! where it stopped parsing rather than that no version accepted it.
 //!
 //! The READINGS the refusal is built from — the unquoted word a parse stopped on where a
 //! value belongs, and otherwise the character or the end of input it stopped on together
@@ -38,13 +47,21 @@ fn invalid_payload_message(reading: &str) -> String {
     format!("{PAYLOAD_MEMBER} is not valid JSON: {reading}")
 }
 
-/// The refusal message for the FIRST descriptor payload of `descriptors` that is not valid
-/// JSON, or `None` when every payload the set carries parses.
+/// The refusal message for the FIRST descriptor payload of `descriptors` this service does
+/// not admit, or `None` when every payload the set carries is content it does.
 ///
 /// Called with the descriptors a request would leave on the record — the whole set, so the
 /// rule holds for every descriptor type and for the payloads nested in a descriptor's
-/// `additionalData` as much as for the top-level one.
+/// `additionalData` as much as for the top-level one. Every write path that accepts a
+/// descriptor goes through this one function, so a create and an edit admit the same
+/// payloads.
 pub fn refusal(descriptors: Option<&Descriptors>) -> Option<String> {
+    unparsed(descriptors).or_else(|| super::mcp_server_schema::refusal(descriptors))
+}
+
+/// The refusal for the first payload of the set that is not a JSON document at all, or
+/// `None` when every payload the set carries parses.
+fn unparsed(descriptors: Option<&Descriptors>) -> Option<String> {
     payloads(descriptors?).into_iter().find_map(|payload| {
         let error = ::serde_json::from_str::<::serde_json::Value>(payload).err()?;
         Some(invalid_payload_message(&reading(payload, &error)))

@@ -42,6 +42,12 @@ const TRANSITION_DEADLINE: Duration = Duration::from_secs(30);
 /// How long a poll loop pauses between two looks at a resource.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// An MCP server definition a supported MCP server schema version accepts: the MCP server
+/// descriptor's content is validated against that schema, so a patch that writes one carries
+/// a named server with a description and a version.
+const MCP_SERVER_DEFINITION: &str =
+    r#"{"name":"com.example/checkout","description":"Checkout tools","version":"1.4.2"}"#;
+
 /// One HTTP answer, reduced to what these tests assert on.
 struct Reply {
     status: u16,
@@ -351,7 +357,7 @@ async fn a_patch_is_applied_to_the_stored_record_and_served_by_every_read_path()
                     "optionalValue": {
                         "mcpServer": {
                             "optionalValue": {
-                                "data": { "optionalValue": "{\"tools\":[]}" },
+                                "data": { "optionalValue": MCP_SERVER_DEFINITION },
                                 "dataSchemaVersion": { "optionalValue": "2025-06-18" }
                             }
                         }
@@ -362,7 +368,7 @@ async fn a_patch_is_applied_to_the_stored_record_and_served_by_every_read_path()
                 "recordType": "CUSTOM",
                 "descriptors": {
                     "custom": { "data": "{\"created\":true}" },
-                    "mcpServer": { "data": "{\"tools\":[]}", "dataSchemaVersion": "2025-06-18" }
+                    "mcpServer": { "data": MCP_SERVER_DEFINITION, "dataSchemaVersion": "2025-06-18" }
                 }
             }),
         ),
@@ -375,7 +381,7 @@ async fn a_patch_is_applied_to_the_stored_record_and_served_by_every_read_path()
                         "custom": {},
                         "mcpServer": {
                             "optionalValue": {
-                                "data": { "optionalValue": "{\"tools\":[\"search\"]}" },
+                                "data": { "optionalValue": MCP_SERVER_DEFINITION },
                                 "additionalData": {
                                     "optionalValue": {
                                         "tools": {
@@ -395,7 +401,7 @@ async fn a_patch_is_applied_to_the_stored_record_and_served_by_every_read_path()
                 "recordType": "MCP",
                 "descriptors": {
                     "mcpServer": {
-                        "data": "{\"tools\":[\"search\"]}",
+                        "data": MCP_SERVER_DEFINITION,
                         "additionalData": {
                             "tools": { "data": "{\"count\":1}", "dataSchemaVersion": "2025-06-18" }
                         }

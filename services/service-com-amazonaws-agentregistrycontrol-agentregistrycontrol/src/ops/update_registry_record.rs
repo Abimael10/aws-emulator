@@ -435,9 +435,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The descriptors this edit would leave on the record: the stored set with the
         // patch applied. A descriptor's content is "serialized as descriptor payload data"
         // and validated against the protocol schema of the descriptor's type, so a patch
-        // that would leave a payload which is not even JSON is refused — the same check a
-        // create runs, applied to the result of the patch, so the invariant holds whichever
-        // operation wrote the payload. Nothing of the record has been written yet.
+        // that would leave a payload which is not even JSON, or one that no supported
+        // version of that descriptor's protocol schema accepts, is refused — the same check
+        // a create runs, applied to the result of the patch, so the invariant holds
+        // whichever operation wrote the payload. Nothing of the record has been written yet.
         let patched_descriptors = {
             let mut descriptors = record.descriptors.clone();
             patch_structure(

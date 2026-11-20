@@ -11,10 +11,17 @@
 //! descriptor's `additionalData` as much as for a descriptor's own. A refused create leaves
 //! the registry exactly as it was, so it occupies no name and appears in no listing.
 //!
+//! The second half of the same rule: content that IS JSON but that no supported version of
+//! the descriptor's own protocol schema accepts is refused the same way. The MCP server
+//! descriptor is "validated against the MCP protocol schema", so a payload that satisfies
+//! none of the supported MCP server schema versions is a 400 that writes nothing, while one
+//! that satisfies any of them is accepted, settles at `DRAFT` and is served back unchanged.
+//!
 //! Every test asserts over a TABLE of inputs, so it holds for a class of requests rather
 //! than for one recorded shape: the rows differ along which descriptor of the typed set
-//! carries the payload, how deep in that set it sits, and what KIND of JSON failure the
-//! payload has.
+//! carries the payload, how deep in that set it sits, what KIND of JSON failure the payload
+//! has, and — for the schema match — which member of a server definition is missing, of the
+//! wrong type or empty, and which supported version a payload is written for.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,6 +50,17 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// error list for these operations (`smithy_query(query="operation",
 /// operation="CreateRegistryRecord")`).
 const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// An MCP server definition a supported MCP server schema version accepts: a named server
+/// with a description and a version. Used wherever a row's subject is something OTHER than
+/// the MCP server descriptor's own content, so the server payload is never what refuses the
+/// request.
+const MCP_SERVER_DEFINITION: &str =
+    r#"{"name":"com.example/checkout","description":"Checkout tools","version":"1.4.2"}"#;
+
+/// How the service refuses an MCP server payload that no supported MCP server schema version
+/// accepts: fixed text throughout, naming the descriptor path whose content was matched.
+const MCP_SERVER_VERSION_MISMATCH: &str = "mcp.server data does not match any supported version";
 
 /// One HTTP answer, reduced to what these tests assert on.
 struct Reply {
@@ -310,7 +328,7 @@ fn invalid_rows() -> Vec<InvalidRow> {
                 record_type: "MCP",
                 descriptors: json!({
                     "mcpServer": {
-                        "data": "{\"tools\":[]}",
+                        "data": MCP_SERVER_DEFINITION,
                         "additionalData": { "tools": { "data": "undefined" } }
                     }
                 }),
@@ -407,7 +425,15 @@ fn valid_payloads() -> Vec<(&'static str, Payload)> {
             "an array",
             Payload {
                 record_type: "MCP",
-                descriptors: json!({ "mcpServer": { "data": "[{\"name\":\"search\"}]" } }),
+                // The array sits in the payload the MCP TOOLS descriptor carries: the
+                // server descriptor's own content has to be a server definition a supported
+                // MCP server schema version accepts, which the tests below are about.
+                descriptors: json!({
+                    "mcpServer": {
+                        "data": MCP_SERVER_DEFINITION,
+                        "additionalData": { "tools": { "data": "[{\"name\":\"search\"}]" } }
+                    }
+                }),
             },
         ),
         (
@@ -718,5 +744,332 @@ fn wrap_members(level: &Value) -> Value {
                 .collect(),
         ),
         leaf => leaf.clone(),
+    }
+}
+
+/// MCP server payloads that ARE JSON documents but that no supported MCP server schema
+/// version accepts. The rows differ along which member of a server definition is missing, is
+/// of the wrong JSON type or is empty; along the JSON value kind the payload is, since a
+/// server definition is an object and no other kind can be one; and along a document that is
+/// a DIFFERENT descriptor's content (a tools document) rather than a server definition.
+fn off_schema_server_payloads() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "an object carrying none of the server members",
+            r#"{"x": 1}"#,
+        ),
+        ("an object with no members at all", "{}"),
+        ("a name and nothing else", r#"{"name":"com.example/checkout"}"#),
+        (
+            "a definition with no description",
+            r#"{"name":"com.example/checkout","version":"1.4.2"}"#,
+        ),
+        (
+            "a definition with no version",
+            r#"{"name":"com.example/checkout","description":"Checkout tools"}"#,
+        ),
+        (
+            "a version_detail carrying no version",
+            r#"{"name":"com.example/checkout","description":"Checkout tools","version_detail":{}}"#,
+        ),
+        (
+            "a name that is empty",
+            r#"{"name":"","description":"Checkout tools","version":"1.4.2"}"#,
+        ),
+        (
+            "a version that is not a string",
+            r#"{"name":"com.example/checkout","description":"Checkout tools","version":2}"#,
+        ),
+        (
+            "a tools document where a server definition belongs",
+            r#"{"tools":[]}"#,
+        ),
+        (
+            "an array of server definitions",
+            r#"[{"name":"com.example/checkout","description":"Checkout tools","version":"1.4.2"}]"#,
+        ),
+        ("a string", r#""com.example/checkout""#),
+        ("a number", "17"),
+        ("a boolean", "true"),
+        ("the null literal", "null"),
+    ]
+}
+
+/// MCP server payloads a supported MCP server schema version DOES accept: one per supported
+/// version (they differ in where the definition's version sits), one carrying members beyond
+/// the ones a version requires, and one stating the payload's own schema version.
+fn on_schema_server_payloads() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("a server definition carrying its version", MCP_SERVER_DEFINITION),
+        (
+            "a server definition whose version sits in version_detail",
+            r#"{"name":"com.example/search","description":"Search tools","version_detail":{"version":"0.9.0"}}"#,
+        ),
+        (
+            "a definition carrying members beyond the required ones",
+            r#"{"name":"com.example/checkout","description":"Checkout tools","version":"1.4.2","websiteUrl":"https://example.test/checkout","packages":[],"repository":{"url":"https://example.test/checkout.git","source":"example"}}"#,
+        ),
+    ]
+}
+
+/// The descriptor sets a create is accepted with, built around the payloads a supported
+/// version accepts: the payload on its own, beside the tools the server exposes, and with
+/// the payload's schema version stated.
+fn on_schema_descriptor_sets() -> Vec<(&'static str, Value)> {
+    let mut sets: Vec<(&'static str, Value)> = on_schema_server_payloads()
+        .into_iter()
+        .map(|(case, payload)| (case, json!({ "mcpServer": { "data": payload } })))
+        .collect();
+    sets.push((
+        "a definition beside the tools the server exposes",
+        json!({
+            "mcpServer": {
+                "data": MCP_SERVER_DEFINITION,
+                "additionalData": { "tools": { "data": "[{\"name\":\"search\"}]" } }
+            }
+        }),
+    ));
+    sets.push((
+        "a definition with the payload's schema version stated",
+        json!({
+            "mcpServer": { "data": MCP_SERVER_DEFINITION, "dataSchemaVersion": "2025-09-29" }
+        }),
+    ));
+    sets
+}
+
+/// The patch body that writes `payload` into the stored MCP server descriptor's content.
+fn mcp_server_data_patch(payload: &str) -> Value {
+    json!({
+        "descriptors": {
+            "optionalValue": {
+                "mcpServer": { "optionalValue": { "data": { "optionalValue": payload } } }
+            }
+        }
+    })
+}
+
+#[tokio::test]
+async fn a_create_whose_mcp_server_payload_matches_no_schema_version_is_refused_and_writes_nothing()
+{
+    let router = router();
+    let registry_id = ready_registry(&router, "off schema mcp servers").await;
+
+    for (case, payload) in off_schema_server_payloads() {
+        let record_name = name_from("rec", case);
+        let refused = create_record(
+            &router,
+            &registry_id,
+            json!({
+                "name": record_name,
+                "recordType": "MCP",
+                "descriptors": { "mcpServer": { "data": payload } },
+            }),
+        )
+        .await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: a payload no supported MCP server schema version accepts is the \
+             modelled 400, got {} {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_code.as_deref(),
+            Some(VALIDATION_EXCEPTION),
+            "case {case:?}: expected error code {VALIDATION_EXCEPTION}, got {:?}",
+            refused.error_code
+        );
+        assert_eq!(
+            refused.message(),
+            MCP_SERVER_VERSION_MISMATCH,
+            "case {case:?}: expected the refusal to be worded {MCP_SERVER_VERSION_MISMATCH:?}, \
+             got {:?}",
+            refused.message()
+        );
+
+        // Nothing was written: no record of the requested name is in the registry.
+        let filtered = list_records(
+            &router,
+            &registry_id,
+            json!({ "filters": [{ "name": "name", "values": [record_name.clone()] }] }),
+        )
+        .await;
+        assert_eq!(
+            filtered.body["registryRecords"].as_array().map(Vec::len),
+            Some(0),
+            "case {case:?}: the refused record is in no listing of its name, got {:?}",
+            filtered.body
+        );
+
+        // And it took no name: the same name is still free for a definition a version takes.
+        let accepted = create_record(
+            &router,
+            &registry_id,
+            json!({
+                "name": record_name,
+                "recordType": "MCP",
+                "descriptors": { "mcpServer": { "data": MCP_SERVER_DEFINITION } },
+            }),
+        )
+        .await;
+        assert_eq!(
+            accepted.status, 202,
+            "case {case:?}: the refused create took no name, got {} {:?}",
+            accepted.status, accepted.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_create_whose_mcp_server_payload_matches_a_schema_version_is_accepted_and_served_back() {
+    let router = router();
+    let registry_id = ready_registry(&router, "on schema mcp servers").await;
+
+    for (case, descriptors) in on_schema_descriptor_sets() {
+        let created = create_record(
+            &router,
+            &registry_id,
+            json!({
+                "name": name_from("rec", case),
+                "recordType": "MCP",
+                "descriptors": descriptors.clone(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            created.status, 202,
+            "case {case:?}: a payload a supported version accepts is accepted, got {} {:?}",
+            created.status, created.body
+        );
+        let record_id = id_of(created.str_field("recordArn")).to_string();
+        let read = record_reaching(&router, case, &registry_id, &record_id, "DRAFT").await;
+        assert_eq!(
+            read.str_field("recordType"),
+            "MCP",
+            "case {case:?}: the record is read back as an MCP record, got {:?}",
+            read.body
+        );
+        assert_eq!(
+            read.body["descriptors"], descriptors,
+            "case {case:?}: the stored descriptors are the ones supplied, got {:?}",
+            read.body["descriptors"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_edit_whose_mcp_server_payload_matches_no_schema_version_is_refused_and_changes_nothing()
+{
+    let router = router();
+    let registry_id = ready_registry(&router, "edited off schema mcp").await;
+
+    for (case, payload) in off_schema_server_payloads() {
+        let created = create_record(
+            &router,
+            &registry_id,
+            json!({
+                "name": name_from("edit", case),
+                "recordType": "MCP",
+                "descriptors": { "mcpServer": { "data": MCP_SERVER_DEFINITION } },
+            }),
+        )
+        .await;
+        assert_eq!(
+            created.status, 202,
+            "case {case:?}: the record under edit is created, got {} {:?}",
+            created.status, created.body
+        );
+        let record_id = id_of(created.str_field("recordArn")).to_string();
+        let before = record_reaching(&router, case, &registry_id, &record_id, "DRAFT").await;
+
+        let refused = update_record(
+            &router,
+            &registry_id,
+            &record_id,
+            mcp_server_data_patch(payload),
+        )
+        .await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: an edit to a payload no supported version accepts is the modelled \
+             400, got {} {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_code.as_deref(),
+            Some(VALIDATION_EXCEPTION),
+            "case {case:?}: expected error code {VALIDATION_EXCEPTION}, got {:?}",
+            refused.error_code
+        );
+        assert_eq!(
+            refused.message(),
+            MCP_SERVER_VERSION_MISMATCH,
+            "case {case:?}: expected the refusal to be worded {MCP_SERVER_VERSION_MISMATCH:?}, \
+             got {:?}",
+            refused.message()
+        );
+
+        // The refused edit changed nothing: the record keeps its descriptors and its status.
+        let after = get_record(&router, &registry_id, &record_id).await;
+        assert_eq!(
+            (
+                after.body["descriptors"].clone(),
+                after.str_field("status").to_string()
+            ),
+            (
+                before.body["descriptors"].clone(),
+                before.str_field("status").to_string()
+            ),
+            "case {case:?}: the refused edit left the record alone, got {:?}",
+            after.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_edit_to_an_mcp_server_payload_a_schema_version_accepts_is_applied() {
+    let router = router();
+    let registry_id = ready_registry(&router, "edited on schema mcp").await;
+
+    for (case, payload) in on_schema_server_payloads() {
+        let created = create_record(
+            &router,
+            &registry_id,
+            json!({
+                "name": name_from("edit", case),
+                "recordType": "MCP",
+                "descriptors": { "mcpServer": { "data": "{\"name\":\"com.example/seed\",\
+                                  \"description\":\"Seed tools\",\"version\":\"0.1.0\"}" } },
+            }),
+        )
+        .await;
+        assert_eq!(
+            created.status, 202,
+            "case {case:?}: the record under edit is created, got {} {:?}",
+            created.status, created.body
+        );
+        let record_id = id_of(created.str_field("recordArn")).to_string();
+        record_reaching(&router, case, &registry_id, &record_id, "DRAFT").await;
+
+        let edited = update_record(
+            &router,
+            &registry_id,
+            &record_id,
+            mcp_server_data_patch(payload),
+        )
+        .await;
+        assert_eq!(
+            edited.status, 202,
+            "case {case:?}: a payload a supported version accepts is accepted on an edit, got \
+             {} {:?}",
+            edited.status, edited.body
+        );
+        let settled = record_reaching(&router, case, &registry_id, &record_id, "DRAFT").await;
+        assert_eq!(
+            settled.body["descriptors"]["mcpServer"]["data"],
+            Value::from(payload),
+            "case {case:?}: the edited payload is what a later read serves, got {:?}",
+            settled.body["descriptors"]
+        );
     }
 }
