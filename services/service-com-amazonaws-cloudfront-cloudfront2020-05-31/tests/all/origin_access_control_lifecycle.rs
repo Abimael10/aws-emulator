@@ -73,6 +73,10 @@ use crate::response_headers_policy_lifecycle::escape;
 /// than read from the crate, so a reworded refusal fails this suite.
 const NO_SUCH_CONTROL_MESSAGE: &str = "The specified origin access control does not exist.";
 
+/// The sentence it answers a value that could address no control of this service at all,
+/// spelled out here for the same reason.
+const UNREADABLE_ID_MESSAGE: &str = "Id format is invalid";
+
 // ---------------------------------------------------------------------------
 // Calling the origin access control surface
 // ---------------------------------------------------------------------------
@@ -487,23 +491,24 @@ async fn create_persists_the_configuration_every_read_then_reports() {
         );
     }
 
-    // An id no control holds exists in no namespace, and ONE sentence says so whatever shape
-    // the value takes: this read models no argument error to report an identifier under, so a
-    // well-shaped id nothing holds, another entity kind's own minted id, a lower-cased id, a
-    // bare word and a single digit all report the control that is absent.
+    // An id no control holds is answered under ONE code and its 404, and the sentence says
+    // WHICH way it failed to resolve: a value of the form this service mints a control's id
+    // in, holding nothing, is the control reported absent, while another entity kind's own
+    // minted id, a lower-cased id, a bare word, a single digit, an unminted namespace letter
+    // and a UUID could address no control at all and are the identifier reported unreadable.
     let distribution_id = created
         .first()
         .map(|(_, id)| id.clone())
         .unwrap_or_else(|| panic!("the table must create at least one control"));
-    for id in [
-        "E1AAAAAAAAAAAA",
-        "not-an-id",
-        "0",
-        distribution_id.to_lowercase().as_str(),
-        "W1AAAAAAAAAAAA",
-        "00000000-0000-0000-0000-000000000000",
+    let lower_cased = distribution_id.to_lowercase();
+    for (id, expected) in [
+        ("E1AAAAAAAAAAAA", NO_SUCH_CONTROL_MESSAGE),
+        ("not-an-id", UNREADABLE_ID_MESSAGE),
+        ("0", UNREADABLE_ID_MESSAGE),
+        (lower_cased.as_str(), UNREADABLE_ID_MESSAGE),
+        ("W1AAAAAAAAAAAA", UNREADABLE_ID_MESSAGE),
+        ("00000000-0000-0000-0000-000000000000", UNREADABLE_ID_MESSAGE),
     ] {
-        let expected = NO_SUCH_CONTROL_MESSAGE;
         let missing = get_control(&router, id).await;
         assert_eq!(
             missing.status, 404,

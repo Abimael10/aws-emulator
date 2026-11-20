@@ -1594,6 +1594,13 @@ pub fn latest_backup_plan_version_unreadable(plan_arn: &str) -> ResourceNotFound
 /// in `Context` — the member a client reads to learn what the rule got wrong —
 /// and states that same reason after the class's fixed prefix
 /// ([`MESSAGE_BACKUP_PLAN_RULES_PREFIX`]).
+///
+/// The envelope belongs to THIS class — the per-rule validations AWS Backup runs
+/// over a rule it is about to schedule jobs from, whose reasons it reports
+/// together under one token — and not to every condition a member inside a rule
+/// can meet: a condition with a token of its own is stated by its own builder,
+/// with its own sentence, wherever the member that carries it sits
+/// ([`rejected_lifecycle`], [`rejected_backup_vault_arn`]).
 pub fn rejected_backup_plan_rule(reason: &str) -> InvalidParameterValueException {
     InvalidParameterValueException {
         code: Some(ERROR_CODE_BACKUP_PLAN_RULE_INVALID.to_string()),
@@ -1601,27 +1608,6 @@ pub fn rejected_backup_plan_rule(reason: &str) -> InvalidParameterValueException
         context: Some(reason.to_string()),
         ..Default::default()
     }
-}
-
-/// `refusal`, as the same condition is stated when the member that carries it
-/// sits inside one of a plan body's RULES: the rule error after the class's
-/// fixed envelope ([`MESSAGE_BACKUP_PLAN_RULES_PREFIX`]).
-///
-/// A condition a rule of a backup plan fails is reported as a failure of that
-/// plan's RULES, which is what the envelope marks — so a client can attribute
-/// the refusal to `BackupPlan$Rules` rather than to a top-level plan parameter.
-/// Only the sentence changes: the condition's own token and `Context` are what
-/// they are wherever the condition is met, so the same condition stated by an
-/// operation on its own ([`rejected_lifecycle`]) and stated inside a rule carry
-/// one token and differ only in the envelope. Fixed text: nothing from the
-/// request enters it, so neither the rule's name nor its values appear.
-#[must_use]
-pub fn stated_in_plan_rule(
-    mut refusal: InvalidParameterValueException,
-) -> InvalidParameterValueException {
-    let reason = refusal.message.unwrap_or_default();
-    refusal.message = Some(format!("{MESSAGE_BACKUP_PLAN_RULES_PREFIX}{reason}"));
-    refusal
 }
 
 /// The modelled refusal for a call that would act under an IAM role AWS Backup
@@ -2354,7 +2340,8 @@ pub enum RejectedBackupPlanBody {
 ///   stored whose schedule nothing resolves;
 /// * every `Lifecycle` the rule carries \u2014 its own and each copy action's \u2014
 ///   leaves the interval the model requires between the transition to cold
-///   storage and the deletion ([`rejected_lifecycle`]);
+///   storage and the deletion ([`rejected_lifecycle`]), stated with that
+///   condition's own sentence;
 /// * the members that name a BACKUP VAULT by ARN carry one
 ///   ([`rejected_backup_vault_arn`]), rather than a rule being stored whose
 ///   destination no vault ARN resolves to.
@@ -2405,12 +2392,10 @@ pub fn rejected_backup_plan_body(plan: &BackupPlanInput) -> Option<RejectedBacku
         // The lifecycle of the rule, and of each of its copy actions, keeps the
         // interval the model requires between a transition to cold storage and
         // the deletion that follows it; one that does not is refused as the
-        // LIFECYCLE it is, with the class's own token and `Context`
-        // ([`rejected_lifecycle`]) — stated, because the member sits inside one
-        // of the plan's RULES, after the per-rule validation envelope
-        // ([`stated_in_plan_rule`]), so a lifecycle inside a plan body and one
-        // an operation takes on its own report one condition and differ only in
-        // that envelope.
+        // LIFECYCLE it is, with the class's own token, `Context` and sentence
+        // ([`rejected_lifecycle`]) — the same answer wherever a lifecycle is
+        // stated, since the condition is a parameter value's own and not one of
+        // the per-rule validations the rule-error envelope marks.
         let lifecycles = ::std::iter::once(rule.lifecycle.as_ref()).chain(
             rule.copy_actions
                 .iter()
@@ -2419,7 +2404,7 @@ pub fn rejected_backup_plan_body(plan: &BackupPlanInput) -> Option<RejectedBacku
         );
         for lifecycle in lifecycles {
             if let Some(refusal) = rejected_lifecycle(lifecycle) {
-                return Some(RejectedBackupPlanBody::Value(stated_in_plan_rule(refusal)));
+                return Some(RejectedBackupPlanBody::Value(refusal));
             }
         }
         // `TargetLogicallyAirGappedBackupVaultArn` and a copy action's

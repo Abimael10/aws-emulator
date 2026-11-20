@@ -279,7 +279,8 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for AuthorizationGate<Eng> {
             // constraint-checked, which is where AWS answers it
             // ([`command_execution_target`]). The operation decides the same thing for
             // itself; what is decided here is only the order.
-            if let Some(refused) = command_execution_target::refusal(operation, req) {
+            if let Some(refused) = command_execution_target::refusal(&*self.engine, operation, req)
+            {
                 return refused;
             }
             match self

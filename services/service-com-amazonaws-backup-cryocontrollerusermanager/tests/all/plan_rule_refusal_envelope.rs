@@ -1,29 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! WHERE a refused member SAT, as AWS Backup words the refusal, driven as real
-//! HTTP through the router.
+//! WHICH refusals of a backup plan body carry AWS Backup's rule-error envelope,
+//! driven as real HTTP through the router.
 //!
-//! The rule under test: a condition met by a member INSIDE one of a backup plan
-//! body's rules fails that rule's validation, so the sentence AWS answers is the
-//! condition's own reason after the fixed rule-error envelope
-//! (`crate::state`'s `MESSAGE_BACKUP_PLAN_RULES_PREFIX`), which is how a client
-//! attributes the refusal to `BackupPlan$Rules` rather than to a top-level plan
-//! parameter; the same condition met by a member an operation takes on its own
-//! is stated as the reason alone. The envelope is fixed text: nothing from the
-//! request enters it, so neither the plan's name nor the rule's appears, and the
-//! condition's own token and `Context` are the same on both sides of the
-//! distinction.
+//! The rule under test: the envelope (`crate::state`'s
+//! `MESSAGE_BACKUP_PLAN_RULES_PREFIX`) belongs to AWS Backup's PER-RULE
+//! VALIDATION class — the checks it runs over a rule it is about to schedule
+//! jobs from, whose reasons it reports together under that class's one token — so
+//! a reason of that class is stated after the envelope wherever a plan body is
+//! stored, while a condition with a TOKEN OF ITS OWN is stated by its own
+//! sentence alone, whichever member of the body carried it and whichever
+//! operation stored it. The envelope is fixed text: nothing from the request
+//! enters it, so neither the plan's name nor the rule's appears.
 //!
 //! The rows differ along what the rule generalises over: which condition the
-//! rule fails (the cold-storage interval of a lifecycle, a schedule expression
-//! that is not a cron expression), where inside the rule the member sits (the
-//! rule itself, one of its copy actions), which operation stores the body
+//! body fails (the cold-storage interval of a lifecycle, which carries its own
+//! token, and a schedule expression that is not a cron expression, which is one
+//! of the per-rule validations), where inside the rule the member sits (the rule
+//! itself, one of its copy actions), which operation stores the body
 //! (`CreateBackupPlan`, `UpdateBackupPlan`), and the day pair or expression the
 //! member carries. The operation-level side is driven through the two surfaces
-//! that take a `Lifecycle` of their own, `StartBackupJob` and `StartCopyJob`.
+//! that take a `Lifecycle` of their own, `StartBackupJob` and `StartCopyJob`,
+//! which answer the same sentence as the plan body's lifecycle.
 //!
 //! `lifecycle_cold_storage_interval.rs` owns the interval rule itself as a table
-//! of day pairs; this suite owns the wording the two positions earn, so neither
+//! of day pairs; this suite owns which refusals the envelope wraps, so neither
 //! file states the other's rule.
 //!
 //! The request harness (`call`, `call_reported`, `router`, `ACCOUNT`, `REGION`)
@@ -108,6 +109,9 @@ struct Row {
     reason: &'static str,
     code: &'static str,
     context: &'static str,
+    /// Whether the row's condition is one of the per-rule validations, whose
+    /// reason the envelope wraps.
+    enveloped: bool,
 }
 
 /// The rows the rule generalises over: both conditions, both positions, several
@@ -122,6 +126,7 @@ fn rows() -> Vec<Row> {
             reason: INTERVAL_REASON,
             code: INTERVAL_CODE,
             context: INTERVAL_CONTEXT,
+            enveloped: false,
         },
         Row {
             case: "a lifecycle on the rule, a deletion before the transition",
@@ -131,6 +136,7 @@ fn rows() -> Vec<Row> {
             reason: INTERVAL_REASON,
             code: INTERVAL_CODE,
             context: INTERVAL_CONTEXT,
+            enveloped: false,
         },
         Row {
             case: "a lifecycle on a copy action, both on the same day",
@@ -140,6 +146,7 @@ fn rows() -> Vec<Row> {
             reason: INTERVAL_REASON,
             code: INTERVAL_CODE,
             context: INTERVAL_CONTEXT,
+            enveloped: false,
         },
         Row {
             case: "a lifecycle on a copy action, a year-long pair a day short",
@@ -149,6 +156,7 @@ fn rows() -> Vec<Row> {
             reason: INTERVAL_REASON,
             code: INTERVAL_CODE,
             context: INTERVAL_CONTEXT,
+            enveloped: false,
         },
         Row {
             case: "a schedule expression that is not an expression at all",
@@ -158,6 +166,7 @@ fn rows() -> Vec<Row> {
             reason: CRON_REASON,
             code: "ERROR_3015",
             context: CRON_REASON,
+            enveloped: true,
         },
         Row {
             case: "a cron expression with too few fields",
@@ -167,6 +176,7 @@ fn rows() -> Vec<Row> {
             reason: CRON_REASON,
             code: "ERROR_3015",
             context: CRON_REASON,
+            enveloped: true,
         },
     ]
 }
@@ -191,14 +201,19 @@ impl Row {
         json!({"BackupPlan": {"BackupPlanName": name, "Rules": [rule]}})
     }
 
-    /// The sentence the row's condition earns inside a plan rule.
-    fn enveloped(&self) -> String {
-        format!("{RULE_ENVELOPE}{}", self.reason)
+    /// The sentence the row's condition earns from a plan body: the per-rule
+    /// validations after the envelope, every other condition on its own.
+    fn sentence(&self) -> String {
+        if self.enveloped {
+            format!("{RULE_ENVELOPE}{}", self.reason)
+        } else {
+            self.reason.to_string()
+        }
     }
 }
 
-/// Assert `answered` is the row's refusal, worded with the envelope.
-fn assert_enveloped(case: &str, status: u16, answered: &Value, row: &Row) {
+/// Assert `answered` is the row's refusal, worded as its class is worded.
+fn assert_worded(case: &str, status: u16, answered: &Value, row: &Row) {
     assert_eq!(
         (
             status,
@@ -209,18 +224,19 @@ fn assert_enveloped(case: &str, status: u16, answered: &Value, row: &Row) {
         (
             400,
             row.code.to_string(),
-            row.enveloped(),
+            row.sentence(),
             row.context.to_string(),
         ),
-        "case {case}: expected the per-rule refusal {:?}, got {status} {answered:?}",
-        row.enveloped()
+        "case {case}: expected the refusal {:?}, got {status} {answered:?}",
+        row.sentence()
     );
 }
 
-/// RULE: every operation that stores a plan body states a condition one of the
-/// body's rules fails after the rule-error envelope, and stores nothing.
+/// RULE: every operation that stores a plan body states a per-rule validation
+/// reason after the rule-error envelope and every other condition's reason on
+/// its own, and stores nothing either way.
 #[tokio::test]
-async fn a_condition_a_plan_rule_fails_is_stated_after_the_rule_error_envelope() {
+async fn a_refused_plan_body_is_worded_by_the_class_of_the_condition_it_failed() {
     for row in rows() {
         // CreateBackupPlan — the body is the one being stored.
         let router = router();
@@ -232,7 +248,7 @@ async fn a_condition_a_plan_rule_fails_is_stated_after_the_rule_error_envelope()
             Some(&row.plan_body("envelope-plan").to_string()),
         )
         .await;
-        assert_enveloped(&format!("CreateBackupPlan/{}", row.case), status, &answered, &row);
+        assert_worded(&format!("CreateBackupPlan/{}", row.case), status, &answered, &row);
 
         // Nothing was stored: the refused plan name is listed nowhere.
         let (status, listed) = call(&router, "GET", "/backup/plans", None).await;
@@ -277,7 +293,7 @@ async fn a_condition_a_plan_rule_fails_is_stated_after_the_rule_error_envelope()
             Some(&row.plan_body("envelope-plan").to_string()),
         )
         .await;
-        assert_enveloped(&format!("UpdateBackupPlan/{}", row.case), status, &answered, &row);
+        assert_worded(&format!("UpdateBackupPlan/{}", row.case), status, &answered, &row);
         let (status, read) = call(&router, "GET", &format!("/backup/plans/{plan_id}"), None).await;
         assert_eq!(
             (status, member(&read, "VersionId")),
@@ -290,10 +306,11 @@ async fn a_condition_a_plan_rule_fails_is_stated_after_the_rule_error_envelope()
 }
 
 /// RULE, the other side: a `Lifecycle` an operation takes on its OWN is refused
-/// for the same condition — one token, one `Context`, the same reason — stated
-/// without the envelope, because no plan rule carried it.
+/// for the same condition — one token, one `Context`, the same reason — which is
+/// the sentence a plan body's lifecycle earns too, because the condition carries
+/// a token of its own rather than being one of the per-rule validations.
 #[tokio::test]
-async fn a_lifecycle_an_operation_takes_itself_is_stated_without_the_envelope() {
+async fn a_lifecycle_an_operation_takes_itself_states_the_same_reason() {
     // (the surface, its method and path, the body the row sends)
     let lifecycles = [
         json!({"MoveToColdStorageAfterDays": 30, "DeleteAfterDays": 119}),

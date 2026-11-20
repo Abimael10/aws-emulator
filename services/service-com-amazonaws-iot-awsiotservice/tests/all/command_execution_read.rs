@@ -266,9 +266,8 @@ impl Emulator {
     }
 
     /// The same record as [`Emulator::seed`], for a device the thing REGISTRY does not
-    /// hold — which is what `StartCommandExecution` leaves behind when it is fired at a
-    /// target nobody created, the case the single-execution readers must answer from the
-    /// execution store rather than from the registry.
+    /// hold — the case a command-execution read and delete refuse on the TARGET, since the
+    /// ARN names no device of the account until the registry holds one.
     fn seed_without_the_device(&self, seed: &Seed<'_>) {
         self.insert_execution(seed);
     }
@@ -1393,17 +1392,17 @@ struct GhostCase {
     deletable: bool,
 }
 
-/// RULE: which device a command-execution `targetArn` names is read off the ARN alone, so
-/// the thing REGISTRY decides nothing about it: an execution stored for a device the
-/// registry does not hold — which is what `StartCommandExecution` leaves when it is fired
-/// at a target nobody created — is reported, timed out and deleted exactly like one of a
-/// registered device, an `executionId` such a device holds nothing under is the modelled
-/// 404, and reading it registers no thing.
+/// RULE: a command-execution `targetArn` names a DEVICE of the caller's account, so the
+/// account's thing REGISTRY is part of resolving it: a `thing/` ARN naming a device the
+/// registry does not hold names no device of the account, and both readers of one execution
+/// refuse it with the account's own authorization answer — HTTP 403 and the fixed sentence —
+/// before anything of the execution store is read, written or removed. Registering that
+/// device makes the very same request serve the stored execution, which is what shows the
+/// refusal is about the registry and not about the record.
 ///
 /// The rows span what the rule generalises over: the `CommandExecutionStatus` the record
-/// is read in (including the `TIMED_OUT` the clock owes, which is the only status an
-/// execution nothing can pick up ever reaches by itself), whether a timer is armed and on
-/// which side of the read its deadline falls, the form of the device's name (`ThingName`:
+/// would be read in (including the `TIMED_OUT` the clock owes), whether a timer is armed and
+/// on which side of the read its deadline falls, the form of the device's name (`ThingName`:
 /// len 1..128, `^[a-zA-Z0-9:_-]+$`) and the region the request is signed for.
 const GHOST_CASES: &[GhostCase] = &[
     GhostCase {
@@ -1459,9 +1458,13 @@ const GHOST_CASES: &[GhostCase] = &[
 ];
 
 #[tokio::test]
-async fn an_execution_of_an_unregistered_device_is_read_and_deleted_like_any_other() {
+async fn an_execution_of_an_unregistered_device_is_refused_on_its_target() {
     let emulator = Emulator::new();
     let now = now_epoch_seconds();
+
+    /// The fixed sentence the account's authorization answer carries, spelled out here
+    /// rather than read from the crate.
+    const NOT_IN_ACCOUNT: &str = "targetArn not found in account";
 
     for case in GHOST_CASES {
         let label = case.case;
@@ -1471,8 +1474,8 @@ async fn an_execution_of_an_unregistered_device_is_read_and_deleted_like_any_oth
             created.status, 200,
             "case {label:?}: the command must be creatable, got {created:?}"
         );
-        // The record the start leaves for a target the registry does not hold: no
-        // `CreateThing` is made for this device, here or anywhere in the case.
+        // A record stored for a target the registry does not hold: no `CreateThing` is
+        // made for this device until the second half of the case.
         emulator.seed_without_the_device(&Seed {
             execution_id: case.execution_id,
             thing_name: case.thing_name,
@@ -1487,22 +1490,61 @@ async fn an_execution_of_an_unregistered_device_is_read_and_deleted_like_any_oth
         });
 
         let target = target_arn(case.region, case.thing_name);
+        // Both readers of one execution answer the target, not the record.
+        for (operation, reply) in [
+            (
+                "GetCommandExecution",
+                emulator
+                    .get_execution(case.execution_id, &target, None, case.region)
+                    .await,
+            ),
+            (
+                "DeleteCommandExecution",
+                emulator
+                    .delete_execution(case.execution_id, &target, case.region)
+                    .await,
+            ),
+        ] {
+            assert_eq!(
+                (reply.status, reply.member("Message").as_str()),
+                (403, Some(NOT_IN_ACCOUNT)),
+                "case {label:?}: {operation} must refuse a target the registry does not \
+                 hold, got {reply:?}"
+            );
+        }
+        // Nothing was read, written or removed: the record is exactly as it was stored.
+        assert_eq!(
+            emulator.stored_status(case.thing_name, case.execution_id),
+            Some(case.stored_status.to_string()),
+            "case {label:?}: a refused request must leave the stored execution as it was"
+        );
+        // And a refused request registers no thing either.
+        let registered = emulator.registered_things(case.region).await;
+        assert!(
+            !registered.iter().any(|thing| thing == case.thing_name),
+            "case {label:?}: a refused request must register no thing, got {registered:?}"
+        );
+
+        // The SAME request once the account holds the device: the target names a device
+        // now, so the stored execution is served — which is what makes the refusal above
+        // a statement about the registry.
+        let registered = emulator.create_thing(case.thing_name, case.region).await;
+        assert_eq!(
+            registered.status, 200,
+            "case {label:?}: the device must be creatable, got {registered:?}"
+        );
         let reply = emulator
             .get_execution(case.execution_id, &target, None, case.region)
             .await;
         assert_eq!(
-            (reply.status, reply.error_code.as_deref()),
-            (200, None),
-            "case {label:?}: the execution of a device the registry does not hold must be \
-             readable, got {reply:?}"
-        );
-        assert_eq!(
             (
+                reply.status,
                 reply.member("executionId"),
                 reply.member("targetArn"),
                 reply.member("status"),
             ),
             (
+                200,
                 &json!(case.execution_id),
                 &json!(target),
                 &json!(case.reported_status),
@@ -1510,21 +1552,6 @@ async fn an_execution_of_an_unregistered_device_is_read_and_deleted_like_any_oth
             "case {label:?}: expected the stored execution of {target} in status {:?}, \
              got {reply:?}",
             case.reported_status
-        );
-        // The status the reader reported is the one the shared store now holds: the
-        // `TIMED_OUT` move was owed at the deadline, and nothing else moved.
-        let stored = emulator.stored_status(case.thing_name, case.execution_id);
-        assert_eq!(
-            stored.as_deref().and_then(command_execution_status),
-            Some(case.reported_status),
-            "case {label:?}: expected the shared store to hold {:?}, got {stored:?}",
-            case.reported_status
-        );
-        // Reading an execution of a device nobody created does not create that device.
-        let registered = emulator.registered_things(case.region).await;
-        assert!(
-            !registered.iter().any(|thing| thing == case.thing_name),
-            "case {label:?}: reading the execution must register no thing, got {registered:?}"
         );
 
         // The device holds exactly the execution the start left: another id is the

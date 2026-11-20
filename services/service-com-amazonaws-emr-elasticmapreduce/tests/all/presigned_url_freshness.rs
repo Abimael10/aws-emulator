@@ -28,10 +28,13 @@ use crate::job_flow_lifecycle::{at, kept_alive_request, Emr};
 use crate::on_cluster_app_ui::{assert_presigned_against_this_emulator, presigned_token};
 use crate::persistent_app_ui::opened_interface;
 
-/// Longer than the service's clock-owed transition span (500 ms), so a UI that was
-/// starting has been attached — which is what makes a presigned URL ready — by the time
-/// we look.
-const PAST_TRANSITION: Duration = Duration::from_millis(900);
+/// How often a UI's readiness is looked at again while it is still starting.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// A generous deadline for the clock-owed attach: the service owes that transition at a span
+/// of its own, and this suite waits for the CONDITION (the UI reporting a URL as ready)
+/// rather than for a time, so the bound only has to be far past that span on any host.
+const ATTACH_DEADLINE: Duration = Duration::from_secs(30);
 
 /// How many times each row asks for a URL.
 const REPEATS: usize = 3;
@@ -42,31 +45,21 @@ const REPEATS: usize = 3;
 /// `PersistentAppUIType` is `SHS | TEZ | YTS`.
 const PROFILER_TO_UI_TYPE: [(&str, &str); 3] = [("SHS", "SHS"), ("TEZUI", "TEZ"), ("YTS", "YTS")];
 
-/// One row: how the request selects the interface, and the application it names.
+/// One row: how the request names the interface, and the application it names.
 struct Case {
     label: &'static str,
-    /// Whether the request names the `PersistentAppUIType` the UI publishes, or leaves the
-    /// UI to answer for its own.
-    name_the_type: bool,
     /// "The application ID associated with the presigned URL"
     /// (`GetPersistentAppUIPresignedURL$ApplicationId`), when the row names one.
     application_id: Option<&'static str>,
 }
 
-const CASES: [Case; 3] = [
-    Case {
-        label: "the UI's own interface",
-        name_the_type: false,
-        application_id: None,
-    },
+const CASES: [Case; 2] = [
     Case {
         label: "the published type, named",
-        name_the_type: true,
         application_id: None,
     },
     Case {
         label: "one application's own interface",
-        name_the_type: false,
         application_id: Some("application_1700000000000_0001"),
     },
 ];
@@ -75,6 +68,28 @@ const CASES: [Case; 3] = [
 fn token_of(case: &str, url: &str) -> String {
     assert_presigned_against_this_emulator(case, url);
     presigned_token(case, url)
+}
+
+/// Look at `GetPersistentAppUIPresignedURL` again until the UI reports a URL as ready — the
+/// condition the clock-owed attach makes true — or a generous deadline passes.
+async fn await_ready(emr: &Emr, case: &str, id: &str, ui_type: &str) {
+    let deadline = std::time::Instant::now() + ATTACH_DEADLINE;
+    loop {
+        let out = emr
+            .ok(
+                "GetPersistentAppUIPresignedURL",
+                json!({ "PersistentAppUIId": id, "PersistentAppUIType": ui_type }),
+            )
+            .await;
+        if at(&out, &["PresignedURLReady"]).as_bool() == Some(true) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: the UI never reported a ready URL, last {out}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 #[tokio::test]
@@ -90,8 +105,8 @@ async fn every_call_presigns_the_url_afresh() {
             .to_string()
     };
 
-    // One UI per profiler the create accepts, all created before the wait below, so the
-    // whole table is attached by the time the first URL is asked for.
+    // One UI per profiler the create accepts, all created before the wait below, so every
+    // row's UI is attached by the time the first URL is asked for.
     let mut uis: Vec<(&str, &str, String)> = Vec::new();
     for (profiler, ui_type) in PROFILER_TO_UI_TYPE {
         let out = emr
@@ -106,7 +121,11 @@ async fn every_call_presigns_the_url_afresh() {
             .to_string();
         uis.push((profiler, ui_type, id));
     }
-    tokio::time::sleep(PAST_TRANSITION).await;
+    // Wait for what the rows need: each UI ATTACHED, which is what makes its presigned URL
+    // ready. Looked at again until it holds, so no row depends on how fast the host runs.
+    for (profiler, ui_type, id) in &uis {
+        await_ready(&emr, profiler, id, ui_type).await;
+    }
 
     // Every token this test ever sees, so freshness is asserted across the whole table
     // and not only within one row.
@@ -115,10 +134,8 @@ async fn every_call_presigns_the_url_afresh() {
     for (profiler, ui_type, id) in &uis {
         for case in &CASES {
             let label = format!("{profiler} / {}", case.label);
-            let mut request = json!({ "PersistentAppUIId": id });
-            if case.name_the_type {
-                request["PersistentAppUIType"] = json!(ui_type);
-            }
+            let mut request =
+                json!({ "PersistentAppUIId": id, "PersistentAppUIType": ui_type });
             if let Some(application_id) = case.application_id {
                 request["ApplicationId"] = json!(application_id);
             }
@@ -207,7 +224,7 @@ async fn a_ui_that_is_not_attached_yet_is_answered_without_a_url() {
     let answer = emr
         .ok(
             "GetPersistentAppUIPresignedURL",
-            json!({ "PersistentAppUIId": id }),
+            json!({ "PersistentAppUIId": id, "PersistentAppUIType": "SHS" }),
         )
         .await;
     assert_eq!(

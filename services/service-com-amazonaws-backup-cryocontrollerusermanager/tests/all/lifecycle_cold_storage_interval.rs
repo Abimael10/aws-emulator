@@ -21,11 +21,9 @@
 //! `Lifecycle`: a plan rule's own, the lifecycle of one of that rule's copy
 //! actions, the same rule stored by `UpdateBackupPlan`, and the lifecycle a
 //! `StartBackupJob` keeps its recovery point under. The condition is ONE, so
-//! every surface answers it with one token and one `Context` — the condition's
-//! own — and the sentence differs only in where the member sat: a lifecycle
-//! inside one of a plan's RULES fails that rule's validation, so its sentence
-//! carries AWS's rule-error envelope before the condition's fixed reason, while
-//! an operation that takes a lifecycle of its own states the reason alone.
+//! every surface answers it the same way — one token, one `Context` and one
+//! sentence, the condition's own — whether the member sat inside one of a plan's
+//! rules or was taken by the operation itself.
 //!
 //! The request harness (`router`, `call`, `call_reported`) is the one
 //! `vault_and_backup_job.rs` exposes to this test binary, so there is ONE wire
@@ -48,15 +46,6 @@ const INTERVAL_CONTEXT: &str = "90";
 /// (`MESSAGE_LIFECYCLE_COLD_STORAGE_INTERVAL`).
 const INTERVAL_REASON: &str = "Invalid lifecycle. DeleteAfterDays cannot be less than 90 days \
                                apart from MoveToColdStorageAfterDays";
-
-/// The envelope AWS states a per-rule validation failure of a backup plan body
-/// after (`MESSAGE_BACKUP_PLAN_RULES_PREFIX`), which the reason follows.
-const RULE_ENVELOPE: &str = "Error in some rules due to : ";
-
-/// The whole sentence a lifecycle stated inside one of a plan's rules earns.
-fn plan_rule_message() -> String {
-    format!("{RULE_ENVELOPE}{INTERVAL_REASON}")
-}
 
 /// The vault every row's job and copy destination names.
 const VAULT: &str = "lifecycle-vault";
@@ -269,7 +258,7 @@ async fn assert_plan_surface(surface: &str, row: &Row, on_rule: bool) {
             (
                 400,
                 INTERVAL_CODE.to_string(),
-                plan_rule_message(),
+                INTERVAL_REASON.to_string(),
                 INTERVAL_CONTEXT.to_string(),
             ),
             "case {surface}/{:?}: expected the interval refusal, got {status} \
@@ -319,7 +308,8 @@ async fn assert_plan_surface(surface: &str, row: &Row, on_rule: bool) {
 }
 
 /// Every surface that stores a plan body applies the interval rule: the rule's
-/// own lifecycle, a copy action's lifecycle, and the body an update stores.
+/// own lifecycle, a copy action's lifecycle, and the body an update stores. Each
+/// states the condition's own sentence, with nothing wrapped around it.
 #[tokio::test]
 async fn a_plan_body_is_stored_only_with_a_lifecycle_that_leaves_the_cold_storage_interval() {
     for row in rows() {
@@ -368,7 +358,7 @@ async fn a_plan_body_is_stored_only_with_a_lifecycle_that_leaves_the_cold_storag
                 (
                     400,
                     INTERVAL_CODE.to_string(),
-                    plan_rule_message(),
+                    INTERVAL_REASON.to_string(),
                     INTERVAL_CONTEXT.to_string(),
                 ),
                 "case UpdateBackupPlan/{:?}: expected the interval refusal, got \
@@ -392,9 +382,8 @@ async fn a_plan_body_is_stored_only_with_a_lifecycle_that_leaves_the_cold_storag
 /// The same interval rule decides whether a backup JOB is started: the
 /// recovery point it would create is kept under the lifecycle the request
 /// names, and the refusal reports the SAME condition a plan body's lifecycle
-/// does — one token, one `Context`, one reason — stated here without the
-/// rule-error envelope, because the lifecycle this operation refuses is its own
-/// rather than a member of one of a plan's rules.
+/// does — one token, one `Context`, one reason — because the condition is one
+/// wherever the member that carries it sits.
 #[tokio::test]
 async fn a_backup_job_is_started_only_with_a_lifecycle_that_leaves_the_cold_storage_interval() {
     for row in rows() {

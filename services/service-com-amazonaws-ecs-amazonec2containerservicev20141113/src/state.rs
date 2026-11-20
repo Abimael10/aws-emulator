@@ -3865,28 +3865,24 @@ impl TaskDefinitionRecord {
     /// on capacity Amazon ECS owns and so has no container instance whose own role the
     /// agent could pull under.
     ///
-    /// Managed-instances capacity is the one launch type with no documented task-definition
-    /// parameter requirement to meet, and no placement reaches it by naming it
-    /// ([`PLACEMENT_LAUNCH_TYPES`]), so no combination of a revision's parameters implies
-    /// it: it is reported only for a revision whose own `requiresCompatibilities` asked
-    /// Amazon ECS to validate it against that launch type.
+    /// Managed-instances capacity places a task on EC2 capacity Amazon ECS manages for the
+    /// caller, so it imposes no task-definition parameter requirement of its own — every
+    /// revision is validated against it, exactly as every revision is validated against
+    /// `EC2`. Which launch types a PLACEMENT may name outright is a further and narrower
+    /// question ([`PLACEMENT_LAUNCH_TYPES`]), decided where a `launchType` is checked
+    /// ([`validate_launch_type`]).
     ///
     /// What the REGISTRATION asked to be validated against (`requiresCompatibilities`) is
-    /// reported separately and unchanged: for a launch type whose requirements are
-    /// documented it neither adds one the parameters rule out nor withholds one they
-    /// support. Which of these launch types a PLACEMENT may name outright is a further
-    /// question, decided where a `launchType` is checked ([`validate_launch_type`]).
+    /// reported separately and unchanged: the derived list neither adds a launch type the
+    /// parameters rule out nor withholds one they support, so it is a function of the
+    /// revision's own parameters rather than of what the request asked for.
     pub fn compatibilities(&self) -> Vec<String> {
         let awsvpc = self.network_mode == NETWORK_MODE_AWSVPC;
         COMPATIBILITY_ORDER
             .iter()
             .filter(|launch_type| match **launch_type {
-                "EC2" => true,
+                "EC2" | "MANAGED_INSTANCES" => true,
                 "EXTERNAL" => !awsvpc,
-                "MANAGED_INSTANCES" => self
-                    .requires_compatibilities
-                    .iter()
-                    .any(|required| required == LAUNCH_TYPE_MANAGED_INSTANCES),
                 "FARGATE" => {
                     awsvpc
                         && self.cpu.is_some()

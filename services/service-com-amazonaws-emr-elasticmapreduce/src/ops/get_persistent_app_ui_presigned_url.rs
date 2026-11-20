@@ -7,11 +7,13 @@
 //! and presigned against this emulator for a bounded validity.
 //!
 //! An id no UI carries is refused with HTTP 400 `ValidationException` naming the profiler
-//! id behind `PersistentAppUIId`; a `PersistentAppUIType` the UI does not publish and an
-//! `ExecutionRoleArn` that is not the ARN of an IAM role are refused the same way, each
-//! naming its own member. While the UI is still starting there is nothing to open yet, which
-//! is exactly what `PresignedURLReady` reports: the call answers
-//! `PresignedURLReady: false` and no URL until the UI is attached.
+//! id behind `PersistentAppUIId`; a `PersistentAppUIType` the request does not state, or one
+//! the UI does not publish, is refused the same way naming that member — the request's own
+//! members are read before the account's state, so a request naming no interface to open is
+//! told about that member rather than about the id. An `ExecutionRoleArn` that is not the ARN
+//! of an IAM role is refused the same way too, naming its own member. While the UI is still
+//! starting there is nothing to open yet, which is exactly what `PresignedURLReady` reports:
+//! the call answers `PresignedURLReady: false` and no URL until the UI is attached.
 //!
 //! ## Shape of an operation
 //!
@@ -164,33 +166,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // The URL opens ONE of the user interfaces a persistent application UI publishes, so
+        // the request has to NAME which: a request that names none names no interface to open,
+        // which is what the member's own sentence reports
+        // ([`crate::state::PRESIGNED_URL_NO_SUCH_UI_MESSAGE`]). The request's own members are
+        // read before anything of the account is, so this is answered before the id is
+        // resolved — a request that gets both wrong is told about the member it carried.
+        let Some(requested_ui_type) = input.persistent_app_ui_type.as_deref() else {
+            return Err(refuse(
+                crate::state::PRESIGNED_URL_NO_SUCH_UI_MESSAGE.to_string(),
+            ));
+        };
+
         let mut store = state.lock();
 
         // An id this account holds no UI for is a client error, not an empty success or
         // a URL for a UI that does not exist. The member the refusal names is the one that
         // did not resolve — the profiler id behind `PersistentAppUIId`
-        // ([`crate::state::PRESIGNED_URL_NO_SUCH_PROFILER_MESSAGE`]) — and not the type,
-        // which this request may have got perfectly right.
+        // ([`crate::state::PRESIGNED_URL_NO_SUCH_PROFILER_MESSAGE`]).
         let Some(record) = store.persistent_app_ui_mut(&input.persistent_app_ui_id, now) else {
             return Err(refuse(
                 crate::state::PRESIGNED_URL_NO_SUCH_PROFILER_MESSAGE.to_string(),
             ));
         };
 
-        // The URL opens one of the user interfaces this UI publishes: the one the
-        // request names, or its own when the request names none. A type it does not
-        // publish resolves to no interface, the same way an unknown id does.
-        let ui_type = match input.persistent_app_ui_type.as_deref() {
-            Some(requested) => {
-                if !record.serves(requested) {
-                    return Err(refuse(
-                        crate::state::PRESIGNED_URL_NO_SUCH_UI_MESSAGE.to_string(),
-                    ));
-                }
-                requested.to_string()
-            }
-            None => record.default_ui_type().to_string(),
-        };
+        // A type the UI does not publish resolves to no interface, which is the same
+        // condition the request naming no type at all meets, so it states the same sentence.
+        if !record.serves(requested_ui_type) {
+            return Err(refuse(
+                crate::state::PRESIGNED_URL_NO_SUCH_UI_MESSAGE.to_string(),
+            ));
+        }
+        let ui_type = requested_ui_type.to_string();
 
         // "Used to determine if the presigned URL is ready."
         // (`GetPersistentAppUIPresignedURLOutput$PresignedURLReady` doc.) A UI the

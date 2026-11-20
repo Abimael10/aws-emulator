@@ -7,23 +7,21 @@
 //! steps — the read of the name and the insert — and each refusal is worded by
 //! the step that caught it, both as `InvalidRequestException` at HTTP 400:
 //!
-//! * a name taken by a DIFFERENT rule, settled there before the request
-//!   arrived, is refused by the read, with the service's fixed sentence for that
-//!   condition, which interpolates nothing from the request and nothing from the
-//!   service's state — so neither the name asked for nor any identifier of the
-//!   rule in the way appears in it, and the same sentence answers whichever held
-//!   rule is in the way, in whichever Region, however many callers ask one after
-//!   another, and whether or not the name was held by an earlier rule since
-//!   deleted;
+//! * a name already HELD and settled there before the request arrived is refused
+//!   by the read — whatever rule that create submits, since what the read reads
+//!   is the NAME — with the service's fixed sentence for that condition, which
+//!   interpolates nothing from the request and nothing from the service's state,
+//!   so neither the name asked for nor any identifier of the rule in the way
+//!   appears in it, and the same sentence answers whichever held rule is in the
+//!   way, in whichever Region, however many callers ask one after another, and
+//!   whether or not the name was held by an earlier rule since deleted;
 //! * a create that read passes — one that read the name as FREE and then lost
-//!   the insert to another create IN FLIGHT beside it, or one that asks for
-//!   EXACTLY the rule already stored under the name, which states no second rule
-//!   for it — reaches the insert and is refused by the uniqueness constraint of
-//!   the store the rule is written through, whose sentence speaks of resources
-//!   rather than of rules: it names the resource holding the name by the internal
-//!   id it is held under — one id across every loser of one race, and a different
-//!   one for a name created again after a delete, because that is a different
-//!   resource.
+//!   the insert to another create IN FLIGHT beside it — reaches the insert and is
+//!   refused by the uniqueness constraint of the store the rule is written
+//!   through, whose sentence speaks of resources rather than of rules: it names
+//!   the resource holding the name by the internal id it is held under — one id
+//!   across every loser of one race, and a different one for a name created again
+//!   after a delete, because that is a different resource.
 //!
 //! Together those are what let a caller tell a name collision from the
 //! operation's other `InvalidRequestException`s, which carry the same status and
@@ -34,8 +32,9 @@
 //! under a freed name), along the Region the reserved name is asked for in,
 //! along the priority the losing create carries, along WHICH member of the rule
 //! the losing create states differently (and along stating none of them
-//! differently), along how many callers ask for one name, and along whether
-//! those callers are sequential or in flight together.
+//! differently, i.e. restating the stored rule exactly), along how many callers
+//! ask for one name, and along whether those callers are sequential or in flight
+//! together.
 //! `graphs_rules_retrievals_and_insights` grades the in-flight case once more,
 //! over the five joined creates it fires for one name.
 
@@ -302,11 +301,10 @@ async fn callers_asking_one_after_another_each_read_the_name_as_held() {
     }
 }
 
-/// RULE: what the service's own read of the name refuses is a name taken by a
-/// DIFFERENT rule, so a create stating exactly the rule already stored under the
-/// name reaches the insert and is refused by the store's uniqueness constraint,
-/// for the resource holding the name — while a create differing in ANY member of
-/// the rule is refused by that read.
+/// RULE: what the service's own read of the name refuses is a name already HELD,
+/// so the rule a late create submits decides nothing: a create stating exactly
+/// the rule already stored under the name and one differing in ANY member of it
+/// are both refused by that read, with the one fixed sentence.
 ///
 /// The rows walk every member of `SamplingRule` a caller supplies
 /// (`smithy_query(query="shape",shape="SamplingRule")`), each stated differently
@@ -314,7 +312,7 @@ async fn callers_asking_one_after_another_each_read_the_name_as_held() {
 /// sequential calls, so what separates the rows is the rule they submit and
 /// nothing about timing.
 #[tokio::test]
-async fn a_create_of_the_rule_already_stored_is_refused_for_the_resource_holding_the_name() {
+async fn a_create_of_a_held_name_is_refused_by_the_name_read_whatever_rule_it_submits() {
     let xray = Xray::new();
     let name = "granite-sampler";
     // The rule under test carries a value for every member a caller may state,
@@ -342,21 +340,17 @@ async fn a_create_of_the_rule_already_stored_is_refused_for_the_resource_holding
         "the rule under test must be created, got {created:?}"
     );
 
-    // Stating exactly that rule again: the name read has no second rule to
-    // refuse, so the constraint answers, naming the resource holding the name.
+    // Stating exactly that rule again: the name is held, which is what the read
+    // refuses, so the fixed sentence answers rather than the constraint's.
     let identical = xray.call("/CreateSamplingRule", &stored).await;
-    let held_id = refused_for_the_resource_that_won("the rule already stored", &identical);
-    // Asked again, the answer is the same: the id belongs to the stored
-    // resource, not to the request.
+    refused_as_already_existing("the rule already stored", &identical);
+    // Asked again, the answer is the same sentence: nothing about the stored
+    // resource or the request enters it.
     let twice = xray.call("/CreateSamplingRule", &stored).await;
-    assert_eq!(
-        refused_for_the_resource_that_won("the rule already stored, twice", &twice),
-        held_id,
-        "the resource holding the name does not change between two creates of it, got {twice:?}"
-    );
+    refused_as_already_existing("the rule already stored, twice", &twice);
 
-    // One member stated differently, per member: that is a second rule for the
-    // name, which the service's own read refuses.
+    // One member stated differently, per member: the name is held either way, so
+    // the same read refuses it with the same sentence.
     let differences: Vec<(&str, Value)> = vec![
         ("ResourceARN", json!("arn:aws:ec2:us-east-1:000000000000:instance/i-0")),
         ("Priority", json!(501)),
@@ -380,8 +374,8 @@ async fn a_create_of_the_rule_already_stored_is_refused_for_the_resource_holding
         refused_as_already_existing(&format!("a rule differing in {member} ({value})"), &answer);
     }
 
-    // None of those refusals touched the stored rule: the name is held once, by
-    // the resource every refusal named.
+    // None of those refusals touched the stored rule: the name is still held
+    // exactly once.
     assert_eq!(
         times_held(&xray, name).await,
         1,

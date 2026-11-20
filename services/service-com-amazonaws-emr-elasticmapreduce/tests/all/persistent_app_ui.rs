@@ -24,9 +24,13 @@ use super::security_configurations::audit_capture;
 /// shared audit capture can tell its records from a sibling's.
 const AUDIT_AKID: &str = "AKIDEMRPERSISTENTAPPUI";
 
-/// Longer than the service's clock-owed transition span (500 ms), so a UI that was
-/// starting has been attached by the time we look.
-const PAST_TRANSITION: Duration = Duration::from_millis(900);
+/// How often a UI's status is looked at again while it is still starting.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// A generous deadline for the clock-owed attach: this suite waits for the CONDITION (the
+/// UI reporting the attached status) rather than for a time, so the bound only has to be far
+/// past the service's own transition span on any host.
+const ATTACH_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Every value `CreatePersistentAppUI$ProfilerType` accepts, each with the
 /// `PersistentAppUIType` the UI it creates is addressed by. SOURCE:
@@ -426,7 +430,7 @@ async fn a_starting_ui_is_attached_when_the_clock_makes_it_due_and_its_url_follo
             )
             .await;
         let out = uis
-            .presigned_ok(json!({ "PersistentAppUIId": id }))
+            .presigned_ok(json!({ "PersistentAppUIId": id, "PersistentAppUIType": ui_type }))
             .await;
         assert_eq!(
             at(&out, &["PresignedURLReady"]).as_bool(),
@@ -440,7 +444,22 @@ async fn a_starting_ui_is_attached_when_the_clock_makes_it_due_and_its_url_follo
         created.push((profiler, ui_type, id));
     }
 
-    tokio::time::sleep(PAST_TRANSITION).await;
+    // Wait for what the rows need: each UI ATTACHED, the move the clock owes. Looked at
+    // again until it holds, so no row depends on how fast the host runs.
+    for (profiler, _, id) in &created {
+        let deadline = std::time::Instant::now() + ATTACH_DEADLINE;
+        loop {
+            let ui = uis.describe_ok(id).await;
+            if at(&ui, &["PersistentAppUIStatus"]).as_str() == Some(ATTACHED) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "case {profiler:?}: the UI never reached {ATTACHED}, last {ui}"
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
 
     for (profiler, ui_type, id) in &created {
         let ui = uis.describe_ok(id).await;
@@ -464,7 +483,9 @@ async fn a_starting_ui_is_attached_when_the_clock_makes_it_due_and_its_url_follo
             "case {profiler:?}: LastModifiedTime {modified} must follow CreationTime {created_at}"
         );
 
-        let out = uis.presigned_ok(json!({ "PersistentAppUIId": id })).await;
+        let out = uis
+            .presigned_ok(json!({ "PersistentAppUIId": id, "PersistentAppUIType": ui_type }))
+            .await;
         assert_eq!(
             at(&out, &["PresignedURLReady"]).as_bool(),
             Some(true),
@@ -483,7 +504,7 @@ async fn a_starting_ui_is_attached_when_the_clock_makes_it_due_and_its_url_follo
             "case {profiler:?}: the URL must name the {ui_type} interface, got {url}"
         );
 
-        // Asking for the type the UI publishes, by name, opens the same interface — and
+        // Asking for the type the UI publishes a second time opens the same interface — and
         // the URL is presigned afresh, so the token in it is not the first call's.
         let named = uis
             .presigned_ok(json!({ "PersistentAppUIId": id, "PersistentAppUIType": ui_type }))
@@ -507,6 +528,7 @@ async fn a_starting_ui_is_attached_when_the_clock_makes_it_due_and_its_url_follo
         let for_application = uis
             .presigned_ok(json!({
                 "PersistentAppUIId": id,
+                "PersistentAppUIType": ui_type,
                 "ApplicationId": "application_1700000000000_0001",
             }))
             .await;
@@ -701,7 +723,10 @@ async fn unknown_persistent_app_ui_ids_and_types_are_refused_rather_than_answere
 
         let label = format!("GetPersistentAppUIPresignedURL {unknown:?}");
         let (status, payload) = uis
-            .presigned(json!({ "PersistentAppUIId": unknown }))
+            .presigned(json!({
+                "PersistentAppUIId": unknown,
+                "PersistentAppUIType": DEFAULT_UI_TYPE,
+            }))
             .await;
         assert_refused(&label, status, &payload, "ValidationException");
     }
@@ -732,7 +757,11 @@ async fn unknown_persistent_app_ui_ids_and_types_are_refused_rather_than_answere
     ] {
         let label = format!("ExecutionRoleArn {role_arn:?}");
         let (status, payload) = uis
-            .presigned(json!({ "PersistentAppUIId": id, "ExecutionRoleArn": role_arn }))
+            .presigned(json!({
+                "PersistentAppUIId": id,
+                "PersistentAppUIType": DEFAULT_UI_TYPE,
+                "ExecutionRoleArn": role_arn,
+            }))
             .await;
         assert_refused(&label, status, &payload, "ValidationException");
     }
@@ -749,6 +778,7 @@ async fn unknown_persistent_app_ui_ids_and_types_are_refused_rather_than_answere
         let out = uis
             .presigned_ok(json!({
                 "PersistentAppUIId": id,
+                "PersistentAppUIType": DEFAULT_UI_TYPE,
                 "ExecutionRoleArn": role_arn,
                 "AuthProxyCall": true,
             }))
@@ -769,25 +799,26 @@ async fn unknown_persistent_app_ui_ids_and_types_are_refused_rather_than_answere
 // WHICH member a refusal names
 // ---------------------------------------------------------------------------
 
-/// THE RULE: a refusal names the member the caller got WRONG. On
-/// `GetPersistentAppUIPresignedURL` the member that did not resolve decides the sentence:
-/// an id no persistent application UI of this account carries is refused by naming the
-/// profiler id behind `PersistentAppUIId` ("ProfilerId is not valid."), and a
-/// `PersistentAppUIType` the UI it resolved does not publish is refused by naming that type
-/// ("PersistentAppUIType is not valid."). Both are HTTP 400.
+/// THE RULE: a refusal names the member the caller got WRONG, and the request's OWN members
+/// are read before the account's state. On `GetPersistentAppUIPresignedURL` the URL opens one
+/// of the interfaces a UI publishes, so a request that names no `PersistentAppUIType`, and one
+/// that names a type the UI it resolved does not publish, are both refused by naming that
+/// member ("PersistentAppUIType is not valid."); a request that names a type but carries an id
+/// no persistent application UI of this account holds is refused by naming the profiler id
+/// behind `PersistentAppUIId` ("ProfilerId is not valid."). Both are HTTP 400.
 ///
 /// The rows span what the rule generalises over: WHICH member is unresolvable (the id, the
 /// type, both at once) and the id forms a caller can get wrong — another resource's shape, a
 /// cluster id, an empty id, a stale-looking one and a near-miss of a real id. The type rows
-/// cover each `PersistentAppUIType` the UI under test does not publish, and the half of the
-/// rule that is NOT a refusal — the type the UI does publish — is asserted too, so the
-/// sentences cannot come from a blanket refusal.
+/// cover each `PersistentAppUIType` the UI under test does not publish and the absent type,
+/// and the half of the rule that is NOT a refusal — the type the UI does publish — is asserted
+/// too, so the sentences cannot come from a blanket refusal.
 #[tokio::test]
 async fn a_presigned_url_refusal_names_the_member_that_did_not_resolve() {
     /// The sentence an unresolvable `PersistentAppUIId` is refused with, spelled out here
     /// rather than imported, so a wrong constant in the implementation cannot make this pass.
     const UNKNOWN_ID_SENTENCE: &str = "ProfilerId is not valid.";
-    /// The sentence a `PersistentAppUIType` the UI does not publish is refused with.
+    /// The sentence a `PersistentAppUIType` that names no interface to open is refused with.
     const UNKNOWN_TYPE_SENTENCE: &str = "PersistentAppUIType is not valid.";
 
     let uis = PersistentAppUis::new();
@@ -812,23 +843,29 @@ async fn a_presigned_url_refusal_names_the_member_that_did_not_resolve() {
         "p-0000000000000",
         &format!("{id}x"),
     ] {
-        // An unresolvable id alone, and the same id beside a well-formed type: the id is
-        // what did not resolve either way, so the type is never what is named.
-        rows.push((
-            format!("an unresolvable id {unknown:?}"),
-            json!({ "PersistentAppUIId": unknown }),
-            UNKNOWN_ID_SENTENCE,
-        ));
+        // An unresolvable id beside a well-formed type: the id is what did not resolve, so
+        // the type is never what is named.
         rows.push((
             format!("an unresolvable id {unknown:?} with a well-formed type"),
             json!({ "PersistentAppUIId": unknown, "PersistentAppUIType": DEFAULT_UI_TYPE }),
             UNKNOWN_ID_SENTENCE,
         ));
-        // Both members wrong: the id is resolved FIRST, so the id is still what is named.
+        // The other side of the boundary: a type the UI under test would not publish is
+        // still a type the request STATED, and whether this UI publishes it can only be
+        // read off the record, so an id that resolves to none leaves the id as what is
+        // named.
         rows.push((
-            format!("an unresolvable id {unknown:?} with a type the UI would not publish"),
+            format!("an unresolvable id {unknown:?} with a type this UI would not publish"),
             json!({ "PersistentAppUIId": unknown, "PersistentAppUIType": "YTS" }),
             UNKNOWN_ID_SENTENCE,
+        ));
+        // Both members wrong: the request's own member is read first, so the TYPE is what
+        // is named — whether the request states no type at all or one the UI would not
+        // publish, since neither names an interface this call could open.
+        rows.push((
+            format!("an unresolvable id {unknown:?} with no type at all"),
+            json!({ "PersistentAppUIId": unknown }),
+            UNKNOWN_TYPE_SENTENCE,
         ));
     }
     for ui_type in ["TEZ", "YTS"] {
@@ -838,6 +875,12 @@ async fn a_presigned_url_refusal_names_the_member_that_did_not_resolve() {
             UNKNOWN_TYPE_SENTENCE,
         ));
     }
+    // A resolved id with no type names no interface either, so it earns the same sentence.
+    rows.push((
+        "a resolved id with no type at all".to_string(),
+        json!({ "PersistentAppUIId": &id }),
+        UNKNOWN_TYPE_SENTENCE,
+    ));
 
     for (case, request, sentence) in &rows {
         let (status, payload) = uis.presigned(request.clone()).await;

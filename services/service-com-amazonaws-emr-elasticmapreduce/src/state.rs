@@ -4584,14 +4584,6 @@ impl PersistentAppUIRecord {
         self.ui_types.iter().any(|served| served == ui_type)
     }
 
-    /// The UI type a presigned-URL request that names none is answered for: the first
-    /// this UI publishes.
-    pub fn default_ui_type(&self) -> &str {
-        self.ui_types
-            .first()
-            .map_or(DEFAULT_PERSISTENT_APP_UI_TYPE, String::as_str)
-    }
-
     /// The wire `PersistentAppUI` for this record — what `DescribePersistentAppUI`
     /// answers with.
     pub fn to_wire(&self) -> PersistentAppUI {

@@ -37,6 +37,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE;
 
+/// The sentence this surface answers a value that could address no control of this service,
+/// spelled out here rather than read from the crate, so a reworded refusal fails this suite.
+const UNREADABLE_ID_MESSAGE: &str = "Id format is invalid";
+
 use crate::distribution_lifecycle::{
     call, create_distribution, emulator, is_version_token, update_distribution, Answer,
     API_VERSION,
@@ -449,7 +453,8 @@ async fn a_delete_lands_only_on_the_current_version() {
 }
 
 /// An id no control holds is `NoSuchOriginAccessControl`, whatever the request says about
-/// the version — and nothing the account holds is touched.
+/// the version, with the sentence for the way it failed to resolve — and nothing the account
+/// holds is touched.
 #[tokio::test]
 async fn an_id_no_control_holds_is_refused() {
     let router = emulator();
@@ -457,25 +462,18 @@ async fn an_id_no_control_holds_is_refused() {
     let (id, etag) = create(&router, &rows[0]).await;
 
     // Ids no control holds: one of the shape this service mints, one of another entity
-    // family's shape, and one that is no entity id at all. This route reads NO form of the
-    // value — the model constrains `Id` no further than `string` and gives it one lookup
-    // failure — so every one of them is the control reported absent.
+    // family's shape, and one that is no entity id at all. The first could address a
+    // control of this service and holds nothing, so it is the control reported absent; the
+    // other two are written in no form a control's id takes, so they are the identifier
+    // this route cannot read.
     for (case, missing, expected) in [
         (
             "minted-shape",
             "E1A2B3C4D5E6F7",
             NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE,
         ),
-        (
-            "another-family",
-            "cg_1A2B3C4D5E6F7",
-            NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE,
-        ),
-        (
-            "not-an-id",
-            "no-such-control",
-            NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE,
-        ),
+        ("another-family", "cg_1A2B3C4D5E6F7", UNREADABLE_ID_MESSAGE),
+        ("not-an-id", "no-such-control", UNREADABLE_ID_MESSAGE),
     ] {
         for (version_case, if_match) in [("no-if-match", None), ("current-of-another", Some(&etag))]
         {
