@@ -909,17 +909,31 @@ async fn send_message(
 /// What a refusal by the action's ROLE says, as the rule-failure report carries it: the
 /// identity-based sentence AWS words for a principal whose own documents do not allow the call
 /// ([`::service_common::iam_authorization::not_authorized_by_identity_policy`]), naming the
-/// role the action asked this service to act as, the call it asked for and the target it asked
+/// SESSION this service performs the action as, the call it asked for and the target it asked
 /// for. The one sentence serves every action that names a role, so two of them cannot word the
 /// same refusal differently.
+///
+/// The principal is the session and not the role itself: an action names "the ARN of the IAM
+/// role that grants access" to its target and AWS IoT acts AS that role, which is done by
+/// assuming it — so the identity the refused call was made by is a session of the role
+/// ([`::service_common::iam_role::assumed_role_session_arn`], the tree's one shaping of that
+/// principal) and that is what the target service's access-denied sentence is about.
 fn role_refusal(role_arn: &str, action: &str, resource: &str) -> String {
     ::service_common::iam_authorization::not_authorized_by_identity_policy(
-        role_arn,
+        &::service_common::iam_role::assumed_role_session_arn(role_arn, ROLE_SESSION_NAME),
         action,
         resource,
         &::service_common::iam_authorization::no_identity_policy_allows(action),
     )
 }
+
+/// The name of the role SESSION the rules engine performs a rule's actions under, which the
+/// principal of a refusal naming that session carries.
+///
+/// The role is the action's; the session NAME is the acting service's, and AWS IoT publishes no
+/// name for the sessions its rules engine opens, so this is the emulator's own stable name for
+/// them — the one part of the principal that is not read off the action's `roleArn`.
+pub const ROLE_SESSION_NAME: &str = "AWSIoTRulesEngine";
 
 /// What a target service's refusal of an action's call SAYS, as the rule-failure report carries
 /// it: that service's own message where it worded one, and the error code it answered where it

@@ -60,7 +60,14 @@ const MINUTE: Duration = Duration::from_secs(60);
 /// instants those occurrences fall on: room for the clock's tick, the publish, the
 /// fan-out and the poll itself on a loaded host. Nothing is asserted about how long any
 /// of that took — this only bounds how long the suite looks.
-const DELIVERY_SLACK: Duration = Duration::from_secs(40);
+///
+/// Generous rather than tight on purpose, and generous by more than one cadence: a clock
+/// that woke late on a loaded host catches up to the next instant ahead rather than owing
+/// the occurrence it slept through, so a row waiting for its SECOND occurrence can have to
+/// wait out another period before one arrives. A run where every occurrence is on time
+/// reaches none of this, because each pass looks again for the CONDITION and the loop ends
+/// as soon as every row has what it is judged on.
+const DELIVERY_SLACK: Duration = Duration::from_secs(100);
 
 /// How far ahead of the write the `StartDate` row states its floor: far enough that every
 /// row's setup can have run before it on a loaded host, and short enough that one poll loop

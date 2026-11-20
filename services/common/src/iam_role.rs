@@ -149,6 +149,52 @@ fn assumed_role_session(session_arn: &str) -> Option<(&str, &str)> {
     (!role.is_empty() && !session.is_empty()).then_some((role, session))
 }
 
+/// The ARN of the SESSION a service acts as while it performs a call under the role
+/// `role_arn`, opened under the session name `session_name`:
+/// `arn:<partition>:sts::<account>:assumed-role/<role name>/<session name>`.
+///
+/// This is the WRITING counterpart of the two readings above, and the identity an
+/// authorization refusal of such a call is about: a role is never acted as directly — a
+/// service that assumes one makes its calls as a session of it, and the permissions in force
+/// on that session are the role's. So a service stating why a call it made under a
+/// caller-supplied role was refused names the session here rather than spelling the role's own
+/// ARN into the sentence
+/// ([`crate::iam_authorization::not_authorized_by_identity_policy`]).
+///
+/// The partition and the account are the ROLE's own, read off its ARN through the crate's one
+/// ARN parse, so a role of another partition or account is named as that role's session rather
+/// than as this emulator's. The role name is the last segment of the ARN's resource, so a role
+/// held under a path (`role/service-role/<name>`) is named the way IAM holds it; a value that
+/// names no role at all is carried into the session ARN as it stands, because a sentence about
+/// it still has to say what the action asked to act as.
+///
+/// `session_name` is the caller's: the name of the session the acting service opens, which
+/// each such service states once for itself. Two private copies of this shaping predate this
+/// function — `assumed_role_principal` in the AppSync crate's
+/// `service::graphql_api::data_source_role` and `session_principal` in its
+/// `service::graphql_api::lambda` — and both are to be MIGRATED onto it in the change that owns
+/// that service.
+#[must_use]
+pub fn assumed_role_session_arn(role_arn: &str, session_name: &str) -> String {
+    let parsed = crate::arn::parse(role_arn);
+    let partition = parsed.map_or(DEFAULT_PARTITION, |arn| arn.partition);
+    let account = parsed.map_or("", |arn| arn.account);
+    let role = parsed
+        .map(|arn| arn.resource)
+        .and_then(|resource| resource.strip_prefix(ROLE_RESOURCE_PREFIX))
+        .and_then(|name| name.rsplit('/').next())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(role_arn);
+    format!("arn:{partition}:sts::{account}:assumed-role/{role}/{session_name}")
+}
+
+/// The resource type an IAM role ARN carries, which the role's path and name follow.
+const ROLE_RESOURCE_PREFIX: &str = "role/";
+
+/// The partition a value this emulator cannot read an ARN out of is named under, which is the
+/// one this emulator serves.
+const DEFAULT_PARTITION: &str = "aws";
+
 /// The group name an IAM ARN carries, when the ARN names an IAM group of THIS account
 /// (`arn:<partition>:iam::<account>:group<path><name>`).
 ///
@@ -800,8 +846,8 @@ async fn role_answer(
 #[cfg(test)]
 mod tests {
     use super::{
-        assumed_role_session_name, assumed_role_session_role_name, instance_profile_name,
-        role_name, role_path, user_name, user_path,
+        assumed_role_session_arn, assumed_role_session_name, assumed_role_session_role_name,
+        instance_profile_name, role_name, role_path, user_name, user_path,
     };
 
     /// The PATH half of an IAM entity ARN of this account: the segments before the name,
@@ -873,6 +919,58 @@ mod tests {
             assert_eq!(
                 read_user, *expected_user,
                 "case {case:?}: expected the user path {expected_user:?}, got {read_user:?}"
+            );
+        }
+    }
+
+    /// RULE: the session a service acts as while performing a call under a role is named
+    /// `arn:<partition>:sts::<account>:assumed-role/<role name>/<session name>`, with the
+    /// partition, the account and the role name read off the ROLE's own ARN.
+    ///
+    /// The rows differ along how the role is held — directly, under a path, in another
+    /// partition, in another account, with no account at all — and along what the value is
+    /// when it names no role of the IAM form at all.
+    #[test]
+    fn a_session_arn_is_shaped_from_the_role_it_is_a_session_of() {
+        let session = "ACTING_SERVICE";
+        for (case, role_arn, expected) in [
+            (
+                "a role of this account",
+                "arn:aws:iam::000000000000:role/rule-action",
+                "arn:aws:sts::000000000000:assumed-role/rule-action/ACTING_SERVICE",
+            ),
+            (
+                "a role held under a path, which IAM names by its last segment",
+                "arn:aws:iam::000000000000:role/service-role/rule-action",
+                "arn:aws:sts::000000000000:assumed-role/rule-action/ACTING_SERVICE",
+            ),
+            (
+                "a role of another partition",
+                "arn:aws-us-gov:iam::210987654321:role/published",
+                "arn:aws-us-gov:sts::210987654321:assumed-role/published/ACTING_SERVICE",
+            ),
+            (
+                "a role of another account",
+                "arn:aws:iam::123456789012:role/crossed",
+                "arn:aws:sts::123456789012:assumed-role/crossed/ACTING_SERVICE",
+            ),
+            (
+                "a role ARN carrying no account",
+                "arn:aws:iam:::role/accountless",
+                "arn:aws:sts:::assumed-role/accountless/ACTING_SERVICE",
+            ),
+            (
+                // Everything that is not a role ARN is carried into the sentence as it
+                // stands: what the action asked to act as is still what is named.
+                "a value that names no role at all",
+                "not-an-arn",
+                "arn:aws:sts:::assumed-role/not-an-arn/ACTING_SERVICE",
+            ),
+        ] {
+            let named = assumed_role_session_arn(role_arn, session);
+            assert_eq!(
+                named, expected,
+                "case {case:?}: expected {expected:?}, got {named:?}"
             );
         }
     }
