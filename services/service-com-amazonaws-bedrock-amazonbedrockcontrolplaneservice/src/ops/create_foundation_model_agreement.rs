@@ -1,15 +1,51 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFoundationModelAgreement
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFoundationModelAgreement`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFoundationModelAgreement::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Accepts, FOR THIS ACCOUNT, the agreement one published foundation model is offered
+//! under, and records that acceptance in
+//! [`crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::foundation_model_agreements`]
+//! — so `GetFoundationModelAvailability` reports the account entitled to the model from then
+//! on, where before it reported the model's terms outstanding. Answers 202 as the model
+//! binds it, naming the model the agreement is for.
+//!
+//! The writer half of `ListFoundationModelAgreementOffers`: the `offerToken` of one of the
+//! offers that listing reports ([`crate::state::model_agreement_offers`]) is what names the
+//! terms a request accepts ([`crate::state::names_offer_of_model`]), so a token no offer of
+//! that model carries names no terms to accept — 400 `ValidationException` carrying
+//! [`crate::state::INVALID_OFFER_TOKEN_MESSAGE`].
+//!
+//! `modelId` is read exactly as the offers listing reads it, because the two operations ask
+//! the same question of it — which agreement-bearing model does this id name:
+//!
+//! * a model the published catalog offers under a provider's own terms
+//!   ([`crate::state::model_offered_under_agreement`]) is the one case there is an agreement
+//!   to accept;
+//! * a model this service recognises and offers no longer is a resource that is GONE, which
+//!   every read of this catalog reports as 404 `ResourceNotFoundException` carrying the
+//!   end-of-life reason ([`crate::state::FOUNDATION_MODEL_END_OF_LIFE_MESSAGE`]);
+//! * every other id — a model AWS publishes itself, which is reached under no provider's
+//!   terms, and an id naming no model of this catalog at all — is a value this operation
+//!   cannot read as the identifier of an agreement-bearing model, which is the INPUT fault
+//!   this service states once ([`crate::state::INVALID_MODEL_IDENTIFIER_MESSAGE`]): 400
+//!   `ValidationException`.
+//!
+//! Two further conditions decide whether the acceptance is made:
+//!
+//! * the account's USE CASE for model access is the acknowledgement Amazon Bedrock takes
+//!   before it acts on a request for access to a model (`PutUseCaseForModelAccess` submits
+//!   it, `GetUseCaseForModelAccess` reports it back, and neither names a model, so the one
+//!   account-level form governs every such request). While the account has submitted none,
+//!   this request is refused 403 `AccessDeniedException` carrying
+//!   [`crate::state::MODEL_ACCESS_USE_CASE_REQUIRED_MESSAGE`], and nothing is recorded;
+//! * a model whose agreement the account already holds has nothing left to accept: 400
+//!   `ConflictException`
+//!   ([`crate::state::foundation_model_agreement_conflict_message`]). The terms of one model
+//!   are accepted once, so a replay of an accepted request is a conflict rather than a
+//!   second acceptance.
+//!
+//! Each refusal leaves the store as it was, which is what keeps the offer of a refused
+//! model's terms outstanding and that model's availability unchanged.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +192,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFoundationModelAgreement` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFoundationModelAgreementErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFoundationModelAgreement"))
+        // An agreement is accepted for the ACCOUNT, so nothing of the request beyond the
+        // model and the offer it names decides this call.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateFoundationModelAgreementErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the foundation model catalog is not available on this engine"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut store = state.lock();
+
+        // Which agreement-bearing model this id names, read exactly as the offers listing
+        // reads it: `modelId` is a `BedrockModelId`, so it names a base model by its id
+        // alone, in the qualified form that pattern admits — the id followed by the
+        // `:`-separated qualifiers, which name a variant of the same published model.
+        let model = match store.foundation_models.resolve_base_model(&input.model_id) {
+            // A model the catalog offers under an agreement: the one case there is an
+            // agreement of it to accept.
+            crate::state::BaseModelIdentity::Offered(model)
+                if crate::state::model_offered_under_agreement(model) =>
+            {
+                *model
+            }
+            // A model this service recognises and offers no longer is a resource that is
+            // GONE, which every read of this catalog reports the same way: 404
+            // `ResourceNotFoundException` carrying the end-of-life reason, rather than a
+            // statement about the value the request carried.
+            crate::state::BaseModelIdentity::Retired => {
+                return Err(
+                    CreateFoundationModelAgreementErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(
+                                crate::state::FOUNDATION_MODEL_END_OF_LIFE_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // Everything else names no model offered under an agreement — no model of this
+            // catalog at all, or a model AWS publishes itself, which is reached under no
+            // provider's terms and so has no agreement to accept. Neither is a value this
+            // operation can read as the identifier of an agreement-bearing model, so both
+            // are the INPUT fault this service states once.
+            _ => {
+                return Err(
+                    CreateFoundationModelAgreementErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                crate::state::INVALID_MODEL_IDENTIFIER_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        // The TERMS being accepted are the terms of the offer the token names, so a token
+        // no offer of this model carries names nothing this request could accept.
+        if !crate::state::names_offer_of_model(&model, &input.offer_token) {
+            return Err(
+                CreateFoundationModelAgreementErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::INVALID_OFFER_TOKEN_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The account's acknowledged use case for model access is what Amazon Bedrock takes
+        // before it acts on a request for access to a model, and it is account-level: the
+        // operations that submit and report it name no model at all. An account that has
+        // submitted none has not reached the point of asking for a model.
+        if store.use_case_for_model_access.is_none() {
+            return Err(
+                CreateFoundationModelAgreementErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(
+                            crate::state::MODEL_ACCESS_USE_CASE_REQUIRED_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The acceptance itself, recorded against the PUBLISHED model the id resolved to, so
+        // a `:`-qualified variant accepts the agreement of the model it is a variant of. An
+        // account that already holds this model's agreement has nothing left to accept, and
+        // the record it holds is left exactly as it was.
+        if !store.accept_foundation_model_agreement(model.model_id) {
+            return Err(
+                CreateFoundationModelAgreementErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(
+                            crate::state::foundation_model_agreement_conflict_message(
+                                &input.model_id,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        Ok(CreateFoundationModelAgreementOutput {
+            // The id the request named, which is the model this agreement is for.
+            model_id: input.model_id,
+        })
     }
 }

@@ -140,6 +140,12 @@ use super::*;
 ///   than appends to, and whose size the model already caps
 ///   (`AcknowledgementFormDataBody` is 10..16384 bytes).
 ///
+/// * `foundation_model_agreements` holds one entry per PUBLISHED model whose agreement this
+///   account has accepted, keyed by that model's own `modelId`, so it is bounded by
+///   [`FOUNDATION_MODELS`] — a model the catalog does not offer under an agreement is never
+///   accepted, and a second acceptance of one model is a `ConflictException` rather than a
+///   second entry.
+///
 /// * `account_data_retention` is a single optional setting, which a put replaces rather
 ///   than appends to, and whose one member is a value out of a fixed enum.
 ///
@@ -463,6 +469,22 @@ pub struct ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// put carried them, because the get reports that same `AcknowledgementFormDataBody`
     /// back.
     pub use_case_for_model_access: Option<Vec<u8>>,
+    /// Every published foundation model whose provider agreement this account has accepted:
+    /// the acceptances `CreateFoundationModelAgreement` records, keyed by the `modelId` of
+    /// the catalog row the request resolved to ([`FoundationModelCatalog::resolve_base_model`])
+    /// rather than by the spelling the request carried, so a `:`-qualified variant of a
+    /// model names the agreement of the published model it is a variant of.
+    ///
+    /// What [`Self::foundation_model_agreement_outstanding`] narrows the PUBLISHED statement
+    /// that a model is offered under a provider's own terms
+    /// ([`model_agreement_outstanding`]) by: the terms of a model in here have been accepted,
+    /// so `GetFoundationModelAvailability` reports the account entitled to it.
+    ///
+    /// Account-level, not keyed by region, for the reason
+    /// [`Self::model_invocation_logging`] is not: this store models the one account the
+    /// emulator serves, and a read of a model's availability answers the same in every
+    /// region the request can address.
+    pub foundation_model_agreements: BTreeSet<String>,
     /// The account's data retention setting, as `PutAccountDataRetention` last stored it,
     /// or `None` while no put has set one — in which case the mode in force is
     /// [`DATA_RETENTION_MODE_DEFAULT`].

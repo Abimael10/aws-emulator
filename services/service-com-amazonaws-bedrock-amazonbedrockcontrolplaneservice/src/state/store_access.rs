@@ -1503,4 +1503,41 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
             self.resource_policies.remove(&attached);
         }
     }
+
+    /// Whether this account has still to accept an agreement before it may use `model`.
+    ///
+    /// The PUBLISHED statement that a model is offered under its provider's own terms
+    /// ([`model_agreement_outstanding`], which is a fact about the catalog row and the same
+    /// for every account) narrowed by what THIS account has accepted
+    /// ([`Self::foundation_model_agreements`]): the terms of a model whose agreement the
+    /// account holds are no longer outstanding, so the offer of them is nothing a caller
+    /// still has to act on.
+    ///
+    /// Stated here, beside the store the acceptance lives in, because it is the one
+    /// question every read of a model's standing asks — so the answer cannot drift between
+    /// the read that reports the standing and the write that accepted the terms.
+    #[must_use]
+    pub fn foundation_model_agreement_outstanding(&self, model: &FoundationModel) -> bool {
+        model_agreement_outstanding(model) && !self.holds_foundation_model_agreement(model.model_id)
+    }
+
+    /// Whether this account holds the agreement of the published model `model_id` — the
+    /// acceptance `CreateFoundationModelAgreement` recorded for that catalog row.
+    #[must_use]
+    pub fn holds_foundation_model_agreement(&self, model_id: &str) -> bool {
+        self.foundation_model_agreements.contains(model_id)
+    }
+
+    /// Record this account's acceptance of the published model `model_id`'s agreement,
+    /// reporting whether the acceptance is NEW.
+    ///
+    /// `false` means the account already held that model's agreement, which is what tells
+    /// an accepting request there was nothing left to accept: the terms of one model are
+    /// accepted once, so a repeat is a conflict rather than a second acceptance, and the
+    /// store cannot grow past the published catalog however many times a request is
+    /// replayed.
+    pub fn accept_foundation_model_agreement(&mut self, model_id: &str) -> bool {
+        self.foundation_model_agreements
+            .insert(model_id.to_string())
+    }
 }

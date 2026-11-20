@@ -22,17 +22,20 @@
 //!   the region the request addressed.
 //! * `agreementAvailability.status` is the account's standing with the model's terms. A
 //!   model offered under its provider's own end-user license agreement has an OUTSTANDING
-//!   offer until the account accepts it ([`crate::state::model_agreement_outstanding`], read
-//!   off the very offers `ListFoundationModelAgreementOffers` reports), so its status is
-//!   `NOT_AVAILABLE`; a model AWS publishes itself is offered under no such agreement and
-//!   so needs none. `errorMessage` is carried by neither: it is optional, and nothing here
-//!   failed.
+//!   offer until the account accepts it
+//!   ([`crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::foundation_model_agreement_outstanding`]
+//!   — the offers `ListFoundationModelAgreementOffers` reports, narrowed by the acceptances
+//!   `CreateFoundationModelAgreement` recorded), so its status is `NOT_AVAILABLE` while the
+//!   account holds no agreement for it and `AVAILABLE` once it does; a model AWS publishes
+//!   itself is offered under no such agreement and so needs none. `errorMessage` is carried
+//!   by neither: it is optional, and nothing here failed.
 //! * `entitlementAvailability` and `authorizationStatus` follow that same standing: the
 //!   entitlement a caller would invoke the model under exists, and the account is
 //!   authorized to use it, exactly while no agreement is outstanding.
 //!
-//! A pure read: the catalog and the offers behind it are published rather than created, so
-//! no call of this operation writes anything and two reads of one model answer alike —
+//! A pure read: the catalog and the offers behind it are published rather than created, and
+//! the acceptance of a model's terms is a write only `CreateFoundationModelAgreement` makes,
+//! so no call of this operation writes anything and two reads of one model answer alike —
 //! asking about a model is not accepting its terms.
 //!
 //! ## Shape of an operation
@@ -230,7 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the model is offered under are unaccepted there is no agreement, no entitlement
         // and no authorization to use it.
         let (agreement_status, entitlement, authorization) =
-            if crate::state::model_agreement_outstanding(&model) {
+            if store.foundation_model_agreement_outstanding(&model) {
                 (
                     crate::state::AGREEMENT_STATUS_NOT_AVAILABLE,
                     crate::state::AVAILABILITY_NOT_AVAILABLE,

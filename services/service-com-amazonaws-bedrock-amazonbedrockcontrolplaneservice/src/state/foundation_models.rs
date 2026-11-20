@@ -2603,16 +2603,67 @@ pub fn model_agreement_offers(model: &FoundationModel, offer_type: Option<&str>)
     }]
 }
 
-/// Whether this account has still to accept an agreement before it may use `model`.
+/// Whether the terms `model` is published under are terms an account can still be asked to
+/// accept.
 ///
 /// An OUTSTANDING offer is exactly that statement: a model published under its provider's
 /// own end-user license agreement is offered to the account until the account accepts those
 /// terms, while a model AWS publishes itself is offered under none and so has no offer to
 /// accept ([`model_agreement_offers`]). Read off the same offers a listing reports, so the
 /// agreement a read of the model's availability describes is the one a caller can act on.
+///
+/// PUBLISHED data, like the offers it is read off: it says what the model is offered under
+/// and not what any one account has done about it. Whether the account still has to act is
+/// that statement narrowed by the acceptances the store holds
+/// ([`ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::foundation_model_agreement_outstanding`]).
 #[must_use]
 pub fn model_agreement_outstanding(model: &FoundationModel) -> bool {
     !model_agreement_offers(model, None).is_empty()
+}
+
+/// Whether `offer_token` is the token of an offer of `model`: one of the tokens a listing
+/// of that model's offers hands out ([`model_agreement_offers`]).
+///
+/// What `CreateFoundationModelAgreement` reads the member by: an `offerToken` "encapsulates
+/// the information for an offer"
+/// (`smithy_query(query="doc",shape="CreateFoundationModelAgreementRequest",member="offerToken")`),
+/// so the terms a request accepts are the terms of the offer its token names — and a token
+/// no offer of that model carries names none of them.
+#[must_use]
+pub fn names_offer_of_model(model: &FoundationModel, offer_token: &str) -> bool {
+    model_agreement_offers(model, None)
+        .iter()
+        .any(|offer| offer.offer_token == offer_token)
+}
+
+/// What this control plane answers for an `offerToken` that names no offer of the model the
+/// request named: the token could not be read as an offer of it.
+///
+/// Stated once beside the offers it is read against, for the reason
+/// [`INVALID_MODEL_IDENTIFIER_MESSAGE`] is stated once: one sentence for one class.
+pub const INVALID_OFFER_TOKEN_MESSAGE: &str = "The provided offer token is invalid.";
+
+/// What this control plane answers a request to accept a model's agreement while the
+/// account has submitted no use case for model access.
+///
+/// The use case is the acknowledgement Amazon Bedrock takes before it acts on a request for
+/// access to a model: `PutUseCaseForModelAccess` submits it and `GetUseCaseForModelAccess`
+/// reports it back, and neither names a model
+/// (`smithy_query(query="operation",operation="PutUseCaseForModelAccess")`), so the one
+/// account-level form governs every model the account asks for access to. A FIXED sentence:
+/// the account has submitted nothing, so there is no value of the request in it.
+pub const MODEL_ACCESS_USE_CASE_REQUIRED_MESSAGE: &str =
+    "You must submit your use case details before you can request access to a model.";
+
+/// How a request to accept the agreement of a model whose agreement this account already
+/// holds is refused: the agreement exists, so there is nothing left for this request to
+/// bring about.
+///
+/// Names the model the request named and nothing else — not the account, not the region:
+/// an agreement is held for a model.
+#[must_use]
+pub fn foundation_model_agreement_conflict_message(model_id: &str) -> String {
+    format!("An agreement already exists for the model {model_id}.")
 }
 
 /// `AgreementStatus` — the agreement this account needs for the model is in place, which

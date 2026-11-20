@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `ListFoundationModelAgreementOffers` end to end over HTTP, through the same
-//! `MultiServiceRouter` the emulator boots.
+//! `ListFoundationModelAgreementOffers` and `CreateFoundationModelAgreement` end to end over
+//! HTTP, through the same `MultiServiceRouter` the emulator boots.
 //!
 //! # The rule
 //!
@@ -20,6 +20,14 @@
 //! every read of this catalog reports as 404 `ResourceNotFoundException` with the
 //! end-of-life reason.
 //!
+//! **Accepting an offer** is the write that answers it: the `offerToken` of an offer of a
+//! model accepts THAT model's agreement for the account, which a later read of the model's
+//! availability reports — once the account's use case for model access is on record, which
+//! is the acknowledgement Amazon Bedrock takes before it acts on a request for access to a
+//! model. A token that names no offer of the model, an id that names no agreement-bearing
+//! model, and a model whose agreement the account already holds each accept nothing and
+//! leave the account's standing as it was.
+//!
 //! # What the tables below generalise over
 //!
 //! The rows walk the WHOLE published catalog rather than a chosen row of it, so every
@@ -29,9 +37,12 @@
 //! `BedrockModelId`'s pattern admits). The refusal rows differ along WHY an id names no
 //! agreement-bearing model: a provider the catalog carries no model of, a model of a
 //! provider it does carry, a deployment-suffixed id, a model past its end of life, and a
-//! model AWS publishes itself.
+//! model AWS publishes itself. The acceptance rows add the axes that rule generalises over:
+//! the model accepted (every agreement-bearing row of the catalog, in both spellings of its
+//! id), and WHY a request accepts nothing (the model it names, the token it carries, the
+//! acknowledgement the account has not submitted, and the agreement it already holds).
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice as bedrock;
 
 use crate::support::{emulator, error_code, label, Emulator, Reply};
@@ -391,5 +402,432 @@ async fn a_model_past_its_end_of_life_has_no_offers_to_report() {
             "case {model_id}: the refusal must state the end-of-life reason, got {:?}",
             reply.body
         );
+    }
+}
+
+// =======================================================================================
+// `CreateFoundationModelAgreement`: accepting the agreement an offer is an offer OF
+// =======================================================================================
+
+/// The URI `CreateFoundationModelAgreement` is bound to
+/// (`smithy_query(query="operation",operation="CreateFoundationModelAgreement")`: POST
+/// `/create-foundation-model-agreement`, success code 202).
+const ACCEPT_URI: &str = "/create-foundation-model-agreement";
+
+/// The URI `PutUseCaseForModelAccess` is bound to (`query="operation"`: POST
+/// `/use-case-for-model-access`, success code 201).
+const USE_CASE_URI: &str = "/use-case-for-model-access";
+
+/// A form inside `AcknowledgementFormDataBody`'s `@length(10..16384)`, as the account's
+/// acknowledged use case for model access.
+const USE_CASE_FORM: &[u8] = br#"{"companyName":"Acme","useCase":"document summarisation"}"#;
+
+/// The standing a model whose provider's terms this account has NOT accepted is reported
+/// in: no agreement, no entitlement, no authorization.
+const OUTSTANDING: (&str, &str, &str) = (
+    bedrock::state::AGREEMENT_STATUS_NOT_AVAILABLE,
+    bedrock::state::AVAILABILITY_NOT_AVAILABLE,
+    bedrock::state::AUTHORIZATION_STATUS_NOT_AUTHORIZED,
+);
+
+/// The standing a model whose agreement this account holds is reported in.
+const ENTITLED: (&str, &str, &str) = (
+    bedrock::state::AGREEMENT_STATUS_AVAILABLE,
+    bedrock::state::AVAILABILITY_AVAILABLE,
+    bedrock::state::AUTHORIZATION_STATUS_AUTHORIZED,
+);
+
+/// Every catalogued model offered under a provider's own agreement: the rows that have an
+/// agreement to accept at all.
+fn agreement_models() -> Vec<&'static bedrock::state::FoundationModel> {
+    CATALOG
+        .iter()
+        .filter(|model| bedrock::state::model_offered_under_agreement(model))
+        .collect()
+}
+
+/// `POST /use-case-for-model-access`: the one account-level acknowledgement
+/// `PutUseCaseForModelAccess` submits. A blob member travels as base64 on restJson1.
+async fn submit_use_case(emulator: &Emulator) -> Reply {
+    let reply = emulator
+        .call(
+            "POST",
+            USE_CASE_URI,
+            Some(json!({ "formData": ::aws_smithy_types::base64::encode(USE_CASE_FORM) })),
+        )
+        .await;
+    assert_eq!(
+        reply.status, 201,
+        "case the account's use case for model access: the put must answer 201, got {} {:?}",
+        reply.status, reply.body
+    );
+    reply
+}
+
+/// `POST /create-foundation-model-agreement` with the `modelId` and `offerToken` a row
+/// names.
+async fn accept(emulator: &Emulator, model_id: &str, offer_token: &str) -> Reply {
+    emulator
+        .call(
+            "POST",
+            ACCEPT_URI,
+            Some(json!({ "modelId": model_id, "offerToken": offer_token })),
+        )
+        .await
+}
+
+/// `GET /foundation-model-availability/{modelId}`: the read an acceptance shows up in.
+async fn availability(emulator: &Emulator, model_id: &str) -> Reply {
+    emulator
+        .call(
+            "GET",
+            &format!("/foundation-model-availability/{}", label(model_id)),
+            None,
+        )
+        .await
+}
+
+/// The `offerToken` the listing of `model_id`'s offers hands out — the token that accepts
+/// that model's agreement.
+async fn offer_token_of(emulator: &Emulator, model_id: &str) -> String {
+    let listed = reported(&offers(emulator, model_id, None).await);
+    let offer = listed
+        .first()
+        .unwrap_or_else(|| panic!("case {model_id}: the model must expose an offer to accept"));
+    offer["offerToken"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {model_id}: an offer must carry an offerToken, got {offer:?}"))
+        .to_string()
+}
+
+/// Assert the standing `GET /foundation-model-availability/{model_id}` reports is
+/// `expected` — the one read that answers whether this account may use the model.
+async fn assert_standing(
+    emulator: &Emulator,
+    case: &str,
+    model_id: &str,
+    expected: (&str, &str, &str),
+) {
+    let reply = availability(emulator, model_id).await;
+    assert_eq!(
+        reply.status, 200,
+        "case {case}: a catalogued model's availability must be served, got {} {:?}",
+        reply.status, reply.body
+    );
+    let actual = (
+        reply
+            .get("agreementAvailability")
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("none")
+            .to_string(),
+        reply
+            .get("entitlementAvailability")
+            .as_str()
+            .unwrap_or("none")
+            .to_string(),
+        reply
+            .get("authorizationStatus")
+            .as_str()
+            .unwrap_or("none")
+            .to_string(),
+    );
+    assert_eq!(
+        (actual.0.as_str(), actual.1.as_str(), actual.2.as_str()),
+        expected,
+        "case {case}: expected the standing {expected:?}, got {:?}",
+        reply.body
+    );
+}
+
+/// RULE: the `offerToken` of an offer of a model accepts THAT model's agreement for the
+/// account, and the acceptance is state: the read of the model's availability reports the
+/// account entitled to it from then on, whichever spelling of the id the acceptance named.
+/// The terms of one model are accepted once, so a repeat of an accepted request is a
+/// conflict rather than a second acceptance.
+#[tokio::test]
+async fn accepting_an_offer_of_a_model_entitles_the_account_to_that_model() {
+    let emulator = emulator();
+    submit_use_case(&emulator).await;
+
+    let models = agreement_models();
+    assert!(
+        models.len() > 1,
+        "the catalog must carry models offered under an agreement, got {}",
+        models.len()
+    );
+    for (index, model) in models.iter().enumerate() {
+        // The rows alternate between the two spellings `BedrockModelId` admits: the bare
+        // published id, and the `:`-qualified form, which names a variant of the same
+        // published model — so the agreement either spelling accepts is the model's.
+        let qualified = index % 2 == 1 && model.model_id.matches(':').count() < 2;
+        let requested = if qualified {
+            format!("{}:24k", model.model_id)
+        } else {
+            model.model_id.to_string()
+        };
+        let case = format!("{} accepted as {requested}", model.model_id);
+
+        // Before: the model's terms are outstanding, so the account is entitled to nothing.
+        assert_standing(&emulator, &case, model.model_id, OUTSTANDING).await;
+
+        let token = offer_token_of(&emulator, model.model_id).await;
+        let reply = accept(&emulator, &requested, &token).await;
+        assert_eq!(
+            reply.status, 202,
+            "case {case}: an accepted agreement answers 202, got {} {:?}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.text("modelId"),
+            requested,
+            "case {case}: the response must name the model the agreement is for, got {:?}",
+            reply.body
+        );
+
+        // After: the acceptance is state the availability read reports, under the bare
+        // published id whichever spelling accepted it.
+        assert_standing(&emulator, &case, model.model_id, ENTITLED).await;
+
+        // The agreement of one model is accepted once.
+        let again = accept(&emulator, &requested, &token).await;
+        assert_eq!(
+            (again.status, code(&again)),
+            (400, "ConflictException"),
+            "case {case}: a second acceptance must be refused as a conflict, got {} {} {:?}",
+            again.status,
+            code(&again),
+            again.body
+        );
+        assert_eq!(
+            message(&case, &again),
+            bedrock::state::foundation_model_agreement_conflict_message(&requested),
+            "case {case}: the conflict must state the agreement the account holds, got {:?}",
+            again.body
+        );
+        assert_standing(&emulator, &case, model.model_id, ENTITLED).await;
+    }
+}
+
+/// One request that accepts nothing: the model and token it carries, and the refusal it must
+/// answer.
+struct Refused {
+    case: String,
+    model_id: String,
+    offer_token: String,
+    status: u16,
+    code: &'static str,
+    message: String,
+}
+
+/// RULE: a request that names no agreement-bearing model, or no offer of the model it names,
+/// accepts nothing — it is refused in the class that identifier's own reading decides, and
+/// leaves every model's standing and every offer exactly as they were.
+#[tokio::test]
+async fn a_request_naming_no_offer_of_an_agreement_bearing_model_accepts_nothing() {
+    let emulator = emulator();
+    submit_use_case(&emulator).await;
+
+    let models = agreement_models();
+    // The model the token rows are read against, and a model of ANOTHER provider whose token
+    // is one of those rows — both read off the catalog rather than written out.
+    let model = models[0];
+    let other = models
+        .iter()
+        .find(|row| row.provider_name != model.provider_name)
+        .expect("the catalog must carry agreement-bearing models of two providers");
+    let token = offer_token_of(&emulator, model.model_id).await;
+    let other_token = offer_token_of(&emulator, other.model_id).await;
+
+    let mut rows: Vec<Refused> = Vec::new();
+
+    // The model id names no model this operation can read as an agreement-bearing one: a
+    // provider the catalog carries no model of, a model the catalog does not carry from a
+    // provider it does, and a deployment-suffixed id.
+    for unreadable in [
+        "acme.model-v1",
+        "anthropic.claude-9-opus-20990101-v9:0",
+        "meta.llama3-1-8b-instruct-v1:0/abcdef123456",
+    ] {
+        rows.push(Refused {
+            case: format!("the id {unreadable}, which names no catalogued model"),
+            model_id: unreadable.to_string(),
+            offer_token: token.clone(),
+            status: 400,
+            code: "ValidationException",
+            message: bedrock::state::INVALID_MODEL_IDENTIFIER_MESSAGE.to_string(),
+        });
+    }
+    // A model AWS publishes itself is reached under no provider's terms, so there is no
+    // agreement of it to accept. Read off the catalog, so these are not one chosen id.
+    let aws_published: Vec<&bedrock::state::FoundationModel> = CATALOG
+        .iter()
+        .filter(|row| !bedrock::state::model_offered_under_agreement(row))
+        .collect();
+    assert!(
+        aws_published.len() > 1,
+        "the catalog must carry models AWS publishes itself, got {}",
+        aws_published.len()
+    );
+    for published in &aws_published {
+        rows.push(Refused {
+            case: format!("the AWS-published model {}", published.model_id),
+            model_id: published.model_id.to_string(),
+            offer_token: token.clone(),
+            status: 400,
+            code: "ValidationException",
+            message: bedrock::state::INVALID_MODEL_IDENTIFIER_MESSAGE.to_string(),
+        });
+    }
+    // A model this service recognises and offers no longer is a resource that is GONE, from
+    // three different providers (`crate::state::RETIRED_FOUNDATION_MODELS`).
+    for retired in [
+        "anthropic.claude-v2",
+        "ai21.j2-ultra-v1",
+        "meta.llama2-70b-chat-v1",
+    ] {
+        assert!(
+            bedrock::state::RETIRED_FOUNDATION_MODELS.contains(&retired),
+            "case {retired}: this row must name a model the service recognises as retired"
+        );
+        rows.push(Refused {
+            case: format!("the retired model {retired}"),
+            model_id: retired.to_string(),
+            offer_token: token.clone(),
+            status: 404,
+            code: "ResourceNotFoundException",
+            message: bedrock::state::FOUNDATION_MODEL_END_OF_LIFE_MESSAGE.to_string(),
+        });
+    }
+    // The token names no offer of the model the request names: a value that is no token at
+    // all, the offer's own `offerId`, the token of another model's offer, and the model's own
+    // token mangled at either end.
+    for (axis, carried) in [
+        ("no offer token at all", "not-an-offer-token".to_string()),
+        (
+            "the offerId rather than the offerToken",
+            bedrock::state::model_offer_id(model.model_id),
+        ),
+        ("the token of another model's offer", other_token.clone()),
+        (
+            "the token with its last character dropped",
+            token[..token.len() - 1].to_string(),
+        ),
+        (
+            "the token in upper case",
+            token.to_ascii_uppercase(),
+        ),
+    ] {
+        rows.push(Refused {
+            case: format!("{} offered {axis}", model.model_id),
+            model_id: model.model_id.to_string(),
+            offer_token: carried,
+            status: 400,
+            code: "ValidationException",
+            message: bedrock::state::INVALID_OFFER_TOKEN_MESSAGE.to_string(),
+        });
+    }
+
+    for row in &rows {
+        let reply = accept(&emulator, &row.model_id, &row.offer_token).await;
+        assert_eq!(
+            (reply.status, code(&reply)),
+            (row.status, row.code),
+            "case {}: expected {} {}, got {} {} {:?}",
+            row.case,
+            row.status,
+            row.code,
+            reply.status,
+            code(&reply),
+            reply.body
+        );
+        assert_eq!(
+            message(&row.case, &reply),
+            row.message,
+            "case {}: the refusal must state the reason this request accepts nothing, got {:?}",
+            row.case,
+            reply.body
+        );
+    }
+
+    // Nothing any of those requests named was accepted: every agreement-bearing model's
+    // terms are still outstanding, and the offer of each is still listed.
+    for row in &models {
+        let case = format!("{} after every refused acceptance", row.model_id);
+        assert_standing(&emulator, &case, row.model_id, OUTSTANDING).await;
+        assert!(
+            !reported(&offers(&emulator, row.model_id, None).await).is_empty(),
+            "case {case}: the offer of a model whose terms are unaccepted is still listed"
+        );
+    }
+}
+
+/// RULE: Amazon Bedrock acts on a request for access to a model only once the account's use
+/// case for model access is on record — the one account-level acknowledgement
+/// `PutUseCaseForModelAccess` submits — so until then an acceptance is refused 403
+/// `AccessDeniedException` and accepts nothing, and the very same request is served once the
+/// form has been submitted.
+#[tokio::test]
+async fn an_acceptance_waits_on_the_accounts_use_case_for_model_access() {
+    let emulator = emulator();
+
+    // Two agreement-bearing models of DIFFERENT providers, read off the catalog: the
+    // acknowledgement is account-level, so it gates them alike.
+    let models = agreement_models();
+    let first = models[0];
+    let second = models
+        .iter()
+        .find(|row| row.provider_name != first.provider_name)
+        .expect("the catalog must carry agreement-bearing models of two providers");
+    let gated = [first, *second];
+
+    let mut tokens: Vec<(&bedrock::state::FoundationModel, String)> = Vec::new();
+    for model in gated {
+        tokens.push((model, offer_token_of(&emulator, model.model_id).await));
+    }
+
+    for (model, token) in &tokens {
+        // Twice, because a refusal records nothing: the second request is refused for the
+        // same missing acknowledgement rather than as a conflict with an agreement the first
+        // one would have made.
+        for attempt in 1..=2 {
+            let case = format!(
+                "{} without the account's use case, attempt {attempt}",
+                model.model_id
+            );
+            let reply = accept(&emulator, model.model_id, token).await;
+            assert_eq!(
+                (reply.status, code(&reply)),
+                (403, "AccessDeniedException"),
+                "case {case}: expected 403 AccessDeniedException, got {} {} {:?}",
+                reply.status,
+                code(&reply),
+                reply.body
+            );
+            assert_eq!(
+                message(&case, &reply),
+                bedrock::state::MODEL_ACCESS_USE_CASE_REQUIRED_MESSAGE,
+                "case {case}: the refusal must state the acknowledgement it waits on, got {:?}",
+                reply.body
+            );
+            assert_standing(&emulator, &case, model.model_id, OUTSTANDING).await;
+            assert!(
+                !reported(&offers(&emulator, model.model_id, None).await).is_empty(),
+                "case {case}: the offer of the model is still outstanding to be accepted"
+            );
+        }
+    }
+
+    // With the acknowledgement on record, the very same requests are served.
+    submit_use_case(&emulator).await;
+    for (model, token) in &tokens {
+        let case = format!("{} with the account's use case on record", model.model_id);
+        let reply = accept(&emulator, model.model_id, token).await;
+        assert_eq!(
+            reply.status, 202,
+            "case {case}: the same request must now be accepted, got {} {:?}",
+            reply.status, reply.body
+        );
+        assert_standing(&emulator, &case, model.model_id, ENTITLED).await;
     }
 }
