@@ -169,10 +169,14 @@ pub const MODIFIABLE_ATTRIBUTES: [&str; 9] = [
     ATTRIBUTE_ENA_SRD_SPECIFICATION,
 ];
 
-/// What a request naming two attributes at once is refused with: "you can specify only one
-/// attribute at a time" is a rule about the request as a whole, so the sentence carries no
-/// variable part.
-pub const ONE_ATTRIBUTE_AT_A_TIME: &str = "Only one attribute can be specified at a time";
+// A request naming more than one attribute is refused through the one builder this crate has
+// for that cause, `crate::state::fields_for_multiple_attribute_types`, which names the
+// attributes the REQUEST carried after EC2's fixed sentence — the same refusal
+// `ModifyInstanceAttribute` and `ModifyVpcAttribute` answer. The names it is given are the
+// EC2 attribute names of [`MODIFIABLE_ATTRIBUTES`], which for the members the model gives an
+// `xmlName` of this form are that `xmlName`
+// (`ModifyNetworkInterfaceAttributeRequest$Description` is `description` and
+// `$SourceDestCheck` is `sourceDestCheck`).
 
 /// "Timeout (in seconds) for idle TCP connections in an established state. Min: 60 seconds.
 /// Max: 432000 seconds (5 days)"
@@ -395,7 +399,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     attributes = MODIFIABLE_ATTRIBUTES.join(" | "),
                 ))
             } else {
-                state::invalid_parameter_combination(ONE_ATTRIBUTE_AT_A_TIME)
+                state::fields_for_multiple_attribute_types(&named)
             });
         };
 

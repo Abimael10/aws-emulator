@@ -27,7 +27,9 @@
 //!    fixing an id.
 //! 3. A ROUTE TO A NAT GATEWAY THE ACCOUNT DOES NOT HOLD is reported by the MEMBER that
 //!    carried it, in the route family's `InvalidNatGatewayID.NotFound`, while the NAT gateway
-//!    family's OWN operations keep their `NatGatewayNotFound` for the same id.
+//!    family's OWN describe keeps its `NatGatewayNotFound` for the same id and its delete,
+//!    which ACTS on the one gateway it is given, screens a value this service never issued as
+//!    `NatGatewayMalformed`.
 //! 4. A NETWORK THAT ALREADY HAS AN INTERNET GATEWAY refuses the `VpcId` it was given
 //!    (`InvalidParameterValue`), where a GATEWAY that is already attached somewhere is the
 //!    association conflict `Resource.AlreadyAssociated` naming the pair that holds.
@@ -58,8 +60,8 @@ use ec2::state::{
     INVALID_CAPACITY_RESERVATION_ID_NOT_FOUND, INVALID_INSTANCE_TYPE,
     INVALID_NAT_GATEWAY_ID_NOT_FOUND, INVALID_NETWORK_INSIGHTS_PATH_ID_NOT_FOUND,
     INVALID_NETWORK_INTERFACE_ATTACHMENT_ID_MALFORMED, INVALID_PARAMETER_COMBINATION,
-    INVALID_PARAMETER_VALUE, NAT_GATEWAY_NOT_FOUND, RESERVATION_CAPACITY_EXCEEDED,
-    RESOURCE_ALREADY_ASSOCIATED,
+    INVALID_PARAMETER_VALUE, NAT_GATEWAY_MALFORMED, NAT_GATEWAY_NOT_FOUND,
+    RESERVATION_CAPACITY_EXCEEDED, RESOURCE_ALREADY_ASSOCIATED,
 };
 
 use super::ec2_query::{element, elements, error_code, filters, unescaped};
@@ -760,7 +762,8 @@ async fn an_instance_whose_type_cannot_serve_the_operation_is_refused_invalid_in
 /// RULE 3: a route whose target names a NAT gateway the account holds none of is refused by
 /// the member that carried the id — `InvalidNatGatewayID.NotFound` — and the table it would
 /// have gone in is left with the local route alone, while the NAT gateway family's own
-/// operations keep answering `NatGatewayNotFound` for the very same id.
+/// describe keeps answering `NatGatewayNotFound` for the very same id and its delete answers
+/// `NatGatewayMalformed` for a value this service never issued.
 ///
 /// The rows differ in the id's payload and width and in the route's destination, and cover
 /// both operations that resolve a route target.
@@ -830,18 +833,28 @@ async fn a_route_to_an_absent_nat_gateway_is_refused_by_the_member_that_named_it
              {INVALID_NAT_GATEWAY_ID_NOT_FOUND}, got {replaced}"
         );
 
-        // The NAT gateway family's own operations report the same id their own way.
-        for action in ["DeleteNatGateway", "DescribeNatGateways"] {
-            let params = if action == "DeleteNatGateway" {
-                vec![param("NatGatewayId", nat_gateway_id)]
-            } else {
-                vec![param("NatGatewayId.1", nat_gateway_id)]
-            };
+        // The NAT gateway family's own operations report the same id their own way: the
+        // describe, which RESOLVES the id for reporting, keeps `NatGatewayNotFound`, while
+        // the delete, which ACTS on the one gateway it is given, screens a value this service
+        // never issued as malformed before any lookup — and none of these rows' ids is one
+        // its mint ever handed out.
+        for (action, params, expected) in [
+            (
+                "DeleteNatGateway",
+                vec![param("NatGatewayId", nat_gateway_id)],
+                NAT_GATEWAY_MALFORMED,
+            ),
+            (
+                "DescribeNatGateways",
+                vec![param("NatGatewayId.1", nat_gateway_id)],
+                NAT_GATEWAY_NOT_FOUND,
+            ),
+        ] {
             let body = refused(case, &router, action, &params).await;
             assert_eq!(
                 error_code(&body),
-                NAT_GATEWAY_NOT_FOUND,
-                "case {case:?}: expected {action} to keep {NAT_GATEWAY_NOT_FOUND}, got {body}"
+                expected,
+                "case {case:?}: expected {action} to answer {expected}, got {body}"
             );
         }
     }

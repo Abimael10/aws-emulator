@@ -922,11 +922,12 @@ async fn a_dry_run_changes_nothing() {
 }
 
 /// An id the get cannot resolve to a scope of the account is refused rather than answered
-/// with an empty content — a value of a Network Access Scope id's own form that names no
-/// scope of the account and a value that is not such an id at all are refused the one way,
-/// with this resource's own `Invalid<Resource>Id.NotFound`. A dry run of either is refused
-/// the same way, because a dry run of a request that would have been refused is refused with
-/// that reason.
+/// with an empty content, and WHICH refusal it gets is a fact of the VALUE: this operation
+/// acts on the one scope it is given, so a value this service could never have ISSUED is
+/// refused as an invalid parameter value naming the member that carried it, while an id it
+/// DID issue that the account holds no scope under is this resource's own
+/// `Invalid<Resource>Id.NotFound`. A dry run of either is refused the same way, because a dry
+/// run of a request that would have been refused is refused with that reason.
 #[tokio::test]
 async fn the_get_refuses_an_id_naming_no_scope() {
     let (router, _engine) = super::ec2_query::emulator();
@@ -934,26 +935,76 @@ async fn the_get_refuses_an_id_naming_no_scope() {
     let (status, body) = create(&router, &create_params("seed-token", &[], &[], &[])).await;
     let body = ok("seed", status, body);
     let stored = reported_scope("seed", &body).scope_id;
+    // A second scope, deleted again, is an id this service DID issue that the account now
+    // holds no scope under: the other half of the pair below.
+    let (status, body) = create(&router, &create_params("gone-token", &[], &[], &[])).await;
+    let body = ok("the scope that is deleted again", status, body);
+    let deleted = reported_scope("the scope that is deleted again", &body).scope_id;
+    let (status, body) = super::ec2_query::call(
+        &router,
+        REGION,
+        "DeleteNetworkInsightsAccessScope",
+        &[param("NetworkInsightsAccessScopeId", &deleted)],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the delete of {deleted} must answer 200, got {status} with body {body}"
+    );
 
-    // Every id this operation cannot resolve is refused the one way, so the rows differ
-    // along the ways a value fails to resolve: a value of this id's own form that the
-    // account holds no scope under (in both the 17- and the 8-hexadecimal-digit form EC2
-    // mints), another resource's prefix, the analysis prefix that merely starts the same
-    // way, too few digits, a digit that is not hexadecimal, and text that is not an id.
-    let refused = [
-        ("a well-formed long id nothing holds", "nis-0123456789abcdef0"),
-        ("a well-formed short id nothing holds", "nis-01234567"),
-        ("another resource's id", "vpc-0123456789abcdef0"),
-        ("the analysis id form", "nisa-0123456789abcdef0"),
-        ("too few digits", "nis-0123"),
-        ("a digit that is not hexadecimal", "nis-0123456789abcdefg"),
-        ("not an id at all", "scope"),
+    // The rows differ along the ways a value fails to resolve: a value of this id's own form
+    // the mint never reached (in both the 17- and the 8-hexadecimal-digit form EC2 mints),
+    // an all-`f` suffix, another resource's prefix, the analysis prefix that merely starts
+    // the same way, too few digits, a digit that is not hexadecimal, and text that is not an
+    // id — each a value no issue of this kind ever produced — beside the id of a scope this
+    // service really minted and has since removed.
+    let refused: Vec<(&str, String, &str)> = vec![
+        (
+            "a long id of this form the mint never reached",
+            "nis-0123456789abcdef0".to_string(),
+            INVALID_PARAMETER_VALUE,
+        ),
+        (
+            "an all-f suffix",
+            "nis-fffffffffffffffff".to_string(),
+            INVALID_PARAMETER_VALUE,
+        ),
+        (
+            "a well-formed short id nothing holds",
+            "nis-01234567".to_string(),
+            INVALID_PARAMETER_VALUE,
+        ),
+        (
+            "another resource's id",
+            "vpc-0123456789abcdef0".to_string(),
+            INVALID_PARAMETER_VALUE,
+        ),
+        (
+            "the analysis id form",
+            "nisa-0123456789abcdef0".to_string(),
+            INVALID_PARAMETER_VALUE,
+        ),
+        ("too few digits", "nis-0123".to_string(), INVALID_PARAMETER_VALUE),
+        (
+            "a digit that is not hexadecimal",
+            "nis-0123456789abcdefg".to_string(),
+            INVALID_PARAMETER_VALUE,
+        ),
+        ("not an id at all", "scope".to_string(), INVALID_PARAMETER_VALUE),
+        (
+            "a scope this service issued and has since removed",
+            deleted.clone(),
+            ec2::state::INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ID_NOT_FOUND,
+        ),
     ];
-    for (case, scope_id) in refused {
-        let expected_code = ec2::state::INVALID_NETWORK_INSIGHTS_ACCESS_SCOPE_ID_NOT_FOUND;
-        let expected_message = format!("{scope_id} does not exist");
+    for (case, scope_id, expected_code) in refused {
+        let expected_message = if expected_code == INVALID_PARAMETER_VALUE {
+            format!("NetworkInsightsAccessScopeId ({scope_id}) is not valid")
+        } else {
+            format!("{scope_id} does not exist")
+        };
         for dry_run in [false, true] {
-            let mut params = vec![param("NetworkInsightsAccessScopeId", scope_id)];
+            let mut params = vec![param("NetworkInsightsAccessScopeId", &scope_id)];
             if dry_run {
                 params.push(param("DryRun", "true"));
             }

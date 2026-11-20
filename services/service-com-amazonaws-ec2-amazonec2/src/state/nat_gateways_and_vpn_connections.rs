@@ -1059,6 +1059,31 @@ pub const NAT_GATEWAY_NOT_FOUND: &str = "NatGatewayNotFound";
 /// id at all, so there is nothing to look up.
 pub const NAT_GATEWAY_MALFORMED: &str = "NatGatewayMalformed";
 
+/// The fixed text of the sentence a NAT gateway id this service never ISSUED is refused with:
+/// `Invalid Nat Gateway ` followed by the id the REQUEST named.
+///
+/// This surface words that refusal its OWN way rather than through [`invalid_id_message`]'s
+/// `Invalid id: "…"`, so the two must not be collapsed into one text.
+pub const INVALID_NAT_GATEWAY_MESSAGE: &str = "Invalid Nat Gateway ";
+
+/// Refuse a value a request gave as a `NatGatewayId` that this service could never have
+/// issued: HTTP 400 [`NAT_GATEWAY_MALFORMED`] with [`INVALID_NAT_GATEWAY_MESSAGE`] and that
+/// value, bounded the way every refusal that echoes a caller's id bounds it
+/// ([`echoed_resource_id`]).
+///
+/// The ONE construction of that refusal, so an operation that screens its `NatGatewayId`
+/// before looking it up and the suites that assert it cannot drift apart.
+pub fn nat_gateway_malformed<E>(nat_gateway_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        NAT_GATEWAY_MALFORMED,
+        400,
+        format!(
+            "{INVALID_NAT_GATEWAY_MESSAGE}{id}",
+            id = echoed_resource_id(nat_gateway_id)
+        ),
+    )
+}
+
 /// `InvalidNatGatewayID.NotFound` (HTTP 400): the code the ROUTE operations answer for a
 /// NAT gateway id the account holds no gateway for.
 ///
@@ -1138,6 +1163,27 @@ impl NatGatewayAddressTransition {
     }
 }
 
+/// The transient `NatGatewayAddressStatus` a `DisassociateNatGatewayAddress` leaves an
+/// address in while its connections drain: `disassociating`, the member of the modelled
+/// catalog (`crate::ops::types::NAT_GATEWAY_ADDRESS_STATUS_VALUES`) that names a
+/// disassociation under way — the Elastic IP counterpart of
+/// [`NAT_GATEWAY_ADDRESS_STATUS_UNASSIGNING`], whose drain it shares.
+pub const NAT_GATEWAY_ADDRESS_STATUS_DISASSOCIATING: &str = "disassociating";
+
+/// The bounds a drain a request asks for is held to: the published `@range(min: 1, max:
+/// 4000)` both drain members carry
+/// (`UnassignPrivateNatGatewayAddressRequest$MaxDrainDurationSeconds` and
+/// `DisassociateNatGatewayAddressRequest$MaxDrainDurationSeconds`).
+///
+/// The boundary validator has already held the request to that range, so a handler never
+/// sees a value outside it; these two are what make
+/// [`ComAmazonawsEc2Amazonec2State::begin_nat_gateway_address_drain`]'s clock arithmetic
+/// independent of that — a number that came from a request never reaches the clock unclamped.
+pub const MAX_NAT_GATEWAY_DRAIN_SECONDS: u64 = 4_000;
+
+/// The floor of that same range (see [`MAX_NAT_GATEWAY_DRAIN_SECONDS`]).
+pub const MIN_NAT_GATEWAY_DRAIN_SECONDS: u64 = 1;
+
 /// The transient `NatGatewayAddressStatus` of a private address being taken off a gateway:
 /// `unassigning`, the `NatGatewayAddressStatus` member that names an unassignment
 /// (`crate::ops::types::NAT_GATEWAY_ADDRESS_STATUS_VALUES`). An address stays in it while
@@ -1157,9 +1203,10 @@ pub const NAT_GATEWAY_ADDRESS_STATUS_UNASSIGNING: &str = "unassigning";
 /// `UnassignPrivateNatGatewayAddress`).
 pub const MAX_SECONDARY_PRIVATE_IPS_PER_NAT_GATEWAY: usize = 31;
 
-/// How long an unassignment drains a private address for when the request names no
-/// maximum: "Default value is 350 seconds"
-/// (`UnassignPrivateNatGatewayAddressRequest$MaxDrainDurationSeconds`).
+/// How long a drain runs for when the request names no maximum: "Default value is 350
+/// seconds" — the default both drain members document
+/// (`UnassignPrivateNatGatewayAddressRequest$MaxDrainDurationSeconds` and
+/// `DisassociateNatGatewayAddressRequest$MaxDrainDurationSeconds`).
 pub const DEFAULT_NAT_GATEWAY_DRAIN_SECONDS: u64 = 350;
 
 /// Refuse an unassignment of the PRIMARY private IPv4 address of a NAT gateway: HTTP 400
@@ -1235,44 +1282,67 @@ impl ComAmazonawsEc2Amazonec2State {
             .unwrap_or_default()
     }
 
-    /// Whether any private address of the NAT gateway `nat_gateway_id` is still draining.
+    /// Whether any address of the NAT gateway `nat_gateway_id` is still draining.
     ///
     /// "While unassigning is in progress, you cannot assign/unassign additional IP
     /// addresses while the connections are being drained"
-    /// (`UnassignPrivateNatGatewayAddress`): both address calls ask this before they write.
+    /// (`UnassignPrivateNatGatewayAddress`), and the same sentence for the Elastic IP
+    /// addresses of a public gateway (`DisassociateNatGatewayAddress`): every address call
+    /// asks this before it writes.
     pub fn nat_gateway_is_draining(&self, nat_gateway_id: &str) -> bool {
         self.nat_gateway_address_drains
             .keys()
             .any(|(gateway, _)| gateway == nat_gateway_id)
     }
 
-    /// Start the drain of the private address `private_ip` of `nat_gateway_id`: the address
-    /// stays ON the gateway, and its release falls due `drain` from now.
+    /// Start the drain of the address of `nat_gateway_id` that holds the private IPv4 address
+    /// `private_ip`: the address stays ON the gateway, and its release falls due `drain` from
+    /// now.
     ///
     /// "A private IP address will only be released at the end of MaxDrainDurationSeconds …
     /// After the existing connections drain out, the private IP addresses are released"
-    /// (`UnassignPrivateNatGatewayAddress`) — recorded rather than waited for, so a caller
-    /// reading the gateway straight after the call still sees the address in the transient
-    /// [`NAT_GATEWAY_ADDRESS_STATUS_UNASSIGNING`] status the drain starts in.
+    /// (`UnassignPrivateNatGatewayAddress`), and "An EIP is released only at the end of
+    /// MaxDrainDurationSeconds … As the existing connections drain out, the EIPs (and the
+    /// corresponding private IP addresses mapped to them) are released"
+    /// (`DisassociateNatGatewayAddress`) — ONE drain for both, recorded rather than waited
+    /// for, so a caller reading the gateway straight after the call still sees the address in
+    /// the transient status its own call started
+    /// ([`NAT_GATEWAY_ADDRESS_STATUS_UNASSIGNING`],
+    /// [`NAT_GATEWAY_ADDRESS_STATUS_DISASSOCIATING`]).
+    ///
+    /// `drain` comes from a request, so it is held to the range both members publish
+    /// ([`MIN_NAT_GATEWAY_DRAIN_SECONDS`]..[`MAX_NAT_GATEWAY_DRAIN_SECONDS`]) and added to
+    /// the clock with `checked_add`: a number a caller chose can neither carry the due
+    /// instant past that ceiling nor overflow the instant.
     pub fn begin_nat_gateway_address_drain(
         &mut self,
         nat_gateway_id: &str,
         private_ip: &str,
         drain: Duration,
     ) {
+        let drain = drain.clamp(
+            Duration::from_secs(MIN_NAT_GATEWAY_DRAIN_SECONDS),
+            Duration::from_secs(MAX_NAT_GATEWAY_DRAIN_SECONDS),
+        );
+        let now = Instant::now();
         // The address is going away, so the move the clock owed it while it was being
         // assigned is owed no longer: leaving it would put an address that is draining back
         // into a terminal `succeeded`.
         self.nat_gateway_address_transitions.remove(private_ip);
         self.nat_gateway_address_drains.insert(
             (nat_gateway_id.to_string(), private_ip.to_string()),
-            Instant::now() + drain,
+            now.checked_add(drain).unwrap_or(now + TRANSITION_DELAY),
         );
     }
 
-    /// Release every draining private address whose wait has run out as of `now`: take it
-    /// off the gateway it was assigned to and hand it back to the subnet's pool, so the
-    /// address the gateway no longer holds is one something else can be given.
+    /// Release every draining address whose wait has run out as of `now`: take it off the
+    /// gateway it was on and hand what it held back — its private IPv4 address to the
+    /// subnet's pool, so something else can be given it, and the Elastic IP address it
+    /// carried (a public gateway's) to the account, through the one seam every path that ends
+    /// an association goes through ([`Self::detach_elastic_ip`]). "Deleting a public NAT
+    /// gateway disassociates its Elastic IP address, but does not release the address from
+    /// your account" (`DeleteNatGateway`) — the same reading of a release: the allocation
+    /// itself stays.
     ///
     /// Applied by [`Self::materialize_due_transitions`], the one place every move this store
     /// owes the clock is materialised.
@@ -1286,14 +1356,30 @@ impl ComAmazonawsEc2Amazonec2State {
         for (nat_gateway_id, private_ip) in due {
             self.nat_gateway_address_drains
                 .remove(&(nat_gateway_id.clone(), private_ip.clone()));
+            let mut released = Vec::new();
             if let Some(addresses) = self
                 .nat_gateways
                 .get_mut(&nat_gateway_id)
                 .and_then(|gateway| gateway.nat_gateway_addresses.as_mut())
             {
-                addresses.retain(|address| {
-                    address.private_ip.as_deref() != Some(private_ip.as_str())
-                });
+                let (gone, kept): (Vec<_>, Vec<_>) = addresses
+                    .drain(..)
+                    .partition(|address| {
+                        address.private_ip.as_deref() == Some(private_ip.as_str())
+                    });
+                released.extend(gone);
+                *addresses = kept;
+            }
+            for address in released {
+                // The association id an Elastic IP address of this gateway was held under
+                // ([`NatGatewayAddress$AssociationId`]); a private gateway's address carries
+                // none, so this is where the two drains differ and nowhere else.
+                if let Some(allocation_id) = address.allocation_id.clone() {
+                    self.detach_elastic_ip(&allocation_id);
+                }
+                if let Some(association_id) = address.association_id.as_deref() {
+                    self.nat_gateway_address_transitions.remove(association_id);
+                }
             }
             self.nat_gateway_address_transitions.remove(&private_ip);
             self.release_private_ip(&private_ip);

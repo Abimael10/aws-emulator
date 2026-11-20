@@ -39,9 +39,9 @@ use std::time::Duration;
 
 use ec2::state::{
     AVAILABILITY_MODE_REGIONAL, AVAILABILITY_MODE_ZONAL, CONNECTIVITY_TYPE_PRIVATE,
-    CONNECTIVITY_TYPE_PUBLIC, NAT_GATEWAY_STATE_AVAILABLE, NAT_GATEWAY_STATE_DELETED,
-    NAT_GATEWAY_STATE_DELETING, NAT_GATEWAY_STATE_PENDING, NAT_GATEWAY_TAGGABLE_RESOURCE,
-    TRANSITION_DELAY,
+    CONNECTIVITY_TYPE_PUBLIC, INVALID_NAT_GATEWAY_MESSAGE, NAT_GATEWAY_STATE_AVAILABLE,
+    NAT_GATEWAY_STATE_DELETED, NAT_GATEWAY_STATE_DELETING, NAT_GATEWAY_STATE_PENDING,
+    NAT_GATEWAY_TAGGABLE_RESOURCE, TRANSITION_DELAY,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -68,6 +68,9 @@ const RESOURCE_ALREADY_ASSOCIATED: &str = "Resource.AlreadyAssociated";
 
 /// EC2's error code for a NAT gateway id the account holds no NAT gateway for.
 const NAT_GATEWAY_NOT_FOUND: &str = "NatGatewayNotFound";
+
+/// EC2's error code for a value that is no NAT gateway id this service ever issued.
+const NAT_GATEWAY_MALFORMED: &str = "NatGatewayMalformed";
 
 /// The code a dry run of a request that would have succeeded answers, and the status EC2
 /// answers it with (HTTP 412, as every other dry run of this service does).
@@ -683,18 +686,48 @@ async fn a_refused_create_stores_nothing() {
 #[tokio::test]
 async fn a_delete_names_a_gateway_the_account_holds() {
     let router = emulator();
-    let case = "a NAT gateway id the account holds nothing for";
-    let (status, refused) = ec2(
-        &router,
-        "DeleteNatGateway",
-        &[p("NatGatewayId", "nat-0123456789abcdef0")],
-    )
-    .await;
-    assert_eq!(
-        (status, error_code(&refused).as_str()),
-        (400, NAT_GATEWAY_NOT_FOUND),
-        "case {case:?}: expected {NAT_GATEWAY_NOT_FOUND}, got {status} {refused}"
-    );
+    // `(case, the NatGatewayId under test, the expected code)`: a value this service could
+    // never have issued is refused as malformed BEFORE any lookup — a documentation-shaped
+    // id and a synthetic one alike — while an id in the range the store's mint has reached
+    // that the account holds no gateway for is refused as not found, so both halves of the
+    // pair stay covered.
+    let rows: &[(&str, &str, &str)] = &[
+        (
+            "a documentation-shaped id this service never issued",
+            "nat-0123456789abcdef0",
+            NAT_GATEWAY_MALFORMED,
+        ),
+        (
+            "a synthetic id of 17 hexadecimal digits",
+            "nat-2ed1589120d281e02",
+            NAT_GATEWAY_MALFORMED,
+        ),
+        (
+            "an id in the range the mint has reached that names no gateway",
+            "nat-00000000000000001",
+            NAT_GATEWAY_NOT_FOUND,
+        ),
+    ];
+    for (case, nat_gateway_id, expected_code) in rows {
+        let (status, refused) = ec2(
+            &router,
+            "DeleteNatGateway",
+            &[p("NatGatewayId", *nat_gateway_id)],
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&refused).as_str()),
+            (400, *expected_code),
+            "case {case:?}: expected {expected_code}, got {status} {refused}"
+        );
+        if *expected_code == NAT_GATEWAY_MALFORMED {
+            assert_eq!(
+                error_message(&refused),
+                format!("{INVALID_NAT_GATEWAY_MESSAGE}{nat_gateway_id}"),
+                "case {case:?}: expected the refusal to name {nat_gateway_id}, got {refused}"
+            );
+        }
+    }
 
     // A dry run of a delete that WOULD have gone through leaves the gateway as it is.
     let case = "a dry run of a delete that would have succeeded";

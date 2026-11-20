@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateNatGatewayAddress
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateNatGatewayAddress`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: moves each secondary Elastic IP address the request names into
+//! `disassociating` on the public NAT gateway that holds it — the address stays associated
+//! while its connections drain — and the clock owes it the RELEASE at the end of
+//! `MaxDrainDurationSeconds`, at which point it leaves the gateway, its private address goes
+//! back to the subnet and the Elastic IP allocation is free again.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateNatGatewayAddress::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +146,204 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateNatGatewayAddress` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateNatGatewayAddressErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateNatGatewayAddress"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            CONNECTIVITY_TYPE_PUBLIC, DEFAULT_NAT_GATEWAY_DRAIN_SECONDS,
+            NAT_GATEWAY_ADDRESS_STATUS_DISASSOCIATING, NAT_GATEWAY_ADDRESS_STATUS_SUCCEEDED,
+            NAT_GATEWAY_STATE_AVAILABLE, incorrect_state, internal_error,
+            require_known_nat_gateway, require_service_state,
+        };
+
+        // `ctx` carries request metadata only, and both the gateway and the associations this
+        // call acts on are named by their own ids, so this operation reads none of it. The
+        // store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "The association IDs of EIPs that have been associated with the NAT gateway"
+        // (`$AssociationIds`, required): a call naming none would disassociate nothing at
+        // all. The member is modelled `clientOptional`, so an absent list reaches the handler
+        // as an empty one rather than being refused at the boundary.
+        if input.association_ids.is_empty() {
+            return Err(Scaffolded::missing_parameter(
+                "The request must name at least one association ID in associationId",
+            ));
+        }
+        // One association id names one address, so naming it twice in one call asks for one
+        // address to be disassociated twice — the reading `AssociateNatGatewayAddress` makes
+        // of a repeated allocation id.
+        let mut named = ::std::collections::BTreeSet::new();
+        for association_id in &input.association_ids {
+            if !named.insert(association_id.as_str()) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{association_id}' for associationId. \
+                     It is named more than once in this request"
+                )));
+            }
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // Every move the clock already owed is applied before anything is read — an
+        // association that has finished, and a drain that has ended — so this call acts on
+        // the gateway as it stands NOW rather than as it stood when something last asked.
+        store.materialize_due_transitions();
+
+        // The NAT gateway is the resource this call acts on, so it is resolved first: the one
+        // place the whole family resolves a `NatGatewayId`, so a value that is not a NAT
+        // gateway id and one the account holds no gateway for are answered as themselves.
+        let gateway = require_known_nat_gateway(&store, &input.nat_gateway_id)?;
+        let gateway_state = gateway.state.clone().unwrap_or_default();
+        // "The default is public connectivity" (`CreateNatGatewayRequest$ConnectivityType`),
+        // so a gateway stored without the member reads as that default.
+        let connectivity = gateway
+            .connectivity_type
+            .clone()
+            .unwrap_or_else(|| CONNECTIVITY_TYPE_PUBLIC.to_string());
+        let held_addresses = gateway.nat_gateway_addresses.clone().unwrap_or_default();
+
+        // "available: The NAT gateway is able to process traffic. This status remains until
+        // you delete the NAT gateway" (`NatGateway$State`): in every other state the gateway
+        // is still coming up, has failed, or is going away, so its addresses are not the
+        // caller's to change — the same reading `AssociateNatGatewayAddress` makes.
+        if gateway_state != NAT_GATEWAY_STATE_AVAILABLE {
+            return Err(incorrect_state(format!(
+                "The NAT gateway '{}' is in state '{gateway_state}', which is not a state in \
+                 which an Elastic IP address can be disassociated from it",
+                input.nat_gateway_id
+            )));
+        }
+        // "Disassociates secondary Elastic IP addresses (EIPs) from a public NAT gateway"
+        // (`DisassociateNatGatewayAddress`): a private NAT gateway has no Elastic IP
+        // addresses at all, so there is none to disassociate.
+        if connectivity != CONNECTIVITY_TYPE_PUBLIC {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The NAT gateway '{}' has connectivityType '{connectivity}'. An Elastic IP \
+                 address is associated with a public NAT gateway",
+                input.nat_gateway_id
+            )));
+        }
+
+        // "While disassociating is in progress, you cannot associate/disassociate additional
+        // EIPs while the connections are being drained" (`DisassociateNatGatewayAddress`) —
+        // the same sentence `UnassignPrivateNatGatewayAddress` carries, asked through the one
+        // state seam both use, so a gateway with any address still draining admits neither
+        // call.
+        if store.nat_gateway_is_draining(&input.nat_gateway_id) {
+            return Err(incorrect_state(format!(
+                "The NAT gateway '{}' is already disassociating an address, so no additional \
+                 Elastic IP address can be disassociated while the connections are being \
+                 drained",
+                input.nat_gateway_id
+            )));
+        }
+
+        // Every association the request names has to be one this gateway HOLDS, in a status
+        // that still admits the change, and none of them may be the gateway's primary
+        // address: "You cannot disassociate your primary EIP"
+        // (`DisassociateNatGatewayAddress`). All of them are checked before the first write,
+        // so a call that is refused leaves every association as it was.
+        let mut draining: Vec<String> = Vec::new();
+        for association_id in &input.association_ids {
+            let Some(address) = held_addresses.iter().find(|address| {
+                address.association_id.as_deref() == Some(association_id.as_str())
+            }) else {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{association_id}' for associationId. The NAT gateway \
+                     '{}' holds no Elastic IP address under that association ID",
+                    input.nat_gateway_id
+                )));
+            };
+            if address.is_primary == Some(true) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{association_id}' for associationId. It is the primary \
+                     Elastic IP address of the NAT gateway '{}', which cannot be \
+                     disassociated",
+                    input.nat_gateway_id
+                )));
+            }
+            // An address whose status is not the terminal `succeeded` is still being worked
+            // on, so it is not one the caller can act on yet.
+            let status = address.status.clone().unwrap_or_default();
+            if status != NAT_GATEWAY_ADDRESS_STATUS_SUCCEEDED {
+                return Err(incorrect_state(format!(
+                    "The Elastic IP address association '{association_id}' of NAT gateway \
+                     '{}' is in status '{status}', which is not a status in which it can be \
+                     disassociated",
+                    input.nat_gateway_id
+                )));
+            }
+            // The drain is keyed by the PRIVATE address the Elastic IP is mapped to, because
+            // that is what a release hands back to the subnet: "the EIPs (and the
+            // corresponding private IP addresses mapped to them) are released".
+            let Some(private_ip) = address.private_ip.clone() else {
+                return Err(internal_error(format!(
+                    "the Elastic IP address association '{association_id}' of NAT gateway \
+                     '{}' is stored without a private IPv4 address",
+                    input.nat_gateway_id
+                )));
+            };
+            draining.push(private_ip);
+        }
+
+        // DryRun sits AFTER every parameter has been resolved and BEFORE the first write: the
+        // flag asks whether the request WOULD have worked, so one that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves every association exactly as it is.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // "The maximum amount of time to wait (in seconds) before forcibly releasing the IP
+        // addresses if connections are still in progress. Default value is 350 seconds"
+        // (`$MaxDrainDurationSeconds`): the wait the caller asked for, or AWS's documented
+        // default when it asked for none. The modelled `@range(min: 1, max: 4000)` the
+        // boundary validator has already held the request to is enforced again by the state
+        // seam that records the drain, so no number a caller chose reaches the clock
+        // unclamped.
+        let drain = ::std::time::Duration::from_secs(
+            input
+                .max_drain_duration_seconds
+                .and_then(|seconds| u64::try_from(seconds).ok())
+                .unwrap_or(DEFAULT_NAT_GATEWAY_DRAIN_SECONDS),
+        );
+
+        // "It stays associated and supports the existing connections but does not support any
+        // new connections" (`DisassociateNatGatewayAddress`): the address is still ON the
+        // gateway and still holds its Elastic IP address and its private address — only its
+        // status moves, to the transient `disassociating` — and what the clock owes it is the
+        // RELEASE at the end of the drain, recorded rather than slept for, through the one
+        // drain seam this surface shares with `UnassignPrivateNatGatewayAddress`.
+        let gateway = store
+            .nat_gateways
+            .get_mut(&input.nat_gateway_id)
+            .ok_or_else(|| {
+                internal_error(format!(
+                    "the NAT gateway '{}' could not be read back",
+                    input.nat_gateway_id
+                ))
+            })?;
+        for address in gateway.nat_gateway_addresses.iter_mut().flatten() {
+            let is_named = address
+                .association_id
+                .as_deref()
+                .is_some_and(|association_id| named.contains(association_id));
+            if is_named {
+                address.status = Some(NAT_GATEWAY_ADDRESS_STATUS_DISASSOCIATING.to_string());
+            }
+        }
+        // Answered out of the store, so the caller sees what a later reader of this gateway
+        // will see rather than the request object: "Information about the NAT gateway IP
+        // addresses" (`$NatGatewayAddresses`) is every address the gateway now has, not only
+        // the ones this call is taking away.
+        let answered = gateway.nat_gateway_addresses.clone().unwrap_or_default();
+        let answered_id = gateway.nat_gateway_id.clone();
+        for private_ip in &draining {
+            store.begin_nat_gateway_address_drain(&input.nat_gateway_id, private_ip, drain);
+        }
+
+        Ok(DisassociateNatGatewayAddressOutput {
+            nat_gateway_id: answered_id,
+            nat_gateway_addresses: Some(answered),
+        })
     }
 }

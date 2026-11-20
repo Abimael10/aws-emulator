@@ -145,11 +145,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let service_state = state::require_service_state(&*self.engine)?;
         let store = service_state.lock();
 
-        // "The ID of the Network Access Scope" (`NetworkInsightsAccessScopeId`): an id that
-        // resolves to no scope of the account is refused — whatever its form, and whether it
-        // was never minted or was deleted — rather than answered with an empty content, with
-        // this resource's own `Invalid<Resource>Id.NotFound`. The code and wording live in
-        // the one place beside the store, so this read and the describes cannot drift apart.
+        // "The ID of the Network Access Scope" (`NetworkInsightsAccessScopeId`): this
+        // operation ACTS on the one scope it is given, so it screens that value BEFORE any
+        // lookup, the way `DeleteNetworkInsightsAccessScope` screens its own — a
+        // `NetworkInsightsAccessScopeId` this service could never have ISSUED
+        // ([`crate::state::ComAmazonawsEc2Amazonec2State::id_was_issued`]) is not a value
+        // this operation can resolve at all, and EC2 states that the id it was given is not
+        // a valid one, naming the member that carried it and the value, rather than
+        // reporting a resource that is gone. The wording lives in the one place beside the
+        // store, so the two operations of this surface that screen a value cannot drift
+        // apart.
+        if !store.id_was_issued(
+            state::NETWORK_INSIGHTS_ACCESS_SCOPE_ID_PREFIX,
+            &input.network_insights_access_scope_id,
+        ) {
+            return Err(state::invalid_network_insights_access_scope_id_value(
+                &input.network_insights_access_scope_id,
+            ));
+        }
+
+        // Screening the value above is what keeps THIS half of the pair reachable: an id this
+        // service DID issue names a scope that may since have gone, and that is the condition
+        // every read of this surface answers with this resource's own
+        // `Invalid<Resource>Id.NotFound` rather than with an empty content.
         if !store
             .network_insights_access_scopes
             .contains_key(&input.network_insights_access_scope_id)

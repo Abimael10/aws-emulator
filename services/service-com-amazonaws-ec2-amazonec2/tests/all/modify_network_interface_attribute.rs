@@ -1241,14 +1241,19 @@ async fn a_request_must_name_exactly_one_attribute() {
         );
     }
 
-    // Pairs spanning the members: two plain attributes, a list beside a structure, and a
-    // boolean beside a list.
-    let pairs: [(&str, Vec<Param>); 3] = [
+    // Collisions spanning the members: two plain attributes, a list beside a structure, a
+    // boolean beside a list, and three members at once — each row carrying the fields the
+    // refusal has to name, which are the attributes the REQUEST carried and nothing else.
+    let collisions: [(&str, Vec<Param>, &[&str]); 4] = [
         (
             "a description and a check",
             vec![
                 param("Description.Value", "two at once"),
                 param("SourceDestCheck.Value", "false"),
+            ],
+            &[
+                describe_attribute_op::ATTRIBUTE_DESCRIPTION,
+                describe_attribute_op::ATTRIBUTE_SOURCE_DEST_CHECK,
             ],
         ),
         (
@@ -1257,6 +1262,10 @@ async fn a_request_must_name_exactly_one_attribute() {
                 param("SecurityGroupId.1", &group),
                 param("ConnectionTrackingSpecification.UdpTimeout", "40"),
             ],
+            &[
+                describe_attribute_op::ATTRIBUTE_GROUP_SET,
+                modify_op::ATTRIBUTE_CONNECTION_TRACKING_SPECIFICATION,
+            ],
         ),
         (
             "a public address and a subnet association",
@@ -1264,9 +1273,26 @@ async fn a_request_must_name_exactly_one_attribute() {
                 param("AssociatePublicIpAddress", "true"),
                 param("AssociatedSubnetId.1", &subnet_id),
             ],
+            &[
+                describe_attribute_op::ATTRIBUTE_ASSOCIATE_PUBLIC_IP_ADDRESS,
+                modify_op::ATTRIBUTE_ASSOCIATED_SUBNET_IDS,
+            ],
+        ),
+        (
+            "three attributes at once",
+            vec![
+                param("Description.Value", "three at once"),
+                param("SecurityGroupId.1", &group),
+                param("EnablePrimaryIpv6", "true"),
+            ],
+            &[
+                describe_attribute_op::ATTRIBUTE_DESCRIPTION,
+                describe_attribute_op::ATTRIBUTE_GROUP_SET,
+                modify_op::ATTRIBUTE_ENABLE_PRIMARY_IPV6,
+            ],
         ),
     ];
-    for (case, changes) in pairs {
+    for (case, changes, collided) in collisions {
         let (status, body) = modify(&router, &eni, &changes).await;
         let (code, message) = refused(case, status, &body, 400);
         assert_eq!(
@@ -1276,8 +1302,11 @@ async fn a_request_must_name_exactly_one_attribute() {
         );
         assert_eq!(
             message,
-            modify_op::ONE_ATTRIBUTE_AT_A_TIME,
-            "case {case:?}: expected the one-attribute-at-a-time refusal, got {message:?}"
+            format!(
+                "Fields for multiple attribute types specified: {fields}",
+                fields = collided.join(", ")
+            ),
+            "case {case:?}: expected the refusal to name {collided:?}, got {message:?}"
         );
     }
 

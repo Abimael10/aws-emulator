@@ -133,8 +133,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            require_known_nat_gateway, require_service_state, system_time_to_date_time,
-            NAT_GATEWAY_STATE_DELETED, NAT_GATEWAY_STATE_DELETING, PendingStateMove,
+            NAT_GATEWAY_ID_PREFIX, NAT_GATEWAY_STATE_DELETED, NAT_GATEWAY_STATE_DELETING,
+            PendingStateMove, nat_gateway_malformed, require_known_nat_gateway,
+            require_service_state, system_time_to_date_time,
         };
 
         // `ctx` carries request metadata only, and a NAT gateway is named by its own id, so
@@ -147,10 +148,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // owed, so what this call does is decided from the state the gateway is ACTUALLY in.
         store.materialize_due_transitions();
 
-        // "Deletes the specified NAT gateway" (`DeleteNatGateway`): an id this account holds
-        // no gateway for is a refusal, not a no-op, and an id that is not shaped like a NAT
-        // gateway id is refused as malformed first — the one place this crate asks those two
-        // questions, in that order.
+        // "The ID of the NAT gateway" (`$NatGatewayId`): this operation ACTS on the one
+        // gateway it is given, so it screens that value BEFORE any lookup. A `NatGatewayId`
+        // this service could never have ISSUED — the ids its mint has counted are the only
+        // ones it ever answered with
+        // ([`crate::state::ComAmazonawsEc2Amazonec2State::id_was_issued`]) — is not a value
+        // this operation can resolve at all, however well its printed form reads, so a
+        // hand-written or synthetic id is refused as malformed rather than reported as a
+        // gateway that is gone: a caller whose cleanup swallows "already deleted" must not
+        // swallow a typo or another account's id.
+        if !store.id_was_issued(NAT_GATEWAY_ID_PREFIX, &input.nat_gateway_id) {
+            return Err(nat_gateway_malformed(&input.nat_gateway_id));
+        }
+
+        // Screening the value above is what keeps THIS half of the pair reachable: an id this
+        // service DID issue names a gateway the account may no longer hold, which is the
+        // condition the NAT gateway family's own not-found code answers.
         let gateway = require_known_nat_gateway(&store, &input.nat_gateway_id)?;
         let already_going = matches!(
             gateway.state.as_deref(),
