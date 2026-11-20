@@ -64,6 +64,12 @@
 //!   bodies SPELL the member another way, reached through [`RequestIdReportedOperation`]:
 //!   the spelling is the service's own fact, read off its recordings, so it is passed in
 //!   rather than restated here.
+//! * [`with_request_id_header_and_error_member`], the header report and the body-member
+//!   report composed under ONE id: the header on every response and the `requestId` member
+//!   of a JSON error body, which is what a service whose recorded failures state the id in
+//!   the body AND whose responses carry it in the header answers with. Reached through
+//!   [`RequestIdReportedOperation`] and
+//!   [`RequestIdEnvelopeDefinition::header_and_error_member`].
 //!
 //! WHERE the id is stated is the protocol's; WHAT it is spelled like is the service's. The
 //! three writers above mint [`new_request_id`], the form almost every AWS service reports,
@@ -366,7 +372,29 @@ pub fn with_request_id_error_member(resp: RtResponse) -> RtResponse {
 /// else is the body [`with_request_id_error_member`] runs: the same minted id, the same
 /// idempotence, the same textual insertion that leaves every other byte as the renderer wrote
 /// it, and the same silence about a success or a body that is not a JSON object.
-pub fn with_request_id_error_member_named(mut resp: RtResponse, member: &str) -> RtResponse {
+pub fn with_request_id_error_member_named(resp: RtResponse, member: &str) -> RtResponse {
+    with_stated_error_member(resp, &new_request_id(), member)
+}
+
+/// The response with `request_id` named as the request it answers, in that same body member:
+/// the body-member report for an answer whose service ALREADY knows which request it is.
+///
+/// [`with_request_id_error_member`] mints the id, because for almost every call the
+/// correlation id belongs to the response alone and nothing else holds one. A service that
+/// reports the id in MORE than one place — the body member of a failure and the header of
+/// every response alike ([`with_request_id_header_and_error_member`]) — states the one id it
+/// already minted here, so a client correlating on either reads the same value.
+///
+/// Which responses it touches and what it leaves alone are exactly
+/// [`with_request_id_error_member`]'s: a success, a body that is not a JSON object and a body
+/// that already names its request are all returned as the renderer wrote them.
+pub fn with_stated_request_id_error_member(resp: RtResponse, request_id: &str) -> RtResponse {
+    with_stated_error_member(resp, request_id, REQUEST_ID_MEMBER)
+}
+
+/// The ONE statement of the body-member report: `request_id` written into `member` of a JSON
+/// error body, which is what the three writers above differ only in the id and the member of.
+fn with_stated_error_member(mut resp: RtResponse, request_id: &str, member: &str) -> RtResponse {
     if resp.status().as_u16() < FIRST_FAILURE_STATUS {
         return resp;
     }
@@ -379,7 +407,7 @@ pub fn with_request_id_error_member_named(mut resp: RtResponse, member: &str) ->
         let Ok(text) = std::str::from_utf8(bytes) else {
             return resp;
         };
-        add_error_request_id(text, &new_request_id(), member)
+        add_error_request_id(text, request_id, member)
     };
     if let Some(rewritten) = rewritten {
         // Only a renderer that advertised a length needs it corrected; the framework's
@@ -391,6 +419,27 @@ pub fn with_request_id_error_member_named(mut resp: RtResponse, member: &str) ->
         *resp.body_mut() = SdkBody::from(rewritten);
     }
     resp
+}
+
+/// The response with the request it answers named in BOTH places a JSON service states it
+/// in: the header AWS reports it in on every response, and the `requestId` member of a JSON
+/// error body — under ONE id.
+///
+/// The report for a service whose recorded failures carry the id in the body itself AND whose
+/// every response carries it in the header: the two writers it composes
+/// ([`with_stated_request_id_header`], through [`named_request_as`], and
+/// [`with_stated_request_id_error_member`]) are handed the
+/// same value, so a client correlating out of the header and one parsing it out of the body
+/// read the same id for one call. An id a layer below already stated in the header is the one
+/// reported, which keeps this idempotent: two layers of one service cannot report two ids for
+/// one call.
+///
+/// Nothing else changes: a success keeps its modelled body, a failure whose body is not a
+/// JSON object keeps it byte for byte, and the status and every other header stay as the
+/// renderer wrote them.
+pub fn with_request_id_header_and_error_member(resp: RtResponse) -> RtResponse {
+    let (resp, stated) = named_request_as(resp, new_request_id);
+    with_stated_request_id_error_member(resp, &stated)
 }
 
 /// The text of the FIRST `<name>` element of `text`, or `None` when it holds none.
@@ -623,8 +672,9 @@ impl ErasedOperation for RequestIdErrorMemberOperation {
 /// the SERVICE chose.
 ///
 /// The three wrappers above each hold ONE of the reports this module states. A service whose
-/// report is its own — because the FORM of the id, or the MEMBER its error bodies spell it in,
-/// is that service's fact — holds this one instead and hands it the same [`Report`] it hands
+/// report is its own — because the FORM of the id, the MEMBER its error bodies spell it in, or
+/// the set of places it states it, is that service's fact — holds this one instead and hands it
+/// the same [`Report`] it hands
 /// [`RequestIdEnvelopeDefinition::reporting`], so the response an operation produced and the
 /// response no operation produced name their request the same way. It stores no operation of
 /// its own: the one it delegates to is the one the service's routing table names for the
@@ -766,6 +816,17 @@ impl<D: ErasedServiceDefinition> RequestIdEnvelopeDefinition<D> {
         }
     }
 
+    /// Wrap a service's generated definition, reporting the id in the header of every
+    /// response AND in the `requestId` member of a JSON error body, under one id
+    /// ([`with_request_id_header_and_error_member`]) — the report for a service that states it
+    /// in both places.
+    pub fn header_and_error_member(inner: D) -> Self {
+        Self {
+            inner,
+            report: with_request_id_header_and_error_member,
+        }
+    }
+
     /// Wrap a service's generated definition, reporting the id with `report` — the
     /// constructor for a service whose report none of the three above states, because the
     /// FORM of the id it names a request by is its own (see [`Report`]).
@@ -779,7 +840,8 @@ impl<D: ErasedServiceDefinition> RequestIdEnvelopeDefinition<D> {
 
     /// Whether the generated routing table can serve this request — the condition under
     /// which a service claims it for [`RequestIdEnvelopeOperation`],
-    /// [`RequestIdHeaderOperation`] or [`RequestIdErrorMemberOperation`], so a request
+    /// [`RequestIdHeaderOperation`], [`RequestIdErrorMemberOperation`] or
+    /// [`RequestIdReportedOperation`], so a request
     /// naming no modelled operation (an `Action` the model does not declare, a method and
     /// path the model does not bind) stays the framework's (or the service's own) routing
     /// failure.
@@ -1335,6 +1397,80 @@ mod tests {
                 ),
                 member,
             );
+            assert_eq!(
+                std::str::from_utf8(again.body().bytes().expect("bytes")).expect("utf-8"),
+                answered_body,
+                "case {case:?}: expected a second report to change nothing"
+            );
+        }
+    }
+
+    /// RULE: the composed report states ONE id in both places a JSON service reports it — the
+    /// header of every response and the `requestId` member of a JSON error body.
+    ///
+    /// The rows span what it generalises over: a success (the header alone — its body is the
+    /// modelled output), failures of three classes, and a body that is not a JSON object.
+    #[test]
+    fn the_composed_report_states_one_id_in_the_header_and_the_body() {
+        // (case, status, the rendered body, whether the body gains the member)
+        let rows = [
+            ("a success", 200u16, r#"{"arn":"a"}"#, false),
+            ("a refusal", 400, r#"{"message":"no"}"#, true),
+            (
+                "a modelled error",
+                404,
+                r#"{"__type":"ResourceNotFoundException","message":"gone"}"#,
+                true,
+            ),
+            ("a server fault", 500, r#"{"__type":"ServiceException"}"#, true),
+            ("an XML envelope", 400, "<Error><Code>x</Code></Error>", false),
+        ];
+
+        for (case, status, body, adds) in rows {
+            let answered = with_request_id_header_and_error_member(RtResponse::new(
+                aws_smithy_runtime_api::http::StatusCode::try_from(status).expect("a status"),
+                SdkBody::from(body),
+            ));
+            assert_eq!(
+                answered.status().as_u16(),
+                status,
+                "case {case:?}: the status must not move"
+            );
+            let stated = answered
+                .headers()
+                .get(REQUEST_ID_HEADER)
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                is_request_id(&stated),
+                "case {case:?}: expected the header to name the request, got {stated:?}"
+            );
+            let answered_body = std::str::from_utf8(answered.body().bytes().expect("bytes"))
+                .expect("utf-8")
+                .to_string();
+            if !adds {
+                assert_eq!(
+                    answered_body, body,
+                    "case {case:?}: expected the body to survive byte for byte, got \
+                     {answered_body:?}"
+                );
+                continue;
+            }
+            let document: serde_json::Value =
+                serde_json::from_str(&answered_body).expect("a JSON object");
+            assert_eq!(
+                document
+                    .get(REQUEST_ID_MEMBER)
+                    .and_then(serde_json::Value::as_str),
+                Some(stated.as_str()),
+                "case {case:?}: expected the body to name the SAME id the header does, got \
+                 {answered_body:?}"
+            );
+            // Idempotent: a second report over the rewritten body adds no second id.
+            let again = with_request_id_header_and_error_member(RtResponse::new(
+                aws_smithy_runtime_api::http::StatusCode::try_from(status).expect("a status"),
+                SdkBody::from(answered_body.clone()),
+            ));
             assert_eq!(
                 std::str::from_utf8(again.body().bytes().expect("bytes")).expect("utf-8"),
                 answered_body,

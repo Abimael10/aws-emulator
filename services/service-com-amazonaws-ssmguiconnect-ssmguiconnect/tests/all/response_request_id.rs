@@ -6,14 +6,16 @@
 //! the service request id in (`x-amzn-RequestId`, matched case-insensitively — the header
 //! the model's own CORS configuration exposes, `smithy_query(query="service_info")`),
 //! freshly minted per call, on EVERY answer — each operation's success, each modelled
-//! error, and the framework-level failures no operation produces. It is a property of the
-//! RESPONSE rather than of any modelled shape, so no output or error shape of this model
-//! declares it, no handler can set it, and it is what an SDK surfaces as
-//! `ResponseMetadata.RequestId` / `ServiceError::request_id()`.
+//! error, and the framework-level failures no operation produces — and a FAILURE states
+//! that same id a second time, in the top-level `requestId` member of its JSON error body
+//! beside the `message`. It is a property of the RESPONSE rather than of any modelled
+//! shape, so no output or error shape of this model declares it, no handler can set it, and
+//! it is what an SDK surfaces as `ResponseMetadata.RequestId` /
+//! `ServiceError::request_id()`.
 //!
 //! What the rule does NOT change, and this suite pins too: the status, the error code and
-//! the body of every one of those answers stay exactly what they were — the id travels in
-//! the header alone, so no response body gains it.
+//! the `message` of every one of those answers stay exactly what they were, and the body of
+//! a SUCCESS is still exactly the modelled output — the id joins an error body only.
 //!
 //! The rows span what the rule generalises over: which operation answered (all three the
 //! model binds), whether the answer is a success or a failure, the failure's status and
@@ -51,7 +53,8 @@ fn names_a_request_id(id: &str) -> bool {
 }
 
 /// RULE: every answer of every operation names the request it answered, whatever its
-/// status, code and layer — and two answers name two requests.
+/// status, code and layer — in the header, and in the error body of a failure — and two
+/// answers name two requests.
 #[tokio::test]
 async fn every_answer_names_the_request_it_answered() {
     let long_token = "t".repeat(65);
@@ -137,14 +140,28 @@ async fn every_answer_names_the_request_it_answered() {
             names_a_request_id(&request_id),
             "case {case:?}: expected a well-formed request id, got {request_id:?}"
         );
-        // The id is a property of the response: no body member gains it.
-        assert!(
-            !serde_json::to_string(&reply.body)
-                .expect("the body serializes")
-                .contains(&request_id),
-            "case {case:?}: the id must travel in the header alone, got {:?}",
-            reply.body
-        );
+        // A FAILURE states that one id in its error body too, beside the `message`; a
+        // success's body is the modelled output, which gains nothing.
+        let in_body = reply
+            .body
+            .get("requestId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if status >= 400 {
+            assert_eq!(
+                in_body.as_deref(),
+                Some(request_id.as_str()),
+                "case {case:?}: expected the error body to name the same request as the \
+                 header, got {:?}",
+                reply.body
+            );
+        } else {
+            assert_eq!(
+                in_body, None,
+                "case {case:?}: expected a success body to stay the modelled output, got {:?}",
+                reply.body
+            );
+        }
         assert!(
             !seen.contains(&request_id),
             "case {case:?}: expected an id of its own, but {request_id:?} already named another \
@@ -206,6 +223,92 @@ async fn an_answer_no_operation_produced_names_its_request_too() {
         assert!(
             names_a_request_id(&request_id),
             "case {case:?}: expected a well-formed request id, got {request_id:?}"
+        );
+        // The router words that failure in this service's own restJson1 envelope, so it is a
+        // JSON object and it names the same request the header does.
+        let document: Value = serde_json::from_str(&body)
+            .unwrap_or_else(|_| panic!("case {case:?}: expected a JSON error body, got {body}"));
+        let members = document.as_object().unwrap_or_else(|| {
+            panic!("case {case:?}: expected a JSON error OBJECT, got {body}")
+        });
+        assert_eq!(
+            members.get("requestId").and_then(Value::as_str),
+            Some(request_id.as_str()),
+            "case {case:?}: expected the error body to name the same request as the header, \
+             got {body}"
+        );
+    }
+}
+
+/// RULE: the id joins an error body as ONE top-level member of the envelope the renderer
+/// wrote, beside the `__type` and the `message` — which it leaves exactly as they were.
+///
+/// The rows span the error classes the model binds to these operations and the operations
+/// that answer them: a 404 from the read, a 403 from the write's account gate, and a 400 the
+/// constraint walk raised ahead of the write.
+#[tokio::test]
+async fn an_error_body_carries_the_id_beside_the_envelope_it_already_had() {
+    // (case, operation, body, expected status, expected error code)
+    let rows: [(&str, &str, Value, u16, &str); 3] = [
+        (
+            "the read's 404",
+            GET,
+            json!({}),
+            404,
+            "ResourceNotFoundException",
+        ),
+        (
+            "the write's 403",
+            UPDATE,
+            update_body("id-403"),
+            403,
+            "AccessDeniedException",
+        ),
+        (
+            "the write's 400",
+            UPDATE,
+            json!({
+                "ConnectionRecordingPreferences":
+                    preferences("123456789012", "rdp-recordings", KEY_ARN),
+                "ClientToken": "t".repeat(65),
+            }),
+            400,
+            "ValidationException",
+        ),
+    ];
+
+    for (case, operation, body, status, code) in rows {
+        let emulator = Emulator::new();
+        let reply = emulator.call(ACCOUNT_KEY, operation, &body).await;
+        assert_eq!(
+            reply.status, status,
+            "case {case:?}: expected {status}, got {reply:?}"
+        );
+        assert_eq!(
+            reply.code, code,
+            "case {case:?}: expected code {code:?}, got {reply:?}"
+        );
+        let members = reply
+            .body
+            .as_object()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a JSON error body, got {reply:?}"));
+        let mut named: Vec<&str> = members.keys().map(String::as_str).collect();
+        named.sort_unstable();
+        assert_eq!(
+            named,
+            ["__type", "message", "requestId"],
+            "case {case:?}: expected the id beside the envelope the renderer wrote, got {:?}",
+            reply.body
+        );
+        assert!(
+            !reply.message.is_empty(),
+            "case {case:?}: expected the modelled message to survive, got {reply:?}"
+        );
+        assert_eq!(
+            members.get("requestId").and_then(Value::as_str),
+            reply.request_id.as_deref(),
+            "case {case:?}: expected the body to name the same request as the header, got \
+             {reply:?}"
         );
     }
 }
@@ -292,6 +395,16 @@ async fn the_id_is_reported_once_per_response() {
             names_a_request_id(&reported[0]),
             "case {case:?}: expected a well-formed request id, got {:?}",
             reported[0]
+        );
+        // And exactly once in the body of a FAILURE, however many layers answered: a
+        // success's body is the modelled output, which gains none.
+        let body = String::from_utf8_lossy(response.body()).to_string();
+        let expected = usize::from(status >= 400);
+        assert_eq!(
+            body.matches("\"requestId\"").count(),
+            expected,
+            "case {case:?}: expected {expected} request id(s) in the body of the {status}, got \
+             {body}"
         );
     }
 
