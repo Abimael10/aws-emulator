@@ -4,25 +4,24 @@
 //! -> `GetCloudConnector`.
 //!
 //! RULE: `DeleteCloudConnector` (DELETE `/cloud-connectors/{Identifier}`, success 200 with
-//! an empty body) REMOVES the cloud-connector record the signing region's store holds under
-//! that identifier, so a following read of it reports it absent while every other stored
-//! connector is left exactly as it was, and the `ClientToken` that created it stops
-//! replaying into the removed id; an identifier that region holds no connector under —
-//! never created, already deleted, or created through another region's endpoint — removes
-//! nothing and is the modelled `ResourceNotFoundException` (HTTP 404), reporting the
-//! identifier the request carried on `ResourceId`, the resource kind on `ResourceType`, and
-//! the sentence the corpus records for an absent cloud connector on both halves of this
-//! resource's surface — the same text its recorded read and mutating 404s carry — which
-//! names no identifier and so is the same for every request.
+//! an empty body, `@idempotent`) REMOVES the cloud-connector record the signing region's
+//! store holds under that identifier, so a following read of it reports it absent while
+//! every other stored connector is left exactly as it was, and the `ClientToken` that
+//! created it stops replaying into the removed id; and it reports the state the caller
+//! asked for rather than whether this call reached it, so an identifier that region holds
+//! no connector under — never created, already deleted, or created through another region's
+//! endpoint — removes nothing and answers that SAME success, with no error code and no
+//! body, rather than a refusal.
 //!
-//! The recorded unit this was derived from
-//! (`iot-managed-integrations.cloud-connector-lifecycle`) is ONE row of the tables below.
-//! The rows differ along what the rule generalises over: which optional members the deleted
-//! connector was created with and in which form (the `@pattern`/`@length` of `Name` and
-//! `Description` at both bounds, the forms of Lambda ARN `LambdaArn` admits), how many
-//! connectors the store holds when one of them is deleted, the form of an absent identifier
-//! inside `CloudConnectorId`'s `@length` 1..64 and `^[A-Za-z0-9-_]+$`, what made it absent,
-//! and the region the request is signed for.
+//! The recorded units this was derived from (`iot-managed-integrations.cloud-connector-\
+//! lifecycle` and the never-created delete of `…cloud-connector-error-paths`) are ONE row
+//! each of the tables below. The rows differ along what the rule generalises over: which
+//! optional members the deleted connector was created with and in which form (the
+//! `@pattern`/`@length` of `Name` and `Description` at both bounds, the forms of Lambda ARN
+//! `LambdaArn` admits), how many connectors the store holds when one of them is deleted,
+//! the form of an absent identifier inside `CloudConnectorId`'s `@length` 1..64 and
+//! `^[A-Za-z0-9-_]+$`, what made it absent, how many times the same delete is repeated, and
+//! the region the request is signed for.
 //!
 //! Every case drives the real restJson1 request path (`MultiServiceRouter::dispatch`), so
 //! the routes, statuses, bodies and modelled errors asserted here are the ones a client
@@ -251,7 +250,29 @@ async fn create(router: &MultiServiceRouter, case: &str, body: Value) -> String 
         .to_string()
 }
 
-/// Assert one answer is the modelled 404 of an absent cloud connector.
+/// Assert one answer is this delete's modelled success: the status the model binds, no
+/// error code, and no body at all (the output shape is `Unit`).
+fn assert_delete_succeeded(case: &str, reply: &Reply) {
+    assert_eq!(
+        reply.status, DELETE_STATUS,
+        "case {case:?}: expected HTTP {DELETE_STATUS}, got {} with body {:?}",
+        reply.status, reply.body
+    );
+    assert_eq!(
+        reply.error_type, None,
+        "case {case:?}: a successful delete carries no error code, got {:?}",
+        reply.error_type
+    );
+    assert_eq!(
+        reply.body,
+        Value::Null,
+        "case {case:?}: the modelled output has no members, so the body is empty, got {:?}",
+        reply.body
+    );
+}
+
+/// Assert one answer is the modelled 404 of an absent cloud connector. Used for the READS
+/// this suite performs: the delete itself answers an absent identifier as a success.
 fn assert_not_found(case: &str, reply: &Reply, identifier: &str) {
     assert_eq!(
         reply.status, 404,
@@ -306,23 +327,7 @@ async fn a_delete_removes_the_connector_a_read_reported() {
         );
 
         let deleted = call(&router, "DELETE", &format!("{COLLECTION}/{id}"), None).await;
-        assert_eq!(
-            deleted.status, DELETE_STATUS,
-            "case {:?}: expected HTTP {DELETE_STATUS}, got {} with body {:?}",
-            case.label, deleted.status, deleted.body
-        );
-        assert_eq!(
-            deleted.error_type, None,
-            "case {:?}: a successful delete carries no error code, got {:?}",
-            case.label, deleted.error_type
-        );
-        assert_eq!(
-            deleted.body,
-            Value::Null,
-            "case {:?}: the modelled output has no members, so the body is empty, got {:?}",
-            case.label,
-            deleted.body
-        );
+        assert_delete_succeeded(case.label, &deleted);
 
         let gone = call(&router, "GET", &format!("{COLLECTION}/{id}"), None).await;
         assert_not_found(case.label, &gone, &id);
@@ -407,10 +412,11 @@ async fn a_delete_leaves_every_other_connector_where_it_was() {
 }
 
 /// RULE: an identifier the signing region's store holds no connector under removes nothing
-/// and is the modelled 404 — whatever form the identifier takes and whatever made the record
-/// absent: never created, already deleted, or created through another region's endpoint.
+/// and answers the modelled success with an empty body and no error code — whatever form
+/// the identifier takes and whatever made the record absent: never created, already
+/// deleted, or created through another region's endpoint.
 #[tokio::test]
-async fn a_delete_of_a_connector_this_region_does_not_hold_is_not_found() {
+async fn a_delete_of_a_connector_this_region_does_not_hold_succeeds_and_removes_nothing() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let router = emulator_over(Arc::clone(&engine));
     let (min_length, max_length) = CLOUD_CONNECTOR_ID_LENGTH;
@@ -427,17 +433,26 @@ async fn a_delete_of_a_connector_this_region_does_not_hold_is_not_found() {
         ("mixed case", "MiXeDcAsE".to_string()),
     ];
     for (form, identifier) in &never_created {
-        let refused = call(&router, "DELETE", &format!("{COLLECTION}/{identifier}"), None).await;
-        assert_not_found(form, &refused, identifier);
+        let answered = call(&router, "DELETE", &format!("{COLLECTION}/{identifier}"), None).await;
+        assert_delete_succeeded(form, &answered);
+        assert!(
+            engine
+                .state::<ServiceState>()
+                .lock()
+                .cloud_connectors
+                .is_empty(),
+            "case {form:?}: a delete that found nothing must store nothing, got {:?}",
+            engine.state::<ServiceState>().lock().cloud_connectors.len()
+        );
     }
 
-    // One connector that EXISTS, so the rows below remove something real and the store is
-    // observed before and after each refusal.
+    // One connector that EXISTS, so the rows below have something real to leave alone and
+    // the store is observed before and after each no-op.
     let case = &cases()[1];
     let id = create(&router, case.label, case.body()).await;
 
-    // Another region's endpoint holds no record under this id, so it deletes nothing and
-    // the creating region still reports the connector.
+    // Another region's endpoint holds no record under this id, so it deletes nothing — and
+    // still succeeds — while the creating region keeps reporting the connector.
     for region in ["us-west-2", "eu-central-1"] {
         let elsewhere = call_signed(
             &router,
@@ -447,7 +462,7 @@ async fn a_delete_of_a_connector_this_region_does_not_hold_is_not_found() {
             None,
         )
         .await;
-        assert_not_found(region, &elsewhere, &id);
+        assert_delete_succeeded(region, &elsewhere);
         let untouched = call(&router, "GET", &format!("{COLLECTION}/{id}"), None).await;
         assert_eq!(
             untouched.status, 200,
@@ -462,24 +477,23 @@ async fn a_delete_of_a_connector_this_region_does_not_hold_is_not_found() {
         );
     }
 
-    // The same identifier, after the connector has really been removed: a second delete
-    // finds nothing to remove and states it exactly as a never-created identifier does.
-    let deleted = call(&router, "DELETE", &format!("{COLLECTION}/{id}"), None).await;
-    assert_eq!(
-        deleted.status, DELETE_STATUS,
-        "case \"already deleted\": the first delete must succeed, got {} with body {:?}",
-        deleted.status, deleted.body
-    );
-    let again = call(&router, "DELETE", &format!("{COLLECTION}/{id}"), None).await;
-    assert_not_found("already deleted", &again, &id);
-    assert!(
-        engine
-            .state::<ServiceState>()
-            .lock()
-            .cloud_connectors
-            .is_empty(),
-        "case \"already deleted\": a refused delete must leave the store as it was"
-    );
+    // The same identifier, repeated after the connector has really been removed: every
+    // delete answers the same success, so a retried teardown is indistinguishable from the
+    // call that did the removing, and the read behind it reports the connector absent.
+    for repeat in 1..=3u32 {
+        let repeated = call(&router, "DELETE", &format!("{COLLECTION}/{id}"), None).await;
+        assert_delete_succeeded(&format!("delete number {repeat}"), &repeated);
+        assert!(
+            engine
+                .state::<ServiceState>()
+                .lock()
+                .cloud_connectors
+                .is_empty(),
+            "case \"delete number {repeat}\": the store must hold no connector afterwards"
+        );
+        let gone = call(&router, "GET", &format!("{COLLECTION}/{id}"), None).await;
+        assert_not_found(&format!("read after delete number {repeat}"), &gone, &id);
+    }
 }
 
 /// RULE: the `ClientToken` that created a connector stops replaying into it once the

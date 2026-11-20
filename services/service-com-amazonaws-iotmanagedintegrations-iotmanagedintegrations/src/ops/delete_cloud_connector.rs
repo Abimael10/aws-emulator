@@ -5,29 +5,24 @@
 //! Removes the C2C (cloud-to-cloud) connector the signing region's store holds under the
 //! `Identifier`, along with the idempotency record that would otherwise replay a
 //! `CreateCloudConnector` into the deleted id, and answers the modelled success (HTTP 200,
-//! empty body). An `Identifier` that region holds no connector for — never created,
-//! already deleted, or another region's — leaves every store untouched and is the modelled
-//! `ResourceNotFoundException` (HTTP 404, a declared error of this operation), reporting
-//! the identifier the request carried on `ResourceId` and the resource kind on
-//! `ResourceType`.
+//! empty body).
 //!
-//! WHICH SENTENCE that 404 carries: the one
-//! [`crate::state::cloud_connector_not_found`] renders, which is what the corpus records
-//! for an absent cloud connector on BOTH halves of this resource's surface — the recorded
-//! `GetCloudConnector` 404 for an unknown identifier and the recorded `UpdateCloudConnector`
-//! 404 for a connector a delete had just removed carry identical `Message` text — so the
-//! sentence belongs to the RESOURCE here, not to the resolving path, and a delete that
-//! finds nothing to remove states what a read of the same identifier states. That is a fact
-//! about this resource only; a sibling whose recorded paths word their own differently keeps
-//! its own pair of reasons.
+//! WHY AN ABSENT IDENTIFIER IS A SUCCESS here rather than a refusal: this delete reports
+//! the state the caller asked for rather than whether this call was the one that reached
+//! it. The corpus records this operation against an identifier the account never created,
+//! and the recorded answer is HTTP 200 with an empty body — this operation's `@idempotent`
+//! contract: the post-condition "the signing region holds no connector under this
+//! identifier" already holds, so there is nothing to refuse. An `Identifier` that region
+//! holds no connector for — never created, already deleted, or another region's —
+//! therefore leaves every store untouched and answers that same success, whatever form the
+//! identifier takes inside `CloudConnectorId`'s modelled `@length` and `@pattern`. The
+//! declared `ResourceNotFoundException` (HTTP 404) stays reserved for other conditions, and
+//! the sentence [`crate::state::cloud_connector_not_found`] renders remains what this
+//! resource's RESOLVING paths — the read and the update — state for an absent connector.
 //!
-//! WHY AN ABSENT IDENTIFIER IS REFUSED here rather than answered as a no-op: this service's
-//! deletes are recorded individually, and the recorded ones of this shape — a managed
-//! thing, a credential locker, an OTA task configuration — answer the modelled 404, each
-//! through its own resource's reason, while the connector-destination delete answers its
-//! recorded success and documents that in its own header. No recording shows this delete
-//! against an identifier the account holds nothing under, so it follows the service's
-//! prevailing recorded shape and the error its own model declares.
+//! That is a fact about this resource's delete only: a sibling delete whose own recording
+//! refuses an absent identifier (a managed thing, a credential locker, an OTA task
+//! configuration) keeps the answer its own fixture records.
 //!
 //! A connector destination created against this connector is left exactly as it was: a
 //! destination is its own resource with its own delete, and this operation models no
@@ -222,19 +217,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         drop(store);
 
-        if !removed {
-            audit(&akid, &region, "not-found");
-            // The one sentence this resource's 404s carry, read and mutation alike — see
-            // the module header — so a delete that found nothing to remove states exactly
-            // what a read of the same identifier states. The identifier is reported on
-            // `ResourceId`, never in the sentence.
-            return Err(DeleteCloudConnectorErrorModeled::ResourceNotFoundException(
-                crate::state::cloud_connector_not_found(&input.identifier),
-            )
-            .into());
-        }
-
-        audit(&akid, &region, "deleted");
+        // Nothing left to remove is the state the request asked for, so the answer is the
+        // same modelled success as the call that did the removing — the audit line is what
+        // distinguishes the two.
+        audit(&akid, &region, if removed { "deleted" } else { "absent" });
         Ok(DeleteCloudConnectorOutput)
     }
 }
