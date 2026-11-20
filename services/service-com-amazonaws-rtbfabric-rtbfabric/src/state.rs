@@ -16,6 +16,8 @@ use std::time::{Duration, SystemTime};
 mod certificates;
 /// The one encoding this service's paginated reads state a page boundary in.
 mod page_tokens;
+/// The one page walk this service's paginated reads take over their records.
+mod paging;
 /// The routing rules a link carries.
 mod routing_rules;
 /// The `/tags/{resourceArn}` surface's one reading of a caller-supplied ARN and of
@@ -32,6 +34,7 @@ pub use certificates::{
 pub use page_tokens::{
     decode_next_token, encode_next_token, TokenRefusal, MAX_TOKEN_LENGTH, TOKEN_LIFETIME,
 };
+pub use paging::{page_of, page_size, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE};
 pub use routing_rules::{
     conditions_stated, priority_conflict_message, LinkRoutingRule, ROUTING_RULE_QUOTA,
     RULE_CONDITIONS_EMPTY_MESSAGE, RULE_STATUS_ACTIVE, RULE_STATUS_CREATION_IN_PROGRESS,

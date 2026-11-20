@@ -175,56 +175,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `maxResults` is modelled `range(min: 1, max: 10)` with a default of 10,
         // and the boundary validator refuses anything outside that window before
         // this handler runs. An in-process caller can still hand over a value the
-        // wire never carries, so a value at or below zero takes the MODELLED
-        // DEFAULT — a page of one is not what an absent member asks for — and
-        // anything above the maximum is capped at it.
-        let page_size = match input.max_results {
-            requested if requested > 0 => {
-                usize::try_from(requested.min(MAX_PAGE_SIZE)).unwrap_or(DEFAULT_PAGE_SIZE)
-            }
-            _ => DEFAULT_PAGE_SIZE,
-        };
+        // wire never carries, so the shared page walk is handed the modelled
+        // maximum as the cap it clamps to.
+        let page_size =
+            crate::state::page_size(Some(input.max_results), Some(crate::state::MAX_PAGE_SIZE));
 
-        // Ordered by `gatewayId`. An id is unique, so that is a total order over
-        // the stored records: a page boundary is stable across calls, and a walk
-        // neither repeats a gateway nor skips one.
-        let mut gateway_ids: Vec<&str> = store
-            .requester_gateways
-            .keys()
-            .map(String::as_str)
-            .collect();
+        // Ordered by `gatewayId`, which is what this listing pages by.
+        let mut gateway_ids: Vec<&str> =
+            store.requester_gateways.keys().map(String::as_str).collect();
         gateway_ids.sort_unstable();
 
-        let start = match resume_after.as_deref() {
-            Some(cursor) => gateway_ids.partition_point(|id| *id <= cursor),
-            None => 0,
-        };
-        let end = start.saturating_add(page_size).min(gateway_ids.len());
-        let page: Vec<String> = gateway_ids[start..end]
-            .iter()
-            .map(|id| (*id).to_string())
-            .collect();
-
-        // A token only when gateways remain after this page, so a caller stops
-        // paging exactly when the enumeration is exhausted.
-        let next_token = (end < gateway_ids.len())
-            .then(|| {
-                page.last()
-                    .map(|cursor| crate::state::encode_next_token(Self::NAME, cursor, now))
-            })
-            .flatten();
+        // Where the cursor resumes, where the page ends and whether a token is
+        // handed out is this service's one page walk, shared with every other
+        // listing of it.
+        let (page, next_token) = crate::state::page_of(
+            Self::NAME,
+            &gateway_ids,
+            |id: &&str| id,
+            resume_after.as_deref(),
+            page_size,
+            now,
+        );
 
         Ok(ListRequesterGatewaysOutput {
-            gateway_ids: Some(page),
+            gateway_ids: Some(page.iter().map(|id| (*id).to_string()).collect()),
             next_token,
         })
     }
 }
 
-/// The largest page this operation returns, from the modelled `maxResults`
-/// range (`range(min: 1, max: 10)`).
-const MAX_PAGE_SIZE: i32 = 10;
-
-/// The page size a request that names no `maxResults` gets: the member's own
-/// modelled default, which is also the range's maximum.
-const DEFAULT_PAGE_SIZE: usize = 10;

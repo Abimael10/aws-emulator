@@ -199,21 +199,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The model bounds `maxResults` neither above nor below and gives it no
         // default, so nothing is refused before this handler runs: a stated upper
-        // limit is honoured as stated, and a request that states none — or states a
-        // page of no results, which asks for nothing a walk could continue from —
-        // takes [`DEFAULT_PAGE_SIZE`]. What a page can hold is bounded whatever a
-        // caller asks for: a page carries records, and the store holds at most
+        // limit is honoured as stated by the shared page walk, which is handed no
+        // cap. What a page can hold is bounded whatever a caller asks for: a page
+        // carries records, and the store holds at most
         // [`crate::state::LINK_QUOTA`] of them.
-        let page_size = match input.max_results {
-            Some(requested) if requested > 0 => {
-                usize::try_from(requested).unwrap_or(DEFAULT_PAGE_SIZE)
-            }
-            _ => DEFAULT_PAGE_SIZE,
-        };
+        let page_size = crate::state::page_size(input.max_results, None);
 
-        // Ordered by `linkId`. An id is unique, so that is a total order over the
-        // records this gateway is an end of: a page boundary is stable across
-        // calls, and a walk neither repeats a link nor skips one.
+        // Ordered by `linkId`, which is what this listing pages by.
         let mut mine: Vec<&crate::state::Link> = store
             .links
             .values()
@@ -221,22 +213,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         mine.sort_unstable_by(|left, right| left.link_id.cmp(&right.link_id));
 
-        let start = match resume_after.as_deref() {
-            Some(cursor) => mine.partition_point(|link| link.link_id.as_str() <= cursor),
-            None => 0,
-        };
-        let end = start.saturating_add(page_size).min(mine.len());
+        // Where the cursor resumes, where the page ends and whether a token is
+        // handed out is this service's one page walk, shared with every other
+        // listing of it.
+        let (reported, next_token) = crate::state::page_of(
+            Self::NAME,
+            &mine,
+            |link: &&crate::state::Link| link.link_id.as_str(),
+            resume_after.as_deref(),
+            page_size,
+            now,
+        );
         let page: Vec<ListLinksResponseStructure> =
-            mine[start..end].iter().copied().map(described).collect();
-
-        // A token only when links remain after this page, so a caller stops paging
-        // exactly when the enumeration is exhausted.
-        let next_token = (end < mine.len())
-            .then(|| {
-                page.last()
-                    .map(|last| crate::state::encode_next_token(Self::NAME, &last.link_id, now))
-            })
-            .flatten();
+            reported.iter().copied().map(described).collect();
 
         Ok(ListLinksOutput {
             links: Some(page),
@@ -250,8 +239,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The model gives this operation's `maxResults` no default and no range, so this
 /// is the emulator's own choice: the page every other listing of this service
 /// hands out, whose `maxResults` the model does bound (`range(min: 1, max: 10)`,
-/// default 10), so one walk of this service does not page unlike the next.
-pub const DEFAULT_PAGE_SIZE: usize = 10;
+/// default 10), so one walk of this service does not page unlike the next. It is
+/// the shared page walk's own default, named here too so a caller reads the page
+/// it gets off the operation.
+pub use crate::state::DEFAULT_PAGE_SIZE;
 
 /// One stored link as the listing describes it.
 ///
