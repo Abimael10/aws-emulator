@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implement it here — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -254,18 +246,212 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyEndpoint"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(invalid_state(
+                "the dms emulator is mounted on an engine that holds no state for it".to_string(),
+            ));
+        };
+
+        // An identifier a modify renames the endpoint to is held to the same grammar a
+        // create holds one to: "Identifiers must begin with a letter and must contain
+        // only ASCII letters, digits, and hyphens. They can't end with a hyphen or
+        // contain two consecutive hyphens" (`EndpointIdentifier` doc), which publishes no
+        // maximum length.
+        if let Some(identifier) = &input.endpoint_identifier {
+            if let Some(refusal) =
+                crate::state::identifier_refusal("EndpointIdentifier", identifier, None)
+            {
+                return Err(crate::scaffolded::Scaffolded::validation(refusal));
+            }
+        }
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        // The engine settings structures THIS request carried, with every password
+        // dropped: built before anything is read out of the store, because the roles the
+        // request asks DMS to assume are read off them.
+        let supplied = crate::state::engine_settings_from_input!(input).sanitized();
+
+        // The endpoint a modify names has to exist before the roles the call would give it
+        // are resolved, so a call that names neither an endpoint DMS holds nor a role it
+        // can use is answered about the resource it could not find. The guard is dropped
+        // before the resolution below, which reaches another service and so cannot be
+        // awaited while the store is held; the endpoint is resolved again under the lock
+        // that writes it.
+        {
+            let mut store = state.lock();
+            store.settle(now);
+            if !store.endpoints.contains_key(&input.endpoint_arn) {
+                return Err(endpoint_does_not_exist(&input.endpoint_arn));
+            }
+        }
+
+        // An endpoint RUNS AS the service access role the request names — "The role must
+        // allow the iam:PassRole action" — so a role THIS call supplies is resolved
+        // against the account's IAM records before any of it is persisted, the way the
+        // create path resolves one. A role this account does not hold, or one whose trust
+        // policy does not admit DMS, is refused with the modelled `AccessDeniedFault` and
+        // the endpoint is left as it was; an emulator with no IAM to ask grounds no
+        // refusal, because the reading is silent unless IAM ANSWERED.
+        for role_arn in crate::state::service_access_role_arns(
+            input.service_access_role_arn.as_deref(),
+            &supplied,
+        ) {
+            if ::service_common::iam_role::role_is_unassumable(
+                ctx,
+                &region,
+                &role_arn,
+                crate::state::DMS_SERVICE_PRINCIPAL,
+            )
+            .await
+            {
+                return Err(ModifyEndpointErrorModeled::AccessDeniedFault(
+                    AccessDeniedFault {
+                        message: Some(crate::state::role_not_configured_message(&role_arn)),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
+        store.settle(now);
+
+        let Some(stored) = store.endpoints.get(&input.endpoint_arn) else {
+            return Err(endpoint_does_not_exist(&input.endpoint_arn));
+        };
+
+        // An endpoint that is on its way out of the account cannot be reconfigured: what
+        // it is owed is its removal, so there is no endpoint left for a later read to
+        // report the new configuration on.
+        if stored.status == crate::state::ENDPOINT_DELETING {
+            return Err(invalid_state(format!(
+                "endpoint {} is {} and cannot be modified in that status",
+                stored.arn, stored.status
+            )));
+        }
+
+        let previous_identifier = stored.identifier.clone();
+        let identifier = input
+            .endpoint_identifier
+            .clone()
+            .unwrap_or_else(|| previous_identifier.clone());
+        // An `EndpointIdentifier` names ONE endpoint of the account, so a rename onto an
+        // identifier another endpoint holds is refused and nothing is written.
+        if identifier != previous_identifier {
+            if let Some(existing) = store.endpoint_arn_by_identifier.get(&identifier) {
+                return Err(ModifyEndpointErrorModeled::ResourceAlreadyExistsFault(
+                    ResourceAlreadyExistsFault {
+                        message: Some(crate::state::endpoint_identifier_in_use_message(
+                            &identifier,
+                        )),
+                        resource_arn: Some(existing.clone()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "If this attribute is Y, the current call to ModifyEndpoint replaces all
+        // existing endpoint settings with the exact settings that you specify in this
+        // call"; N — the default — "replaces any endpoint settings that already exist
+        // with new values, for settings with the same names" and keeps the rest
+        // (`ExactSettings` doc).
+        let settings = supplied.folded_onto(&stored.settings, input.exact_settings.unwrap_or(false));
+
+        // The endpoint the write runs on. It is resolved a second time only because the
+        // read above borrows the store immutably; the same guard covers both, so this is
+        // the endpoint just read, and the refusal is the one a store that lost it between
+        // the two locks of this call would owe.
+        let Some(endpoint) = store.endpoints.get_mut(&input.endpoint_arn) else {
+            return Err(endpoint_does_not_exist(&input.endpoint_arn));
+        };
+
+        // Every member the request supplied becomes the endpoint's value for it, and a
+        // member the request omitted keeps the one the endpoint already held: what the
+        // endpoint holds is the LAST value DMS accepted for each of its members.
+        endpoint.identifier = identifier.clone();
+        if let Some(endpoint_type) = input.endpoint_type {
+            endpoint.endpoint_type = endpoint_type;
+        }
+        if let Some(engine_name) = input.engine_name {
+            endpoint.engine_name = engine_name;
+        }
+        if let Some(username) = input.username {
+            endpoint.username = Some(username);
+        }
+        if let Some(server_name) = input.server_name {
+            endpoint.server_name = Some(server_name);
+        }
+        if let Some(port) = input.port {
+            endpoint.port = Some(port);
+        }
+        if let Some(database_name) = input.database_name {
+            endpoint.database_name = Some(database_name);
+        }
+        // "Additional attributes associated with the connection. To reset this parameter,
+        // pass the empty string ("") as an argument" (`ExtraConnectionAttributes` doc), so
+        // the empty string is how a caller asks for the endpoint to carry none.
+        if let Some(extra_connection_attributes) = input.extra_connection_attributes {
+            endpoint.extra_connection_attributes =
+                (!extra_connection_attributes.is_empty()).then_some(extra_connection_attributes);
+        }
+        if let Some(ssl_mode) = input.ssl_mode {
+            endpoint.ssl_mode = ssl_mode;
+        }
+        if let Some(certificate_arn) = input.certificate_arn {
+            endpoint.certificate_arn = Some(certificate_arn);
+        }
+        if let Some(service_access_role_arn) = input.service_access_role_arn {
+            endpoint.service_access_role_arn = Some(service_access_role_arn);
+        }
+        if let Some(external_table_definition) = input.external_table_definition {
+            endpoint.external_table_definition = Some(external_table_definition);
+        }
+        endpoint.settings = settings;
+
+        // "The modified endpoint", through the one projection every operation that answers
+        // with an endpoint goes through — so the modify response, a later describe and the
+        // endpoint a delete echoes all report what this call accepted.
+        let modified = endpoint.to_shape();
+
+        if identifier != previous_identifier {
+            // The index holds one entry per identifier an endpoint of the account holds,
+            // so the renamed endpoint releases the identifier it held and takes the new
+            // one, and a create may then take the released one.
+            store.endpoint_arn_by_identifier.remove(&previous_identifier);
+            store
+                .endpoint_arn_by_identifier
+                .insert(identifier, input.endpoint_arn.clone());
+        }
+
+        Ok(ModifyEndpointOutput {
+            endpoint: Some(modified),
+        })
     }
+}
+
+/// What DMS answers an `EndpointArn` that names no endpoint the account holds.
+///
+/// A well-formed ARN that resolves to no endpoint is a PARAMETER VALUE naming nothing
+/// rather than one of this operation's modelled faults, so DMS refuses it with HTTP 400
+/// `InvalidParameterValueException` — an error code this service's model declares for no
+/// operation — in its own fixed sentence, whose only variable part is the ARN the CALLER
+/// sent.
+fn endpoint_does_not_exist(endpoint_arn: &str) -> ModifyEndpointError {
+    crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
+        "Endpoint with arn {endpoint_arn} does not exist."
+    ))
+}
+
+/// The error this operation models for a resource that cannot be used for a database
+/// migration in the state it is in. The DMS model declares no server-side fault, so the
+/// unreachable "no store" branch uses it too rather than a 501, which would claim the
+/// operation is unimplemented.
+fn invalid_state(message: String) -> ModifyEndpointError {
+    ModifyEndpointErrorModeled::InvalidResourceStateFault(InvalidResourceStateFault {
+        message: Some(message),
+    })
+    .into()
 }

@@ -17,6 +17,10 @@
 /// with.
 pub mod filters;
 
+/// Folding the engine settings a `ModifyEndpoint` request supplied onto the ones an
+/// endpoint already holds, which is what `ExactSettings` selects between.
+pub mod endpoint_settings;
+
 /// The RUN of a replication task: the full load it performs between the endpoints' own
 /// data planes, the per-task and per-table accounting that load records, and the stop a
 /// task with no phase after it arrives at.
@@ -665,6 +669,41 @@ pub struct EngineSettings {
     /// Settings for an Amazon Timestream target.
     pub timestream: Option<TimestreamSettings>,
 }
+
+/// Build [`EngineSettings`] from the per-engine settings members of an endpoint request.
+///
+/// `CreateEndpoint` and `ModifyEndpoint` model the same settings members, so both read them
+/// through this ONE list: a structure the model adds later reaches both paths by being named
+/// here. The two requests are distinct generated types with the same member names, which is
+/// why this is a macro over the binding rather than a function over a trait; it moves each
+/// member out of that binding, exactly as writing the literal in the handler would.
+macro_rules! engine_settings_from_input {
+    ($input:ident) => {
+        $crate::state::EngineSettings {
+            dynamo_db: $input.dynamo_db_settings,
+            s3: $input.s3_settings,
+            dms_transfer: $input.dms_transfer_settings,
+            mongo_db: $input.mongo_db_settings,
+            kinesis: $input.kinesis_settings,
+            kafka: $input.kafka_settings,
+            elasticsearch: $input.elasticsearch_settings,
+            neptune: $input.neptune_settings,
+            redshift: $input.redshift_settings,
+            postgre_sql: $input.postgre_sql_settings,
+            my_sql: $input.my_sql_settings,
+            oracle: $input.oracle_settings,
+            sybase: $input.sybase_settings,
+            microsoft_sql_server: $input.microsoft_sql_server_settings,
+            ibm_db2: $input.ibm_db2_settings,
+            doc_db: $input.doc_db_settings,
+            redis: $input.redis_settings,
+            gcp_my_sql: $input.gcp_my_sql_settings,
+            timestream: $input.timestream_settings,
+        }
+    };
+}
+
+pub(crate) use engine_settings_from_input;
 
 /// Clear each named member of an optional settings structure.
 macro_rules! clear_members {
@@ -1451,6 +1490,16 @@ pub fn subnet_group_identifier_refusal(value: &str) -> Option<String> {
 /// report it identically.
 pub fn subnet_group_absent_message(identifier: &str) -> String {
     format!("Replication Subnet Group '{identifier}' does not exist.")
+}
+
+/// DMS's sentence for an `EndpointIdentifier` another endpoint of the account already
+/// holds, naming the identifier the CALLER sent, double-quoted.
+///
+/// The existing endpoint's ARN has no place in the message text — it travels in the
+/// modelled `ResourceAlreadyExistsFault$resourceArn` member instead — and one wording
+/// serves both operations that take an identifier, `CreateEndpoint` and `ModifyEndpoint`.
+pub fn endpoint_identifier_in_use_message(identifier: &str) -> String {
+    format!(r#"ReplicationEndpoint "{identifier}" already in use."#)
 }
 
 /// DMS's sentence for a service access role it cannot use, naming the role ARN the

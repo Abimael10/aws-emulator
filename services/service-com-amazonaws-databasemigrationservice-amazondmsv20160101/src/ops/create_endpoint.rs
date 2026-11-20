@@ -298,28 +298,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // dropped: built here rather than inside the record below because the roles the
         // endpoint asks DMS to assume are read off them, and that read happens before
         // anything is persisted.
-        let settings = crate::state::EngineSettings {
-            dynamo_db: input.dynamo_db_settings,
-            s3: input.s3_settings,
-            dms_transfer: input.dms_transfer_settings,
-            mongo_db: input.mongo_db_settings,
-            kinesis: input.kinesis_settings,
-            kafka: input.kafka_settings,
-            elasticsearch: input.elasticsearch_settings,
-            neptune: input.neptune_settings,
-            redshift: input.redshift_settings,
-            postgre_sql: input.postgre_sql_settings,
-            my_sql: input.my_sql_settings,
-            oracle: input.oracle_settings,
-            sybase: input.sybase_settings,
-            microsoft_sql_server: input.microsoft_sql_server_settings,
-            ibm_db2: input.ibm_db2_settings,
-            doc_db: input.doc_db_settings,
-            redis: input.redis_settings,
-            gcp_my_sql: input.gcp_my_sql_settings,
-            timestream: input.timestream_settings,
-        }
-        .sanitized();
+        let settings = crate::state::engine_settings_from_input!(input).sanitized();
 
         // An endpoint RUNS AS the service access role the request names, so the role is
         // resolved against the account's IAM records at create time — DMS does not defer
@@ -359,8 +338,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // its own fixed sentence; the existing endpoint's ARN has no place
                     // in the message text, and travels in the modelled `resourceArn`
                     // member instead.
-                    message: Some(format!(
-                        r#"ReplicationEndpoint "{identifier}" already in use."#
+                    message: Some(crate::state::endpoint_identifier_in_use_message(
+                        &identifier,
                     )),
                     resource_arn: Some(existing.clone()),
                 },

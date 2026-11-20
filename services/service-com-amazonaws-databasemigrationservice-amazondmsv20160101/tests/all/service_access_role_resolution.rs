@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `CreateEndpoint`: the service access role an endpoint is created with is resolved
-//! against the account's IAM records BEFORE the endpoint is persisted.
+//! `CreateEndpoint` and `ModifyEndpoint`: the service access role an endpoint is given is
+//! resolved against the account's IAM records BEFORE the endpoint is persisted or changed.
 //!
-//! The rule under test: a member of a create whose value names the IAM role the service
-//! will act as is resolved against the account's roles at create time — the check is not
+//! The rule under test: a member whose value names the IAM role the service will act as is
+//! resolved against the account's roles by the call that supplies it — the check is not
 //! deferred to a later call — and a value IAM answers for as a role this account does not
 //! hold, or one whose trust policy does not admit the DMS service principal, is refused
 //! with the modelled `AccessDeniedFault` (HTTP 400) with nothing persisted. A value IAM
@@ -342,4 +342,90 @@ async fn an_endpoint_that_names_no_role_is_created_whatever_iam_holds() {
         endpoint_is_held(&emulator, "ep-no-role").await,
         "expected the endpoint to be persisted"
     );
+}
+
+#[tokio::test]
+async fn a_modify_resolves_the_role_it_names_before_the_endpoint_is_changed() {
+    let (emulator, _ec2, iam) = Emulator::with_network();
+    let roles = Roles {
+        usable: create_role(&iam, "/", "dms-endpoint-access", &trust(DMS_PRINCIPAL)).await,
+        usable_under_path: create_role(
+            &iam,
+            "/service-role/",
+            "dms-endpoint-access-pathed",
+            &trust(DMS_PRINCIPAL),
+        )
+        .await,
+        untrusted: create_role(&iam, "/", "dms-endpoint-denied", &trust(OTHER_PRINCIPAL)).await,
+    };
+
+    // One endpoint per row, created naming no role at all, so what each row asserts is
+    // what the MODIFY's own value was resolved to.
+    for (index, value) in values(&roles).into_iter().enumerate() {
+        let identifier = format!("ep-modify-{index}");
+        let created = emulator
+            .ok(
+                value.case,
+                "CreateEndpoint",
+                &json!({
+                    "EndpointIdentifier": identifier,
+                    "EndpointType": "target",
+                    "EngineName": "s3",
+                    "S3Settings": { "BucketName": "landing-zone", "BucketFolder": "out" },
+                }),
+            )
+            .await;
+        let arn = text(&created, "/Endpoint/EndpointArn");
+
+        let (status, response) = emulator
+            .call(
+                "ModifyEndpoint",
+                &json!({ "EndpointArn": arn, "ServiceAccessRoleArn": value.role_arn }),
+            )
+            .await;
+        if value.accepted {
+            assert_eq!(
+                status, 200,
+                "case {:?}: expected the modify to be accepted, got {status} {response}",
+                value.case
+            );
+            assert_eq!(
+                text(&response, "/Endpoint/ServiceAccessRoleArn"),
+                value.role_arn,
+                "case {:?}: expected the endpoint to report the role the modify named, \
+                 got {response}",
+                value.case
+            );
+        } else {
+            let code = error_code(&response);
+            assert_eq!(
+                (status, code.as_str()),
+                (400, ACCESS_DENIED),
+                "case {:?}: expected the modify to be refused with {ACCESS_DENIED}, got \
+                 {status} {response}",
+                value.case
+            );
+            let message = text(&response, "/message");
+            assert!(
+                message.contains(&value.role_arn),
+                "case {:?}: expected the refusal to name {}, got {message:?}",
+                value.case,
+                value.role_arn
+            );
+            let described = emulator
+                .ok(
+                    value.case,
+                    "DescribeEndpoints",
+                    &json!({ "Filters": [{ "Name": "endpoint-arn", "Values": [arn] }] }),
+                )
+                .await;
+            assert!(
+                described
+                    .pointer("/Endpoints/0/ServiceAccessRoleArn")
+                    .is_none(),
+                "case {:?}: a refused modify must change nothing, got {described}",
+                value.case
+            );
+        }
+    }
 }
