@@ -164,15 +164,27 @@ fn published_addresses(status: &Value, case: &str) -> Vec<(String, String)> {
     addresses
 }
 
-/// One data-plane request to the ADDRESS the control plane published for a domain, dialled
-/// exactly as a client dials it: a client builds `https://{address}{path}`, so the
-/// AUTHORITY of the published value is the host the request carries and signs, and whatever
-/// the value carries after it is the prefix of the request path.
+/// The two halves of a PUBLISHED address: the authority a client dials — the host its
+/// request carries and signs — and whatever the published value carries after it, which is
+/// the prefix of the request path.
 ///
 /// One reading for both shapes a published address takes: the address a client of this
 /// emulator reaches the domain at (this emulator's own endpoint, with the reserved path that
 /// names the plane and the domain) and the host AWS names an endpoint by (an authority
-/// alone, where the prefix is empty).
+/// alone, where the prefix is empty). `pub(crate)` because a request a sibling suite sends
+/// to the same published value under another credential scheme reads it HERE rather than
+/// growing a second copy of the split.
+pub(crate) fn split_address(address: &str) -> (&str, &str) {
+    match address.find('/') {
+        Some(end) => (&address[..end], &address[end..]),
+        None => (address, ""),
+    }
+}
+
+/// One data-plane request to the ADDRESS the control plane published for a domain, dialled
+/// exactly as a client dials it: a client builds `https://{address}{path}`, so the
+/// AUTHORITY of the published value is the host the request carries and signs, and whatever
+/// the value carries after it is the prefix of the request path ([`split_address`]).
 pub(crate) async fn at_address(
     emulator: &Emulator,
     address: &str,
@@ -181,10 +193,7 @@ pub(crate) async fn at_address(
     path: &str,
     body: Option<Value>,
 ) -> Answer {
-    let (authority, prefix) = match address.find('/') {
-        Some(end) => (&address[..end], &address[end..]),
-        None => (address, ""),
-    };
+    let (authority, prefix) = split_address(address);
     dispatch(
         emulator,
         authority,

@@ -33,10 +33,14 @@ use super::domain_rest_data_plane::{endpoint_of, error_type};
 
 /// The master user every domain below is created with, and its password — the credentials
 /// `MasterUserOptions$MasterUserName`/`MasterUserPassword` name.
-const MASTER: &str = "os-master";
+///
+/// `pub(crate)` with [`create_body`] below, because a sibling suite creates the SAME
+/// configuration — fine-grained access control over an internal user database — to decide an
+/// AWS principal's requests on it, and reads it here rather than growing a second copy.
+pub(crate) const MASTER: &str = "os-master";
 
 /// Its password. Within `MasterUserPassword`'s modelled length (8..128).
-const MASTER_PASSWORD: &str = "Master-pass-1!";
+pub(crate) const MASTER_PASSWORD: &str = "Master-pass-1!";
 
 /// The second user the database comes to hold, which the cases below bind to roles.
 const ANALYST: &str = "analyst";
@@ -50,7 +54,7 @@ const CHALLENGE: &str = "www-authenticate";
 /// A domain with fine-grained access control switched on, its three prerequisites met, and
 /// an INTERNAL master user — the configuration a client that wants its own user database
 /// creates.
-fn create_body(domain: &str) -> Value {
+pub(crate) fn create_body(domain: &str) -> Value {
     json!({
         "DomainName": domain,
         "EncryptionAtRestOptions": { "Enabled": true },

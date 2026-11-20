@@ -49,6 +49,16 @@ use super::domain_lifecycle::{Answer, Emulator, DEFAULT_ACCESS_KEY_ID, REGION};
 #[path = "domain_rest_data_plane/security_audit_configuration.rs"]
 mod security_audit_configuration;
 
+/// The same BOUNDARY as this suite's third rule, for the principal an estate reaches a
+/// domain with — an IAM role assumed through STS — on a domain whose master user is a user
+/// of its own internal database, so no IAM identity is the master and the role mappings
+/// decide alone.
+///
+/// The `#[path]` is what points this child at its own directory, for the reason the sibling
+/// above carries it.
+#[path = "domain_rest_data_plane/fgac_iam_role_search_authorization.rs"]
+mod fgac_iam_role_search_authorization;
+
 /// The role the unmapped session below is assumed from — the position a Firehose delivery
 /// role is in when nothing has bound it to a fine-grained-access-control role.
 const DELIVERY_ROLE: &str = "firehose-delivery";
@@ -238,6 +248,19 @@ pub(crate) fn error_type(answer: &Answer) -> String {
         .as_str()
         .unwrap_or_default()
         .to_string()
+}
+
+/// How the security plugin DESCRIBES the user a request speaks for: its own name and the
+/// backend roles its credential arrived with.
+///
+/// ONE wording, because two answers carry it — the `security_exception` a refusal states and
+/// the `user` the plugin's `authinfo` reports — so the two assertions cannot drift on what a
+/// caller is told it is. `pub(crate)` for the sibling suite that asserts the refusal.
+pub(crate) fn user_description(user: &str, backend_roles: &[String]) -> String {
+    format!(
+        "User [name={user}, backend_roles=[{}], requestedTenant=null]",
+        backend_roles.join(", ")
+    )
 }
 
 /// RULE: the endpoint a domain publishes serves the OpenSearch REST surface, and every
@@ -1300,13 +1323,7 @@ async fn the_security_plugin_tells_every_authenticated_caller_who_it_is() {
         );
         assert_eq!(
             answered.body["user"].as_str(),
-            Some(
-                format!(
-                    "User [name={user}, backend_roles=[{}], requestedTenant=null]",
-                    backend_roles.join(", ")
-                )
-                .as_str()
-            ),
+            Some(user_description(user, backend_roles).as_str()),
             "case {case:?}: expected the user description the cluster states, got {:?}",
             answered.body
         );
