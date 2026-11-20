@@ -1852,8 +1852,9 @@ fn json_to_document(value: &Value) -> ::aws_smithy_types::Document {
 ///
 /// `reason` is the whole message: what the parser or the evaluation reported, worded the
 /// way the openCypher endpoint words it (see [`super::open_cypher_parse_failure`]), so the
-/// caller can fix the query from the message alone. `code` carries the HTTP status the
-/// member's own documentation says it carries.
+/// caller can fix the query from the message alone. The error CLASS a client branches on is
+/// written from the shape's own name, and the same text goes out under `message` as well
+/// (see `crate::ops::types::error_message_wire`).
 pub fn malformed_open_cypher_query(reason: &str) -> MalformedQueryException {
     MalformedQueryException {
         detailed_message: reason.to_string(),

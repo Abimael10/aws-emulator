@@ -6,7 +6,8 @@
 //!
 //! 1. Every modelled refusal this service answers carries its text in the member a client
 //!    reads as the error message (`message`) as well as in the modelled `detailedMessage`,
-//!    so a client that branches on the message gets one.
+//!    names the error CLASS — the exception's own name, never the numeric HTTP status — in
+//!    `code`, and names its own request in `requestId`.
 //! 2. A `queryId` no registry holds is refused `InvalidParameterException` (HTTP 400) by
 //!    BOTH query languages' status and cancel endpoints, with the supplied id in the
 //!    message, and the two languages keep separate registries.
@@ -231,16 +232,28 @@ const REFUSALS: &[Refusal] = &[
         status: 400,
         code: "InvalidParameterException",
     },
+    Refusal {
+        case: "an openCypher query carrying no query to run",
+        method: "POST",
+        uri: "/opencypher",
+        body: Some(r#"{"query":"   "}"#),
+        status: 400,
+        code: "MissingParameterException",
+    },
 ];
+
+/// The body of `refusal`, as the case states it.
+fn case_body(refusal: &Refusal) -> Option<Value> {
+    refusal
+        .body
+        .map(|payload| serde_json::from_str::<Value>(payload).expect("the case body is JSON"))
+}
 
 #[tokio::test]
 async fn every_refusal_carries_its_text_in_the_member_a_client_reads() {
     let Emulator { router, .. } = emulator();
     for refusal in REFUSALS {
-        let body = refusal
-            .body
-            .map(|payload| serde_json::from_str::<Value>(payload).expect("the case body is JSON"));
-        let answer = call(&router, refusal.method, refusal.uri, body).await;
+        let answer = call(&router, refusal.method, refusal.uri, case_body(refusal)).await;
         assert_eq!(
             answer.status, refusal.status,
             "case {:?}: expected HTTP {}, got {} with {:?}",
@@ -268,6 +281,67 @@ async fn every_refusal_carries_its_text_in_the_member_a_client_reads() {
             answer.text
         );
     }
+}
+
+/// The members a modelled neptunedata refusal body carries. The first three are the
+/// members every exception shape of this service declares — source:
+/// smithy_query(query="shape", shape="MalformedQueryException,InvalidParameterException,
+/// MissingParameterException,MLResourceNotFoundException"), whose member set is
+/// `detailedMessage`, `requestId` and `code` — and `message` is the fourth the data plane
+/// writes the same text under.
+const REFUSAL_BODY_MEMBERS: &[&str] = &["detailedMessage", "requestId", "code", "message"];
+
+#[tokio::test]
+async fn every_refusal_body_names_its_exception_class_and_its_own_request() {
+    let Emulator { router, .. } = emulator();
+    let mut request_ids: Vec<String> = Vec::new();
+    for refusal in REFUSALS {
+        let answer = call(&router, refusal.method, refusal.uri, case_body(refusal)).await;
+        for member in REFUSAL_BODY_MEMBERS {
+            let carried = answer.body[*member].as_str().unwrap_or_default();
+            assert!(
+                !carried.is_empty(),
+                "case {:?}: the refusal body carries {member} as a non-empty string, got {:?}",
+                refusal.case,
+                answer.text
+            );
+        }
+        // `code` is the error CLASS a client branches on — the exception's own name, which
+        // is also what the `__type` header-and-body classification names — and never the
+        // numeric HTTP status, which the status line already carries.
+        assert_eq!(
+            answer.body["code"].as_str(),
+            Some(refusal.code),
+            "case {:?}: code carries the exception class {}, got {:?}",
+            refusal.case,
+            refusal.code,
+            answer.body["code"]
+        );
+        assert_eq!(
+            answer.body["code"].as_str(),
+            Some(answer.error_code()),
+            "case {:?}: code and the wire classification name one class, got {:?}",
+            refusal.case,
+            answer.text
+        );
+        request_ids.push(
+            answer.body["requestId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        );
+    }
+
+    // Two refusals never name the same request: `requestId` identifies ONE answer.
+    let minted = request_ids.len();
+    request_ids.sort();
+    request_ids.dedup();
+    assert_eq!(
+        request_ids.len(),
+        minted,
+        "each refusal names its own request, {minted} refusals carry {} ids",
+        request_ids.len()
+    );
 }
 
 // ---------------------------------------------------------------------------------------
@@ -703,6 +777,36 @@ const OPEN_CYPHER_REFUSALS: &[OpenCypherRefusal] = &[
         column: 18,
         offset: 17,
     },
+    OpenCypherRefusal {
+        case: "a keyword one letter short that the query then ends after",
+        query: "MATCH (n) RETUR",
+        input: "EOI",
+        expected: "n/N",
+        line: 1,
+        column: 16,
+        offset: 15,
+    },
+    OpenCypherRefusal {
+        case: "a keyword one letter short on the third line",
+        query: "MATCH (n)\nWHERE n.x = 1\nRETUR n",
+        input: " ",
+        expected: "n/N",
+        line: 3,
+        column: 6,
+        offset: 29,
+    },
+    // The position is counted in CHARACTERS, not bytes: the label below carries a
+    // multi-byte character, so a byte count would report one column and one offset too
+    // many.
+    OpenCypherRefusal {
+        case: "a keyword one letter short after multi-byte text",
+        query: "MATCH (n:`Café`) RETUR n",
+        input: " ",
+        expected: "n/N",
+        line: 1,
+        column: 23,
+        offset: 22,
+    },
 ];
 
 #[tokio::test]
@@ -738,6 +842,22 @@ async fn an_open_cypher_query_the_parser_cannot_read_is_refused_with_its_message
             "case {:?}: expected message {expected:?}, got {:?}",
             refusal.case,
             answer.message()
+        );
+        // The same text under the modelled member, and the error CLASS in `code`: a client
+        // reads the diagnostic from `message` and branches on `code`.
+        assert_eq!(
+            answer.detailed_message(),
+            expected,
+            "case {:?}: expected detailedMessage {expected:?}, got {:?}",
+            refusal.case,
+            answer.detailed_message()
+        );
+        assert_eq!(
+            answer.body["code"].as_str(),
+            Some("MalformedQueryException"),
+            "case {:?}: code carries the exception class, got {:?}",
+            refusal.case,
+            answer.body["code"]
         );
     }
 
