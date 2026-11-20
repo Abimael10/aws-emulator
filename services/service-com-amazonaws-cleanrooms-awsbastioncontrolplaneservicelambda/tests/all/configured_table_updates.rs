@@ -29,7 +29,9 @@
 
 use serde_json::{json, Value};
 
-use super::cleanrooms_collaboration_lifecycle::{account_id, error_code, error_message, Emulator};
+use super::cleanrooms_collaboration_lifecycle::{
+    account_id, error_code, error_message, once_the_clock_has_left, Emulator,
+};
 use super::cleanrooms_configured_table::{
     table_reference, ALL_ANALYSIS_METHODS, ALL_SELECTED_ANALYSIS_METHODS,
     ALL_TABLE_REFERENCE_TYPES, COLUMN_NAMES, MIN_SELECTED_ANALYSIS_METHODS,
@@ -265,6 +267,11 @@ async fn update_configured_table_patches_only_the_members_the_request_carries() 
         );
         let before = created["configuredTable"].clone();
         let id = before["id"].as_str().unwrap_or_default().to_string();
+
+        // The update has to be able to stamp an instant AFTER the create's, and this
+        // service states an instant to the millisecond.
+        let (created_at, _) = timestamps(&before);
+        once_the_clock_has_left(created_at).await;
 
         let (status, response) = emulator.update_configured_table(&id, case.body.clone()).await;
         assert_eq!(

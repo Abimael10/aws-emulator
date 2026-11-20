@@ -73,6 +73,45 @@ pub(crate) async fn get_query(
         .await
 }
 
+/// How long a poll waits for the run a query is owed to have happened.
+///
+/// Generous rather than tight: the completion is due a span after the start call, so this
+/// deadline is only the point at which the run is declared never to have happened — a
+/// loaded host must not be the thing that trips it.
+const RUN_PATIENCE: Duration = Duration::from_secs(120);
+
+/// How often that poll asks again.
+const RUN_POLL: Duration = Duration::from_millis(25);
+
+/// Read the query until it reports a terminal status, and answer that query. Waits for the
+/// CONDITION, never for a fixed time.
+pub(crate) async fn poll_until_terminal(
+    emulator: &Emulator,
+    membership_id: &str,
+    query_id: &str,
+) -> Value {
+    let deadline = std::time::Instant::now() + RUN_PATIENCE;
+    loop {
+        let (status, body) = get_query(emulator, membership_id, query_id).await;
+        assert_eq!(
+            status, 200,
+            "expected GetProtectedQuery 200 while waiting for the run, got {status} with {body}"
+        );
+        let query = body["protectedQuery"].clone();
+        if query["status"]
+            .as_str()
+            .is_some_and(cleanrooms_state::protected_query_is_terminal)
+        {
+            return query;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the query never reached a terminal status, last read {query}"
+        );
+        tokio::time::sleep(RUN_POLL).await;
+    }
+}
+
 /// Create `collaboration`, join it with `membership_body` (its `collaborationIdentifier`
 /// and `queryLogStatus` are filled in here) and return the stored `Membership`.
 async fn join(emulator: &Emulator, collaboration: Value, membership_body: Value) -> Value {
@@ -133,21 +172,30 @@ pub(crate) fn without_settled_members(query: &Value) -> Value {
 }
 
 /// Every state a stored protected query may legally be in: SUBMITTED with no error
-/// while the owed transition is not yet due, else FAILED carrying the reason the run
-/// was never performed. Nothing else, and never a SUCCESS with results nothing
-/// computed.
+/// while the owed run is not yet due, STARTED while its statement is being run, else the
+/// outcome of that run — SUCCESS carrying what it computed, or FAILED carrying what the
+/// engine refused the statement for. Nothing else, and never a SUCCESS with results
+/// nothing computed.
 fn assert_legal_state(case: &str, query: &Value) {
     match query["status"].as_str() {
-        Some("SUBMITTED") => assert!(
-            query.get("error").is_none(),
-            "case {case:?}: a SUBMITTED query carries no error, got {:?}",
-            query.get("error")
+        Some("SUBMITTED" | "STARTED") => assert!(
+            query.get("error").is_none() && query.get("result").is_none(),
+            "case {case:?}: a query that has not settled carries no error and no result, got {query}"
         ),
         Some("FAILED") => {
+            // Every query of this suite reads relations no configured table association
+            // of its membership names, so the statement is one the engine refuses.
             assert_eq!(
                 query["error"]["code"].as_str(),
-                Some(cleanrooms_state::PROTECTED_QUERY_FAILURE_CODE),
+                Some(cleanrooms_state::PROTECTED_QUERY_ERROR_CODE_INVALID_QUERY),
                 "case {case:?}: unexpected failure code, got {:?}",
+                query["error"]
+            );
+            assert!(
+                query["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| !message.is_empty()),
+                "case {case:?}: the failure says what the statement was refused for, got {:?}",
                 query["error"]
             );
             assert!(
@@ -156,6 +204,41 @@ fn assert_legal_state(case: &str, query: &Value) {
             );
         }
         other => panic!("case {case:?}: unexpected protected query status {other:?} in {query}"),
+    }
+}
+
+/// The `computeConfiguration` a query reports: the worker members in effect — the
+/// model's declared defaults where the request named none — with the engine's own worker
+/// properties and any the request wrote over them.
+fn expected_worker(worker_type: &str, number: i64, requested: &[(&str, &str)]) -> Value {
+    let mut properties: std::collections::BTreeMap<String, String> =
+        cleanrooms_state::default_worker_properties()
+            .into_iter()
+            .collect();
+    properties.extend(
+        requested
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string())),
+    );
+    json!({
+        "worker": {
+            "type": worker_type,
+            "number": number,
+            "properties": { "spark": properties },
+        },
+    })
+}
+
+/// The `keyPrefix` a query's results really go under: the configured prefix, then the
+/// collaboration the query ran in.
+fn expected_key_prefix(membership: &Value, configured: Option<&str>) -> String {
+    let collaboration = membership["collaborationId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no collaborationId in {membership}"));
+    let partition = format!("collaboration={collaboration}");
+    match configured {
+        Some(prefix) => format!("{}/{partition}", prefix.trim_end_matches('/')),
+        None => partition,
     }
 }
 
@@ -176,7 +259,9 @@ struct QueryCase {
     /// The `StartProtectedQuery` body, built from the stored membership so a row can
     /// name that membership inside an ARN.
     request: fn(&Value) -> Value,
-    expected: fn() -> Expected,
+    /// What the response must carry, built from the stored membership: the result
+    /// configuration in effect names the collaboration the query runs in.
+    expected: fn(&Value) -> Expected,
 }
 
 fn membership_default_result_configuration() -> Value {
@@ -196,9 +281,15 @@ fn query_cases() -> Vec<QueryCase> {
             label: "inline queryString, no result or compute configuration anywhere",
             membership: || json!({}),
             request: |_| minimal_query(),
-            expected: || Expected {
+            expected: |_| Expected {
                 result_configuration: Value::Null,
-                compute_configuration: Value::Null,
+                // Nothing to override the model's declared worker defaults with, so the
+                // query reports the compute it runs on.
+                compute_configuration: expected_worker(
+                    cleanrooms_state::DEFAULT_WORKER_COMPUTE_TYPE,
+                    i64::from(cleanrooms_state::DEFAULT_WORKER_COMPUTE_NUMBER),
+                    &[],
+                ),
                 query_compute_payer_account_id: json!(account_id()),
             },
         },
@@ -222,21 +313,31 @@ fn query_cases() -> Vec<QueryCase> {
                             },
                         },
                     },
-                    "computeConfiguration": { "worker": { "type": "CR.4X", "number": 32 } },
+                    "computeConfiguration": {
+                        "worker": {
+                            "type": "CR.4X",
+                            "number": 32,
+                            "properties": { "spark": { "spark.sql.shuffle.partitions": "8" } },
+                        },
+                    },
                 })
             },
-            expected: || Expected {
+            expected: |membership| Expected {
                 result_configuration: json!({
                     "outputConfiguration": {
                         "s3": {
                             "resultFormat": "CSV",
                             "bucket": "clean-rooms-results",
-                            "keyPrefix": "queries/2026",
+                            "keyPrefix": expected_key_prefix(membership, Some("queries/2026")),
                             "singleFileOutput": true,
                         },
                     },
                 }),
-                compute_configuration: json!({ "worker": { "type": "CR.4X", "number": 32 } }),
+                compute_configuration: expected_worker(
+                    "CR.4X",
+                    32,
+                    &[("spark.sql.shuffle.partitions", "8")],
+                ),
                 query_compute_payer_account_id: json!(account_id()),
             },
         },
@@ -253,15 +354,24 @@ fn query_cases() -> Vec<QueryCase> {
                     },
                 })
             },
-            expected: || Expected {
+            expected: |membership| Expected {
                 // The membership-side shape carries a `roleArn` the query-side shape
-                // does not model, so only the output configuration carries over.
+                // does not model, so only the output configuration carries over — with
+                // the collaboration partition the results really go under.
                 result_configuration: json!({
                     "outputConfiguration": {
-                        "s3": { "resultFormat": "PARQUET", "bucket": "membership-default-results" },
+                        "s3": {
+                            "resultFormat": "PARQUET",
+                            "bucket": "membership-default-results",
+                            "keyPrefix": expected_key_prefix(membership, None),
+                        },
                     },
                 }),
-                compute_configuration: Value::Null,
+                compute_configuration: expected_worker(
+                    cleanrooms_state::DEFAULT_WORKER_COMPUTE_TYPE,
+                    i64::from(cleanrooms_state::DEFAULT_WORKER_COMPUTE_NUMBER),
+                    &[],
+                ),
                 query_compute_payer_account_id: json!(account_id()),
             },
         },
@@ -278,18 +388,18 @@ fn query_cases() -> Vec<QueryCase> {
                     "computeConfiguration": { "worker": {} },
                 })
             },
-            expected: || Expected {
+            expected: |_| Expected {
+                // A member output configuration names no key prefix to partition.
                 result_configuration: json!({
                     "outputConfiguration": { "member": { "accountId": account_id() } },
                 }),
                 // Both worker members carry a declared default, so the query reports
                 // the compute it runs on.
-                compute_configuration: json!({
-                    "worker": {
-                        "type": cleanrooms_state::DEFAULT_WORKER_COMPUTE_TYPE,
-                        "number": cleanrooms_state::DEFAULT_WORKER_COMPUTE_NUMBER,
-                    },
-                }),
+                compute_configuration: expected_worker(
+                    cleanrooms_state::DEFAULT_WORKER_COMPUTE_TYPE,
+                    i64::from(cleanrooms_state::DEFAULT_WORKER_COMPUTE_NUMBER),
+                    &[],
+                ),
                 query_compute_payer_account_id: json!(account_id()),
             },
         },
@@ -313,23 +423,28 @@ fn query_cases() -> Vec<QueryCase> {
                     "computeConfiguration": { "worker": { "number": WORKER_NUMBER_MIN } },
                 })
             },
-            expected: || Expected {
+            expected: |membership| Expected {
                 result_configuration: json!({
                     "outputConfiguration": {
                         "distribute": {
                             "locations": [
-                                { "s3": { "resultFormat": "PARQUET", "bucket": "distributed-results" } },
+                                {
+                                    "s3": {
+                                        "resultFormat": "PARQUET",
+                                        "bucket": "distributed-results",
+                                        "keyPrefix": expected_key_prefix(membership, None),
+                                    },
+                                },
                                 { "member": { "accountId": account_id() } },
                             ],
                         },
                     },
                 }),
-                compute_configuration: json!({
-                    "worker": {
-                        "type": cleanrooms_state::DEFAULT_WORKER_COMPUTE_TYPE,
-                        "number": WORKER_NUMBER_MIN,
-                    },
-                }),
+                compute_configuration: expected_worker(
+                    cleanrooms_state::DEFAULT_WORKER_COMPUTE_TYPE,
+                    WORKER_NUMBER_MIN,
+                    &[],
+                ),
                 query_compute_payer_account_id: json!(account_id()),
             },
         },
@@ -349,15 +464,17 @@ fn query_cases() -> Vec<QueryCase> {
                     "queryComputePayerAccountId": account_id(),
                 })
             },
-            expected: || Expected {
+            expected: |membership| Expected {
                 result_configuration: json!({
                     "outputConfiguration": {
-                        "s3": { "resultFormat": "CSV", "bucket": "per-query-results" },
+                        "s3": {
+                            "resultFormat": "CSV",
+                            "bucket": "per-query-results",
+                            "keyPrefix": expected_key_prefix(membership, None),
+                        },
                     },
                 }),
-                compute_configuration: json!({
-                    "worker": { "type": "CR.8X", "number": WORKER_NUMBER_MAX },
-                }),
+                compute_configuration: expected_worker("CR.8X", WORKER_NUMBER_MAX, &[]),
                 query_compute_payer_account_id: json!(account_id()),
             },
         },
@@ -378,7 +495,7 @@ async fn start_protected_query_persists_and_get_protected_query_returns_it_uncha
         .await;
         let membership_id = membership["id"].as_str().expect("membership id").to_string();
         let request = (case.request)(&membership);
-        let expected = (case.expected)();
+        let expected = (case.expected)(&membership);
 
         let (status, started) = start_query(&emulator, &membership_id, request.clone()).await;
         assert_eq!(
@@ -424,13 +541,22 @@ async fn start_protected_query_persists_and_get_protected_query_returns_it_uncha
             "case {label:?}: the SQL parameters are stored as sent, got {:?}",
             query["sqlParameters"]
         );
-        for absent in ["result", "statistics", "error", "differentialPrivacy"] {
+        for absent in ["result", "statistics", "error"] {
             assert!(
                 query.get(absent).is_none(),
-                "case {label:?}: nothing has run, so {absent} must be absent, got {:?}",
+                "case {label:?}: nothing has run yet, so {absent} must be absent, got {:?}",
                 query.get(absent)
             );
         }
+        // `DifferentialPrivacyParameters$sensitivityParameters` is a required list, so the
+        // member is reported — empty for a query no analysis rule configures differential
+        // privacy for.
+        assert_eq!(
+            query["differentialPrivacy"],
+            json!({ "sensitivityParameters": [] }),
+            "case {label:?}: unexpected differentialPrivacy, got {:?}",
+            query.get("differentialPrivacy")
+        );
         for (member, expected) in [
             ("resultConfiguration", expected.result_configuration),
             ("computeConfiguration", expected.compute_configuration),
@@ -847,7 +973,7 @@ async fn the_query_compute_payer_is_computed_from_the_collaboration() {
 }
 
 #[tokio::test]
-async fn a_started_query_is_submitted_until_the_clock_settles_it_and_then_fails_with_a_reason() {
+async fn a_started_query_is_submitted_until_the_clock_runs_it_and_then_reports_the_outcome() {
     // The span is the emulator's own choice, inside the band this project fixes for a
     // transition the clock owes, and it is never zero.
     let delay = cleanrooms_state::PROTECTED_QUERY_SETTLE_DELAY;
@@ -884,25 +1010,28 @@ async fn a_started_query_is_submitted_until_the_clock_settles_it_and_then_fails_
         "a SUBMITTED query carries no error, got {fetched}"
     );
 
-    tokio::time::sleep(delay + Duration::from_millis(250)).await;
-
-    let (status, settled) = get_query(&emulator, &membership_id, &query_id).await;
-    assert_eq!(status, 200, "expected GetProtectedQuery 200, got {settled}");
-    let settled_query = settled["protectedQuery"].clone();
+    // The outcome is waited for by looking again until it is there, never by sleeping a
+    // fixed time: the deadline is only the point at which the run is declared never to
+    // have happened.
+    let settled_query = poll_until_terminal(&emulator, &membership_id, &query_id).await;
+    // This membership associates no configured table, so the statement names a relation
+    // the collaboration does not expose and the engine refuses it.
     assert_eq!(
         settled_query["status"].as_str(),
         Some("FAILED"),
-        "once the span has passed the clock owes the terminal status, got {settled_query}"
+        "a statement the engine refuses settles in FAILED, got {settled_query}"
     );
     assert_eq!(
         settled_query["error"]["code"].as_str(),
-        Some(cleanrooms_state::PROTECTED_QUERY_FAILURE_CODE),
+        Some(cleanrooms_state::PROTECTED_QUERY_ERROR_CODE_INVALID_QUERY),
         "unexpected failure code, got {settled_query}"
     );
-    assert_eq!(
-        settled_query["error"]["message"].as_str(),
-        Some(cleanrooms_state::PROTECTED_QUERY_FAILURE_MESSAGE),
-        "the failure says why the run was never performed, got {settled_query}"
+    assert!(
+        settled_query["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("orders")),
+        "the failure carries the engine's own sentence about the relation the statement \
+         named, got {settled_query}"
     );
     for absent in ["result", "statistics"] {
         assert!(
@@ -1007,5 +1136,103 @@ async fn get_protected_query_is_addressed_under_the_membership_that_started_it()
                 "case {label:?}: unexpected query, got {body}"
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn the_result_prefix_in_effect_partitions_by_collaboration_whichever_source_names_it() {
+    let emulator = Emulator::new();
+
+    // The rule generalises over WHERE the configuration comes from (the call, else the
+    // membership's default) and over the FORM of the prefix it names (none, a bare
+    // segment, one with a trailing slash, a nested one, and one that already carries a
+    // partition segment of its own).
+    let cases: Vec<(&str, Option<&str>, Option<&str>)> = vec![
+        ("the call names no prefix at all", Some(""), None),
+        ("the call names a bare prefix", Some("results"), Some("results")),
+        (
+            "the call names a prefix with a trailing slash",
+            Some("results/"),
+            Some("results"),
+        ),
+        (
+            "the call names a nested prefix",
+            Some("tenants/acme/results/"),
+            Some("tenants/acme/results"),
+        ),
+        (
+            "the call names a prefix that is already partitioned",
+            Some("results/dt=2026-11-09"),
+            Some("results/dt=2026-11-09"),
+        ),
+        ("the membership default names the prefix", None, Some("results")),
+    ];
+
+    for (row, (label, call_prefix, configured)) in cases.into_iter().enumerate() {
+        let mut membership_body = json!({});
+        if call_prefix.is_none() {
+            let mut s3 = json!({ "resultFormat": "CSV", "bucket": "clean-rooms-results" });
+            if let Some(prefix) = configured {
+                s3["keyPrefix"] = json!(prefix);
+            }
+            membership_body = json!({
+                "defaultResultConfiguration": {
+                    "outputConfiguration": { "s3": s3 },
+                    "roleArn": "arn:aws:iam::000000000000:role/clean-rooms-results",
+                },
+            });
+        }
+        let membership = join(
+            &emulator,
+            minimal_collaboration(&format!("prefix-{row}")),
+            membership_body,
+        )
+        .await;
+        let membership_id = membership["id"].as_str().expect("membership id").to_string();
+
+        let mut body = minimal_query();
+        if let Some(prefix) = call_prefix {
+            let mut s3 = json!({ "resultFormat": "CSV", "bucket": "clean-rooms-results" });
+            if !prefix.is_empty() {
+                s3["keyPrefix"] = json!(prefix);
+            }
+            body["resultConfiguration"] = json!({ "outputConfiguration": { "s3": s3 } });
+        }
+        let (status, started) = start_query(&emulator, &membership_id, body).await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: expected StartProtectedQuery 200, got {status} with {started}"
+        );
+        let query = started["protectedQuery"].clone();
+        let expected = expected_key_prefix(
+            &membership,
+            configured.filter(|prefix| !prefix.is_empty()),
+        );
+        assert_eq!(
+            query["resultConfiguration"]["outputConfiguration"]["s3"]["keyPrefix"].as_str(),
+            Some(expected.as_str()),
+            "case {label:?}: expected the prefix in effect {expected:?}, got {query}"
+        );
+        // `KeyPrefix` is `length 0..512, pattern ^[\w!.=*/-]*$`: the prefix the service
+        // reports stays inside the modelled constraints.
+        assert!(
+            expected.len() <= 512
+                && expected
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '!' | '.' | '=' | '*' | '/' | '-')),
+            "case {label:?}: the reported prefix must satisfy the KeyPrefix pattern, got {expected:?}"
+        );
+        // The read path reports the same prefix: one projection serves both.
+        let id = query["id"].as_str().expect("protected query id");
+        let (status, fetched) = get_query(&emulator, &membership_id, id).await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: expected GetProtectedQuery 200, got {status} with {fetched}"
+        );
+        assert_eq!(
+            fetched["protectedQuery"]["resultConfiguration"],
+            query["resultConfiguration"],
+            "case {label:?}: the read reports the stored configuration, got {fetched}"
+        );
     }
 }

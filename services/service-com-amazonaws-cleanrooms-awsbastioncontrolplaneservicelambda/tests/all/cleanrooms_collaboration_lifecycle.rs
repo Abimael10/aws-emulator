@@ -178,6 +178,32 @@ pub(crate) fn error_message(body: &Value) -> String {
         .to_string()
 }
 
+/// Wait until the service's own clock has left the millisecond `instant` falls in.
+///
+/// Every instant this service reports is stated to the millisecond, so a call made inside
+/// the same millisecond as another reports the same instant — which would make "this call
+/// restamped the instant" unobservable. This waits for the CONDITION (the clock having
+/// moved past that instant), never for a fixed time, and the deadline is only the point at
+/// which the clock is declared not to be moving.
+pub(crate) async fn once_the_clock_has_left(instant: f64) {
+    let deadline = std::time::Instant::now() + CLOCK_PATIENCE;
+    loop {
+        if cleanrooms_state::now().as_secs_f64() > instant {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the clock never moved past {instant}"
+        );
+        tokio::time::sleep(CLOCK_POLL).await;
+    }
+}
+
+/// How long [`once_the_clock_has_left`] waits for the clock to move on, and how often it
+/// looks again. Generous: a loaded host must not be the thing that trips it.
+const CLOCK_PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
+const CLOCK_POLL: std::time::Duration = std::time::Duration::from_millis(1);
+
 /// Whether `id` is in the form the model's `UUID` shape declares:
 /// `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`.
 pub(crate) fn is_model_uuid(id: &str) -> bool {

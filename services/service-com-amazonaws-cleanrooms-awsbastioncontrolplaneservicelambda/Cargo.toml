@@ -8,6 +8,19 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# The in-process SQL engine a protected query's statement RUNS on
+# (`service_common::sql_wire_planes::sql_engine`): bounded, confined to its own tables
+# and shared with every other SQL data plane of this workspace, so no second engine is
+# opened here.
+service-common = { path = "../common" }
+# The Data Catalog a configured table references (`GlueTableReference`): the columns and
+# the location of the table behind a relation a protected query reads are the ones Glue's
+# own reads report, rather than a second copy kept here.
+service-com-amazonaws-glue-awsglue = { workspace = true }
+# The object store two things here reach: the DATA under a catalog table's location, which
+# the rows a query reads are decoded from, and the RESULT object a successful query writes
+# — so the location a query reports is one a later `GetObject`/`ListObjectsV2` serves.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -29,6 +42,18 @@ hex = { workspace = true }
 # Parses an analysis template's SQL so `AnalysisTemplate$schema.referencedTables` is
 # the relations the analysis really reads, rather than a hand-rolled text scan.
 sqlparser = { version = "0.59", features = ["visitor"] }
+# `csv`: the objects under a configured table's catalog location are DELIMITED TEXT and a
+# CSV result object is written back as the same format, so both are read and written by
+# the maintained reader/writer for it rather than by a splitter written here.
+csv = "1.4"
+# `parquet`: a result configuration whose `resultFormat` is PARQUET asks for the columnar
+# Parquet format, so the object a query writes for it is written by the Apache
+# implementation of that format — the same one this workspace already writes such objects
+# with. Pure Rust, with only the codecs it needs.
+parquet = { version = "60", default-features = false, features = [
+    "snap",
+    "flate2-rust_backend",
+] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

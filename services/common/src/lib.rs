@@ -384,6 +384,11 @@ pub mod cfn_resource_handlers;
 /// destination the stage names — for both API Gateway planes, which configure and render it
 /// the same way, so a REST stage and an HTTP api's stage cannot write one format differently.
 pub mod api_gateway_access_logs;
+/// The ONE reading of the ROWS behind a DATA CATALOG table — the delimited-text objects at
+/// its location, decoded as its SerDe says they hold them — and of the LOAD of those rows
+/// into this workspace's in-process SQL engine, for every service whose data plane answers a
+/// query over such a table, so two of them cannot decode one table differently.
+pub mod catalog_table_rows;
 /// The ONE clock an emulated service's clock-owed transitions are decided against — the due
 /// instants a transient status is recorded with and the comparisons that materialise them —
 /// for every service that reports one, so a caller can hold a span open or cross it instead

@@ -38,7 +38,7 @@ use super::protected_queries::{
 /// How long a poll loop waits for a transition the clock owes before giving up. The owed
 /// span is `cleanrooms_state::PROTECTED_QUERY_SETTLE_DELAY`; this budget is deliberately
 /// far larger, so a loaded host cannot fail the test.
-const POLL_DEADLINE: Duration = Duration::from_secs(60);
+const POLL_DEADLINE: Duration = Duration::from_secs(120);
 /// How long the poll loop waits between two reads.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// How far out a row pushes an owed transition it does not want to fall due yet.

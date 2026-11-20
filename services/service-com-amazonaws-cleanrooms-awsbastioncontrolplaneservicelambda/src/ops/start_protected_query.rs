@@ -9,15 +9,16 @@
 //! joined must still exist, and the calling account must hold the `CAN_QUERY` ability
 //! the collaboration granted it. The members the SERVICE decides are derived from state
 //! too — the result configuration falls back to the membership's stored default
-//! (`crate::state::protected_query_result_configuration`) and the query-compute payer to
+//! (`crate::state::effective_result_configuration`) and the query-compute payer to
 //! the collaboration's payer candidate (`crate::state::query_compute_payer`).
 //!
-//! The query itself is NOT executed: Clean Rooms runs SQL over the configured tables a
-//! collaboration associates, and this emulator serves the control plane only, with no
-//! analytics data plane. So the accepted query enters `SUBMITTED` and the clock owes it
-//! the modelled failure state with a reason that says exactly that
-//! (`crate::state::PROTECTED_QUERY_FAILURE_CODE`), rather than a fabricated `SUCCESS`
-//! with results nothing computed.
+//! The query itself is RUN: Clean Rooms runs SQL over the configured tables a
+//! collaboration associates, so the accepted query enters `SUBMITTED` and the clock owes
+//! it the outcome of that run a span later — the statement is executed over the data
+//! those tables really hold and the rows it computed are written where its result
+//! configuration points (`crate::state::settle_protected_queries`), so it settles in
+//! `SUCCESS` carrying that result, or in `FAILED` carrying what the engine refused it
+//! for.
 //!
 //! ## Shape of an operation
 //!
@@ -330,24 +331,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             id: id.clone(),
             membership_id: membership.id.clone(),
             membership_arn: membership.arn.clone(),
-            create_time: ::aws_smithy_types::DateTime::from(started_at),
+            // Stated to the millisecond, as every instant this service reports is.
+            create_time: st::to_timestamp(started_at),
             sql_parameters: Some(sql_parameters),
-            // The clock owes this query its terminal status; until then it is the
-            // query the service has accepted but not finished.
+            // The clock owes this query its run; until then it is the query the service
+            // has accepted but not finished.
             status: st::PROTECTED_QUERY_STATUS_SUBMITTED.to_string(),
-            result_configuration: st::protected_query_result_configuration(
+            result_configuration: st::effective_result_configuration(
                 input.result_configuration,
                 &membership,
             ),
-            // Nothing has run, so there is no duration to report and no result to
-            // point at; the settled failure explains why.
+            // Nothing has run yet, so there is no duration to report and no result to
+            // point at; the completion the clock owes fills both in.
             statistics: None,
             result: None,
             error: None,
-            // Differential privacy applies to the analysis rules of the tables a query
-            // reads, and this emulator holds none, so a query reports no parameters.
-            differential_privacy: None,
-            compute_configuration: st::effective_compute_configuration(input.compute_configuration),
+            // The sensitivity parameters in force for this query, which is the member's
+            // required list — empty while no analysis rule of the tables it reads
+            // configures differential privacy.
+            differential_privacy: Some(st::differential_privacy_parameters()),
+            // Every member of the worker configuration carries a declared default, so the
+            // compute the query runs on is determinate and reported.
+            compute_configuration: Some(st::effective_compute_configuration(
+                input.compute_configuration,
+            )),
             query_compute_payer_account_id: input
                 .query_compute_payer_account_id
                 .or_else(|| st::query_compute_payer(&record)),
@@ -358,9 +365,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             st::ProtectedQueryRecord {
                 query,
                 terminal_due: Some(started_at + st::PROTECTED_QUERY_SETTLE_DELAY),
-                // Nothing can run the query, so the status the clock owes it is the
-                // modelled failure state (`st::PROTECTED_QUERY_FAILURE_CODE` says why).
-                terminal_status: st::PROTECTED_QUERY_STATUS_FAILED.to_string(),
+                // The run falls due a span after this call: the statement is executed
+                // then (`crate::state::settle_protected_queries`), so the status the
+                // clock owes this query is the one its own run reaches — SUCCESS for a
+                // statement the engine answers, FAILED for one it refuses.
+                terminal_status: st::PROTECTED_QUERY_STATUS_SUCCESS.to_string(),
             },
         );
         store.protected_query_order.push(id.clone());

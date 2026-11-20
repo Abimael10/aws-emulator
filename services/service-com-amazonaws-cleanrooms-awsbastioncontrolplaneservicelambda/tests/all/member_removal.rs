@@ -25,7 +25,7 @@ use service_com_amazonaws_cleanrooms_awsbastioncontrolplaneservicelambda::state 
 
 use super::cleanrooms_collaboration_lifecycle::{
     account_id, collaboration_owned_elsewhere, error_code, error_message, minimal_collaboration,
-    Emulator, ALL_LOG_STATUSES, ALL_MEMBER_ABILITIES, REGION,
+    once_the_clock_has_left, Emulator, ALL_LOG_STATUSES, ALL_MEMBER_ABILITIES, REGION,
 };
 use super::collaboration_change_requests::{
     create_change_request, declared_member, member_change, NEWCOMER_ACCOUNT, PARTNER_ACCOUNT,
@@ -254,6 +254,9 @@ async fn delete_member_moves_the_party_to_removed_and_keeps_the_rest_of_the_rost
 
         // The FIRST call performs the removal and restamps the party's own `updateTime`;
         // every later call is the `@idempotent` repeat, which must change nothing at all.
+        // The removal has to be able to stamp an instant AFTER the roster's, and this
+        // service states an instant to the millisecond.
+        once_the_clock_has_left(timestamp(label, &removed_before, "updateTime")).await;
         let mut first_after: Option<Vec<Value>> = None;
         for call in 1..=case.calls {
             let (status, body) = delete_member(&emulator, &collaboration_id, case.remove).await;

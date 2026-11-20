@@ -7,10 +7,11 @@
 //! under another.
 //!
 //! Before it answers, it materializes the protected-query transitions the CLOCK
-//! already owes (`crate::state::settle_protected_queries`) — a query's terminal status
-//! falls due a fixed span after the `StartProtectedQuery` call that began it, whether
-//! or not anybody polls, so applying the ones already due is reporting what the clock
-//! did, not mutating on read. A query read inside that span is still `SUBMITTED`.
+//! already owes (`crate::state::settle_protected_queries`) — a query's completion falls
+//! due a fixed span after the `StartProtectedQuery` call that began it, whether or not
+//! anybody polls, so running the ones already due and reporting what they produced is
+//! reporting what the clock did, not mutating on read. A query read inside that span is
+//! still `SUBMITTED`.
 //!
 //! ## Shape of an operation
 //!
@@ -164,8 +165,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let membership_id = input.membership_identifier;
         let query_id = input.protected_query_identifier;
 
-        let mut store = state.lock();
-        store.settle_protected_queries(::std::time::SystemTime::now());
+        // The completions the clock already owes are materialized BEFORE the store's guard
+        // is taken, because a query's run is work no guard is held for.
+        st::settle_protected_queries(&self.engine, ::std::time::SystemTime::now()).await;
+
+        let store = state.lock();
 
         if !store.memberships.contains_key(&membership_id) {
             return Err(GetProtectedQueryErrorModeled::ResourceNotFoundException(

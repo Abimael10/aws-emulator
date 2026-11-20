@@ -117,6 +117,11 @@ hex = { workspace = true }
 # `iam_trust_policy`: an IAM trust policy IS a JSON document, so it is read with a
 # maintained JSON parser rather than by hand.
 serde_json = { workspace = true }
+# `catalog_table_rows`: the objects under a Data Catalog table's location are DELIMITED
+# TEXT, so the records and fields a read decodes out of them are read by the maintained
+# reader for that format rather than by a splitter written here — the separator, the
+# quoting and the line terminators come from the table's own SerDe.
+csv = "1.4"
 # `submitted_collections`: reads the ORDER a request's JSON object wrote a map member's
 # entries in, which the built input (a `HashMap`) does not keep. Only the deserializer
 # seam is used; no shape here derives `Serialize`.

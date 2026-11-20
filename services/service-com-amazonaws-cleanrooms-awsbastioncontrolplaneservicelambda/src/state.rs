@@ -83,7 +83,7 @@ use crate::ops::types::{
     ConfiguredTableAnalysisRulePolicyV1, ConfiguredTableAssociation,
     ConfiguredTableAssociationAnalysisRule, ConfiguredTableAssociationAnalysisRulePolicy,
     ConfiguredTableAssociationAnalysisRulePolicyV1, ConfiguredTableAssociationSchemaTypeProperties,
-    ConfiguredTableAssociationSummary, DataEncryptionMetadata,
+    ConfiguredTableAssociationSummary, DataEncryptionMetadata, DifferentialPrivacyParameters,
     DifferentialPrivacyTemplateParametersOutput, ErrorMessageConfiguration, MLMemberAbilities,
     MemberChangeSpecification, MemberSpecification, MemberSummary, Membership,
     MembershipJobComputePaymentConfig, MembershipMLPaymentConfig,
@@ -93,11 +93,12 @@ use crate::ops::types::{
     MembershipQueryComputePaymentConfig, MembershipSummary,
     MembershipSyntheticDataGenerationPaymentConfig, PaymentConfiguration, PrivacyBudgetTemplate,
     PrivacyBudgetTemplateParametersInput, PrivacyBudgetTemplateParametersOutput,
-    PrivacyBudgetTemplateSummary, ProtectedQuery,
-    ProtectedQueryError, ProtectedQueryOutputConfiguration, ProtectedQueryResultConfiguration,
+    PrivacyBudgetTemplateSummary, ProtectedQuery, ProtectedQueryDistributeOutputConfigurationLocation,
+    ProtectedQueryOutputConfiguration, ProtectedQueryResultConfiguration,
+    ProtectedQueryS3OutputConfiguration, ProtectedQueryStatistics,
     QueryComputePaymentConfig, ResourceNotFoundException, Schema, SchemaStatusDetail,
     SchemaStatusReason, SchemaTypeProperties, SnowflakeTableSchema, SyntheticDataParameters,
-    TableReference, WorkerComputeConfiguration,
+    TableReference, WorkerComputeConfiguration, WorkerComputeConfigurationProperties,
 };
 
 /// The schemas a collaboration holds: the relations its members contributed to it,
@@ -105,6 +106,12 @@ use crate::ops::types::{
 /// here rather than persisted a second time.
 mod schemas;
 pub use schemas::*;
+
+/// The RUN of a protected query: the statement a membership submitted, executed over the
+/// data the configured tables of its collaboration hold, with the rows it computed
+/// written where its result configuration points.
+mod protected_query_run;
+pub use protected_query_run::*;
 
 /// The ARN service segment and the SigV4 signing name for Clean Rooms, from
 /// `OPERATIONS.md` (`sigv4 name cleanrooms`) and the `CollaborationArn` /
@@ -159,10 +166,14 @@ pub const DEFAULT_ML_IS_RESPONSIBLE: bool = false;
 
 /// `ProtectedQueryStatus` values this slice produces (model shape
 /// `ProtectedQueryStatus`: SUBMITTED | STARTED | CANCELLED | CANCELLING | FAILED |
-/// SUCCESS | TIMED_OUT). A started query is SUBMITTED until the clock settles it, and
-/// FAILED is the only terminal status this emulator can reach — see
-/// [`PROTECTED_QUERY_FAILURE_CODE`].
+/// SUCCESS | TIMED_OUT). A started query is SUBMITTED until the clock settles it in the
+/// outcome of its RUN — SUCCESS for a statement the engine answered,
+/// [`PROTECTED_QUERY_STATUS_FAILED`] for one it refused.
 pub const PROTECTED_QUERY_STATUS_SUBMITTED: &str = "SUBMITTED";
+/// See [`PROTECTED_QUERY_STATUS_SUBMITTED`]. The catalog's RUNNING status: the status a
+/// query is in while its statement is being executed, between the span the clock owed it
+/// and the outcome that run reached.
+pub const PROTECTED_QUERY_STATUS_STARTED: &str = "STARTED";
 /// See [`PROTECTED_QUERY_STATUS_SUBMITTED`].
 pub const PROTECTED_QUERY_STATUS_FAILED: &str = "FAILED";
 /// See [`PROTECTED_QUERY_STATUS_SUBMITTED`]. A query a caller asked to cancel is
@@ -171,10 +182,10 @@ pub const PROTECTED_QUERY_STATUS_FAILED: &str = "FAILED";
 pub const PROTECTED_QUERY_STATUS_CANCELLING: &str = "CANCELLING";
 /// See [`PROTECTED_QUERY_STATUS_CANCELLING`].
 pub const PROTECTED_QUERY_STATUS_CANCELLED: &str = "CANCELLED";
-/// See [`PROTECTED_QUERY_STATUS_SUBMITTED`]. No protected query of this emulator reaches
-/// these two: there is no analytics data plane to run one to SUCCESS, and none is left
-/// running long enough to TIME_OUT. They are named so every value of the catalog this
-/// slice reasons about is referenced the same way.
+/// See [`PROTECTED_QUERY_STATUS_SUBMITTED`]. The status a query whose statement the
+/// engine answered settles in; no query of this emulator is left running long enough to
+/// TIME_OUT, which is named so every value of the catalog this slice reasons about is
+/// referenced the same way.
 pub const PROTECTED_QUERY_STATUS_SUCCESS: &str = "SUCCESS";
 /// See [`PROTECTED_QUERY_STATUS_SUCCESS`].
 pub const PROTECTED_QUERY_STATUS_TIMED_OUT: &str = "TIMED_OUT";
@@ -204,20 +215,15 @@ pub const PROTECTED_QUERY_TERMINAL_STATUSES: [&str; 4] = [
 /// sees it CANCELLING; the due instant is stored rather than slept on.
 pub const PROTECTED_QUERY_SETTLE_DELAY: Duration = Duration::from_millis(500);
 
-/// The `ProtectedQueryError.code` a settled query carries.
+/// The segment a query's results are PARTITIONED by under the key prefix its result
+/// configuration names: the collaboration the query ran in, in the `name=value` form a
+/// partitioned prefix is written in.
 ///
-/// Clean Rooms executes a protected query against the configured tables a
-/// collaboration associates; this emulator serves the Clean Rooms CONTROL plane only
-/// and has no analytics data plane to run SQL on, so no protected query can be
-/// executed. The run is therefore not performed and the query ends in the modelled
-/// failure state ([`PROTECTED_QUERY_STATUS_FAILED`]) with an error that says exactly
-/// that — never in a fabricated SUCCESS with results nothing computed.
-pub const PROTECTED_QUERY_FAILURE_CODE: &str = "QUERY_EXECUTION_UNAVAILABLE";
-
-/// The `ProtectedQueryError.message` that goes with [`PROTECTED_QUERY_FAILURE_CODE`].
-pub const PROTECTED_QUERY_FAILURE_MESSAGE: &str =
-    "this emulator serves the Clean Rooms control plane only: it has no analytics data \
-     plane, so the protected query was accepted and recorded but never executed";
+/// One bucket and prefix serve every collaboration a member queries, so the prefix in
+/// effect for a query carries the collaboration it ran in — which is what a reader of
+/// the returned `resultConfiguration` is told, and where the result object really is
+/// (see [`effective_result_configuration`]).
+pub const RESULT_COLLABORATION_PARTITION: &str = "collaboration";
 
 /// `MembershipStatus` values this slice produces (model shape `MembershipStatus`:
 /// ACTIVE | REMOVED | COLLABORATION_DELETED).
@@ -1606,28 +1612,73 @@ impl ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
         }
     }
 
-    /// Materialize every protected-query transition the CLOCK already owes at `now`.
+    /// Materialize every protected-query transition the CLOCK already owes at `now`,
+    /// CLAIMING the run of each submitted query that has fallen due, and answer the
+    /// queries claimed.
     ///
-    /// A query's terminal status falls due [`PROTECTED_QUERY_SETTLE_DELAY`] after the
-    /// call that started it, whether or not anybody calls again, so a reporting
-    /// operation applies the ones already owed before it answers. It changes nothing
-    /// that is not yet due: a caller reading a query inside that span sees it
-    /// SUBMITTED.
-    pub fn settle_protected_queries(&mut self, now: SystemTime) {
+    /// A query's completion falls due [`PROTECTED_QUERY_SETTLE_DELAY`] after the call that
+    /// started it, whether or not anybody calls again, so a reporting operation applies
+    /// the ones already owed before it answers. A cancellation owes no run: the query it
+    /// abandoned settles in CANCELLED here, with no result and no statistics. A submitted
+    /// query's run, which is the work this holds no guard for, is CLAIMED instead — the
+    /// query enters the catalog's running status (`STARTED`) and is owed nothing further,
+    /// so exactly one caller runs it and a reader meanwhile sees it running — and the
+    /// outcome is written back through [`Self::apply_protected_query_run`].
+    ///
+    /// It changes nothing that is not yet due: a caller reading a query inside that span
+    /// sees it SUBMITTED, and a query that has already settled is left where it is.
+    pub fn claim_due_protected_queries(&mut self, now: SystemTime) -> Vec<ProtectedQuery> {
+        let mut claimed = Vec::new();
         for record in self.protected_queries.values_mut() {
             if record.terminal_due.is_none_or(|due| due > now) {
                 continue;
             }
             record.terminal_due = None;
-            record.query.status = record.terminal_status.clone();
-            // A query that settles in the failure state carries that failure's reason,
-            // and NO statistics or result either way: there is no duration to report
-            // for work nothing did, and a cancelled query failed at nothing.
-            if record.terminal_status == PROTECTED_QUERY_STATUS_FAILED {
-                record.query.error = Some(ProtectedQueryError {
-                    code: PROTECTED_QUERY_FAILURE_CODE.to_string(),
-                    message: PROTECTED_QUERY_FAILURE_MESSAGE.to_string(),
+            // A cancellation settles without a run: the work it abandoned never happened,
+            // so there is nothing to report a result or a duration for.
+            if record.terminal_status != PROTECTED_QUERY_STATUS_SUCCESS {
+                record.query.status = record.terminal_status.clone();
+                continue;
+            }
+            record.query.status = PROTECTED_QUERY_STATUS_STARTED.to_string();
+            claimed.push(record.query.clone());
+        }
+        claimed
+    }
+
+    /// Write the outcome of the run of `query_id` back onto the stored query: the status it
+    /// reached, what it produced, and how long it took from its creation to `completed`.
+    pub fn apply_protected_query_run(
+        &mut self,
+        query_id: &str,
+        run: QueryRun,
+        completed: SystemTime,
+    ) {
+        let Some(record) = self.protected_queries.get_mut(query_id) else {
+            return;
+        };
+        // A query a caller has since asked to cancel is no longer running this statement:
+        // the cancellation it is heading for is what settles it, so the outcome of the
+        // abandoned run is dropped rather than written over that.
+        if record.query.status != PROTECTED_QUERY_STATUS_STARTED {
+            return;
+        }
+        let elapsed = protected_query_elapsed(&record.query, completed);
+        match run {
+            QueryRun::Succeeded(result) => {
+                record.query.status = PROTECTED_QUERY_STATUS_SUCCESS.to_string();
+                record.query.result = result;
+                // "The duration of the protected query, from creation until query
+                // completion, in milliseconds"
+                // (`ProtectedQueryStatistics$totalDurationInMillis`).
+                record.query.statistics = Some(ProtectedQueryStatistics {
+                    total_duration_in_millis: Some(elapsed),
+                    billed_resource_utilization: None,
                 });
+            }
+            QueryRun::Failed(error) => {
+                record.query.status = PROTECTED_QUERY_STATUS_FAILED.to_string();
+                record.query.error = Some(error);
             }
         }
     }
@@ -2692,10 +2743,28 @@ pub fn effective_analytics_engine(requested: Option<String>) -> String {
     requested.unwrap_or_else(|| DEFAULT_ANALYTICS_ENGINE.to_string())
 }
 
-/// Now, as the modelled `Timestamp` type.
+/// Now, as the modelled `Timestamp` type, stated to the MILLISECOND.
 pub fn now() -> DateTime {
-    DateTime::from(::std::time::SystemTime::now())
+    to_timestamp(::std::time::SystemTime::now())
 }
+
+/// `at` as the modelled `Timestamp` type, truncated to the MILLISECOND it falls in.
+///
+/// This protocol carries a timestamp as epoch seconds with a fractional part, and the
+/// finest an instant AWS reports is stated to is the millisecond — so an instant reported
+/// with the clock's own nanoseconds carries a precision no timestamp of this API has.
+/// TRUNCATED, never rounded: the instant reported is the millisecond the call fell in,
+/// which is also why re-stating a value this produced leaves it where it is.
+pub fn to_timestamp(at: SystemTime) -> DateTime {
+    let stamp = DateTime::from(at);
+    DateTime::from_secs_and_nanos(
+        stamp.secs(),
+        (stamp.subsec_nanos() / NANOS_PER_MILLISECOND) * NANOS_PER_MILLISECOND,
+    )
+}
+
+/// How many nanoseconds one millisecond holds, for [`to_timestamp`].
+const NANOS_PER_MILLISECOND: u32 = 1_000_000;
 
 /// A fresh resource id in the `UUID` shape's form: lowercase hex, 36 characters,
 /// matching `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`.
@@ -3236,38 +3305,108 @@ pub const DEFAULT_WORKER_COMPUTE_TYPE: &str = "CR.1X";
 /// `range 2..1024`.
 pub const DEFAULT_WORKER_COMPUTE_NUMBER: i32 = 16;
 
-/// The compute configuration a protected query runs with.
+/// The compute configuration a protected query runs with — always one, because every
+/// member of the worker configuration carries a declared default.
 ///
-/// A caller that named no compute configuration selected none, and the member stays
-/// absent. A caller that named a `worker` configuration gets the one in force: each of
-/// its optional members is materialized at the default the model declares for it
-/// ([`DEFAULT_WORKER_COMPUTE_TYPE`], [`DEFAULT_WORKER_COMPUTE_NUMBER`]), so a later
-/// read reports the compute the query runs on rather than an absent member.
+/// `ComputeConfiguration` is a union whose one member is a `WorkerComputeConfiguration`,
+/// and each of that structure's members is optional with a default the model declares
+/// ([`DEFAULT_WORKER_COMPUTE_TYPE`], [`DEFAULT_WORKER_COMPUTE_NUMBER`]) — so the compute a
+/// query runs on is determinate whatever the request named, and the query reports it
+/// rather than an absent member. The worker PROPERTIES in effect are the settings the
+/// analytics engine runs with ([`default_worker_properties`]), with every property the
+/// request named written over them: a caller that re-submits the reported configuration
+/// asks for the same compute it just ran on.
 pub fn effective_compute_configuration(
     requested: Option<ComputeConfiguration>,
-) -> Option<ComputeConfiguration> {
-    let ComputeConfiguration::Worker(worker) = requested?;
-    Some(ComputeConfiguration::Worker(WorkerComputeConfiguration {
+) -> ComputeConfiguration {
+    let worker = match requested {
+        Some(ComputeConfiguration::Worker(worker)) => worker,
+        None => WorkerComputeConfiguration::default(),
+    };
+    ComputeConfiguration::Worker(WorkerComputeConfiguration {
         r#type: Some(
             worker
                 .r#type
                 .unwrap_or_else(|| DEFAULT_WORKER_COMPUTE_TYPE.to_string()),
         ),
         number: Some(worker.number.unwrap_or(DEFAULT_WORKER_COMPUTE_NUMBER)),
-        properties: worker.properties,
-    }))
+        properties: Some(effective_worker_properties(worker.properties)),
+    })
 }
 
-/// Where a protected query's results are written: the configuration the request
-/// carried, else the membership's stored `defaultResultConfiguration` — documented on
+/// The `spark` properties the analytics engine a protected query runs on is configured
+/// with, which is what the query reports as the worker properties in effect.
+///
+/// `WorkerComputeConfigurationProperties` carries them under its one member, `spark` —
+/// "the configuration properties for the worker compute environment" — and the engine
+/// behind a SQL protected query runs with its query optimizations turned on, so that is
+/// the setting a reader of the query's compute configuration is told about. A property the
+/// request named replaces the engine's own value for that property
+/// ([`effective_compute_configuration`]).
+pub fn default_worker_properties() -> HashMap<String, String> {
+    HashMap::from([(
+        "spark.cleanrooms.athena.optimizationsEnabled".to_string(),
+        "true".to_string(),
+    )])
+}
+
+/// [`default_worker_properties`] with every property `requested` named written over them.
+fn effective_worker_properties(
+    requested: Option<WorkerComputeConfigurationProperties>,
+) -> WorkerComputeConfigurationProperties {
+    let mut properties = default_worker_properties();
+    if let Some(WorkerComputeConfigurationProperties::Spark(named)) = requested {
+        properties.extend(named);
+    }
+    WorkerComputeConfigurationProperties::Spark(properties)
+}
+
+/// The differential-privacy parameters a protected query reports.
+///
+/// `DifferentialPrivacyParameters$sensitivityParameters` is a REQUIRED list, so the member
+/// is reported with the parameters in force rather than omitted: a query over tables whose
+/// analysis rules configure no differential privacy has no sensitivity parameters, which is
+/// the empty list.
+pub fn differential_privacy_parameters() -> DifferentialPrivacyParameters {
+    DifferentialPrivacyParameters {
+        sensitivity_parameters: Vec::new(),
+    }
+}
+
+/// How long a protected query took, from its creation until it completed, in
+/// milliseconds — what `ProtectedQueryStatistics$totalDurationInMillis` reports.
+///
+/// Never negative and never zero: the completion falls due a span after the creation
+/// ([`PROTECTED_QUERY_SETTLE_DELAY`]), so the duration of a query that completed is at
+/// least that span.
+fn protected_query_elapsed(query: &ProtectedQuery, completed: SystemTime) -> i64 {
+    let created = SystemTime::UNIX_EPOCH
+        + Duration::from_nanos(u64::try_from(query.create_time.as_nanos()).unwrap_or_default());
+    let elapsed = completed
+        .duration_since(created)
+        .unwrap_or(PROTECTED_QUERY_SETTLE_DELAY)
+        .max(PROTECTED_QUERY_SETTLE_DELAY);
+    i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+}
+
+/// Where a protected query's results are written, and under which prefix.
+///
+/// The configuration IN EFFECT for a query is the one the call carried
+/// (`StartProtectedQueryInput$resultConfiguration`, "the details needed to write the query
+/// results"), else the membership's stored `defaultResultConfiguration` — documented on
 /// `CreateMembershipInput$defaultResultConfiguration` as "the default protected query
 /// result configuration" — projected onto the query-side shape. `None` when the request
 /// named none and the membership holds no default.
-pub fn protected_query_result_configuration(
+///
+/// An Amazon S3 location's `keyPrefix` is then the PARTITIONED prefix the results really
+/// go under: the configured prefix followed by the collaboration the query ran in
+/// ([`RESULT_COLLABORATION_PARTITION`]), so a reader of the returned configuration
+/// computes the same address the service wrote to.
+pub fn effective_result_configuration(
     requested: Option<ProtectedQueryResultConfiguration>,
     membership: &Membership,
 ) -> Option<ProtectedQueryResultConfiguration> {
-    requested.or_else(|| {
+    let configured = requested.or_else(|| {
         let default = membership.default_result_configuration.as_ref()?;
         // `MembershipProtectedQueryOutputConfiguration` declares one member, `s3`, and
         // it is the same shape the query-side union's `s3` member targets.
@@ -3279,7 +3418,48 @@ pub fn protected_query_result_configuration(
         Some(ProtectedQueryResultConfiguration {
             output_configuration,
         })
+    })?;
+    let partitioned = |mut s3: ProtectedQueryS3OutputConfiguration| {
+        s3.key_prefix = Some(partitioned_key_prefix(
+            s3.key_prefix.as_deref(),
+            &membership.collaboration_id,
+        ));
+        s3
+    };
+    let output_configuration = match configured.output_configuration {
+        ProtectedQueryOutputConfiguration::S3(s3) => {
+            ProtectedQueryOutputConfiguration::S3(partitioned(s3))
+        }
+        ProtectedQueryOutputConfiguration::Distribute(mut distribute) => {
+            distribute.locations = distribute
+                .locations
+                .into_iter()
+                .map(|location| match location {
+                    ProtectedQueryDistributeOutputConfigurationLocation::S3(s3) => {
+                        ProtectedQueryDistributeOutputConfigurationLocation::S3(partitioned(s3))
+                    }
+                    member => member,
+                })
+                .collect();
+            ProtectedQueryOutputConfiguration::Distribute(distribute)
+        }
+        // A member or intermediate-table output names no key prefix to partition.
+        other => other,
+    };
+    Some(ProtectedQueryResultConfiguration {
+        output_configuration,
     })
+}
+
+/// The S3 key prefix a query's results are written under: the configured prefix, then the
+/// collaboration partition. `KeyPrefix` is `length 0..512, pattern ^[\w!.=*/-]*$`, which
+/// the `collaboration=<id>` segment is within.
+fn partitioned_key_prefix(configured: Option<&str>, collaboration_id: &str) -> String {
+    let partition = format!("{RESULT_COLLABORATION_PARTITION}={collaboration_id}");
+    match configured.map(|prefix| prefix.trim_end_matches('/')) {
+        Some(prefix) if !prefix.is_empty() => format!("{prefix}/{partition}"),
+        _ => partition,
+    }
 }
 
 /// Everything a new `Membership` is built from: the ids minted for it, the stored
@@ -3709,4 +3889,39 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState>)
+}
+
+/// Materialize every protected-query transition the clock owes at `now`, RUNNING the
+/// statement of each submitted query whose completion has fallen due.
+///
+/// This is what a reporting operation of the protected-query slice calls BEFORE it takes
+/// the store's guard, because a run is work no guard may be held for: the due queries are
+/// claimed under the guard ([`CleanRoomsState::claim_due_protected_queries`]), the guard is
+/// released, each claimed statement is executed on the BLOCKING POOL
+/// ([`run_protected_query`], which is synchronous and holds no guard of this service while
+/// the engine runs), and the outcome is written back under the guard again
+/// ([`CleanRoomsState::apply_protected_query_run`]). So the async worker serving the call
+/// stays free to be timed out, cancelled or shut down while a statement runs.
+pub async fn settle_protected_queries<Eng: Send + Sync + 'static>(
+    engine: &::std::sync::Arc<Eng>,
+    now: SystemTime,
+) {
+    let Some(state) = service_state(&**engine) else {
+        return;
+    };
+    let claimed = state.lock().claim_due_protected_queries(now);
+    for query in claimed {
+        let id = query.id.clone();
+        let held = ::std::sync::Arc::clone(engine);
+        let run = ::tokio::task::spawn_blocking(move || run_protected_query(&*held, &query)).await;
+        // A run the pool could not carry out reported nothing, so the query is left in the
+        // status it is running in rather than settled on an outcome nothing produced: the
+        // next caller finds it still STARTED.
+        let Ok(run) = run else {
+            continue;
+        };
+        state
+            .lock()
+            .apply_protected_query_run(&id, run, SystemTime::now());
+    }
 }

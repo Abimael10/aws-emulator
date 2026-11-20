@@ -183,12 +183,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        let mut store = state.lock();
-        // The transitions the clock already owes are materialized BEFORE the decision,
-        // so a query whose span has passed is judged in the status it is already in
-        // rather than the one the call that started it left it in.
+        // The completions the clock already owes are materialized BEFORE the store's guard
+        // is taken — a query's run is work no guard is held for — so a query whose span
+        // has passed is judged in the status it is already in rather than the one the call
+        // that started it left it in.
         let now = ::std::time::SystemTime::now();
-        store.settle_protected_queries(now);
+        st::settle_protected_queries(&self.engine, now).await;
+
+        let mut store = state.lock();
 
         if !store.memberships.contains_key(&membership_id) {
             return Err(UpdateProtectedQueryErrorModeled::ResourceNotFoundException(
