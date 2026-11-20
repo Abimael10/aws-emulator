@@ -27,7 +27,9 @@ use std::collections::BTreeMap;
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_connectcases_amazonconnectcases::state::MAX_TAGS_PER_RESOURCE;
 
-use crate::harness::{domain, field_of_type, fields_of_every_type, string_at, template, Emulator};
+use crate::harness::{
+    domain, field_of_type, fields_of_every_type, string_at, tags_path, template, Emulator,
+};
 
 /// The service's generic not-found sentence, written out here rather than taken
 /// from the crate so the expectations are independent of the code under test.
@@ -53,25 +55,6 @@ const LONGEST_TAG_VALUE: usize = 256;
 /// (`smithy_query(query="shape",shape="MutableTags")`).
 const LONGEST_TAG_KEY: usize = 128;
 
-/// Percent-encode one path segment, so an ARN travels in the non-greedy `{arn}`
-/// label of `/tags/{arn}`.
-fn label(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (byte as char).to_string()
-            }
-            other => format!("%{other:02X}"),
-        })
-        .collect()
-}
-
-/// The tagging path of one resource.
-fn tags_path(arn: &str) -> String {
-    format!("/tags/{}", label(arn))
-}
-
 /// A tag map as a JSON object, which is how a `Tags` map travels on the wire.
 fn tag_body(tags: &[(&str, &str)]) -> Value {
     json!({
@@ -83,9 +66,9 @@ fn tag_body(tags: &[(&str, &str)]) -> Value {
     })
 }
 
-/// The tag map a response member spells, in an order two maps compare in. An
-/// ABSENT member is the empty set: a read of a resource reports no `tags` member
-/// when the resource carries none.
+/// The tag map a response member spells, in an order two maps compare in. The
+/// member is present on every read of a resource, carrying the empty map for a
+/// resource that carries no tags.
 fn tag_set(response: &Value, member: &str, case: &str) -> BTreeMap<String, String> {
     match response.get(member) {
         None | Some(Value::Null) => BTreeMap::new(),

@@ -17,14 +17,136 @@ pub struct GetDomainInput {
     pub domain_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.connectcases#GetDomainResponse")]
+/// One domain, as a read of it reports it.
+///
+/// Its schema and serializer are written out below instead of derived from the
+/// model. `#[smithy_macros::smithy(shape = ...)]` admits EXACTLY the member list
+/// the on-disk model declares, and the wire form of a domain read carries one
+/// member that model does not: `lastModifiedTime`, the instant the domain itself
+/// was last changed, which the service reports beside `createdTime` so a caller
+/// that already read a domain can tell whether it has changed since.
+///
+/// The modelled members keep the names, order and indices
+/// `smithy_query(query="shape", shape="GetDomainResponse")` gives them, and the
+/// member the model does not declare is appended last with its shape id in a
+/// namespace of its own, so it neither claims to be modelled nor collides with a
+/// member the model may declare later.
 #[derive(Debug, Clone)]
 pub struct GetDomainOutput {
     pub domain_id: String,
     pub domain_arn: String,
     pub name: String,
     pub created_time: ::aws_smithy_types::DateTime,
+    /// The stored instant of the domain's last change. Not an `Option`: the
+    /// record always holds one (a domain nothing has changed since it was
+    /// created reports its creation instant), so the member is always reported.
+    pub last_modified_time: ::aws_smithy_types::DateTime,
     pub domain_status: String,
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
 
+/// One member schema of [`GetDomainOutput`], named and indexed as the model
+/// orders it.
+macro_rules! get_domain_member {
+    ($name:literal, $ty:ident, $index:literal) => {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                concat!("com.amazonaws.connectcases#GetDomainResponse$", $name),
+                GetDomainOutput::NAMESPACE,
+                $name,
+            ),
+            ::aws_smithy_schema::ShapeType::$ty,
+            $name,
+            $index,
+        )
+    };
+}
+
+/// One member schema of [`GetDomainOutput`] the on-disk model does not declare:
+/// the same shape as a modelled member, with its shape id in the namespace
+/// recorded-only members live in.
+macro_rules! get_domain_recorded_member {
+    ($name:literal, $ty:ident, $index:literal) => {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                concat!(
+                    "com.amazonaws.connectcases.recorded#GetDomainResponse$",
+                    $name
+                ),
+                GetDomainOutput::RECORDED_NAMESPACE,
+                $name,
+            ),
+            ::aws_smithy_schema::ShapeType::$ty,
+            $name,
+            $index,
+        )
+    };
+}
+
+impl GetDomainOutput {
+    const SHAPE_ID: &'static str = "com.amazonaws.connectcases#GetDomainResponse";
+    const NAMESPACE: &'static str = "com.amazonaws.connectcases";
+    /// The namespace of a member the wire carries but the on-disk model does not
+    /// declare.
+    const RECORDED_NAMESPACE: &'static str = "com.amazonaws.connectcases.recorded";
+
+    pub const M_DOMAIN_ID: ::aws_smithy_schema::Schema = get_domain_member!("domainId", String, 0);
+    pub const M_DOMAIN_ARN: ::aws_smithy_schema::Schema = get_domain_member!("domainArn", String, 1);
+    pub const M_NAME: ::aws_smithy_schema::Schema = get_domain_member!("name", String, 2);
+    pub const M_CREATED_TIME: ::aws_smithy_schema::Schema =
+        get_domain_member!("createdTime", Timestamp, 3);
+    pub const M_DOMAIN_STATUS: ::aws_smithy_schema::Schema =
+        get_domain_member!("domainStatus", String, 4);
+    pub const M_TAGS: ::aws_smithy_schema::Schema = get_domain_member!("tags", Map, 5);
+    /// The instant the domain was last changed, under the name the service
+    /// reports it by beside `createdTime`.
+    pub const M_LAST_MODIFIED_TIME: ::aws_smithy_schema::Schema =
+        get_domain_recorded_member!("lastModifiedTime", Timestamp, 6);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            Self::SHAPE_ID,
+            Self::NAMESPACE,
+            "GetDomainResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_DOMAIN_ID,
+            &Self::M_DOMAIN_ARN,
+            &Self::M_NAME,
+            &Self::M_CREATED_TIME,
+            &Self::M_DOMAIN_STATUS,
+            &Self::M_TAGS,
+            &Self::M_LAST_MODIFIED_TIME,
+        ],
+    );
+}
+
+pub static GET_DOMAIN_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema = &GetDomainOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for GetDomainOutput {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        s.write_string(&Self::M_DOMAIN_ID, self.domain_id.as_str())?;
+        s.write_string(&Self::M_DOMAIN_ARN, self.domain_arn.as_str())?;
+        s.write_string(&Self::M_NAME, self.name.as_str())?;
+        s.write_timestamp(&Self::M_CREATED_TIME, &self.created_time)?;
+        s.write_string(&Self::M_DOMAIN_STATUS, self.domain_status.as_str())?;
+        // Written whatever the domain holds: a domain that was never tagged
+        // reports the member as an empty map, never leaves it out
+        // (`crate::state::tags_output`).
+        if let Some(tags) = self.tags.as_ref() {
+            s.write_map(&Self::M_TAGS, &|map| {
+                for (key, value) in tags.iter() {
+                    map.write_string(&Self::M_TAGS, key.as_str())?;
+                    map.write_string(&Self::M_TAGS, value.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        s.write_timestamp(&Self::M_LAST_MODIFIED_TIME, &self.last_modified_time)?;
+        Ok(())
+    }
+}

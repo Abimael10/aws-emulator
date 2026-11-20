@@ -256,9 +256,11 @@ async fn a_layout_s_content_round_trips_through_state_for_every_form_of_content(
             fetched.get("createdTime").is_some() && fetched.get("lastModifiedTime").is_some(),
             "case {case:?}: both stored timestamps must be reported, got {fetched:?}"
         );
-        assert!(
-            fetched.get("tags").is_none(),
-            "case {case:?}: a layout that was never tagged reports no tags, got {fetched:?}"
+        assert_eq!(
+            fetched.get("tags"),
+            Some(&json!({})),
+            "case {case:?}: a layout that was never tagged reports an empty tag map, got \
+             {fetched:?}"
         );
 
         // A read reports; it must not change what the next reader sees.
@@ -660,7 +662,7 @@ async fn a_template_s_default_layout_is_resolved_against_the_domain_s_layouts() 
         .await;
     assert_eq!(
         fetched.get("layoutConfiguration"),
-        Some(&json!({ "defaultLayout": layout_id })),
+        Some(&json!({ "defaultLayout": layout_id, "defaultLayoutName": null })),
         "case {case:?}: the stored defaultLayout must be reported, got {fetched:?}"
     );
 

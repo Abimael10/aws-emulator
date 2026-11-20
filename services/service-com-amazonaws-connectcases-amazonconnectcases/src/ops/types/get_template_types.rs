@@ -18,13 +18,39 @@ pub struct GetTemplateInput {
     pub template_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.connectcases#GetTemplateResponse")]
+/// One template, as a read of it reports it.
+///
+/// Its schema and serializer are written out below instead of derived from the
+/// model, for two reasons.
+///
+/// `#[smithy_macros::smithy(shape = ...)]` admits EXACTLY the member list the
+/// on-disk model declares, and the wire form of a template read carries one
+/// member that model does not: `defaultValues`, the field values a case created
+/// from the template starts with — empty for every template this service can
+/// hold, since no operation of the model writes one.
+///
+/// And the derived serializer writes a member only when the record holds a value
+/// for it, while this service reports a template's aggregates — its tag map, its
+/// case-rule list, its tag-propagation list and its layout configuration — on
+/// EVERY template, carrying the empty map, the empty list, and a configuration
+/// whose own members are explicit nulls. A client reading `template.rules` or
+/// `template.layoutConfiguration.defaultLayout` reads them without first testing
+/// for the key.
+///
+/// The modelled members keep the names, order and indices
+/// `smithy_query(query="shape", shape="GetTemplateResponse")` gives them, and
+/// the member the model does not declare is appended last with its shape id in a
+/// namespace of its own, so it neither claims to be modelled nor collides with a
+/// member the model may declare later.
 #[derive(Debug, Clone, Default)]
 pub struct GetTemplateOutput {
     pub template_id: String,
     pub template_arn: String,
     pub name: String,
     pub description: Option<String>,
+    /// The stored configuration, or `None` for a template that names no default
+    /// layout. Reported either way: see
+    /// [`GetTemplateOutput::serialize_members`].
     pub layout_configuration: Option<LayoutConfiguration>,
     pub required_fields: Option<Vec<RequiredField>>,
     pub tags: Option<std::collections::HashMap<String, String>>,
@@ -32,7 +58,220 @@ pub struct GetTemplateOutput {
     pub deleted: bool,
     pub created_time: Option<::aws_smithy_types::DateTime>,
     pub last_modified_time: Option<::aws_smithy_types::DateTime>,
-    pub rules: Option<Vec<TemplateRule>>,
-    pub tag_propagation_configurations: Option<Vec<TagPropagationConfiguration>>,
+    /// The template's case rules, not an `Option`: the member is reported on
+    /// every template, as `[]` for one that carries no rule.
+    pub rules: Vec<TemplateRule>,
+    /// The template's tag-propagation configurations, as [`Self::rules`].
+    pub tag_propagation_configurations: Vec<TagPropagationConfiguration>,
 }
 
+/// One member schema of [`GetTemplateOutput`], named and indexed as the model
+/// orders it.
+macro_rules! get_template_member {
+    ($name:literal, $ty:ident, $index:literal) => {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                concat!("com.amazonaws.connectcases#GetTemplateResponse$", $name),
+                GetTemplateOutput::NAMESPACE,
+                $name,
+            ),
+            ::aws_smithy_schema::ShapeType::$ty,
+            $name,
+            $index,
+        )
+    };
+}
+
+/// One member schema the on-disk model does not declare: the same shape as a
+/// modelled member, with its shape id in the namespace recorded-only members
+/// live in. `$shape` names the structure the member belongs to, so the id says
+/// where on the wire it sits.
+macro_rules! recorded_member {
+    ($shape:literal, $name:literal, $ty:ident, $index:literal) => {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                concat!("com.amazonaws.connectcases.recorded#", $shape, "$", $name),
+                RECORDED_NAMESPACE,
+                $name,
+            ),
+            ::aws_smithy_schema::ShapeType::$ty,
+            $name,
+            $index,
+        )
+    };
+}
+
+/// The namespace of a member the wire carries but the on-disk model does not
+/// declare.
+const RECORDED_NAMESPACE: &str = "com.amazonaws.connectcases.recorded";
+
+impl GetTemplateOutput {
+    const SHAPE_ID: &'static str = "com.amazonaws.connectcases#GetTemplateResponse";
+    const NAMESPACE: &'static str = "com.amazonaws.connectcases";
+
+    pub const M_TEMPLATE_ID: ::aws_smithy_schema::Schema =
+        get_template_member!("templateId", String, 0);
+    pub const M_TEMPLATE_ARN: ::aws_smithy_schema::Schema =
+        get_template_member!("templateArn", String, 1);
+    pub const M_NAME: ::aws_smithy_schema::Schema = get_template_member!("name", String, 2);
+    pub const M_DESCRIPTION: ::aws_smithy_schema::Schema =
+        get_template_member!("description", String, 3);
+    pub const M_LAYOUT_CONFIGURATION: ::aws_smithy_schema::Schema =
+        get_template_member!("layoutConfiguration", Structure, 4);
+    pub const M_REQUIRED_FIELDS: ::aws_smithy_schema::Schema =
+        get_template_member!("requiredFields", List, 5);
+    pub const M_TAGS: ::aws_smithy_schema::Schema = get_template_member!("tags", Map, 6);
+    pub const M_STATUS: ::aws_smithy_schema::Schema = get_template_member!("status", String, 7);
+    pub const M_DELETED: ::aws_smithy_schema::Schema = get_template_member!("deleted", Boolean, 8);
+    pub const M_CREATED_TIME: ::aws_smithy_schema::Schema =
+        get_template_member!("createdTime", Timestamp, 9);
+    pub const M_LAST_MODIFIED_TIME: ::aws_smithy_schema::Schema =
+        get_template_member!("lastModifiedTime", Timestamp, 10);
+    pub const M_RULES: ::aws_smithy_schema::Schema = get_template_member!("rules", List, 11);
+    pub const M_TAG_PROPAGATION_CONFIGURATIONS: ::aws_smithy_schema::Schema =
+        get_template_member!("tagPropagationConfigurations", List, 12);
+    /// The field values a case created from this template starts with, which the
+    /// on-disk model does not declare.
+    pub const M_DEFAULT_VALUES: ::aws_smithy_schema::Schema =
+        recorded_member!("GetTemplateResponse", "defaultValues", List, 13);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            Self::SHAPE_ID,
+            Self::NAMESPACE,
+            "GetTemplateResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_TEMPLATE_ID,
+            &Self::M_TEMPLATE_ARN,
+            &Self::M_NAME,
+            &Self::M_DESCRIPTION,
+            &Self::M_LAYOUT_CONFIGURATION,
+            &Self::M_REQUIRED_FIELDS,
+            &Self::M_TAGS,
+            &Self::M_STATUS,
+            &Self::M_DELETED,
+            &Self::M_CREATED_TIME,
+            &Self::M_LAST_MODIFIED_TIME,
+            &Self::M_RULES,
+            &Self::M_TAG_PROPAGATION_CONFIGURATIONS,
+            &Self::M_DEFAULT_VALUES,
+        ],
+    );
+}
+
+pub static GET_TEMPLATE_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema = &GetTemplateOutput::SCHEMA;
+
+/// The layout configuration of one template, as a read of the template reports
+/// it: both of the members the service's own response carries, each explicitly
+/// null when the template names no value for it.
+///
+/// `defaultLayout` is the modelled member; `defaultLayoutName` is the companion
+/// the service's response carries and the on-disk model does not declare. Both
+/// are read off the stored configuration, so the two cannot disagree about which
+/// layout a template defaults to.
+struct LayoutConfigurationWireForm<'a>(Option<&'a LayoutConfiguration>);
+
+impl LayoutConfigurationWireForm<'_> {
+    const M_DEFAULT_LAYOUT: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.connectcases#LayoutConfiguration$defaultLayout",
+            "com.amazonaws.connectcases",
+            "defaultLayout",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "defaultLayout",
+        0,
+    );
+
+    const M_DEFAULT_LAYOUT_NAME: ::aws_smithy_schema::Schema =
+        recorded_member!("LayoutConfiguration", "defaultLayoutName", String, 1);
+}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for LayoutConfigurationWireForm<'_> {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        match self
+            .0
+            .and_then(|configuration| configuration.default_layout.as_deref())
+        {
+            Some(layout_id) => s.write_string(&Self::M_DEFAULT_LAYOUT, layout_id)?,
+            None => s.write_null(&Self::M_DEFAULT_LAYOUT)?,
+        }
+        // Nothing in this model names a default layout by NAME — neither the
+        // create nor the update carries the member — so the configuration holds
+        // no value for it and it is reported as the null it is, never left out.
+        s.write_null(&Self::M_DEFAULT_LAYOUT_NAME)
+    }
+}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for GetTemplateOutput {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        s.write_string(&Self::M_TEMPLATE_ID, self.template_id.as_str())?;
+        s.write_string(&Self::M_TEMPLATE_ARN, self.template_arn.as_str())?;
+        s.write_string(&Self::M_NAME, self.name.as_str())?;
+        // A description is a value the template either holds or does not, so it
+        // is reported only when the record carries one.
+        if let Some(description) = self.description.as_ref() {
+            s.write_string(&Self::M_DESCRIPTION, description.as_str())?;
+        }
+        // Reported on every template, carrying the stored default layout or the
+        // explicit nulls of a template that names none.
+        s.write_struct(
+            &Self::M_LAYOUT_CONFIGURATION,
+            &LayoutConfigurationWireForm(self.layout_configuration.as_ref()),
+        )?;
+        if let Some(required_fields) = self.required_fields.as_ref() {
+            s.write_list(&Self::M_REQUIRED_FIELDS, &|list| {
+                for required in required_fields.iter() {
+                    list.write_struct(&RequiredField::SCHEMA, required)?;
+                }
+                Ok(())
+            })?;
+        }
+        // The stored tag set whatever it holds: a template that was never tagged
+        // reports `{}` (`crate::state::tags_output`).
+        if let Some(tags) = self.tags.as_ref() {
+            s.write_map(&Self::M_TAGS, &|map| {
+                for (key, value) in tags.iter() {
+                    map.write_string(&Self::M_TAGS, key.as_str())?;
+                    map.write_string(&Self::M_TAGS, value.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        s.write_string(&Self::M_STATUS, self.status.as_str())?;
+        s.write_boolean(&Self::M_DELETED, self.deleted)?;
+        if let Some(created_time) = self.created_time.as_ref() {
+            s.write_timestamp(&Self::M_CREATED_TIME, created_time)?;
+        }
+        if let Some(last_modified_time) = self.last_modified_time.as_ref() {
+            s.write_timestamp(&Self::M_LAST_MODIFIED_TIME, last_modified_time)?;
+        }
+        // The stored lists whatever they hold: a template that carries no case
+        // rule and propagates no tags reports both as `[]`.
+        s.write_list(&Self::M_RULES, &|list| {
+            for rule in self.rules.iter() {
+                list.write_struct(&TemplateRule::SCHEMA, rule)?;
+            }
+            Ok(())
+        })?;
+        s.write_list(&Self::M_TAG_PROPAGATION_CONFIGURATIONS, &|list| {
+            for configuration in self.tag_propagation_configurations.iter() {
+                list.write_struct(&TagPropagationConfiguration::SCHEMA, configuration)?;
+            }
+            Ok(())
+        })?;
+        // No operation of this model writes a template's default field values,
+        // so every template this service holds carries none and the member is
+        // reported as the empty list it is.
+        s.write_list(&Self::M_DEFAULT_VALUES, &|_list| Ok(()))?;
+        Ok(())
+    }
+}

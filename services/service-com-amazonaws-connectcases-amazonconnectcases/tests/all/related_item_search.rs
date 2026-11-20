@@ -400,12 +400,11 @@ fn by_id(items: &[Value], case: &str) -> HashMap<String, Value> {
         .collect()
 }
 
-/// One reported instant, in the epoch seconds this emulator's `date-time`
-/// members carry.
+/// One reported instant, in epoch seconds: the service carries a `date-time`
+/// member as an RFC 3339 string, which the shared harness turns back into a
+/// number this suite can order.
 fn instant(item: &Value, member: &str, case: &str) -> f64 {
-    item.get(member)
-        .and_then(Value::as_f64)
-        .unwrap_or_else(|| panic!("case {case:?}: no instant member {member:?} in {item:?}"))
+    crate::harness::instant_at(item, member, case)
 }
 
 #[tokio::test]

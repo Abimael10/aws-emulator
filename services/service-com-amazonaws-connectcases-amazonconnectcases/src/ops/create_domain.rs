@@ -195,6 +195,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 domain_arn,
                 name: input.name,
                 created_time,
+                // Nothing has changed the domain yet, so its last-modified
+                // instant IS its creation instant.
+                last_modified_time: created_time,
                 domain_status: crate::state::DOMAIN_STATUS_ACTIVE.to_string(),
                 tags: ::std::collections::HashMap::new(),
                 fields,

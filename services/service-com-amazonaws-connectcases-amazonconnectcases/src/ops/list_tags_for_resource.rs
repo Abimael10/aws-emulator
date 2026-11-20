@@ -163,8 +163,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // carries no tags is reported as an EMPTY map rather than as an absent member:
         // the member is present whenever the resource resolved, which is what lets a
         // client read `tags` without first testing for it. A read of the resource
-        // itself reports no `tags` member in that case ([`crate::state::tags_output`]),
-        // because there the map is one member among many.
+        // itself reports the member the same way ([`crate::state::tags_output`]), so
+        // the two readers of one tag set cannot disagree about how "no tags" looks.
         Ok(ListTagsForResourceOutput {
             tags: Some(tags.clone()),
         })

@@ -622,7 +622,7 @@ async fn a_search_projects_exactly_the_requested_fields_as_get_case_reports_them
     }
 
     // Every case carries the id and templateId of the stored case, and its tags
-    // only when it has any.
+    // whatever they are — the empty map for a case that carries none.
     let case = "identity and tags come from the stored case";
     let response = fixture.search(case, json!({})).await;
     for item in response
@@ -637,15 +637,15 @@ async fn a_search_projects_exactly_the_requested_fields_as_get_case_reports_them
             "case {case:?} [{label}]: the stored templateId must be reported, got {item:?}"
         );
         let expected_tags = match label.as_str() {
-            "printer-seattle" => Some(json!({ "team": "north", "tier": "gold" })),
-            "printer-boston" => Some(json!({ "team": "south" })),
-            _ => None,
+            "printer-seattle" => json!({ "team": "north", "tier": "gold" }),
+            "printer-boston" => json!({ "team": "south" }),
+            _ => json!({}),
         };
         assert_eq!(
             item.get("tags").cloned(),
-            expected_tags,
-            "case {case:?} [{label}]: tags must be the stored tags, absent when there are none, \
-             got {item:?}"
+            Some(expected_tags),
+            "case {case:?} [{label}]: tags must be the stored tags, an empty map when there are \
+             none, got {item:?}"
         );
     }
 }

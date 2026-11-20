@@ -42,6 +42,16 @@
 //!    `SingleSelect` is refused with `ValidationException` (400) naming that
 //!    STORED type, and no field id — the field is already addressed by the
 //!    request's own path labels.
+//! 9. Every member of this model that targets a timestamp declares
+//!    `@timestampFormat("date-time")`, so every instant this service reports
+//!    travels as an RFC 3339 / ISO-8601 date-time STRING naming the instant the
+//!    service wrote — never as the epoch-seconds NUMBER the restJson1 protocol
+//!    defaults to.
+//! 10. A read reports a resource's AGGREGATE members — its tag map, a template's
+//!     case-rule, tag-propagation and default-value lists, and a template's
+//!     layout configuration — on every record it answers, carrying the empty map,
+//!     the empty list or a configuration of explicit nulls when the record holds
+//!     nothing in them, so a client reads them without first testing for the key.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcases_amazonconnectcases::state::{
@@ -49,7 +59,8 @@ use service_com_amazonaws_connectcases_amazonconnectcases::state::{
 };
 
 use crate::harness::{
-    domain, field_of_type, fields_of_every_type, get_case_fields, string_at, template, Emulator,
+    domain, field_of_type, fields_of_every_type, get_case_fields, instant_at, string_at, tags_path,
+    template, Emulator,
 };
 
 /// An Amazon Connect contact ARN, as a `Contact` related item links to one.
@@ -1325,5 +1336,565 @@ async fn a_layout_listing_reports_the_layouts_the_domain_still_holds() {
         response.get("message").and_then(Value::as_str),
         Some(RESOURCE_NOT_FOUND_MESSAGE),
         "case {case:?}: expected the fixed sentence, got {response:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RULE 9, on the model: every timestamp this service declares is a `date-time`
+// ---------------------------------------------------------------------------
+
+/// This service's own namespace, so the model walk below skips the Smithy
+/// prelude's shapes.
+const SERVICE_NAMESPACE: &str = "com.amazonaws.connectcases";
+
+/// How far from this test's own clock reading a reported instant may sit. What
+/// is asserted is that the member names the instant the service wrote rather
+/// than zero or a fixed literal, so the slack is generous enough that a loaded
+/// machine cannot turn it into a timing failure.
+const INSTANT_SLACK_SECONDS: f64 = 300.0;
+
+/// The region and account every ARN this emulator mints is scoped to: the
+/// harness signs for `us-east-1`.
+const HOME_REGION: &str = "us-east-1";
+const ACCOUNT: &str = "000000000000";
+
+/// This service's own Smithy model, as shipped in this crate.
+fn shipped_model() -> Value {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/smithy-model/com-amazonaws-connectcases-amazonconnectcases.json"
+    );
+    let bytes = std::fs::read(path).unwrap_or_else(|error| panic!("read {path}: {error}"));
+    serde_json::from_slice(&bytes).unwrap_or_else(|error| panic!("parse {path}: {error}"))
+}
+
+/// The `@timestampFormat` a member-like node declares, on the node itself or on
+/// the shape it targets — Smithy admits the trait in either place.
+fn declared_format<'model>(
+    shapes: &'model serde_json::Map<String, Value>,
+    node: &'model Value,
+) -> Option<&'model str> {
+    let on_node = node
+        .get("traits")
+        .and_then(|traits| traits.get("smithy.api#timestampFormat"))
+        .and_then(Value::as_str);
+    let on_target = node
+        .get("target")
+        .and_then(Value::as_str)
+        .and_then(|target| shapes.get(target))
+        .and_then(|shape| shape.get("traits"))
+        .and_then(|traits| traits.get("smithy.api#timestampFormat"))
+        .and_then(Value::as_str);
+    on_node.or(on_target)
+}
+
+/// Whether a member-like node targets a timestamp: the Smithy prelude's own
+/// `Timestamp`, or a model shape declared `"type": "timestamp"`.
+fn targets_a_timestamp(shapes: &serde_json::Map<String, Value>, node: &Value) -> bool {
+    match node.get("target").and_then(Value::as_str) {
+        Some("smithy.api#Timestamp") => true,
+        Some(target) => {
+            shapes.get(target).and_then(|shape| shape.get("type")) == Some(&json!("timestamp"))
+        }
+        None => false,
+    }
+}
+
+/// Every member-like node of one shape, as `(member path, node)`: a structure's
+/// or union's members, a list's element, and a map's key and value — the four
+/// places a model can bind a timestamp.
+fn member_nodes(shape_id: &str, shape: &Value) -> Vec<(String, Value)> {
+    let mut nodes = Vec::new();
+    if let Some(members) = shape.get("members").and_then(Value::as_object) {
+        for (name, node) in members {
+            nodes.push((format!("{shape_id}${name}"), node.clone()));
+        }
+    }
+    for single in ["member", "key", "value"] {
+        if let Some(node) = shape.get(single) {
+            nodes.push((format!("{shape_id}${single}"), node.clone()));
+        }
+    }
+    nodes
+}
+
+/// RULE 9 on the model: every member of this model that targets a timestamp
+/// declares `@timestampFormat("date-time")`.
+///
+/// This is what makes the service-wide date-time codec (`src/service.rs`'s
+/// `override_protocol`) the model's own rule rather than a guess: a member that
+/// declared `epoch-seconds` or `http-date` would be carried in the wrong form,
+/// and would fail here instead. Read off the shipped model, so a model refresh
+/// that added such a member is reported rather than silently served.
+#[test]
+fn every_timestamp_member_of_the_model_declares_the_date_time_format() {
+    let model = shipped_model();
+    let shapes = model
+        .get("shapes")
+        .and_then(Value::as_object)
+        .expect("the model must declare shapes");
+
+    let mut timestamp_members = 0_usize;
+    let mut wrong: Vec<String> = Vec::new();
+    for (shape_id, shape) in shapes {
+        if !shape_id.starts_with(SERVICE_NAMESPACE) {
+            continue;
+        }
+        for (path, node) in member_nodes(shape_id, shape) {
+            if !targets_a_timestamp(shapes, &node) {
+                continue;
+            }
+            timestamp_members += 1;
+            let format = declared_format(shapes, &node);
+            if format != Some("date-time") {
+                wrong.push(format!("{path}: {format:?}"));
+            }
+        }
+    }
+
+    assert!(
+        wrong.is_empty(),
+        "case \"the shipped model\": every timestamp member must declare the date-time format, \
+         got {} that do not: {wrong:?}",
+        wrong.len()
+    );
+    // A floor, so a walk that found nothing cannot pass as agreement.
+    assert!(
+        timestamp_members >= 10,
+        "case \"the shipped model\": the walk must have reached this model's timestamp members, \
+         got {timestamp_members}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RULES 9 and 10, on the wire
+// ---------------------------------------------------------------------------
+
+/// One domain carrying one of every record a read of this service reports an
+/// instant or an aggregate member for.
+struct Records {
+    domain_id: String,
+    field_id: String,
+    layout_id: String,
+    template_id: String,
+    case_id: String,
+}
+
+/// A Cases ARN of this emulator: the domain's own when `suffix` is empty, one of
+/// its resources otherwise.
+fn cases_arn(domain_id: &str, suffix: &str) -> String {
+    format!("arn:aws:cases:{HOME_REGION}:{ACCOUNT}:domain/{domain_id}{suffix}")
+}
+
+/// This test's clock reading, in epoch seconds.
+fn now_seconds() -> f64 {
+    ::aws_smithy_types::DateTime::from(std::time::SystemTime::now()).as_secs_f64()
+}
+
+/// Build a domain with a field, a layout, a template, a case and one related
+/// item under it.
+///
+/// `populated` says whether the records carry anything in their aggregate
+/// members: with it set, every record is tagged, the template names a default
+/// layout and propagates a tag map, and the case is created with tags. Without
+/// it, nothing is tagged and the template names no optional member — the records
+/// whose aggregates are empty, which is the pair of shapes rule 9 generalises
+/// over.
+async fn records(emulator: &Emulator, prefix: &str, populated: bool) -> Records {
+    let domain_id = domain(emulator, &format!("{prefix}-domain")).await;
+    let field = emulator
+        .ok(
+            prefix,
+            "POST",
+            &format!("/domains/{domain_id}/fields"),
+            json!({ "name": format!("{prefix}-field"), "type": "Text" }),
+        )
+        .await;
+    let field_id = string_at(&field, "fieldId", prefix);
+    let layout = emulator
+        .ok(
+            prefix,
+            "POST",
+            &format!("/domains/{domain_id}/layouts"),
+            json!({ "name": format!("{prefix}-layout"), "content": { "basic": {} } }),
+        )
+        .await;
+    let layout_id = string_at(&layout, "layoutId", prefix);
+
+    let mut template_body = json!({
+        "name": format!("{prefix}-template"),
+        "requiredFields": [{ "fieldId": field_id }],
+    });
+    if populated {
+        template_body["layoutConfiguration"] = json!({ "defaultLayout": layout_id });
+        template_body["tagPropagationConfigurations"] =
+            json!([{ "resourceType": "Cases", "tagMap": { "team": "support" } }]);
+    }
+    let created_template = emulator
+        .ok(
+            prefix,
+            "POST",
+            &format!("/domains/{domain_id}/templates"),
+            template_body,
+        )
+        .await;
+    let template_id = string_at(&created_template, "templateId", prefix);
+
+    let mut case_body = json!({
+        "templateId": template_id,
+        "fields": [entry(&field_id, &json!({ "stringValue": "a customer note" }))],
+    });
+    if populated {
+        case_body["tags"] = json!({ "team": "support" });
+    }
+    let created_case = emulator
+        .ok(
+            prefix,
+            "POST",
+            &format!("/domains/{domain_id}/cases"),
+            case_body,
+        )
+        .await;
+    let case_id = string_at(&created_case, "caseId", prefix);
+
+    // One association, so the instant a related item was linked at is reported
+    // too.
+    emulator
+        .ok(
+            prefix,
+            "POST",
+            &format!("/domains/{domain_id}/cases/{case_id}/related-items/"),
+            json!({
+                "type": "Comment",
+                "content": { "comment": { "body": "called back", "contentType": "Text/Plain" } },
+            }),
+        )
+        .await;
+
+    if populated {
+        // The records a create takes no tags for, tagged through the tagging
+        // operation — the only way this service's domains, fields, layouts and
+        // templates come to carry any.
+        for suffix in [
+            String::new(),
+            format!("/field/{field_id}"),
+            format!("/layout/{layout_id}"),
+            format!("/template/{template_id}"),
+        ] {
+            let arn = cases_arn(&domain_id, &suffix);
+            emulator
+                .ok(
+                    prefix,
+                    "POST",
+                    &tags_path(&arn),
+                    json!({ "tags": { "team": "support" } }),
+                )
+                .await;
+        }
+    }
+
+    Records {
+        domain_id,
+        field_id,
+        layout_id,
+        template_id,
+        case_id,
+    }
+}
+
+/// Every document a read of those records answers, each the object that carries
+/// the members under test.
+struct Answers {
+    domain: Value,
+    layout: Value,
+    template: Value,
+    /// The `BatchGetField` entry for the one field, not the whole batch answer.
+    field: Value,
+    case: Value,
+    /// The newest `GetCaseAuditEvents` entry.
+    audit_event: Value,
+    /// The `SearchAllRelatedItems` entry for the one association.
+    related_item: Value,
+}
+
+/// Read every record back, over the wire.
+async fn answers(emulator: &Emulator, records: &Records, case: &str) -> Answers {
+    let domain_id = &records.domain_id;
+    let batch = emulator
+        .ok(
+            case,
+            "POST",
+            &format!("/domains/{domain_id}/fields-batch"),
+            json!({ "fields": [{ "id": records.field_id }] }),
+        )
+        .await;
+    let history = emulator
+        .ok(
+            case,
+            "POST",
+            &format!("/domains/{domain_id}/cases/{}/audit-history", records.case_id),
+            json!({}),
+        )
+        .await;
+    let related = emulator
+        .ok(
+            case,
+            "POST",
+            &format!("/domains/{domain_id}/related-items-search"),
+            json!({}),
+        )
+        .await;
+
+    /// The first entry of a list member, which every row above answers one of.
+    fn first(document: &Value, member: &str, case: &str) -> Value {
+        document
+            .get(member)
+            .and_then(Value::as_array)
+            .and_then(|entries| entries.first())
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: no {member} entry in {document:?}")
+            })
+    }
+
+    Answers {
+        domain: emulator
+            .ok(case, "POST", &format!("/domains/{domain_id}"), json!({}))
+            .await,
+        layout: emulator
+            .ok(
+                case,
+                "POST",
+                &format!("/domains/{domain_id}/layouts/{}", records.layout_id),
+                json!({}),
+            )
+            .await,
+        template: emulator
+            .ok(
+                case,
+                "POST",
+                &format!("/domains/{domain_id}/templates/{}", records.template_id),
+                json!({}),
+            )
+            .await,
+        field: first(&batch, "fields", case),
+        case: emulator
+            .ok(
+                case,
+                "POST",
+                &format!("/domains/{domain_id}/cases/{}", records.case_id),
+                json!({ "fields": [{ "id": records.field_id }] }),
+            )
+            .await,
+        audit_event: first(&history, "auditEvents", case),
+        related_item: first(&related, "relatedItems", case),
+    }
+}
+
+/// RULE 9 on the wire: every instant this service reports is an RFC 3339
+/// date-time STRING naming the moment the service wrote — not a number.
+///
+/// The rows span the class the rule generalises over: every read path of this
+/// service that reports an instant, and every instant member of each.
+#[tokio::test]
+async fn every_instant_a_read_reports_is_a_date_time_string() {
+    let emulator = Emulator::new();
+    let records = records(&emulator, "instants", false).await;
+    let answers = answers(&emulator, &records, "instants").await;
+
+    let rows: [(&str, &Value, &[&str]); 6] = [
+        (
+            "GetDomain",
+            &answers.domain,
+            &["createdTime", "lastModifiedTime"],
+        ),
+        (
+            "GetLayout",
+            &answers.layout,
+            &["createdTime", "lastModifiedTime"],
+        ),
+        (
+            "GetTemplate",
+            &answers.template,
+            &["createdTime", "lastModifiedTime"],
+        ),
+        (
+            "BatchGetField entry",
+            &answers.field,
+            &["createdTime", "lastModifiedTime"],
+        ),
+        (
+            "GetCaseAuditEvents entry",
+            &answers.audit_event,
+            &["performedTime"],
+        ),
+        (
+            "SearchAllRelatedItems entry",
+            &answers.related_item,
+            &["associationTime"],
+        ),
+    ];
+
+    let now = now_seconds();
+    for (case, document, members) in rows {
+        for member in members {
+            let reported = document.get(*member).unwrap_or_else(|| {
+                panic!("case {case:?}: no {member} member in {document:?}")
+            });
+            assert!(
+                reported.is_string(),
+                "case {case:?}: {member} must be a date-time string, got {reported:?}"
+            );
+            let instant = instant_at(document, member, case);
+            assert!(
+                (instant - now).abs() <= INSTANT_SLACK_SECONDS,
+                "case {case:?}: {member} must name the instant the service wrote (near {now}), \
+                 got {instant}"
+            );
+        }
+    }
+}
+
+/// RULE 10: a read reports every aggregate member of the record it answers,
+/// carrying the empty value when the record holds nothing in it.
+///
+/// The rows span what the rule generalises over: every read path that reports
+/// one, each of the member KINDS (a map, a list, a structure of nulls), and both
+/// forms of record — one whose aggregates are empty and one whose aggregates
+/// hold the values a create and a tag write put there.
+#[tokio::test]
+async fn a_read_reports_every_aggregate_member_whatever_the_record_holds() {
+    let emulator = Emulator::new();
+    let empty = records(&emulator, "empty-aggregates", false).await;
+    let held = records(&emulator, "held-aggregates", true).await;
+    let empty = answers(&emulator, &empty, "empty aggregates").await;
+    let held_layout = held.layout_id.clone();
+    let held = answers(&emulator, &held, "held aggregates").await;
+
+    let propagation = json!([{ "resourceType": "Cases", "tagMap": { "team": "support" } }]);
+    let one_tag = json!({ "team": "support" });
+    let rows: Vec<(&str, &Value, &str, Value)> = vec![
+        // Nothing in any aggregate: the member is the empty value, never absent.
+        ("GetDomain, untagged", &empty.domain, "tags", json!({})),
+        ("GetLayout, untagged", &empty.layout, "tags", json!({})),
+        ("GetCase, untagged", &empty.case, "tags", json!({})),
+        (
+            "BatchGetField entry, untagged",
+            &empty.field,
+            "tags",
+            json!({}),
+        ),
+        ("GetTemplate, untagged", &empty.template, "tags", json!({})),
+        (
+            "GetTemplate with no case rule",
+            &empty.template,
+            "rules",
+            json!([]),
+        ),
+        (
+            "GetTemplate propagating no tags",
+            &empty.template,
+            "tagPropagationConfigurations",
+            json!([]),
+        ),
+        (
+            "GetTemplate with no default values",
+            &empty.template,
+            "defaultValues",
+            json!([]),
+        ),
+        (
+            "GetTemplate naming no default layout",
+            &empty.template,
+            "layoutConfiguration",
+            json!({ "defaultLayout": null, "defaultLayoutName": null }),
+        ),
+        // The same members on records that DO hold something: the one value the
+        // record carries, reported under the same key.
+        ("GetDomain, tagged", &held.domain, "tags", one_tag.clone()),
+        ("GetLayout, tagged", &held.layout, "tags", one_tag.clone()),
+        ("GetCase, tagged", &held.case, "tags", one_tag.clone()),
+        (
+            "BatchGetField entry, tagged",
+            &held.field,
+            "tags",
+            one_tag.clone(),
+        ),
+        ("GetTemplate, tagged", &held.template, "tags", one_tag),
+        (
+            "GetTemplate propagating one tag map",
+            &held.template,
+            "tagPropagationConfigurations",
+            propagation,
+        ),
+        (
+            "GetTemplate naming a default layout",
+            &held.template,
+            "layoutConfiguration",
+            json!({ "defaultLayout": held_layout, "defaultLayoutName": null }),
+        ),
+        (
+            "GetTemplate with no case rule, tagged",
+            &held.template,
+            "rules",
+            json!([]),
+        ),
+        (
+            "GetTemplate with no default values, tagged",
+            &held.template,
+            "defaultValues",
+            json!([]),
+        ),
+    ];
+
+    for (case, document, member, expected) in rows {
+        let reported = document.get(member);
+        assert_eq!(
+            reported,
+            Some(&expected),
+            "case {case:?}: expected {member} to be {expected:?}, got {reported:?} in \
+             {document:?}"
+        );
+    }
+}
+
+/// RULE 9 on the domain's own instants: a domain reports when it was created and
+/// when it was last changed, and the second moves only when the domain changes.
+#[tokio::test]
+async fn a_domain_reports_the_instant_it_was_last_changed() {
+    let emulator = Emulator::new();
+    let domain_id = domain(&emulator, "domain-last-modified").await;
+    let path = format!("/domains/{domain_id}");
+
+    let case = "a domain nothing has changed";
+    let before = emulator.ok(case, "POST", &path, json!({})).await;
+    assert_eq!(
+        before.get("lastModifiedTime"),
+        before.get("createdTime"),
+        "case {case:?}: a domain nothing has changed reports its creation instant as its \
+         last-modified instant, got {before:?}"
+    );
+
+    // The one operation that edits a domain's own configuration.
+    let case = "a domain whose case-event configuration was written";
+    emulator
+        .ok(
+            case,
+            "PUT",
+            &format!("/domains/{domain_id}/case-event-configuration"),
+            json!({ "eventBridge": { "enabled": true } }),
+        )
+        .await;
+    let after = emulator.ok(case, "POST", &path, json!({})).await;
+    assert_eq!(
+        after.get("createdTime"),
+        before.get("createdTime"),
+        "case {case:?}: a write never moves createdTime, got {after:?}"
+    );
+    assert!(
+        instant_at(&after, "lastModifiedTime", case)
+            > instant_at(&before, "lastModifiedTime", case),
+        "case {case:?}: a write of the domain's configuration must move lastModifiedTime past \
+         {before:?}, got {after:?}"
     );
 }

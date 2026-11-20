@@ -357,6 +357,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             changed = true;
             template.tag_propagation_configurations = configurations;
         }
+        if let Some(rules) = input.rules {
+            // A write of the same list is not a change, and the case rule an
+            // entry names is a rule reference's whole identity here.
+            let same = template
+                .rules
+                .iter()
+                .map(|rule| rule.case_rule_id.as_str())
+                .eq(rules.iter().map(|rule| rule.case_rule_id.as_str()));
+            changed |= !same;
+            template.rules = rules;
+        }
         // `lastModifiedTime` is "Timestamp at which the resource was created or
         // last modified", so it moves only when this call modified something.
         if changed {

@@ -64,6 +64,11 @@
 //! * `tags` (Tags) — A map of of key-value pairs that represent tags on a resource. Tags are
 //!   used to organize, track, or control access for this resource.
 //!
+//! Beside those, the service's own response carries `lastModifiedTime` — the instant the
+//! domain itself was last changed — which the on-disk model does not declare; it is
+//! reported from the stored record by the hand-written wire form of `GetDomainResponse`
+//! in `super::types`.
+//!
 //! ## Errors
 //!
 //! * `AccessDeniedException` (HTTP 403) — You do not have sufficient access to perform this
@@ -171,6 +176,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             domain_arn: domain.domain_arn.clone(),
             name: domain.name.clone(),
             created_time: crate::state::timestamp(domain.created_time),
+            // The instant the domain itself was last changed, reported beside
+            // the creation instant: the record always holds one, so the member
+            // is always reported.
+            last_modified_time: crate::state::timestamp(domain.last_modified_time),
             domain_status: domain.domain_status.clone(),
             tags: crate::state::tags_output(&domain.tags),
         })

@@ -80,6 +80,11 @@
 //!   the template.
 //! * `templateId` (TemplateId, len 1..500) **required** — A unique identifier of a template.
 //!
+//! Beside those, the service's own response carries `defaultValues` — the field values a
+//! case created from the template starts with — which the on-disk model does not declare,
+//! and reports `layoutConfiguration` with a second member, `defaultLayoutName`. Both live
+//! in the hand-written wire form of `GetTemplateResponse` in `super::types`.
+//!
 //! ## Errors
 //!
 //! * `AccessDeniedException` (HTTP 403) — You do not have sufficient access to perform this
@@ -209,6 +214,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             template_arn: template.template_arn.clone(),
             name: template.name.clone(),
             description: template.description.clone(),
+            // The stored configuration, reported whether or not the template
+            // names a default layout: the member is on every template, as a
+            // configuration of explicit nulls for one that names none (see the
+            // wire form of `GetTemplateResponse` in `super::types`).
             layout_configuration: template.layout_configuration.clone(),
             required_fields: if required_fields.is_empty() {
                 None
@@ -220,14 +229,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             deleted: template.deleted,
             created_time: Some(crate::state::timestamp(template.created_time)),
             last_modified_time: Some(crate::state::timestamp(template.last_modified_time)),
-            // Case rules are a resource of their own; `CreateCaseRule` is still a
-            // stub, so no template can carry one and none is reported.
-            rules: None,
+            // The stored list whatever it holds: a template that carries no case
+            // rule reports `[]` rather than leaving the member out, so a caller
+            // that iterates it never has to tell an empty list from an absent
+            // one. Nothing can put an entry here while `CreateCaseRule` is a
+            // stub, which is what both writes of a template refuse.
+            rules: template.rules.clone(),
             // The stored list whatever it holds: the service reports the member
             // on every read of a template, as `[]` for one that propagates no
             // tags, so a caller that iterates it never has to tell an empty
             // list from an absent one.
-            tag_propagation_configurations: Some(template.tag_propagation_configurations.clone()),
+            tag_propagation_configurations: template.tag_propagation_configurations.clone(),
         })
     }
 }

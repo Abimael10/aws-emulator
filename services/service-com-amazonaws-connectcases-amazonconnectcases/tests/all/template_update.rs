@@ -27,7 +27,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcases_amazonconnectcases::ops::types::TEMPLATE_STATUS_VALUES;
 
-use crate::harness::{domain, string_at, Emulator};
+use crate::harness::{domain, instant_at, string_at, Emulator};
 
 /// The published bounds of the members `UpdateTemplate` writes, from the model:
 /// `TemplateName` is `@length(1..100)`, `TemplateDescription` `@length(..255)`,
@@ -140,13 +140,6 @@ pub(crate) async fn update_template(
         .await
 }
 
-/// A numeric member of a read's answer (the epoch-seconds timestamps).
-fn number_at(json: &Value, member: &str, case: &str) -> f64 {
-    json.get(member)
-        .and_then(Value::as_f64)
-        .unwrap_or_else(|| panic!("case {case:?}: no numeric member {member:?} in {json:?}"))
-}
-
 /// A `requiredFields` list over `field_ids`, in the order given.
 pub(crate) fn required(field_ids: &[&String]) -> Value {
     Value::Array(
@@ -215,7 +208,10 @@ async fn update_template_writes_only_the_members_its_request_carries() {
         description: None,
         status: "Active".to_string(),
         required_fields: Some(required(&[&first])),
-        layout_configuration: None,
+        // A read reports the layout configuration whatever the template holds,
+        // so a template that names no default layout carries it with both of
+        // its members explicitly null.
+        layout_configuration: Some(json!({ "defaultLayout": null, "defaultLayoutName": null })),
         // A read reports the tag-propagation list whatever it holds, so a
         // template that propagates no tags carries it as an empty list.
         tag_propagation_configurations: Some(json!([])),
@@ -312,19 +308,22 @@ async fn update_template_writes_only_the_members_its_request_carries() {
 
     // `layoutConfiguration`: a layout of the domain, another one, and the
     // configuration with no `defaultLayout` member at all.
-    expected.layout_configuration = Some(json!({ "defaultLayout": layout_a }));
+    expected.layout_configuration =
+        Some(json!({ "defaultLayout": layout_a, "defaultLayoutName": null }));
     rows.push((
         "layoutConfiguration naming a layout of the domain".to_string(),
         json!({ "layoutConfiguration": { "defaultLayout": layout_a } }),
         expected.clone(),
     ));
-    expected.layout_configuration = Some(json!({ "defaultLayout": layout_b }));
+    expected.layout_configuration =
+        Some(json!({ "defaultLayout": layout_b, "defaultLayoutName": null }));
     rows.push((
         "layoutConfiguration naming another layout of the domain".to_string(),
         json!({ "layoutConfiguration": { "defaultLayout": layout_b } }),
         expected.clone(),
     ));
-    expected.layout_configuration = Some(json!({}));
+    expected.layout_configuration =
+        Some(json!({ "defaultLayout": null, "defaultLayoutName": null }));
     rows.push((
         "layoutConfiguration with no defaultLayout".to_string(),
         json!({ "layoutConfiguration": {} }),
@@ -356,7 +355,8 @@ async fn update_template_writes_only_the_members_its_request_carries() {
     expected.description = Some(json!("all members in one call"));
     expected.status = "Inactive".to_string();
     expected.required_fields = Some(required(&[&first, &third]));
-    expected.layout_configuration = Some(json!({ "defaultLayout": layout_a }));
+    expected.layout_configuration =
+        Some(json!({ "defaultLayout": layout_a, "defaultLayoutName": null }));
     rows.push((
         "every modifiable member at once".to_string(),
         json!({
@@ -377,7 +377,7 @@ async fn update_template_writes_only_the_members_its_request_carries() {
         expected.clone(),
     ));
 
-    let created_time = number_at(
+    let created_time = instant_at(
         &get_template(&emulator, "creation instant", &domain_id, &template_id).await,
         "createdTime",
         "creation instant",
@@ -406,7 +406,7 @@ async fn update_template_writes_only_the_members_its_request_carries() {
             "case {case:?}: an update never re-mints the templateArn, got {fetched:?}"
         );
         assert_eq!(
-            number_at(&fetched, "createdTime", &case),
+            instant_at(&fetched, "createdTime", &case),
             created_time,
             "case {case:?}: an update never moves createdTime, got {fetched:?}"
         );
@@ -480,13 +480,13 @@ async fn an_update_moves_last_modified_time_only_when_it_changed_something() {
 
     for (case, body, moves) in rows {
         let before = get_template(&emulator, case, &domain_id, &template_id).await;
-        let was = number_at(&before, "lastModifiedTime", case);
-        let created = number_at(&before, "createdTime", case);
+        let was = instant_at(&before, "lastModifiedTime", case);
+        let created = instant_at(&before, "createdTime", case);
 
         update_template(&emulator, case, &domain_id, &template_id, body).await;
 
         let after = get_template(&emulator, case, &domain_id, &template_id).await;
-        let now = number_at(&after, "lastModifiedTime", case);
+        let now = instant_at(&after, "lastModifiedTime", case);
         if moves {
             assert!(
                 now > was,
@@ -501,7 +501,7 @@ async fn an_update_moves_last_modified_time_only_when_it_changed_something() {
             );
         }
         assert_eq!(
-            number_at(&after, "createdTime", case),
+            instant_at(&after, "createdTime", case),
             created,
             "case {case:?}: an update never moves createdTime, got {after:?}"
         );

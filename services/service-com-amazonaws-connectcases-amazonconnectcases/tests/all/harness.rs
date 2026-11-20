@@ -158,11 +158,50 @@ impl Emulator {
     }
 }
 
+/// Percent-encode one path segment, so an ARN travels in the non-greedy `{arn}`
+/// label of `/tags/{arn}`.
+fn label(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
+}
+
+/// The tagging path of one resource.
+pub fn tags_path(arn: &str) -> String {
+    format!("/tags/{}", label(arn))
+}
+
 pub fn string_at(json: &Value, member: &str, case: &str) -> String {
     json.get(member)
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("case {case:?}: no string member {member:?} in {json:?}"))
         .to_string()
+}
+
+/// The instant the `date-time` member `member` names, in epoch seconds.
+///
+/// Every timestamp member of this model declares
+/// `@timestampFormat("date-time")`, so the service reports an instant as an RFC
+/// 3339 string; this is the one place a suite turns that text back into a number
+/// it can order and compare.
+pub fn instant_at(json: &Value, member: &str, case: &str) -> f64 {
+    let text = json
+        .get(member)
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: no date-time member {member:?} in {json:?}")
+        });
+    ::aws_smithy_types::DateTime::from_str(text, ::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|error| {
+            panic!("case {case:?}: {member} {text:?} is not an RFC 3339 date-time: {error}")
+        })
+        .as_secs_f64()
 }
 
 /// Every `FieldValueUnion` variant, each paired with the `FieldType` whose

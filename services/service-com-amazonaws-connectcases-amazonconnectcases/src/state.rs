@@ -65,7 +65,8 @@ use crate::ops::types::{
     BasicLayout, ConflictException, EventBridgeConfiguration, FieldAttributes, FieldGroup,
     FieldOption, FieldValueUnion, InternalServerException, LayoutConfiguration, LayoutContent,
     LayoutSections, RelatedItemInputContent, RequiredField, ResourceNotFoundException, Section,
-    ServiceQuotaExceededException, TagPropagationConfiguration, UserUnion, ValidationException,
+    ServiceQuotaExceededException, TagPropagationConfiguration, TemplateRule, UserUnion,
+    ValidationException,
 };
 
 /// The ARN namespace (and SigV4 signing name / endpoint prefix) of this service,
@@ -324,6 +325,12 @@ pub struct Domain {
     pub domain_arn: String,
     pub name: String,
     pub created_time: SystemTime,
+    /// When the domain itself was last changed: its creation instant until a
+    /// write against the domain record moves it (`PutCaseEventConfiguration`,
+    /// the one operation that edits a domain's own configuration). Reported
+    /// beside `createdTime` by `GetDomain`, which is how a caller detects a
+    /// change to a domain it already read.
+    pub last_modified_time: SystemTime,
     pub domain_status: String,
     pub tags: HashMap<String, String>,
     pub fields: HashMap<String, Field>,
@@ -356,7 +363,7 @@ pub struct Field {
     pub deleted: bool,
     /// The field's tags, as `TagResource` merges them in: `CreateField` takes
     /// no tags, so a field carries none until it is tagged and a read reports
-    /// no `tags` member for it until then ([`tags_output`]).
+    /// an EMPTY tag map for it until then ([`tags_output`]).
     pub tags: HashMap<String, String>,
     pub created_time: SystemTime,
     pub last_modified_time: SystemTime,
@@ -371,6 +378,12 @@ pub struct Template {
     pub description: Option<String>,
     pub layout_configuration: Option<LayoutConfiguration>,
     pub required_fields: Vec<RequiredField>,
+    /// The case rules the template carries, as its create and its update write
+    /// them. Empty for every template this store can hold while
+    /// `CreateCaseRule` is a stub: both writes refuse a request that names a
+    /// case rule, so nothing can put an entry here yet, and a read reports the
+    /// empty list the record holds.
+    pub rules: Vec<TemplateRule>,
     pub tag_propagation_configurations: Vec<TagPropagationConfiguration>,
     /// One of `TEMPLATE_STATUS_VALUES`.
     pub status: String,
@@ -2053,14 +2066,18 @@ pub fn included_field_count(configuration: &EventBridgeConfiguration) -> usize {
         .map_or(0, |case_data| case_data.fields.len())
 }
 
-/// A tag map for a response member: absent when the resource carries no tags,
-/// which is how the service reports one that was never tagged.
+/// A tag map for a response member: the resource's stored tag set, PRESENT
+/// whatever it holds, so a resource that was never tagged reports `{}` rather
+/// than leaving the member out.
+///
+/// Every `tags` member of this service targets `Tags`
+/// (`smithy_query(query="shape",shape="Tags")`), and the service reports it on
+/// every record it answers: a client reads `tags` without first testing for it,
+/// and tells "no tags" from "not reported" by the map being empty rather than by
+/// the key being missing. The `Option` is the generated member's own type, not a
+/// choice made here — it is always `Some`.
 pub fn tags_output(tags: &HashMap<String, String>) -> Option<HashMap<String, String>> {
-    if tags.is_empty() {
-        None
-    } else {
-        Some(tags.clone())
-    }
+    Some(tags.clone())
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

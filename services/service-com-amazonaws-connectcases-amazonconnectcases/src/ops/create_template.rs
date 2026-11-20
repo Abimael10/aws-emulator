@@ -251,9 +251,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // claiming a lookup it did not perform; when that create lands it
         // becomes a lookup against the domain's own rules, as the
         // `layoutConfiguration.defaultLayout` lookup below now is.
-        let rule_ids: Vec<String> = input
-            .rules
-            .unwrap_or_default()
+        let rules = input.rules.unwrap_or_default();
+        let rule_ids: Vec<String> = rules
             .iter()
             .map(|rule| rule.case_rule_id.clone())
             .collect();
@@ -303,6 +302,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 description: input.description,
                 layout_configuration: input.layout_configuration,
                 required_fields,
+                // The list the request carried, which the refusal above holds
+                // to the empty one while no case rule can exist.
+                rules,
                 tag_propagation_configurations: input
                     .tag_propagation_configurations
                     .unwrap_or_default(),

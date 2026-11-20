@@ -187,6 +187,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rather than resolved against `domain.fields` the way a case's field
         // values are.
         domain.event_bridge = Some(input.event_bridge);
+        // The domain's own configuration just changed, so the instant a reader
+        // detects that change by moves with it.
+        domain.last_modified_time = ::std::time::SystemTime::now();
 
         Ok(PutCaseEventConfigurationOutput {})
     }

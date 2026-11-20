@@ -6,7 +6,8 @@
 //! Tags are NOT a collection of their own — every resource this service holds
 //! already owns its `tags` map, which is what [`tags_output`] reports on a read
 //! of the resource ([`Domain`], [`Field`], [`Template`], [`Layout`], [`Case`],
-//! [`RelatedItem`]), so deleting a resource takes its tags with it and no second
+//! [`RelatedItem`]), present whatever it holds, so deleting a resource takes its
+//! tags with it and no second
 //! copy of a tag set can drift from the first. What the tagging operations
 //! share, and what lives here, is the RESOLUTION step: an `Arn` names one
 //! resource of one kind, and only a record this store actually holds is

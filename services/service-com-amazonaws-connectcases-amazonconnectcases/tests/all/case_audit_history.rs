@@ -28,8 +28,8 @@ use service_com_amazonaws_connectcases_amazonconnectcases::state::{
 // The request plumbing and the lifecycle helpers live in `tests/all/harness.rs`,
 // shared with this crate's other suites.
 use crate::harness::{
-    domain, field_of_type, fields_of_every_type, is_minted_id, string_at, template, Emulator,
-    DEFAULT_ACCESS_KEY_ID,
+    domain, field_of_type, fields_of_every_type, instant_at, is_minted_id, string_at, template,
+    Emulator, DEFAULT_ACCESS_KEY_ID,
 };
 
 /// A second caller, so an edge attributed to the caller's own credentials is
@@ -180,12 +180,7 @@ fn assert_history(case: &str, events: &[Value], expected: &[ExpectedEvent]) {
         // The instant is the one the edit was performed at, so its VALUE is this
         // run's: what is asserted is that every entry reports one, and that the
         // entries run from the most recently performed edit to the oldest.
-        let performed_time = event
-            .get("performedTime")
-            .and_then(Value::as_f64)
-            .unwrap_or_else(|| {
-                panic!("case {case:?}: an entry with no performedTime instant: {event:?}")
-            });
+        let performed_time = instant_at(event, "performedTime", &case);
         assert!(
             performed_time > 0.0,
             "case {case:?}: performedTime must be the instant the edit was performed, \
