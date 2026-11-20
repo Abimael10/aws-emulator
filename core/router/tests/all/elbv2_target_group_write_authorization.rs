@@ -39,7 +39,13 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::query_wire::{element, elements, form_encode, opt_element};
 
 /// The Region every request below is signed for.
-const REGION: &str = "us-east-1";
+///
+/// This constant and the request plumbing below are `pub(crate)` because the sibling suite
+/// `elbv2_denied_registration_and_unused_target_health.rs` drives the same three services over
+/// the same wire — IAM holds the role, STS mints the session, Elastic Load Balancing v2 takes
+/// the decision — so there is ONE copy of it and the two suites cannot drift into signing or
+/// addressing differently.
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The API versions the awsQuery requests of each service carry.
 const ELB_VERSION: &str = "2015-12-01";
@@ -51,12 +57,12 @@ const STS_VERSION: &str = "2011-06-15";
 const SESSION: &str = "probe";
 
 /// The IAM action prefix of this service: an action is `elasticloadbalancing:<OperationName>`.
-const ACTION_PREFIX: &str = "elasticloadbalancing";
+pub(crate) const ACTION_PREFIX: &str = "elasticloadbalancing";
 
 /// The access key id of the account's own published credential, which is what every other
 /// suite signs with: a key neither STS nor IAM holds a record for resolves to the account's
 /// own identity.
-const ACCOUNT_KEY: &str = "AKIDEXAMPLE";
+pub(crate) const ACCOUNT_KEY: &str = "AKIDEXAMPLE";
 
 /// A trust policy letting the account root assume a role. It carries none of the characters
 /// that are significant in an `application/x-www-form-urlencoded` body.
@@ -72,7 +78,7 @@ const TRUST_POLICY: &str = concat!(
 const VPC: &str = "vpc-targetgroup-authz";
 
 /// The whole emulator over one engine, exactly as the binary assembles it.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine = aws_emulator_router::new_engine();
     let mut router = aws_emulator_router::build_router(engine);
     // Signature verification is the front door's concern, not this suite's: what decides a
@@ -82,7 +88,7 @@ fn router() -> MultiServiceRouter {
 }
 
 /// One form body: the action, the version and the parameters.
-fn form(action: &str, version: &str, params: &[(&str, &str)]) -> String {
+pub(crate) fn form(action: &str, version: &str, params: &[(&str, &str)]) -> String {
     let mut body = format!("Action={action}&Version={version}");
     for (name, value) in params {
         body.push('&');
@@ -96,7 +102,7 @@ fn form(action: &str, version: &str, params: &[(&str, &str)]) -> String {
 /// Send one form-encoded request to the service `signing_name` addresses, signed with
 /// `access_key_id` — the key the service reads the caller's identity from — and answer its
 /// status and body.
-async fn send(
+pub(crate) async fn send(
     router: &MultiServiceRouter,
     access_key_id: &str,
     signing_name: &str,
@@ -124,7 +130,7 @@ async fn send(
 }
 
 /// One Elastic Load Balancing v2 call, signed with `access_key_id`.
-async fn elbv2(
+pub(crate) async fn elbv2(
     router: &MultiServiceRouter,
     access_key_id: &str,
     action: &str,
@@ -140,7 +146,11 @@ async fn elbv2(
 }
 
 /// One Elastic Load Balancing v2 call made as the account itself, which must succeed.
-async fn as_account(router: &MultiServiceRouter, action: &str, params: &[(&str, &str)]) -> String {
+pub(crate) async fn as_account(
+    router: &MultiServiceRouter,
+    action: &str,
+    params: &[(&str, &str)],
+) -> String {
     let (status, body) = elbv2(router, ACCOUNT_KEY, action, params).await;
     assert_eq!(
         status, 200,
@@ -160,17 +170,17 @@ async fn iam(router: &MultiServiceRouter, action: &str, params: &[(&str, &str)])
 }
 
 /// The principal a session speaks for, and the key it signs with.
-struct Session {
+pub(crate) struct Session {
     /// The access key id STS minted for the session.
-    key: String,
+    pub(crate) key: String,
     /// The assumed-role ARN STS reports for it, which is what a refusal names.
-    principal: String,
+    pub(crate) principal: String,
 }
 
 /// A role carrying `document` as its inline policy (none when `document` is `None`), assumed
 /// for a session: what the account holds for the principal, written through IAM's own
 /// `CreateRole`/`PutRolePolicy` and minted through STS's own `AssumeRole`.
-async fn session_of(
+pub(crate) async fn session_of(
     router: &MultiServiceRouter,
     role_name: &str,
     document: Option<&str>,
@@ -251,12 +261,12 @@ async fn registered_targets(router: &MultiServiceRouter, arn: &str) -> Vec<Strin
 }
 
 /// The error code an answer carries, or `"<none>"` for one that carries no `<Code>`.
-fn error_code(body: &str) -> String {
+pub(crate) fn error_code(body: &str) -> String {
     opt_element(body, "Code").unwrap_or_else(|| "<none>".to_string())
 }
 
 /// IAM's own refusal sentence for `action` on `resource`, closed by `reason`.
-fn refusal(principal: &str, action: &str, resource: &str, reason: &str) -> String {
+pub(crate) fn refusal(principal: &str, action: &str, resource: &str, reason: &str) -> String {
     format!(
         "User: {principal} is not authorized to perform: {action} on resource: {resource} {reason}"
     )
