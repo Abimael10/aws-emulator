@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDataAutomationLibraryEntities
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDataAutomationLibraryEntities`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDataAutomationLibraryEntities::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the entities ONE DataAutomationLibrary holds under one entity type — the same
+//! entities `GetDataAutomationLibraryEntity` resolves one of, which are what the ingestion
+//! jobs accepted against that library have made of it (`crate::state::library_entities`) —
+//! in this service's listing order, one page at a time.
+//!
+//! A READ (`@readonly`): it projects the fold of the jobs this store already holds and writes
+//! nothing of its own beyond the library removals the clock has already made due. The library
+//! it enumerates has to resolve, so an ARN this store holds no library under is refused
+//! instead.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +158,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDataAutomationLibraryEntities` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDataAutomationLibraryEntitiesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDataAutomationLibraryEntities"))
+        // The `libraryArn` this listing is OF has to be one this endpoint admits: refused on
+        // the INPUT, before any lookup, with the rule and the sentence single-homed in
+        // `crate::state::library_arn`.
+        if let Some(refusal) = crate::state::library_arn::region_refusal(ctx, &input.library_arn) {
+            return Err(
+                ListDataAutomationLibraryEntitiesErrorModeled::ValidationException(refusal).into(),
+            );
+        }
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListDataAutomationLibraryEntitiesError::Modeled(
+                ListDataAutomationLibraryEntitiesErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the Bedrock Data Automation store is unavailable".to_string(),
+                        ),
+                    },
+                ),
+            )
+        })?;
+        // A read: it projects what is already stored, having first materialised the library
+        // removals the clock has already made due — the entities of a library whose delete has
+        // settled went with it (`crate::state::library_deletion`).
+        let mut store = state.lock();
+        // ONE clock read for the whole call, so the removals it materialises and the
+        // ingestions it folds are as of one instant.
+        let now = ::std::time::SystemTime::now();
+        store.settle_library_deletions(now);
+
+        // The listing is OF one library, named by the request's required `libraryArn`, so an
+        // ARN this store holds no library under has no entity collection to enumerate:
+        // refused with the service's fixed sentence for an unresolved library, the same one
+        // the read of a single entity answers for it.
+        if !store.libraries.contains_key(&input.library_arn) {
+            return Err(
+                ListDataAutomationLibraryEntitiesErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::LIBRARY_ARN_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::PageCursor::from_token(token).ok_or_else(|| {
+                ListDataAutomationLibraryEntitiesErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some("nextToken is not a token this service issued".to_string()),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: "nextToken".to_string(),
+                            message: "must be a nextToken returned by a previous \
+                                      ListDataAutomationLibraryEntities call"
+                                .to_string(),
+                        }]),
+                    },
+                )
+            })?),
+        };
+
+        // What the COMPLETED ingestions have left under that (library, entity type) pair is
+        // what this listing enumerates: the same fold a read of one entity resolves against,
+        // so nothing an in-flight job carries is served and an entity a completed delete took
+        // out is gone from both.
+        let held: Vec<crate::state::library_entities::LibraryEntityRecord> = store
+            .library_entities_in_order(&input.library_arn, &input.entity_type, now)
+            .into_iter()
+            .filter(|record| cursor.as_ref().is_none_or(|c| c.precedes(record)))
+            .collect();
+
+        // `maxResults` caps the page; absent, the server's own page limit does, so a listing
+        // never serialises more than one modeled-maximum page. The modeled range is 1..1000,
+        // so a value reaching this handler is in range; clamping to 1 at the bottom keeps a
+        // page honest if that ever changes.
+        let limit = input
+            .max_results
+            .unwrap_or(crate::state::library_entities::ENTITY_PAGE_LIMIT)
+            .clamp(1, crate::state::library_entities::ENTITY_PAGE_LIMIT) as usize;
+        let page = &held[..limit.min(held.len())];
+
+        // A token is handed back only when something is left AFTER this page, so the last
+        // page of a listing never carries one.
+        let next_token = page
+            .last()
+            .filter(|_| held.len() > page.len())
+            .map(|record| crate::state::PageCursor::after(record).to_token());
+
+        Ok(ListDataAutomationLibraryEntitiesOutput {
+            entities: Some(
+                page.iter()
+                    .map(|record| record.to_entity_summary())
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

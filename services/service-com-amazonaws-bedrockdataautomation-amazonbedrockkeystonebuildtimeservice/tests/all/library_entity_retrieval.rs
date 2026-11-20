@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end HTTP coverage of `GetDataAutomationLibraryEntity`: the read of ONE entity a
-//! DataAutomationLibrary holds.
+//! End-to-end HTTP coverage of the ENTITIES a DataAutomationLibrary holds:
+//! `GetDataAutomationLibraryEntity`, the read of ONE of them, and
+//! `ListDataAutomationLibraryEntities`, the listing of the ones a (library, entity type) pair
+//! holds.
 //!
 //! RULE. The entities of a (library, entity type) pair are what the ingestion jobs accepted
 //! against that library have made of it: an `UPSERT` job's inline entries stand the entity
 //! its `entityId` names up (or replace what was stored under it) once that job has
 //! completed, and a `DELETE` job's entries take entities out — so a read of the triple
 //! reports the description, language and phrases of the latest entry that upserted the id,
-//! and refuses anything that resolves to nothing (an unresolved library, another library's
-//! entity, the other modelled entity type, an id nothing upserted, an id a delete removed).
+//! the listing of the pair enumerates exactly those entities (in this service's listing
+//! order, one page at a time, with `maxResults` capping the page and a `nextToken` handed
+//! back only while something is left after it), and both refuse anything that resolves to
+//! nothing (an unresolved library, another library's entity, the other modelled entity type,
+//! an id nothing upserted, an id a delete removed).
 //!
 //! Every case drives the real `restJson1` wire path — `MultiServiceRouter::dispatch` with a
 //! signed-looking request — so routing, HTTP binding, constraint validation, the handler and
@@ -17,8 +22,9 @@
 //! client would.
 //!
 //! The suites are TABLE-driven: the rows differ along the `entityId` form, whether a
-//! description is carried, the language named, the number of phrases and whether a phrase
-//! carries a display form — never over one recorded request.
+//! description is carried, the language named, the number of phrases, whether a phrase
+//! carries a display form, how many entities one pair holds and the page size asked for —
+//! never over one recorded request.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -125,6 +131,17 @@ fn entity_uri(library_arn: &str, entity_type: &str, entity_id: &str) -> String {
         encode_label(library_arn),
         encode_label(entity_type),
         encode_label(entity_id)
+    )
+}
+
+/// The entity COLLECTION path, per `ListDataAutomationLibraryEntities`'s modelled `@http`
+/// `{method: POST, uri:
+/// /data-automation-libraries/{libraryArn}/entityType/{entityType}/entities/}`.
+fn entities_uri(library_arn: &str, entity_type: &str) -> String {
+    format!(
+        "/data-automation-libraries/{}/entityType/{}/entities/",
+        encode_label(library_arn),
+        encode_label(entity_type)
     )
 }
 
@@ -540,4 +557,503 @@ async fn what_resolves_to_nothing_is_refused() {
             "case {case:?}: expected {message:?}, got {refused:?}"
         );
     }
+}
+
+/// `ListDataAutomationLibraryEntities` with the page the case asks for.
+async fn list_entities(
+    router: &MultiServiceRouter,
+    library_arn: &str,
+    entity_type: &str,
+    page: &Value,
+) -> (u16, Value) {
+    call(
+        router,
+        "POST",
+        &entities_uri(library_arn, entity_type),
+        page,
+    )
+    .await
+}
+
+/// The `vocabulary` summaries a listing answered, in the order it served them.
+fn listed(payload: &Value, case: &str) -> Vec<Value> {
+    payload
+        .get("entities")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("case {case:?}: no entities array in {payload:?}"))
+        .iter()
+        .map(|item| {
+            item.get("vocabulary")
+                .cloned()
+                .unwrap_or_else(|| panic!("case {case:?}: no vocabulary summary in {item:?}"))
+        })
+        .collect()
+}
+
+/// The `entityId`s a listing served, in that order.
+fn listed_ids(payload: &Value, case: &str) -> Vec<String> {
+    listed(payload, case)
+        .iter()
+        .map(|summary| string_at(summary, "entityId", case))
+        .collect()
+}
+
+/// The entity info one upsert entry carries: the id, the language, an optional description
+/// and `phrases` phrase(s) — each phrase text derived from the id, so no two entities of one
+/// case carry the same phrase.
+fn vocabulary_info(
+    entity_id: &str,
+    language: &str,
+    description: Option<&str>,
+    phrases: usize,
+) -> Value {
+    let texts: Vec<Value> = (0..phrases)
+        .map(|index| json!({ "text": format!("{entity_id}-phrase-{index}") }))
+        .collect();
+    let mut info = json!({ "entityId": entity_id, "language": language, "phrases": texts });
+    if let Some(text) = description {
+        info["description"] = json!(text);
+    }
+    info
+}
+
+/// One upsert submission carrying every entity the case describes.
+fn upsert_submission(entity_type: &str, entities: &[(String, &str, Option<&str>, usize)]) -> Value {
+    let entries: Vec<Value> = entities
+        .iter()
+        .map(|(entity_id, language, description, phrases)| {
+            json!({ "vocabulary": vocabulary_info(entity_id, language, *description, *phrases) })
+        })
+        .collect();
+    submission(
+        entity_type,
+        "UPSERT",
+        json!({ "upsertEntitiesInfo": entries }),
+    )
+}
+
+/// Look at the whole listing until it holds exactly `want` entities, or the generous
+/// [`POLL_DEADLINE`] passes.
+///
+/// The ingestion a submission owes falls due a span after the call, so what a case waits for
+/// is the CONDITION (the listing holds what the ingestion left) rather than a length of time.
+async fn poll_listing(
+    router: &MultiServiceRouter,
+    library_arn: &str,
+    entity_type: &str,
+    want: usize,
+    case: &str,
+) -> Value {
+    let started = Instant::now();
+    let mut last = (0u16, Value::Null);
+    while started.elapsed() < POLL_DEADLINE {
+        let answer = list_entities(router, library_arn, entity_type, &json!({})).await;
+        if answer.0 == 200 && listed_ids(&answer.1, case).len() == want {
+            return answer.1;
+        }
+        last = answer;
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    panic!(
+        "case {case:?}: the listing never held {want} entity/entities; last answer was {last:?}"
+    );
+}
+
+/// Walk every page of one listing with the page size the case names, and return the ids in
+/// the order they were served, how large each page was, and how many pages it took.
+async fn walk_listing(
+    router: &MultiServiceRouter,
+    library_arn: &str,
+    entity_type: &str,
+    max_results: Option<i32>,
+    case: &str,
+) -> (Vec<String>, Vec<usize>, usize) {
+    let mut ids: Vec<String> = Vec::new();
+    let mut sizes: Vec<usize> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut pages = 0usize;
+    loop {
+        let mut page = json!({});
+        if let Some(limit) = max_results {
+            page["maxResults"] = json!(limit);
+        }
+        if let Some(cursor) = token.as_ref() {
+            page["nextToken"] = json!(cursor);
+        }
+        let (status, payload) = list_entities(router, library_arn, entity_type, &page).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected ListDataAutomationLibraryEntities 200, got {status} with \
+             {payload:?}"
+        );
+        let served = listed_ids(&payload, case);
+        sizes.push(served.len());
+        ids.extend(served);
+        pages += 1;
+        token = payload
+            .get("nextToken")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if token.is_none() {
+            return (ids, sizes, pages);
+        }
+        assert!(
+            pages <= 64,
+            "case {case:?}: the listing handed back a token on {pages} pages for {} id(s)",
+            ids.len()
+        );
+    }
+}
+
+/// One row of the listing table: the case, the entity type ingested into and the entities one
+/// upsert carries — the id, the language, an optional description and the phrase count.
+type ListingRow<'a> = (
+    &'a str,
+    &'a str,
+    Vec<(String, &'a str, Option<&'a str>, usize)>,
+);
+
+/// RULE: the listing of a (library, entity type) pair enumerates exactly the entities the
+/// completed ingestions left there, each as the narrow modelled
+/// `VocabularyEntitySummary` — the id, the description and language the upsert carried, HOW
+/// MANY phrases it holds, and the instant the ingestion that wrote it completed — and a read
+/// of each listed id resolves the same entity.
+///
+/// The rows differ along how many entities the pair holds (one, a few, the modelled maximum
+/// of one payload, `smithy_query(query="shape",shape="UpsertEntitiesInfo")`:
+/// `@length(min: 1, max: 10)`), which modelled entity type they are ingested under
+/// (`smithy_query(query="shape",shape="EntityType")` -> `["VOCABULARY",
+/// "RECOGNIZED_PERSON"]`), whether a description is carried and how many phrases each entity
+/// holds.
+#[tokio::test]
+async fn the_listing_enumerates_what_the_completed_ingestions_left() {
+    let rows: Vec<ListingRow<'_>> = vec![
+        (
+            "one entity",
+            "VOCABULARY",
+            vec![("vocab-only".to_string(), "EN", None, 1)],
+        ),
+        (
+            "three entities, two of them described",
+            "VOCABULARY",
+            vec![
+                ("vocab-c".to_string(), "DE", Some("coastal birds"), 2),
+                ("vocab-a".to_string(), "FR", None, 1),
+                ("vocab_b".to_string(), "JA", Some("garden birds"), 3),
+            ],
+        ),
+        (
+            "the other modelled entity type, at one payload's modelled maximum",
+            "RECOGNIZED_PERSON",
+            (0..10)
+                .map(|index| {
+                    (
+                        format!("person-{index:02}"),
+                        "KO",
+                        (index % 2 == 0).then_some("a described person"),
+                        1 + index % 3,
+                    )
+                })
+                .collect(),
+        ),
+    ];
+
+    for (index, (case, entity_type, entities)) in rows.into_iter().enumerate() {
+        let router = emulator();
+        let library = create_library(&router, &format!("entity-listing-library-{index}")).await;
+        submit(
+            &router,
+            &library,
+            case,
+            &upsert_submission(entity_type, &entities),
+        )
+        .await;
+
+        let answer = poll_listing(&router, &library, entity_type, entities.len(), case).await;
+        // Every entity of this pair was written by the one ingestion, so they share its
+        // instant and the listing order is decided by the id that breaks that tie.
+        let mut expected: Vec<String> = entities
+            .iter()
+            .map(|(entity_id, ..)| entity_id.clone())
+            .collect();
+        expected.sort();
+        assert_eq!(
+            listed_ids(&answer, case),
+            expected,
+            "case {case:?}: expected the ingested ids in listing order, got {answer:?}"
+        );
+        assert!(
+            answer.get("nextToken").is_none(),
+            "case {case:?}: the last page of a listing carries no token, got {answer:?}"
+        );
+
+        for summary in listed(&answer, case) {
+            let entity_id = string_at(&summary, "entityId", case);
+            let (_, language, description, phrases) = entities
+                .iter()
+                .find(|(ingested, ..)| *ingested == entity_id)
+                .unwrap_or_else(|| panic!("case {case:?}: {entity_id:?} was never ingested"));
+            assert_eq!(
+                summary.get("language").and_then(Value::as_str),
+                Some(*language),
+                "case {case:?}: expected the language the upsert carried for {entity_id:?}, got \
+                 {summary:?}"
+            );
+            assert_eq!(
+                summary.get("description").and_then(Value::as_str),
+                *description,
+                "case {case:?}: expected the description the upsert carried for {entity_id:?}, \
+                 got {summary:?}"
+            );
+            assert_eq!(
+                summary.get("numOfPhrases").and_then(Value::as_i64),
+                Some(*phrases as i64),
+                "case {case:?}: expected {phrases} phrase(s) counted for {entity_id:?}, got \
+                 {summary:?}"
+            );
+            // The summary is the NARROW projection: it counts the phrases rather than
+            // serving them.
+            assert!(
+                summary.get("phrases").is_none(),
+                "case {case:?}: a summary carries no phrases member, got {summary:?}"
+            );
+            let (status, read) = get_entity(&router, &library, entity_type, &entity_id).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: every listed id resolves, got {status} with {read:?} for \
+                 {entity_id:?}"
+            );
+            let reported = vocabulary(&read, case);
+            assert_eq!(
+                reported
+                    .get("phrases")
+                    .and_then(Value::as_array)
+                    .map(Vec::len),
+                Some(*phrases),
+                "case {case:?}: the read and the listing must agree about {entity_id:?}, got \
+                 {reported:?}"
+            );
+            assert_eq!(
+                timestamp_at(&summary, "lastModifiedTime", case),
+                timestamp_at(&reported, "lastModifiedTime", case),
+                "case {case:?}: the read and the listing must report one instant for \
+                 {entity_id:?}"
+            );
+        }
+    }
+}
+
+/// RULE: `maxResults` caps the page, a `nextToken` is handed back only while something is
+/// left after it, and resuming with that token continues the same listing — so walking the
+/// pages of one listing serves every entity of the pair exactly once, in the same order,
+/// whatever page size was asked for.
+///
+/// The rows differ along the page size: one at a time, a size that divides the collection, a
+/// size that does not, a size larger than the collection, the modelled maximum
+/// (`smithy_query(query="operation",operation="ListDataAutomationLibraryEntities")`:
+/// `maxResults` is `@range(min: 1, max: 1000)`) and no `maxResults` at all.
+#[tokio::test]
+async fn a_page_is_capped_and_a_token_resumes_the_listing() {
+    let router = emulator();
+    let library = create_library(&router, "entity-paging-library").await;
+    let entities: Vec<(String, &str, Option<&str>, usize)> = (0..5)
+        .map(|index| (format!("vocab-{index:02}"), "ES", None, 1))
+        .collect();
+    submit(
+        &router,
+        &library,
+        "the paged fixture",
+        &upsert_submission("VOCABULARY", &entities),
+    )
+    .await;
+    let whole = poll_listing(
+        &router,
+        &library,
+        "VOCABULARY",
+        entities.len(),
+        "the paged fixture",
+    )
+    .await;
+    let order = listed_ids(&whole, "the paged fixture");
+
+    // (case, the maxResults asked for, how many pages it takes)
+    let rows: [(&str, Option<i32>, usize); 6] = [
+        ("one at a time", Some(1), 5),
+        ("a size that does not divide the collection", Some(2), 3),
+        ("a size that divides the collection", Some(5), 1),
+        ("a size larger than the collection", Some(6), 1),
+        ("the modelled maximum", Some(1000), 1),
+        ("no maxResults at all", None, 1),
+    ];
+    for (case, max_results, pages) in rows {
+        let (served, sizes, walked) =
+            walk_listing(&router, &library, "VOCABULARY", max_results, case).await;
+        assert_eq!(
+            served, order,
+            "case {case:?}: the pages must serve the listing's order exactly once, got {served:?}"
+        );
+        assert_eq!(
+            walked, pages,
+            "case {case:?}: expected {pages} page(s), got {walked} of sizes {sizes:?}"
+        );
+        if let Some(limit) = max_results {
+            for size in &sizes {
+                assert!(
+                    *size <= limit as usize,
+                    "case {case:?}: a page must carry at most {limit} item(s), got {sizes:?}"
+                );
+            }
+        }
+    }
+}
+
+/// RULE: the listing is OF one (library, entity type) pair, so a pair nothing has ingested
+/// into enumerates nothing, and everything that resolves to nothing — an unresolved library,
+/// a library ARN of another Region, a `nextToken` this service never issued — is refused with
+/// the modelled error for it.
+#[tokio::test]
+async fn the_listing_is_of_one_pair_and_refuses_what_resolves_to_nothing() {
+    let router = emulator();
+    let library = create_library(&router, "entity-listing-scope-library").await;
+    let other = create_library(&router, "entity-listing-scope-other").await;
+    submit(
+        &router,
+        &library,
+        "fixture",
+        &upsert_submission(
+            "VOCABULARY",
+            &[("vocab-of-one-pair".to_string(), "IT", None, 1)],
+        ),
+    )
+    .await;
+    poll_listing(&router, &library, "VOCABULARY", 1, "fixture").await;
+
+    // (case, the library addressed, the entity type)
+    let empty: [(&str, &str, &str); 3] = [
+        (
+            "the other modelled entity type of the same library",
+            &library,
+            "RECOGNIZED_PERSON",
+        ),
+        ("a library nothing has ingested into", &other, "VOCABULARY"),
+        (
+            "the other entity type of that library",
+            &other,
+            "RECOGNIZED_PERSON",
+        ),
+    ];
+    for (case, library_arn, entity_type) in empty {
+        let (status, payload) = list_entities(&router, library_arn, entity_type, &json!({})).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: an empty pair is enumerated, not refused, got {status} with \
+             {payload:?}"
+        );
+        assert_eq!(
+            listed_ids(&payload, case),
+            Vec::<String>::new(),
+            "case {case:?}: expected no entity, got {payload:?}"
+        );
+        assert!(
+            payload.get("nextToken").is_none(),
+            "case {case:?}: an empty listing carries no token, got {payload:?}"
+        );
+    }
+
+    // (case, the library addressed, the page asked for, status, error code, the message AWS
+    // answers)
+    let refusals: [(&str, &str, Value, u16, &str, &str); 3] = [
+        (
+            "a library this store holds nothing under",
+            UNKNOWN_LIBRARY_ARN,
+            json!({}),
+            404,
+            "ResourceNotFoundException",
+            state::LIBRARY_ARN_NOT_FOUND_MESSAGE,
+        ),
+        (
+            "a library of another Region",
+            OTHER_REGION_LIBRARY_ARN,
+            json!({}),
+            400,
+            "ValidationException",
+            state::library_arn::WRONG_REGION_MESSAGE,
+        ),
+        (
+            "a nextToken this service never issued",
+            &library,
+            json!({ "nextToken": "not-a-token-this-service-issued" }),
+            400,
+            "ValidationException",
+            "nextToken is not a token this service issued",
+        ),
+    ];
+    for (case, library_arn, page, status, code, message) in refusals {
+        let (actual, refused) = list_entities(&router, library_arn, "VOCABULARY", &page).await;
+        assert_eq!(
+            actual, status,
+            "case {case:?}: expected {status}, got {actual} with {refused:?}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            code,
+            "case {case:?}: expected {code}, got {refused:?}"
+        );
+        assert_eq!(
+            refused.get("message").and_then(Value::as_str),
+            Some(message),
+            "case {case:?}: expected {message:?}, got {refused:?}"
+        );
+    }
+}
+
+/// RULE: the listing and the read of one entity are two projections of ONE fold, so a
+/// completed `DELETE` takes the entity it names out of both while every other entity of the
+/// pair stays where it was.
+#[tokio::test]
+async fn a_completed_delete_leaves_the_listing_without_that_entity() {
+    let router = emulator();
+    let library = create_library(&router, "entity-listing-delete-library").await;
+    let entities: Vec<(String, &str, Option<&str>, usize)> = ["vocab-kept-a", "vocab-removed", "vocab-kept-b"]
+        .iter()
+        .map(|entity_id| ((*entity_id).to_string(), "PT", None, 2))
+        .collect();
+    submit(
+        &router,
+        &library,
+        "the fixture",
+        &upsert_submission("VOCABULARY", &entities),
+    )
+    .await;
+    poll_listing(&router, &library, "VOCABULARY", entities.len(), "the fixture").await;
+
+    submit(
+        &router,
+        &library,
+        "the delete",
+        &submission(
+            "VOCABULARY",
+            "DELETE",
+            json!({ "deleteEntitiesInfo": { "entityIds": ["vocab-removed"] } }),
+        ),
+    )
+    .await;
+    let after = poll_listing(
+        &router,
+        &library,
+        "VOCABULARY",
+        entities.len() - 1,
+        "the delete",
+    )
+    .await;
+    assert_eq!(
+        listed_ids(&after, "the delete"),
+        vec!["vocab-kept-a".to_string(), "vocab-kept-b".to_string()],
+        "case \"the delete\": expected the entities the delete did not name, got {after:?}"
+    );
+    let (status, gone) = get_entity(&router, &library, "VOCABULARY", "vocab-removed").await;
+    assert_eq!(
+        status, 404,
+        "case \"the delete\": the read agrees with the listing, got {status} with {gone:?}"
+    );
 }

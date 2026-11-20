@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The ENTITIES a DataAutomationLibrary holds — what `GetDataAutomationLibraryEntity`
-//! resolves one of. The entity TYPES a library has acquired are
-//! [`super::library_entity_types`]; the jobs that put entities there are
-//! [`super::library_ingestion`].
+//! resolves one of and `ListDataAutomationLibraryEntities` enumerates. The entity TYPES a
+//! library has acquired are [`super::library_entity_types`]; the jobs that put entities
+//! there are [`super::library_ingestion`].
 //!
 //! RULE. The entities of a (library, entity type) pair are what the ingestion jobs accepted
 //! against that library have made of it: a job's payload applies when the clock has made
@@ -27,7 +27,8 @@
 //! releases its entities with them.
 //!
 //! Single-homed here because the read of one entity and the entity list of a library are two
-//! projections of that same fold.
+//! projections of that same fold, served one page at a time in this service's listing order
+//! ([`super::in_listing_order`]).
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -37,7 +38,11 @@ use super::library_ingestion::{
     DataAutomationLibraryIngestionJobRecord, INGESTION_JOB_COMPLETED,
 };
 use super::ComAmazonawsBedrockdataautomationAmazonbedrockkeystonebuildtimeserviceState as ServiceState;
-use crate::ops::types::{EntityDetails, InlinePayload, Phrase, UpsertEntityInfo, VocabularyEntity};
+use super::ListedResource;
+use crate::ops::types::{
+    DataAutomationLibraryEntitySummary, EntityDetails, InlinePayload, Phrase, UpsertEntityInfo,
+    VocabularyEntity, VocabularyEntitySummary,
+};
 
 /// [`super::LIBRARY_ARN_NOT_FOUND_MESSAGE`] for the resource this module holds: what a read
 /// answers when the (entity type, entity id) pair it was handed names no entity of the
@@ -48,6 +53,15 @@ use crate::ops::types::{EntityDetails, InlinePayload, Phrase, UpsertEntityInfo, 
 /// it is spelled here once and never formatted.
 pub const ENTITY_NOT_FOUND_MESSAGE: &str =
     "The specified entity ID and entity type is not found.";
+
+/// The largest page `ListDataAutomationLibraryEntities` serves, and the page size it uses
+/// when the request names no `maxResults`. The same value as [`super::LIBRARY_PAGE_LIMIT`]
+/// because it has the same source: this listing binds `maxResults` to the one modelled
+/// `MaxResults` shape
+/// (`smithy_query(query="operation",operation="ListDataAutomationLibraryEntities")` ->
+/// `@range(min: 1, max: 1000)`), so no caller can ask for more than this and an absent
+/// `maxResults` cannot serialise every entity a library holds either.
+pub const ENTITY_PAGE_LIMIT: i32 = super::LIBRARY_PAGE_LIMIT;
 
 /// The `operationType` whose submissions take entities OUT of the library they name.
 ///
@@ -85,6 +99,45 @@ impl LibraryEntityRecord {
             phrases: Some(self.phrases.clone()),
             last_modified_time: Some(self.last_modified_time),
         })
+    }
+
+    /// Project the entity onto the NARROW `DataAutomationLibraryEntitySummary` union an item
+    /// of a listing is.
+    ///
+    /// `smithy_query(query="shape",shape="DataAutomationLibraryEntitySummary")` carries the
+    /// single member `vocabulary` (`VocabularyEntitySummary`) — the same arm the read's
+    /// `EntityDetails` carries — and that summary reports the entity's identity, its
+    /// description and language, HOW MANY phrases it holds rather than the phrases themselves,
+    /// and the instant it was last written. Every member is filled from the same record the
+    /// read projects, so a listing and a read of one entity cannot disagree about it.
+    #[must_use]
+    pub fn to_entity_summary(&self) -> DataAutomationLibraryEntitySummary {
+        DataAutomationLibraryEntitySummary::Vocabulary(VocabularyEntitySummary {
+            entity_id: Some(self.entity_id.clone()),
+            description: self.description.clone(),
+            language: Some(self.language.clone()),
+            // `numOfPhrases` carries `@range(min: 1)`
+            // (`smithy_query(query="shape",shape="VocabularyEntitySummary")`), so an entity
+            // holding no phrase reports NO count rather than a zero the model does not admit.
+            num_of_phrases: i32::try_from(self.phrases.len())
+                .ok()
+                .filter(|count| *count >= 1),
+            last_modified_time: Some(self.last_modified_time),
+        })
+    }
+}
+
+impl ListedResource for LibraryEntityRecord {
+    /// The instant this entity was last written, then its `entityId` — the same shape of key
+    /// every listing of this service orders by ([`super::in_listing_order`]), with the entity's
+    /// own instant standing where a resource's `creationTime` does and its identity inside its
+    /// (library, entity type) pair breaking the tie between the entities one ingestion wrote.
+    fn order_key(&self) -> (i64, u32, &str) {
+        (
+            self.last_modified_time.secs(),
+            self.last_modified_time.subsec_nanos(),
+            self.entity_id.as_str(),
+        )
     }
 }
 
@@ -226,6 +279,26 @@ impl ServiceState {
     ) -> Option<LibraryEntityRecord> {
         self.library_entities(library_arn, entity_type, now)
             .remove(entity_id)
+    }
+
+    /// The entities of one (library, entity type) pair as of `now`, in this service's listing
+    /// order ([`LibraryEntityRecord::order_key`]) — what a page of
+    /// `ListDataAutomationLibraryEntities` is taken from.
+    ///
+    /// The same fold [`Self::library_entities`] serves the read of one entity from, so a
+    /// listing enumerates exactly the entities a read of each id would resolve.
+    #[must_use]
+    pub fn library_entities_in_order(
+        &self,
+        library_arn: &str,
+        entity_type: &str,
+        now: SystemTime,
+    ) -> Vec<LibraryEntityRecord> {
+        let held = self.library_entities(library_arn, entity_type, now);
+        super::in_listing_order(held.values())
+            .into_iter()
+            .cloned()
+            .collect()
     }
 }
 
