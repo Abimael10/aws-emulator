@@ -221,11 +221,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 };
                 // A delete begins from the group's settled, usable status: one
                 // still `creating`, or `modifying` from a change the clock has
-                // not carried through, is refused with the modelled state fault
-                // and the group is left exactly as it was.
+                // not carried through (a migration in flight among them), is
+                // refused with the modelled state fault — naming the status the
+                // group's own record carries — and the group is left exactly as
+                // it was.
                 if group.status != crate::state::STATUS_AVAILABLE {
                     return Err(invalid_state(
-                        crate::state::replication_group_delete_state_refusal(&key),
+                        crate::state::replication_group_delete_state_refusal(&key, &group.status),
                     ));
                 }
                 let members: Vec<(String, bool)> = group

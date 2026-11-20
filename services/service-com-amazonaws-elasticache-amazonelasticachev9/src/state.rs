@@ -787,10 +787,17 @@ pub fn cache_cluster_delete_state_refusal(cache_cluster_id: &str) -> String {
 
 /// How ElastiCache refuses a DELETE of a replication group that is not itself in
 /// a state a delete may begin from (one still `creating`, or `modifying` from a
-/// change the clock has not settled): the same sentence
-/// [`cache_cluster_delete_state_refusal`] states, about the group.
-pub fn replication_group_delete_state_refusal(replication_group_id: &str) -> String {
-    format!("Replication group {replication_group_id} is not in a valid state to be deleted.")
+/// change the clock has not settled, a migration in flight among them).
+///
+/// The sentence states the rule — the status the group carries is not one a
+/// delete may begin from — and its variable parts are the group as this service
+/// stores it ("this value is stored as a lowercase string") and the status its
+/// own record carries at this instant.
+pub fn replication_group_delete_state_refusal(replication_group_id: &str, status: &str) -> String {
+    format!(
+        "Replication group {replication_group_id} has status {status} which is not valid for \
+         deletion."
+    )
 }
 
 /// How ElastiCache refuses a replica-count change that asks for the count a

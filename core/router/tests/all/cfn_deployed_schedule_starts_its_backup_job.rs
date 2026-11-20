@@ -345,10 +345,12 @@ struct Row {
     schedule: &'static str,
 }
 
-/// Every form a `ScheduleExpression` states a cadence in, each with its first firing falling due
-/// the same span after the rule can reach a target. Which INSTANTS each form then names is the
-/// EventBridge service crate's own reading; what a row here pins is the chain that first firing
-/// drives.
+/// Every form a `ScheduleExpression` states a cadence in. Which INSTANTS each form names is the
+/// EventBridge service crate's own reading — a `rate(...)` states an interval and no instant, so
+/// its first firing falls inside the first period, while a `cron(...)` NAMES its instants and
+/// fires at the first one ahead of the clock — so the cron row names an instant in every minute,
+/// the finest resolution that format has, rather than one a row would have to wait out the rest
+/// of an hour for. What a row here pins is the chain that first firing drives.
 fn rows() -> Vec<Row> {
     vec![
         Row {
@@ -363,8 +365,11 @@ fn rows() -> Vec<Row> {
         },
         Row {
             case: "a cron schedule naming its own instants",
-            slug: "cron-hourly",
-            schedule: "cron(0 * * * ? *)",
+            slug: "cron-minutely",
+            // The six-field, minute-resolution form `ScheduleExpression` documents ("Minutes
+            // Hours Day-of-month Month Day-of-week Year"), with `?` for the day of the week:
+            // its instants fall at the top of every minute.
+            schedule: "cron(* * * * ? *)",
         },
     ]
 }

@@ -15,9 +15,11 @@
 //! The rule under test: a delete is served only while the group AND every member cluster it
 //! is made of are in a state a delete may begin from (`available`); a member in any other
 //! state — one being snapshotted, one still `creating`, one `modifying` — is refused
-//! `InvalidReplicationGroupState` (HTTP 400) naming THAT member cluster, and the group is
-//! left exactly as it was. Once the clock has settled the member, the same call is served:
-//! the group answers `deleting` and it and its member clusters are gone.
+//! `InvalidReplicationGroupState` (HTTP 400) naming THAT member cluster, a group that is
+//! itself in another state is refused the same fault naming the group and the status it
+//! carries, and either way the group is left exactly as it was. Once the clock has settled
+//! the work that status stood for, the same call is served: the group answers `deleting` and
+//! it and its member clusters are gone.
 //!
 //! The tables span what the rule generalises over: WHICH member of the group is held
 //! (its only member, the primary of a shard that has a replica, a replica, the primary of
@@ -30,7 +32,7 @@ use std::time::Duration;
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
 use crate::cache_data_plane::{command, endpoint_of, open, Resp};
-use crate::harness::{params, poll_until, Emulator, Reply, REGION};
+use crate::harness::{assert_refusal, params, poll_until, Emulator, Reply, REGION};
 use crate::lifecycle_convergence::{every_pending_change_due_in, HELD_OUT_OF_REACH};
 
 /// Create one replication group and answer the create's reply.
@@ -264,8 +266,11 @@ async fn a_delete_of_a_group_the_clock_has_not_settled_is_refused_in_the_groups_
     );
     assert_eq!(
         refused.error_message(),
-        "Replication group fresh-rg is not in a valid state to be deleted.",
-        "the refusal must name the stored group id, got {}",
+        format!(
+            "Replication group fresh-rg has status {} which is not valid for deletion.",
+            state::STATUS_CREATING
+        ),
+        "the refusal must name the stored group id and the status it carries, got {}",
         refused.body
     );
     every_pending_change_due_in(&emulator, Duration::ZERO);
@@ -304,8 +309,11 @@ async fn a_delete_of_a_group_the_clock_has_not_settled_is_refused_in_the_groups_
     );
     assert_eq!(
         refused.error_message(),
-        "Replication group scaling-rg is not in a valid state to be deleted.",
-        "the refusal must name the stored group id, got {}",
+        format!(
+            "Replication group scaling-rg has status {} which is not valid for deletion.",
+            state::STATUS_MODIFYING
+        ),
+        "the refusal must name the stored group id and the status it carries, got {}",
         refused.body
     );
 
@@ -331,6 +339,152 @@ async fn a_delete_of_a_group_the_clock_has_not_settled_is_refused_in_the_groups_
             deleted.body
         );
         assert_group_gone(&emulator, id, id).await;
+    }
+}
+
+/// One status-gate row: the case, the group id, the pairs that create it, the ACTION that
+/// takes the group out of `available` (the `awsQuery` action name, empty when the row holds
+/// the create itself) with the pairs that call it, and the status the group then carries.
+type StatusGateCase = (
+    &'static str,
+    &'static str,
+    &'static [(&'static str, &'static str)],
+    &'static str,
+    &'static [(&'static str, &'static str)],
+    &'static str,
+);
+
+#[tokio::test]
+async fn the_status_gate_refusal_reports_the_status_the_group_itself_carries() {
+    let emulator = Emulator::new();
+    // The axis: WHICH outstanding piece of work the group's status stands for when the
+    // delete arrives — a create the clock has not carried through, a data migration in
+    // flight, a failover setting being applied, a replica being added. The refusal is the
+    // one sentence for all of them, and its status is read off the group's own record, so
+    // each row asserts the sentence built from the status `DescribeReplicationGroups`
+    // reports rather than from a literal.
+    let cases: [StatusGateCase; 4] = [
+        (
+            "a create the clock has not carried through",
+            "gate-fresh-rg",
+            &[("ReplicasPerNodeGroup", "0")],
+            "",
+            &[],
+            state::STATUS_CREATING,
+        ),
+        (
+            "a data migration in flight",
+            "gate-mig-rg",
+            &[("NumCacheClusters", "2"), ("AutomaticFailoverEnabled", "true")],
+            "StartMigration",
+            &[
+                ("CustomerNodeEndpointList.member.1.Address", "10.0.0.7"),
+                ("CustomerNodeEndpointList.member.1.Port", "6379"),
+            ],
+            state::STATUS_MODIFYING,
+        ),
+        (
+            "a failover setting being applied",
+            "gate-failover-rg",
+            &[("NumCacheClusters", "2")],
+            "ModifyReplicationGroup",
+            &[
+                ("AutomaticFailoverEnabled", "true"),
+                ("ApplyImmediately", "true"),
+            ],
+            state::STATUS_MODIFYING,
+        ),
+        (
+            "a replica being added",
+            "gate-grow-rg",
+            &[("ReplicasPerNodeGroup", "0")],
+            "IncreaseReplicaCount",
+            &[("NewReplicaCount", "1"), ("ApplyImmediately", "true")],
+            state::STATUS_MODIFYING,
+        ),
+    ];
+
+    for (case, id, extra, action, action_pairs, expected_status) in cases {
+        if action.is_empty() {
+            let created = create_group(&emulator, id, extra).await;
+            assert_eq!(
+                created.status, 200,
+                "case {case:?}: the create must answer 200, got {} {}",
+                created.status, created.body
+            );
+        } else {
+            available_group(&emulator, case, id, extra).await;
+            let mut pairs = params(&[("ReplicationGroupId", id)]);
+            pairs.extend(params(action_pairs));
+            let started = emulator.call(action, &pairs).await;
+            assert_eq!(
+                started.status, 200,
+                "case {case:?}: {action} must be accepted, got {} {}",
+                started.status, started.body
+            );
+        }
+        // The outstanding work is held out of reach, so the group really is in its
+        // transient status when the delete arrives, whatever the host is doing.
+        every_pending_change_due_in(&emulator, HELD_OUT_OF_REACH);
+
+        let held = describe_group(&emulator, id).await;
+        let reported = held
+            .text("ReplicationGroup/Status")
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            reported, expected_status,
+            "case {case:?}: the group must report {expected_status}, got {}",
+            held.body
+        );
+
+        let refused = delete_group(&emulator, id, &[]).await;
+        assert_refusal(
+            case,
+            &refused,
+            400,
+            "InvalidReplicationGroupState",
+            &format!(
+                "Replication group {id} has status {reported} which is not valid for deletion."
+            ),
+        );
+        // "The group must survive the refusal": exactly the one group is still reported,
+        // in the status it was in.
+        let still = describe_group(&emulator, id).await;
+        assert_eq!(
+            (
+                still.status,
+                still.all("ReplicationGroup/ReplicationGroupId"),
+                still.text("ReplicationGroup/Status")
+            ),
+            (200, vec![id], Some(reported.as_str())),
+            "case {case:?}: the refused delete must leave the group as it was, got {} {}",
+            still.status,
+            still.body
+        );
+
+        // Once the clock has settled the work the status stood for, the identical delete
+        // is served and the group goes away.
+        every_pending_change_due_in(&emulator, Duration::ZERO);
+        poll_until(
+            &emulator,
+            REGION,
+            case,
+            "the group reaching available",
+            "DescribeReplicationGroups",
+            &params(&[("ReplicationGroupId", id)]),
+            |reply| reply.text("ReplicationGroup/Status") == Some(state::STATUS_AVAILABLE),
+        )
+        .await;
+        let deleted = delete_group(&emulator, id, &[]).await;
+        assert_eq!(
+            (deleted.status, deleted.text("ReplicationGroup/Status")),
+            (200, Some(state::STATUS_DELETING)),
+            "case {case:?}: the settled group must be deletable, got {} {}",
+            deleted.status,
+            deleted.body
+        );
+        assert_group_gone(&emulator, case, id).await;
     }
 }
 

@@ -113,8 +113,10 @@ pub(crate) const DYNAMODB_TYPE: &str = "DynamoDB";
 
 /// How long a row waits for the handover and the run it must see, how long the row that must
 /// see NOTHING keeps looking for one, and how often either looks. Each is generous: nothing
-/// here is a measurement of how fast the host runs.
-pub(crate) const RUN_BUDGET: Duration = Duration::from_secs(60);
+/// here is a measurement of how fast the host runs. The wait covers a whole minute, because a
+/// row whose rule carries a `cron(...)` schedule waits for an instant that expression NAMES —
+/// at minute resolution, the finest that format has — and not for a span this emulator chooses.
+pub(crate) const RUN_BUDGET: Duration = Duration::from_secs(180);
 pub(crate) const QUIET_WINDOW: Duration = Duration::from_secs(3);
 pub(crate) const LOOK_INTERVAL: Duration = Duration::from_millis(50);
 
