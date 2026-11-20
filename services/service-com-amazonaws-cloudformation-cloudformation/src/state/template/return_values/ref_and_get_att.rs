@@ -2088,6 +2088,42 @@ pub(crate) fn return_values(
             );
             (arn, attributes)
         }
+        // AWS IoT Core Device Advisor's own control plane: the test suite an
+        // `AWS::IoTCoreDeviceAdvisor::SuiteDefinition` declares. "Ref returns the suite
+        // definition id" (the type's primary identifier); Fn::GetAtt reads
+        // `SuiteDefinitionArn`, `SuiteDefinitionId` and `SuiteDefinitionVersion`. That service
+        // MINTS the id — `CreateSuiteDefinition` takes no identifier for the suite and answers
+        // the `suiteDefinitionId` it drew (a `UUID`, `@length 12..36`) with the
+        // `suitedefinition/<id>` ARN built around it — so the id and the ARN here are
+        // STAND-INS of that form, and the VERSION label is that service's own to keep; all
+        // three are re-pointed at what the create really answered
+        // ([`super::provisioner::Provisioner::IotCoreDeviceAdvisorSuiteDefinition`]).
+        IOT_CORE_DEVICE_ADVISOR_SUITE_DEFINITION => {
+            let suite_definition_id = generated_uuid(resource_type, name);
+            let arn = ::emulator_server::emulator_arn(
+                IOT_DEVICE_ADVISOR_ARN_NAMESPACE,
+                region,
+                &format!(
+                    "{IOT_CORE_DEVICE_ADVISOR_SUITE_DEFINITION_PATH}/{suite_definition_id}"
+                ),
+            );
+            attributes.insert(
+                IOT_CORE_DEVICE_ADVISOR_SUITE_DEFINITION_ARN_ATTRIBUTE.to_string(),
+                arn,
+            );
+            attributes.insert(
+                IOT_CORE_DEVICE_ADVISOR_SUITE_DEFINITION_ID_ATTRIBUTE.to_string(),
+                suite_definition_id.clone(),
+            );
+            attributes.insert(
+                IOT_CORE_DEVICE_ADVISOR_SUITE_DEFINITION_VERSION_ATTRIBUTE.to_string(),
+                service_assigned_document(
+                    name,
+                    IOT_CORE_DEVICE_ADVISOR_SUITE_DEFINITION_VERSION_ATTRIBUTE,
+                ),
+            );
+            (suite_definition_id, attributes)
+        }
         // Backup Gateway's own control plane: the hypervisor an
         // `AWS::BackupGateway::Hypervisor` declares. "Ref returns the hypervisor ARN" (the
         // type's primary identifier); Fn::GetAtt reads `HypervisorArn`. That service MINTS

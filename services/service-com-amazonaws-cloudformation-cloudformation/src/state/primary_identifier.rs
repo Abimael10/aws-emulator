@@ -126,6 +126,13 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         // returns the hypervisor ARN") — the `ServerArn` every call on a hypervisor takes; the
         // type's own `Name` is only what the hypervisor is called.
         BACKUP_GATEWAY_HYPERVISOR => "HypervisorArn",
+        // An IoT Core Device Advisor suite definition, identified by the id that service minted
+        // for it ("Ref returns the suite definition id") — the `suiteDefinitionId` every call on
+        // one takes; the suite's own name lives inside its configuration and two accounts' suites
+        // may share one.
+        IOT_CORE_DEVICE_ADVISOR_SUITE_DEFINITION => {
+            IOT_CORE_DEVICE_ADVISOR_SUITE_DEFINITION_ID_ATTRIBUTE
+        }
         // A Recycle Bin retention rule, identified by the ARN that service built around the
         // identifier it minted ("Ref returns the rule ARN") — the type declares no name a
         // client could name one by.

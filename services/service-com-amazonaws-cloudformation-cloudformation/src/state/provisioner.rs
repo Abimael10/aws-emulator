@@ -514,6 +514,7 @@ use super::template::{
     GLUE_TABLE_OPTIMIZER, GRAFANA_WORKSPACE,
     GUARDDUTY_DETECTOR, GUARDDUTY_IP_SET,
     IAM_ACCESS_KEY,
+    IOT_CORE_DEVICE_ADVISOR_SUITE_DEFINITION,
     KINESIS_STREAM,
     KMS_ALIAS, KMS_KEY,
     MASTER_USER_SECRET_ARN_ATTRIBUTE,
@@ -1238,6 +1239,13 @@ pub(super) enum Provisioner {
     /// the `spendingLimitArn` the type publishes — the handle every spending-limit API takes
     /// — so it is read off that create's own answer and is the identity a `Ref` resolves to.
     BraketSpendingLimit,
+    /// `AWS::IoTCoreDeviceAdvisor::SuiteDefinition`: the test suite AWS IoT Core Device
+    /// Advisor's own `CreateSuiteDefinition` records, `UpdateSuiteDefinition` reconfigures and
+    /// `DeleteSuiteDefinition` removes. That service DRAWS the `suiteDefinitionId` the type
+    /// publishes — the handle every suite-definition API takes — so it is read off that
+    /// create's own answer and is the identity a `Ref` resolves to
+    /// ([`iot_core_device_advisor_suite_definitions`]).
+    IotCoreDeviceAdvisorSuiteDefinition,
     /// `AWS::BCM::Dashboard` and `AWS::BCM::ScheduledReport`: the Billing and Cost
     /// Management Dashboards dashboard `CreateDashboard` makes under the name the template
     /// states, and the scheduled report `CreateScheduledReport` makes ON one of those
@@ -1614,6 +1622,9 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
             Some(Provisioner::BedrockAgentCoreWorkloadIdentity)
         }
         BRAKET_SPENDING_LIMIT => Some(Provisioner::BraketSpendingLimit),
+        IOT_CORE_DEVICE_ADVISOR_SUITE_DEFINITION => {
+            Some(Provisioner::IotCoreDeviceAdvisorSuiteDefinition)
+        }
         BCM_DASHBOARD => Some(Provisioner::BcmDashboard),
         BCM_SCHEDULED_REPORT => Some(Provisioner::BcmScheduledReport),
         APPLICATION_SIGNALS_SERVICE_LEVEL_OBJECTIVE => {
@@ -2453,6 +2464,13 @@ impl Provisioner {
             // declaration asks for.
             Self::BraketSpendingLimit => {
                 create_braket_spending_limit(ctx, region, resource, propagated).await
+            }
+            // `AWS::IoTCoreDeviceAdvisor::SuiteDefinition` publishes `Tags` as a list of
+            // pairs, which `CreateSuiteDefinition` takes as the `TagMap` of its own `tags`
+            // member, so a suite a stack creates carries the tags CloudFormation gives it
+            // beside the ones the declaration asks for.
+            Self::IotCoreDeviceAdvisorSuiteDefinition => {
+                create_suite_definition(ctx, region, resource, propagated).await
             }
             // Both `AWS::BCM::*` types publish `Tags`, and each of their creates takes a
             // `resourceTags` list of its own, so a dashboard and a scheduled report a stack
@@ -3501,6 +3519,11 @@ impl Provisioner {
             Self::BraketSpendingLimit => {
                 delete_braket_spending_limit(ctx, region, physical_resource_id).await
             }
+            // The delete addresses the suite by the id AWS IoT Core Device Advisor drew for
+            // it, which is this resource's physical id.
+            Self::IotCoreDeviceAdvisorSuiteDefinition => {
+                delete_suite_definition(ctx, region, physical_resource_id).await
+            }
             // Each delete addresses its resource by the ARN that service minted for it, which
             // is this resource's physical id.
             Self::BcmDashboard => delete_bcm_dashboard(ctx, region, physical_resource_id).await,
@@ -3666,6 +3689,11 @@ mod bedrock_sessions;
 /// the return-value catalogue key their entries for those types by.
 pub(crate) mod sagemaker_resources;
 mod braket_spending_limits;
+/// The AWS IoT Core Device Advisor SUITE DEFINITION arms: the test suite an
+/// `AWS::IoTCoreDeviceAdvisor::SuiteDefinition` declares, recorded in the service that owns it
+/// so a client's own reads — and a suite run started against it — resolve the id the stack
+/// publishes.
+mod iot_core_device_advisor_suite_definitions;
 /// The Billing and Cost Management Dashboards arms: the dashboard an `AWS::BCM::Dashboard`
 /// declares and the scheduled report an `AWS::BCM::ScheduledReport` declares, created in the
 /// service that owns them so a client's own reads — and an execution of the report — resolve
@@ -3890,6 +3918,7 @@ use bedrock_flows::*;
 use bedrock_sessions::*;
 use sagemaker_resources::*;
 use braket_spending_limits::*;
+use iot_core_device_advisor_suite_definitions::*;
 use bcm_dashboards::*;
 use application_signals::*;
 use cleanrooms_ml_training_datasets::*;

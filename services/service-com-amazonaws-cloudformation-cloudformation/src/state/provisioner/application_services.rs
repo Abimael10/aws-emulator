@@ -2426,6 +2426,32 @@ pub(crate) fn tags_as_map(tags: &[(String, String)]) -> Map<String, Value> {
         .collect()
 }
 
+/// The tags one answer reports as a `TagMap` under `member`, as the ordered pairs the
+/// reconciliation compares ([`tag_delta`]).
+///
+/// The inverse of [`tags_as_map`] over a service's own answer: a tag read whose wire shape is a
+/// MAP of key to value, under the member that service's model spells it with (`tags`, `Tags`).
+/// A key that is empty is not a tag and contributes nothing, and a value that is not text
+/// contributes the empty string, because a tag value is a string on every wire that takes one.
+///
+/// The ONE implementation of that reading, so two arms handed the same answer cannot compare it
+/// differently. A service whose tag read answers a LIST of `{Key, Value}` structures is read by
+/// [`declared_tags`] instead, which is the shape a declaration's own `Tags` property shares.
+pub(super) fn reported_tag_map(answered: &Value, member: &str) -> Vec<(String, String)> {
+    let Some(Value::Object(tags)) = answered.get(member) else {
+        return Vec::new();
+    };
+    tags.iter()
+        .filter(|(key, _)| !key.is_empty())
+        .map(|(key, value)| {
+            (
+                key.clone(),
+                value.as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
 /// The two halves of bringing a resource's tags to the set this deployment gives it: the
 /// tags to WRITE — one the resource does not carry at all, or carries with another value —
 /// and the KEYS to drop, which are the ones it carries that the set no longer states.

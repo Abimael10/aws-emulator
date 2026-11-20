@@ -359,6 +359,14 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
             Arc::clone(&engine),
         ),
     );
+    // AWS IoT Core Device Advisor, for the `AWS::IoTCoreDeviceAdvisor::SuiteDefinition` a stack
+    // really creates there, so a suite that deploys one reads the test suite back through that
+    // service's own wire, by the id the stack publishes.
+    router.register_service(
+        service_com_amazonaws_iotdeviceadvisor_iotsenateservice::EmulatedService::new(Arc::clone(
+            &engine,
+        )),
+    );
     // AWS Network Security Manager, for the rule, the template, the policy and the scope an
     // `AWS::NetworkSecurityManager::*` a stack declares is really created there, so a suite
     // that deploys one reads those entities back through that service's own wire, by the ARNs

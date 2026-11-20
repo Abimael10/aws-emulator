@@ -11386,6 +11386,7 @@ dependencies = [
  "service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-iot-awsiotservice",
+ "service-com-amazonaws-iotdeviceadvisor-iotsenateservice",
  "service-com-amazonaws-kinesis-kinesis-20131202",
  "service-com-amazonaws-lambda-awsgirapiservice",
  "service-com-amazonaws-memorydb-amazonmemorydb",

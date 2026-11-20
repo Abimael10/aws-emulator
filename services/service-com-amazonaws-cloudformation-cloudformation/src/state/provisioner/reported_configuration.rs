@@ -625,6 +625,10 @@ impl Provisioner {
             Self::BraketSpendingLimit => {
                 describe_braket_spending_limit(ctx, region, physical_resource_id).await
             }
+            // That service's own read of the suite, by the id it drew for it.
+            Self::IotCoreDeviceAdvisorSuiteDefinition => {
+                describe_suite_definition(ctx, region, physical_resource_id).await
+            }
             // That service's own reads of the dashboard and of the scheduled report, each by
             // the ARN it minted for the resource.
             Self::BcmDashboard => {

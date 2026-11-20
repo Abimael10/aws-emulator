@@ -453,6 +453,56 @@ pub(super) const CLEANROOMSML_TRAINING_DATASET_PATH: &str = "training-dataset";
 /// `AWS::Braket::SpendingLimit`'s `CreatedAt` does.
 pub const CLEANROOMSML_TRAINING_DATASET_ARN_ATTRIBUTE: &str = "TrainingDatasetArn";
 
+/// The resource type of an IOT CORE DEVICE ADVISOR SUITE DEFINITION: the test suite AWS IoT
+/// Core Device Advisor's own `CreateSuiteDefinition` records, which a suite RUN is then started
+/// from.
+///
+/// The middle segment is `IoTCoreDeviceAdvisor`, as the AWS resource and property types
+/// reference spells the namespace — NOT that model's own `awsService.cloudFormationName`
+/// (`IotDeviceAdvisor`): the type is what a template spells, the same position
+/// [`ECR_PUBLIC_REPOSITORY`] is in.
+///
+/// "Ref returns the suite definition id" and `Fn::GetAtt` reads
+/// [`IOT_CORE_DEVICE_ADVISOR_SUITE_DEFINITION_ATTRIBUTES`]. That service MINTS the id:
+/// `CreateSuiteDefinition` takes no identifier for the suite — the declaration states the
+/// suite's configuration and its tags — and answers the `suiteDefinitionId` it drew (a `UUID`,
+/// `@length 12..36`) with the `suitedefinition/<id>` ARN built around it, which is the handle
+/// `GetSuiteDefinition`, `UpdateSuiteDefinition` and `DeleteSuiteDefinition` each address one
+/// by. No name CloudFormation decides is such a uuid, so neither the id nor the ARN can be
+/// computed from the template — that is what [`identity_is_service_assigned`] names this type
+/// for.
+pub const IOT_CORE_DEVICE_ADVISOR_SUITE_DEFINITION: &str =
+    "AWS::IoTCoreDeviceAdvisor::SuiteDefinition";
+
+/// That service's ARN namespace, which is the namespace a suite-definition ARN carries (its
+/// model's own `awsService.arnNamespace`, `iotdeviceadvisor`), and the resource path such an ARN
+/// carries before the id that service minted.
+pub const IOT_DEVICE_ADVISOR_ARN_NAMESPACE: &str = "iotdeviceadvisor";
+pub(super) const IOT_CORE_DEVICE_ADVISOR_SUITE_DEFINITION_PATH: &str = "suitedefinition";
+
+/// Every `Fn::GetAtt` attribute an [`IOT_CORE_DEVICE_ADVISOR_SUITE_DEFINITION`] publishes, in
+/// the sorted order a resource's own attribute map holds them in: the ARN that service built,
+/// the id it minted and the version label it keeps the suite's live configuration under.
+///
+/// All three are values only AWS IoT Core Device Advisor produces, so each is a STAND-IN until
+/// the deployment has re-pointed it at what that service really answered
+/// ([`crate::state::provisioner::Provisioner::IotCoreDeviceAdvisorSuiteDefinition`]).
+pub(super) const IOT_CORE_DEVICE_ADVISOR_SUITE_DEFINITION_ATTRIBUTES: &[&str] = &[
+    "SuiteDefinitionArn",
+    "SuiteDefinitionId",
+    "SuiteDefinitionVersion",
+];
+
+/// The two of those attributes the naming rules compute from the id they stand in with: the
+/// ARN built around it, and the id itself — which is also what the type's `Ref` returns.
+pub const IOT_CORE_DEVICE_ADVISOR_SUITE_DEFINITION_ARN_ATTRIBUTE: &str = "SuiteDefinitionArn";
+pub const IOT_CORE_DEVICE_ADVISOR_SUITE_DEFINITION_ID_ATTRIBUTE: &str = "SuiteDefinitionId";
+
+/// The remaining one, which no naming rule can compute: the label that service keeps the
+/// suite's live configuration under, reported off its own read of the suite.
+pub const IOT_CORE_DEVICE_ADVISOR_SUITE_DEFINITION_VERSION_ATTRIBUTE: &str =
+    "SuiteDefinitionVersion";
+
 /// The `AWS::<cloudFormationName>::<Resource>` type of a BACKUP GATEWAY HYPERVISOR: the
 /// on-premises host Backup Gateway reads virtual machines off, connected to by that service's
 /// own `ImportHypervisorConfiguration`. The middle segment is that model's own

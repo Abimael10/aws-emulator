@@ -653,6 +653,15 @@ impl Provisioner {
             // Every other type's in-place update is its own entry here, exactly as its
             // create and delete are: until one is written, nothing is asked of the owning
             // service and the deployment says so.
+            // `UpdateSuiteDefinition` takes the suite's id together with its WHOLE
+            // configuration — the same document the create carried — so a changed declaration
+            // reaches the suite AWS IoT Core Device Advisor already holds rather than replacing
+            // it, and that service allocates the new version label.
+            Self::IotCoreDeviceAdvisorSuiteDefinition => {
+                update_suite_definition(ctx, region, resource, declared)
+                    .await
+                    .map(Some)
+            }
             _ => Ok(None),
         }
     }
@@ -812,6 +821,13 @@ impl Provisioner {
                     &launch_template_tags(declared, propagated),
                 )
                 .await
+            }
+            // A suite definition's tags are that service's own `TagResource` and
+            // `UntagResource`: `CreateSuiteDefinition`'s `tags` map applies to the suite that
+            // call creates, and `UpdateSuiteDefinition` carries no tags at all, so this is
+            // where the set a suite is to end up carrying is reconciled.
+            Self::IotCoreDeviceAdvisorSuiteDefinition => {
+                retag_suite_definition(ctx, region, resource, declared, propagated).await
             }
             // Every other type's re-tagging is its own entry here, for the same reason its
             // create, update and delete are: the tag set is the same for every type, but the

@@ -3100,6 +3100,10 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     GUARDDUTY_IP_SET,
     IAM_ACCESS_KEY,
     "AWS::IAM::Role",
+    // The AWS IoT Core Device Advisor suite definition, publishing the id that service mints
+    // for it, the ARN built around that id and the version label it keeps the suite's live
+    // configuration under.
+    IOT_CORE_DEVICE_ADVISOR_SUITE_DEFINITION,
     KMS_KEY,
     // The newer Lake Formation permission type, publishing the two halves of the composite
     // identifier of the grant it declares.

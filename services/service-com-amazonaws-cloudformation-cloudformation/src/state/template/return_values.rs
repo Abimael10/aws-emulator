@@ -332,6 +332,13 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         // A hypervisor publishes the ARN Backup Gateway minted for it, which is the one return
         // value these naming rules compute a stand-in for before it exists.
         BACKUP_GATEWAY_HYPERVISOR => BACKUP_GATEWAY_HYPERVISOR_ATTRIBUTES,
+        // An IoT Core Device Advisor suite definition publishes the id that service mints for
+        // it, the ARN built around that id, and the version label it keeps the suite's live
+        // configuration under — the three return values these naming rules compute a stand-in
+        // for before the suite exists.
+        IOT_CORE_DEVICE_ADVISOR_SUITE_DEFINITION => {
+            IOT_CORE_DEVICE_ADVISOR_SUITE_DEFINITION_ATTRIBUTES
+        }
         // A retention rule publishes the ARN and the identifier Recycle Bin minted for it and
         // the lock state it keeps, all three of which these naming rules compute a stand-in
         // for before the rule exists.
@@ -969,6 +976,15 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // one by. A name CloudFormation decides is no such ARN, so the identity in force is
         // the one that service answered.
         || resource_type == BACKUP_GATEWAY_HYPERVISOR
+        // An IoT CORE DEVICE ADVISOR suite definition is one more: `CreateSuiteDefinition`
+        // takes no identifier for the suite — the declaration states the suite's configuration
+        // and its tags — and answers the `suiteDefinitionId` that service drew (a `UUID`,
+        // `@length 12..36`) with the `suitedefinition/<id>` ARN built around it. That id is
+        // what "Ref returns the suite definition id" publishes and what `GetSuiteDefinition`,
+        // `UpdateSuiteDefinition` and `DeleteSuiteDefinition` each address one by, and no name
+        // CloudFormation decides is such a uuid, so the identity in force is the one that
+        // service answered.
+        || resource_type == IOT_CORE_DEVICE_ADVISOR_SUITE_DEFINITION
         // A NEPTUNE ANALYTICS graph and a snapshot of one are two more: `CreateGraph` takes
         // the graph's NAME and `CreateGraphSnapshot` the snapshot's, neither takes an
         // identifier, and each answers the id that service minted — `^g-[a-z0-9]{10}$` for a

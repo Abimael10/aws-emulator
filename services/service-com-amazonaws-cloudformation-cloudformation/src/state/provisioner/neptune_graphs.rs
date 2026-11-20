@@ -750,20 +750,9 @@ fn reported_graph_attributes(graph: &Value) -> BTreeMap<String, String> {
 
 /// The tags one `ListTagsForResource` answer reports, as the ordered pairs the reconciliation
 /// compares: that service answers them as a `TagMap`, under the lower-cased member its own
-/// model spells ([`TAGS_MEMBER`]).
+/// model spells ([`TAGS_MEMBER`]), which is the shared reading of that shape.
 fn reported_tags(answered: &Value) -> Vec<(String, String)> {
-    let Some(Value::Object(tags)) = answered.get(TAGS_MEMBER) else {
-        return Vec::new();
-    };
-    tags.iter()
-        .filter(|(key, _)| !key.is_empty())
-        .map(|(key, value)| {
-            (
-                key.clone(),
-                value.as_str().map(str::to_string).unwrap_or_default(),
-            )
-        })
-        .collect()
+    reported_tag_map(answered, TAGS_MEMBER)
 }
 
 /// The NAME the graph is created under: the `GraphName` the declaration states, or — for a
