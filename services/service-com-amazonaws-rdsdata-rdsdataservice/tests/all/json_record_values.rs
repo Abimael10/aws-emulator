@@ -460,6 +460,121 @@ async fn a_postgresql_typed_projection_is_executed_and_returns_its_result_envelo
     );
 }
 
+/// RULE: a result set two of whose columns carry ONE LABEL cannot be returned keyed BY
+/// that label, so `formatRecordsAs=JSON` refuses it with the modelled
+/// `UnsupportedResultException` instead of emitting a JSON object with a repeated member
+/// name — while the SAME result set in `records`, where the position and not the name tells
+/// the columns apart, is served. Giving each column its own label makes the same query
+/// serve under JSON, and labels compare EXACTLY, as JSON member names do.
+///
+/// The rows differ along how the duplicate arises (one column selected twice, both sides
+/// of a self-join, two joined tables that each declare the name, one alias written twice)
+/// and along how a caller gives each column its own name (an alias on one side, an alias on
+/// both, and labels that differ only in case, which are two member names and so two
+/// columns).
+#[tokio::test]
+async fn a_result_set_with_two_columns_of_one_name_is_refused_under_json() {
+    let api = DataApi::new();
+    for ddl in [
+        "CREATE TABLE nodes (id INT, label VARCHAR(16))",
+        "CREATE TABLE edges (id INT, weight INT)",
+        "INSERT INTO nodes (id, label) VALUES (1, 'one'), (2, 'two')",
+        "INSERT INTO edges (id, weight) VALUES (1, 10), (2, 20)",
+    ] {
+        api.run(json!({"sql": ddl})).await;
+    }
+
+    // What AWS tells a caller whose result set carries one name twice: fixed text, naming
+    // neither the column nor the statement.
+    const REFUSAL: &str = "The result can't be converted to JSON because it has a duplicate column.";
+
+    // (case, the statement, the JSON document it is served as — `null` where the JSON form
+    //  must be refused instead)
+    let cases = [
+        (
+            "one column selected twice",
+            "SELECT id, id FROM nodes WHERE id = 1",
+            Value::Null,
+        ),
+        (
+            "both sides of a self-join",
+            "SELECT a.id, b.id FROM nodes a JOIN nodes b ON a.id = b.id WHERE a.id = 1",
+            Value::Null,
+        ),
+        (
+            "two joined tables that each declare the name",
+            "SELECT nodes.id, edges.id FROM nodes JOIN edges ON nodes.id = edges.id \
+             WHERE nodes.id = 1",
+            Value::Null,
+        ),
+        (
+            "one alias written twice",
+            "SELECT id AS node, label AS node FROM nodes WHERE id = 1",
+            Value::Null,
+        ),
+        (
+            "an alias on one side",
+            "SELECT a.id, b.id AS other FROM nodes a JOIN nodes b ON a.id = b.id \
+             WHERE a.id = 1",
+            json!([{"id": 1, "other": 1}]),
+        ),
+        (
+            "an alias on both sides",
+            "SELECT a.id AS left_id, b.id AS right_id FROM nodes a JOIN nodes b \
+             ON a.id = b.id WHERE a.id = 2",
+            json!([{"left_id": 2, "right_id": 2}]),
+        ),
+        (
+            // The aliases are DELIMITED, because an unquoted name folds to lower case (the
+            // name rules in `src/state/postgres.rs`): two labels that differ only in case are
+            // two member names, and this row is about that comparison rather than about
+            // folding.
+            "labels differing only in case",
+            "SELECT id AS \"node\", id AS \"NODE\" FROM nodes WHERE id = 1",
+            json!([{"node": 1, "NODE": 1}]),
+        ),
+        (
+            "columns of different names",
+            "SELECT id, label FROM nodes WHERE id = 1",
+            json!([{"id": 1, "label": "one"}]),
+        ),
+    ];
+
+    for (case, sql, served_as) in cases {
+        let (status, body) = api
+            .execute(json!({"sql": sql, "formatRecordsAs": "JSON"}))
+            .await;
+        if served_as.is_null() {
+            assert_eq!(
+                (status, error_code(&body), body["message"].clone()),
+                (400, "UnsupportedResultException", json!(REFUSAL)),
+                "case {case:?}: the JSON form cannot key a row by a repeated name, got \
+                 {status} {body}"
+            );
+        } else {
+            assert_eq!(status, 200, "case {case:?}: got {status} {body}");
+            assert_eq!(
+                formatted(&body),
+                served_as,
+                "case {case:?}: expected {served_as}, got {body}"
+            );
+        }
+
+        // The SAME result set in the records form is served either way: a repeated label
+        // costs nothing where the position tells the columns apart.
+        let (status, records_form) = api.execute(json!({"sql": sql})).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?} in the records form: expected HTTP 200, got {status} {records_form}"
+        );
+        assert_eq!(
+            list(&records_form, "records").len(),
+            1,
+            "case {case:?} in the records form: expected the row, got {records_form}"
+        );
+    }
+}
+
 /// RULE: the base64 text a binary column is rendered as — in `formattedRecords`
 /// and in `records`' `blobValue` alike — is the base64 of the BYTES the column
 /// holds, so a client that decodes it gets what was stored.

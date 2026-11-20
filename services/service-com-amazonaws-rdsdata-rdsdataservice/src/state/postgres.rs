@@ -1507,6 +1507,50 @@ pub fn namespace_statement(sql: &str) -> Result<Option<NamespaceStatement>, SqlE
     })
 }
 
+/// Whether `sql` DEFINES OR MODIFIES a stored object of the database rather than reading
+/// or changing rows: the data-definition class — a table, index, view, trigger, sequence,
+/// schema or database that a statement creates, alters, renames, empties or drops.
+///
+/// What this is for: the engines behind this API differ on whether such a statement is
+/// part of the transaction it is issued in, and the MySQL family's own documentation lists
+/// the data-definition statements as the ones that COMMIT the transaction implicitly
+/// (`crate::state::Cluster::commits_the_transaction`). A statement about a TEMPORARY
+/// object is the exception that documentation names, and is not one of these: it defines
+/// an object private to its own session.
+///
+/// Read from the PARSE, like every other decision in this module, and through the same
+/// bounded reader [`plan`] uses. A statement NEITHER dialect reads, and one past that
+/// bound, defines nothing — it never reaches the engine at all, because [`plan`] refuses
+/// it in the words that reader answers with.
+pub fn defines_data(sql: &str) -> bool {
+    let Ok((_, statements)) = read(sql) else {
+        return false;
+    };
+    let [statement] = statements.as_slice() else {
+        return false;
+    };
+    match statement {
+        Statement::CreateTable(create) => !create.temporary,
+        Statement::Drop { temporary, .. } => !temporary,
+        Statement::AlterTable { .. }
+        | Statement::CreateIndex(_)
+        | Statement::CreateView { .. }
+        | Statement::CreateTrigger { .. }
+        | Statement::CreateSchema { .. }
+        | Statement::CreateSequence { .. }
+        | Statement::CreateDatabase { .. }
+        | Statement::Truncate { .. }
+        | Statement::RenameTable(_) => true,
+        // An ALLOW-LIST, pinned to the statements this data plane runs at all: every
+        // definition class the authorizer admits ([`crate::state`]'s
+        // `confine_to_data_plane`) is named above, and a statement that only reads or
+        // changes rows is not one of these. A definition class this data plane starts
+        // admitting has to be added here with it — which is why the two lists are stated
+        // against each other rather than this one defaulting to "a definition".
+        _ => false,
+    }
+}
+
 /// The name a database statement names, as the catalog holds it: an UNQUOTED
 /// identifier is folded to lower case, which is what PostgreSQL does to every name a
 /// statement writes without quotes, and a delimited one keeps the case it was written

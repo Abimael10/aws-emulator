@@ -1922,10 +1922,11 @@ async fn every_call_answers_inside_the_request_budget() {
 
 /// RULE: a `typeHint` on a `stringValue` names the type that string is SENT AS, so the
 /// string has to be a value of that type — the documented form is accepted and stored,
-/// and anything else is refused as a value the service CANNOT PARSE as that type,
-/// naming the hint and the string, in the class a failure to read the caller's data is
-/// — and a hint on any other `Field` member, where the member already names the type,
-/// is ignored.
+/// and anything else is refused with the FIXED parse-error sentence of that type, which
+/// names the type and the fault its reader reports and carries NOTHING of the request (the
+/// string it could not read is not quoted back), in the class a failure to read the
+/// caller's data is — and a hint on any other `Field` member, where the member already
+/// names the type, is ignored.
 ///
 /// The formats come from the model: `DATE` is `YYYY-MM-DD`, `TIME` is
 /// `HH:MM:SS[.FFF]`, `TIMESTAMP` is `YYYY-MM-DD HH:MM:SS[.FFF]`, and `DECIMAL`,
@@ -1949,33 +1950,33 @@ async fn a_type_hint_decides_what_a_string_parameter_may_be() {
 
     // One row per hint the model declares: a value of the documented form, one that is
     // the right shape for some OTHER hint (so a hint that was ignored would let it
-    // through), and the sentence the refusal of that string carries — the hint and the
-    // string for a value the service cannot read as that type, and the PARSER's own
+    // through), and the sentence the refusal of that string carries — the type the hint
+    // sends the string as and the fault its reader reports, and the PARSER's own
     // complaint for a document, which is what a document type's input error says.
     let cases = [
         (
             "DATE",
             "2024-02-29",
             "2024-02-30",
-            "Cannot parse DATE parameter: \"2024-02-30\"".to_string(),
+            "Parse Error for Date: input contains invalid characters".to_string(),
         ),
         (
             "TIME",
             "23:59:59.500",
             "24:00:00",
-            "Cannot parse TIME parameter: \"24:00:00\"".to_string(),
+            "Parse Error for Time: input contains invalid characters".to_string(),
         ),
         (
             "TIMESTAMP",
             "2024-01-31 00:00:00",
             "2024-01-31T00:00:00",
-            "Cannot parse TIMESTAMP parameter: \"2024-01-31T00:00:00\"".to_string(),
+            "Parse Error for Timestamp: input contains invalid characters".to_string(),
         ),
         (
             "DECIMAL",
             "-12345678901234567890.25",
             "12.5e3",
-            "Cannot parse DECIMAL parameter: \"12.5e3\"".to_string(),
+            "Parse Error for Decimal: input contains invalid characters".to_string(),
         ),
         (
             "JSON",
@@ -1988,7 +1989,7 @@ async fn a_type_hint_decides_what_a_string_parameter_may_be() {
             "UUID",
             "4bcd3f0e-7a25-4f8c-9c3a-1b2c3d4e5f60",
             "4bcd3f0e-7a25-4f8c-9c3a",
-            "Cannot parse UUID parameter: \"4bcd3f0e-7a25-4f8c-9c3a\"".to_string(),
+            "Parse Error for UUID: input contains invalid characters".to_string(),
         ),
     ];
     for (hint, accepted, refused, expected_message) in cases {
@@ -2078,6 +2079,102 @@ async fn a_type_hint_decides_what_a_string_parameter_may_be() {
             "case {hint} at {value:?}: expected HTTP {expected}, got {status} {body}"
         );
     }
+
+    // The FAULT the sentence carries, over the strings each reader refuses: input left
+    // over once a value of the type has been read is trailing input, and a string whose
+    // characters are not those of such a value at all is the other fault. None of these
+    // sentences carries the string the request sent.
+    //
+    // (the hint, the string, the sentence the refusal carries)
+    let faults = [
+        (
+            "DATE",
+            "22/10/2026",
+            "Parse Error for Date: input contains invalid characters",
+        ),
+        (
+            "DATE",
+            "",
+            "Parse Error for Date: input contains invalid characters",
+        ),
+        (
+            "DATE",
+            "2026-13-01",
+            "Parse Error for Date: input contains invalid characters",
+        ),
+        (
+            "DATE",
+            "2026-10-22T00:00",
+            "Parse Error for Date: trailing input",
+        ),
+        ("DATE", "2026-10-22 ", "Parse Error for Date: trailing input"),
+        (
+            "TIME",
+            "noon",
+            "Parse Error for Time: input contains invalid characters",
+        ),
+        ("TIME", "12:30:00Z", "Parse Error for Time: trailing input"),
+        (
+            "TIMESTAMP",
+            "2026/10/22 00:00:00",
+            "Parse Error for Timestamp: input contains invalid characters",
+        ),
+        (
+            "TIMESTAMP",
+            "2026-10-22 00:00:00+02",
+            "Parse Error for Timestamp: trailing input",
+        ),
+        (
+            "DECIMAL",
+            "one",
+            "Parse Error for Decimal: input contains invalid characters",
+        ),
+        (
+            "UUID",
+            "not-a-uuid",
+            "Parse Error for UUID: input contains invalid characters",
+        ),
+    ];
+    for (hint, value, expected_message) in faults {
+        let (status, body) = api
+            .execute(json!({
+                "sql": INSERT_HINTED,
+                "parameters": [
+                    parameter("hint", json!({"stringValue": hint})),
+                    json!({"name": "value", "value": {"stringValue": value}, "typeHint": hint}),
+                ],
+            }))
+            .await;
+        assert_eq!(
+            (status, body["message"].clone()),
+            (400, json!(expected_message)),
+            "case {hint} refusing {value:?}: expected HTTP 400 and {expected_message:?}, \
+             got {status} {body}"
+        );
+    }
+
+    // And the sentence is FIXED for the fault: two different strings that fail the same
+    // way earn the same message, which is what a client matching on it to classify a bad
+    // parameter reads — the message being the only thing that distinguishes one refusal
+    // of a parameter from another.
+    let mut sentences = Vec::new();
+    for value in ["22/10/2026", "2026-13-01"] {
+        let (_, body) = api
+            .execute(json!({
+                "sql": INSERT_HINTED,
+                "parameters": [
+                    parameter("hint", json!({"stringValue": "DATE"})),
+                    json!({"name": "value", "value": {"stringValue": value}, "typeHint": "DATE"}),
+                ],
+            }))
+            .await;
+        sentences.push(body["message"].clone());
+    }
+    assert_eq!(
+        sentences[0], sentences[1],
+        "case \"two DATE strings of one fault\": each must carry the same sentence, got \
+         {sentences:?}"
+    );
 
     // A seventh hint is not a value `TypeHint` has, so it is refused rather than
     // dropped.

@@ -110,7 +110,7 @@
 //!   `the_engine_heap_ceiling_refuses_an_allocation_heavy_statement` at the foot
 //!   of this file pins that.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime};
 
 use rusqlite::config::DbConfig;
@@ -870,6 +870,11 @@ impl Cluster {
     /// Run one statement inside the transaction `transaction_id` names, against the
     /// database that transaction READS: everything committed on its database now, plus
     /// its own writes ([`Transaction::rebase_onto`]).
+    ///
+    /// A statement that COMMITS the transaction implicitly on the engine this cluster
+    /// runs does so here, before it runs and again after
+    /// ([`Self::commits_the_transaction`] decides which statements those are, and
+    /// [`Self::commit_in_place`] installs what the transaction had written).
     pub fn run_in_transaction(
         &mut self,
         transaction_id: &str,
@@ -878,6 +883,11 @@ impl Cluster {
         parameters: &[SqlParameter],
     ) -> Result<StatementOutcome, SqlError> {
         self.read_what_is_committed(transaction_id, budget)?;
+        // ONE reading of the statement for both the commits it earns.
+        let commits = self.commits_the_transaction(sql);
+        if commits {
+            self.commit_in_place(transaction_id, budget)?;
+        }
         let transaction = self.open_transaction_mut(transaction_id)?;
         transaction.touch();
         transaction.require_room_for(1)?;
@@ -885,12 +895,20 @@ impl Cluster {
             .open_database()?
             .run_within(budget, sql, parameters)?;
         transaction.record(sql, parameters, &outcome);
+        if commits {
+            self.commit_in_place(transaction_id, budget)?;
+        }
         Ok(outcome)
     }
 
     /// Run one statement once per parameter set inside the transaction
     /// `transaction_id` names, as ONE unit of work, against the same database its
     /// single statements run against.
+    ///
+    /// A statement that commits the transaction implicitly does so here too, for the
+    /// reason [`Self::commits_the_transaction`] gives: which statements commit the
+    /// transaction they are issued in is a property of the STATEMENT, not of the
+    /// operation that carried it.
     pub fn run_batch_in_transaction(
         &mut self,
         transaction_id: &str,
@@ -899,6 +917,10 @@ impl Cluster {
         parameter_sets: &[Vec<SqlParameter>],
     ) -> Result<Vec<StatementOutcome>, SqlError> {
         self.read_what_is_committed(transaction_id, budget)?;
+        let commits = self.commits_the_transaction(sql);
+        if commits {
+            self.commit_in_place(transaction_id, budget)?;
+        }
         let transaction = self.open_transaction_mut(transaction_id)?;
         transaction.touch();
         transaction.require_room_for(parameter_sets.len())?;
@@ -908,7 +930,110 @@ impl Cluster {
         for (parameters, outcome) in parameter_sets.iter().zip(&outcomes) {
             transaction.record(sql, parameters, outcome);
         }
+        if commits {
+            self.commit_in_place(transaction_id, budget)?;
+        }
         Ok(outcomes)
+    }
+
+    /// COMMIT the transaction `transaction_id` names, if `sql` is a statement the engine
+    /// this cluster runs commits the transaction for.
+    ///
+    /// On the MySQL-family engines a data-definition statement cannot be part of a
+    /// transaction: it commits the transaction it is issued in, before it runs and again
+    /// after, so everything the transaction had written before it is DURABLE and a later
+    /// rollback has nothing of that work left to discard. PostgreSQL's data definition IS
+    /// transactional — a `CREATE TABLE` in a transaction goes away with it — so nothing is
+    /// committed for such a statement on a PostgreSQL cluster, and the one the engine the
+    /// cluster runs does decides which it is ([`EngineFamily`]).
+    ///
+    /// What the transaction then holds: nothing it may still take back. Its copy of the
+    /// database is installed as the committed database of its name, it carries on against
+    /// a fresh copy of what is now committed, and the statements it had written are
+    /// forgotten — so a rollback after this discards only what the transaction writes from
+    /// here on, and a commit installs only that.
+    ///
+    /// A no-op for a transaction a statement of its own has already failed in (its writes can
+    /// no longer reach the committed database whatever ends it). `Err` for a `transactionId`
+    /// that names no RUNNING transaction, which is the refusal every call quoting it earns.
+    ///
+    /// Called for a statement the caller has ALREADY read as one about the cluster's DATABASES
+    /// (`postgres::namespace_statement`): such a statement defines or drops a database, so it
+    /// is a data definition and nothing reads the statement a second time to say so.
+    pub fn commit_for_namespace_definition(
+        &mut self,
+        transaction_id: &str,
+        budget: &mut RequestBudget,
+    ) -> Result<(), SqlError> {
+        if !self.commits_definitions_implicitly() {
+            return Ok(());
+        }
+        self.commit_in_place(transaction_id, budget)
+    }
+
+    /// Whether the engine THIS CLUSTER RUNS commits a transaction for a data-definition
+    /// statement issued in it: the MySQL family does, and an engine whose data definition is
+    /// part of the transaction that issued it does not. The ONE engine test behind both
+    /// entry points above.
+    fn commits_definitions_implicitly(&self) -> bool {
+        self.engine == EngineFamily::MySql
+    }
+
+    /// Whether `sql` is a statement the engine this cluster runs commits the transaction it
+    /// is issued in for: a data-definition statement, on an engine that commits for one.
+    fn commits_the_transaction(&self, sql: &str) -> bool {
+        self.commits_definitions_implicitly() && postgres::defines_data(sql)
+    }
+
+    /// Install the transaction's own copy of the database as the committed database of its
+    /// name, leaving the transaction RUNNING on a fresh copy of it
+    /// ([`Transaction::commit_in_place`]).
+    fn commit_in_place(
+        &mut self,
+        transaction_id: &str,
+        budget: &mut RequestBudget,
+    ) -> Result<(), SqlError> {
+        if self.open_transaction_mut(transaction_id)?.is_aborted() {
+            return Ok(());
+        }
+        let database = self.prepare_to_install_writes(transaction_id, budget)?;
+        let transaction = self.open_transaction_mut(transaction_id)?;
+        transaction.touch();
+        let installed = transaction.commit_in_place()?;
+        self.databases.insert(database, installed);
+        Ok(())
+    }
+
+    /// Get ready to install the writes of the transaction `transaction_id` names, and answer
+    /// the NAME they belong to.
+    ///
+    /// The one preparation EVERY installation of a transaction's writes makes, whether the
+    /// transaction ends there (`CommitTransaction`) or goes on (an implicit commit):
+    ///
+    /// * the destination slot is claimed through the CAPPED accessor first, so a commit that
+    ///   cannot be served (the cluster is at `MAX_DATABASES_PER_CLUSTER` and this name is new,
+    ///   because the committed database was swept while the transaction was open) is refused
+    ///   with the transaction still intact rather than losing its writes;
+    /// * and the transaction is put back on top of everything committed on that database since
+    ///   it last ran — READ COMMITTED at the install itself, so a commit another writer made
+    ///   while this transaction was open is not replaced by this one.
+    ///
+    /// An ABORTED transaction installs nothing, so there is nothing to put on top of anything
+    /// and it is not rebased; the name is still answered, because its caller still has the copy
+    /// to drop and the sequence marks to carry over.
+    pub fn prepare_to_install_writes(
+        &mut self,
+        transaction_id: &str,
+        budget: &mut RequestBudget,
+    ) -> Result<String, SqlError> {
+        let transaction = self.open_transaction_mut(transaction_id)?;
+        let aborted = transaction.is_aborted();
+        let database = database_key(transaction.database.as_ref());
+        self.database_mut(&database)?;
+        if !aborted {
+            self.read_what_is_committed(transaction_id, budget)?;
+        }
+        Ok(database)
     }
 
     /// Put the transaction `transaction_id` names back on top of what is COMMITTED on
@@ -2487,6 +2612,31 @@ impl Transaction {
         Ok(pending)
     }
 
+    /// Hand back the copy this transaction has been writing into, for a caller that
+    /// installs it as the committed database while the transaction GOES ON — the
+    /// implicit commit a statement of a class the engine does not run inside a
+    /// transaction earns ([`Cluster::commits_the_transaction`]).
+    ///
+    /// Unlike [`Self::end`] this does not end the transaction: it is left reading a fresh
+    /// copy of the database that is about to be committed, with the statements it had
+    /// written forgotten — they are committed now, so nothing can replay them and nothing
+    /// is left for a rollback to discard. The copy it carries on with is taken BEFORE the
+    /// installed one is handed over, so a transaction whose copy could not be taken keeps
+    /// the one it had.
+    fn commit_in_place(&mut self) -> Result<Database, SqlError> {
+        let pending = self.pending.as_ref().ok_or_else(|| {
+            SqlError::TransactionNotFound(self.end_cause().unwrap_or(TransactionEnd::Terminated))
+        })?;
+        let carried_on = pending.snapshot()?;
+        self.based_on = carried_on.version();
+        let installed = self
+            .pending
+            .replace(carried_on)
+            .expect("the copy was just read");
+        self.writes.clear();
+        Ok(installed)
+    }
+
     /// Record that a statement of this transaction FAILED, which is what terminates it:
     /// "a transaction is terminated when a statement in it fails"
     /// (`BeginTransaction`'s own documentation). Nothing it wrote can reach the committed
@@ -2695,8 +2845,9 @@ impl StatementOutcome {
     /// allocated rather than materialising a map per row and then a second full
     /// copy of the whole body.
     ///
-    /// `Err` when the body would pass the budget, or when a value has no JSON
-    /// form at all (see [`json_for`]) — both answered with the modelled
+    /// `Err` when the body would pass the budget, when a value has no JSON
+    /// form at all (see [`json_for`]), and when two columns carry ONE LABEL (see
+    /// [`require_distinct_labels`]) — all answered with the modelled
     /// `UnsupportedResultException`.
     ///
     /// `returns` is the request's `resultSetOptions`, which this form honours exactly as
@@ -2707,6 +2858,7 @@ impl StatementOutcome {
         budget: &mut RequestBudget,
         returns: ReturnTypes,
     ) -> Result<String, SqlError> {
+        require_distinct_labels(&self.columns)?;
         let mut formatted = String::from("[");
         for (index, row) in self.rows.iter().enumerate() {
             if index > 0 {
@@ -2814,6 +2966,41 @@ fn require_returnable(columns: &[ColumnInfo]) -> Result<(), SqlError> {
         None => Ok(()),
     }
 }
+
+/// Refuse a result set two of whose columns carry ONE LABEL, for the form that keys
+/// each row BY that label.
+///
+/// A JSON object holds one member per name, so two columns of the same label cannot
+/// both be members of the object a row is rendered as: one of them would be lost, and
+/// which one is decided by whichever JSON reader the client happens to use. The
+/// statement is valid and the engine ran it — it is the RESULT that cannot be returned
+/// in the form the request asked for, which is what the modelled
+/// `UnsupportedResultException` says — so a caller that wants that result set as JSON
+/// gives each column its own label (an alias on one side of a self-join), and the same
+/// query is then served.
+///
+/// Labels compare EXACTLY, the way JSON member names do: two labels differing in case
+/// are two members, so they are two columns of the object.
+///
+/// Only the JSON form is bounded by this: `records` carries one list per row, in which
+/// the position and not the name tells the columns apart, so a repeated label costs
+/// nothing there.
+fn require_distinct_labels(columns: &[ColumnInfo]) -> Result<(), SqlError> {
+    let mut labelled: HashSet<&str> = HashSet::with_capacity(columns.len());
+    for column in columns {
+        if !labelled.insert(column.label.as_str()) {
+            return Err(SqlError::UnsupportedResult(
+                DUPLICATE_COLUMN_UNDER_JSON.to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// What AWS tells a caller whose result set carries one name twice and asked for it as
+/// JSON: entirely fixed text, naming neither the column nor the statement.
+const DUPLICATE_COLUMN_UNDER_JSON: &str =
+    "The result can't be converted to JSON because it has a duplicate column.";
 
 /// What ONE REQUEST may spend on the engine.
 ///
@@ -3340,9 +3527,10 @@ fn value_text(value: &SqlValue) -> Option<String> {
 /// number, a JSON document and a UUID
 /// (`smithy_query(query="shape", shape="SqlParameter")`, member `typeHint`;
 /// the value list is `TypeHint`). So the hint is what the request is CHECKED
-/// against: a string that is not the form its hint names is refused, naming the
-/// parameter and the accepted form, rather than silently stored under a type it
-/// is not.
+/// against: a string that is not the form its hint names is refused in the fixed
+/// sentence that names the TYPE it could not be read as
+/// ([`cannot_parse_parameter`]), rather than silently stored under a type it is
+/// not.
 ///
 /// And the hint is what the value is SENT AS, which is not always the string the
 /// request spelled it with: a value of the hint's own type has one form, and the
@@ -3362,18 +3550,26 @@ fn value_text(value: &SqlValue) -> Option<String> {
 /// JSON or UUID storage class of its own — and what a later read returns is
 /// decided by the COLUMN's declared type, not by the hint (see [`field_for`]).
 fn hinted_text(name: &str, hint: &str, value: &str) -> Result<SqlValue, SqlError> {
-    let cannot_parse = |hint: &str| Err(cannot_parse_parameter(hint, value));
+    // The sentence a string that is no value of the hint's type is refused with: the TYPE
+    // the hint sends it as, and the FAULT that type's own reader reports.
+    let cannot_parse =
+        |type_name: &str, fault: &'static str| Err(cannot_parse_parameter(type_name, fault));
     let sent: Result<String, String> = match hint.to_ascii_uppercase().as_str() {
-        "DATE" => is_date(value)
-            .then(|| value.to_string())
-            .map_or_else(|| cannot_parse("DATE"), Ok),
-        "TIME" => time_of_day(value).map_or_else(|| cannot_parse("TIME"), Ok),
+        "DATE" => match date_fault(value) {
+            None => Ok(value.to_string()),
+            Some(fault) => cannot_parse("Date", fault),
+        },
+        "TIME" => time_of_day(value)
+            .map_or_else(|| cannot_parse("Time", time_fault(value)), Ok),
         "TIMESTAMP" => is_timestamp(value)
             .then(|| value.to_string())
-            .map_or_else(|| cannot_parse("TIMESTAMP"), Ok),
+            .map_or_else(|| cannot_parse("Timestamp", timestamp_fault(value)), Ok),
+        // A decimal number and a UUID are read as a WHOLE — the string either is one or is
+        // not — so the fault their reader reports is that the string is not written in the
+        // characters of a value of that type.
         "DECIMAL" => is_decimal(value)
             .then(|| value.to_string())
-            .map_or_else(|| cannot_parse("DECIMAL"), Ok),
+            .map_or_else(|| cannot_parse("Decimal", INVALID_CHARACTERS), Ok),
         // A document is read by a PARSER, which says what is wrong with a string that
         // is not one — the detail the type's own input error carries.
         "JSON" => serde_json::from_str::<serde_json::Value>(value)
@@ -3382,7 +3578,9 @@ fn hinted_text(name: &str, hint: &str, value: &str) -> Result<SqlValue, SqlError
         "UUID" => uuid::Uuid::parse_str(value)
             .is_ok()
             .then(|| value.to_string())
-            .map_or_else(|| cannot_parse("UUID"), Ok),
+            .map_or_else(|| cannot_parse("UUID", INVALID_CHARACTERS), Ok),
+        // Each arm above names the TYPE its hint sends the string as, as the parse
+        // failure's own sentence writes that type ([`cannot_parse_parameter`]).
         // The model declares `TypeHint` as an enum of exactly those six, so a
         // seventh value is a request this service cannot act on rather than a
         // hint it may drop.
@@ -3397,14 +3595,80 @@ fn hinted_text(name: &str, hint: &str, value: &str) -> Result<SqlValue, SqlError
 }
 
 /// What the service tells a caller whose hinted string it cannot read as a value of the
-/// type the hint named: the hint as the model declares it, and the string the request
-/// sent.
+/// type the hint named: the parse failure of THAT TYPE, named as the sentence writes it.
+///
+/// FIXED text for the class, carrying nothing of the request: the string that could not be
+/// read is not quoted back, so every string that fails the same way is refused in the
+/// same sentence — which is what a client matching on the message to classify a bad
+/// parameter reads, since the message is the only thing that distinguishes one refusal of a
+/// parameter from another — and no caller input is interpolated into it.
 ///
 /// A failure to READ the value the request sent, so it is reported as the data plane's
 /// own error and not as a fault of the call's shape: the request named a type the model
 /// has and sent a string the model carries.
-fn cannot_parse_parameter(hint: &str, value: &str) -> String {
-    format!("Cannot parse {hint} parameter: \"{value}\"")
+fn cannot_parse_parameter(type_name: &str, fault: &str) -> String {
+    format!("Parse Error for {type_name}: {fault}")
+}
+
+/// The two faults a reader of one of these types reports, which is what the sentence above
+/// carries: a string whose characters are not those of a value of the type at all, and one
+/// that holds a value of the type FOLLOWED by something else.
+///
+/// Both are the service's own words for their fault, and both are observed: a string of the
+/// wrong form altogether (`22/10/2026`) earns the first, and a date carrying a time after it
+/// (`2026-10-22T00:00`) the second. `tests/all/sql_data_api.rs` pins each against the strings
+/// of its fault.
+const INVALID_CHARACTERS: &str = "input contains invalid characters";
+const TRAILING_INPUT: &str = "trailing input";
+
+/// Which of those two faults the `time` crate's reader reports, and `None` for a string it
+/// read as a value of the type.
+///
+/// Input LEFT OVER once a value of the type has been read is trailing input; everything
+/// else — a component that is no number, a component the string does not carry, a
+/// separator the format does not have there, and a date or time the calendar and the clock
+/// do not have — is a string that is not written in the characters of such a value.
+fn parse_fault<T>(read: Result<T, time::error::Parse>) -> Option<&'static str> {
+    match read {
+        Ok(_) => None,
+        Err(time::error::Parse::ParseFromDescription(
+            time::error::ParseFromDescription::UnexpectedTrailingCharacters { .. },
+        )) => Some(TRAILING_INPUT),
+        Err(_) => Some(INVALID_CHARACTERS),
+    }
+}
+
+/// The fault to report for a string read against the SEVERAL forms one documented format
+/// admits (with a fraction of a second and without): a form that reports input left over
+/// did read a value of the type and then found more, so that is the fault; a string every
+/// form refuses outright is not written in the characters of such a value.
+fn fault_of_either(forms: [Option<&'static str>; 2]) -> &'static str {
+    if forms.contains(&Some(TRAILING_INPUT)) {
+        TRAILING_INPUT
+    } else {
+        INVALID_CHARACTERS
+    }
+}
+
+/// The fault a string that is no `TIME` carries, read against both forms the documented
+/// format admits.
+fn time_fault(value: &str) -> &'static str {
+    fault_of_either([
+        parse_fault(time::Time::parse(value, TIME_WITH_SUBSECOND_FORMAT)),
+        parse_fault(time::Time::parse(value, TIME_FORMAT)),
+    ])
+}
+
+/// And the fault a string that is no `TIMESTAMP` carries, read against both forms of that
+/// format for the same reason.
+fn timestamp_fault(value: &str) -> &'static str {
+    fault_of_either([
+        parse_fault(time::PrimitiveDateTime::parse(
+            value,
+            TIMESTAMP_WITH_SUBSECOND_FORMAT,
+        )),
+        parse_fault(time::PrimitiveDateTime::parse(value, TIMESTAMP_FORMAT)),
+    ])
 }
 
 /// And what it tells a caller whose JSON parameter is not a document: the type the
@@ -3468,9 +3732,11 @@ fn as_stored_document(value: &serde_json::Value) -> serde_json::Value {
 
 /// `YYYY-MM-DD`, parsed as a CALENDAR date by the `time` crate, so only a date
 /// the calendar really has is accepted (29 February in a leap year, not in a
-/// common one). No date arithmetic is written here.
-fn is_date(value: &str) -> bool {
-    time::Date::parse(value, DATE_FORMAT).is_ok()
+/// common one), and `None` for a string it read as one. No date arithmetic is
+/// written here; what a string that is NOT a date carries is the fault that
+/// reader reports ([`parse_fault`]).
+fn date_fault(value: &str) -> Option<&'static str> {
+    parse_fault(time::Date::parse(value, DATE_FORMAT))
 }
 
 /// `YYYY-MM-DD HH:MM:SS[.FFF]`: the date and the time in one value, checked as a

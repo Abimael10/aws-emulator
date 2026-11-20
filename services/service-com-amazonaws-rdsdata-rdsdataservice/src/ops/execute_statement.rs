@@ -378,6 +378,10 @@ fn execute(
             // transaction block.
             if let Some(transaction_id) = transaction_id {
                 cluster.open_transaction_mut(transaction_id)?.touch();
+                // And a statement of a class the engine the cluster runs does not run
+                // inside a transaction COMMITS the transaction it was issued in, which a
+                // statement about the cluster's databases is one of.
+                cluster.commit_for_namespace_definition(transaction_id, &mut budget)?;
             }
             cluster.apply_namespace(&statement)?
         }

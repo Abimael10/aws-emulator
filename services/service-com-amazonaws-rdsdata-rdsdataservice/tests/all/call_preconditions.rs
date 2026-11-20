@@ -257,6 +257,13 @@ impl Cloud {
         answered
     }
 
+    /// Any other Data API call, by the path its operation is bound to, as the account's
+    /// own credential: the operations a suite drives beyond the two statement ones — the
+    /// one that opens a transaction and the two that end one.
+    pub(crate) async fn call(&self, path: &str, body: Value) -> (u16, Value) {
+        self.call_as(ACCOUNT_KEY_ID, path, body).await
+    }
+
     /// One awsQuery call to IAM, as the account's own credential: the status and the XML
     /// body.
     async fn iam(&self, action: &str, params: &[(&str, &str)]) -> (u16, String) {

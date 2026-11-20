@@ -246,27 +246,19 @@ fn commit(
     let mut state = store.lock();
     let cluster = state.cluster_mut(&input.resource_arn)?;
     cluster.expire_timed_out_transactions();
-    // The name the transaction's writes belong to, read before the transaction is
-    // ended: the destination slot is claimed through the CAPPED accessor first, so a
-    // commit that cannot be served (the cluster is at `MAX_DATABASES_PER_CLUSTER` and
-    // this name is new, because the committed database was swept while the transaction
-    // was open) is refused with the transaction still intact rather than losing its
-    // writes.
-    let transaction = cluster.open_transaction_mut(&input.transaction_id)?;
-    let aborted = transaction.is_aborted();
-    let database = crate::state::database_key(transaction.database.as_ref());
-    cluster.database_mut(&database)?;
-    // READ COMMITTED, at the commit itself: the writes this transaction is about to
-    // install go ON TOP of everything committed on that database since it last ran, so
-    // a commit another writer made while this transaction was open is not replaced by
-    // this one. An ABORTED transaction installs nothing, so there is nothing to put on
-    // top of anything.
-    if !aborted {
-        cluster.read_what_is_committed(
-            &input.transaction_id,
-            &mut crate::state::RequestBudget::new(),
-        )?;
-    }
+    // The name the transaction's writes belong to, and the database ready to take them — the
+    // one preparation every installation of a transaction's writes makes
+    // (`Cluster::prepare_to_install_writes`): the destination slot is claimed through the
+    // CAPPED accessor, so a commit that cannot be served is refused with the transaction still
+    // intact rather than losing its writes, and the transaction is put back on top of
+    // everything committed on that database since it last ran (READ COMMITTED at the commit
+    // itself, so a commit another writer made while this transaction was open is not replaced
+    // by this one). An ABORTED transaction installs nothing, so it is not rebased.
+    let aborted = cluster.open_transaction_mut(&input.transaction_id)?.is_aborted();
+    let database = cluster.prepare_to_install_writes(
+        &input.transaction_id,
+        &mut crate::state::RequestBudget::new(),
+    )?;
     // Ending the transaction hands back the database it was writing into and leaves its
     // id with the cluster, now terminal — so a SECOND commit of the same id is answered
     // for a transaction a previous call ended rather than as an id this service never

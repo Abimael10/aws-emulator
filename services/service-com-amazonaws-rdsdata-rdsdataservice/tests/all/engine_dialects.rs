@@ -548,6 +548,193 @@ async fn a_batch_of_no_parameter_sets_runs_the_statement_once() {
     }
 }
 
+/// One statement issued inside a transaction, and what the engines whose data definition
+/// is not transactional do with the work the transaction had done before it.
+struct Definition {
+    case: &'static str,
+    /// The statement under test, issued inside the transaction.
+    sql: &'static str,
+    /// Whether it is a statement that COMMITS the transaction on the MySQL family: every
+    /// statement that defines or modifies a stored object does, and a statement about a
+    /// TEMPORARY object — the exception MySQL's own list of implicitly committing
+    /// statements names — does not, nor does a statement that only changes rows.
+    commits_on_mysql: bool,
+    /// A statement that is served only where the definition itself took effect, read
+    /// after the transaction has been rolled back; `None` for a definition no later
+    /// statement can ask about.
+    proof: Option<&'static str>,
+}
+
+/// RULE: a statement that DEFINES OR MODIFIES a stored object cannot be part of a
+/// transaction on the MySQL-family engines — it commits the transaction it is issued in,
+/// so everything the transaction had written before it is durable and a later
+/// `RollbackTransaction` has none of that work left to discard, while the transaction goes
+/// on and whatever it writes AFTER the definition is still rolled back. PostgreSQL's data
+/// definition IS transactional, so on an Aurora PostgreSQL cluster the same sequence
+/// rolls back whole — which engine the addressed cluster runs is the Amazon RDS control
+/// plane's own fact.
+///
+/// The rows differ along the statement issued inside the transaction (a table created, a
+/// column added, a table dropped, an index created), and along the two kinds that do NOT
+/// commit it: a TEMPORARY object, which MySQL's own list of implicitly committing
+/// statements excepts, and a statement that only changes rows.
+#[tokio::test]
+async fn a_data_definition_inside_a_transaction_commits_it_on_the_mysql_family() {
+    let definitions = &[
+        Definition {
+            case: "a table created",
+            sql: "CREATE TABLE created_inside (id INT)",
+            commits_on_mysql: true,
+            proof: Some("SELECT id FROM created_inside"),
+        },
+        Definition {
+            case: "a column added",
+            sql: "ALTER TABLE ledger ADD COLUMN note VARCHAR(16)",
+            commits_on_mysql: true,
+            proof: Some("SELECT note FROM ledger"),
+        },
+        Definition {
+            case: "a table dropped",
+            sql: "DROP TABLE spare",
+            commits_on_mysql: true,
+            proof: None,
+        },
+        Definition {
+            case: "an index created",
+            sql: "CREATE INDEX ledger_label ON ledger (label)",
+            commits_on_mysql: true,
+            proof: None,
+        },
+        Definition {
+            case: "a TEMPORARY table created",
+            sql: "CREATE TEMPORARY TABLE scratch (id INT)",
+            commits_on_mysql: false,
+            proof: None,
+        },
+        Definition {
+            case: "a statement that only changes rows",
+            sql: "INSERT INTO ledger (id, label) VALUES (3, 'dml')",
+            commits_on_mysql: false,
+            proof: None,
+        },
+    ];
+
+    for (index, definition) in definitions.iter().enumerate() {
+        for engine in ["aurora-mysql", "aurora-postgresql"] {
+            let committed = definition.commits_on_mysql && engine == "aurora-mysql";
+            let cloud = Cloud::new();
+            let (resource_arn, secret_arn) = cloud
+                .create_cluster_running(&format!("emu-ddl-{index}-{engine}"), engine, true)
+                .await;
+            let call = |members: Value| {
+                let mut members = members;
+                members["resourceArn"] = json!(resource_arn);
+                members["secretArn"] = json!(secret_arn);
+                members["database"] = json!(DATABASE);
+                members
+            };
+            for ddl in [
+                "CREATE TABLE ledger (id INT, label VARCHAR(16))",
+                "CREATE TABLE spare (id INT)",
+            ] {
+                cloud.run(call(json!({"sql": ddl}))).await;
+            }
+
+            let (status, begun) = cloud
+                .call("/BeginTransaction", call(json!({})))
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {:?} on {engine}: BeginTransaction failed with {begun}",
+                definition.case
+            );
+            let transaction_id = begun["transactionId"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {:?} on {engine}: BeginTransaction returns an id: {begun}",
+                        definition.case
+                    )
+                })
+                .to_string();
+
+            // The work the transaction does BEFORE the statement under test, the statement
+            // itself, and work it does AFTER it — which a rollback discards on either
+            // engine, because the transaction goes on.
+            for sql in [
+                "INSERT INTO ledger (id, label) VALUES (1, 'before')",
+                definition.sql,
+                "INSERT INTO ledger (id, label) VALUES (2, 'after')",
+            ] {
+                let served = cloud
+                    .run(call(json!({"sql": sql, "transactionId": transaction_id})))
+                    .await;
+                assert!(
+                    served.get("message").is_none(),
+                    "case {:?} on {engine}: {sql} must be served, got {served}",
+                    definition.case
+                );
+            }
+
+            // What a reader OUTSIDE the transaction sees once the definition has run: the
+            // work the definition committed, and nothing else — the row written after it
+            // is still the transaction's own.
+            let expected = if committed {
+                json!([[{"stringValue": "before"}]])
+            } else {
+                json!([])
+            };
+            let outside = cloud
+                .run(call(json!({"sql": "SELECT label FROM ledger ORDER BY id"})))
+                .await;
+            assert_eq!(
+                outside["records"],
+                expected,
+                "case {:?} on {engine}: expected {expected} committed by the statement, \
+                 got {outside}",
+                definition.case
+            );
+
+            let (status, rolled_back) = cloud
+                .call(
+                    "/RollbackTransaction",
+                    call(json!({"transactionId": transaction_id})),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {:?} on {engine}: RollbackTransaction failed with {rolled_back}",
+                definition.case
+            );
+
+            // And what survives the rollback is exactly what the definition had committed.
+            let after = cloud
+                .run(call(json!({"sql": "SELECT label FROM ledger ORDER BY id"})))
+                .await;
+            assert_eq!(
+                after["records"],
+                expected,
+                "case {:?} on {engine}: expected {expected} to survive the rollback, \
+                 got {after}",
+                definition.case
+            );
+
+            // The definition itself is durable too where the engine commits it, and goes
+            // away with the transaction where it does not.
+            if let Some(proof) = definition.proof {
+                let (status, body) = cloud.execute(call(json!({"sql": proof}))).await;
+                let expected_status = if committed { 200 } else { 400 };
+                assert_eq!(
+                    status, expected_status,
+                    "case {:?} on {engine}: expected HTTP {expected_status} for {proof}, \
+                     got {status} {body}",
+                    definition.case
+                );
+            }
+        }
+    }
+}
+
 /// One condition the database raises, with the statement that raises it and the sentence
 /// each engine words it with.
 struct Diagnostic {
