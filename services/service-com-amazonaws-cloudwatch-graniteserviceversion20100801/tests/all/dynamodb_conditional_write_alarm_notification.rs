@@ -47,9 +47,9 @@ use crate::harness::{
 /// turned-down conditional write on and the dimension it reports that series per — written as
 /// literals so a series published under a name no AWS reader asks for fails here instead of
 /// agreeing with itself.
-const NAMESPACE: &str = "AWS/DynamoDB";
-const CONDITIONAL_CHECK_FAILED_REQUESTS: &str = "ConditionalCheckFailedRequests";
-const TABLE_DIMENSION: &str = "TableName";
+pub(crate) const NAMESPACE: &str = "AWS/DynamoDB";
+pub(crate) const CONDITIONAL_CHECK_FAILED_REQUESTS: &str = "ConditionalCheckFailedRequests";
+pub(crate) const TABLE_DIMENSION: &str = "TableName";
 
 /// The `X-Amz-Target` prefix Amazon DynamoDB names its operations under.
 const DYNAMODB_TARGET_PREFIX: &str = "DynamoDB_20120810";
@@ -90,7 +90,7 @@ const TOLERANCE: f64 = 1e-9;
 /// mounts them: the series DynamoDB publishes about the writes it turned down is the one
 /// CloudWatch grades, and the notification an alarm action publishes reaches the queue
 /// subscribed to its topic.
-fn emulator_with_dynamodb_and_notifications() -> Emulator {
+pub(crate) fn emulator_with_dynamodb_and_notifications() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -116,7 +116,11 @@ fn emulator_with_dynamodb_and_notifications() -> Emulator {
 /// One Amazon DynamoDB call over its `awsJson1.0` wire, answering its HTTP status and parsed
 /// body — the seam a row needs, since a write a condition turns down is a REFUSAL and the
 /// shared `rpc` helper requires a 200.
-async fn dynamodb(emulator: &Emulator, operation: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn dynamodb(
+    emulator: &Emulator,
+    operation: &str,
+    body: Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -143,7 +147,12 @@ async fn dynamodb(emulator: &Emulator, operation: &str, body: Value) -> (u16, Va
 }
 
 /// The same call, required to be served.
-async fn dynamodb_ok(emulator: &Emulator, case: &str, operation: &str, body: Value) -> Value {
+pub(crate) async fn dynamodb_ok(
+    emulator: &Emulator,
+    case: &str,
+    operation: &str,
+    body: Value,
+) -> Value {
     let (status, answered) = dynamodb(emulator, operation, body).await;
     assert_eq!(
         status, 200,
@@ -159,7 +168,7 @@ async fn monitoring(emulator: &Emulator, operation: &str, body: &Value) -> Value
 
 /// Which write surface a row's refusals come in through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Surface {
+pub(crate) enum Surface {
     /// The item API's three write verbs, each guarded by a `ConditionExpression`.
     Put,
     Update,
@@ -172,7 +181,7 @@ enum Surface {
 
 impl Surface {
     /// The operation a refusal of this surface is made with.
-    fn operation(self) -> &'static str {
+    pub(crate) fn operation(self) -> &'static str {
         match self {
             Self::Put => "PutItem",
             Self::Update => "UpdateItem",
@@ -183,7 +192,7 @@ impl Surface {
     }
 
     /// The error code this surface reports an unmet condition as.
-    fn refusal_code(self) -> &'static str {
+    pub(crate) fn refusal_code(self) -> &'static str {
         match self {
             Self::Transaction => "TransactionCanceledException",
             _ => "ConditionalCheckFailedException",
@@ -191,7 +200,7 @@ impl Surface {
     }
 
     /// The request that is turned down: the write guarded on a version no stored item holds.
-    fn refused_request(self, table: &str) -> Value {
+    pub(crate) fn refused_request(self, table: &str) -> Value {
         match self {
             Self::Put => json!({
                 "TableName": table,
@@ -238,7 +247,7 @@ impl Surface {
 }
 
 /// The item the seeded key holds: the version a winning write states and a losing one does not.
-fn seeded_item() -> Value {
+pub(crate) fn seeded_item() -> Value {
     json!({"pk": {"S": KEY}, "version": {"N": LIVE_VERSION.to_string()}})
 }
 
@@ -562,7 +571,7 @@ async fn the_refusal_burst_moves_a_settled_alarm_into_alarm_and_notifies() {
 /// Create one table on-demand, with the one partition key every row addresses. The caller waits
 /// for it to serve, so a suite that creates several tables can have them become ACTIVE over one
 /// span rather than one each.
-async fn create_table(emulator: &Emulator, name: &str) {
+pub(crate) async fn create_table(emulator: &Emulator, name: &str) {
     let (status, created) = dynamodb(
         emulator,
         "CreateTable",
@@ -582,7 +591,7 @@ async fn create_table(emulator: &Emulator, name: &str) {
 
 /// Look at `DescribeTable` until DynamoDB reports the table ACTIVE — the state a write needs.
 /// The wait is for that service's own report rather than for a span.
-async fn table_when_active(emulator: &Emulator, case: &str, name: &str) {
+pub(crate) async fn table_when_active(emulator: &Emulator, case: &str, name: &str) {
     let deadline = Instant::now() + WORK_WAIT;
     let mut last = Value::Null;
     while Instant::now() < deadline {
