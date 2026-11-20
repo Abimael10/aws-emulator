@@ -14,8 +14,9 @@
 //!
 //! A run that reached NO node is an execution all the same — State Manager dispatched the
 //! association — but nothing reported a result for it: it has no target to report one, so it
-//! reports no detail and no count of targets by status, and its status stays the `Pending` the
-//! association itself reports ([`associations::AssociationRecord::overview`]). One rule holds
+//! reports no detail and the EMPTY count of targets by status, and its status stays the
+//! `Pending` the association itself reports
+//! ([`associations::AssociationRecord::overview`]). One rule holds
 //! across both reads: a result is reported by the nodes a run reached, and a run that reached
 //! none has no result.
 //!
@@ -134,12 +135,16 @@ impl AssociationRunRecord {
     /// execution itself has reached ([`AssociationRunRecord::status`]), rendered as the one
     /// entry `{Status=count}` the member carries it as.
     ///
-    /// `None` for a run that reached no node: a count of resources by status is a count over
-    /// the resources an execution reached and there are none, the reading the association's
-    /// own aggregated count takes.
-    pub fn resource_count_by_status(&self, now: SystemTime) -> Option<String> {
-        (!self.nodes.is_empty())
-            .then(|| format!("{{{}={}}}", self.status(now), self.nodes.len()))
+    /// A run that reached NO node reports the EMPTY aggregate, `{}`: the member is a count
+    /// over the resources an execution reached, and a count over none is empty rather than
+    /// absent — the execution happened, and State Manager had nothing to report a status for.
+    /// That is the form a client reads to tell "this execution counted nothing" from "this
+    /// execution counted something", so it is reported for every execution.
+    pub fn resource_count_by_status(&self, now: SystemTime) -> String {
+        if self.nodes.is_empty() {
+            return "{}".to_string();
+        }
+        format!("{{{}={}}}", self.status(now), self.nodes.len())
     }
 
     /// Whether the execution filter `key`/`value` under `operator` admits this execution as
@@ -203,7 +208,7 @@ impl AssociationRunRecord {
             last_execution_date: self
                 .has_finished(now)
                 .then(|| ::aws_smithy_types::DateTime::from(self.finished_at())),
-            resource_count_by_status: self.resource_count_by_status(now),
+            resource_count_by_status: Some(self.resource_count_by_status(now)),
             // The alarms this execution was dispatched to watch are the ones the version it
             // applied carries, and none has been invoked.
             alarm_configuration: association

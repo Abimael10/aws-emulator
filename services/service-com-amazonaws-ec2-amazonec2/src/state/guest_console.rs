@@ -176,12 +176,71 @@ pub struct GuestMachine {
     /// Whether a metadata request of its guest has to carry a session token
     /// (`InstanceMetadataOptionsResponse$HttpTokens` is `required`).
     pub metadata_token_required: bool,
+    /// The IAM instance profile this machine RUNS AS, where it runs as one: the ARN and the
+    /// unique id of the profile ([`ComAmazonawsEc2Amazonec2State::iam_instance_profile_of_instance`])
+    /// and the NAME of the role that profile carries.
+    ///
+    /// Published to the guest by its metadata service — "information about the IAM instance
+    /// profile associated with the instance" at `iam/info`, and the role whose credentials
+    /// the guest's agents use under `iam/security-credentials/` — which is how a program
+    /// inside the guest learns which role it is running as.
+    ///
+    /// The role's name is a fact IAM holds rather than this store, so it is filled in by the
+    /// caller that reaches the guest with that service's store in reach
+    /// ([`GuestIdentity`]); a guest reached with none published for it publishes no role,
+    /// rather than a name nothing resolved.
+    pub instance_profile: Option<GuestInstanceProfile>,
+}
+
+/// The IAM instance profile one machine runs as, as its guest's metadata service publishes
+/// it.
+#[derive(Debug, Clone, Default)]
+pub struct GuestInstanceProfile {
+    /// "The Amazon Resource Name (ARN) of the instance profile"
+    /// (`IamInstanceProfile$Arn`).
+    pub arn: Option<String>,
+    /// "The ID of the instance profile" (`IamInstanceProfile$Id`).
+    pub id: Option<String>,
+    /// The NAME of the role the profile carries, which is the name the metadata service
+    /// lists under `iam/security-credentials/`; `None` where nothing resolved it.
+    pub role_name: Option<String>,
+}
+
+/// What the CALLER of a guest program supplies about the machine's IDENTITY — the part of it
+/// this store cannot read, because it belongs to another service.
+///
+/// A guest's metadata service publishes the role its instance profile carries, and which role
+/// that is lives in IAM's own records; a caller that reaches a guest with the engine in hand
+/// resolves it there ([`ComAmazonawsEc2Amazonec2State::instance_profile_role_name`]) and hands
+/// it over here, so this store keeps no second copy of an IAM record.
+#[derive(Debug, Clone, Default)]
+pub struct GuestIdentity {
+    /// The name of the role the instance's instance profile carries.
+    pub iam_role_name: Option<String>,
+}
+
+impl GuestMachine {
+    /// The same machine, running as the role `identity` names.
+    ///
+    /// The ONE place that fact reaches a machine, so the boot's own program and a command
+    /// something later sends the guest publish one role rather than two readings of it.
+    #[must_use]
+    pub fn running_as(mut self, identity: &GuestIdentity) -> Self {
+        if let Some(profile) = self.instance_profile.as_mut() {
+            profile.role_name = identity.iam_role_name.clone();
+        }
+        self
+    }
 }
 
 impl ComAmazonawsEc2Amazonec2State {
     /// What the guest of `instance` knows about the machine it runs on — every value read
     /// off the stored instance, the account's image catalog and the published instance-type
     /// facts.
+    ///
+    /// The one fact of the machine that is NOT this store's — the name of the role its
+    /// instance profile carries — is left for the caller that reaches the guest to supply
+    /// ([`GuestMachine::running_as`]).
     pub fn guest_machine(&self, instance: &InstanceRecord) -> GuestMachine {
         GuestMachine {
             instance_id: instance.instance_id.clone(),
@@ -204,6 +263,15 @@ impl ComAmazonawsEc2Amazonec2State {
             metadata_endpoint_enabled: instance.detail.http_endpoint
                 == super::METADATA_ENDPOINT_ENABLED,
             metadata_token_required: instance.detail.http_tokens == super::HTTP_TOKENS_REQUIRED,
+            // The profile the instance runs as is this store's own record of it; the role it
+            // carries is IAM's, and is filled in by the caller that has that store in reach.
+            instance_profile: self
+                .iam_instance_profile_of_instance(&instance.instance_id)
+                .map(|profile| GuestInstanceProfile {
+                    arn: profile.arn,
+                    id: profile.id,
+                    role_name: None,
+                }),
         }
     }
 
@@ -729,6 +797,9 @@ mod tests {
             ramdisk_id: None,
             metadata_endpoint_enabled: true,
             metadata_token_required: false,
+            // A machine that runs as no instance profile, which is what a launch that names
+            // none stores.
+            instance_profile: None,
         }
     }
 

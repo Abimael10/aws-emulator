@@ -180,7 +180,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
-        let store = state.lock();
+        // The managed-node registrations the clock already owed were due at the same instant
+        // whether or not anybody called, so they are materialised first — with no guard of
+        // this store held ([`crate::state::node_registration::settle_registrations`]).
+        crate::state::node_registration::settle_registrations(&*self.engine, &region);
+        let mut store = state.lock();
+        // And so was the application the association owes a node that has registered since its
+        // current run was dispatched, which that execution counts: materialised before the
+        // executions are read.
+        store.materialize_due(now);
 
         // The specified association doesn't exist (`AssociationDoesNotExist`): an
         // association is reachable through the Region it was created in, by the id that

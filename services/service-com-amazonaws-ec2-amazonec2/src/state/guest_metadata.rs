@@ -18,10 +18,15 @@
 //!
 //! Every value is read off the STORED instance ([`GuestMachine`], the one reading of what a
 //! guest knows about its machine): the id, the image, the type, the architecture, the
-//! addresses, the zone and the Region of that zone, the instant it was launched, and the
-//! metadata options its launch chose. Nothing is echoed from a request, and nothing is
-//! answered for a fact the record does not carry — a path whose value the instance has none
-//! of is a `404` rather than an invented value.
+//! addresses, the zone and the Region of that zone, the instant it was launched, the
+//! metadata options its launch chose, and the IAM instance profile it runs as — the profile
+//! this store holds for it and the name of the role that profile carries, which is the one
+//! fact of the machine another service owns ([`GuestMachine::running_as`]). Nothing is echoed
+//! from a request, and nothing is answered for a fact the record does not carry — a path
+//! whose value the instance has none of is a `404` rather than an invented value, which is
+//! why an instance running as no profile publishes no `iam/` category at all, and why the
+//! credentials AWS publishes UNDER a role's name are published by nothing here: a credential
+//! is minted by the credential store, never by a reader.
 //!
 //! The identity document is SIGNED: [`identity_document_signature`] is the RSASSA-PKCS1-v1_5
 //! signature of the document's own bytes under a 2048-bit key this process generates once
@@ -50,13 +55,27 @@ use ::service_common::instance_metadata_service::{
 use ::service_common::jws_signing::{SigningKey, RS256};
 use ::service_common::posix_shell_session::EnvironmentPrograms;
 
-use super::guest_console::{guest_mac_address, GuestMachine};
+use super::guest_console::{guest_mac_address, GuestInstanceProfile, GuestMachine};
 use super::{iso8601_utc, region_of_zone_name};
 
 pub use ::service_common::instance_metadata_service::{
     metadata_address, METADATA_ADDRESS_OCTETS, METADATA_CLIENT, METADATA_TOKEN_HEADER,
     METADATA_TOKEN_PATH, METADATA_TOKEN_TTL_HEADER,
 };
+
+/// The path the instance profile the machine runs as is published at ("information about the
+/// IAM instance profile associated with the instance", Amazon EC2 User Guide, "Instance
+/// metadata categories").
+pub const IAM_INFO_PATH: &str = "/latest/meta-data/iam/info";
+
+/// The path the role whose credentials the guest's agents use is listed at: the category is a
+/// LISTING, whose one entry is the name of that role, and the credentials themselves are
+/// published under it, one path per role.
+pub const IAM_SECURITY_CREDENTIALS_PATH: &str = "/latest/meta-data/iam/security-credentials";
+
+/// `Code` of the `iam/info` document for an instance whose profile the metadata service
+/// resolved: the word AWS's own document carries.
+const IAM_INFO_SUCCESS: &str = "Success";
 
 /// The path the signed identity document of the instance is published at
 /// (`RegisterContainerInstanceRequest$instanceIdentityDocument`).
@@ -154,6 +173,15 @@ impl PublishedInstanceMetadata for GuestPrograms {
             "/latest/meta-data/placement/region" => {
                 one(region_of_zone_name(&machine.availability_zone).to_string())
             }
+            // The profile the machine runs as, and the role it carries: an instance that runs
+            // as no profile publishes neither, which is what the metadata service of such an
+            // instance answers (the category is simply not there).
+            IAM_INFO_PATH => machine.instance_profile.as_ref().map(iam_info),
+            IAM_SECURITY_CREDENTIALS_PATH => machine
+                .instance_profile
+                .as_ref()
+                .and_then(|profile| profile.role_name.clone())
+                .map(|role_name| vec![role_name]),
             IDENTITY_DOCUMENT_PATH => one(identity_document(machine)),
             // The published signature is base64 text of the document's signature, which is
             // the form the operations that take one accept.
@@ -170,6 +198,8 @@ impl PublishedInstanceMetadata for GuestPrograms {
 const METADATA_CATEGORIES: &[&str] = &[
     "ami-id",
     "hostname",
+    "iam/info",
+    "iam/security-credentials",
     "instance-id",
     "instance-type",
     "local-hostname",
@@ -179,6 +209,31 @@ const METADATA_CATEGORIES: &[&str] = &[
     "placement/region",
     "public-ipv4",
 ];
+
+/// The `iam/info` document of the instance profile a machine runs as: the members AWS's own
+/// document carries (Amazon EC2 User Guide, "Instance metadata categories"), each read off
+/// the profile this store holds for the instance. A member the profile has no value for is
+/// left out rather than written as null, which is what the published document does.
+fn iam_info(profile: &GuestInstanceProfile) -> Vec<String> {
+    let mut document = ::serde_json::Map::new();
+    document.insert(
+        "Code".to_string(),
+        ::serde_json::Value::String(IAM_INFO_SUCCESS.to_string()),
+    );
+    if let Some(arn) = profile.arn.clone() {
+        document.insert(
+            "InstanceProfileArn".to_string(),
+            ::serde_json::Value::String(arn),
+        );
+    }
+    if let Some(id) = profile.id.clone() {
+        document.insert(
+            "InstanceProfileId".to_string(),
+            ::serde_json::Value::String(id),
+        );
+    }
+    vec![::serde_json::Value::Object(document).to_string()]
+}
 
 /// The identity document of `machine`: the JSON document the metadata service publishes for
 /// the instance, with every member read off the stored instance.

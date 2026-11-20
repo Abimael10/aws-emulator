@@ -1941,6 +1941,12 @@ fn content_within_size(content: &str) -> Result<(), ContentRejection> {
 /// enum, `crate::ops::types::PING_STATUS_VALUES`).
 pub const PING_STATUS_ONLINE: &str = "Online";
 
+/// The `PingStatus` a node whose agent is NO LONGER reaching the service carries (same
+/// enum): the node is registered — Systems Manager still reports it — and the agent inside it
+/// has stopped reporting, which is what an instance that cannot reach the service's endpoints
+/// any more leaves behind.
+pub const PING_STATUS_CONNECTION_LOST: &str = "ConnectionLost";
+
 /// The `ResourceType` of a node that is an EC2 instance (from the modelled enum,
 /// `crate::ops::types::RESOURCE_TYPE_VALUES`).
 pub const RESOURCE_TYPE_EC2_INSTANCE: &str = "EC2Instance";
@@ -2410,6 +2416,9 @@ impl ComAmazonawsSsmAmazonssmState {
         // And so was the removal of an OpsItem whose delete had settled by then
         // (`ops_items::OPS_ITEM_DELETE_SETTLES_AFTER`).
         self.settle_ops_item_deletions_due(now);
+        // And so was the application an association owes a node that has registered since its
+        // current run was dispatched ([`Self::settle_due_association_targets`]).
+        self.settle_due_association_targets();
     }
 
     /// The command `command_id` names in `region`, or `None` when that Region holds none.

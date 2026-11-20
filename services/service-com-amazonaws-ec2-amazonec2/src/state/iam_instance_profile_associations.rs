@@ -529,6 +529,40 @@ pub(super) fn iam_held_instance_profile<Eng: Send + Sync + 'static>(
     })
 }
 
+/// The NAME of the role the instance `instance_id` RUNS AS — the role the instance profile
+/// EC2 holds for that instance carries — or `None` for an instance that runs as no profile,
+/// or whose profile the account's IAM records hold nothing for.
+///
+/// "An instance profile can contain only one role" (`AddRoleToInstanceProfile`), so the
+/// profile names exactly one. The record is IAM's own
+/// ([`iam_store::ComAmazonawsIamAwsidentitymanagementv20100508State::instance_profile_report`]),
+/// read the way [`iam_held_instance_profile`] reads a profile beside it, so this service keeps
+/// no second copy of which role a profile carries — and what the guest's own metadata service
+/// publishes under `iam/security-credentials/` is therefore the role IAM holds right now.
+///
+/// Call it with NO guard of this service's store held: it takes this store's guard to read
+/// which profile the instance runs as, releases it, and then takes IAM's.
+pub fn instance_profile_role_name<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    instance_id: &str,
+) -> Option<String> {
+    let arn = {
+        let ec2 = crate::state::service_state(engine)?;
+        let store = ec2.lock();
+        store
+            .iam_instance_profile_of_instance(instance_id)
+            .and_then(|profile| profile.arn)?
+    };
+    let name = ::service_common::iam_role::instance_profile_name(&arn)?;
+    let iam = iam_store::service_state(engine)?;
+    let held = iam
+        .lock()
+        .instance_profile_report(&iam_store::name_key(name))?;
+    held.roles
+        .first()
+        .map(|role| role.role_name.clone())
+}
+
 /// The instance profile an `IamInstanceProfileSpecification` names, as an association
 /// reports it (`IamInstanceProfileAssociation$IamInstanceProfile`).
 ///

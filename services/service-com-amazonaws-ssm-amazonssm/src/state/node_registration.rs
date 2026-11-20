@@ -35,6 +35,17 @@
 //!    a managed one, so the role whose credentials its agent registered with is reported,
 //!    under the name IAM holds it by, which is the form a hybrid activation's node reports
 //!    too (`CreateActivationRequest$IamRole` is a role NAME).
+//! 4. **whether the agent can REACH the service** — the agent registers by CALLING Systems
+//!    Manager over HTTPS, so the instance's security groups have to let that call out: "make
+//!    sure that the security group … allows HTTPS (port 443) outbound traffic to the Systems
+//!    Manager endpoints" (AWS Systems Manager User Guide, the agent's connectivity
+//!    requirements). The decision is Amazon EC2's own reading of its rules
+//!    ([`ComAmazonawsEc2Amazonec2State::security_groups_admit_outbound`]), so this service
+//!    holds no second notion of what a group allows. An instance whose groups admit no such
+//!    call never registers, and a node that HAS registered whose groups stop admitting it
+//!    reports [`super::PING_STATUS_CONNECTION_LOST`] — it stays a managed node, which is what
+//!    `DescribeInstanceInformation` reports for a node whose agent has stopped reporting,
+//!    rather than vanishing.
 //!
 //! An instance whose role's policies this emulator cannot READ — an attachment of AWS's own
 //! catalog whose document IAM holds nothing for — registers: refusing on evidence this
@@ -53,7 +64,8 @@
 //! is why a REPORTING operation of this service takes it before it reads the node store.
 //! Nothing else about a node is rewritten afterwards — a registration happens once, and
 //! what the agent reported then is what the record keeps — except the TAGS the node
-//! reports, which are the instance's own tag set rather than a copy frozen at registration.
+//! reports, which are the instance's own tag set rather than a copy frozen at registration,
+//! and the `PingStatus` it reports, which is whether the agent is reaching the service NOW.
 //! What the node store can hold this way is bounded by the instance store it is derived from
 //! (Amazon EC2's own `MAX_STORED_INSTANCES`): at most one node per instance of that store,
 //! per Region.
@@ -65,7 +77,7 @@ use ::service_com_amazonaws_ec2_amazonec2::state as ec2;
 use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam;
 use ::service_common::iam_authorization::{self as authorization, Decision};
 
-use super::{ManagedNodeRecord, RESOURCE_TYPE_EC2_INSTANCE};
+use super::{ManagedNodeRecord, PING_STATUS_CONNECTION_LOST, PING_STATUS_ONLINE, RESOURCE_TYPE_EC2_INSTANCE};
 
 /// How long after its launch an instance's registration with Systems Manager falls due.
 ///
@@ -87,6 +99,14 @@ pub const REGISTRATION_ACTION: &str = "ssm:UpdateInstanceInformation";
 /// The service principal an instance profile's role has to trust for Amazon EC2 to act as
 /// it on an instance's behalf, so that the agent on the instance has credentials at all.
 pub const EC2_SERVICE_PRINCIPAL: &str = "ec2.amazonaws.com";
+
+/// The protocol the agent reaches Systems Manager over, as a security group rule names one.
+pub const AGENT_PROTOCOL: &str = "tcp";
+
+/// The port it reaches it on: "allows HTTPS (port 443) outbound traffic to the Systems
+/// Manager endpoints" (AWS Systems Manager User Guide) — the agent's calls are HTTPS, so
+/// what the instance's groups have to let out is HTTPS.
+pub const AGENT_ENDPOINT_PORT: u16 = 443;
 
 /// The SSM Agent build the managed nodes of this emulator report
 /// (`InstanceInformation$AgentVersion`, pattern `^[0-9]{1,6}(\.[0-9]{1,6}){2,3}$`).
@@ -123,7 +143,8 @@ pub const PLATFORM_TYPE_LINUX: &str = "Linux";
 /// stores and then writes this service's.
 ///
 /// The two writes are the ones the clock owes: a node whose instance was launched more than
-/// [`REGISTRATION_DELAY`] ago and whose profile lets the agent register is added, and a node
+/// [`REGISTRATION_DELAY`] ago, whose profile lets the agent register and whose security groups
+/// let the agent's own call reach the service is added, and a node
 /// THIS projection registered whose instance no longer qualifies — gone, stopped,
 /// terminated, or no longer running as such a profile — is dropped, because
 /// `DescribeInstanceInformation` reports no node for it. A node registered any other way (a
@@ -132,7 +153,9 @@ pub const PLATFORM_TYPE_LINUX: &str = "Linux";
 /// A node this projection already registered also has the TAGS it reports brought in line
 /// with the instance's own, because they are the instance's tags rather than something the
 /// registration froze: that is what a `tag:` target selects a node by and what Patch Manager
-/// reads a node's patch group from.
+/// reads a node's patch group from — and the `PingStatus` it reports brought in line with
+/// whether the agent can still reach the service ([`agent_reaches_service`]), because that
+/// status IS whether the agent is reporting.
 pub fn settle_registrations<Eng: Send + Sync + 'static>(engine: &Eng, region: &str) {
     let registered = registered_nodes(engine, region, SystemTime::now());
     let Some(state) = super::service_state(engine) else {
@@ -152,9 +175,15 @@ pub fn settle_registrations<Eng: Send + Sync + 'static>(engine: &Eng, region: &s
         let Some(id) = node.node_id().map(str::to_string) else {
             continue;
         };
+        let ping_status = node.properties.ping_status.clone();
         match store.managed_node_mut(region, &id) {
             None => {
-                store.insert_managed_node(region, node);
+                // An instance whose agent cannot reach the service has never registered:
+                // registering is a CALL the agent makes, so a node is created for one that
+                // could make it and for no other.
+                if ping_status.as_deref() == Some(super::PING_STATUS_ONLINE) {
+                    store.insert_managed_node(region, node);
+                }
             }
             Some(held) if held.registered_from_instance => {
                 // A registration happens once, so nothing else about the node is rewritten
@@ -170,6 +199,13 @@ pub fn settle_registrations<Eng: Send + Sync + 'static>(engine: &Eng, region: &s
                 for (key, value) in node.tags {
                     held.tags.insert(key, value);
                 }
+                // …and the PING STATUS, which is not a fact the registration froze either:
+                // it is whether the agent is reaching the service now, so an instance whose
+                // groups stopped letting its HTTPS call out reports `ConnectionLost`, and one
+                // whose groups let it out again reports `Online` on its next ping. The
+                // instant of that ping is left where it was: the ping that instant records is
+                // one the agent made.
+                held.properties.ping_status = ping_status;
             }
             Some(_) => {}
         }
@@ -259,6 +295,10 @@ struct ManagedInstance {
     /// the tags the instance holds (`Target`: "you could specify `tag:ServerRole` … to run
     /// a command on instances that include EC2 tags of `ServerRole,WebServer`").
     tags: BTreeMap<String, String>,
+    /// Whether the instance's security groups let the agent's own HTTPS call to the Systems
+    /// Manager endpoints OUT ([`AGENT_ENDPOINT_PORT`]): an agent that cannot reach the
+    /// service cannot register, and one that could and no longer can has stopped reporting.
+    reaches_service: bool,
 }
 
 impl ManagedInstance {
@@ -284,6 +324,7 @@ impl ManagedInstance {
             launch_time: instance.launch_time,
             availability_zone: instance.placement_az.clone(),
             tags: instance.tags.clone(),
+            reaches_service: agent_reaches_service(store, instance),
         })
     }
 
@@ -299,6 +340,11 @@ impl ManagedInstance {
     /// `iam_role` is the name of the role the instance's instance profile carries, which is
     /// the role the node registered as and so what it reports as its own `IamRole`
     /// ([`registration_role`]); `None` only where which role that is cannot be read at all.
+    ///
+    /// The `PingStatus` is whether the agent is REPORTING: it registers, and goes on
+    /// reporting itself, by calling the service, so a node whose instance lets that call out
+    /// is `Online` and one whose instance does not has lost its connection
+    /// ([`agent_reaches_service`]).
     fn node(self, iam_role: Option<String>) -> ManagedNodeRecord {
         let mut node =
             ManagedNodeRecord::registering(self.id, RESOURCE_TYPE_EC2_INSTANCE, self.registered_at);
@@ -322,13 +368,46 @@ impl ManagedInstance {
         reported.architecture = Some(self.architecture);
         reported.launch_time = Some(::aws_smithy_types::DateTime::from(self.launch_time));
         reported.availability_zone = Some(self.availability_zone);
+        reported.ping_status = Some(
+            if self.reaches_service {
+                PING_STATUS_ONLINE
+            } else {
+                PING_STATUS_CONNECTION_LOST
+            }
+            .to_string(),
+        );
         node
     }
 }
 
-/// When `instance`'s registration with Systems Manager fell due: [`REGISTRATION_DELAY`]
-/// after the instant it was launched.
+/// Whether the agent inside `instance`'s guest can REACH Systems Manager: the instance's
+/// security groups let an HTTPS call out ([`AGENT_PROTOCOL`], [`AGENT_ENDPOINT_PORT`]).
 ///
+/// The groups are the ones the instance's own interface carries
+/// (`ComAmazonawsEc2Amazonec2State::instance_security_groups`) and the decision over their
+/// rules is that service's own
+/// ([`ec2::ComAmazonawsEc2Amazonec2State::security_groups_admit_outbound`]), so what a group
+/// allows is read in ONE place for the whole emulator.
+///
+/// An instance Amazon EC2 reports in NO security group is one whose filter this emulator
+/// holds nothing for, which is not evidence that the agent's call is blocked — the same
+/// reading the module docs take of a grant that cannot be read — so its agent reaches the
+/// service.
+fn agent_reaches_service(
+    store: &ec2::ComAmazonawsEc2Amazonec2State,
+    instance: &ec2::InstanceRecord,
+) -> bool {
+    let group_ids: Vec<String> = store
+        .instance_security_groups(instance)
+        .into_iter()
+        .filter_map(|group| group.group_id)
+        .collect();
+    group_ids.is_empty()
+        || store.security_groups_admit_outbound(&group_ids, AGENT_PROTOCOL, AGENT_ENDPOINT_PORT)
+}
+
+/// When `instance`'s registration with Systems Manager fell due: [`REGISTRATION_DELAY`]
+/// after the instant it was launched.///
 /// Derived from the stored launch instant rather than from the clock, so it is the same
 /// instant on every read — which is what lets the node record report one `RegistrationDate`
 /// however often it is materialised.

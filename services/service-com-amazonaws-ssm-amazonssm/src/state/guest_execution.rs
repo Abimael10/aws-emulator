@@ -217,6 +217,12 @@ fn resolved_line(text: &str, values: &BTreeMap<String, Vec<String>>) -> String {
 /// ([`super::guest_resolver`]): a script that resolves a name is answered by the DNS of the
 /// VPC the node is in, which is read ONCE here — before the store that owns the guest is
 /// taken — because answering a query reads three stores and running the script holds one.
+///
+/// The machine's own IDENTITY travels the same way: which role the instance's instance
+/// profile carries is a fact IAM holds, so that service's own records answer it
+/// ([`ec2_store::instance_profile_role_name`], read before the guest's store is taken), and
+/// the guest's metadata service publishes it to a program that asks — the read an agent makes
+/// to learn the role it is running as.
 pub fn perform_in_guest<Eng: Send + Sync + 'static>(
     engine: &Eng,
     instance_id: &str,
@@ -228,6 +234,9 @@ pub fn perform_in_guest<Eng: Send + Sync + 'static>(
         engine, instance_id,
     )
     .map(super::guest_resolver::resolver_programs);
+    let identity = ec2_store::GuestIdentity {
+        iam_role_name: ec2_store::instance_profile_role_name(engine, instance_id),
+    };
     let ec2 = ec2_store::service_state(engine)?;
     let mut store = ec2.lock();
     // The moves that service already owed the instance — its launch reaching `running` and
@@ -235,5 +244,5 @@ pub fn perform_in_guest<Eng: Send + Sync + 'static>(
     // and a script runs in the guest that boot brought up. Materialising them is EC2's own
     // write, through its own one-stop materialiser.
     store.materialize_due_transitions();
-    store.run_in_instance_guest_with(instance_id, commands, resolver)
+    store.run_in_instance_guest_with(instance_id, commands, resolver, &identity)
 }

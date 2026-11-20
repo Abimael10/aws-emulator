@@ -38,7 +38,7 @@ use ::service_common::posix_shell_session::{
     layered, Bounds, EnvironmentPrograms, OutputLimits, SessionConfig, ShellSession,
 };
 
-use super::guest_console::{guest_environment, guest_volume};
+use super::guest_console::{guest_environment, guest_volume, GuestIdentity};
 use super::{ComAmazonawsEc2Amazonec2State, InstanceStateName};
 
 /// How many commands ONE run performs before the session is given up on.
@@ -85,23 +85,28 @@ impl ComAmazonawsEc2Amazonec2State {
         instance_id: &str,
         commands: &[String],
     ) -> Option<GuestRun> {
-        self.run_in_instance_guest_with(instance_id, commands, None)
+        self.run_in_instance_guest_with(instance_id, commands, None, &GuestIdentity::default())
     }
 
     /// [`Self::run_in_instance_guest`], with `supplied` as the programs the CALLER installs in
-    /// the guest beside the machine's own ([`super::guest_metadata::guest_programs`]).
+    /// the guest beside the machine's own ([`super::guest_metadata::guest_programs`]) and
+    /// `identity` as the part of the machine's own identity another service owns.
     ///
     /// A guest has programs whose answers come from state this store cannot read — an agent's
     /// resolver client, which answers out of the account's DNS — and the component that CAN
     /// read that state is the one that reaches into the guest. So it hands those programs over
     /// here rather than this store keeping a second notion of what they answer; the machine's
     /// own programs are asked first, so nothing the caller supplies can shadow one of them
-    /// ([`::service_common::posix_shell_session::layered`]).
+    /// ([`::service_common::posix_shell_session::layered`]). The one FACT of the machine in
+    /// the same position — the name of the role its instance profile carries, which IAM holds
+    /// — travels the same way, resolved by the caller
+    /// ([`super::instance_profile_role_name`]).
     pub fn run_in_instance_guest_with(
         &mut self,
         instance_id: &str,
         commands: &[String],
         supplied: Option<Box<dyn EnvironmentPrograms>>,
+        identity: &GuestIdentity,
     ) -> Option<GuestRun> {
         let instance = self.instances.get(instance_id)?;
         if instance.state != InstanceStateName::Running {
@@ -112,7 +117,10 @@ impl ComAmazonawsEc2Amazonec2State {
         let boot = instance.boots.last()?;
         let (boot_id, number) = (boot.boot_id.clone(), boot.number);
         let files = instance.guest_files.clone();
-        let machine = self.guest_machine(instance);
+        // The machine the program runs on, running as the role the caller resolved for it:
+        // which role the instance's profile carries is a fact IAM holds, so it is handed in
+        // rather than read here ([`GuestMachine::running_as`]).
+        let machine = self.guest_machine(instance).running_as(identity);
         // The services the machine is running now, which a command of this run may install,
         // start or stop ([`super::guest_services`]).
         let services =

@@ -1201,9 +1201,13 @@ async fn a_dispatch_that_reached_no_node_reports_no_result() {
             );
             assert!(
                 entry["DetailedStatus"].is_null()
-                    && entry["ResourceCountByStatus"].is_null()
                     && entry["LastExecutionDate"].is_null(),
-                "case {case:?}: a count or a detail over no resource is none, got {entry:?}"
+                "case {case:?}: a detail over no resource is none, got {entry:?}"
+            );
+            assert_eq!(
+                entry["ResourceCountByStatus"],
+                json!("{}"),
+                "case {case:?}: a count over no resource is the empty aggregate, got {entry:?}"
             );
             // The execution resolves, and reports the nothing it reached.
             let reached = targets(

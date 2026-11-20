@@ -122,6 +122,18 @@ pub const MAX_ASSOCIATIONS_TOTAL: usize = 2 * MAX_ASSOCIATIONS_PER_REGION;
 /// having run it before.
 pub const MAX_ASSOCIATION_EXECUTIONS: usize = 100;
 
+/// How many managed nodes ONE run of an association reports as reached
+/// ([`AssociationRunRecord::nodes`]).
+///
+/// Emulator resource guard, NOT a published AWS quota: a run's reached nodes are settled
+/// against the node store as nodes register ([`ComAmazonawsSsmAmazonssmState::settle_due_association_targets`]),
+/// and the store is held in memory for as long as the process runs — so a ceiling is what
+/// keeps one association's run from holding a node id per instance ever launched. Well above
+/// the nodes a Region of this emulator holds at once, and a run that has reached this many
+/// takes no further node rather than growing, exactly as the executions above drop the
+/// oldest rather than refusing a dispatch.
+pub const MAX_ASSOCIATION_RUN_NODES: usize = 1_000;
+
 /// How many versions ONE association keeps: "You have reached the maximum number versions
 /// allowed for an association. Each association has a limit of 1,000 versions"
 /// (`AssociationVersionLimitExceeded`). An update past it is refused with that error rather
@@ -395,10 +407,15 @@ pub struct AssociationRecord {
 
 /// One run of an association: when State Manager dispatched it, and to which managed nodes.
 ///
-/// The nodes are resolved from the node store at the instant the run STARTS, because that
-/// is when the association's targets are evaluated — a node registered afterwards was not
-/// one this run was dispatched to. The run's result is derived from `started_at` rather than
-/// written by anything: it has finished once [`ASSOCIATION_EXECUTION_DELAY`] has passed.
+/// The nodes are the ones the association's targets select while this is its CURRENT run: a
+/// target is criteria rather than a list, and a tag target "automatically applies the
+/// association to new managed nodes that you add to the tag group" (`Target`), so a node that
+/// registers while this run is the association's is a node this run reached
+/// ([`ComAmazonawsSsmAmazonssmState::settle_due_association_targets`], which also drops the
+/// nodes the Region no longer holds — nothing holds the kind an execution target reports for
+/// one — and holds the list to [`MAX_ASSOCIATION_RUN_NODES`]). The run's result is derived
+/// from `started_at` rather than written by anything: it has finished once
+/// [`ASSOCIATION_EXECUTION_DELAY`] has passed.
 #[derive(Debug, Clone)]
 pub struct AssociationRunRecord {
     /// "The execution ID for the association" (`AssociationExecution$ExecutionId`), minted
@@ -410,10 +427,10 @@ pub struct AssociationRunRecord {
     pub association_version: u64,
     /// When the run was dispatched.
     pub started_at: SystemTime,
-    /// The ids of the managed nodes it was dispatched to, in ascending node-id order. EMPTY
-    /// for a run whose targets selected no registered node, which is a run with no node to
-    /// apply the document on — and which still finishes, having applied it on all none of
-    /// them.
+    /// The ids of the managed nodes it reached, in ascending node-id order, at most
+    /// [`MAX_ASSOCIATION_RUN_NODES`] of them. EMPTY for a run whose targets have selected no
+    /// registered node, which is a run with no node to apply the document on — and which
+    /// still finishes, having applied it on all none of them.
     pub nodes: Vec<String>,
 }
 
@@ -1008,6 +1025,75 @@ impl ComAmazonawsSsmAmazonssmState {
         let nodes = self.association_run_nodes(held);
         if let Some(held) = self.association_mut(region, association_id) {
             held.start_run(nodes, now);
+        }
+    }
+
+    /// Bring the TARGETS of every association's current run in line with the nodes its
+    /// targets select now.
+    ///
+    /// An association's targets are CRITERIA rather than a list of nodes, and State Manager
+    /// applies the association to the nodes they select as that selection changes: "State
+    /// Manager applies the configuration when the association is created" and a tag target
+    /// "automatically applies the association to new managed nodes that you add to the tag
+    /// group" (`Target`). So a node that registers after the association's current run was
+    /// dispatched — an instance launched by the same template, whose agent came up a moment
+    /// later — is a node that run has applied the document on: it is reported as a target of
+    /// that execution and counted in it.
+    ///
+    /// The write is one the CLOCK already owed: a node registers at a stored instant of the
+    /// node store, whether or not anybody called, and the application State Manager owes it
+    /// was owed from that instant.
+    ///
+    /// What a run holds afterwards is exactly the nodes it reached THAT THIS REGION STILL
+    /// HOLDS: a node whose instance is gone is no longer a managed node of the account —
+    /// nothing holds the kind an execution target reports for it — so it is no longer reported
+    /// as one, which is also what BOUNDS this list by the nodes the node store holds rather
+    /// than by every instance ever launched. A run that has reached
+    /// [`MAX_ASSOCIATION_RUN_NODES`] of them takes no further node, so one association's run
+    /// is bounded whatever the node store grows to. The settle is therefore idempotent: two
+    /// reads in a row, with nothing registering or going away between them, leave the same
+    /// targets.
+    ///
+    /// Nothing is settled for an association that has never been dispatched (the call that
+    /// applies a version is what starts its first run) or one that runs only on the schedule
+    /// its version carries ([`AssociationRecord::runs_when_applied`]).
+    pub fn settle_due_association_targets(&mut self) {
+        let settled: Vec<((String, String), Vec<String>)> = self
+            .associations
+            .iter()
+            .filter(|(_, record)| record.runs_when_applied())
+            .filter_map(|(key, record)| {
+                let last = record.last_run()?;
+                // The nodes this run reached that are still registered, which is what it
+                // reports, and the ones its targets select now, which are what it has reached
+                // since. A set, so neither pass costs a scan of the list per node.
+                let region = record.region.as_str();
+                let mut reached: BTreeSet<String> = last
+                    .nodes
+                    .iter()
+                    .filter(|id| self.managed_node(region, id).is_some())
+                    .cloned()
+                    .collect();
+                for id in self.association_run_nodes(record) {
+                    if reached.len() >= MAX_ASSOCIATION_RUN_NODES {
+                        break;
+                    }
+                    reached.insert(id);
+                }
+                // Ascending node-id order, which is the order a run holds its nodes in.
+                let settled: Vec<String> = reached.into_iter().collect();
+                (settled != last.nodes).then(|| (key.clone(), settled))
+            })
+            .collect();
+        for (key, nodes) in settled {
+            let Some(run) = self
+                .associations
+                .get_mut(&key)
+                .and_then(AssociationRecord::last_run_mut)
+            else {
+                continue;
+            };
+            run.nodes = nodes;
         }
     }
 
