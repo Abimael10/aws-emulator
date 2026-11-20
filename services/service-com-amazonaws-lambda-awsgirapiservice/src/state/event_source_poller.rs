@@ -127,10 +127,16 @@
 //!   that the pass handled — a record a batch did not take, or one its invocation did not
 //!   process, is where the next read starts.
 //!
-//! Each pass reads what the shard holds and hands it over at once, so a mapping that
-//! configures a `MaximumBatchingWindowInSeconds` above the stream default of 0 is not
-//! waited out here: that yields SMALLER batches than such a mapping would see on AWS,
-//! never a record that is not delivered.
+//! * A BATCH IS GATHERED OVER THE WINDOW THE MAPPING ASKS FOR. "The maximum amount of time,
+//!   in seconds, that Lambda spends gathering records before invoking the function"
+//!   (`MaximumBatchingWindowInSeconds`): a mapping stating one hands a batch over once it
+//!   holds `BatchSize` records or that span has run since the first record of it was read,
+//!   whichever comes first — both are MAXIMA — so such a mapping invokes its function with
+//!   what accumulated over the window rather than with each record as it arrives, and a
+//!   mapping carrying the stream default of 0 seconds hands over what one read found. The
+//!   gathering costs no record and no position: the shard is checkpointed only past a batch
+//!   that was delivered, so a batch still gathering is simply read again, with the records
+//!   that arrived meanwhile, until it is due ([`PollerWork::gathered_for`]).
 //!
 //! Every call this module makes goes to the emulator it is running inside, over the
 //! in-process callback ([`smithy_server_runtime::EmbeddedEmulator`]): the stream is read
@@ -460,6 +466,11 @@ struct ShardSourcedMapping {
     /// How many records one batch holds at most, from `BatchSize`, clamped to what this
     /// emulator reads in one go ([`MAX_RECORDS_PER_BATCH`]).
     batch_size: i32,
+    /// How long one batch may be GATHERED for before it is handed over, from
+    /// `MaximumBatchingWindowInSeconds` ([`super::sqs_poller::batching_window`]); zero for a
+    /// mapping stating none, which is the stream default, and which hands over what one read
+    /// found.
+    batching_window: Duration,
     /// How many batches of ONE shard the mapping has in flight at once, from
     /// `ParallelizationFactor` ([`in_flight_batches_per_shard`]).
     in_flight_batches: usize,
@@ -736,11 +747,33 @@ struct PollerWork {
     /// stream this poller reads, an entry is given up as soon as its window is finalised,
     /// and the map is empty for a mapping that configures no window.
     windows: BTreeMap<String, tumbling_window::OpenWindow>,
+    /// When the batch at the head of each shard was first read, keyed by shard id, which is
+    /// when that batch's batching window opened ([`GatheringBatch`]). Bounded and given up
+    /// like [`Self::attempts`], and never consulted for a mapping whose batching window is
+    /// the stream default of zero.
+    gathering: BTreeMap<String, GatheringBatch>,
     /// The minute this mapping last published a 0-valued poll count for, for a mapping that
     /// meters its passes: such a zero says the poller looked and found nothing, and it is
     /// published once per minute, which is the resolution the series is aggregated at
     /// ([`claims_idle_minute`]). `None` while the poller has published none.
     idle_minute: Option<i64>,
+}
+
+/// When the batch at the head of ONE shard was first read, and which batch that is.
+///
+/// "The maximum amount of time, in seconds, that Lambda spends gathering records before
+/// invoking the function" (`MaximumBatchingWindowInSeconds`) is measured from the first
+/// record of the batch being gathered, so the instant belongs to the records it was opened
+/// for: it is keyed by the position that batch starts at and given up as soon as the shard
+/// has moved on, because a batch read from a moved position is a different batch and gathers
+/// over its own window.
+#[derive(Debug)]
+struct GatheringBatch {
+    /// The sequence number of the first record of the batch being gathered, which is the
+    /// position the shard is still at.
+    head: String,
+    /// When that record was first read, which is when this batch's window opened.
+    opened_at: SystemTime,
 }
 
 /// How many records one batch of ONE shard holds while the mapping is splitting a batch its
@@ -797,11 +830,35 @@ impl PollerWork {
         half
     }
 
+    /// How long the batch at `head` of `shard` has been GATHERING at `now`, opening its
+    /// window at this instant for a batch not seen at that position before.
+    ///
+    /// The window is measured from the first record of the batch, not from the pass that
+    /// found the shard empty, so it opens when there is something to gather.
+    fn gathered_for(&mut self, shard: &str, head: &str, now: SystemTime) -> Duration {
+        let opened_at = match self.gathering.get(shard) {
+            Some(held) if held.head == head => held.opened_at,
+            _ => {
+                self.gathering.insert(
+                    shard.to_string(),
+                    GatheringBatch {
+                        head: head.to_string(),
+                        opened_at: now,
+                    },
+                );
+                now
+            }
+        };
+        now.duration_since(opened_at).unwrap_or_default()
+    }
+
     /// The shard has MOVED ON, so neither the attempts spent on the batch it was at nor the
-    /// split that batch was being read in says anything about what it reads next.
+    /// split that batch was being read in says anything about what it reads next, and the
+    /// window the batch it handed over was gathered over is over with it.
     fn moved_on(&mut self, shard: &str) {
         self.attempts.remove(shard);
         self.bisected.remove(shard);
+        self.gathering.remove(shard);
     }
 }
 
@@ -924,6 +981,12 @@ fn run_of(
         function_name: mapping.function_name.clone(),
         invoke_identity_arn,
         batch_size: mapping.batch_size.clamp(1, MAX_RECORDS_PER_BATCH),
+        // "The maximum amount of time, in seconds, that Lambda spends gathering records
+        // before invoking the function": the one rule whichever source the mapping polls,
+        // so it is read where the queue reader reads it.
+        batching_window: super::sqs_poller::batching_window(
+            mapping.maximum_batching_window_in_seconds,
+        ),
         // "The number of batches to process from each shard concurrently", held to what the
         // function's own concurrency admits and to what the mapping's own tumbling window
         // admits ([`in_flight_batches_of`]).
@@ -1065,6 +1128,29 @@ async fn move_batches(
         // The position the shard is at, which is the record the batch at its head starts
         // with: what the attempts spent on that batch, and a split of it, are keyed by.
         let position: &str = sequence_numbers.first().map_or("", String::as_str);
+        // How many records ONE batch of this mapping holds here: its `BatchSize`, or the half
+        // a batch its function errored on was split into, while the shard is still at that
+        // batch's own position ([`PollerWork::batch_limit`]).
+        let limit = work.batch_limit(shard, position, batch_records(run));
+        // "The maximum amount of time, in seconds, that Lambda spends gathering records
+        // before invoking the function" (`MaximumBatchingWindowInSeconds`): a mapping that
+        // states a window holds what it read until that batch is full or the window has run,
+        // whichever comes first ([`super::sqs_poller::batch_is_due`], the one place that
+        // decision is taken whichever source the mapping polls). Gathering costs neither a
+        // record nor a position: the cursor moves only past a batch that was DELIVERED, so
+        // the pass that follows reads these records again together with whatever arrived
+        // meanwhile, and nothing is metered, filtered or handed over for a batch that is
+        // still gathering.
+        if !run.batching_window.is_zero()
+            && !super::sqs_poller::batch_is_due(
+                records.len(),
+                limit,
+                work.gathered_for(shard, position, SystemTime::now()),
+                run.batching_window,
+            )
+        {
+            continue;
+        }
         // One age per BATCH read, because the age is a property of that read: a pass that
         // took several batches off one shard meters each of them, from the instant its newest
         // record was WRITTEN ([`stamped_with_the_write`]).
@@ -1119,7 +1205,7 @@ async fn move_batches(
             invoking,
             &grouping_keys(run, listed.partition_key_attribute.as_deref(), invoking),
             run.in_flight_batches,
-            work.batch_limit(shard, position, batch_records(run)),
+            limit,
         );
         // The tumbling window this pass's invocations aggregate into, for a mapping that
         // configures one: the window the clock is in, opened for a shard aggregating into
@@ -2063,6 +2149,7 @@ mod tests {
             function_name: "metered".to_string(),
             invoke_identity_arn: None,
             batch_size: 1,
+            batching_window: Duration::ZERO,
             in_flight_batches: 1,
             filters: Vec::new(),
             reports_batch_item_failures: false,

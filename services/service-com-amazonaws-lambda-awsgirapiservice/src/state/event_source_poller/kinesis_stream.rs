@@ -448,6 +448,7 @@ mod tests {
             function_name: "consume".to_string(),
             invoke_identity_arn: Some("arn:aws:iam::000000000000:role/consume".to_string()),
             batch_size: MAX_RECORDS_PER_BATCH,
+            batching_window: ::std::time::Duration::ZERO,
             in_flight_batches: 1,
             filters: Vec::new(),
             reports_batch_item_failures: false,

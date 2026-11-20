@@ -1103,6 +1103,28 @@ pub fn batch_is_due(
     gathered > 0 && (gathered >= batch_size || waited >= window)
 }
 
+/// The batching window a mapping gathers ONE batch over: "the maximum amount of time, in
+/// seconds, that Lambda spends gathering records before invoking the function"
+/// (`MaximumBatchingWindowInSeconds`).
+///
+/// Zero for a mapping that states none — "for Kinesis, DynamoDB, and Amazon SQS event
+/// sources, the default batching window is 0 seconds" — so such a mapping hands over what
+/// one read found. The value is read inside the member's own range
+/// ([`MAX_BATCHING_WINDOW_SECONDS`]) however it got into the store.
+///
+/// `pub` because the window is ONE rule whichever source a mapping polls, so the reader of a
+/// shard source gathers over it from here too ([`super::event_source_poller`]).
+#[must_use]
+pub fn batching_window(configured: Option<i32>) -> Duration {
+    Duration::from_secs(
+        configured
+            .unwrap_or(0)
+            .clamp(0, MAX_BATCHING_WINDOW_SECONDS)
+            .unsigned_abs()
+            .into(),
+    )
+}
+
 /// Fold what this pass polled into what `target` is gathering, and decide whether the batch
 /// is due.
 ///
@@ -1774,14 +1796,7 @@ fn polling_targets(
                 // "The maximum amount of time, in seconds, that Lambda spends gathering
                 // records before invoking the function": a mapping that states none gathers
                 // for no time at all, which is the default for a queue source.
-                batching_window: Duration::from_secs(
-                    mapping
-                        .maximum_batching_window_in_seconds
-                        .unwrap_or(0)
-                        .clamp(0, MAX_BATCHING_WINDOW_SECONDS)
-                        .unsigned_abs()
-                        .into(),
-                ),
+                batching_window: batching_window(mapping.maximum_batching_window_in_seconds),
                 filters: super::event_source_filter::patterns_of(
                     mapping.filter_criteria.as_ref(),
                 ),

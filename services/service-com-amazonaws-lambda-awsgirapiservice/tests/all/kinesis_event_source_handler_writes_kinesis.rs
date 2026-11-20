@@ -95,7 +95,10 @@ const EVENT_VERSION: &str = "1.0";
 /// the records are put where a client puts them, the role Lambda reads the source stream as
 /// is the one IAM holds, and the handler's own SDK call is dispatched back into this same
 /// router — so the stream this suite reads is the stream the handler wrote.
-fn emulator() -> MultiServiceRouter {
+///
+/// `pub(crate)` because every suite whose mapped handler makes an SDK call of its own needs
+/// exactly this trio (`tests/all/kinesis_event_source_batching_window.rs`).
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -240,13 +243,16 @@ async fn put_record(
 
 /// A reader of the sink stream: one iterator per shard, read from the oldest record the shard
 /// holds, advanced by every drain so a record is read exactly once.
-struct SinkReader {
+///
+/// `pub(crate)` because every suite that reads back what a mapped handler WROTE reads it this
+/// one way (`tests/all/kinesis_event_source_batching_window.rs`).
+pub(crate) struct SinkReader {
     iterators: Vec<String>,
 }
 
 impl SinkReader {
     /// A reader positioned at the oldest record of every shard of `stream`.
-    async fn of(router: &MultiServiceRouter, case: &str, stream: &str) -> Self {
+    pub(crate) async fn of(router: &MultiServiceRouter, case: &str, stream: &str) -> Self {
         let (status, listed) = kinesis(router, "ListShards", &json!({ "StreamName": stream })).await;
         assert_eq!(
             status, 200,
@@ -291,7 +297,7 @@ impl SinkReader {
 
     /// Every record the sink has handed over since the last drain, as the document the
     /// handler wrote: one forwarded record envelope per record.
-    async fn drain(&mut self, router: &MultiServiceRouter, case: &str) -> Vec<Value> {
+    pub(crate) async fn drain(&mut self, router: &MultiServiceRouter, case: &str) -> Vec<Value> {
         let mut forwarded: Vec<Value> = Vec::new();
         for iterator in &mut self.iterators {
             let (status, answered) = kinesis(
