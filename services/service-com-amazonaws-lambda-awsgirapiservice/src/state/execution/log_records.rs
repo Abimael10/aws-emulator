@@ -23,7 +23,11 @@
 //! `SystemLogLevel` over the platform's. Both filters are on what Lambda SENDS ("set this
 //! property to filter the application logs for your function that Lambda sends to CloudWatch",
 //! and the same sentence for the system logs), so both are applied where the delivery is made
-//! rather than inside the runtime that wrote the record.
+//! rather than inside the runtime that wrote the record. Each record is judged at the level IT
+//! states: an application record at the level of the logger that emitted it, and a platform
+//! record at the level of what it reports ([`platform_record_level`]) — a record of a run that
+//! did not succeed is a warning about that run, whatever the same record of an ordinary run is
+//! stated at.
 //!
 //! Nothing here is synthesised. Every field of a frame is the one the plain-text framing
 //! states — the invocation's id, the version that executed, and what the run measured —
@@ -448,13 +452,13 @@ pub(super) fn system_admitted_at(message: &str, filter: Option<&str>) -> bool {
     let Some(threshold) = filter.and_then(severity) else {
         return true;
     };
-    let Some(kind) = platform_kind(message) else {
+    let Some((kind, record)) = platform_record(message) else {
         return true;
     };
-    // A kind this ladder does not place is SENT: a record whose level is unknown is judged the
+    // A kind this reading does not place is SENT: a record whose level is unknown is judged the
     // way a record stating no level is ([`admitted_at`]), so nothing is withheld for want of a
     // reading of it.
-    platform_record_level(&kind)
+    platform_record_level(&kind, &record)
         .and_then(severity)
         .is_none_or(|level| level >= threshold)
 }
@@ -462,19 +466,35 @@ pub(super) fn system_admitted_at(message: &str, filter: Option<&str>) -> bool {
 /// The kind a platform record names itself as (`platform.start`, …), or `None` for a record
 /// that is no platform record at all.
 fn platform_kind(message: &str) -> Option<String> {
-    let record: ::serde_json::Map<String, ::serde_json::Value> =
+    platform_record(message).map(|(kind, _)| kind)
+}
+
+/// The kind a platform record names itself as, together with the fields that kind carries —
+/// which is what the record STATES, and so what the level it is stated at is read from
+/// ([`platform_record_level`]) — or `None` for a record that is no platform record at all.
+fn platform_record(message: &str) -> Option<(String, ::serde_json::Value)> {
+    let members: ::serde_json::Map<String, ::serde_json::Value> =
         match ::serde_json::from_str(message) {
             Ok(::serde_json::Value::Object(members)) => members,
             _ => return None,
         };
-    let kind = record.get(TYPE_MEMBER)?.as_str()?;
-    kind.starts_with(PLATFORM_TYPE_PREFIX)
-        .then(|| kind.to_string())
+    let kind = members.get(TYPE_MEMBER)?.as_str()?;
+    if !kind.starts_with(PLATFORM_TYPE_PREFIX) {
+        return None;
+    }
+    Some((
+        kind.to_string(),
+        members
+            .get(RECORD_MEMBER)
+            .cloned()
+            .unwrap_or(::serde_json::Value::Null),
+    ))
 }
 
-/// How much DETAIL each platform record names, on the ladder the system level filters by.
+/// How much DETAIL each KIND of platform record names, on the ladder the system level filters
+/// by, for a record of a run that came to what an ordinary run comes to.
 ///
-/// The frames of an ORDINARY run — the initialization of the execution environment, the
+/// The records of an ORDINARY run — the initialization of the execution environment, the
 /// opening of an invocation, the end of the runtime's work on it and the report of what it
 /// spent — are the records Lambda states about every invocation, so they are that ladder's
 /// `INFO` records; a record about a log Lambda could not deliver is a warning about the log
@@ -493,15 +513,46 @@ const PLATFORM_RECORD_LEVELS: &[(&str, &str)] = &[
     ("platform.logsDropped", "WARN"),
 ];
 
-/// The level the platform record `kind` is stated at, or `None` for a kind the ladder above
-/// does not place — a record this reading says nothing about, which is therefore withheld by
-/// no level.
-fn platform_record_level(kind: &str) -> Option<&'static str> {
+/// The member a platform record carries the fields of its own kind under.
+const RECORD_MEMBER: &str = "record";
+
+/// The level a platform record whose run or phase did NOT succeed is stated at: a record
+/// reporting a run the handler failed, or one the platform ended at a bound of the function's,
+/// is a WARNING about that run rather than a statement about an ordinary one — which is what a
+/// function filtering its system logs at the least detailed level keeps them for — so the
+/// records that close such a run reach the group whatever level the function selected, while
+/// the same records of a run that answered are stated at the level of their kind.
+const FAILED_RUN_LEVEL: &str = "WARN";
+
+/// The level the platform record of kind `kind` carrying `record` is stated at, or `None` for a
+/// kind this reading does not place — a record it says nothing about, which is therefore
+/// withheld by no level.
+///
+/// It is read from what the record STATES: a record whose status reports that the invocation or
+/// the initialization phase it closes did not succeed is stated at [`FAILED_RUN_LEVEL`], and
+/// every other record at the level of its kind ([`PLATFORM_RECORD_LEVELS`]).
+fn platform_record_level(kind: &str, record: &::serde_json::Value) -> Option<&'static str> {
+    if reports_a_failure(record) {
+        return Some(FAILED_RUN_LEVEL);
+    }
     PLATFORM_RECORD_LEVELS
         .iter()
         .find(|(named, _)| *named == kind)
         .map(|(_, level)| *level)
 }
+
+/// Whether `record` states that what it reports did not SUCCEED: the status a platform record
+/// of an invocation or of an initialization phase carries ([`status`]), which every outcome but
+/// the handler's own answer is reported under.
+fn reports_a_failure(record: &::serde_json::Value) -> bool {
+    record
+        .get(STATUS_MEMBER)
+        .and_then(::serde_json::Value::as_str)
+        .is_some_and(|reported| reported != STATUS_SUCCESS)
+}
+
+/// The member a platform record of an invocation or of a phase states its OUTCOME under.
+const STATUS_MEMBER: &str = "status";
 
 /// What the run came to, as the platform records state it: the handler answered, the handler
 /// failed, the run was stopped at the function's own `Timeout`, or the platform ended it.
@@ -907,12 +958,20 @@ mod tests {
     }
 
     /// RULE: `SystemLogLevel` filters the PLATFORM records of a run independently of the level
-    /// the application records are filtered at — one row per level the model declares for it,
-    /// at and around each platform record's own level, plus an application record, which this
-    /// filter never withholds.
+    /// the application records are filtered at, and each platform record is judged at the level
+    /// of what IT reports — a record of a run that did not succeed being a warning about that
+    /// run — one row per level the model declares for it, at and around each record's own
+    /// level, the records that close a run for every outcome a run comes to, plus an
+    /// application record, which this filter never withholds.
     #[test]
     fn a_platform_record_is_sent_only_at_the_selected_system_level_and_lower() {
         let completion = Completion::Returned("{}".to_string());
+        let failed = Completion::Raised {
+            error_type: "RuntimeError".to_string(),
+            error_message: "boom".to_string(),
+            stack_trace: Vec::new(),
+            initialization: false,
+        };
         let application = ::serde_json::json!({
             "timestamp": "2026-10-26T07:33:20.123Z",
             "level": "ERROR",
@@ -940,16 +999,120 @@ mod tests {
                 Some("INFO"),
                 true,
             ),
+            // The records that CLOSE a run are judged by what they REPORT: those of a run that
+            // answered are the records of an ordinary run, and those of a run that did not
+            // succeed are warnings about it, which the least detailed level still admits.
             (
-                "the frame that closes the handler's run, one level higher in detail than the \
-                 filter",
+                "the record that closes the run of a handler that answered, one level higher in \
+                 detail than the filter",
                 runtime_done(true, at(), "req-1", &completion, produced()),
                 Some("WARN"),
                 false,
             ),
             (
-                "the frame that states what the run spent, one level higher in detail",
+                "the same record at the level the records of an ordinary run are stated at",
+                runtime_done(true, at(), "req-1", &completion, produced()),
+                Some("INFO"),
+                true,
+            ),
+            (
+                "the record that closes a run stopped at the function's own Timeout, at the \
+                 least detailed level",
+                runtime_done(
+                    true,
+                    at(),
+                    "req-1",
+                    &Completion::Stopped(Stop::Deadline),
+                    produced(),
+                ),
+                Some("WARN"),
+                true,
+            ),
+            (
+                "the record that closes a run the handler failed, at the least detailed level",
+                runtime_done(true, at(), "req-1", &failed, produced()),
+                Some("WARN"),
+                true,
+            ),
+            (
+                "the frame that states what the run of a handler that answered spent, one level \
+                 higher in detail than the filter",
                 report(true, at(), "req-1", &completion, measured()),
+                Some("WARN"),
+                false,
+            ),
+            (
+                "the same frame at the level the records of an ordinary run are stated at",
+                report(true, at(), "req-1", &completion, measured()),
+                Some("INFO"),
+                true,
+            ),
+            (
+                "the same frame at the most detailed level",
+                report(true, at(), "req-1", &completion, measured()),
+                Some("DEBUG"),
+                true,
+            ),
+            (
+                "the frame that states what a run stopped at the function's own Timeout spent, \
+                 at the least detailed level",
+                report(
+                    true,
+                    at(),
+                    "req-1",
+                    &Completion::Stopped(Stop::Deadline),
+                    measured(),
+                ),
+                Some("WARN"),
+                true,
+            ),
+            (
+                "the frame that states what a run the handler failed spent, at the least \
+                 detailed level",
+                report(true, at(), "req-1", &failed, measured()),
+                Some("WARN"),
+                true,
+            ),
+            (
+                "the frame that states what a run the platform ended spent, at the least \
+                 detailed level",
+                report(
+                    true,
+                    at(),
+                    "req-1",
+                    &Completion::Stopped(Stop::Memory),
+                    measured(),
+                ),
+                Some("WARN"),
+                true,
+            ),
+            (
+                "the records that close an initialization that FAILED, at the least detailed \
+                 level",
+                init_done(
+                    at(),
+                    &InitDone {
+                        initialization_type: "on-demand",
+                        took: Duration::from_millis(12),
+                        failed: true,
+                    },
+                )
+                .remove(1),
+                Some("WARN"),
+                true,
+            ),
+            (
+                "the same record of an initialization that stood the environment up, one level \
+                 higher in detail than the filter",
+                init_done(
+                    at(),
+                    &InitDone {
+                        initialization_type: "on-demand",
+                        took: Duration::from_millis(12),
+                        failed: false,
+                    },
+                )
+                .remove(1),
                 Some("WARN"),
                 false,
             ),
