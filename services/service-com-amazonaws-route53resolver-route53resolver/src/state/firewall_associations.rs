@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! What a DNS Firewall rule-group-to-VPC association admits as its `Priority`,
-//! and what a rule group that still carries one refuses.
+//! what a rule group that still carries one refuses, and what the association
+//! states about the lifecycle step it stands in.
 //!
-//! Both are about the association as a RESOURCE rather than about the rules the
-//! group holds, so they live beside each other: the band a `Priority` has to
-//! fall in, stated once for the associate and the update that write one, and
-//! the conflict a delete of the group the association points at is refused
-//! with, with the lookup that decides it.
+//! All three are about the association as a RESOURCE rather than about the rules
+//! the group holds, so they live beside each other: the band a `Priority` has to
+//! fall in, stated once for the associate and the update that write one, the
+//! conflict a delete of the group the association points at is refused with,
+//! with the lookup that decides it, and the `StatusMessage` each step of the
+//! association's lifecycle leaves on it
+//! ([`firewall_rule_group_association_status_message`]).
 
 use super::*;
 
@@ -121,6 +124,88 @@ pub fn firewall_rule_group_associated_conflict(
             ),
             trace_root,
         )),
+    }
+}
+
+/// The `StatusMessage` an association reports while the service is still
+/// putting the association a caller just asked for in place.
+///
+/// `FirewallRuleGroupAssociation$StatusMessage` is "additional information about
+/// the status of the response, if available"
+/// (`smithy_query(query="doc",shape="FirewallRuleGroupAssociation",member="StatusMessage")`),
+/// and what DNS Firewall states there is the lifecycle step the association
+/// reached — the same thing a domain list
+/// ([`FIREWALL_DOMAIN_LIST_STATUS_MESSAGE_COMPLETE`]) and a rule group
+/// ([`FIREWALL_RULE_GROUP_STATUS_MESSAGE_COMPLETE`]) state. The sentence is
+/// fixed text for the step and carries no part of the request, so one
+/// association's message is every association's message while it stands in that
+/// step.
+pub const FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_MESSAGE_CREATING: &str =
+    "Creating Firewall Rule Group Association";
+
+/// The `StatusMessage` an association reports while a change a caller made to an
+/// association that already stood in place is still settling — the step's own
+/// sentence, stated for the same reason as
+/// [`FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_MESSAGE_CREATING`] and likewise
+/// carrying nothing from the request.
+pub const FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_MESSAGE_UPDATING: &str =
+    "Updating Firewall Rule Group Association";
+
+/// The `StatusMessage` an association reports once it holds
+/// [`FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_COMPLETE`]: the change that was in
+/// flight — the one that put the association in place, or a later one to it —
+/// has finished.
+///
+/// The twin of [`FIREWALL_DOMAIN_LIST_STATUS_MESSAGE_CHANGED`] for an
+/// association: what `StatusMessage` states is the step the association LAST
+/// reached, and the step it reaches when it settles is the end of the change
+/// that was settling, whichever change that was.
+pub const FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_MESSAGE_COMPLETE: &str =
+    "Finished rule group association update";
+
+/// The `StatusMessage` an association reports once it holds
+/// [`FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_DELETING`] — the delete step's own
+/// sentence, stated for the resource it is about exactly as the domain list's
+/// ([`FIREWALL_DOMAIN_LIST_STATUS_MESSAGE_DELETING`]) and the rule group's
+/// ([`FIREWALL_RULE_GROUP_STATUS_MESSAGE_DELETING`]) are.
+pub const FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_MESSAGE_DELETING: &str =
+    "Deleting Firewall Rule Group Association";
+
+/// The `StatusMessage` the lifecycle step `status` leaves on a rule-group
+/// association whose change in flight is `change`, or `None` for a step DNS
+/// Firewall states nothing for — the association twin of
+/// [`firewall_domain_list_status_message`] and
+/// [`firewall_rule_group_status_message`], and derived from the status for the
+/// same reason: no projection of an association can then report one step's
+/// status with another step's message.
+///
+/// The model's `FirewallRuleGroupAssociationStatus` has no `CREATING` value, so
+/// `UPDATING` covers both a brand-new association being put in place and a
+/// change to one that already stood: `change` is what tells those two apart, and
+/// it is the only step whose sentence the status alone does not decide.
+pub fn firewall_rule_group_association_status_message(
+    status: &str,
+    change: FirewallChange,
+) -> Option<String> {
+    match status {
+        FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_COMPLETE => {
+            Some(FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_MESSAGE_COMPLETE.to_string())
+        }
+        FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_UPDATING => Some(
+            match change {
+                FirewallChange::Created => {
+                    FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_MESSAGE_CREATING
+                }
+                FirewallChange::Changed => {
+                    FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_MESSAGE_UPDATING
+                }
+            }
+            .to_string(),
+        ),
+        FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_DELETING => {
+            Some(FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_MESSAGE_DELETING.to_string())
+        }
+        _ => None,
     }
 }
 

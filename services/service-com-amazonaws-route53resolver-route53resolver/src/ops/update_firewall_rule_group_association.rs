@@ -342,6 +342,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // call still observes the transient status.
         record.status =
             crate::state::FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_UPDATING.to_string();
+        // The association already stood in place, so the step it now reports is
+        // about THIS change rather than about the one that created it, and the
+        // sentence beside that step says so
+        // (`crate::state::firewall_rule_group_association_status_message`).
+        record.change = crate::state::FirewallChange::Changed;
         record.settled_at = Some(now + crate::state::PROVISIONING_DELAY);
 
         Ok(UpdateFirewallRuleGroupAssociationOutput {

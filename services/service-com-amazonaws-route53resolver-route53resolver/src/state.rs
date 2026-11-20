@@ -3190,7 +3190,11 @@ pub struct FirewallRuleGroupAssociationRecord {
     /// The `FirewallRuleGroupAssociationStatus` this association reports, as of
     /// [`Self::settled_at`].
     pub status: String,
-    pub status_message: Option<String>,
+    /// Which change this association's transient status is about: the one that
+    /// put it in place, or a later change to it. The `StatusMessage` the
+    /// association reports is DERIVED from the status and this change
+    /// ([`Self::status_message_at`]), so it is never held beside it.
+    pub change: FirewallChange,
     /// `AssociateFirewallRuleGroup$Tags`, kept with the record so they are not
     /// silently discarded; `FirewallRuleGroupAssociation` models no `Tags`
     /// member, so they are reported by `ListTagsForResource` alone.
@@ -3216,6 +3220,14 @@ impl FirewallRuleGroupAssociationRecord {
         }
     }
 
+    /// The `StatusMessage` this association reports as of `now`: the sentence
+    /// the step [`Self::status_at`] reports leaves on it
+    /// ([`firewall_rule_group_association_status_message`]) — the association
+    /// twin of [`FirewallRuleGroupRecord::status_message_at`].
+    pub fn status_message_at(&self, now: Instant) -> Option<String> {
+        firewall_rule_group_association_status_message(self.status_at(now), self.change)
+    }
+
     /// Project the record onto the modelled `FirewallRuleGroupAssociation`.
     pub fn to_association(&self, now: Instant) -> FirewallRuleGroupAssociation {
         FirewallRuleGroupAssociation {
@@ -3231,7 +3243,7 @@ impl FirewallRuleGroupAssociationRecord {
             // account made is its own, so it stays unset.
             managed_owner_name: None,
             status: Some(self.status_at(now).to_string()),
-            status_message: self.status_message.clone(),
+            status_message: self.status_message_at(now),
             creator_request_id: Some(self.creator_request_id.clone()),
             creation_time: Some(self.creation_time.clone()),
             modification_time: Some(self.modification_time.clone()),

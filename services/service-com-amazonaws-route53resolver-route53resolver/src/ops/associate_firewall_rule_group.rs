@@ -428,10 +428,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // clock owes — so a caller reading it straight after this call still
             // observes the transient status.
             status: crate::state::FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_UPDATING.to_string(),
-            // "Additional information about the status of the response, IF
-            // AVAILABLE": an association coming up with nothing to report adds
-            // nothing, so none is invented here.
-            status_message: None,
+            // The transient step is about the change that PUT the association in
+            // place, so the sentence it reports is that step's own
+            // (`crate::state::firewall_rule_group_association_status_message`),
+            // and the sentence it reports once settled follows from the same
+            // derivation rather than being stamped here.
+            change: crate::state::FirewallChange::Created,
             tags: input.tags.clone().unwrap_or_default(),
             creation_time: timestamp.clone(),
             modification_time: timestamp,

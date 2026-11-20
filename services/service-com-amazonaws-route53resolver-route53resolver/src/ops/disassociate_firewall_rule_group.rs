@@ -219,10 +219,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The answer is the association this call took out, as it stood, and it
         // is on its way out — so it reports the model's `DELETING` rather than
-        // the settled status it held until now.
+        // the settled status it held until now, with the sentence that step
+        // leaves on an association beside it
+        // (`crate::state::firewall_rule_group_association_status_message`), so
+        // the status and the message the answer carries are the same step's.
         let mut association = record.to_association(now);
         association.status =
             Some(crate::state::FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_DELETING.to_string());
+        association.status_message = crate::state::firewall_rule_group_association_status_message(
+            crate::state::FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_DELETING,
+            record.change,
+        );
         association.modification_time = Some(crate::state::now_rfc3339());
 
         Ok(DisassociateFirewallRuleGroupOutput {

@@ -1,33 +1,38 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end tests for the lifecycle state the DNS Firewall domain-list and
-//! rule-group projections report: the pair of `Status` and `StatusMessage`
-//! `CreateFirewallDomainList`, `GetFirewallDomainList`, `UpdateFirewallDomains`,
-//! `DeleteFirewallDomainList`, `CreateFirewallRuleGroup`,
-//! `GetFirewallRuleGroup` and `DeleteFirewallRuleGroup` answer with.
+//! End-to-end tests for the lifecycle state the DNS Firewall domain-list,
+//! rule-group and rule-group-ASSOCIATION projections report: the pair of
+//! `Status` and `StatusMessage` `CreateFirewallDomainList`,
+//! `GetFirewallDomainList`, `UpdateFirewallDomains`, `DeleteFirewallDomainList`,
+//! `CreateFirewallRuleGroup`, `GetFirewallRuleGroup`, `DeleteFirewallRuleGroup`,
+//! `AssociateFirewallRuleGroup`, `GetFirewallRuleGroupAssociation`,
+//! `ListFirewallRuleGroupAssociations`, `UpdateFirewallRuleGroupAssociation` and
+//! `DisassociateFirewallRuleGroup` answer with.
 //!
 //! Every case goes over the wire the service actually speaks (awsJson1_1,
 //! `POST /` with `X-Amz-Target: Route53Resolver.<OperationName>`), through the
 //! shared [`super::harness`], so what is asserted is the HTTP behaviour and not
 //! a handler called directly.
 //!
-//! What these cases pin is the rule the slice implements: a domain list and a
-//! rule group each stand in a lifecycle step, and every projection of one
-//! reports that step BOTH as its `Status` and as the sentence the step states in
-//! `StatusMessage` — the step it LAST reached, so a resource a caller has
-//! written states the step that change reached and not the one its create did;
-//! a change the service applies inside the call it was asked for leaves the
+//! What these cases pin is the rule the slice implements: a domain list, a rule
+//! group and an association each stand in a lifecycle step, and every projection
+//! of one reports that step BOTH as its `Status` and as the sentence the step
+//! states in `StatusMessage` — the step it LAST reached, so a resource a caller
+//! has written states the step that change reached and not the one its create
+//! did; a change the service applies inside the call it was asked for leaves the
 //! resource in its settled step, so no response reports a step that is still in
-//! flight for work that is already done.
+//! flight for work that is already done. Putting an association in place is
+//! asynchronous, so there the step the caller is shown moves with the clock, and
+//! the sentence moves with the step.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_route53resolver_route53resolver::ops::types::{
     FIREWALL_DOMAIN_LIST_STATUS_VALUES, FIREWALL_DOMAIN_UPDATE_OPERATION_VALUES,
-    FIREWALL_RULE_GROUP_STATUS_VALUES,
+    FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_VALUES, FIREWALL_RULE_GROUP_STATUS_VALUES,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::harness::{emulator, expect_error, ok, string_member};
+use super::harness::{emulator, expect_error, ok, settled_association, string_member, Emulator};
 
 /// The sentence DNS Firewall states for a domain list that stands in its
 /// created, settled step, the one it states once a write of its domains has
@@ -47,6 +52,23 @@ const RULE_GROUP_CHANGED_MESSAGE: &str = "Finished rule group update";
 /// accepted for — the group's own delete-step sentence, as
 /// [`DOMAIN_LIST_DELETING_MESSAGE`] is the list's.
 const RULE_GROUP_DELETING_MESSAGE: &str = "Deleting the Firewall Rule Group";
+
+/// The sentence DNS Firewall states while the rule-group-to-VPC association a
+/// caller just asked for is still being put in place, the one it states while a
+/// change to an association that already stood is still settling, the one it
+/// states once the change in flight has finished, and the one it states for an
+/// association a disassociate has been accepted for. All four are fixed text for
+/// the step, with no part of the request in them.
+const ASSOCIATION_CREATING_MESSAGE: &str = "Creating Firewall Rule Group Association";
+const ASSOCIATION_CHANGING_MESSAGE: &str = "Updating Firewall Rule Group Association";
+const ASSOCIATION_SETTLED_MESSAGE: &str = "Finished rule group association update";
+const ASSOCIATION_DELETING_MESSAGE: &str = "Deleting Firewall Rule Group Association";
+
+/// The `FirewallRuleGroupAssociationStatus` an association reports while a
+/// change to it is still settling, from the model's enum
+/// (`smithy_query(query="shape",shape="FirewallRuleGroupAssociationStatus")`,
+/// re-exported as the catalog the cases check against).
+const IN_FLIGHT: &str = "UPDATING";
 
 /// The settled `FirewallDomainListStatus`/`FirewallRuleGroupStatus` both
 /// families report once nothing is in flight, out of the model's enums
@@ -542,5 +564,342 @@ async fn the_sentence_belongs_to_the_step_and_not_to_one_request() {
         seen.len(),
         12,
         "case \"four lists and four groups\": every projection was read, got {seen:?}"
+    );
+}
+
+/// The sentences a projection of an association may state beside each step.
+///
+/// One step carries two: the model's enum declares no `CREATING` value, so an
+/// association being put in place and a change to one that already stood both
+/// report [`IN_FLIGHT`], each with its own sentence. Every other step admits
+/// exactly one, which is what lets a reading taken while the clock may or may
+/// not have settled the association still be checked.
+fn association_sentences_of(status: &str) -> &'static [&'static str] {
+    match status {
+        SETTLED => &[ASSOCIATION_SETTLED_MESSAGE],
+        IN_FLIGHT => &[ASSOCIATION_CREATING_MESSAGE, ASSOCIATION_CHANGING_MESSAGE],
+        DELETING => &[ASSOCIATION_DELETING_MESSAGE],
+        _ => &[],
+    }
+}
+
+/// Assert the association pairs the step it reports with a sentence THAT step
+/// states — the invariant that holds whichever change is settling.
+fn assert_paired_step(association: &Value, case: &str) {
+    let status = string_member(association, "Status");
+    let message = string_member(association, "StatusMessage");
+    let admitted = association_sentences_of(&status);
+    assert!(
+        admitted.contains(&message.as_str()),
+        "case {case:?}: Status {status:?} states one of {admitted:?}, got {message:?} in \
+         {association}"
+    );
+}
+
+/// The `FirewallRuleGroupAssociation` of a response body.
+fn association(case: &str, body: &Value) -> Value {
+    body.get("FirewallRuleGroupAssociation")
+        .unwrap_or_else(|| panic!("case {case:?}: the response carries an association, got {body}"))
+        .clone()
+}
+
+/// Create one rule group over the wire and answer the id the service minted.
+async fn create_rule_group(router: &Emulator, label: &str) -> String {
+    let created = ok(
+        router,
+        "CreateFirewallRuleGroup",
+        json!({
+            "CreatorRequestId": format!("group-{label}"),
+            "Name": format!("group-{label}"),
+        }),
+    )
+    .await;
+    string_member(&rule_group(&created), "Id")
+}
+
+/// Read the association `id` back through its own reader.
+async fn read_association(router: &Emulator, id: &str) -> Value {
+    let read = ok(
+        router,
+        "GetFirewallRuleGroupAssociation",
+        json!({ "FirewallRuleGroupAssociationId": id }),
+    )
+    .await;
+    association("the read", &read)
+}
+
+/// The association `id` as `ListFirewallRuleGroupAssociations` reports it.
+async fn listed_association(router: &Emulator, case: &str, id: &str) -> Value {
+    // `MaxResults` ranges 1..100 and no case below makes more associations than
+    // that, so one page carries every one of them.
+    let listing = ok(
+        router,
+        "ListFirewallRuleGroupAssociations",
+        json!({ "MaxResults": 100 }),
+    )
+    .await;
+    listing
+        .get("FirewallRuleGroupAssociations")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: the listing reports the associations, got {listing}")
+        })
+        .iter()
+        .find(|entry| string_member(entry, "Id") == id)
+        .unwrap_or_else(|| panic!("case {case:?}: the listing must report {id}, got {listing}"))
+        .clone()
+}
+
+/// One row of the association table: how the association is made, and what its
+/// update changes.
+struct AssociationCase {
+    case: &'static str,
+    /// `Name`, in one of the forms the model's pattern
+    /// `^(?!^[0-9]+$)([a-zA-Z0-9\-_' ']+)$` admits.
+    name: &'static str,
+    /// `CreatorRequestId`, in forms of different shapes.
+    creator_request_id: &'static str,
+    /// `Priority`, from the band `AssociateFirewallRuleGroup$Priority`
+    /// publishes: "the allowed values for Priority are between 100 and 9900".
+    priority: i32,
+    /// `MutationProtection` as the request names it, or `None` to leave it to
+    /// the default the operation documents.
+    mutation_protection: Option<&'static str>,
+    /// The members the row's update names. An association held against
+    /// modification admits only the change that lifts that protection, so what
+    /// the update carries differs by row.
+    update: Value,
+}
+
+/// The rows every association step below is driven over: the inputs the rule
+/// has to answer the same way, because the step an association stands in is not
+/// something the request chooses.
+fn association_cases() -> Vec<AssociationCase> {
+    vec![
+        AssociationCase {
+            case: "the lowest published priority, protection left to its default",
+            name: "assoc-low-bound",
+            creator_request_id: "req-low",
+            priority: 100,
+            mutation_protection: None,
+            update: json!({ "Priority": 2_000 }),
+        },
+        AssociationCase {
+            case: "a priority inside the band, protection asked off explicitly",
+            name: "ops' assoc 2",
+            creator_request_id: "2026-11-10T02:49:39Z",
+            priority: 5_000,
+            mutation_protection: Some("DISABLED"),
+            update: json!({ "Name": "renamed_by_the_update", "Priority": 3_300 }),
+        },
+        AssociationCase {
+            case: "the highest published priority, protection asked for",
+            name: "assoc_high_bound",
+            creator_request_id: "r",
+            priority: 9_900,
+            mutation_protection: Some("ENABLED"),
+            update: json!({ "MutationProtection": "DISABLED" }),
+        },
+    ]
+}
+
+/// Every projection of a rule-group association — the acknowledgement, the
+/// reader a client polls, the listing, the update's answer and the
+/// disassociate's — reports the step the association stands in as both `Status`
+/// and `StatusMessage`.
+///
+/// Putting an association in place is asynchronous, so the step the
+/// acknowledgement reports is the one that change is under way in, the step the
+/// readers report once the move the clock owes has fallen due is the settled
+/// one, and a later change to the association is under way in a step of its own.
+#[tokio::test]
+async fn every_association_projection_states_the_step_it_stands_in() {
+    let router = emulator();
+
+    for (index, row) in association_cases().into_iter().enumerate() {
+        let case = row.case;
+        let group = create_rule_group(&router, &format!("step-{index}")).await;
+        let vpc = format!("vpc-step-{index}");
+        router.hold_vpcs([&vpc]);
+
+        let mut request = json!({
+            "CreatorRequestId": row.creator_request_id,
+            "FirewallRuleGroupId": group,
+            "VpcId": vpc,
+            "Priority": row.priority,
+            "Name": row.name,
+        });
+        if let Some(protection) = row.mutation_protection {
+            request["MutationProtection"] = json!(protection);
+        }
+
+        let made = association(
+            case,
+            &ok(&router, "AssociateFirewallRuleGroup", request).await,
+        );
+        assert_step(
+            &made,
+            IN_FLIGHT,
+            ASSOCIATION_CREATING_MESSAGE,
+            FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_VALUES,
+            &format!("{case}: the associate"),
+        );
+        let id = string_member(&made, "Id");
+
+        // A read taken before the move the clock owes has fallen due reports
+        // whichever step the association stands in by then — always with that
+        // step's own sentence.
+        assert_paired_step(
+            &read_association(&router, &id).await,
+            &format!("{case}: the read while the association is being made"),
+        );
+
+        // Once the change has settled, the reader a client polls and the listing
+        // both state the settled step.
+        settled_association(&router, &id, case).await;
+        assert_step(
+            &read_association(&router, &id).await,
+            SETTLED,
+            ASSOCIATION_SETTLED_MESSAGE,
+            FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_VALUES,
+            &format!("{case}: the read once the association settled"),
+        );
+        assert_step(
+            &listed_association(&router, case, &id).await,
+            SETTLED,
+            ASSOCIATION_SETTLED_MESSAGE,
+            FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_VALUES,
+            &format!("{case}: the listing once the association settled"),
+        );
+
+        // A change to an association that already stood: the transient step is
+        // about THIS change, so it states the change's own sentence and not the
+        // one the association came up under.
+        let mut update = row.update.clone();
+        update["FirewallRuleGroupAssociationId"] = json!(id.clone());
+        let updated = association(
+            case,
+            &ok(&router, "UpdateFirewallRuleGroupAssociation", update).await,
+        );
+        assert_step(
+            &updated,
+            IN_FLIGHT,
+            ASSOCIATION_CHANGING_MESSAGE,
+            FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_VALUES,
+            &format!("{case}: the update"),
+        );
+
+        settled_association(&router, &id, case).await;
+        assert_step(
+            &read_association(&router, &id).await,
+            SETTLED,
+            ASSOCIATION_SETTLED_MESSAGE,
+            FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_VALUES,
+            &format!("{case}: the read once the update settled"),
+        );
+
+        // The association the disassociate took out is on its way out, so it
+        // states the removing step and that step's own sentence.
+        let removed = association(
+            case,
+            &ok(
+                &router,
+                "DisassociateFirewallRuleGroup",
+                json!({ "FirewallRuleGroupAssociationId": id }),
+            )
+            .await,
+        );
+        assert_step(
+            &removed,
+            DELETING,
+            ASSOCIATION_DELETING_MESSAGE,
+            FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_VALUES,
+            &format!("{case}: the disassociate"),
+        );
+    }
+}
+
+/// An association's sentence belongs to the step and not to one request:
+/// associations made by different requests, at different priorities, in
+/// different VPCs and with different names all state the same sentence once they
+/// stand in the same step, and one listing pairs each of them with ITS own step.
+#[tokio::test]
+async fn an_associations_sentence_belongs_to_its_step_and_not_to_one_request() {
+    let router = emulator();
+
+    // (the association's name, its priority) — four associations of one account,
+    // each made by its own request into its own VPC.
+    let rows: &[(&str, i32)] = &[
+        ("listed-first", 150),
+        ("listed second 2", 3_300),
+        ("listed_third", 7_777),
+        ("l", 9_800),
+    ];
+
+    let mut made: Vec<(String, String)> = Vec::new();
+    for (index, (name, priority)) in rows.iter().enumerate() {
+        let case = format!("the association {name:?}");
+        let group = create_rule_group(&router, &format!("sentence-{index}")).await;
+        let vpc = format!("vpc-sentence-{index}");
+        router.hold_vpcs([&vpc]);
+        let acknowledged = association(
+            &case,
+            &ok(
+                &router,
+                "AssociateFirewallRuleGroup",
+                json!({
+                    "CreatorRequestId": format!("req-sentence-{index}"),
+                    "FirewallRuleGroupId": group,
+                    "VpcId": vpc,
+                    "Priority": priority,
+                    "Name": name,
+                }),
+            )
+            .await,
+        );
+        assert_step(
+            &acknowledged,
+            IN_FLIGHT,
+            ASSOCIATION_CREATING_MESSAGE,
+            FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_VALUES,
+            &format!("{case}: the associate"),
+        );
+        made.push((case, string_member(&acknowledged, "Id")));
+    }
+
+    // One listing, read while the associations are in whatever step the clock
+    // has left them in: every entry is paired with its own step.
+    for (case, id) in &made {
+        assert_paired_step(
+            &listed_association(&router, case, id).await,
+            &format!("{case}: the listing while the associations are being made"),
+        );
+    }
+
+    // Once each has settled, they all state the SAME sentence — the step's, not
+    // the association's — through the reader and through the listing alike.
+    for (case, id) in &made {
+        settled_association(&router, id, case).await;
+    }
+    for (case, id) in &made {
+        assert_step(
+            &read_association(&router, id).await,
+            SETTLED,
+            ASSOCIATION_SETTLED_MESSAGE,
+            FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_VALUES,
+            &format!("{case}: the read once every association settled"),
+        );
+        assert_step(
+            &listed_association(&router, case, id).await,
+            SETTLED,
+            ASSOCIATION_SETTLED_MESSAGE,
+            FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_VALUES,
+            &format!("{case}: the listing once every association settled"),
+        );
+    }
+    assert_eq!(
+        made.len(),
+        rows.len(),
+        "case \"four associations\": every association was projected, got {made:?}"
     );
 }
