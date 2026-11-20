@@ -306,7 +306,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let step_executions = page
             .iter()
             .take(page_size)
-            .map(|step| step.to_step_execution())
+            .map(|step| execution.step_execution_report(step))
             .collect();
         // A step is still waiting past this page: hand the caller the id it resumes at, so
         // the next request continues where this one stopped.

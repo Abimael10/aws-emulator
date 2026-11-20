@@ -503,25 +503,29 @@ impl StepExecutionRecord {
 
     /// The modelled `StepExecution` for this step: the runbook's own declaration beside
     /// what the walk did. A member nothing has produced is left unset rather than filled
-    /// in — a step that has not started reports no window, and one that ran no action
-    /// reports no response.
+    /// in — a step that has not started reports no window, one that ran no action reports
+    /// no response, and a flow member the step's declaration does not set (`MaxAttempts`,
+    /// `IsCritical`) is absent rather than carrying the default the walk runs the step
+    /// with: what the declaration left out is not on the wire.
     ///
     /// The two PARAMETER MAPS a step carries are the exception: `Outputs` and
     /// `OverriddenParameters` are on the wire for every step a read reports, empty for a
     /// step that produced no output and for one nothing overrode a parameter of, rather
     /// than being left out — so a client that indexes either map finds it on every step of
     /// every read.
-    pub fn to_step_execution(&self) -> StepExecution {
+    ///
+    /// `valid_next_steps` is where the runbook's graph may take the walk after this step
+    /// ([`AutomationExecutionRecord::valid_next_steps`]), which only the whole runbook
+    /// knows; empty for a step the walk can go nowhere from, which reports no such member.
+    pub fn to_step_execution(&self, valid_next_steps: Vec<String>) -> StepExecution {
         StepExecution {
             step_name: Some(self.definition.name.clone()),
             action: Some(self.definition.action.clone()),
             timeout_seconds: self.definition.timeout_seconds,
             on_failure: Some(self.definition.on_failure().to_string()),
-            max_attempts: Some(
-                self.definition
-                    .max_attempts
-                    .unwrap_or(runbook::DEFAULT_MAX_ATTEMPTS),
-            ),
+            // "The maximum number of tries to run the action of the step": what the step's
+            // own declaration asked for, and nothing where it asked for nothing.
+            max_attempts: self.definition.max_attempts,
             execution_start_time: self.started_at.map(::aws_smithy_types::DateTime::from),
             execution_end_time: self.ended_at.map(::aws_smithy_types::DateTime::from),
             step_status: Some(self.status.clone()),
@@ -553,8 +557,11 @@ impl StepExecutionRecord {
             overridden_parameters: Some(::std::collections::HashMap::new()),
             is_end: self.definition.is_end,
             next_step: self.definition.next_step.clone(),
-            is_critical: Some(self.definition.critical()),
-            valid_next_steps: None,
+            // "The flag which can be used to help decide whether the failure of current
+            // step leads to the Automation failure": the step's own declaration, and
+            // nothing where it declares none.
+            is_critical: self.definition.is_critical,
+            valid_next_steps: (!valid_next_steps.is_empty()).then_some(valid_next_steps),
             targets: None,
             target_location: None,
             triggered_alarms: None,
@@ -723,6 +730,71 @@ impl AutomationExecutionRecord {
             ordered.reverse();
         }
         ordered
+    }
+
+    /// The modelled `StepExecution` for one step of this execution: the step's own
+    /// projection ([`StepExecutionRecord::to_step_execution`]), carrying the steps the
+    /// runbook may take the walk to after it — which only the whole runbook knows.
+    pub fn step_execution_report(&self, step: &StepExecutionRecord) -> StepExecution {
+        let at = self
+            .steps
+            .iter()
+            .position(|held| held.step_execution_id == step.step_execution_id);
+        step.to_step_execution(at.map(|at| self.valid_next_steps(at)).unwrap_or_default())
+    }
+
+    /// The steps the walk may enter after the step at `index`, by name, in the order the
+    /// runbook's own graph offers them ("Strings that describe the step's valid next steps",
+    /// `StepExecution$ValidNextSteps`).
+    ///
+    /// Where the walk goes from a step is what [`Self::succeed_step`] and [`Self::fail_step`]
+    /// decide, so the same members decide this: a choice of an `aws:branch` names the step it
+    /// goes to and the branch its own default; any other step goes to the step its `nextStep`
+    /// names, or to the step the runbook declares after it, and a `step:` `onFailure` adds the
+    /// step a failure sends the walk to. A step that ends the automation (`isEnd`) is followed
+    /// by nothing, and neither is the last step of a runbook that names no successor.
+    ///
+    /// A name the runbook holds no step of is left out: it names no step the walk could
+    /// enter — such a flow member ends the execution instead ([`Self::step_after`]).
+    pub fn valid_next_steps(&self, index: usize) -> Vec<String> {
+        let Some(definition) = self.steps.get(index).map(|step| step.definition.clone()) else {
+            return Vec::new();
+        };
+        if definition.is_end.unwrap_or(false) {
+            return Vec::new();
+        }
+        let mut named: Vec<String> = Vec::new();
+        if definition.action == ACTION_BRANCH {
+            // "If no choices match and a Default is specified, the automation goes to that
+            // step": a branch goes to one of its choices, or to its default.
+            if let Ok(branch) = runbook::branch_of(&definition.inputs) {
+                named.extend(branch.choices.into_iter().map(|choice| choice.next_step));
+                named.extend(branch.default);
+            }
+        } else {
+            named.extend(definition.next_step.clone().or_else(|| {
+                self.steps
+                    .get(index.saturating_add(1))
+                    .map(|next| next.definition.name.clone())
+            }));
+            // "With conditional branching, we add step:stepName to support the automation
+            // to go to another specific step": a failure of this step goes there.
+            if let Some(on_failure) = definition
+                .on_failure()
+                .strip_prefix(runbook::ON_FAILURE_STEP_PREFIX)
+            {
+                named.push(on_failure.to_string());
+            }
+        }
+        let mut valid: Vec<String> = Vec::with_capacity(named.len());
+        for name in named {
+            if self.steps.iter().any(|step| step.definition.name == name)
+                && !valid.contains(&name)
+            {
+                valid.push(name);
+            }
+        }
+        valid
     }
 
     /// Materialise everything the clock already owes this execution at `now`: the pickup
@@ -1535,7 +1607,7 @@ impl AutomationExecutionRecord {
             step_executions: (!self.steps.is_empty()).then(|| {
                 self.steps
                     .iter()
-                    .map(StepExecutionRecord::to_step_execution)
+                    .map(|step| self.step_execution_report(step))
                     .collect()
             }),
             // Every step this execution holds is reported, so the list is never the

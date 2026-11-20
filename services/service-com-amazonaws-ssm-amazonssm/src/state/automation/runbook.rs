@@ -41,10 +41,6 @@ pub const ON_FAILURE_CONTINUE: &str = "Continue";
 /// The `onFailure` form that names the step to go to instead: `onFailure: "step:<name>"`.
 pub const ON_FAILURE_STEP_PREFIX: &str = "step:";
 
-/// The `maxAttempts` a step that declares none runs with: "The maximum number of tries to
-/// run the action of the step. The default value is `1`" (`StepExecution$MaxAttempts`).
-pub const DEFAULT_MAX_ATTEMPTS: i32 = 1;
-
 /// One step of a runbook, exactly as the content declares it.
 #[derive(Debug, Clone)]
 pub struct RunbookStep {

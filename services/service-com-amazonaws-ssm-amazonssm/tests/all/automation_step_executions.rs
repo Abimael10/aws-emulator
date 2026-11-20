@@ -386,6 +386,8 @@ async fn every_step_of_the_walk_is_reported_with_what_the_walk_did() {
         (
             text(&decide, "Action"),
             text(&decide, "OnFailure"),
+            // The step declares no `maxAttempts`, so the report carries no `MaxAttempts`:
+            // what the declaration left out is not on the wire.
             decide["MaxAttempts"].as_i64(),
             decide["ExecutionStartTime"].is_null(),
             decide["ExecutionEndTime"].is_null(),
@@ -393,7 +395,7 @@ async fn every_step_of_the_walk_is_reported_with_what_the_walk_did() {
         (
             "aws:branch".to_string(),
             "Abort".to_string(),
-            Some(1),
+            None,
             false,
             false
         ),
