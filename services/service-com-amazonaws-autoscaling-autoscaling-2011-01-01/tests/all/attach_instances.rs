@@ -57,9 +57,15 @@ const IMAGE_ID: &str = "ami-0123456789abcdef0";
 const IN_SERVICE: &str = "InService";
 const PENDING: &str = "Pending";
 
-/// The whole message every group-scoped capacity change of this service answers a name no
-/// group holds with: the detail field after the dash is left unfilled.
-const ABSENT_GROUP_MESSAGE: &str = "AutoScalingGroup name not found - null";
+/// The whole message an attach naming a group this service does not hold answers with: the
+/// fixed prefix, then the detail clause THIS operation reports, which labels the resource
+/// and names the group the request asked for.
+///
+/// THE ONE COPY for this suite; `attach_instances_absent_group.rs` drives the same sentence
+/// over a table of names.
+pub(crate) fn absent_group_message(name: &str) -> String {
+    format!("AutoScalingGroup name not found - AutoScalingGroup: {name} not found")
+}
 
 /// Where a group in this suite places its instances.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -540,7 +546,7 @@ async fn an_attach_that_cannot_be_made_is_refused_whole() {
             case: "a group that does not exist",
             group: "asg-attach-absent".to_string(),
             ids: vec![spare.clone()],
-            message: ABSENT_GROUP_MESSAGE.to_string(),
+            message: absent_group_message("asg-attach-absent"),
         },
         RefusalRow {
             case: "an instance id Amazon EC2 holds nothing for",

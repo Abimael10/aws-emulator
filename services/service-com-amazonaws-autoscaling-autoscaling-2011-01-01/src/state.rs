@@ -4178,6 +4178,16 @@ pub fn absent_group_message_as_name(name: &str) -> String {
     format!("{ABSENT_GROUP_PREFIX}{name}")
 }
 
+/// The absent-group refusal whose detail LABELS the resource and then states the name it
+/// was asked for was not found — the detail form `AttachInstances` serves.
+///
+/// Separate from the forms above because the detail is each operation's own: the name is
+/// the only part taken from the request, interpolated bare after the label, and the rest
+/// of the sentence, punctuation included, is fixed text.
+pub fn absent_group_message_labelling_name(name: &str) -> String {
+    format!("{ABSENT_GROUP_PREFIX}AutoScalingGroup: {name} not found")
+}
+
 /// The absent-group refusal whose detail states that the group could not be FOUND under
 /// the name asked for, quoted — the detail form `DescribeLoadBalancerTargetGroups`
 /// serves.

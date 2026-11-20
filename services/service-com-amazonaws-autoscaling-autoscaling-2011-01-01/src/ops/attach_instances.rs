@@ -202,11 +202,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.materialize_due(&*self.engine, now);
 
-        // A name no group answers to is refused with the wording this service's
-        // group-scoped capacity changes answer with, its detail field left unfilled.
+        // A name no group answers to is refused with the detail clause THIS operation
+        // reports, which labels the resource and names the group the request asked for
+        // ([`crate::state::absent_group_message_labelling_name`]) — the name is read from
+        // the request, so the refusal says which group was missing.
         if !state.groups.contains_key(&name) {
             return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL,
+                crate::state::absent_group_message_labelling_name(&name),
             ));
         }
 
