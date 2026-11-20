@@ -41,12 +41,15 @@ const POLICY_READ_DEADLINE: Duration = Duration::from_secs(60);
 
 /// The policy-language version every document here states, so no row depends on the version a
 /// document stating none is read under (that rule is pinned by its own suite).
-const POLICY_VERSION: &str = "2012-10-17";
+///
+/// `pub(crate)` with [`ACTION`], [`PLACEHOLDER_RESOURCE`] and [`document`] so a sibling suite
+/// attaches documents of the same shape rather than its own copy of it.
+pub(crate) const POLICY_VERSION: &str = "2012-10-17";
 
 /// The action every document here names: a table action, and none of the policy-management
 /// actions, so no document takes this caller's own ability to change the policy away and none
 /// needs `ConfirmRemoveSelfResourceAccess`.
-const ACTION: &str = "dynamodb:GetItem";
+pub(crate) const ACTION: &str = "dynamodb:GetItem";
 
 /// Another account than the one this emulator serves, whose entities this account's IAM is not
 /// the one to hold.
@@ -94,7 +97,7 @@ struct Row {
 
 /// A one-statement document over [`ACTION`], with `principal` written under `element`
 /// (`Principal` or `NotPrincipal`) and the effect `effect`.
-fn document(table_arn: &str, effect: &str, element: &str, principal: Value) -> Value {
+pub(crate) fn document(table_arn: &str, effect: &str, element: &str, principal: Value) -> Value {
     json!({
         "Version": POLICY_VERSION,
         "Statement": [{
@@ -118,7 +121,7 @@ fn deny(element: &str, principal: Value) -> Value {
 
 /// The `Resource` every row's document names: a wildcard rather than one table's ARN, so one
 /// document is the same text whichever of this suite's tables it is attached to.
-const PLACEHOLDER_RESOURCE: &str = "*";
+pub(crate) const PLACEHOLDER_RESOURCE: &str = "*";
 
 /// The rows: one per way the rule is reached.
 fn rows() -> Vec<Row> {
@@ -264,7 +267,10 @@ fn rows() -> Vec<Row> {
 /// parameter-value clause over the sentence that a principal of the document could not be
 /// resolved. It is FIXED text in its entirety — AWS names neither the offending value nor the
 /// type it was named under, so every refused row below expects the same sentence.
-const INVALID_PRINCIPAL: &str =
+///
+/// `pub(crate)` so the suite that pins the same sentence over an attach made BEFORE and AFTER
+/// the identity exists (`resource_policy_principal_admission_tracks_iam`) expects one text.
+pub(crate) const INVALID_PRINCIPAL: &str =
     "One or more parameter values were invalid: Invalid principal in policy document.";
 
 /// RULE: see the module docs — `PutResourcePolicy` admits a document only when every principal
@@ -427,7 +433,9 @@ async fn given_identities(router: &MultiServiceRouter, case: &str) -> Held {
 
 /// One emulator serving DynamoDB beside IAM over ONE shared engine: the identities a policy
 /// names are IAM's records, so the policy store resolves them where IAM holds them.
-fn emulator_with_iam() -> MultiServiceRouter {
+///
+/// `pub(crate)` for the sibling suites that drive the same two services together.
+pub(crate) fn emulator_with_iam() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The suites drive unsigned requests, exactly as the shared harness does.
@@ -442,7 +450,9 @@ fn emulator_with_iam() -> MultiServiceRouter {
 }
 
 /// Create one table and answer the ARN its own description reports for it.
-async fn create_table(router: &MultiServiceRouter, case: &str, name: &str) -> String {
+///
+/// `pub(crate)` for the sibling suites that attach a document to a table of their own.
+pub(crate) async fn create_table(router: &MultiServiceRouter, case: &str, name: &str) -> String {
     let created = ok(
         router,
         "CreateTable",
@@ -462,7 +472,7 @@ async fn create_table(router: &MultiServiceRouter, case: &str, name: &str) -> St
 
 /// The `Policy` of a `GetResourcePolicy` answer, parsed — the document is compared as JSON, so
 /// nothing here depends on how the members of one object are ordered.
-fn reported_document(case: &str, read: &Value) -> Value {
+pub(crate) fn reported_document(case: &str, read: &Value) -> Value {
     let document = read["Policy"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: the read reports a policy document, got {read}"));
@@ -474,7 +484,7 @@ fn reported_document(case: &str, read: &Value) -> Value {
 /// Poll `GetResourcePolicy` until the revision `revision` is the one in force, and answer that
 /// read — the reader is eventually consistent, so the wait is for the CONDITION under a generous
 /// deadline ([`POLICY_READ_DEADLINE`]) rather than for a span.
-async fn read_when_revised(
+pub(crate) async fn read_when_revised(
     router: &MultiServiceRouter,
     case: &str,
     resource_arn: &str,
@@ -547,7 +557,13 @@ async fn create_group(router: &MultiServiceRouter, case: &str, name: &str) -> St
 }
 
 /// One awsQuery call to IAM, answered with the HTTP status and the XML body.
-async fn iam(router: &MultiServiceRouter, action: &str, params: &[(&str, &str)]) -> (u16, String) {
+///
+/// `pub(crate)` for the sibling suites that make the identities their documents name.
+pub(crate) async fn iam(
+    router: &MultiServiceRouter,
+    action: &str,
+    params: &[(&str, &str)],
+) -> (u16, String) {
     let mut body = format!("Action={action}&Version=2010-05-08");
     for (name, value) in params {
         body.push('&');
@@ -581,7 +597,9 @@ fn form_encode(value: &str) -> String {
 }
 
 /// The text of the first `<tag>` element of an XML body.
-fn element(case: &str, body: &str, tag: &str) -> String {
+///
+/// `pub(crate)` for the sibling suites that read an ARN off IAM's answer.
+pub(crate) fn element(case: &str, body: &str, tag: &str) -> String {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let (_, rest) = body
