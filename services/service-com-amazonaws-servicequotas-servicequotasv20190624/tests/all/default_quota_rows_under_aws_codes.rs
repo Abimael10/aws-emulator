@@ -136,7 +136,7 @@ const PUBLISHED_ROWS: &[Row] = &[
         unit: "None",
         adjustable: true,
         period: Some((1, "HOUR")),
-        metric: resource_count("RDS", "CustomEndpoints"),
+        metric: resource_count("RDS", "CustomEndpointsPerDBCluster"),
     },
     Row {
         service_code: "rds",
@@ -166,7 +166,7 @@ const PUBLISHED_ROWS: &[Row] = &[
         quota_name: "Tables for 4xlarge cluster node type",
         value: 200_000.0,
         unit: "None",
-        adjustable: true,
+        adjustable: false,
         period: None,
         metric: None,
     },
@@ -176,7 +176,7 @@ const PUBLISHED_ROWS: &[Row] = &[
         quota_name: "Nodes in a cluster",
         value: 128.0,
         unit: "None",
-        adjustable: true,
+        adjustable: false,
         period: None,
         metric: None,
     },
@@ -190,7 +190,7 @@ const PUBLISHED_ROWS: &[Row] = &[
         unit: "Count",
         adjustable: true,
         period: Some((5, "MINUTE")),
-        metric: resource_count("RedshiftServerless", "ServerlessNamespaces"),
+        metric: resource_count("RedshiftServerless", "ServerlessNamespace"),
     },
     Row {
         service_code: "redshift-serverless",
@@ -200,7 +200,7 @@ const PUBLISHED_ROWS: &[Row] = &[
         unit: "Count",
         adjustable: true,
         period: Some((5, "MINUTE")),
-        metric: resource_count("RedshiftServerless", "RedshiftProcessingUnits"),
+        metric: resource_count("RedshiftServerless", "RedshiftProcessingUnit"),
     },
     // route53resolver — a per-VPC plane published as fixed, and a domain-list plane in
     // the hundreds of thousands.
@@ -243,7 +243,7 @@ const PUBLISHED_ROWS: &[Row] = &[
         quota_name: "Object size",
         value: 48.828_125,
         unit: "Terabytes",
-        adjustable: true,
+        adjustable: false,
         period: None,
         metric: None,
     },
@@ -325,7 +325,7 @@ const PUBLISHED_ROWS: &[Row] = &[
         service_code: "secretsmanager",
         quota_code: "L-8D82A813",
         quota_name: "Combined rate of DeleteResourcePolicy, GetResourcePolicy, \
-                     PutResourcePolicy and ValidateResourcePolicy API requests",
+                     PutResourcePolicy, and ValidateResourcePolicy API requests",
         value: 50.0,
         unit: "None",
         adjustable: false,
@@ -523,13 +523,17 @@ async fn no_row_answers_to_a_code_aws_never_minted() {
 
 /// A per-API request-rate row is published over one second, metered by that operation's
 /// `AWS/Usage` `CallCount` under the service's display name, and described by the
-/// sentence AWS publishes for the class with the operation named in it.
+/// sentence the OWNING SERVICE publishes for the class with the operation named in it —
+/// optionally followed by that service's adjustment guidance, which is fixed text of the
+/// class too.
 #[tokio::test]
 async fn a_request_rate_row_names_the_operation_it_throttles() {
     let engine = emulator();
     let caller = client(&engine, "ap-northeast-1");
 
     let mut rate_rows = 0_usize;
+    let mut rows_with_guidance = 0_usize;
+    let mut rows_without_guidance = 0_usize;
     for (service_code, _, usage_service) in COVERED_SERVICES {
         for quota in default_quotas(&caller, service_code).await {
             if quota["UsageMetric"]["MetricName"] != json!("CallCount") {
@@ -555,24 +559,55 @@ async fn a_request_rate_row_names_the_operation_it_throttles() {
                 json!({"PeriodValue": 1, "PeriodUnit": "SECOND"}),
                 "case {case}: a request rate is published over one second, got {quota}"
             );
-            assert_eq!(
-                quota["Description"],
-                json!(format!(
-                    "The maximum number of {api} requests you can make per second in this \
-                     account in the current Region."
-                )),
-                "case {case}: expected the sentence AWS publishes for a request-rate quota, got \
-                 {quota}"
-            );
+            let (sentence, guidance) = rate_class_wording(service_code, &api);
+            let described = quota["Description"].as_str().unwrap_or_default();
+            let with_guidance = format!("{sentence} {guidance}");
+            if described == sentence {
+                rows_without_guidance += 1;
+            } else if !guidance.is_empty() && described == with_guidance {
+                rows_with_guidance += 1;
+            } else {
+                panic!(
+                    "case {case}: expected the sentence {service_code} publishes for the rate \
+                     of {api}, got {described:?}"
+                );
+            }
             rate_rows += 1;
         }
     }
 
     assert!(
-        rate_rows >= 6,
-        "case catalog: the rule must be asserted over the request-rate rows of these catalogs, \
-         got {rate_rows} rows"
+        rate_rows >= 6 && rows_with_guidance >= 1 && rows_without_guidance >= 1,
+        "case catalog: the rule must be asserted over the request-rate rows of these catalogs \
+         and both branches of the class's sentence, got {rate_rows} rows, {rows_with_guidance} \
+         with the adjustment guidance and {rows_without_guidance} without"
     );
+}
+
+/// The `Description` a service of this table publishes for the rate of one API, and the
+/// guidance sentence it appends to a row it will raise (empty for a service that
+/// publishes none).
+///
+/// SOURCE: the recorded default-quota listings of `scheduler` and `secretsmanager`, which
+/// word the same fact two ways: Scheduler as the requests per second it serves before it
+/// rejects the rest of the interval, Secrets Manager as the transactions per second it
+/// serves the API's requests at.
+fn rate_class_wording(service_code: &str, api: &str) -> (String, &'static str) {
+    match service_code {
+        "scheduler" => (
+            format!(
+                "Maximum {api} requests per second. When you reach this quota, EventBridge \
+                 Scheduler rejects requests for this operation for the remainder of the \
+                 interval."
+            ),
+            "This is adjustable to tens of thousands of requests per second.",
+        ),
+        "secretsmanager" => (
+            format!("The maximum transactions per second for {api} API requests."),
+            "",
+        ),
+        other => panic!("case {other}: this catalog publishes no per-API rate row"),
+    }
 }
 
 /// The published set of each of these services does not depend on how it is paged, and
