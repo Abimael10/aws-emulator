@@ -2269,33 +2269,36 @@ pub fn session_in_illegal_state(status: &str) -> String {
 /// RECORDED template: the fixed sentence around its two variable parts, written as the
 /// service words them — the `SessionId` the request addressed and the status the session is
 /// actually in, read off the store, each stated as `<member>=<value>`. The behaviour it goes
-/// with is 400, with the run's modelled `IllegalSessionStateException` while the service is
-/// still bringing the runtime up or taking it down, and with its `InvalidInputException` once
-/// the session has ENDED ([`super::session_has_ended`]) and its id names no runtime at all.
+/// with is 400 with the run's modelled `InvalidInputException`, which is the refusal this
+/// service is recorded answering a run on a session that is not ready with, whether the
+/// service is still bringing its runtime up and the status may yet change or the session has
+/// ENDED ([`super::session_has_ended`]) and its id names no runtime at all.
 pub fn session_not_ready(id: &str, status: &str) -> String {
     format!("Session is not ready, session_id={id}, status={status}")
 }
 
-/// A statement run on a session that is still actioning one: the runtime is busy, so
-/// it cannot take the code. RECORDED: what is pinned is the behaviour — 400 with the
-/// run's modelled `InvalidInputException`, which is the refusal this service answers a
-/// session already running a statement with, rather than the `SessionBusyException`
-/// the model also declares for the operation. The sentence names the session and the
-/// statement it is still running, which is what a caller waits on.
-pub fn session_busy_with_statement(id: &str, statement_id: i32) -> String {
-    format!(
-        "Session {id} is still running statement {statement_id}, so it cannot take \
-             another statement yet."
-    )
+/// A statement read (`GetStatement`, and every other operation that addresses a
+/// statement by its session and `Id`) for an id OUTSIDE the id space of the session it
+/// was asked for ([`super::SessionEntry::statement_id_in_live_space`]): no session mints
+/// it, so it names no statement at all.
+///
+/// RECORDED template: fixed text around its ONE variable part, the statement `Id` the
+/// request asked for, taken exactly as sent. The session is NOT named — the caller
+/// already addressed it — which is why this takes the id alone.
+pub fn statement_not_found(id: i32) -> String {
+    format!("Statement {id} not found.")
 }
 
-/// A statement read (`GetStatement`, and every other operation that addresses a
-/// statement by its session and `Id`) for an id that session never minted. Follows
-/// the per-resource template of [`session_not_found`], built from the two members that
-/// together are the whole address of a statement.
-pub fn statement_not_found(session_id: &str, id: i32) -> String {
-    format!("Statement {id} not found in session {session_id}.")
-}
+/// A statement read for an id the session has not minted but that is INSIDE its live id
+/// space ([`super::SessionEntry::statement_id_in_live_space`]): the id names a statement
+/// slot of this session's own runtime, so what the read cannot serve is about the
+/// session's state rather than about an id nothing could ever hold.
+///
+/// RECORDED constant, and the whole message: the sentence has no variable part at all —
+/// neither the session nor the id appears in it. It is therefore not the wording a
+/// session request resting in an unusable status is refused with
+/// ([`session_in_illegal_state`]), which names that status.
+pub const STATEMENT_ILLEGAL_SESSION_STATUS: &str = "Illegal Session Status";
 
 /// A usage profile write whose `ConfigurationObject` sets a `DefaultValue` above the
 /// `MaxValue` it sets for the same parameter. RECORDED template: the sentence carries

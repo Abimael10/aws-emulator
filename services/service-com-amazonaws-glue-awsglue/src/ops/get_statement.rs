@@ -7,8 +7,11 @@
 //! Reports the statement a session minted an `Id` for
 //! ([`crate::state::SessionEntry::statements`]): the code the run submitted, the state it
 //! has reached and the instants it moved between all come from that record, so this read
-//! and the `RunStatement` that wrote it agree. A session this Region never created, or an
-//! id that session never minted, is a miss rather than an invented statement.
+//! and the `RunStatement` that wrote it agree. A session this Region never created is a miss
+//! rather than an invented statement, and so is an `Id` outside the id space of the session
+//! it was asked for; an `Id` INSIDE that space the session does not hold is refused as a
+//! state of the session, not as a statement that does not exist
+//! ([`crate::state::SessionEntry::statement_id_in_live_space`]).
 //!
 //! The one write this read makes is the state change the CLOCK had already made due: a
 //! statement leaves the state its run put it in at an instant that run recorded, whether
@@ -230,13 +233,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let Some(statement) = session.statement(input.id) else {
+            // Which refusal an id this session does not hold answers follows from whether
+            // the id is one of this session's own at all: an `Id` the session has minted, or
+            // the one it would mint next, names a statement slot of this session's runtime
+            // ([`crate::state::SessionEntry::statement_id_in_live_space`]), so what the read
+            // cannot serve is reported as a state of the SESSION; an id outside that space
+            // names no statement of any session, which is the statement miss.
+            if session.statement_id_in_live_space(input.id) {
+                return Err(GetStatementErrorModeled::IllegalSessionStateException(
+                    IllegalSessionStateException {
+                        // The service's fixed sentence for this refusal, which has no
+                        // variable part: neither the session nor the id appears in it.
+                        message: Some(
+                            crate::state::messages::STATEMENT_ILLEGAL_SESSION_STATUS.to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
             return Err(GetStatementErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    // The refusal names the pair that resolved to nothing.
-                    message: Some(crate::state::messages::statement_not_found(
-                        &input.session_id,
-                        input.id,
-                    )),
+                    // The refusal names the statement id that resolved to nothing, and
+                    // nothing else.
+                    message: Some(crate::state::messages::statement_not_found(input.id)),
                     from_federation_source: None,
                 },
             )

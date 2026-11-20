@@ -438,18 +438,39 @@ impl SessionEntry {
     /// CLAIM the execution of the next statement of this session that is still awaiting one,
     /// and answer its `Id`.
     ///
+    /// A session runs the statements it has taken ONE AT A TIME — its runtime is "currently
+    /// busy processing another request" (`SessionBusyException`) while a cell's code is in
+    /// flight — so a statement is claimed only while no statement of this session is carrying
+    /// its runtime ([`StatementEntry::carries_runtime`]), and the one claimed is the OLDEST
+    /// still awaiting an execution, which is submission order
+    /// ([`Self::statements`]). Everything submitted in the meantime stays queued, and the next
+    /// call that finds it owed takes it up.
+    ///
+    /// Claiming is also what STARTS the statement: the session has taken its code up, so the
+    /// clock owes it [`STATEMENT_STATE_RUNNING`] [`STATEMENT_SETTLES_AFTER`] out from `now`,
+    /// where a statement still queued behind another is owed nothing yet and stays
+    /// [`STATEMENT_STATE_WAITING`].
+    ///
     /// A statement whose code nothing has run yet is marked
     /// ([`StatementEntry::awaiting_execution`]), so this is what the execution path asks for
     /// to find the work it owes ([`super::statement_execution`]). The claim is taken under the
     /// store's guard and cleared here, so two calls that find the same statement owed an
     /// execution cannot both run it; a claim nothing performs is given back
     /// ([`Self::release_statement_claim`]).
-    pub fn claim_statement_awaiting_execution(&mut self) -> Option<i32> {
+    pub fn claim_statement_awaiting_execution(&mut self, now: SystemTime) -> Option<i32> {
+        if self
+            .statements
+            .iter()
+            .any(|statement| statement.carries_runtime(now))
+        {
+            return None;
+        }
         let statement = self
             .statements
             .iter_mut()
             .find(|statement| statement.awaiting_execution)?;
         statement.awaiting_execution = false;
+        statement.begin_execution(now);
         Some(statement.id)
     }
 
@@ -457,22 +478,25 @@ impl SessionEntry {
     /// performed: it stays owed, so a later call hands it off.
     pub fn release_statement_claim(&mut self, id: i32) {
         if let Some(statement) = self.statement_mut(id) {
+            statement.executing_since = None;
             if !statement.is_terminal() {
                 statement.awaiting_execution = true;
+                statement.unbegin_execution();
             }
         }
     }
 
-    /// Whether a statement of this session has not finished, which is what makes the
-    /// session busy: the remote runtime is "currently busy processing another request"
-    /// (`SessionBusyException`) until the statement it is running comes to rest.
+    /// Whether `id` is inside the id space of this session: an `Id` this session has already
+    /// minted for a statement, or the one it would mint next ([`Self::next_statement_id`]).
     ///
-    /// Call [`Self::settle_due_statements`] first, or a statement the clock has already
-    /// finished still counts as in flight.
-    pub fn has_statement_in_flight(&self) -> bool {
-        self.statements
-            .iter()
-            .any(|statement| !statement.is_terminal())
+    /// The ids a session mints count up from [`FIRST_STATEMENT_ID`], so an id inside this
+    /// range names a statement slot of this session's own runtime — including one whose record
+    /// this session's retention has since dropped ([`Self::run_statement`]), which the session
+    /// did mint — while one outside it names no statement of any session. That is what decides
+    /// HOW a read of an id the session does not hold is refused
+    /// ([`crate::ops::get_statement`]).
+    pub fn statement_id_in_live_space(&self, id: i32) -> bool {
+        (FIRST_STATEMENT_ID..=self.next_statement_id).contains(&id)
     }
 
     /// Record `code` as the next statement of this session, and answer the `Id` it was
@@ -480,16 +504,30 @@ impl SessionEntry {
     ///
     /// Running a statement is what a session is used for, so it is also the activity the
     /// IDLE leg of its timeout is measured from ([`Self::times_out_at`]). At most
-    /// [`MAX_STATEMENTS_PER_SESSION`] records are kept, the oldest dropped first, exactly
-    /// as a job keeps its runs; the id sequence is unaffected by that drop.
+    /// [`MAX_STATEMENTS_PER_SESSION`] records are kept — the HARD ceiling on what one session
+    /// holds, whatever a caller submits and whether the records are queued, running or
+    /// finished — and the OLDEST go first, exactly as a job keeps its runs; the id sequence is
+    /// unaffected by that drop, so a dropped id still reads as one of this session's own
+    /// ([`Self::statement_id_in_live_space`]).
+    ///
+    /// The one record kept whatever its age is the one CARRYING the session's runtime
+    /// ([`StatementEntry::carries_runtime`]): dropping that one would take the outcome of the
+    /// execution in flight with it. Only one statement of a session can carry its runtime, so
+    /// the count always comes back to the ceiling.
     pub fn run_statement(&mut self, code: &str, now: SystemTime) -> i32 {
         let id = self.next_statement_id;
         self.next_statement_id = id.saturating_add(1);
         self.last_active_on = now;
         self.statements.push(StatementEntry::run(id, code, now));
         if self.statements.len() > MAX_STATEMENTS_PER_SESSION {
-            let overflow = self.statements.len() - MAX_STATEMENTS_PER_SESSION;
-            self.statements.drain(..overflow);
+            let mut overflow = self.statements.len() - MAX_STATEMENTS_PER_SESSION;
+            self.statements.retain(|statement| {
+                let droppable = overflow > 0 && !statement.carries_runtime(now);
+                if droppable {
+                    overflow -= 1;
+                }
+                !droppable
+            });
         }
         id
     }
@@ -537,6 +575,17 @@ pub const TERMINAL_STATEMENT_STATES: [&str; 3] = [
 /// stored on the record and materialised by whichever later call reads it; nothing sleeps.
 pub const STATEMENT_SETTLES_AFTER: Duration = SESSION_SETTLES_AFTER;
 
+/// How long a statement's claim on its session's runtime counts for
+/// ([`StatementEntry::carries_runtime`]), past which the session treats it as ABANDONED and
+/// takes the next statement up.
+///
+/// The span one handed-off execution can hold a statement for at all: the task performing it
+/// gives up on the thread the code runs on at [`STATEMENT_HOST_WAIT`] and records what the
+/// execution came to, which clears the claim. A claim still held past that span belongs to an
+/// execution nothing is waiting for any more — a task dropped as this process shuts down — so
+/// it is not allowed to stall the statements queued behind it.
+pub const STATEMENT_CLAIM_ABANDONED_AFTER: Duration = STATEMENT_HOST_WAIT;
+
 /// The `Id` the first statement of a session is given, which a session's ids then count
 /// up from.
 pub const FIRST_STATEMENT_ID: i32 = 1;
@@ -582,6 +631,16 @@ pub struct StatementEntry {
     /// by [`SessionEntry::claim_statement_awaiting_execution`] and performed by whichever
     /// call finds it owed ([`super::statement_execution`]).
     pub awaiting_execution: bool,
+    /// The instant the session's runtime took THIS statement's code up, while its execution
+    /// has not answered yet; `None` whenever nothing is running it.
+    ///
+    /// A session runs the statements it has taken one at a time, so this is what makes the
+    /// session's runtime busy: while one statement carries it
+    /// ([`Self::carries_runtime`]), the next one queued is not claimed
+    /// ([`SessionEntry::claim_statement_awaiting_execution`]). It is the INSTANT rather than a
+    /// flag because a claim nothing ever answers for has to stop counting at some point, or
+    /// one lost execution would stall every statement queued behind it.
+    pub executing_since: Option<SystemTime>,
     /// The instant the state this statement's own execution decided falls due, once that
     /// execution has answered and the state the clock owed it first has not been reached yet
     /// ([`Self::record_execution`]).
@@ -593,8 +652,13 @@ pub struct StatementEntry {
 
 impl StatementEntry {
     /// Record a statement submitted at `now` under `id`, in [`STATEMENT_STATE_WAITING`]
-    /// with [`STATEMENT_STATE_RUNNING`] due [`STATEMENT_SETTLES_AFTER`] out and its code
-    /// owing an execution.
+    /// with its code owing an execution and NO state owed by the clock yet.
+    ///
+    /// A session runs the statements it has taken one at a time, so a statement submitted
+    /// while the session's runtime carries another one is queued behind it: what moves this
+    /// statement on is the session TAKING ITS CODE UP ([`Self::begin_execution`]), which is
+    /// when [`STATEMENT_STATE_RUNNING`] becomes due for it, and not the instant it was
+    /// submitted.
     pub fn run(id: i32, code: &str, now: SystemTime) -> Self {
         Self {
             id,
@@ -602,14 +666,55 @@ impl StatementEntry {
             state: STATEMENT_STATE_WAITING.to_string(),
             started_on: now,
             completed_on: None,
-            settles_at: Some(now.checked_add(STATEMENT_SETTLES_AFTER).unwrap_or(now)),
+            settles_at: None,
             // The session takes the statement and then actions it, so the state the clock
             // owes it next is the one it is in while its code runs; what it comes to REST in
             // is its own execution's answer and nothing else's.
             settles_to: STATEMENT_STATE_RUNNING.to_string(),
             awaiting_execution: true,
+            executing_since: None,
             rests_at: None,
             outcome: None,
+        }
+    }
+
+    /// Whether this statement is CARRYING its session's runtime as of `now`: the session took
+    /// its code up ([`Self::executing_since`]) and the execution that took it has not answered
+    /// yet, within the longest span one execution can hold a statement
+    /// ([`STATEMENT_CLAIM_ABANDONED_AFTER`]).
+    ///
+    /// Past that span the claim is treated as ABANDONED, so the session takes the next
+    /// statement up: an execution nothing answered for (a task dropped as this process shuts
+    /// down) costs the statement it was running and not every statement queued behind it.
+    pub fn carries_runtime(&self, now: SystemTime) -> bool {
+        self.executing_since.is_some_and(|since| {
+            !now.duration_since(since)
+                .is_ok_and(|held| held >= STATEMENT_CLAIM_ABANDONED_AFTER)
+        })
+    }
+
+    /// The session's runtime has TAKEN THIS STATEMENT UP as of `now`: its code is being run,
+    /// so the clock owes it [`STATEMENT_STATE_RUNNING`] [`STATEMENT_SETTLES_AFTER`] out —
+    /// deliberately not at once, so a caller reading straight after the hand-off still
+    /// observes the statement waiting.
+    ///
+    /// A statement that has already left `WAITING`, or that has come to rest, is not moved:
+    /// the state it reached stands.
+    pub(super) fn begin_execution(&mut self, now: SystemTime) {
+        self.executing_since = Some(now);
+        if self.state != STATEMENT_STATE_WAITING || self.settles_at.is_some() {
+            return;
+        }
+        self.settles_at = Some(now.checked_add(STATEMENT_SETTLES_AFTER).unwrap_or(now));
+        self.settles_to = STATEMENT_STATE_RUNNING.to_string();
+    }
+
+    /// Take that back for a statement the session did NOT take up after all — a claim
+    /// nothing performed ([`SessionEntry::release_statement_claim`]): the statement is queued
+    /// again, so the clock owes it nothing until something really runs its code.
+    pub(super) fn unbegin_execution(&mut self) {
+        if self.state == STATEMENT_STATE_WAITING && self.outcome.is_none() {
+            self.settles_at = None;
         }
     }
 
@@ -633,8 +738,10 @@ impl StatementEntry {
     /// A statement that has already come to rest is not moved.
     pub fn record_execution(&mut self, outcome: StatementOutcome, now: SystemTime) {
         // Whatever happens below, this statement no longer owes its code an execution: it
-        // has had one.
+        // has had one, and the session's runtime is no longer carrying it, so the next
+        // statement queued behind it can be taken up.
         self.awaiting_execution = false;
+        self.executing_since = None;
         if self.is_terminal() {
             return;
         }

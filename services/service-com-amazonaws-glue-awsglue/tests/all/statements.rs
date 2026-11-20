@@ -5,10 +5,10 @@
 //!
 //! RULE: a statement is a record of the session it was run on, addressed by the session's
 //! `Id` and an `Id` that session mints for it in submission order, and a session takes one
-//! only while its runtime is up and free — so a run is refused when the session is in any
-//! status but `READY` and when a statement of that session has not finished, and the
-//! statement a run records carries the code it submitted until the clock moves it to its
-//! terminal state.
+//! whenever its runtime is up — so a run is refused, as invalid input, only when the session
+//! is in a status other than `READY`, a statement submitted while the session is actioning
+//! another is queued rather than refused, and the statement a run records carries the code it
+//! submitted until the clock moves it to its terminal state.
 //!
 //! Every call goes over the wire through the shared [`crate::wire`] harness, so what is
 //! asserted is HTTP behaviour and not a direct call into a handler.
@@ -22,7 +22,8 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::{
-    messages, ComAmazonawsGlueAwsglueState, FIRST_STATEMENT_ID,
+    messages, ComAmazonawsGlueAwsglueState, StatementEntry, FIRST_STATEMENT_ID,
+    MAX_STATEMENTS_PER_SESSION, STATEMENT_CLAIM_ABANDONED_AFTER,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -37,6 +38,7 @@ const MAX_CODE_LENGTH: usize = 68_000;
 /// `RUNNING`, `AVAILABLE`, `CANCELLING`, `CANCELLED`, `ERROR`, from
 /// `smithy_query shape=StatementState`).
 const STATE_WAITING: &str = "WAITING";
+const STATE_RUNNING: &str = "RUNNING";
 pub(crate) const STATE_AVAILABLE: &str = "AVAILABLE";
 
 /// The `SessionStatus` values a run is refused in here, of the modelled enum
@@ -44,6 +46,9 @@ pub(crate) const STATE_AVAILABLE: &str = "AVAILABLE";
 /// `smithy_query shape=SessionStatus`).
 const STATUS_PROVISIONING: &str = "PROVISIONING";
 const STATUS_TIMEOUT: &str = "TIMEOUT";
+const STATUS_STOPPING: &str = "STOPPING";
+const STATUS_STOPPED: &str = "STOPPED";
+const STATUS_FAILED: &str = "FAILED";
 
 /// An IAM role ARN of the form the modelled `OrchestrationRoleArn` pattern requires
 /// (`^arn:aws[^:]*:iam::[0-9]*:role/.+$`).
@@ -417,125 +422,472 @@ async fn one_session_mints_statement_ids_in_submission_order() {
 }
 
 // ---------------------------------------------------------------------------
-// Refusals
+// Queueing
 // ---------------------------------------------------------------------------
 
-/// A session still actioning a statement cannot take another: the run is refused, nothing
-/// is recorded for it, and the session takes a statement again once the one in flight has
-/// come to rest.
+/// How many statements of the session `id` the store itself holds as being EXECUTED right
+/// now.
+///
+/// A session runs the statements it has taken ONE AT A TIME, which is not observable from a
+/// state a reader sees, so it is asserted on the store: never more than one of a session's
+/// statements carries its runtime at the same instant.
+fn executing_statement_count(engine: &Arc<engine::InMemoryEngine>, id: &str) -> usize {
+    let state = engine.state::<ComAmazonawsGlueAwsglueState>();
+    let store = state.lock();
+    store
+        .session(REGION, id)
+        .map(|session| {
+            session
+                .statements
+                .iter()
+                .filter(|statement| statement.executing_since.is_some())
+                .count()
+        })
+        .unwrap_or_default()
+}
+
+/// The `Id` of every statement `ListStatements` reports for `id`, in the order it served
+/// them — read through the listing suite's own page reader, so both suites read a page the
+/// same way.
+async fn listed_statement_ids(router: &MultiServiceRouter, id: &str) -> Vec<i64> {
+    let page = crate::statement_listing::list(router, id, None).await;
+    crate::statement_listing::listed_ids(&page)
+}
+
+/// A session whose runtime is up takes EVERY statement submitted to it: a run submitted
+/// while the session is still actioning another is queued rather than refused, each answers
+/// with its own id in submission order, the listing then reports all of them in that order,
+/// and each comes to rest carrying what its OWN code computed — while the session never runs
+/// two of them at the same instant.
+///
+/// The rows differ along how many statements are submitted back to back, from two up.
 #[tokio::test]
-async fn a_run_on_a_session_still_actioning_a_statement_is_refused() {
+async fn a_session_queues_the_statements_submitted_back_to_back() {
+    // (case, the session, how many statements are submitted without waiting for any)
+    let rows: &[(&str, &str, usize)] = &[
+        ("two back-to-back runs", "queued-two", 2),
+        ("three back-to-back runs", "queued-three", 3),
+        ("five back-to-back runs", "queued-five", 5),
+    ];
+
+    for (case, session, count) in rows {
+        let engine = Arc::new(engine::InMemoryEngine::new());
+        let router = emulator_on(engine.clone());
+        ready_session(&router, &engine, session).await;
+
+        // Code whose answer has to be COMPUTED: the product of the cell's own position,
+        // which nothing of the request echoes.
+        let submitted: Vec<String> = (0..*count)
+            .map(|index| format!("print({index} * 7 + 3)"))
+            .collect();
+        let mut minted: Vec<i64> = Vec::new();
+        for (index, code) in submitted.iter().enumerate() {
+            let id = run(&router, session, code).await;
+            let expected = i64::from(FIRST_STATEMENT_ID) + index as i64;
+            assert_eq!(
+                id, expected,
+                "case {case}: statement {index} must be taken and minted {expected}, got \
+                 {id} after {minted:?}"
+            );
+            minted.push(id);
+            let executing = executing_statement_count(&engine, session);
+            assert!(
+                executing <= 1,
+                "case {case}: a session runs one statement at a time, and {executing} of \
+                 them were being executed after submitting statement {index}"
+            );
+        }
+
+        // Every queued statement is a record of the session, in submission order.
+        let listed = listed_statement_ids(&router, session).await;
+        assert_eq!(
+            listed, minted,
+            "case {case}: the listing must report every queued statement in submission \
+             order, got {listed:?}"
+        );
+
+        // Each of them runs, and comes to rest in the state its own code came to with that
+        // code's own output on it.
+        for (index, id) in minted.iter().enumerate() {
+            let settled = statement_at_rest(&router, &engine, session, *id).await;
+            let executing = executing_statement_count(&engine, session);
+            assert!(
+                executing <= 1,
+                "case {case}: a session runs one statement at a time, and {executing} of \
+                 them were being executed while statement {index} came to rest"
+            );
+            assert_eq!(
+                settled["State"].as_str(),
+                Some(STATE_AVAILABLE),
+                "case {case}: queued statement {index} must run to its end, got {settled}"
+            );
+            let computed = format!("{}\n", index * 7 + 3);
+            assert_eq!(
+                settled
+                    .pointer("/Output/Data/TextPlain")
+                    .and_then(Value::as_str),
+                Some(computed.as_str()),
+                "case {case}: queued statement {index} must report what its own code \
+                 computed, got {settled}"
+            );
+        }
+    }
+}
+
+/// A statement the session has TAKEN but not begun actioning does not stop it taking the
+/// next one: the run is served while the earlier statement is still queued, each keeps its
+/// own id, and the queued statement is left where it was.
+#[tokio::test]
+async fn a_statement_still_in_flight_does_not_refuse_the_next_run() {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let router = emulator_on(engine.clone());
-    let session = "busy";
+    let session = "still-in-flight";
     ready_session(&router, &engine, session).await;
 
     let in_flight = run(&router, session, "print('in flight')").await;
-    // The statement stays in flight for the whole span, whatever a caller does next: the
-    // state the clock owes it next is held open.
-    set_statement_due(&engine, session, far_future());
+    // The statement stays where it is for the whole test: every state the clock still owes
+    // it is held open, so the session has taken it and not begun actioning it.
+    make_owed_statement_states_due(&engine, session, far_future());
 
     for (case, code) in [
         ("a second run", "print('second')"),
         ("a third run", "print('third')"),
     ] {
+        let next = run(&router, session, code).await;
+        assert!(
+            next > in_flight,
+            "case {case}: a session that has taken statement {in_flight} must take another \
+             and mint it a later id, got {next}"
+        );
+        make_owed_statement_states_due(&engine, session, far_future());
+        let read = get(&router, session, in_flight).await;
+        assert!(
+            !TERMINAL_STATES.contains(&read["State"].as_str().unwrap_or_default()),
+            "case {case}: taking another statement must not finish the one in flight, got \
+             {read}"
+        );
+    }
+
+    let listed = listed_statement_ids(&router, session).await;
+    assert_eq!(
+        listed,
+        vec![in_flight, in_flight + 1, in_flight + 2],
+        "every statement the session took must be a record of it, in submission order, got \
+         {listed:?}"
+    );
+}
+
+/// Put the statement `statement` of the session `id` into the state its runtime ACTIONS it
+/// in, and hold it there: `RUNNING`, with every state the clock could still owe it ahead of
+/// the row.
+///
+/// The way a suite observes what a session does while its runtime is actioning a statement
+/// without waiting for a span or for a cell's own code, written through the store the way
+/// every other owed instant in these suites is.
+fn force_statement_running(engine: &Arc<engine::InMemoryEngine>, id: &str, statement: i64) {
+    let state = engine.state::<ComAmazonawsGlueAwsglueState>();
+    let mut store = state.lock();
+    let entry = store
+        .session_mut(REGION, id)
+        .unwrap_or_else(|| panic!("{id} was created"));
+    let held = entry
+        .statements
+        .iter_mut()
+        .find(|held| i64::from(held.id) == statement)
+        .unwrap_or_else(|| panic!("session {id:?} must hold statement {statement}"));
+    held.state = STATE_RUNNING.to_string();
+    held.settles_at = Some(far_future());
+    held.rests_at = Some(far_future());
+}
+
+/// A session whose runtime is ACTIONING a statement takes the next one too: it is queued
+/// behind the one being actioned, which is left where it was, and the listing then reports
+/// both in submission order.
+///
+/// This is the other side of the queueing rule from the back-to-back rows: the statement in
+/// flight is in the state its runtime actions it in rather than one the session has merely
+/// taken.
+#[tokio::test]
+async fn a_session_actioning_a_statement_queues_the_next_run() {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator_on(engine.clone());
+    let session = "actioning";
+    ready_session(&router, &engine, session).await;
+
+    let actioned = run(&router, session, "print('actioned')").await;
+    force_statement_running(&engine, session, actioned);
+    assert_eq!(
+        get(&router, session, actioned).await["State"].as_str(),
+        Some(STATE_RUNNING),
+        "the row's statement must be the one the runtime is actioning"
+    );
+
+    for (case, code) in [
+        ("a second run", "print('second')"),
+        ("a third run", "print('third')"),
+    ] {
+        let queued = run(&router, session, code).await;
+        assert!(
+            queued > actioned,
+            "case {case}: a session actioning statement {actioned} must take another and \
+             mint it a later id, got {queued}"
+        );
+        let read = get(&router, session, actioned).await;
+        assert_eq!(
+            read["State"].as_str(),
+            Some(STATE_RUNNING),
+            "case {case}: taking another statement must leave the one being actioned where \
+             it was, got {read}"
+        );
+    }
+
+    let listed = listed_statement_ids(&router, session).await;
+    assert_eq!(
+        listed,
+        vec![actioned, actioned + 1, actioned + 2],
+        "every statement the session took must be a record of it, in submission order, got \
+         {listed:?}"
+    );
+}
+
+/// A claim NOTHING ever answers for does not stall the queue: a statement the session took
+/// up long ago and whose execution never reported stops counting as carrying the runtime, so
+/// the next statement is still run and comes to rest carrying what its own code computed.
+///
+/// The stale claim is written through the store, which is the only way a claim nothing
+/// answers for exists at all — the task that performs one records an outcome on every path.
+#[tokio::test]
+async fn a_claim_nothing_answers_for_does_not_stall_the_queue() {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator_on(engine.clone());
+    let session = "stale-claim";
+    ready_session(&router, &engine, session).await;
+
+    // A statement the session took up longer ago than a claim counts for, owing no further
+    // state and awaiting no execution: whatever was running it is gone.
+    let stale = {
+        let state = engine.state::<ComAmazonawsGlueAwsglueState>();
+        let mut store = state.lock();
+        let entry = store
+            .session_mut(REGION, session)
+            .unwrap_or_else(|| panic!("{session} was created"));
+        let mut statement = StatementEntry::run(entry.next_statement_id, "print('lost')", SystemTime::now());
+        statement.state = STATE_RUNNING.to_string();
+        statement.settles_at = Some(far_future());
+        statement.awaiting_execution = false;
+        statement.executing_since = SystemTime::now()
+            .checked_sub(2 * STATEMENT_CLAIM_ABANDONED_AFTER);
+        let id = statement.id;
+        entry.statements.push(statement);
+        entry.next_statement_id = id + 1;
+        i64::from(id)
+    };
+
+    let next = run(&router, session, "print(6 * 7)").await;
+    assert!(
+        next > stale,
+        "the session must take another statement after a claim nothing answered for, got \
+         {next} after {stale}"
+    );
+    let settled = statement_at_rest(&router, &engine, session, next).await;
+    assert_eq!(
+        settled["State"].as_str(),
+        Some(STATE_AVAILABLE),
+        "the statement behind the lost one must run to its end, got {settled}"
+    );
+    assert_eq!(
+        settled
+            .pointer("/Output/Data/TextPlain")
+            .and_then(Value::as_str),
+        Some("42\n"),
+        "it must report what its own code computed, got {settled}"
+    );
+}
+
+/// A session keeps at most the statement records it retains, whatever a caller submits: a
+/// queued statement cannot grow what one session holds past that ceiling, the OLDEST records
+/// go first, and the one the session's runtime is carrying is kept whatever its age.
+#[tokio::test]
+async fn a_session_keeps_at_most_the_statements_it_retains() {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator_on(engine.clone());
+    let session = "retained";
+    ready_session(&router, &engine, session).await;
+
+    // Fill the session to its retention window through the store, so the ceiling is reached
+    // without running a hundred cells: the first record is the one its runtime is carrying,
+    // every other one is queued with nothing running it.
+    let carried = {
+        let state = engine.state::<ComAmazonawsGlueAwsglueState>();
+        let mut store = state.lock();
+        let entry = store
+            .session_mut(REGION, session)
+            .unwrap_or_else(|| panic!("{session} was created"));
+        let now = SystemTime::now();
+        entry.statements = (0..MAX_STATEMENTS_PER_SESSION)
+            .map(|index| {
+                let id = FIRST_STATEMENT_ID + index as i32;
+                let mut statement = StatementEntry::run(id, &format!("print({id})"), now);
+                statement.settles_at = Some(far_future());
+                statement.awaiting_execution = false;
+                if index == 0 {
+                    // The record the runtime is carrying: its claim is fresh, so it is the
+                    // one record the retention must keep.
+                    statement.state = STATE_RUNNING.to_string();
+                    statement.executing_since = Some(now);
+                }
+                statement
+            })
+            .collect();
+        entry.next_statement_id = FIRST_STATEMENT_ID + MAX_STATEMENTS_PER_SESSION as i32;
+        i64::from(FIRST_STATEMENT_ID)
+    };
+
+    // Every further run is taken, and none of them grows what the session holds.
+    for case in 1..=3 {
+        let taken = run(&router, session, &format!("print('taken {case}')")).await;
+        assert_eq!(
+            stored_statement_count(&engine, session),
+            MAX_STATEMENTS_PER_SESSION,
+            "case {case}: a session must hold at most {MAX_STATEMENTS_PER_SESSION} statements"
+        );
+        // The statement just taken is one of the records kept, and so is the one being
+        // carried: what went is the OLDEST of the rest.
+        let read = get(&router, session, taken).await;
+        assert_eq!(
+            read["Id"].as_i64(),
+            Some(taken),
+            "case {case}: the statement just taken must be a record of the session, got {read}"
+        );
+        let carrying = get(&router, session, carried).await;
+        assert_eq!(
+            carrying["State"].as_str(),
+            Some(STATE_RUNNING),
+            "case {case}: the statement the runtime is carrying must be kept, got {carrying}"
+        );
+        let dropped = carried + case;
         let (status, body) = call(
             &router,
-            "RunStatement",
-            &json!({ "SessionId": session, "Code": code }),
+            "GetStatement",
+            &json!({ "SessionId": session, "Id": dropped }),
         )
         .await;
         assert_eq!(
             status, 400,
-            "case {case}: a busy session must be refused with 400, got {status} with {body}"
-        );
-        assert!(
-            error_code(&body).ends_with("InvalidInputException"),
-            "case {case}: expected InvalidInputException, got {} in {body}",
-            error_code(&body)
-        );
-        assert_eq!(
-            error_message(&body),
-            messages::session_busy_with_statement(session, in_flight as i32),
-            "case {case}: the refusal must name the statement the session is still \
-             running, got {body}"
+            "case {case}: the oldest record must have gone, and {dropped} reads back with \
+             {status} and {body}"
         );
     }
-
-    // A refused run records nothing: the next id the session mints is the one after the
-    // statement in flight, not after the refusals.
-    let (status, body) = call(
-        &router,
-        "GetStatement",
-        &json!({ "SessionId": session, "Id": in_flight + 1 }),
-    )
-    .await;
-    assert_eq!(
-        status, 400,
-        "a refused run must record no statement, got {status} with {body}"
-    );
-
-    statement_at_rest(&router, &engine, session, in_flight).await;
-    let next = run(&router, session, "print('taken')").await;
-    assert_eq!(
-        next,
-        in_flight + 1,
-        "a session takes a statement again once the one in flight has come to rest, and \
-         mints the next id for it, got {next}"
-    );
 }
+
+// ---------------------------------------------------------------------------
+// Refusals
+// ---------------------------------------------------------------------------
 
 /// Which refusal a READ of the statement a refused run would have recorded answers.
 ///
-/// A session the service still holds a runtime for serves its statement surface, so the id
-/// nothing minted is the statement miss; a session that has ENDED has no runtime whose
-/// statements could be read, so the whole surface is refused the way the run was.
+/// A session the service still holds a runtime for serves its statement surface, so an id
+/// inside that session's own id space is refused as a state of the SESSION; a session that
+/// has ENDED has no runtime whose statements could be read at all, so the whole surface is
+/// refused the way the run was.
 enum ReadRefusal {
-    StatementMiss,
+    IllegalSessionStatus,
     SessionEnded,
 }
 
-/// A session whose runtime is not up takes no statement: a run is refused in every status
-/// but `READY`, and nothing is recorded for it. Which refusal it is follows from what the
-/// status says about the runtime — a session the service is still bringing up or taking down
-/// is in an invalid state for the run, while a session that has ENDED has no runtime at all
-/// and its id names nothing that could take code, which is refused as invalid input.
+/// One row of the not-ready table: the session to create, the create body, how its status is
+/// reached, the status it is then in, and the refusal a read of its statements answers.
+struct NotReadyRow {
+    case: &'static str,
+    session: &'static str,
+    create: Value,
+    /// How far the session's own instants are pulled back, so its documented timeout has
+    /// fallen due; `ZERO` for a row that does not turn on the clock.
+    elapsed: Duration,
+    /// The status written straight into the store for a row no call of this emulator reaches.
+    forced: Option<&'static str>,
+    status: &'static str,
+    read_refusal: ReadRefusal,
+}
+
+/// A session whose runtime is not up takes no statement: a run is refused in every status but
+/// `READY`, nothing is recorded for it, and the refusal is the same one whatever the status
+/// says about the runtime — the session is not ready, which is reported as invalid input and
+/// names the status it is actually in.
 ///
-/// The rows are the statuses a session reaches by the clock alone: the one its create put
-/// it in, and the one its own documented timeout brings it to.
+/// The rows span the modelled `SessionStatus` values other than `READY`: the two a session
+/// reaches by the clock alone (the one its create put it in and the one its own documented
+/// timeout brings it to), the one a session being taken down is in, and the two a session
+/// that has ended rests in.
 #[tokio::test]
 async fn a_run_on_a_session_that_is_not_ready_is_refused() {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let router = emulator_on(engine.clone());
 
-    // (case, the session, the create body, how far its clock is pulled back, the status, the
-    //  modelled error the run is refused with, the refusal a read of its statements answers)
-    let cases: Vec<(&str, &str, Value, Duration, &str, &str, ReadRefusal)> = vec![
-        (
-            "a session whose provisioning has not finished",
-            "provisioning",
-            json!({}),
-            Duration::ZERO,
-            STATUS_PROVISIONING,
-            "IllegalSessionStateException",
-            ReadRefusal::StatementMiss,
-        ),
-        (
+    let cases: Vec<NotReadyRow> = vec![
+        NotReadyRow {
+            case: "a session whose provisioning has not finished",
+            session: "provisioning",
+            create: json!({}),
+            elapsed: Duration::ZERO,
+            forced: None,
+            status: STATUS_PROVISIONING,
+            read_refusal: ReadRefusal::IllegalSessionStatus,
+        },
+        NotReadyRow {
             // "The number of minutes before session times out", at the modelled floor of
             // `Timeout` ("range 1.."), so one minute later the session has ended.
-            "a session its own timeout has ended",
-            "timed-out",
-            json!({ "Timeout": 1, "IdleTimeout": 1 }),
-            Duration::from_secs(2 * SECONDS_PER_MINUTE),
-            STATUS_TIMEOUT,
-            "InvalidInputException",
-            ReadRefusal::SessionEnded,
-        ),
+            case: "a session its own timeout has ended",
+            session: "timed-out",
+            create: json!({ "Timeout": 1, "IdleTimeout": 1 }),
+            elapsed: Duration::from_secs(2 * SECONDS_PER_MINUTE),
+            forced: None,
+            status: STATUS_TIMEOUT,
+            read_refusal: ReadRefusal::SessionEnded,
+        },
+        NotReadyRow {
+            case: "a session whose runtime is being taken down",
+            session: "stopping",
+            create: json!({}),
+            elapsed: Duration::ZERO,
+            forced: Some(STATUS_STOPPING),
+            status: STATUS_STOPPING,
+            read_refusal: ReadRefusal::IllegalSessionStatus,
+        },
+        NotReadyRow {
+            case: "a session whose runtime never came up",
+            session: "failed",
+            create: json!({}),
+            elapsed: Duration::ZERO,
+            forced: Some(STATUS_FAILED),
+            status: STATUS_FAILED,
+            read_refusal: ReadRefusal::SessionEnded,
+        },
+        NotReadyRow {
+            case: "a session a stop took down",
+            session: "stopped",
+            create: json!({}),
+            elapsed: Duration::ZERO,
+            forced: Some(STATUS_STOPPED),
+            status: STATUS_STOPPED,
+            read_refusal: ReadRefusal::SessionEnded,
+        },
     ];
 
-    for (case, session, extra, elapsed, status_expected, error_expected, read_refusal) in &cases {
-        create_session(&router, session, extra.clone()).await;
-        if elapsed.is_zero() {
+    for row in &cases {
+        let NotReadyRow {
+            case,
+            session,
+            create,
+            elapsed,
+            forced,
+            status: status_expected,
+            read_refusal,
+        } = row;
+        create_session(&router, session, create.clone()).await;
+        if let Some(status) = forced {
+            force_session_status(&engine, session, status);
+        } else if elapsed.is_zero() {
             // The provisioning this row is about is held open for the whole row.
             set_session_due(&engine, session, far_future());
         } else {
@@ -555,8 +907,8 @@ async fn a_run_on_a_session_that_is_not_ready_is_refused() {
              {status} with {body}"
         );
         assert!(
-            error_code(&body).ends_with(error_expected),
-            "case {case}: expected {error_expected}, got {} in {body}",
+            error_code(&body).ends_with("InvalidInputException"),
+            "case {case}: expected InvalidInputException, got {} in {body}",
             error_code(&body)
         );
         assert_eq!(
@@ -585,12 +937,22 @@ async fn a_run_on_a_session_that_is_not_ready_is_refused() {
             status, 400,
             "case {case}: no statement of this session reads back, got {status} with {body}"
         );
-        let expected_message = match read_refusal {
-            ReadRefusal::StatementMiss => {
-                messages::statement_not_found(session, FIRST_STATEMENT_ID)
-            }
-            ReadRefusal::SessionEnded => messages::session_not_ready(session, status_expected),
+        let (expected_code, expected_message) = match read_refusal {
+            ReadRefusal::IllegalSessionStatus => (
+                "IllegalSessionStateException",
+                messages::STATEMENT_ILLEGAL_SESSION_STATUS.to_string(),
+            ),
+            ReadRefusal::SessionEnded => (
+                "InvalidInputException",
+                messages::session_not_ready(session, status_expected),
+            ),
         };
+        assert!(
+            error_code(&body).ends_with(expected_code),
+            "case {case}: expected {expected_code} reading the statement back, got {} in \
+             {body}",
+            error_code(&body)
+        );
         assert_eq!(
             error_message(&body),
             expected_message,
@@ -599,8 +961,9 @@ async fn a_run_on_a_session_that_is_not_ready_is_refused() {
     }
 }
 
-/// A run or a read for a session this endpoint never created is a miss, and so is one for a
-/// statement id its session never minted.
+/// A run or a read for a session this endpoint never created is a miss, and so is a read for
+/// a statement id OUTSIDE the id space of the session it was asked for — while an id inside
+/// that space the session does not hold is refused as a state of the session instead.
 #[tokio::test]
 async fn an_address_nothing_holds_is_a_miss() {
     let engine = Arc::new(engine::InMemoryEngine::new());
@@ -672,8 +1035,48 @@ async fn an_address_nothing_holds_is_a_miss() {
         );
     }
 
-    // An id the session never minted, on either side of the one it did.
-    for id in [-1, 0, held + 1, held + 99] {
+    // An id the session does not hold, on either side of its own id space: the ids a session
+    // mints count up from the first, so the ones it has minted and the one it would mint
+    // next name statement slots of this session's runtime, and every other id names no
+    // statement of any session.
+    //
+    // (case, the id asked for, the modelled error, the sentence it carries)
+    let misses: Vec<(&str, i64, &str, String)> = vec![
+        (
+            "the id the session would mint next",
+            held + 1,
+            "IllegalSessionStateException",
+            messages::STATEMENT_ILLEGAL_SESSION_STATUS.to_string(),
+        ),
+        (
+            "one past the id space",
+            held + 2,
+            "EntityNotFoundException",
+            messages::statement_not_found((held + 2) as i32),
+        ),
+        (
+            "far above the id space",
+            held + 987_654,
+            "EntityNotFoundException",
+            messages::statement_not_found((held + 987_654) as i32),
+        ),
+        (
+            // "default 0" (`IntegerValue`): the id a request that named none carries, which
+            // is below the first id a session mints.
+            "the modelled default id",
+            0,
+            "EntityNotFoundException",
+            messages::statement_not_found(0),
+        ),
+        (
+            "an id below the id space",
+            -1,
+            "EntityNotFoundException",
+            messages::statement_not_found(-1),
+        ),
+    ];
+
+    for (case, id, expected_code, expected_message) in &misses {
         let (status, body) = call(
             &router,
             "GetStatement",
@@ -682,18 +1085,18 @@ async fn an_address_nothing_holds_is_a_miss() {
         .await;
         assert_eq!(
             status, 400,
-            "case {id}: a statement nothing recorded must be refused, got {status} with \
+            "case {case}: a statement nothing recorded must be refused, got {status} with \
              {body}"
         );
         assert!(
-            error_code(&body).ends_with("EntityNotFoundException"),
-            "case {id}: expected EntityNotFoundException, got {} in {body}",
+            error_code(&body).ends_with(expected_code),
+            "case {case}: expected {expected_code} for id {id}, got {} in {body}",
             error_code(&body)
         );
         assert_eq!(
-            error_message(&body),
-            messages::statement_not_found(session, id as i32),
-            "case {id}: the refusal must name the statement asked for, got {body}"
+            &error_message(&body),
+            expected_message,
+            "case {case}: unexpected wording for id {id}, got {body}"
         );
     }
 }

@@ -40,6 +40,13 @@
 //! hands off what was already owed rather than reporting a statement nothing is running: the
 //! execution was owed the instant the statement was recorded, whoever recorded it.
 //!
+//! A session takes every statement submitted to it while its runtime is up, and runs them ONE
+//! AT A TIME: a statement is claimed only while no statement of that session is carrying its
+//! runtime ([`SessionEntry::claim_statement_awaiting_execution`]), the oldest one awaiting an
+//! execution first, so a cell submitted while another is in flight is QUEUED — recorded, owed
+//! an execution, and taken up by the next call that finds it owed once the one ahead of it has
+//! answered.
+//!
 //! WHAT the statement then REPORTS is the clock's, not this module's: the state the execution
 //! came to is owed one span after the statement has been [`STATEMENT_STATE_RUNNING`], and
 //! never before one span after the execution itself answered
@@ -300,8 +307,10 @@ pub async fn perform_owed_session_statements<Eng: ::std::marker::Send + ::std::m
             session.settle_if_due(now);
             session.settle_due_statements(now);
             // The execution is CLAIMED under the guard, so two calls that find the same
-            // statement owed one cannot both run it.
-            let Some(statement_id) = session.claim_statement_awaiting_execution() else {
+            // statement owed one cannot both run it — and only one statement of a session
+            // is ever claimed at a time, because a session runs the statements it has taken
+            // one at a time, so everything submitted in the meantime stays queued.
+            let Some(statement_id) = session.claim_statement_awaiting_execution(now) else {
                 break;
             };
             match StatementPlan::of(session, statement_id) {

@@ -297,14 +297,14 @@ async fn stopping_a_ready_session_takes_its_runtime_down() {
             "case {case}: a session still coming down has not completed, got {stopping}"
         );
 
-        // A runtime that is coming down takes no code: the service is still moving the
-        // session, so the run is refused as a state the session is in.
+        // A runtime that is coming down takes no code: the session is not ready, which the
+        // run refuses as invalid input whatever the status says about the runtime.
         assert_run_refused(
             &router,
             case,
             id,
             STATUS_STOPPING,
-            "IllegalSessionStateException",
+            "InvalidInputException",
         )
         .await;
 

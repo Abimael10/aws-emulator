@@ -9,18 +9,23 @@
 //! session minted for it, so `GetStatement` reads back the code this run submitted and a
 //! session's ids count up in submission order.
 //!
-//! A statement can only be taken by a runtime that is up and free, so this run is refused
-//! when the session has no runtime up and when a statement of that session has not finished
-//! yet. Which refusal depends on what the session's status says about its runtime: a session
-//! the service is itself still bringing up or taking down is in an invalid state for the run
-//! (its modelled `IllegalSessionStateException`), while a session that has ENDED
-//! ([`crate::state::session_has_ended`]) has no runtime at all any more, so its `SessionId`
-//! names nothing that can take code and the run is refused as invalid input — which is also
-//! the refusal this service is recorded answering a run on a stopped session with, and the
-//! one it answers a session still actioning a statement with. The statement itself is
-//! recorded in `WAITING` with `RUNNING` due [`crate::state::STATEMENT_SETTLES_AFTER`] out, so
-//! a caller that runs a second statement straight after this one still observes the session
-//! busy.
+//! A statement can only be taken by a session whose runtime is up, so this run is refused
+//! when the session's status is anything but READY — the service is still bringing its
+//! runtime up, is taking it down, or the session has ENDED
+//! ([`crate::state::session_has_ended`]) and its `SessionId` names nothing that could take
+//! code at all. RECORDED: every one of those is refused as invalid input, rather than as a
+//! state the session could leave.
+//!
+//! A session whose runtime IS up takes EVERY statement submitted to it: one that is already
+//! actioning a statement QUEUES the new one rather than refusing it, because a session runs
+//! the statements it has taken one at a time
+//! ([`crate::state::SessionEntry::claim_statement_awaiting_execution`]). So a client submits
+//! cell after cell, each answers with its own `Id`, and `ListStatements` reports them in
+//! submission order. The statement itself is recorded in `WAITING`, and the clock owes it
+//! `RUNNING` [`crate::state::STATEMENT_SETTLES_AFTER`] out from the instant the session takes
+//! its code UP, so a caller that reads a statement straight after submitting it still
+//! observes it waiting and one queued behind another observes it waiting until the session
+//! gets to it.
 //!
 //! Submitting a statement is also what STARTS it: the code is handed to a task of this
 //! process, which runs it on the session's Spark runtime and records what that execution came
@@ -231,49 +236,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             session.settle_due_statements(now);
 
             // "The period in which a remote Spark runtime environment is running": a session
-            // still being provisioned, or one being taken down, has no runtime up yet to take
-            // code, so the run is refused instead of recording a statement nothing could ever
-            // action. A session that has ENDED has no runtime at all any more and nothing
-            // brings one back, so its `SessionId` names nothing that could take code: that is
-            // refused as invalid input rather than as a state the session could leave.
-            if crate::state::session_has_ended(&session.status) {
-                return Err(RunStatementErrorModeled::InvalidInputException(
-                    InvalidInputException {
-                        message: Some(crate::state::messages::session_not_ready(
-                            &input.session_id,
-                            &session.status,
-                        )),
-                        from_federation_source: None,
-                    },
-                )
-                .into());
-            }
+            // whose status is not READY has no runtime up that could take code — the service
+            // is still bringing one up, is taking it down, or the session has ENDED and
+            // nothing brings one back — so the run is refused instead of recording a
+            // statement nothing could ever action. RECORDED: that refusal is this
+            // operation's `InvalidInputException` for every such status, rather than the
+            // `IllegalSessionStateException` the model also declares for it.
             if session.status != crate::state::SESSION_STATUS_READY {
-                return Err(RunStatementErrorModeled::IllegalSessionStateException(
-                    IllegalSessionStateException {
+                return Err(RunStatementErrorModeled::InvalidInputException(
+                    InvalidInputException {
                         message: Some(crate::state::messages::session_not_ready(
                             &input.session_id,
                             &session.status,
-                        )),
-                    },
-                )
-                .into());
-            }
-            // One runtime actions one statement at a time, so a session still actioning one
-            // cannot take another. The recorded refusal for that is this operation's
-            // `InvalidInputException` rather than the `SessionBusyException` the model also
-            // declares for it, and it names the statement the caller is waiting on.
-            if let Some(in_flight) = session
-                .statements
-                .iter()
-                .find(|statement| !statement.is_terminal())
-                .map(|statement| statement.id)
-            {
-                return Err(RunStatementErrorModeled::InvalidInputException(
-                    InvalidInputException {
-                        message: Some(crate::state::messages::session_busy_with_statement(
-                            &input.session_id,
-                            in_flight,
                         )),
                         from_federation_source: None,
                     },

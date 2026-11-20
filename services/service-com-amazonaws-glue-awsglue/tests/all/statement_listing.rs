@@ -92,7 +92,7 @@ fn listed_statements(page: &Value) -> Vec<Value> {
 }
 
 /// The `Id` of every statement one answer reports, in the order it reported them.
-fn listed_ids(page: &Value) -> Vec<i64> {
+pub(crate) fn listed_ids(page: &Value) -> Vec<i64> {
     listed_statements(page)
         .iter()
         .map(|statement| {
@@ -111,7 +111,7 @@ fn token_of(page: &Value) -> Option<String> {
 }
 
 /// One `ListStatements` call for `session`, resumed from `token` when there is one.
-async fn list(router: &MultiServiceRouter, session: &str, token: Option<&str>) -> Value {
+pub(crate) async fn list(router: &MultiServiceRouter, session: &str, token: Option<&str>) -> Value {
     let mut request = json!({ "SessionId": session });
     if let Some(cursor) = token {
         request["NextToken"] = json!(cursor);
@@ -527,8 +527,8 @@ async fn a_session_the_store_does_not_hold_is_not_found() {
 
 /// The listing reports the state the CLOCK owes each statement and changes nothing else:
 /// two listings of statements whose terminal state is not yet due agree, the state the
-/// clock owed is reported once it is due and keeps being reported, and a session still
-/// actioning a statement is still busy after it has been listed.
+/// clock owed is reported once it is due and keeps being reported, and a statement the
+/// session is still actioning is left where it was by a listing.
 #[tokio::test]
 async fn listing_statements_reports_the_state_the_clock_owes_and_changes_nothing_else() {
     let (router, engine) = emulator_with_engine();
@@ -554,28 +554,29 @@ async fn listing_statements_reports_the_state_the_clock_owes_and_changes_nothing
         );
     }
 
-    // Listing a session's statements does not finish the one in flight: the session is
-    // still busy, so a further run is still refused.
-    let (status, body) = call(
-        &router,
-        "RunStatement",
-        &json!({ "SessionId": session, "Code": "print('after the listing')" }),
-    )
-    .await;
-    assert_eq!(
-        status, 400,
-        "case \"nothing due\": a listing must not free a busy session, got {status} with {body}"
+    // Listing a session's statements does not finish the one in flight: it keeps the state
+    // it was in — and the session still takes a further statement, which is queued behind
+    // it rather than refused.
+    let queued = run(&router, session, "print('after the listing')").await;
+    assert!(
+        queued > in_flight,
+        "case \"nothing due\": a listing must not stop the session taking another statement, \
+         got {queued} after {in_flight}"
     );
+    set_statement_due(&engine, session, far_future());
+    let still_in_flight = get(&router, session, in_flight).await;
     assert_eq!(
-        error_message(&body),
-        messages::session_busy_with_statement(session, in_flight as i32),
-        "case \"nothing due\": the refusal must still name the statement in flight, got {body}"
+        still_in_flight["State"].as_str(),
+        Some(STATE_WAITING),
+        "case \"nothing due\": the statement in flight must keep the state it was in, got \
+         {still_in_flight}"
     );
 
-    // Once every state the statement is owed has fallen due, the listing reports the state
-    // its own execution came to — and keeps reporting the same thing, so the listing
+    // Once every state the statements are owed has fallen due, the listing reports the state
+    // each one's own execution came to — and keeps reporting the same thing, so the listing
     // materialises what was due rather than moving a statement because it was read.
     statement_at_rest(&router, &engine, session, in_flight).await;
+    statement_at_rest(&router, &engine, session, queued).await;
     let settled = list(&router, session, None).await;
     let again = list(&router, session, None).await;
     assert_eq!(
