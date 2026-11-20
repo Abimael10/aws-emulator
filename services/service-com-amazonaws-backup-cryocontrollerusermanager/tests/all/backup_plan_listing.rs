@@ -24,7 +24,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::vault_and_backup_job::{call, router};
+use super::vault_and_backup_job::{call, create_vault, router};
 
 /// A body member as a string, or `"<unset>"` when the member is absent.
 fn member(body: &Value, name: &str) -> String {
@@ -48,6 +48,17 @@ async fn create_plan(router: &MultiServiceRouter, name: &str) -> Value {
         "setup: CreateBackupPlan {name:?} expected 200, got {status} {created:?}"
     );
     created
+}
+
+/// The backup vault this suite's rules target, created before any plan names
+/// it: a rule's `TargetBackupVaultName` names a vault of the caller's account
+/// and Region, which an update resolves before it stores a new version.
+async fn given_target_vault(router: &MultiServiceRouter) {
+    let (status, created) = create_vault(router, "listing-vault", "{}").await;
+    assert_eq!(
+        status, 200,
+        "setup: CreateBackupVault expected 200, got {status} {created:?}"
+    );
 }
 
 /// `GET /backup/plans` — `ListBackupPlans`'s binding, with its query members.
@@ -89,6 +100,7 @@ fn listed(body: &Value) -> Vec<(String, String, String)> {
 #[tokio::test]
 async fn the_listing_reports_the_accounts_plans_at_their_current_version() {
     let router = router();
+    given_target_vault(&router).await;
 
     // Nothing created, nothing listed — the empty account is a page, not a
     // refusal.

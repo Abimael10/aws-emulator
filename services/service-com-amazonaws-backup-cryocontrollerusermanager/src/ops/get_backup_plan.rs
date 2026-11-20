@@ -8,12 +8,19 @@
 //! the body that was stored \u2014 the version the request names, or the plan's
 //! current one where it names none.
 //!
-//! Only a version the account still HOLDS is reported: a plan whose deletion
-//! `DeleteBackupPlan` recorded, like a `VersionId` naming a version the plan
-//! never had, is no longer there to read and is refused with the modelled
+//! Only a version the account still HOLDS is reported: a `VersionId` naming a
+//! version the plan never had, like the version a recorded deletion took, is no
+//! longer there to read and is refused with the modelled
 //! `ResourceNotFoundException` — the resolution step
 //! [`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::backup_plan`]
-//! performs for every plan read.
+//! performs for every plan read. Deleting a plan deletes the version it held
+//! CURRENT, so the versions an update superseded keep reading back afterwards.
+//!
+//! The `DeletionDate` reported beside a plan body is that VERSION's: the instant
+//! the plan stopped holding the version this read answers from
+//! ([`crate::state::BackupPlanRecord::version_deletion_date`]), so a version an
+//! update superseded reads back with the instant it was superseded and the
+//! version in force reads back with none.
 //!
 //! `ScheduledRunsPreview` is reported only for a caller that asks for one
 //! (`MaxScheduledRunsPreview` defaults to 0, and the model documents the member
@@ -357,11 +364,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             version_id: Some(version.version_id.clone()),
             creator_request_id: plan.creator_request_id.clone(),
             creation_date: Some(::aws_smithy_types::DateTime::from(version.creation_date)),
-            // The stored member, which a resolved plan never carries: a
-            // version whose deletion is recorded is refused above rather than
-            // reported. `DeleteBackupPlan` is what answers the deletion
-            // instant.
-            deletion_date: plan.deletion_date.map(::aws_smithy_types::DateTime::from),
+            // The deletion instant of the VERSION this read answers from: a
+            // version an update superseded reports when it was superseded, and
+            // the version in force reports none until the plan's own deletion
+            // is recorded.
+            deletion_date: plan
+                .version_deletion_date(version)
+                .map(::aws_smithy_types::DateTime::from),
             last_execution_date: plan
                 .last_execution_date
                 .map(::aws_smithy_types::DateTime::from),

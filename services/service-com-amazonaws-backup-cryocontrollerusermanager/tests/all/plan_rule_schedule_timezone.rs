@@ -26,7 +26,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::vault_and_backup_job::{call, router};
+use super::vault_and_backup_job::{call, create_vault, router};
 
 /// The zone a rule that declares none is scheduled in (`crate::state::schedule`'s
 /// `DEFAULT_SCHEDULE_EXPRESSION_TIMEZONE`).
@@ -118,6 +118,14 @@ fn reported_zone(read: &Value, rule_name: &str) -> String {
 async fn a_stored_rule_reports_the_timezone_its_schedule_runs_in() {
     for (case, declared, expected) in declared_zones() {
         let router = router();
+        // The vault the rows' rules target: an update resolves every rule's
+        // `TargetBackupVaultName` in the caller's Region before it stores the
+        // body, so the account holds it first.
+        let (status, vault) = create_vault(&router, "timezone-vault", "{}").await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected CreateBackupVault 200, got {status} {vault:?}"
+        );
         // Two rules in ONE body: the row's rule beside a sibling that always
         // declares a zone, so a defaulted zone can never be a sibling's.
         let body = json!({

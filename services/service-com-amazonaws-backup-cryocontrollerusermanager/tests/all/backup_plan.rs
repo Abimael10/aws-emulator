@@ -473,7 +473,7 @@ async fn a_plan_body_outside_what_aws_accepts_is_refused() {
         (
             "no rules at all",
             json!({"BackupPlanName": "refused", "Rules": []}),
-            "InvalidParameterValueException",
+            "MissingParameterValueException",
         ),
         (
             "one rule name used twice",

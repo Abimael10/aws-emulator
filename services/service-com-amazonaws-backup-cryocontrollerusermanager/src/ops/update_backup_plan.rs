@@ -187,6 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
         let plan = input.backup_plan;
 
         // The body check `CreateBackupPlan` applies, so an update stores only a
@@ -194,17 +195,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // limit error, so a body past the rule cap is answered as the parameter
         // value AWS cannot accept, carrying the limit it is past.
         if let Some(refusal) = crate::state::rejected_backup_plan_body(&plan) {
-            return Err(UpdateBackupPlanErrorModeled::InvalidParameterValueException(
-                match refusal {
-                    crate::state::RejectedBackupPlanBody::Value(refusal) => refusal,
-                    crate::state::RejectedBackupPlanBody::TooManyRules(message) => {
+            return Err(match refusal {
+                crate::state::RejectedBackupPlanBody::Value(refusal) => {
+                    UpdateBackupPlanErrorModeled::InvalidParameterValueException(refusal)
+                }
+                // A plan body that sets no rules leaves the `@required` member
+                // unsupplied, which is the MISSING parameter condition rather
+                // than a value out of range.
+                crate::state::RejectedBackupPlanBody::NoRules(refusal) => {
+                    UpdateBackupPlanErrorModeled::MissingParameterValueException(refusal)
+                }
+                crate::state::RejectedBackupPlanBody::TooManyRules(message) => {
+                    UpdateBackupPlanErrorModeled::InvalidParameterValueException(
                         InvalidParameterValueException {
                             message: Some(message),
                             ..Default::default()
-                        }
-                    }
-                },
-            )
+                        },
+                    )
+                }
+            }
             .into());
         }
 
@@ -218,9 +227,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // stores nothing.
             if store.live_backup_plan(&input.backup_plan_id).is_none() {
                 return Err(UpdateBackupPlanErrorModeled::ResourceNotFoundException(
-                    crate::state::backup_plan_not_found(),
+                    crate::state::backup_plan_update_not_found(),
                 )
                 .into());
+            }
+            // Every rule of the body names the vault its backups are stored in,
+            // and the version is stored only once all of them resolve in this
+            // request's region: validate, THEN commit, so an update this
+            // service refuses leaves the plan at the version it already held
+            // rather than reporting a configuration the account cannot hold.
+            if let Some(refusal) = store.rejected_plan_rule_target_vaults(&region, &plan) {
+                return Err(
+                    UpdateBackupPlanErrorModeled::InvalidParameterValueException(refusal).into(),
+                );
             }
             let version = store.minted_backup_plan_version(plan, now);
             let Some(record) = store.live_backup_plan_mut(&input.backup_plan_id) else {
@@ -228,7 +247,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // lock. Answered as the absent resource it would be rather than
                 // reporting a version of a plan nothing holds.
                 return Err(UpdateBackupPlanErrorModeled::ResourceNotFoundException(
-                    crate::state::backup_plan_not_found(),
+                    crate::state::backup_plan_update_not_found(),
                 )
                 .into());
             };

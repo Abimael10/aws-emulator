@@ -970,14 +970,34 @@ pub const ERROR_CODE_VAULT_ALREADY_EXISTS: &str = "ERROR_1101";
 /// The sentence AWS states for that condition — fixed, like the one above.
 pub const MESSAGE_VAULT_ALREADY_EXISTS: &str = "Backup vault with the same name already exists";
 
+/// `Code` for "the backup plan this update must store the next version of is
+/// not one this account holds".
+pub const ERROR_CODE_BACKUP_PLAN_UPDATE_NOT_FOUND: &str = "ERROR_2204";
 /// The sentence AWS states for "the backup plan this call resolves is not one
-/// this account holds" on a call that resolves one WITHOUT reading a version of
-/// it — fixed, and worded as this service words the same condition for a backup
-/// job ([`MESSAGE_BACKUP_JOB_NOT_FOUND`]): it names no part of the request. A
-/// plan READ states the version it could not read instead
-/// ([`MESSAGE_BACKUP_PLAN_VERSION_UNREADABLE`]). No `Code`: this condition has
-/// no observed token.
-pub const MESSAGE_BACKUP_PLAN_NOT_FOUND: &str = "Cannot find Backup plan";
+/// this account holds" on the call that stores the NEXT VERSION of one — fixed:
+/// it names no part of the request, and states both ways the plan can be absent
+/// (the account never held it, or its deletion is recorded) because the call
+/// cannot tell them apart. A plan READ states the version it could not read
+/// instead ([`MESSAGE_BACKUP_PLAN_VERSION_UNREADABLE`]).
+pub const MESSAGE_BACKUP_PLAN_UPDATE_NOT_FOUND: &str =
+    "Cannot update the Backup plan. Backup plan does not exist or has been deleted";
+
+/// `Code` for "the plan body this call stores sets no rules".
+pub const ERROR_CODE_BACKUP_PLAN_NO_RULES: &str = "ERROR_4202";
+/// The sentence AWS states for that condition — fixed: it names neither the
+/// member nor the plan. A plan "includes a BackupPlanName and one or more sets
+/// of Rules" (model doc for `BackupPlanInput`), and `Rules` is `@required`, so a
+/// list the model admits as present but EMPTY leaves the required parameter
+/// unsupplied rather than carrying a value out of range — which is why the
+/// condition is the MISSING parameter one.
+pub const MESSAGE_BACKUP_PLAN_NO_RULES: &str = "No rules are set";
+
+/// `Code` for "a backup vault this call names does not exist".
+pub const ERROR_CODE_BACKUP_VAULT_DOES_NOT_EXIST: &str = "ERROR_3201";
+/// The sentence AWS states for that condition — fixed: it names neither the
+/// vault nor the rule that targets it, so a caller is told the class of the
+/// refusal and nothing about the account's vaults.
+pub const MESSAGE_BACKUP_VAULT_DOES_NOT_EXIST: &str = "A Backup vault does not exist";
 
 /// `Code` for "the version of the backup plan this read asks for cannot be
 /// read".
@@ -1159,7 +1179,7 @@ pub const MESSAGE_RECOVERY_POINT_HELD: &str =
 
 /// The sentence AWS states for "the backup selection asked about is not one the
 /// named plan holds" — fixed, and worded as this service words the same
-/// condition for a backup plan ([`MESSAGE_BACKUP_PLAN_NOT_FOUND`]): it names no
+/// condition for a backup job ([`MESSAGE_BACKUP_JOB_NOT_FOUND`]): it names no
 /// part of the request. Its token is
 /// [`ERROR_CODE_BACKUP_SELECTION_NOT_FOUND`].
 pub const MESSAGE_BACKUP_SELECTION_NOT_FOUND: &str = "Cannot find Backup selection";
@@ -1484,12 +1504,41 @@ pub fn backup_vault_not_found(vault_name: &str) -> ResourceNotFoundException {
     }
 }
 
-/// The modelled refusal for a backup plan id this account does not hold, for
-/// the call that resolves a plan WITHOUT reading a version of it — the update
-/// that stores the next version is the one that does.
-pub fn backup_plan_not_found() -> ResourceNotFoundException {
+/// The modelled refusal the UPDATE of a backup plan answers when the id it
+/// names is not one this account holds — see
+/// [`MESSAGE_BACKUP_PLAN_UPDATE_NOT_FOUND`], with the condition's own token
+/// ([`ERROR_CODE_BACKUP_PLAN_UPDATE_NOT_FOUND`]).
+///
+/// A plan whose deletion is recorded and a plan id the account never held are
+/// ONE condition here: neither has a version this update could store the next
+/// one after, and the sentence states both.
+pub fn backup_plan_update_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(MESSAGE_BACKUP_PLAN_NOT_FOUND.to_string()),
+        code: Some(ERROR_CODE_BACKUP_PLAN_UPDATE_NOT_FOUND.to_string()),
+        message: Some(MESSAGE_BACKUP_PLAN_UPDATE_NOT_FOUND.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a plan body that sets NO RULES: the required
+/// `Rules` parameter is not supplied, so the refusal is the MISSING parameter
+/// one — see [`MESSAGE_BACKUP_PLAN_NO_RULES`] and
+/// [`ERROR_CODE_BACKUP_PLAN_NO_RULES`].
+pub fn backup_plan_no_rules() -> MissingParameterValueException {
+    MissingParameterValueException {
+        code: Some(ERROR_CODE_BACKUP_PLAN_NO_RULES.to_string()),
+        message: Some(MESSAGE_BACKUP_PLAN_NO_RULES.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a call that names a backup vault this account does
+/// not hold in this Region — see [`MESSAGE_BACKUP_VAULT_DOES_NOT_EXIST`], with
+/// the condition's own token ([`ERROR_CODE_BACKUP_VAULT_DOES_NOT_EXIST`]).
+pub fn backup_vault_does_not_exist() -> InvalidParameterValueException {
+    InvalidParameterValueException {
+        code: Some(ERROR_CODE_BACKUP_VAULT_DOES_NOT_EXIST.to_string()),
+        message: Some(MESSAGE_BACKUP_VAULT_DOES_NOT_EXIST.to_string()),
         ..Default::default()
     }
 }
@@ -2263,6 +2312,11 @@ pub enum RejectedBackupPlanBody {
     /// A member of the body carries a value AWS does not accept, as this
     /// modelled refusal states.
     Value(InvalidParameterValueException),
+    /// The body sets no rules at all, so the `@required` `Rules` parameter is
+    /// not supplied: the MISSING parameter condition
+    /// ([`backup_plan_no_rules`]), which is a different class from a value AWS
+    /// does not accept.
+    NoRules(MissingParameterValueException),
     /// The body carries more rules than a backup plan may hold; the sentence
     /// states the limit.
     TooManyRules(String),
@@ -2278,7 +2332,8 @@ pub enum RejectedBackupPlanBody {
 ///
 /// * a plan "includes a BackupPlanName and one or more sets of Rules" (model
 ///   doc for the member), so a rule list the model admits as present but empty
-///   schedules nothing;
+///   leaves the `@required` `Rules` unsupplied and schedules nothing
+///   ([`backup_plan_no_rules`]);
 /// * the rule list is sized by the request, so it is capped before the
 ///   per-rule checks below walk it and before any of it is stored;
 /// * a rule is identified within its plan by its name, so two rules of one
@@ -2295,10 +2350,7 @@ pub enum RejectedBackupPlanBody {
 ///   destination no vault ARN resolves to.
 pub fn rejected_backup_plan_body(plan: &BackupPlanInput) -> Option<RejectedBackupPlanBody> {
     if plan.rules.is_empty() {
-        return Some(RejectedBackupPlanBody::Value(InvalidParameterValueException {
-            message: Some("Rules must contain at least one backup rule".to_string()),
-            ..Default::default()
-        }));
+        return Some(RejectedBackupPlanBody::NoRules(backup_plan_no_rules()));
     }
     if plan.rules.len() > MAX_RULES_PER_PLAN {
         return Some(RejectedBackupPlanBody::TooManyRules(format!(
@@ -3075,10 +3127,28 @@ impl BackupPlanRecord {
             .chain(::std::iter::once(&self.current))
     }
 
-    /// The version stored under `version_id`, if this plan has one: a version
-    /// stays readable by its own id after an update supersedes it.
-    pub fn version(&self, version_id: &str) -> Option<&BackupPlanVersion> {
+    /// The versions of this plan a read can still answer from.
+    ///
+    /// "Deleting a backup plan deletes the current version of a backup plan.
+    /// Previous versions, if any, will still exist" (model doc for
+    /// `DeleteBackupPlan`): recording a plan's deletion takes the version the
+    /// plan held CURRENT out of what a read answers, and leaves every version an
+    /// update superseded exactly where it was.
+    pub fn readable_versions(&self) -> impl Iterator<Item = &BackupPlanVersion> {
+        let deleted_version = self
+            .deletion_date
+            .is_some()
+            .then_some(self.current.version_id.as_str());
         self.versions()
+            .filter(move |version| Some(version.version_id.as_str()) != deleted_version)
+    }
+
+    /// The version stored under `version_id` a read can still answer from, if
+    /// this plan holds one: a version an update superseded stays readable by its
+    /// own id, while the version a recorded deletion took does not
+    /// ([`Self::readable_versions`]).
+    pub fn readable_version(&self, version_id: &str) -> Option<&BackupPlanVersion> {
+        self.readable_versions()
             .find(|version| version.version_id == version_id)
     }
 
@@ -3094,6 +3164,32 @@ impl BackupPlanRecord {
         self.superseded.drain(..overflow);
     }
 
+    /// The instant this plan stopped holding `version`, or `None` while it still
+    /// holds it.
+    ///
+    /// `DeletionDate` is "the date and time a backup plan is deleted" of the
+    /// PLAN AT A VERSION (the member `GetBackupPlanOutput` reports beside the
+    /// version it answers from, and the one `BackupPlansListMember` carries for
+    /// each version a plan's version list reports), and a plan stops holding a
+    /// version in exactly two ways: an update stores another version in its
+    /// place — the moment that successor was stored — or the plan's deletion is
+    /// recorded, which takes the version it then held current ("Deleting a
+    /// backup plan deletes the current version of a backup plan. Previous
+    /// versions, if any, will still exist", model doc for `DeleteBackupPlan`).
+    /// So the version in force carries no deletion date until the plan's own is
+    /// recorded, and every version an update superseded carries the instant it
+    /// was superseded.
+    pub fn version_deletion_date(&self, version: &BackupPlanVersion) -> Option<SystemTime> {
+        let mut held = self
+            .versions()
+            .skip_while(|held| held.version_id != version.version_id);
+        match (held.next(), held.next()) {
+            (Some(_), Some(successor)) => Some(successor.creation_date),
+            (Some(_), None) => self.deletion_date,
+            (None, _) => None,
+        }
+    }
+
     /// The ONE list projection of a stored plan AT one of its versions, so
     /// every operation that reports plans reports the same members of the same
     /// record: the identifiers and the account-level instants are the plan's
@@ -3106,7 +3202,9 @@ impl BackupPlanRecord {
             backup_plan_name: Some(version.name.clone()),
             version_id: Some(version.version_id.clone()),
             creation_date: Some(::aws_smithy_types::DateTime::from(version.creation_date)),
-            deletion_date: self.deletion_date.map(::aws_smithy_types::DateTime::from),
+            deletion_date: self
+                .version_deletion_date(version)
+                .map(::aws_smithy_types::DateTime::from),
             last_execution_date: self
                 .last_execution_date
                 .map(::aws_smithy_types::DateTime::from),
@@ -3529,20 +3627,22 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
     /// optionally the version asked for.
     ///
     /// A plan read answers from the plan AT A VERSION — the one the request
-    /// named, or the plan's latest where it named none — so every way such a
-    /// read can fail to resolve one is the SAME condition: the version it was
+    /// named, or the plan's current one where it named none — so every way such
+    /// a read can fail to resolve one is the SAME condition: the version it was
     /// asked for is not there to be read ([`backup_plan_version_unreadable`]).
-    /// That covers an id this account holds no plan under, a plan whose
-    /// deletion `DeleteBackupPlan` recorded, and a `VersionId` the plan never
-    /// had; the refusal does not tell the caller which of them it was.
+    /// That covers an id this account holds no plan under, a `VersionId` the
+    /// plan never had, and the version a recorded deletion took; the refusal
+    /// does not tell the caller which of them it was.
     ///
-    /// A read that names NO version answers from the plan's current version,
-    /// the one the latest update stored; one that names a version answers from
-    /// exactly that version, which an update that superseded it left readable.
-    ///
-    /// A deleted plan's record is KEPT (the deletion instant is part of it),
-    /// but it is no longer readable: no version of a plan the account has
-    /// deleted is reported again.
+    /// A deleted plan's record is KEPT, and so are the versions it still holds:
+    /// "Deleting a backup plan deletes the current version of a backup plan.
+    /// Previous versions, if any, will still exist" (model doc for
+    /// `DeleteBackupPlan`). So a read that NAMES a version an update superseded
+    /// keeps answering from it after the plan is deleted — reporting the plan's
+    /// deletion instant, which is how a caller tells that version of a deleted
+    /// plan from one of a live plan — while a read that names no version has no
+    /// current version left to answer from and is refused, exactly as a read
+    /// naming the version the deletion took is.
     pub fn backup_plan(
         &self,
         plan_id: &str,
@@ -3552,14 +3652,38 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
             .backup_plans
             .get(plan_id)
             .ok_or_else(backup_plan_version_unreadable)?;
-        if plan.deletion_date.is_some() {
-            return Err(backup_plan_version_unreadable());
-        }
         let version = match version_id {
+            None if plan.deletion_date.is_some() => {
+                return Err(backup_plan_version_unreadable())
+            }
             None => &plan.current,
-            Some(asked) => plan.version(asked).ok_or_else(backup_plan_version_unreadable)?,
+            Some(asked) => plan
+                .readable_version(asked)
+                .ok_or_else(backup_plan_version_unreadable)?,
         };
         Ok((plan, version))
+    }
+
+    /// Why the body `plan` is not one this region of the account can hold, as
+    /// far as the resources its rules NAME, or `None` when every one of them
+    /// resolves.
+    ///
+    /// A rule's `TargetBackupVaultName` names "the name of a logical container
+    /// where backups are stored" (model doc) in the caller's account and Region,
+    /// and a rule whose target does not resolve could store no backup at all, so
+    /// a call that would store such a body is refused in full — before anything
+    /// is stored, so a refused call leaves the plan the account holds exactly as
+    /// it was. The refusal names neither the rule nor the vault
+    /// ([`backup_vault_does_not_exist`]).
+    pub fn rejected_plan_rule_target_vaults(
+        &self,
+        region: &str,
+        plan: &BackupPlanInput,
+    ) -> Option<InvalidParameterValueException> {
+        plan.rules
+            .iter()
+            .any(|rule| self.vault(region, &rule.target_backup_vault_name).is_none())
+            .then(backup_vault_does_not_exist)
     }
 
     /// The plan a `CreatorRequestId` names, if this account holds one: "If the

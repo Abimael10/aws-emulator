@@ -884,6 +884,17 @@ async fn a_refused_plan_mutation_publishes_nothing() {
         &queue_arn,
     )
     .await;
+    // The vault this row's rules target: an update resolves every rule's
+    // `TargetBackupVaultName` in the caller's Region before it stores a version, so the
+    // account holds it before the accepted mutations below.
+    backup(
+        &router,
+        case,
+        "PUT",
+        &format!("/backup-vaults/{VAULT}"),
+        Some(&json!({})),
+    )
+    .await;
 
     // An id of the form this service mints that names no plan: the update and the delete of
     // it are refused, and the model gives each refusal HTTP 400.

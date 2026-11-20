@@ -32,7 +32,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::vault_and_backup_job::{call, error_code, router};
+use super::vault_and_backup_job::{call, create_vault, error_code, router};
 
 /// The width of every token the service mints, read from the service's own
 /// published constant so this suite cannot drift from what the wire carries.
@@ -249,6 +249,16 @@ async fn a_minted_plan_version_token_is_opaque_and_unrelated_to_its_plan() {
 #[tokio::test]
 async fn every_version_of_one_plan_gets_an_independently_drawn_token() {
     let router = router();
+    // The vaults the rules target: an update resolves every rule's
+    // `TargetBackupVaultName` in the caller's Region before it stores a version,
+    // so the account holds them first.
+    for name in ["plan-vault", "other-vault"] {
+        let (status, vault) = create_vault(&router, name, "{}").await;
+        assert_eq!(
+            status, 200,
+            "setup: expected CreateBackupVault 200 for {name}, got {status} {vault:?}"
+        );
+    }
     let (status, created) = create_plan(
         &router,
         &json!({"BackupPlan": {

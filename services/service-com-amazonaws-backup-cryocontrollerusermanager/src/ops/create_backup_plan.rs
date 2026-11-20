@@ -199,6 +199,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::RejectedBackupPlanBody::Value(refusal) => {
                     CreateBackupPlanErrorModeled::InvalidParameterValueException(refusal)
                 }
+                // A plan body that sets no rules leaves the `@required` member
+                // unsupplied, which is the MISSING parameter condition rather
+                // than a value out of range.
+                crate::state::RejectedBackupPlanBody::NoRules(refusal) => {
+                    CreateBackupPlanErrorModeled::MissingParameterValueException(refusal)
+                }
                 crate::state::RejectedBackupPlanBody::TooManyRules(message) => {
                     CreateBackupPlanErrorModeled::LimitExceededException(LimitExceededException {
                         message: Some(message),

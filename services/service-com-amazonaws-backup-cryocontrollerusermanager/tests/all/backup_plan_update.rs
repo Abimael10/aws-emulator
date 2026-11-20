@@ -16,6 +16,10 @@
 //!   superseding a version does not rewrite it;
 //! * a body AWS does not accept is refused with the error this operation models
 //!   for it and stores nothing: the plan still reports the version it had;
+//! * every rule's `TargetBackupVaultName` is resolved against the account's
+//!   vaults in the caller's Region BEFORE anything is stored, so an update
+//!   naming a vault the account does not hold is refused in full and the plan
+//!   keeps the version it already had;
 //! * a `BackupPlanId` naming no live plan — one the account never held, and one
 //!   whose deletion is recorded — is 400 `ResourceNotFoundException`;
 //! * a mutation of a stored plan that FOLLOWS the call which created it — each
@@ -46,7 +50,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::vault_and_backup_job::{call, error_code, router, ACCOUNT, REGION};
+use super::vault_and_backup_job::{call, create_vault, error_code, router, ACCOUNT, REGION};
 
 // The emulator the event cases drive and the bus readers they share, exposed by
 // the suite that pins this service's job state changes: Backup, EventBridge and
@@ -61,13 +65,28 @@ use crate::job_state_change_events::{
 /// 400).
 const INVALID_PARAMETER: &str = "InvalidParameterValueException";
 
+/// The error shape a body that leaves a required parameter unsupplied names
+/// (`smithy_query` operation `UpdateBackupPlan`:
+/// `MissingParameterValueException`, `httpError` 400).
+const MISSING_PARAMETER: &str = "MissingParameterValueException";
+
 /// The error shape an id naming no live plan names (`smithy_query` operation
 /// `UpdateBackupPlan`: `ResourceNotFoundException`, `httpError` 400).
 const NOT_FOUND: &str = "ResourceNotFoundException";
 
-/// The sentence this service states for "the backup plan asked about is not one
-/// this account holds" (`crate::state`'s `MESSAGE_BACKUP_PLAN_NOT_FOUND`).
-const PLAN_NOT_FOUND: &str = "Cannot find Backup plan";
+/// The sentence AWS states for "the backup plan this update must store the next
+/// version of is not one this account holds", with that condition's own `Code`
+/// (`crate::state`'s `MESSAGE_BACKUP_PLAN_UPDATE_NOT_FOUND` /
+/// `ERROR_CODE_BACKUP_PLAN_UPDATE_NOT_FOUND`).
+const PLAN_NOT_FOUND: &str =
+    "Cannot update the Backup plan. Backup plan does not exist or has been deleted";
+const PLAN_NOT_FOUND_CODE: &str = "ERROR_2204";
+
+/// The sentence AWS states for "the plan body sets no rules", with its own
+/// `Code` (`crate::state`'s `MESSAGE_BACKUP_PLAN_NO_RULES` /
+/// `ERROR_CODE_BACKUP_PLAN_NO_RULES`).
+const NO_RULES: &str = "No rules are set";
+const NO_RULES_CODE: &str = "ERROR_4202";
 
 /// A plan id of the form this service mints but no plan of a fresh account
 /// carries.
@@ -121,6 +140,20 @@ async fn get_plan(
 /// `DELETE /backup/plans/{BackupPlanId}` — `DeleteBackupPlan`'s HTTP binding.
 async fn delete_plan(router: &MultiServiceRouter, plan_id: &str) -> (u16, Value) {
     call(router, "DELETE", &format!("/backup/plans/{plan_id}"), None).await
+}
+
+/// The backup vaults this suite's rules target, created in the account before
+/// any plan names them: a rule's `TargetBackupVaultName` names a vault of the
+/// caller's account and Region, and an update resolves every one of them before
+/// it stores the body it was given.
+async fn given_target_vaults(router: &MultiServiceRouter) {
+    for name in ["plan-vault", "other-vault"] {
+        let (status, created) = create_vault(router, name, "{}").await;
+        assert_eq!(
+            status, 200,
+            "setup: expected CreateBackupVault 200 for {name}, got {status} {created:?}"
+        );
+    }
 }
 
 /// A string member of a JSON object, or the empty string.
@@ -331,6 +364,7 @@ async fn an_update_stores_another_version_and_supersedes_the_one_before_it() {
         // One router per row: each row's plan is the only plan the account
         // holds, so a row cannot see what another row stored.
         let router = router();
+        given_target_vaults(&router).await;
         let created_body = created_plan("superseded-plan");
         let (status, created) = create_plan(&router, &json!({"BackupPlan": created_body})).await;
         assert_eq!(
@@ -437,6 +471,7 @@ async fn every_update_of_a_plan_adds_a_version_that_stays_readable() {
     for updates in [1_usize, 2, 5] {
         let case = format!("{updates} update(s) of one plan");
         let router = router();
+        given_target_vaults(&router).await;
         let (status, created) = create_plan(
             &router,
             &json!({"BackupPlan": created_plan("chained-plan")}),
@@ -524,10 +559,12 @@ fn rules_past_the_cap() -> Value {
 /// it had: a refused update stores nothing.
 #[tokio::test]
 async fn an_update_outside_what_aws_accepts_is_refused_and_stores_nothing() {
-    let cases: Vec<(&str, Value)> = vec![
+    // (case, the body the update sends, the error shape AWS names for it)
+    let cases: Vec<(&str, Value, &str)> = vec![
         (
             "no rules at all",
             json!({"BackupPlanName": "superseded-plan", "Rules": []}),
+            MISSING_PARAMETER,
         ),
         (
             "one rule name used twice",
@@ -538,6 +575,7 @@ async fn an_update_outside_what_aws_accepts_is_refused_and_stores_nothing() {
                     {"RuleName": "daily", "TargetBackupVaultName": "other-vault"},
                 ],
             }),
+            INVALID_PARAMETER,
         ),
         (
             "a start window one minute under its documented floor",
@@ -549,6 +587,7 @@ async fn an_update_outside_what_aws_accepts_is_refused_and_stores_nothing() {
                     "StartWindowMinutes": MIN_START_WINDOW_MINUTES - 1,
                 }],
             }),
+            INVALID_PARAMETER,
         ),
         (
             "a completion window one minute past its documented ceiling",
@@ -560,6 +599,7 @@ async fn an_update_outside_what_aws_accepts_is_refused_and_stores_nothing() {
                     "CompletionWindowMinutes": MAX_WINDOW_MINUTES + 1,
                 }],
             }),
+            INVALID_PARAMETER,
         ),
         (
             "a copy action whose destination is not an ARN",
@@ -571,6 +611,7 @@ async fn an_update_outside_what_aws_accepts_is_refused_and_stores_nothing() {
                     "CopyActions": [{"DestinationBackupVaultArn": "far-away"}],
                 }],
             }),
+            INVALID_PARAMETER,
         ),
         (
             "an air-gapped target that is not an ARN",
@@ -582,12 +623,29 @@ async fn an_update_outside_what_aws_accepts_is_refused_and_stores_nothing() {
                     "TargetLogicallyAirGappedBackupVaultArn": "air-gapped",
                 }],
             }),
+            INVALID_PARAMETER,
         ),
-        ("one rule more than a plan may hold", rules_past_the_cap()),
+        (
+            "one rule more than a plan may hold",
+            rules_past_the_cap(),
+            INVALID_PARAMETER,
+        ),
+        (
+            "a rule targeting a vault the account does not hold",
+            json!({
+                "BackupPlanName": "superseded-plan",
+                "Rules": [{
+                    "RuleName": "daily",
+                    "TargetBackupVaultName": "never-created-vault",
+                }],
+            }),
+            INVALID_PARAMETER,
+        ),
     ];
 
-    for (case, body) in cases {
+    for (case, body, expected_shape) in cases {
         let router = router();
+        given_target_vaults(&router).await;
         let (status, created) = create_plan(
             &router,
             &json!({"BackupPlan": created_plan("superseded-plan")}),
@@ -602,8 +660,8 @@ async fn an_update_outside_what_aws_accepts_is_refused_and_stores_nothing() {
         let (status, refused) = update_plan(&router, &plan_id, &body).await;
         assert_eq!(
             (status, error_code(&refused).as_str()),
-            (400, INVALID_PARAMETER),
-            "case {case:?}: expected 400 {INVALID_PARAMETER}, got {status} {refused:?}"
+            (400, expected_shape),
+            "case {case:?}: expected 400 {expected_shape}, got {status} {refused:?}"
         );
         assert!(
             !text(&refused, "Message").is_empty(),
@@ -636,6 +694,7 @@ async fn an_update_outside_what_aws_accepts_is_refused_and_stores_nothing() {
 #[tokio::test]
 async fn an_update_of_a_plan_the_account_does_not_hold_is_resource_not_found() {
     let router = router();
+    given_target_vaults(&router).await;
     let (status, created) = create_plan(
         &router,
         &json!({"BackupPlan": created_plan("held-for-update")}),
@@ -677,8 +736,9 @@ async fn an_update_of_a_plan_the_account_does_not_hold_is_resource_not_found() {
                 status,
                 error_code(&refused).as_str(),
                 text(&refused, "Message").as_str(),
+                text(&refused, "Code").as_str(),
             ),
-            (400, NOT_FOUND, PLAN_NOT_FOUND),
+            (400, NOT_FOUND, PLAN_NOT_FOUND, PLAN_NOT_FOUND_CODE),
             "case {case:?}: expected 400 {NOT_FOUND} {PLAN_NOT_FOUND:?}, got {status} {refused:?}"
         );
     }
@@ -761,6 +821,7 @@ async fn a_plan_mutation_is_published_as_a_backup_plan_state_change() {
         // Backup, EventBridge and Amazon SQS on one engine: the publication
         // reaches EventBridge in process, and the rule delivers to this queue.
         let router = emulator();
+        given_target_vaults(&router).await;
         let (queue, queue_arn) = given_queue(&router, case, "plan-state-change-events").await;
         given_rule(
             &router,
@@ -836,6 +897,7 @@ async fn a_plan_mutation_is_published_as_a_backup_plan_state_change() {
 async fn a_refused_update_publishes_no_plan_state_change() {
     let case = "a refused update beside an accepted one";
     let router = emulator();
+    given_target_vaults(&router).await;
     let (queue, queue_arn) = given_queue(&router, case, "refused-plan-events").await;
     // Owed EVERY envelope of this source: a rule filtering any of them out could
     // not tell "withheld" from "filtered".
@@ -872,9 +934,14 @@ async fn a_refused_update_publishes_no_plan_state_change() {
     )
     .await;
     assert_eq!(
-        (status, error_code(&refused).as_str()),
-        (400, INVALID_PARAMETER),
-        "case {case:?}: expected 400 {INVALID_PARAMETER}, got {status} {refused:?}"
+        (
+            status,
+            error_code(&refused).as_str(),
+            text(&refused, "Message").as_str(),
+            text(&refused, "Code").as_str(),
+        ),
+        (400, MISSING_PARAMETER, NO_RULES, NO_RULES_CODE),
+        "case {case:?}: expected 400 {MISSING_PARAMETER} {NO_RULES:?}, got {status} {refused:?}"
     );
 
     // The accepted update that follows is the first thing the queue is handed,
