@@ -451,6 +451,19 @@ impl State {
             query.status = super::QUERY_STATUS_COMPLETE.to_string();
             query.running_due_ms = None;
             query.complete_due_ms = None;
+            // Its execution ended at that same instant, which is the span its reported
+            // duration is measured over ([`super::QueryRecord::query_duration_ms`]).
+            query.ended_time_ms = Some(triggered_ms);
+            // "The ARN of the user who ran the query": an automated execution is run by the
+            // scheduled query's own role ("The ARN of the IAM role used to execute the query
+            // and deliver results"), not by whoever read the history that materialised it.
+            query.user_identity = Some(record.execution_role_arn.clone());
+            // The configuration names the log groups and the lookback window outside the query
+            // string, so the query this run stores is the effective one those name
+            // ([`super::QueryRecord::set_effective_query_string`]).
+            query.set_effective_query_string(
+                super::query_admission::pipeline_selects_its_own_sources(&record.query_string),
+            );
             self.queries.insert(query_id.clone(), query);
             self.enforce_query_ceiling();
             let mut execution = ScheduledQueryExecution::new(

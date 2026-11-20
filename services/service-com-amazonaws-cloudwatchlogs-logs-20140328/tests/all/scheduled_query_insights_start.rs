@@ -115,6 +115,22 @@ fn horizon() -> i64 {
     now_ms() / 1_000 + 1
 }
 
+/// The log group NAMES a list of `logGroupIdentifiers` resolves to, which is how the effective
+/// query string a start stores names the sources it reads: an identifier may be a name or
+/// either ARN form of one group, and a log group ARN's last segment is the group's name.
+fn group_names(identifiers: &[String]) -> Vec<String> {
+    identifiers
+        .iter()
+        .map(|identifier| {
+            identifier
+                .rsplit(':')
+                .next()
+                .unwrap_or(identifier)
+                .to_string()
+        })
+        .collect()
+}
+
 /// The `queryId` a successful `StartQuery` answered.
 fn query_id(case: &str, answer: &Value) -> String {
     answer["queryId"]
@@ -212,8 +228,12 @@ async fn a_query_of_a_group_holding_events_is_served_for_every_window_in_the_cla
             .unwrap_or_else(|| panic!("case {case:?}: the started query must be reported"));
         assert_eq!(
             reported["queryString"].as_str(),
-            Some(query_string),
-            "case {case:?}: the reported query string is the one that was started, got {reported}"
+            Some(
+                format!("SOURCE \"{GROUP}\" START={start_time} END={end_time} | {query_string}")
+                    .as_str()
+            ),
+            "case {case:?}: the reported query string is the effective one the start stored, got \
+             {reported}"
         );
         assert_eq!(
             reported["logGroupName"].as_str(),
@@ -450,13 +470,14 @@ async fn a_scheduled_querys_own_configuration_starts_an_interactive_query() {
              {scheduled}"
         );
 
+        let end_time = horizon();
         let id = started(
             &logs,
             case,
             &json!({
                 "logGroupIdentifiers": configured,
                 "startTime": first - 60,
-                "endTime": horizon(),
+                "endTime": end_time,
                 "queryString": scheduled["queryString"].clone(),
             }),
         )
@@ -464,9 +485,23 @@ async fn a_scheduled_querys_own_configuration_starts_an_interactive_query() {
         let reported = described(&logs, &json!({}), &id)
             .await
             .unwrap_or_else(|| panic!("case {case:?}: the started query must be reported"));
+        // The scheduled query's own string, stored as the effective query the start's
+        // parameters stand for: the `SOURCE` command over the log groups it was configured
+        // with, in the order it named them, and the window the start asked for.
+        let sources: Vec<String> = group_names(&identifiers)
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect();
         assert_eq!(
             reported["queryString"].as_str(),
-            Some(query_string),
+            Some(
+                format!(
+                    "SOURCE {} START={} END={end_time} | {query_string}",
+                    sources.join(", "),
+                    first - 60
+                )
+                .as_str()
+            ),
             "case {case:?}: the started query is the scheduled query's own, got {reported}"
         );
         assert_eq!(

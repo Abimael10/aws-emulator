@@ -1329,8 +1329,15 @@ pub struct QueryRecord {
     /// `QueryInfo$queryLanguage` — "The query language used for this query",
     /// [`DEFAULT_QUERY_LANGUAGE`] when the start named none.
     pub query_language: String,
-    /// `QueryInfo$queryString` — "The query string used in this query."
+    /// The query string the start SUBMITTED, which is the text this service COMPILES and
+    /// RUNS ([`insights::prepare`]).
     pub query_string: String,
+    /// `QueryInfo$queryString` — "The query string used in this query": the EFFECTIVE query,
+    /// which is what this service reports and what [`Self::set_effective_query_string`]
+    /// derives from the submitted text and the members the start named the log groups, the
+    /// time range and the row limit in. Equal to [`Self::query_string`] for a query that
+    /// named all three inside the query string itself.
+    pub effective_query_string: String,
     /// `QueryInfo$logGroupName` — "The name of the log group scanned by this query", for a
     /// query that named exactly one. A query over several log groups, or one whose `SOURCE`
     /// command selects them, carries the whole list in [`Self::log_group_names`] and reports
@@ -1354,6 +1361,15 @@ pub struct QueryRecord {
     /// `QueryInfo$createTime` — "The date and time that this query was created", in epoch
     /// milliseconds.
     pub create_time_ms: i64,
+    /// The instant this query reached a TERMINAL status, in epoch milliseconds, which is what
+    /// `QueryInfo$queryDuration` is measured to. `None` for a query that is still scheduled or
+    /// running: nothing has executed to the end, so there is no span yet.
+    pub ended_time_ms: Option<i64>,
+    /// `QueryInfo$userIdentity` — "The ARN of the user who ran the query": the principal the
+    /// call that started it spoke for, or — for an automated run of a scheduled query — the
+    /// role that query executes under. Set by the caller that mints the record, which is the
+    /// one place that knows the identity.
+    pub user_identity: Option<String>,
     /// The instant this query is due to start running, stored rather than waited for: a
     /// reporting operation materialises the transition once the clock is past it
     /// ([`materialize_due_query_transitions`]). `None` once it has left `Scheduled`.
@@ -1393,6 +1409,10 @@ impl QueryRecord {
             query_id: query_id.to_string(),
             query_language: query_language.to_string(),
             query_string: query_string.to_string(),
+            // Until the caller that knows how the start named the log groups records the
+            // effective query ([`Self::set_effective_query_string`]), the submitted text is
+            // the whole of it.
+            effective_query_string: query_string.to_string(),
             // "The name of the log group scanned by this query" is one name, so it is
             // reported only for a query that reads exactly one log group.
             log_group_name: match log_group_names.as_slice() {
@@ -1405,6 +1425,10 @@ impl QueryRecord {
             limit: None,
             status: QUERY_STATUS_SCHEDULED.to_string(),
             create_time_ms,
+            // A query that has not run has not finished either, and the identity is recorded by
+            // the caller that knows it.
+            ended_time_ms: None,
+            user_identity: None,
             running_due_ms: Some(running_due_ms),
             complete_due_ms: Some(running_due_ms.saturating_add(QUERY_COMPLETION_DELAY_MS)),
             // A query that has not run has produced no results to report.
@@ -1433,10 +1457,53 @@ impl QueryRecord {
     /// transition, so the completion it was armed for is DISCARDED rather than materialised
     /// later over the cancellation. Only a query that [`Self::is_active`] has an execution
     /// left to stop.
-    pub fn cancel(&mut self) {
+    ///
+    /// `now_ms` is the instant it stopped, which is where its execution ENDED: a cancelled
+    /// query ran from the instant it was created to this one and no further.
+    pub fn cancel(&mut self, now_ms: i64) {
         self.status = QUERY_STATUS_CANCELLED.to_string();
         self.running_due_ms = None;
         self.complete_due_ms = None;
+        self.ended_time_ms = Some(now_ms);
+    }
+
+    /// Record the EFFECTIVE query string this query reports
+    /// ([`Self::effective_query_string`]).
+    ///
+    /// CloudWatch Logs Insights names the log groups to read, the time range and the row limit
+    /// INSIDE a Logs Insights QL query, so a start that names them as parameters instead is
+    /// stored as the query those parameters stand for: the `SOURCE` command that selects those
+    /// log groups over that range, then the submitted pipeline, then the `limit` command the
+    /// `limit` parameter stands for. `selects_own_sources` says whether the submitted text
+    /// already names its own log groups, in which case nothing is prepended — there is no
+    /// parameter standing in for a command the query already carries.
+    ///
+    /// The OpenSearch languages have source and limit syntax of their own, so a query written
+    /// in one of them reports the text that was submitted.
+    pub fn set_effective_query_string(&mut self, selects_own_sources: bool) {
+        if self.query_language != DEFAULT_QUERY_LANGUAGE {
+            self.effective_query_string = self.query_string.clone();
+            return;
+        }
+        let mut effective = String::new();
+        if !selects_own_sources && !self.log_group_names.is_empty() {
+            let sources: Vec<String> = self
+                .log_group_names
+                .iter()
+                .map(|name| format!("{QUOTED_SOURCE_NAME}{name}{QUOTED_SOURCE_NAME}"))
+                .collect();
+            effective.push_str(&format!(
+                "{EFFECTIVE_SOURCE_COMMAND} {} {EFFECTIVE_SOURCE_START}{} {EFFECTIVE_SOURCE_END}{} {STAGE_SEPARATOR} ",
+                sources.join(", "),
+                self.start_time_secs,
+                self.end_time_secs,
+            ));
+        }
+        effective.push_str(&self.query_string);
+        if let Some(limit) = self.limit {
+            effective.push_str(&format!(" {STAGE_SEPARATOR} {LIMIT_COMMAND} {limit}"));
+        }
+        self.effective_query_string = effective;
     }
 
     /// Materialise the status changes the clock owes this query: a scheduled query whose
@@ -1457,8 +1524,21 @@ impl QueryRecord {
             if due <= now_ms {
                 self.status = QUERY_STATUS_COMPLETE.to_string();
                 self.complete_due_ms = None;
+                // The execution ended AT the instant it was due to, so the duration it reports
+                // is the span the clock owed and not the span until something looked.
+                self.ended_time_ms = Some(due);
             }
         }
+    }
+
+    /// `QueryInfo$queryDuration` — "The duration in milliseconds that the query took to
+    /// execute": the span from the instant this query was created to the instant its execution
+    /// ENDED ([`Self::ended_time_ms`]), and zero while it is still scheduled or running, which
+    /// is a query whose execution has taken no span yet rather than one with no duration.
+    pub fn query_duration_ms(&self) -> i64 {
+        self.ended_time_ms
+            .map(|ended| ended.saturating_sub(self.create_time_ms).max(0))
+            .unwrap_or_default()
     }
 
     /// This query as the model's `QueryInfo` structure, which is what `DescribeQueries`
@@ -1467,21 +1547,59 @@ impl QueryRecord {
         crate::ops::types::QueryInfo {
             query_language: Some(self.query_language.clone()),
             query_id: Some(self.query_id.clone()),
-            query_string: Some(self.query_string.clone()),
+            query_string: Some(self.effective_query_string.clone()),
             status: Some(self.status.clone()),
             create_time: Some(self.create_time_ms),
             log_group_name: self.log_group_name.clone(),
-            // "The duration in milliseconds that the query took to execute", "The total
-            // number of bytes scanned by the query" and "The ARN of the user who ran the
-            // query" are facts about an EXECUTION and an identity this emulator does not
-            // hold: nothing it stores can report any of them, so none is reported rather
-            // than filled with a number nothing measured.
-            query_duration: None,
-            bytes_scanned: None,
-            user_identity: None,
+            // "The duration in milliseconds that the query took to execute"
+            // ([`Self::query_duration_ms`]).
+            query_duration: Some(self.query_duration_ms()),
+            // "The total number of bytes scanned by the query": what its RUN read, which is
+            // the same figure `GetQueryResults` reports in the statistics of this query
+            // ([`insights::Execution::bytes_scanned`]) — and zero for a query whose run has
+            // scanned nothing yet.
+            bytes_scanned: Some(
+                self.snapshot
+                    .as_ref()
+                    .map(|execution| execution.bytes_scanned)
+                    .unwrap_or_default(),
+            ),
+            // "The ARN of the user who ran the query" ([`Self::user_identity`]).
+            user_identity: self.user_identity.clone(),
         }
     }
 }
+
+/// The command a Logs Insights QL query selects the log groups it reads with, as the
+/// EFFECTIVE query string spells it: "the queryString must include a SOURCE command to select
+/// log groups for the query" (`StartQuery`), written in the upper case that sentence names it
+/// by. The compiler itself matches the command without regard to case
+/// ([`query_compile::SOURCE`]), so the spelling is a property of how the stored query is
+/// WRITTEN and not of what it selects.
+const EFFECTIVE_SOURCE_COMMAND: &str = "SOURCE";
+
+/// How the `SOURCE` command of an effective query string quotes one log group name, which is
+/// how the pipelined languages write an identifier that may carry anything
+/// ([`insights::read_group_selectors`] takes the quoting off wherever it stands).
+const QUOTED_SOURCE_NAME: &str = "\"";
+
+/// The `SOURCE` argument stating the beginning of the range the query reads, followed by the
+/// instant itself: the `startTime` the start named, as it named it.
+const EFFECTIVE_SOURCE_START: &str = "START=";
+
+/// The `SOURCE` argument stating the end of that range. See [`EFFECTIVE_SOURCE_START`].
+const EFFECTIVE_SOURCE_END: &str = "END=";
+
+/// What separates two commands of a Logs Insights QL query: "The processors work one after
+/// another, in the order that you list them, like a pipeline" — the pipe every stage of a
+/// query string is split on ([`query_compile`]).
+const STAGE_SEPARATOR: &str = "|";
+
+/// The Logs Insights QL command that bounds how many rows a query returns, which is the
+/// command `StartQuery$limit` ("The maximum number of log events to return from the query")
+/// stands for in the effective query string. One of the commands the compiler itself names
+/// ([`query_compile::COMMANDS`]).
+const LIMIT_COMMAND: &str = "limit";
 
 /// A query that has been accepted but has not started running, from the model's
 /// `QueryStatus` enum (`Scheduled` | `Running` | `Complete` | `Failed` | `Cancelled` |

@@ -36,6 +36,10 @@ use serde_json::{json, Value};
 
 use crate::harness::{now_ms, Logs};
 
+use service_com_amazonaws_cloudwatchlogs_logs_20140328::state::{
+    QUERY_COMPLETION_DELAY_MS, QUERY_RUNNING_DELAY_MS,
+};
+
 /// The operations under test.
 const START: &str = "StartQuery";
 const DESCRIBE: &str = "DescribeQueries";
@@ -49,12 +53,13 @@ const NOT_FOUND: &str = "ResourceNotFoundException";
 const SCHEDULED: &str = "Scheduled";
 const COMPLETE: &str = "Complete";
 
-/// How long a case waits before treating a started query as finished: past both spans the
-/// start armed (`QUERY_RUNNING_DELAY_MS` + `QUERY_COMPLETION_DELAY_MS`), with room for the
-/// test's own scheduling.
-fn past_completion() -> Duration {
-    Duration::from_millis(900)
-}
+/// How long a case waits, in all, for a query to reach the status the clock owes it: a
+/// deadline generous enough for a loaded host, reached by looking at the reported query again
+/// until the status holds rather than by sleeping for a span the test guessed.
+const STATUS_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long such a poll waits before looking again.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// A query string that compiles, used by every case whose subject is NOT the query string.
 const VALID_QUERY: &str = "fields @timestamp, @message | filter @message like /ERROR/ | limit 20";
@@ -96,6 +101,25 @@ async fn described_query(logs: &Logs, body: &Value, id: &str) -> Option<Value> {
         .await
         .into_iter()
         .find(|query| query["queryId"].as_str() == Some(id))
+}
+
+/// The query carrying `id` once it reports `wanted`, waiting for that CONDITION under a
+/// generous deadline rather than for a span the test guessed.
+async fn described_query_in_status(logs: &Logs, id: &str, wanted: &str) -> Value {
+    let deadline = std::time::Instant::now() + STATUS_DEADLINE;
+    loop {
+        let query = described_query(logs, &json!({}), id)
+            .await
+            .expect("the started query must be reported");
+        if query["status"].as_str() == Some(wanted) {
+            return query;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case the query {id}: expected it to reach {wanted}, got {query}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// Every query string the compiler must refuse, each with the fault it carries.
@@ -277,8 +301,14 @@ async fn a_query_string_that_compiles_is_accepted_and_stored() {
             .unwrap_or_else(|| panic!("case {case:?}: the started query must be reported"));
         assert_eq!(
             reported["queryString"].as_str(),
-            Some(query_string),
-            "case {case:?}: the reported query string is the one that was started, got {reported}"
+            Some(
+                format!(
+                    "SOURCE \"{GROUP}\" START={start_time} END={end_time} | {query_string}"
+                )
+                .as_str()
+            ),
+            "case {case:?}: the reported query string is the effective one the start stored, got \
+             {reported}"
         );
         assert_eq!(
             reported["logGroupName"].as_str(),
@@ -562,19 +592,15 @@ async fn a_started_query_reaches_complete_on_the_clock_and_is_filtered_by_what_i
             .await,
     );
 
-    tokio::time::sleep(past_completion()).await;
-    let completed = described_query(&logs, &json!({}), &id)
-        .await
-        .expect("the query must still be reported");
+    // Both queries reach `Complete` on the CLOCK: each status is looked at again until it
+    // holds, so the case waits for the transitions rather than for a span of its own.
+    let completed = described_query_in_status(&logs, &id, COMPLETE).await;
+    described_query_in_status(&logs, &other, COMPLETE).await;
     assert_eq!(
-        completed["status"].as_str(),
-        Some(COMPLETE),
-        "case past the spans the start armed: the query is {COMPLETE}, got {completed}"
-    );
-    assert!(
-        completed["queryDuration"].is_null(),
-        "case past the spans the start armed: nothing executed the query, so no duration is \
-         reported for it, got {completed}"
+        completed["queryDuration"].as_i64(),
+        Some(QUERY_RUNNING_DELAY_MS + QUERY_COMPLETION_DELAY_MS),
+        "case past the spans the start armed: the duration is the span its execution took, got \
+         {completed}"
     );
 
     // (case, the filter, the ids it must report)

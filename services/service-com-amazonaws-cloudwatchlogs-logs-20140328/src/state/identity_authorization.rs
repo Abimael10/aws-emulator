@@ -155,6 +155,30 @@ pub fn refusal_for_identity<Eng: Send + Sync + 'static>(
     decided(&caller, operation, resource)
 }
 
+/// The ARN of the principal this request speaks for, as `sts:GetCallerIdentity` reports it —
+/// the same reading a refusal blames, which is what a record of this service names as the
+/// identity that made the call.
+///
+/// A credential neither store holds a record for speaks for the account itself, which is the
+/// identity this emulator publishes its own credential as
+/// ([`::service_common::caller_principal::ambient_user_arn`]), and so is the fallback for a
+/// credential nothing resolves a spelling for at all.
+///
+/// Asked with NO store guard of this service held, and it writes nothing to either store it
+/// reads.
+#[must_use]
+pub fn caller_arn<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+) -> String {
+    let arn = caller(engine, ctx).arn;
+    if arn.is_empty() {
+        ::service_common::caller_principal::ambient_user_arn()
+    } else {
+        arn
+    }
+}
+
 /// IAM's decision about `logs:<operation>` on `resource` for `caller`, as the sentence a
 /// refusal carries, or `None` where it is allowed.
 ///

@@ -171,7 +171,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // completes at the instants its start armed — so the status this stop is judged
         // against is the one that was already due at this instant, materialised before the
         // decision rather than moved on because a stop happened to look.
-        store.materialize_due_query_transitions(crate::state::now_ms());
+        let now = crate::state::now_ms();
+        store.materialize_due_query_transitions(now);
 
         // "The ID number of the query to stop. To find this ID number, use DescribeQueries":
         // an id this account holds no query under names no query to stop, which is the missing
@@ -204,7 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Only a query still in progress has an execution left to stop; one an earlier stop
         // already cancelled stays exactly as it is.
         if query.is_active() {
-            query.cancel();
+            query.cancel(now);
         }
 
         Ok(StopQueryOutput {

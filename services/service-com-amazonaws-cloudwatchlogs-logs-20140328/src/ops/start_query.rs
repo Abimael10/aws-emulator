@@ -436,8 +436,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // `ctx` carries the Region the credential scope names — which is where the key policy
-        // of the account's query-result key is read — and otherwise only request metadata: a
-        // query is identified by the id this call mints and by nothing about the request.
+        // of the account's query-result key is read — and the credential the request was signed
+        // with, which is the user this query is recorded as having been run by
+        // (`QueryInfo$userIdentity`); a query is identified by the id this call mints and by
+        // nothing else about the request.
         let region = crate::state::request_region(ctx.parts());
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
@@ -548,6 +550,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(query_results_key_unusable(message));
         }
 
+        // Whether the submitted query string NAMES the log groups it reads itself, which is the
+        // second of the two forms `StartQuery` documents ("Or the queryString must include a
+        // SOURCE command to select log groups for the query"). A statement of the SQL query
+        // language names them in its own source clause, so it always does.
+        let selects_own_sources = sql
+            || compiled
+                .as_ref()
+                .is_some_and(crate::state::query_compile::CompiledQuery::selects_its_own_sources)
+            // PPL opens its pipeline with the command that names them, which is the same
+            // second form: the log groups are named in the query string.
+            || (compiled.is_none()
+                && crate::state::query_admission::pipeline_selects_its_own_sources(
+                    &input.query_string,
+                ));
+
+        // "The ARN of the user who ran the query" (`QueryInfo$userIdentity`): the principal
+        // the request was signed for, read the way every other decision of this service reads
+        // it and — like those — with no guard of this service's store held
+        // ([`crate::state::identity_authorization::caller_arn`]).
+        let user_identity = crate::state::identity_authorization::caller_arn(&*self.engine, ctx);
+
         let mut store = state.lock();
 
         // Whichever place names them, the log groups are resolved to the names the store keys
@@ -595,16 +618,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|name| store.log_groups.contains_key(name))
             .collect()
         } else {
-            let query_selects_sources = compiled
-                .as_ref()
-                .is_some_and(crate::state::query_compile::CompiledQuery::selects_its_own_sources)
-                // PPL opens its pipeline with the command that names them, which is the same
-                // second form: the log groups are named in the query string.
-                || (compiled.is_none()
-                    && crate::state::query_admission::pipeline_selects_its_own_sources(
-                        &input.query_string,
-                    ));
-            if named_members.is_empty() && !query_selects_sources {
+            if named_members.is_empty() && !selects_own_sources {
                 return Err(invalid_parameter(format!(
                     "Exactly one of {}, or a SOURCE command in the query string, must specify the \
                      log groups to query.",
@@ -721,6 +735,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             now,
         );
         record.limit = input.limit;
+        record.user_identity = Some(user_identity);
+        // What this service stores for the query is the EFFECTIVE one: the log groups, the
+        // range and the row limit this request named as parameters are the `SOURCE` and `limit`
+        // commands they stand for, unless the submitted query already selects its own log
+        // groups ([`crate::state::QueryRecord::set_effective_query_string`]).
+        record.set_effective_query_string(selects_own_sources);
         store.queries.insert(query_id.clone(), record);
         store.enforce_query_ceiling();
         // The store is released before the run is handed over, so the query runs over the

@@ -62,6 +62,17 @@ async fn account_with_tables(logs: &Logs) -> (i64, i64) {
     (now_secs - 600, now_secs + 600)
 }
 
+/// The query string the service STORES for a start of `query_string` over the standing group
+/// and window: CloudWatch Logs Insights names the log groups and the range inside the query,
+/// so the `logGroupName` and the window this start names as parameters are reported as the
+/// `SOURCE` command they stand for.
+fn effective_query_string(window: (i64, i64), query_string: &str) -> String {
+    format!(
+        "SOURCE \"{GROUP}\" START={} END={} | {query_string}",
+        window.0, window.1
+    )
+}
+
 /// Start `query_string` over the standing group and window.
 async fn start(logs: &Logs, window: (i64, i64), query_string: &str) -> (u16, Value) {
     logs.call(
@@ -176,8 +187,9 @@ async fn a_query_through_a_lookup_table_is_accepted_and_stored() {
             .unwrap_or_else(|| panic!("case {case:?}: the started query must be reported, got {page}"));
         assert_eq!(
             reported["queryString"].as_str(),
-            Some(query_string.as_str()),
-            "case {case:?}: the reported query string is the one that was started, got {reported}"
+            Some(effective_query_string(window, &query_string).as_str()),
+            "case {case:?}: the reported query string is the effective one the start stored, got \
+             {reported}"
         );
         started.push(id);
     }

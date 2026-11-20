@@ -187,8 +187,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The matched events": one record per sample message the pattern matches, carrying
         // the message's 1-based position in the sample the REQUEST sent — so a caller can
         // tell which of its messages matched — the message itself, and the values the
-        // pattern extracted from it. A pattern that selects no field of the event extracts
-        // nothing, and then the record carries no `extractedValues` rather than an empty map.
+        // pattern extracted from it. Every match carries `extractedValues`: a pattern that
+        // selects no NAMED field of the event extracted nothing, which is the empty map it
+        // extracted rather than no map at all, so a caller iterating what a filter would emit
+        // reads an empty map instead of a missing member.
         //
         // The sample is up to 50 messages (`TestEventMessages` is `length 1..50`) and each
         // is matched in bounded work, but the loop yields between messages all the same, so
@@ -203,8 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             matches.push(MetricFilterMatchRecord {
                 event_number: i64::try_from(index + 1).unwrap_or(i64::MAX),
                 event_message: Some(message.clone()),
-                extracted_values: (!extracted.is_empty())
-                    .then(|| extracted.into_iter().collect()),
+                extracted_values: Some(extracted.into_iter().collect()),
             });
         }
 

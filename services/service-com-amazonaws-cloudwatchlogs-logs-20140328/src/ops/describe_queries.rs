@@ -263,13 +263,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        // One enumeration, in the order the store holds it (by `queryId`), of the queries
-        // that satisfy EVERY filter the request named. `status` and `queryLanguage` target
-        // modelled enums, so the boundary validator has already refused a value outside
-        // either.
+        // One enumeration of the queries that satisfy EVERY filter the request named, MOST
+        // RECENTLY CREATED FIRST: this operation reports the queries "that are scheduled,
+        // running, or have been run recently in this account", so the recent ones are the ones
+        // a page opens with and a client reading one page sees the latest activity. The store
+        // keys queries by the `queryId` minted from its own monotonic counter, so the key order
+        // IS the order they were created in and reversing it is that order newest first.
+        // `status` and `queryLanguage` target modelled enums, so the boundary validator has
+        // already refused a value outside either.
         let matching: Vec<&crate::state::QueryRecord> = store
             .queries
             .values()
+            .rev()
             .filter(|query| {
                 input
                     .log_group_name
@@ -297,8 +302,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
+        // The token is a POSITION in that newest-first enumeration: the page resumes at the
+        // first query created before the one the previous page ended on.
         let first = match &cursor {
-            Some(cursor) => matching.partition_point(|query| query.query_id <= cursor.after),
+            Some(cursor) => matching.partition_point(|query| query.query_id >= cursor.after),
             None => 0,
         };
         // "Limits the number of returned queries to the specified number." `maxResults` is
