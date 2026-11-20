@@ -8,8 +8,11 @@
 //!
 //! The route (`/tags/{resourceArn}`) addresses a resource by its ARN alone, so which
 //! resource that is — and whether this service holds it at all — is resolved where every
-//! tagging operation resolves it (`crate::state::tags`). An ARN this service holds no
-//! resource for is that route's own 404 `NotFoundException`, built there too.
+//! tagging operation resolves it (`crate::state::tags`). An ARN whose resource part names
+//! no resource type the route addresses is refused there as that route's own 400
+//! `BadRequestException`, and an ARN of a type it does address that this service holds no
+//! resource for is its own 404 `NotFoundException`; both are built there, so every
+//! operation of the route answers the same ARN the same way.
 //!
 //! ## Shape of an operation
 //!
@@ -161,8 +164,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let store = state.lock();
 
-        let Some(tags) = store.resource_tags(&input.resource_arn) else {
-            return Err(crate::state::tags::not_found());
+        let tags = match store.resource_tags(&input.resource_arn) {
+            Ok(tags) => tags,
+            // Which class of refusal an unservable ARN gets is the route's decision, made
+            // once for the read, the write and the removal alike
+            // (`crate::state::tags::refusal_error`).
+            Err(refusal) => return Err(crate::state::tags::refusal_error(refusal)),
         };
 
         // Every resource of this service carries a tag set — empty for one created with

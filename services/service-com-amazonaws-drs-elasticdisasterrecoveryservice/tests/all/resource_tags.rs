@@ -15,17 +15,18 @@
 //!
 //! 1. The route reports the tag set the resource its `resourceArn` addresses carries —
 //!    the set the resource was created with, and the empty set for a resource created
-//!    with none — whatever the shape of that set, and for EVERY kind of resource this
-//!    service holds, because the route addresses a resource by ARN alone and takes no
+//!    with none — whatever the shape of that set, and for EVERY resource type the route
+//!    addresses, because the route addresses a resource by ARN alone and takes no
 //!    resource type.
 //! 2. It is a READ: the same ARN reports the same tag set however often it is asked, and
 //!    the resource's own reader keeps reporting that set too.
-//! 3. An ARN this service holds no resource for is refused by EVERY operation of the
-//!    route alike, with HTTP 404, the error code `NotFoundException` and the message
-//!    `Resource was not found`, and nothing it addresses is written. The ways an ARN can
-//!    name nothing span the rows: an id nothing minted, a stored resource's id under
-//!    another Region or account, a kind of this service's that holds nothing, and
-//!    another service's resource.
+//! 3. An ARN of a resource type the route addresses that this service holds no resource
+//!    for is refused by EVERY operation of the route alike, with HTTP 404, the error code
+//!    `NotFoundException` and the message `Resource was not found`, and nothing it
+//!    addresses is written. The ways such an ARN can name nothing span the rows: an id
+//!    nothing minted, a stored resource's id under another Region or account, and a
+//!    resource type of this service's that holds nothing. An ARN the route does NOT
+//!    address is the other refusal class, which `tagging_resource_arn_faults` covers.
 //! 4. A write MERGES: `TagResource` sets the keys it names, overwrites a key the resource
 //!    already carries and leaves every other key where it is, so two calls naming
 //!    disjoint keys leave both sets on the resource; `UntagResource` removes the keys it
@@ -121,7 +122,11 @@ pub(crate) async fn call_path(
 }
 
 /// `GET /tags/{resourceArn}` — `ListTagsForResource` as the model binds it.
-async fn list_tags(router: &MultiServiceRouter, region: &str, resource_arn: &str) -> Answer {
+pub(crate) async fn list_tags(
+    router: &MultiServiceRouter,
+    region: &str,
+    resource_arn: &str,
+) -> Answer {
     call_path(
         router,
         region,
@@ -133,7 +138,7 @@ async fn list_tags(router: &MultiServiceRouter, region: &str, resource_arn: &str
 }
 
 /// `POST /tags/{resourceArn}` with a `tags` body — `TagResource` as the model binds it.
-async fn tag_resource(
+pub(crate) async fn tag_resource(
     router: &MultiServiceRouter,
     region: &str,
     resource_arn: &str,
@@ -152,7 +157,7 @@ async fn tag_resource(
 
 /// `DELETE /tags/{resourceArn}?tagKeys=…` — `UntagResource` as the model binds it:
 /// `tagKeys` is an `@httpQuery` list, so a client repeats the parameter per key.
-async fn untag_resource(
+pub(crate) async fn untag_resource(
     router: &MultiServiceRouter,
     region: &str,
     resource_arn: &str,
@@ -188,12 +193,12 @@ fn query_value(key: &str) -> &str {
 }
 
 /// The `tags` member of an answer, for an assertion that names the case.
-fn reported_tags(answer: &Answer) -> Option<&Value> {
+pub(crate) fn reported_tags(answer: &Answer) -> Option<&Value> {
     answer.member("tags")
 }
 
 /// A string member of an answer's body.
-fn text(answer: &Answer, name: &str) -> String {
+pub(crate) fn text(answer: &Answer, name: &str) -> String {
     answer
         .member(name)
         .and_then(Value::as_str)
@@ -202,7 +207,11 @@ fn text(answer: &Answer, name: &str) -> String {
 }
 
 /// Create a Recovery Plan, optionally tagged, and answer its ARN.
-async fn plan_with_tags(router: &MultiServiceRouter, region: &str, tags: Option<&Value>) -> String {
+pub(crate) async fn plan_with_tags(
+    router: &MultiServiceRouter,
+    region: &str,
+    tags: Option<&Value>,
+) -> String {
     let mut body = json!({"name": "Tagged plan"});
     if let Some(tags) = tags {
         body["tags"] = tags.clone();
@@ -242,7 +251,14 @@ async fn template_with_tags(router: &MultiServiceRouter, tags: &Value) -> String
 }
 
 /// Create a launch configuration template carrying `tags`, and answer its ARN.
-async fn launch_template_with_tags(router: &MultiServiceRouter, tags: &Value) -> String {
+///
+/// The tagging route does not address this resource type (see
+/// `crate::tagging_resource_arn_faults`), so what it is here for is the rows that show the
+/// route refusing its ARN while the resource itself carries its tags.
+pub(crate) async fn launch_template_with_tags(
+    router: &MultiServiceRouter,
+    tags: &Value,
+) -> String {
     let answer = call_in(
         router,
         REGION,
@@ -338,10 +354,10 @@ async fn a_resource_reports_the_tag_set_it_carries() {
     }
 }
 
-/// ONE route, every kind of resource: the tag set reported for an ARN is the set the
-/// resource THAT ARN addresses carries, whether the resource was created through an
+/// ONE route, every resource type it addresses: the tag set reported for an ARN is the set
+/// the resource THAT ARN addresses carries, whether the resource was created through an
 /// operation of this service or registered by the replication agent — the route takes no
-/// resource type, so the kind can only come from the ARN.
+/// resource type, so the type can only come from the ARN.
 #[tokio::test]
 async fn every_kind_of_resource_reports_its_own_tag_set_through_the_one_route() {
     let (router, engine) = drs_with_engine();
@@ -351,9 +367,6 @@ async fn every_kind_of_resource_reports_its_own_tag_set_through_the_one_route() 
 
     let template_tags = json!({"kind": "replication-configuration-template"});
     let template = template_with_tags(&router, &template_tags).await;
-
-    let launch_template_tags = json!({"kind": "launch-configuration-template"});
-    let launch_template = launch_template_with_tags(&router, &launch_template_tags).await;
 
     // A source server is registered by the replication agent, which this emulator does
     // not model, so the one way to hold one is to write the store directly — the same
@@ -380,11 +393,6 @@ async fn every_kind_of_resource_reports_its_own_tag_set_through_the_one_route() 
     for (case, arn, expected) in [
         ("a recovery plan", &plan, &plan_tags),
         ("a replication configuration template", &template, &template_tags),
-        (
-            "a launch configuration template",
-            &launch_template,
-            &launch_template_tags,
-        ),
         ("a source server", &server, &server_tags),
     ] {
         let read = list_tags(&router, REGION, arn).await;
@@ -404,11 +412,12 @@ async fn every_kind_of_resource_reports_its_own_tag_set_through_the_one_route() 
 // Rule 3 — an ARN this service holds no resource for
 // ---------------------------------------------------------------------------
 
-/// An ARN this service holds no resource for is refused by every operation of the route
-/// alike — 404 `NotFoundException` with the message `Resource was not found` — and
-/// nothing it addresses changes. The rows are ARNs absent for different reasons: ids
-/// nothing minted, a STORED resource's id under another Region or another account, a
-/// resource kind of this service that holds nothing, and another service's resource.
+/// An ARN of a resource type the route addresses that this service holds no resource for
+/// is refused by every operation of the route alike — 404 `NotFoundException` with the
+/// message `Resource was not found` — and nothing it addresses changes. The rows are such
+/// ARNs, absent for different reasons: ids nothing minted, a STORED resource's id under
+/// another Region or another account, and resource types of this service that hold
+/// nothing.
 #[tokio::test]
 async fn an_arn_this_service_holds_no_resource_for_is_not_found() {
     let (router, _engine) = drs_with_engine();
@@ -444,27 +453,20 @@ async fn an_arn_this_service_holds_no_resource_for_is_not_found() {
             ),
         ),
         (
-            "a launch configuration template id nothing minted",
-            format!(
-                "arn:aws:drs:{REGION}:{ACCOUNT}:launch-configuration-template/\
-                 lct-00000000000000000"
-            ),
-        ),
-        (
             "a source server nothing registered",
             format!("arn:aws:drs:{REGION}:{ACCOUNT}:source-server/s-00000000000000009"),
         ),
         (
-            "a resource kind of this service that holds nothing",
+            "a resource type of this service that holds nothing",
             format!("arn:aws:drs:{REGION}:{ACCOUNT}:job/drsjob-00000000000000000"),
         ),
         (
-            "a recovery instance, another kind this service holds nothing of",
+            "a recovery instance, another type this service holds nothing of",
             format!("arn:aws:drs:{REGION}:{ACCOUNT}:recovery-instance/i-0123456789abcdef0"),
         ),
         (
-            "another service's resource",
-            format!("arn:aws:ec2:{REGION}:{ACCOUNT}:subnet/subnet-0123456789abcdef0"),
+            "a source network, another type this service holds nothing of",
+            format!("arn:aws:drs:{REGION}:{ACCOUNT}:source-network/sn-00000000000000000"),
         ),
     ];
 
@@ -715,16 +717,15 @@ async fn a_removal_takes_out_only_the_keys_it_names() {
     }
 }
 
-/// ONE route, every kind of resource: a write addresses the resource its ARN names, and
-/// the tags it sets and removes are the ones that resource's own reader reports — the
-/// route takes no resource type, so the kind can only come from the ARN.
+/// ONE route, every resource type it addresses: a write addresses the resource its ARN
+/// names, and the tags it sets and removes are the ones that resource's own reader reports
+/// — the route takes no resource type, so the type can only come from the ARN.
 #[tokio::test]
 async fn a_write_reaches_every_kind_of_resource_through_the_one_route() {
     let (router, engine) = drs_with_engine();
 
     let plan = plan_with_tags(&router, REGION, Some(&json!({"kind": "recovery-plan"}))).await;
     let template = template_with_tags(&router, &json!({"kind": "template"})).await;
-    let launch_template = launch_template_with_tags(&router, &json!({"kind": "launch"})).await;
 
     // A source server is registered by the replication agent, which this emulator does
     // not model, so the one way to hold one is to write the store directly.
@@ -749,7 +750,6 @@ async fn a_write_reaches_every_kind_of_resource_through_the_one_route() {
     for (case, arn, kind) in [
         ("a recovery plan", &plan, "recovery-plan"),
         ("a replication configuration template", &template, "template"),
-        ("a launch configuration template", &launch_template, "launch"),
         ("a source server", &server, "source-server"),
     ] {
         let answer = tag_resource(&router, REGION, arn, &json!({"added": "yes"})).await;

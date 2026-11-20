@@ -9,9 +9,11 @@
 //! The route (`/tags/{resourceArn}`) addresses a resource by its ARN alone, so which
 //! resource that is — and whether this service holds it at all — is resolved where every
 //! tagging operation resolves it (`crate::state::tags`), and the keys are removed from
-//! the resource's OWN set, which is what the resource's reader reports. An ARN this
-//! service holds no resource for is that route's own 404 `NotFoundException`, built
-//! there too, and nothing is removed for it.
+//! the resource's OWN set, which is what the resource's reader reports. An ARN whose
+//! resource part names no resource type the route addresses is refused there as that
+//! route's own 400 `BadRequestException`, and an ARN of a type it does address that this
+//! service holds no resource for is its own 404 `NotFoundException`; nothing is removed
+//! for either.
 //!
 //! ## Shape of an operation
 //!
@@ -185,8 +187,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
 
-        let Some(tags) = store.resource_tags_mut(&input.resource_arn) else {
-            return Err(crate::state::tags::not_found());
+        let tags = match store.resource_tags_mut(&input.resource_arn) {
+            Ok(tags) => tags,
+            // Which class of refusal an unservable ARN gets is the route's decision, made
+            // once for the read, the write and the removal alike
+            // (`crate::state::tags::refusal_error`).
+            Err(refusal) => return Err(crate::state::tags::refusal_error(refusal)),
         };
 
         // Removed from the resource's own set, key by key: a key the set does not carry
