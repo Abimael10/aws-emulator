@@ -601,6 +601,84 @@ async fn a_data_source_this_endpoint_does_not_call_is_reported_to_the_caller() {
     }
 }
 
+#[tokio::test]
+async fn a_call_that_failed_is_reported_even_where_the_response_half_ignores_the_error() {
+    let router = emulator();
+    let bus = given_bus(&router, "unhandled").await;
+    // A role whose documents do NOT allow the publication, so the call the data source makes
+    // is one the permissions in force refuse: the step's data source WAS called and did not
+    // answer, which is the outcome its response half runs over.
+    let role = given_role(
+        &router,
+        "appsync-unhandled",
+        Some(&statement("Allow", "events:DescribeEventBus", &bus.arn)),
+    )
+    .await;
+    let api = create_api(&router, "unhandled", &bus, &role).await;
+
+    // Two further resolvers on the SAME data source, neither of whose response halves reads
+    // `ctx.error`: one written in code, one in mapping templates. A half that neither raises
+    // an error of its own nor appends one leaves the failure unhandled, so the field reports
+    // it rather than the value a call that failed never produced.
+    let definitions: &[(&str, &str, Value)] = &[
+        (
+            "a response half written in code that returns the result",
+            "publishCoded",
+            json!({
+                "fieldName": "publishCoded",
+                "kind": "UNIT",
+                "dataSourceName": DATA_SOURCE,
+                "code": "export function request(ctx) {\n\
+                         return {operation: 'PutEvents', events: JSON.parse(ctx.args.events)};\n\
+                         }\n\
+                         export function response(ctx) { return ctx.result; }",
+                "runtime": {"name": RUNTIME.0, "runtimeVersion": RUNTIME.1},
+            }),
+        ),
+        (
+            "a response half written in templates that renders the result",
+            "publishTemplated",
+            json!({
+                "fieldName": "publishTemplated",
+                "kind": "UNIT",
+                "dataSourceName": DATA_SOURCE,
+                "requestMappingTemplate":
+                    "{\"version\": \"2018-05-29\", \"operation\": \"PutEvents\", \
+                      \"events\": $ctx.args.events}",
+                "responseMappingTemplate": "$util.toJson($ctx.result)",
+            }),
+        ),
+    ];
+    for (case, field, resolver) in definitions {
+        let (status, created) = appsync(
+            &router,
+            "POST",
+            &format!("/v1/apis/{}/types/Mutation/resolvers", api.api_id),
+            Some(resolver.clone()),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: CreateResolver must answer 200, got {created}"
+        );
+        let events = vec![json!({
+            "source": MATCHED_SOURCE, "detailType": DETAIL_TYPE, "detail": {"orderId": "I-9"},
+        })];
+        let answered = published_through(case, &api, field, &events).await;
+        assert_eq!(
+            answered["errors"][0]["errorType"].as_str(),
+            Some(ACCESS_DENIED_ERROR_TYPE),
+            "case {case:?}: expected the refused call to be reported to the caller, got \
+             {answered}"
+        );
+        assert_eq!(
+            answered["data"][field],
+            Value::Null,
+            "case {case:?}: a field whose call failed carries no value, got {answered}"
+        );
+    }
+}
+
 /// POST one mutation publishing `events` to the API's own endpoint, as a client does, and
 /// answer the GraphQL document it was served.
 async fn publish(case: &str, api: &Api, events: &[Value]) -> Value {

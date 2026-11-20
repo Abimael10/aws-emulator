@@ -299,7 +299,7 @@ fn reported_identity(
 /// for it, else the address the client dialled this socket at, which on a loopback listener
 /// is the one it came from. `None` when the request states neither, which leaves the member
 /// off rather than inventing one.
-fn source_ip(headers: &::http::HeaderMap) -> Option<String> {
+pub(super) fn source_ip(headers: &::http::HeaderMap) -> Option<String> {
     let field = |name: &str| {
         headers
             .get(name)

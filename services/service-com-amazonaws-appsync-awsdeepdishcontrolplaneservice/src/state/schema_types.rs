@@ -384,12 +384,23 @@ pub struct DirectiveUse {
     pub arguments: Vec<DirectiveArgument>,
 }
 
-/// One argument of a [`DirectiveUse`]: its name and its value as GraphQL writes one, so a
-/// string value carries its quotation and a list or object value its brackets.
+/// One argument of a [`DirectiveUse`]: its name, its value as GraphQL writes one — so a
+/// string value carries its quotation and a list or object value its brackets — and the
+/// STRING values that value carries, read by the parser.
+///
+/// Both forms are kept because they answer different questions. The written text is what a
+/// report of the type writes back, verbatim, so a directive reads as the definition declared
+/// it. The strings are what a RULE about the directive is judged on — the groups an
+/// `@aws_auth` guard names, the mutations an `@aws_subscribe` link names — and they are the
+/// parser's own `StringValue`s, so GraphQL's escaping is applied by `apollo-parser` rather
+/// than by a second reading of its string syntax.
 #[derive(Debug, Clone)]
 pub struct DirectiveArgument {
     pub name: String,
     pub value: String,
+    /// The string values the argument's value carries: one for a string, one per string
+    /// element for a list of them, and none for a value that carries no string at all.
+    pub strings: Vec<String>,
 }
 
 /// Whether a field or enum value is deprecated, and why.
@@ -783,6 +794,7 @@ fn directive_uses(directives: Option<cst::Directives>) -> Vec<DirectiveUse> {
                         .filter_map(|argument| {
                             Some(DirectiveArgument {
                                 name: argument.name()?.text().to_string(),
+                                strings: argument_strings(argument.value().as_ref()),
                                 value: argument
                                     .value()?
                                     .syntax()
@@ -798,6 +810,27 @@ fn directive_uses(directives: Option<cst::Directives>) -> Vec<DirectiveUse> {
             Some(DirectiveUse { name, arguments })
         })
         .collect()
+}
+
+/// The STRING values one directive argument's value carries, as the parser read them: the
+/// value itself for a string, each string element for a list of them, and none for anything
+/// else.
+///
+/// Read from `apollo-parser`'s own `StringValue`, which applies GraphQL's escaping, so a rule
+/// judged on these names (an `@aws_auth` group, an `@aws_subscribe` mutation) is judged on
+/// the value the schema wrote rather than on a re-reading of its quotation.
+fn argument_strings(value: Option<&cst::Value>) -> Vec<String> {
+    match value {
+        Some(cst::Value::StringValue(text)) => vec![String::from(text.clone())],
+        Some(cst::Value::ListValue(list)) => list
+            .values()
+            .filter_map(|element| match element {
+                cst::Value::StringValue(text) => Some(String::from(text)),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// The type a field or argument names, as a reference tree.

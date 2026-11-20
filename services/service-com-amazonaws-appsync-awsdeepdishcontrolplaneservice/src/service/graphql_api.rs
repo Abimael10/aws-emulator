@@ -15,6 +15,10 @@
 //!   `start` that begins a subscription on a field of the API's schema, the `stop` that ends
 //!   one, and the `data` frames a subscription receives.
 //!
+//! What a call presenting a TOKEN is decided by is the mode that issued it: a Cognito user
+//! pool token is verified against the pool the API configured ([`user_pool`]), and a Lambda
+//! authorizer's input is handed to the function the API named ([`authorizer`]).
+//!
 //! Both are opened when the API is created ([`open_for_api`], called by `CreateGraphqlApi`)
 //! and closed when it is deleted, and the `host:port` each landed on is what the API
 //! publishes — because the whole purpose of either value is that a client dials it, and no
@@ -59,6 +63,8 @@ pub mod metrics;
 pub mod query;
 pub mod realtime;
 pub mod role_session;
+pub mod subscriptions;
+pub mod user_pool;
 
 /// Everything one of these sockets needs to answer from: the service's own store, the API
 /// the socket belongs to (the socket itself says which, so no host has to name it), where

@@ -54,7 +54,7 @@ use ::service_com_amazonaws_wafv2_awswaf_20190729::service::edge as waf_edge;
 use ::tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::execution::{self, GraphqlRequest};
-use super::{authorizer, caller, field_logs, PlaneContext};
+use super::{authorizer, caller, field_logs, user_pool, PlaneContext};
 use crate::service::event_api::{self, PresentedAuth};
 
 /// The response field every answer this endpoint writes carries the request's own id in, as
@@ -309,9 +309,44 @@ async fn served_request(
     // that presents no SigV4 material names no principal, which is every call made under
     // another of the API's authorization modes.
     let signed = caller::presented_caller(&context.engine, &parts.headers);
-    let identity = signed
+    let mut identity = signed
         .as_ref()
         .map_or(Json::Null, |caller| caller.identity.clone());
+    // What the API's `AMAZON_COGNITO_USER_POOLS` mode decides about this call, which is taken
+    // BEFORE any field of it resolves: the token the request presents is verified against the
+    // user pool the API configured, and what that token CLAIMS is who the call speaks for
+    // ([`user_pool`]). An API that configured no user pool decides nothing here. The groups an
+    // admitted token claims are kept, because the API's schema may guard its fields by them.
+    let mut user_pool_groups: Option<Vec<String>> = None;
+    match user_pool::decided(
+        context,
+        presented_material(&parts.headers),
+        caller::source_ip(&parts.headers),
+        started,
+    ) {
+        user_pool::Decided::NotApplicable => {}
+        user_pool::Decided::Refused(reason) => {
+            ::tracing::info!(
+                api_id = %context.api_id,
+                %reason,
+                "the token this call presented authorizes no call on this API"
+            );
+            return refusal_logged(
+                context,
+                request_id,
+                started,
+                clock,
+                UNAUTHORIZED_STATUS,
+                event_api::UNAUTHORIZED_ERROR_TYPE,
+                event_api::UNAUTHORIZED_MESSAGE,
+            )
+            .await;
+        }
+        user_pool::Decided::Admitted(admitted) => {
+            identity = admitted.identity;
+            user_pool_groups = Some(admitted.groups);
+        }
+    }
     let Ok(document) = ::serde_json::from_slice::<Json>(body) else {
         return refusal_logged(
             context,
@@ -354,6 +389,9 @@ async fn served_request(
         // credentials — the same answer the API's own fields are judged against.
         caller: signed.clone(),
         unauthorized: Vec::new(),
+        // The groups an admitted user pool token claims, which the schema's own group guards
+        // are judged against as each field resolves ([`user_pool::refused_fields`]).
+        user_pool_groups: user_pool_groups.clone(),
     };
     let mut request = request;
     // What the API's `AWS_LAMBDA` authorization mode decides about this call, which is taken

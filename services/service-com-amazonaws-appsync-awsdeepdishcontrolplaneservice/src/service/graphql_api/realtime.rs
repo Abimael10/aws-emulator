@@ -549,7 +549,15 @@ fn served_message(
                 let store = context.state.lock();
                 super::authorized(&store, &context.api_id, connection_auth)
             };
-            if !authorized {
+            // A token presented for a connection is decided by the mode that issued it, by
+            // the same rule the API's GraphQL endpoint applies to a call
+            // ([`super::user_pool`]): a Cognito user pool token has to be one the pool the
+            // API configured signed, inside its own window.
+            let refused_token = matches!(
+                token_decision(context, connection_auth),
+                super::user_pool::Decided::Refused(_)
+            );
+            if !authorized || refused_token {
                 // A connect this endpoint turned away on the client's own account is what
                 // `ConnectClientError` counts, and the connection ends with the refusal:
                 // nothing more is served over it.
@@ -610,13 +618,14 @@ fn started(
     if subscription_id.is_empty() {
         return error_frame(subscription_id, BAD_REQUEST_ERROR_TYPE, MESSAGE_NAMES_AN_ID);
     }
-    let Some(field) = subscription_field(message) else {
+    let Some(selected) = subscription_selection(message) else {
         return error_frame(
             subscription_id,
             BAD_REQUEST_ERROR_TYPE,
             START_CARRIES_A_SUBSCRIPTION,
         );
     };
+    let field = selected.name.clone();
     // A start is authorized by the material IT carries, falling back to the material the
     // connection was opened with, because that is the material the client presented for
     // this call.
@@ -625,6 +634,55 @@ fn started(
         .map(PresentedAuth::from_object)
         .filter(PresentedAuth::is_present)
         .unwrap_or_else(|| connection_auth.clone());
+    // A token presented for a subscription is decided by the mode that issued it, by the same
+    // rule the API's GraphQL endpoint applies to a call ([`super::user_pool`]). Taken before
+    // the store is locked, because that decision reads this store and the user-pool
+    // service's.
+    let admitted_groups = match token_decision(context, &auth) {
+        super::user_pool::Decided::Refused(reason) => {
+            ::tracing::info!(
+                api_id = %context.api_id,
+                %reason,
+                "the token this subscription presented authorizes no call on this API"
+            );
+            return error_frame(
+                subscription_id,
+                event_api::UNAUTHORIZED_ERROR_TYPE,
+                event_api::UNAUTHORIZED_MESSAGE,
+            );
+        }
+        super::user_pool::Decided::Admitted(admitted) => Some(admitted.groups),
+        super::user_pool::Decided::NotApplicable => None,
+    };
+    // The subscription field's OWN group guard, for a subscriber the user pool mode admitted:
+    // a field the schema guards with `@aws_auth(cognito_groups: …)` is one a caller claiming
+    // none of those groups may not reach, on this endpoint as on the API's GraphQL one
+    // ([`super::user_pool::refused_fields`]). The root type is read under a lock of its own,
+    // because the guard reads the store too.
+    if let Some(groups) = admitted_groups {
+        let root = context
+            .state
+            .lock()
+            .graphql_apis
+            .get(&context.api_id)
+            .map(|api| api.subscription_root_type());
+        let guarded = root.is_some_and(|root| {
+            !super::user_pool::refused_fields(context, &[(root, field.clone())], &groups)
+                .is_empty()
+        });
+        if guarded {
+            ::tracing::info!(
+                api_id = %context.api_id,
+                %field,
+                "this subscriber claims none of the groups the field's guard names"
+            );
+            return error_frame(
+                subscription_id,
+                event_api::UNAUTHORIZED_ERROR_TYPE,
+                event_api::UNAUTHORIZED_MESSAGE,
+            );
+        }
+    }
     let recorded = {
         let mut store = context.state.lock();
         if !super::authorized(&store, &context.api_id, &auth) {
@@ -654,6 +712,7 @@ fn started(
             connection_id,
             subscription_id,
             &field,
+            selected.arguments.clone(),
         )
     };
     match recorded {
@@ -684,42 +743,46 @@ fn stopped(context: &PlaneContext, connection_id: &str, subscription_id: &str) -
     json!({"id": subscription_id, MESSAGE_TYPE_MEMBER: COMPLETE}).to_string()
 }
 
-/// The subscription FIELD a `start` asks for, or `None` for a message that carries no
-/// subscription document at all.
+/// What the mode that issued the token `auth` presents decides about this connection or
+/// subscription, by the rule the API's GraphQL endpoint applies to a call
+/// ([`super::user_pool`]).
+///
+/// A handshake carries no request fields, so the material travels in the base64url
+/// authorization object this endpoint reads it from ([`PresentedAuth`]); what is decided
+/// about it is the same. No address is reported for it: a real-time client states none in
+/// that object, so nothing of `$context.identity.sourceIp` is invented for one.
+fn token_decision(context: &PlaneContext, auth: &PresentedAuth) -> super::user_pool::Decided {
+    super::user_pool::decided(
+        context,
+        auth.authorization.as_deref().unwrap_or_default(),
+        None,
+        ::std::time::SystemTime::now(),
+    )
+}
+
+/// The subscription a `start` asks for — the field and the arguments it carries — or `None`
+/// for a message that carries no subscription document at all.
 ///
 /// A `start` carries its GraphQL request in `payload.data`, as the document a client would
-/// POST to the API's HTTPS endpoint: a JSON object with a `query`. That query is read by
-/// the maintained GraphQL parser this crate already reads a schema with (`apollo-parser`),
-/// never by anything hand-written, and what makes it a subscription is the operation
-/// GraphQL itself defines — a `subscription` operation, whose selected field is the field
-/// subscribed to ("Subscription operations must have exactly one root field").
-fn subscription_field(message: &Json) -> Option<String> {
+/// POST to the API's HTTPS endpoint: a JSON object with a `query` and, where the document is
+/// parameterised, its `variables`. That document is read by the SAME reading an executed
+/// request's document goes through ([`super::execution::subscription_selection`]) — the
+/// maintained GraphQL parser, under the same bounds — so the field and the arguments a
+/// subscription is recorded with are the ones a query of the same document would address.
+/// What makes it a subscription is the operation GraphQL itself defines: a `subscription`
+/// operation, whose one selected field is the field subscribed to ("subscription operations
+/// must have exactly one root field").
+fn subscription_selection(message: &Json) -> Option<super::execution::SelectedField> {
     let data = message.pointer("/payload/data").and_then(Json::as_str)?;
     let request: Json = ::serde_json::from_str(data).ok()?;
     let query = request.get("query").and_then(Json::as_str)?;
-    let parsed = ::apollo_parser::Parser::new(query)
-        .recursion_limit(crate::state::DEFINITION_RECURSION_LIMIT)
-        .token_limit(crate::state::DEFINITION_TOKEN_LIMIT)
-        .parse();
-    if parsed.errors().next().is_some() {
-        return None;
-    }
-    use ::apollo_parser::cst;
-    parsed.document().definitions().find_map(|definition| {
-        let cst::Definition::OperationDefinition(operation) = definition else {
-            return None;
-        };
-        operation.operation_type()?.subscription_token()?;
-        operation
-            .selection_set()?
-            .selections()
-            .find_map(|selection| match selection {
-                cst::Selection::Field(selected) => {
-                    Some(selected.name()?.text().to_string())
-                }
-                _ => None,
-            })
-    })
+    let variables = request
+        .get("variables")
+        .and_then(Json::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let operation_name = request.get("operationName").and_then(Json::as_str);
+    super::execution::subscription_selection(query, operation_name, &variables)
 }
 
 /// What a start this plane cannot record is stated with.

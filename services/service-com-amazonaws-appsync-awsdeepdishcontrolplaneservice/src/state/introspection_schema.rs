@@ -248,6 +248,38 @@ impl GraphqlApiRecord {
             .unwrap_or_default()
     }
 
+    /// The SUBSCRIPTION fields of this API's schema that the MUTATION field `mutation_field`
+    /// publishes to, in the order the schema declares them.
+    ///
+    /// AppSync links the two with a directive on the subscription field:
+    /// `@aws_subscribe(mutations: ["<mutationField>"])` names the mutations whose result that
+    /// subscription receives, so a mutation publishes to every subscription field whose
+    /// directive names it and to no other. A schema that writes the directive on no field
+    /// links no mutation to any subscription, which is what a client subscribing to such a
+    /// schema observes: a subscription nothing ever delivers to.
+    ///
+    /// Read from the stored types, so the links reported are the ones the schema that was
+    /// CREATED declares.
+    pub fn subscriptions_published_by(&self, mutation_field: &str) -> Vec<String> {
+        let named = self.subscription_root_type();
+        self.types
+            .get(&named)
+            .map(|record| {
+                record
+                    .parsed
+                    .fields
+                    .iter()
+                    .filter(|field| {
+                        subscribed_mutations(&field.directives)
+                            .iter()
+                            .any(|named| named == mutation_field)
+                    })
+                    .map(|field| field.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// This API's introspection schema in `format`, or the text a
     /// `GraphQLSchemaException` carries for an API that holds no schema to introspect.
     ///
@@ -430,6 +462,32 @@ impl GraphqlApiRecord {
         referenced.into_keys().collect()
     }
 }
+
+/// The mutation fields a subscription field's `@aws_subscribe` directive names, or an empty
+/// list where the directives write none.
+///
+/// The names are the parser's own string values of the argument
+/// (`DirectiveArgument::strings`), so GraphQL's escaping is applied by `apollo-parser` — the
+/// same reading the group guards on a field are judged on
+/// (`crate::service::graphql_api::user_pool`).
+fn subscribed_mutations(directives: &[super::DirectiveUse]) -> Vec<String> {
+    directives
+        .iter()
+        .filter(|directive| directive.name == SUBSCRIBE_DIRECTIVE)
+        .flat_map(|directive| {
+            directive
+                .arguments
+                .iter()
+                .filter(|argument| argument.name == SUBSCRIBE_MUTATIONS_ARGUMENT)
+                .flat_map(|argument| argument.strings.clone())
+        })
+        .collect()
+}
+
+/// The directive a schema links a subscription field to the mutations that publish to it
+/// with, and the argument naming them.
+const SUBSCRIBE_DIRECTIVE: &str = "aws_subscribe";
+const SUBSCRIBE_MUTATIONS_ARGUMENT: &str = "mutations";
 
 /// One built-in scalar as introspection's `__Type`: a scalar carries no member a type
 /// system defines, so every member but its kind and name is null — the same rendering a

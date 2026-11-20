@@ -70,6 +70,12 @@ pub struct Configured<'a> {
 /// Make the call `requested` asks for against `source`'s table and answer the result the
 /// step's response half is handed, or what the step did not resolve with — a [`Refused`],
 /// whose type is what the step's own `ctx.error.type` carries.
+///
+/// A BATCH request is bounded BEFORE any of the per-table work is done: the call is built
+/// first ([`Call::wire_request`], which refuses a batch past the limit of the one DynamoDB
+/// call it is made as — [`MAX_BATCH_WRITE_REQUESTS`], [`MAX_BATCH_GET_KEYS`]), so neither the
+/// permission weighing below nor the hop itself can be multiplied by a table or entry count
+/// the request chose.
 pub async fn answered(
     context: &PlaneContext,
     source: &Configured<'_>,
@@ -100,18 +106,21 @@ pub async fn answered(
         .unwrap_or(&context.region);
     let body = call.wire_request(table, requested).map_err(Refused::request)?;
     // The permissions are weighed BEFORE the hop: a call they do not admit reads and writes
-    // nothing, which is what lets a denied read leave the item it addressed untouched.
-    let resource = ::engine::emulator_arn(
-        ARN_SERVICE,
-        region,
-        &format!("{TABLE_RESOURCE_PREFIX}{table}"),
-    );
+    // nothing, which is what lets a denied read leave the item it addressed untouched. A
+    // BATCH call addresses the tables its own request names, so each of them is weighed.
     let action = call.action();
-    if let Some(refusal) = unauthorized(context, source, caller, &action, &resource).await {
-        return Err(Refused {
-            message: refusal,
-            error_type: answered_error_type(ACCESS_DENIED_EXCEPTION),
-        });
+    for named in call.tables(table, requested) {
+        let resource = ::engine::emulator_arn(
+            ARN_SERVICE,
+            region,
+            &format!("{TABLE_RESOURCE_PREFIX}{named}"),
+        );
+        if let Some(refusal) = unauthorized(context, source, caller, &action, &resource).await {
+            return Err(Refused {
+                message: refusal,
+                error_type: answered_error_type(ACCESS_DENIED_EXCEPTION),
+            });
+        }
     }
     let answer = called(context, region, call.target(), &body).await?;
     Ok(call.read_answer(&body, &answer))
@@ -161,6 +170,9 @@ enum Call {
     DeleteItem,
     Query,
     Scan,
+    BatchGetItem,
+    BatchPutItem,
+    BatchDeleteItem,
 }
 
 impl Call {
@@ -172,6 +184,9 @@ impl Call {
         "DeleteItem",
         "Query",
         "Scan",
+        "BatchGetItem",
+        "BatchPutItem",
+        "BatchDeleteItem",
     ];
 
     /// The call `operation` names, or `None` for a value this data source does not serve.
@@ -183,12 +198,28 @@ impl Call {
             "DeleteItem" => Some(Self::DeleteItem),
             "Query" => Some(Self::Query),
             "Scan" => Some(Self::Scan),
+            "BatchGetItem" => Some(Self::BatchGetItem),
+            "BatchPutItem" => Some(Self::BatchPutItem),
+            "BatchDeleteItem" => Some(Self::BatchDeleteItem),
             _ => None,
         }
     }
 
+    /// Whether this call addresses MANY items across the tables its own request names, rather
+    /// than one item of the table the data source was configured with.
+    fn is_batch(self) -> bool {
+        matches!(
+            self,
+            Self::BatchGetItem | Self::BatchPutItem | Self::BatchDeleteItem
+        )
+    }
+
     /// The DynamoDB operation this call makes, which is the name its own wire target carries
     /// and the name of the IAM action it performs ("Actions defined by Amazon DynamoDB").
+    ///
+    /// A batch operation of this data source is one DynamoDB call over many items: the two
+    /// WRITE batches are both that service's `BatchWriteItem`, which takes a put and a delete
+    /// request alike, and the read batch is its `BatchGetItem`.
     fn target(self) -> &'static str {
         match self {
             Self::GetItem => "GetItem",
@@ -197,6 +228,8 @@ impl Call {
             Self::DeleteItem => "DeleteItem",
             Self::Query => "Query",
             Self::Scan => "Scan",
+            Self::BatchGetItem => "BatchGetItem",
+            Self::BatchPutItem | Self::BatchDeleteItem => "BatchWriteItem",
         }
     }
 
@@ -204,6 +237,20 @@ impl Call {
     /// it performs.
     fn action(self) -> String {
         format!("{ACTION_NAMESPACE}:{}", self.target())
+    }
+
+    /// The tables this call addresses: the one the data source was configured with, and — for
+    /// a BATCH call, which states its own tables — every table its request names.
+    ///
+    /// Each one is a table the permissions in force have to admit the call on, because each is
+    /// a table the call reads or writes.
+    fn tables(self, configured: &str, requested: &Json) -> Vec<String> {
+        if !self.is_batch() {
+            return vec![configured.to_string()];
+        }
+        batch_tables(requested)
+            .map(|tables| tables.into_iter().map(|(name, _)| name).collect())
+            .unwrap_or_default()
     }
 
     /// The request this call is made with, as DynamoDB's own input carries it, or the sentence
@@ -215,7 +262,11 @@ impl Call {
     /// names for it.
     fn wire_request(self, table: &str, requested: &Json) -> Result<Json, String> {
         let mut input = JsonMap::new();
-        input.insert(TABLE_NAME_INPUT.to_string(), Json::String(table.to_string()));
+        // A batch call addresses the tables its own request names, so it carries no single
+        // table at all; every other call is made against the configured one.
+        if !self.is_batch() {
+            input.insert(TABLE_NAME_INPUT.to_string(), Json::String(table.to_string()));
+        }
         match self {
             Self::GetItem => {
                 input.insert(KEY_INPUT.to_string(), object(requested, KEY_MEMBER)?);
@@ -270,6 +321,76 @@ impl Call {
                 carry_number(&mut input, requested, SEGMENT_MEMBER, SEGMENT_INPUT)?;
                 carry_number(&mut input, requested, TOTAL_SEGMENTS_MEMBER, TOTAL_SEGMENTS_INPUT)?;
             }
+            // Both write batches are one `BatchWriteItem` over the write requests the tables
+            // the request names carry: a put request per item written, a delete request per
+            // key removed. How MANY writes one such call may carry is bounded before any of
+            // them is built ([`MAX_BATCH_WRITE_REQUESTS`]).
+            Self::BatchPutItem | Self::BatchDeleteItem => {
+                let mut request_items = JsonMap::new();
+                let mut carried: usize = 0;
+                for (name, stated) in batch_tables(requested)? {
+                    let Json::Array(entries) = stated else {
+                        return Err(format!("{A_BATCH_TABLE_IS_A_LIST} {TABLES_MEMBER}.{name}."));
+                    };
+                    if entries.is_empty() {
+                        return Err(format!("{A_BATCH_TABLE_IS_NOT_EMPTY} {TABLES_MEMBER}.{name}."));
+                    }
+                    carried = carried.saturating_add(entries.len());
+                    if carried > MAX_BATCH_WRITE_REQUESTS {
+                        return Err(format!(
+                            "{A_WRITE_BATCH_CARRIES} {MAX_BATCH_WRITE_REQUESTS} \
+                             {ITEMS_OR_KEYS_IN_ALL}"
+                        ));
+                    }
+                    let writes: Vec<Json> = entries
+                        .iter()
+                        .map(|entry| match self {
+                            Self::BatchDeleteItem => {
+                                json!({DELETE_REQUEST_INPUT: {KEY_INPUT: entry}})
+                            }
+                            _ => json!({PUT_REQUEST_INPUT: {ITEM_INPUT: entry}}),
+                        })
+                        .collect();
+                    request_items.insert(name, Json::Array(writes));
+                }
+                input.insert(REQUEST_ITEMS_INPUT.to_string(), Json::Object(request_items));
+            }
+            // The read batch is one `BatchGetItem` over the keys each table the request names
+            // states, with that table's own read flag and projection. How many keys one such
+            // call may read is bounded before any of them is carried
+            // ([`MAX_BATCH_GET_KEYS`]).
+            Self::BatchGetItem => {
+                let mut request_items = JsonMap::new();
+                let mut carried: usize = 0;
+                for (name, stated) in batch_tables(requested)? {
+                    let keys = match stated.get(KEYS_MEMBER) {
+                        Some(Json::Array(keys)) if !keys.is_empty() => keys.clone(),
+                        _ => {
+                            return Err(format!(
+                                "{A_BATCH_GET_STATES} {TABLES_MEMBER}.{name}.{KEYS_MEMBER}."
+                            ))
+                        }
+                    };
+                    carried = carried.saturating_add(keys.len());
+                    if carried > MAX_BATCH_GET_KEYS {
+                        return Err(format!(
+                            "{A_READ_BATCH_CARRIES} {MAX_BATCH_GET_KEYS} {ITEMS_OR_KEYS_IN_ALL}"
+                        ));
+                    }
+                    let mut per_table = JsonMap::new();
+                    per_table.insert(KEYS_INPUT.to_string(), Json::Array(keys));
+                    carry_bool(
+                        &mut per_table,
+                        &stated,
+                        CONSISTENT_READ_MEMBER,
+                        CONSISTENT_READ_INPUT,
+                    )?;
+                    expression(&stated, PROJECTION_MEMBER)?
+                        .carry(&mut per_table, PROJECTION_EXPRESSION_INPUT);
+                    request_items.insert(name, Json::Object(per_table));
+                }
+                input.insert(REQUEST_ITEMS_INPUT.to_string(), Json::Object(request_items));
+            }
         }
         Ok(wire_values(&Json::Object(input)))
     }
@@ -308,7 +429,114 @@ impl Call {
                         .unwrap_or_else(|| json!(0)),
                 })
             }
+            // What a write batch came to is what it wrote or removed, per table, which the
+            // request itself describes: `BatchWriteItem` answers only what it did NOT carry
+            // out, which is reported beside it under the member that batch states it in.
+            Self::BatchPutItem => batch_answer(
+                requested,
+                answered,
+                |write| write.get(PUT_REQUEST_INPUT).and_then(|put| put.get(ITEM_INPUT)),
+                UNPROCESSED_ITEMS_MEMBER,
+            ),
+            Self::BatchDeleteItem => batch_answer(
+                requested,
+                answered,
+                |write| {
+                    write
+                        .get(DELETE_REQUEST_INPUT)
+                        .and_then(|delete| delete.get(KEY_INPUT))
+                },
+                UNPROCESSED_KEYS_MEMBER,
+            ),
+            // What a read batch came to is what each table ANSWERED, beside the keys it did
+            // not get to.
+            Self::BatchGetItem => {
+                let data = per_table(answered.get(RESPONSES_OUTPUT), |items| {
+                    items
+                        .as_array()
+                        .map(|items| items.iter().map(plain_value).collect())
+                        .unwrap_or_default()
+                });
+                let unprocessed = per_table(answered.get(UNPROCESSED_KEYS_OUTPUT), |stated| {
+                    stated
+                        .get(KEYS_INPUT)
+                        .and_then(Json::as_array)
+                        .map(|keys| keys.iter().map(plain_value).collect())
+                        .unwrap_or_default()
+                });
+                json!({
+                    DATA_MEMBER: data,
+                    UNPROCESSED_KEYS_MEMBER: unprocessed,
+                })
+            }
         }
+    }
+}
+
+/// The result of one WRITE batch: what it carried per table, read back out of the call it
+/// made with `written`, beside the writes DynamoDB did not carry out.
+///
+/// `written` is what one entry of a table's write list states — the item a put carries or the
+/// key a delete addresses — so one reading serves both batches, and the unprocessed writes the
+/// answer reports are read the same way.
+fn batch_answer(
+    requested: &Json,
+    answered: &Json,
+    written: impl Fn(&Json) -> Option<&Json> + Copy,
+    unprocessed_member: &str,
+) -> Json {
+    let carried = |writes: &Json| -> Vec<Json> {
+        writes
+            .as_array()
+            .map(|writes| writes.iter().filter_map(written).map(plain_value).collect())
+            .unwrap_or_default()
+    };
+    let mut result = JsonMap::new();
+    result.insert(
+        DATA_MEMBER.to_string(),
+        per_table(requested.get(REQUEST_ITEMS_INPUT), carried),
+    );
+    result.insert(
+        unprocessed_member.to_string(),
+        per_table(answered.get(UNPROCESSED_ITEMS_OUTPUT), carried),
+    );
+    Json::Object(result)
+}
+
+/// One per-table map of a batch's result: every table the map `stated` names, with `read`
+/// applied to that table's own entry.
+///
+/// An absent map is an empty one — a batch that left nothing unprocessed states no table —
+/// so what a resolver reads is a map it can walk either way.
+fn per_table(stated: Option<&Json>, read: impl Fn(&Json) -> Vec<Json>) -> Json {
+    let tables = stated
+        .and_then(Json::as_object)
+        .map(|tables| {
+            tables
+                .iter()
+                .map(|(name, entry)| (name.clone(), Json::Array(read(entry))))
+                .collect::<JsonMap<String, Json>>()
+        })
+        .unwrap_or_default();
+    Json::Object(tables)
+}
+
+/// The tables a BATCH request names and what it states for each, in the order the request
+/// writes them, or the sentence the request is refused with.
+///
+/// "`tables`: the tables to … in" is where every batch operation of this data source states
+/// what it addresses, so a request that names none addresses no table and is refused before
+/// any call is built.
+fn batch_tables(requested: &Json) -> Result<Vec<(String, Json)>, String> {
+    match requested.get(TABLES_MEMBER) {
+        Some(Json::Object(tables)) if !tables.is_empty() => Ok(tables
+            .iter()
+            .map(|(name, stated)| (name.clone(), stated.clone()))
+            .collect()),
+        Some(Json::Object(_)) | None | Some(Json::Null) => {
+            Err(format!("{A_BATCH_STATES} {TABLES_MEMBER}."))
+        }
+        Some(_) => Err(format!("{A_MEMBER_IS_A_MAP} {TABLES_MEMBER}.")),
     }
 }
 
@@ -804,6 +1032,13 @@ const SELECT_MEMBER: &str = "select";
 const SEGMENT_MEMBER: &str = "segment";
 const TOTAL_SEGMENTS_MEMBER: &str = "totalSegments";
 const NEXT_TOKEN_MEMBER: &str = "nextToken";
+/// The members a BATCH request and its result carry: the tables it addresses, the keys a read
+/// batch states per table, and the two members the result reports under.
+const TABLES_MEMBER: &str = "tables";
+const KEYS_MEMBER: &str = "keys";
+const DATA_MEMBER: &str = "data";
+const UNPROCESSED_ITEMS_MEMBER: &str = "unprocessedItems";
+const UNPROCESSED_KEYS_MEMBER: &str = "unprocessedKeys";
 
 /// The members of the result a selection answers with.
 const ITEMS_MEMBER: &str = "items";
@@ -830,6 +1065,12 @@ const FILTER_EXPRESSION_INPUT: &str = "FilterExpression";
 const PROJECTION_EXPRESSION_INPUT: &str = "ProjectionExpression";
 const EXPRESSION_NAMES_INPUT: &str = "ExpressionAttributeNames";
 const EXPRESSION_VALUES_INPUT: &str = "ExpressionAttributeValues";
+/// The members a batch call's own input carries: the per-table map, the write requests it
+/// holds and the keys a read batch states.
+const REQUEST_ITEMS_INPUT: &str = "RequestItems";
+const PUT_REQUEST_INPUT: &str = "PutRequest";
+const DELETE_REQUEST_INPUT: &str = "DeleteRequest";
+const KEYS_INPUT: &str = "Keys";
 
 /// The values `ReturnValues` takes for the two calls whose result is an item they did not
 /// read: the item as it now stands after an update, and as it stood before a delete.
@@ -842,6 +1083,11 @@ const ATTRIBUTES_OUTPUT: &str = "Attributes";
 const ITEMS_OUTPUT: &str = "Items";
 const SCANNED_COUNT_OUTPUT: &str = "ScannedCount";
 const LAST_EVALUATED_KEY_OUTPUT: &str = "LastEvaluatedKey";
+/// The members a batch call's own answer carries: what each table answered, and what it did
+/// not get to.
+const RESPONSES_OUTPUT: &str = "Responses";
+const UNPROCESSED_ITEMS_OUTPUT: &str = "UnprocessedItems";
+const UNPROCESSED_KEYS_OUTPUT: &str = "UnprocessedKeys";
 
 /// The members an AWS JSON refusal names its class and states its sentence in.
 const ERROR_TYPE_MEMBER: &str = "__type";
@@ -875,6 +1121,29 @@ const AN_OPERATION_STATES: &str = "This AMAZON_DYNAMODB operation states the ite
 const A_PUT_STATES: &str = "A PutItem request states the values of the item it writes in";
 const AN_UPDATE_STATES: &str = "An UpdateItem request states the update it makes in";
 const A_QUERY_STATES: &str = "A Query request states the key condition it selects by in";
+const A_BATCH_STATES: &str = "A batch request states the tables it addresses in";
+const A_BATCH_TABLE_IS_A_LIST: &str =
+    "A write batch states the items or keys of each table it addresses as a list in";
+const A_BATCH_TABLE_IS_NOT_EMPTY: &str =
+    "A batch addresses at least one item of every table it names, and none is stated in";
+const A_BATCH_GET_STATES: &str = "A BatchGetItem request states the keys it reads in";
+const A_WRITE_BATCH_CARRIES: &str = "A write batch carries at most";
+const A_READ_BATCH_CARRIES: &str = "A BatchGetItem request reads at most";
+const ITEMS_OR_KEYS_IN_ALL: &str = "items across the tables it addresses.";
+
+/// How many writes one write batch may carry, across every table it names.
+///
+/// The limit of the ONE call it is made as: "a single call to `BatchWriteItem` can transmit up
+/// to 16MB of data over the network, consisting of up to 25 item put or delete operations"
+/// (Amazon DynamoDB's `BatchWriteItem`). It is also what bounds the work ONE GraphQL request
+/// can ask of this data source: the permissions of every table named are weighed before the
+/// call is made, so a request past this limit is refused before any of that is done.
+const MAX_BATCH_WRITE_REQUESTS: usize = 25;
+
+/// How many keys one read batch may read, across every table it names: "a single operation can
+/// retrieve up to 16 MB of data, which can contain as many as 100 items"
+/// (Amazon DynamoDB's `BatchGetItem`). Bounds the same work for the same reason.
+const MAX_BATCH_GET_KEYS: usize = 100;
 const A_MEMBER_IS_A_MAP: &str =
     "This member of an AMAZON_DYNAMODB request is a JSON object, which is not what is carried \
      at";
@@ -1131,8 +1400,176 @@ mod tests {
         // And an operation no DynamoDB data source serves is refused too, naming the ones it
         // does.
         assert!(
-            Call::named("BatchGetItem").is_none(),
+            Call::named("TransactWriteItems").is_none(),
             "case an operation this data source does not serve: expected no call"
+        );
+    }
+
+    /// RULE: a BATCH operation addresses the tables its own request names — the items each
+    /// writes, the keys each removes or reads — and what it came to is reported per table.
+    #[test]
+    fn a_batch_operation_addresses_the_tables_its_request_names() {
+        let item = |id: &str| json!({"id": {"S": id}, "value": {"N": 7}});
+        // The rows differ along the batch (write of items, delete of keys, read of keys), how
+        // many tables it names and how many entries each carries.
+        let put = Call::named("BatchPutItem").expect("BatchPutItem must be served");
+        let built = put
+            .wire_request(
+                "items",
+                &json!({"tables": {"items": [item("A-1"), item("A-2")]}}),
+            )
+            .unwrap_or_else(|refusal| panic!("the put batch must build: {refusal}"));
+        assert_eq!(
+            built,
+            json!({"RequestItems": {"items": [
+                {"PutRequest": {"Item": {"id": {"S": "A-1"}, "value": {"N": "7"}}}},
+                {"PutRequest": {"Item": {"id": {"S": "A-2"}, "value": {"N": "7"}}}},
+            ]}}),
+            "a put batch must carry one put request per item, got {built}"
+        );
+        // What it came to is the items it carried, per table, beside what was not processed.
+        let read = put.read_answer(&built, &json!({}));
+        assert_eq!(
+            read,
+            json!({
+                "data": {"items": [
+                    {"id": "A-1", "value": 7},
+                    {"id": "A-2", "value": 7},
+                ]},
+                "unprocessedItems": {},
+            }),
+            "a put batch must report the items it wrote per table, got {read}"
+        );
+
+        let delete = Call::named("BatchDeleteItem").expect("BatchDeleteItem must be served");
+        let built = delete
+            .wire_request("items", &json!({"tables": {"items": [{"id": {"S": "A-1"}}]}}))
+            .unwrap_or_else(|refusal| panic!("the delete batch must build: {refusal}"));
+        assert_eq!(
+            built,
+            json!({"RequestItems": {"items": [
+                {"DeleteRequest": {"Key": {"id": {"S": "A-1"}}}},
+            ]}}),
+            "a delete batch must carry one delete request per key, got {built}"
+        );
+
+        let get = Call::named("BatchGetItem").expect("BatchGetItem must be served");
+        let built = get
+            .wire_request(
+                "items",
+                &json!({"tables": {
+                    "items": {"keys": [{"id": {"S": "A-1"}}], "consistentRead": true},
+                    "others": {"keys": [{"id": {"S": "B-1"}}]},
+                }}),
+            )
+            .unwrap_or_else(|refusal| panic!("the get batch must build: {refusal}"));
+        assert_eq!(
+            built,
+            json!({"RequestItems": {
+                "items": {"Keys": [{"id": {"S": "A-1"}}], "ConsistentRead": true},
+                "others": {"Keys": [{"id": {"S": "B-1"}}]},
+            }}),
+            "a get batch must carry the keys of every table it names, got {built}"
+        );
+        let read = get.read_answer(
+            &built,
+            &json!({
+                "Responses": {"items": [{"id": {"S": "A-1"}}], "others": []},
+                "UnprocessedKeys": {"others": {"Keys": [{"id": {"S": "B-1"}}]}},
+            }),
+        );
+        assert_eq!(
+            read,
+            json!({
+                "data": {"items": [{"id": "A-1"}], "others": []},
+                "unprocessedKeys": {"others": [{"id": "B-1"}]},
+            }),
+            "a get batch must report what each table answered, got {read}"
+        );
+
+        // Every batch names the tables it addresses, and those are the tables the call's
+        // permissions are weighed on; a request naming none is refused.
+        assert_eq!(
+            put.tables(
+                "configured",
+                &json!({"tables": {"items": [], "others": []}})
+            ),
+            vec!["items".to_string(), "others".to_string()],
+            "a batch is weighed on the tables its request names"
+        );
+        assert_eq!(
+            Call::GetItem.tables("configured", &json!({})),
+            vec!["configured".to_string()],
+            "a single-item call is weighed on the table the data source was configured with"
+        );
+        let refused = put.wire_request("items", &json!({"operation": "BatchPutItem"}));
+        assert!(
+            refused.is_err_and(|refusal| refusal.ends_with("tables.")),
+            "a batch naming no table must be refused by that member"
+        );
+    }
+
+    /// RULE: a batch is bounded by the limit of the ONE DynamoDB call it is made as, counted
+    /// ACROSS the tables it names, and it addresses at least one item of every table it names
+    /// — so neither the permissions weighed per table nor the call itself can be multiplied by
+    /// a count the request chose.
+    #[test]
+    fn a_batch_past_the_limit_of_its_own_call_is_refused_before_any_of_it_is_weighed() {
+        let items = |count: usize| -> Json {
+            Json::Array(
+                (0..count)
+                    .map(|at| json!({"id": {"S": format!("A-{at}")}}))
+                    .collect(),
+            )
+        };
+        let write = |tables: Json| {
+            Call::named("BatchPutItem")
+                .expect("BatchPutItem must be served")
+                .wire_request("items", &json!({"tables": tables}))
+        };
+        let read = |tables: Json| {
+            Call::named("BatchGetItem")
+                .expect("BatchGetItem must be served")
+                .wire_request("items", &json!({"tables": tables}))
+        };
+        // The rows sit at each published bound, one past it, and one past it ACROSS two
+        // tables, beside the table that addresses nothing.
+        assert!(
+            write(json!({"items": items(MAX_BATCH_WRITE_REQUESTS)})).is_ok(),
+            "a write batch at the limit must build"
+        );
+        assert!(
+            write(json!({"items": items(MAX_BATCH_WRITE_REQUESTS + 1)})).is_err(),
+            "a write batch one past the limit must be refused"
+        );
+        assert!(
+            write(json!({
+                "items": items(MAX_BATCH_WRITE_REQUESTS),
+                "others": items(1),
+            }))
+            .is_err(),
+            "a write batch past the limit across two tables must be refused"
+        );
+        assert!(
+            write(json!({"items": []})).is_err(),
+            "a write batch naming a table it addresses nothing of must be refused"
+        );
+        let keys = |count: usize| json!({"keys": items(count)});
+        assert!(
+            read(json!({"items": keys(MAX_BATCH_GET_KEYS)})).is_ok(),
+            "a read batch at the limit must build"
+        );
+        assert!(
+            read(json!({"items": keys(MAX_BATCH_GET_KEYS + 1)})).is_err(),
+            "a read batch one past the limit must be refused"
+        );
+        assert!(
+            read(json!({"items": keys(MAX_BATCH_GET_KEYS), "others": keys(1)})).is_err(),
+            "a read batch past the limit across two tables must be refused"
+        );
+        assert!(
+            read(json!({"items": keys(0)})).is_err(),
+            "a read batch naming a table it reads nothing of must be refused"
         );
     }
 

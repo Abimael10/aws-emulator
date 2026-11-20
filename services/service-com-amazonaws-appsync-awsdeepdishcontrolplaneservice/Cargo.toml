@@ -149,6 +149,12 @@ aws-sdk-lambda = { version = "1", default-features = false, features = ["rt-toki
 sha2 = { workspace = true }
 # Writes that digest out as the key an entry is held under, through the tree's one hex encoder.
 hex = { workspace = true }
+# The service that OWNS the user pool a GraphQL API's `AMAZON_COGNITO_USER_POOLS`
+# authorization mode names: a call on such an API is decided by verifying the token it
+# presents against the key set that pool publishes
+# (`src/service/graphql_api/user_pool.rs`), read through that service's own accessors, so a
+# pool its operations created is one this mode accepts tokens of.
+service-com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice = { workspace = true }
 # The service that holds the certificate a custom domain is served with: which names one
 # certificate covers is ITS fact, so `CreateDomainName` asks that store whether the
 # certificate it was handed can serve the requested domain name

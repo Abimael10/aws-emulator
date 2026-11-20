@@ -80,6 +80,14 @@ pub struct GraphqlRequest {
     /// authorization in front of the API refused ([`super::query`]), which resolve to
     /// nothing and are reported as errors of their own path instead of being run.
     pub unauthorized: Vec<(String, String)>,
+    /// The GROUPS the user pool token this call presented claims, for a call that mode
+    /// admitted — `None` for a call of every other authorization mode.
+    ///
+    /// Kept rather than resolved into [`Self::unauthorized`] up front because the schema may
+    /// guard a field of ANY type: the guard is judged where each field resolves
+    /// ([`super::user_pool::refused_fields`]), which is every depth the selection reaches and
+    /// not only the operation's root.
+    pub user_pool_groups: Option<Vec<String>>,
 }
 
 /// What executing one request came to: the data it resolved, and the errors of the fields
@@ -397,7 +405,11 @@ pub async fn execute(context: &PlaneContext, request: &GraphqlRequest) -> Answer
     // The parse happens in a scope of its own: the parser's own tree is not `Send`, so what
     // leaves this call is the operation and the fields it selects, read out of that tree and
     // owned, and the tree itself is gone before anything is awaited.
-    let (kind, fields) = match read_operation(request) {
+    let (kind, fields) = match read_operation(
+        &request.query,
+        request.operation_name.as_deref(),
+        &request.variables,
+    ) {
         Ok(read) => read,
         Err(refusal) => return Answer::refused(refusal),
     };
@@ -458,6 +470,13 @@ pub async fn execute(context: &PlaneContext, request: &GraphqlRequest) -> Answer
     let data = execution
         .resolve_fields(&root_type, &Json::Null, &fields, Vec::new(), 0)
         .await;
+    // A MUTATION is also what a subscription of this API receives: every field of it that
+    // resolved is published to the subscriptions the API's schema links to that mutation
+    // ([`super::subscriptions`]). A query publishes nothing, because no subscription is
+    // declared on one.
+    if kind == OperationKind::Mutation {
+        super::subscriptions::published(context, &fields, &data).await;
+    }
     Answer {
         data: Some(data),
         errors: execution.errors,
@@ -476,7 +495,11 @@ pub fn selected_root_fields(
     context: &PlaneContext,
     request: &GraphqlRequest,
 ) -> Vec<(String, String)> {
-    let Ok((kind, fields)) = read_operation(request) else {
+    let Ok((kind, fields)) = read_operation(
+        &request.query,
+        request.operation_name.as_deref(),
+        &request.variables,
+    ) else {
         return Vec::new();
     };
     let Some(root_type) = context
@@ -498,12 +521,41 @@ pub fn selected_root_fields(
         .collect()
 }
 
-/// Read `request`'s document: the operation to run and the fields it selects, owned, with
-/// the request's own variables already substituted.
+/// The ONE root field a SUBSCRIPTION document selects, with the client's own variables
+/// already substituted into its arguments — or `None` for a document that is not a
+/// subscription operation of one field ("subscription operations must have exactly one root
+/// field").
+///
+/// The reading is the SAME one an executed request's document goes through
+/// ([`read_operation`]), under the same bounds, so a subscription's field and arguments are
+/// read exactly as a query's are rather than by a second parse written beside it. It is what
+/// the real-time endpoint records a `start` as ([`super::realtime`]) and what a published
+/// mutation is filtered against ([`super::subscriptions`]).
+pub fn subscription_selection(
+    query: &str,
+    operation_name: Option<&str>,
+    variables: &JsonMap<String, Json>,
+) -> Option<SelectedField> {
+    let (kind, fields) = read_operation(query, operation_name, variables).ok()?;
+    if kind != OperationKind::Subscription {
+        return None;
+    }
+    match fields.as_slice() {
+        [selected] => Some(selected.clone()),
+        _ => None,
+    }
+}
+
+/// Read one document: the operation to run and the fields it selects, owned, with the
+/// request's own variables already substituted.
 ///
 /// Synchronous on purpose — nothing of the parser's tree escapes it.
-fn read_operation(request: &GraphqlRequest) -> Result<(OperationKind, Vec<SelectedField>), String> {
-    let parsed = ::apollo_parser::Parser::new(&request.query)
+fn read_operation(
+    query: &str,
+    operation_name: Option<&str>,
+    variables: &JsonMap<String, Json>,
+) -> Result<(OperationKind, Vec<SelectedField>), String> {
+    let parsed = ::apollo_parser::Parser::new(query)
         .recursion_limit(crate::state::DEFINITION_RECURSION_LIMIT)
         .token_limit(crate::state::DEFINITION_TOKEN_LIMIT)
         .parse();
@@ -511,11 +563,11 @@ fn read_operation(request: &GraphqlRequest) -> Result<(OperationKind, Vec<Select
         return Err(format!("{NOT_A_DOCUMENT} {}", error.message()));
     }
     let document = parsed.document();
-    let operation = selected_operation(&document, request.operation_name.as_deref())
-        .ok_or_else(|| no_such_operation(request.operation_name.as_deref()))?;
+    let operation = selected_operation(&document, operation_name)
+        .ok_or_else(|| no_such_operation(operation_name))?;
     let mut expansion = Expansion {
         document: &document,
-        variables: &request.variables,
+        variables,
         remaining: MAX_SELECTED_NODES,
         held: MAX_ARGUMENT_BYTES,
         spreading: Vec::new(),
@@ -690,6 +742,21 @@ impl Execution<'_> {
         {
             self.fault(unauthorized_field(path, type_name, &field.name));
             return Json::Null;
+        }
+        // And so does one the SCHEMA guards by Cognito group membership that this caller's
+        // token does not satisfy. Judged HERE rather than over the operation's root alone,
+        // because a guard is written on a field of any type and this is where every field of
+        // the selection resolves ([`super::user_pool::refused_fields`]).
+        if let Some(groups) = self.request.user_pool_groups.clone() {
+            let refused = super::user_pool::refused_fields(
+                self.context,
+                &[(type_name.to_string(), field.name.clone())],
+                &groups,
+            );
+            if !refused.is_empty() {
+                self.fault(unauthorized_field(path, type_name, &field.name));
+                return Json::Null;
+            }
         }
         // The fields GraphQL's INTROSPECTION SYSTEM adds to every schema are answered from
         // the API's own type system, before any resolver is looked for: no resolver can be
@@ -1192,15 +1259,26 @@ impl Execution<'_> {
         // A data source that was CALLED and did not answer is handed to the step's own
         // `ctx.error`, over which the response half still runs; a step no data source was
         // called for is reported to the caller ([`Self::run_templates`] states the rule).
-        let (result, error) = match self.data_source_outcome(step, &requested.value).await {
-            DataSourceOutcome::Result(result) => (result, Json::Null),
-            DataSourceOutcome::Answered(failure) => (Json::Null, failure.reported()),
+        let (result, error, unhandled) = match self.data_source_outcome(step, &requested.value).await
+        {
+            DataSourceOutcome::Result(result) => (result, Json::Null, None),
+            DataSourceOutcome::Answered(failure) => (Json::Null, failure.reported(), Some(failure)),
             DataSourceOutcome::NotCalled(failure) => return Err(failure),
         };
         let context = step_context(base, stash, &result, previous, &error);
+        // How many errors THIS step's half appended ([`Self::run_templates`] states why the
+        // count is taken per step rather than over the field's whole list).
+        let appended_before = self.appended.len();
         let answered = self
             .evaluated(code, RESPONSE_FUNCTION, &context, stash)
             .await?;
+        // A half that handles the failure in NEITHER way a definition can does not make the
+        // call succeed ([`Self::run_templates`] states the rule), so the field reports it.
+        if let Some(failure) = unhandled {
+            if self.appended.len() == appended_before {
+                return Err(failure);
+            }
+        }
         self.record_response(recorded, &answered.value);
         Ok(answered.value)
     }
@@ -1301,9 +1379,14 @@ impl Execution<'_> {
     /// A data source that was CALLED and did not answer is not the end of the step: AppSync
     /// hands what went wrong to the step's own `$ctx.error` and evaluates the RESPONSE half
     /// over it, so a definition that states what to do about a failure decides the field —
-    /// which is what `$util.error($ctx.error.message, $ctx.error.type)` is written for. A step
-    /// with no response half to run reports the failure itself, and so does one whose data
-    /// source was never called at all ([`DataSourceOutcome`]).
+    /// which is what `$util.error($ctx.error.message, $ctx.error.type)` is written for. A half
+    /// that handles it in NEITHER way a definition can — raising its own error, or appending
+    /// one beside a value it still answers — leaves the failure unhandled, and the field
+    /// reports it: a call that failed produced no value, so a half that ignores the failure
+    /// cannot turn it into one. Whether it handled it is counted over THIS step's own appended
+    /// errors, because the field's list spans every step of a pipeline. A step with no
+    /// response half to run reports the failure itself, and so does one whose data source was
+    /// never called at all ([`DataSourceOutcome`]).
     async fn run_templates(
         &mut self,
         step: &PipelineStep,
@@ -1322,10 +1405,13 @@ impl Execution<'_> {
             None => Json::Null,
         };
         self.record_request(recorded, &requested);
-        let (result, error) = match self.data_source_outcome(step, &requested).await {
-            DataSourceOutcome::Result(result) => (result, Json::Null),
+        // What the data source answered, and — for a call that FAILED over a step with a
+        // response half — the failure that half runs over, kept because a half that handles
+        // it in neither of the two ways a definition can does not make the call succeed.
+        let (result, error, unhandled) = match self.data_source_outcome(step, &requested).await {
+            DataSourceOutcome::Result(result) => (result, Json::Null, None),
             DataSourceOutcome::Answered(failure) if templates.response.is_some() => {
-                (Json::Null, failure.reported())
+                (Json::Null, failure.reported(), Some(failure))
             }
             DataSourceOutcome::Answered(failure) | DataSourceOutcome::NotCalled(failure) => {
                 return Err(failure)
@@ -1333,9 +1419,19 @@ impl Execution<'_> {
         };
         let answered = match &templates.response {
             Some(template) => {
+                // How many errors THIS step's half appended is what says whether it handled
+                // the failure: the field's list is not cleared between the steps of a
+                // pipeline, so what an earlier step appended says nothing about this one.
+                let appended_before = self.appended.len();
                 let context = step_context(base, stash, &result, previous, &error);
                 let rendered = self.rendered(template, &context, stash).await?;
-                read_rendered(&rendered, RESPONSE_TEMPLATE)?
+                let answered = read_rendered(&rendered, RESPONSE_TEMPLATE)?;
+                if let Some(failure) = unhandled {
+                    if self.appended.len() == appended_before {
+                        return Err(failure);
+                    }
+                }
+                answered
             }
             None => result,
         };
@@ -3116,6 +3212,10 @@ fn read_value(
         }
         Value::StringValue(text) => Json::String(String::from(text.clone())),
         Value::ListValue(list) => {
+            // A composite is charged for ITS OWN node before its elements are read: a list or
+            // an object is retained whatever its elements weigh, so a literal of empty
+            // composites costs budget rather than nothing ([`COMPOSITE_NODE_BYTES`]).
+            spend(held, COMPOSITE_NODE_BYTES)?;
             let mut elements: Vec<Json> = Vec::new();
             for element in list.values() {
                 elements.push(read_value(
@@ -3128,6 +3228,7 @@ fn read_value(
             return Ok(Json::Array(elements));
         }
         Value::ObjectValue(object) => {
+            spend(held, COMPOSITE_NODE_BYTES)?;
             let mut members = JsonMap::new();
             for member in object.object_fields() {
                 let (Some(name), Some(value)) = (member.name(), member.value()) else {
@@ -3152,15 +3253,31 @@ fn read_value(
             ::serde_json::from_str(text.trim()).unwrap_or(Json::Null)
         }
     };
-    // A list and an object are charged through their own elements above, so only the values
-    // that are read whole are weighed here — which is where a substituted variable lands.
+    // A list and an object are charged for their own node and then through their elements
+    // above, so only the values that are read whole are weighed here — which is where a
+    // substituted variable lands.
     let weight = mapping_template::weigh(&read, 0)
         .map_err(|_| format!("{TOO_MUCH_ARGUMENT} {MAX_ARGUMENT_BYTES} bytes."))?;
+    spend(held, weight)?;
+    Ok(read)
+}
+
+/// What a COMPOSITE value's own node costs the argument budget: the footprint the shared
+/// reading of a held value gives one (`mapping_template::weigh` charges a `Json`'s own size
+/// for the node and then its elements), so one service weighs a held value one way.
+const COMPOSITE_NODE_BYTES: usize = ::std::mem::size_of::<Json>();
+
+/// Spend `weight` of what one document's arguments may still hold, or refuse the document for
+/// asking to hold more than [`MAX_ARGUMENT_BYTES`].
+///
+/// The ONE place that budget is drawn down, so every value a document's arguments retain —
+/// each composite's own node and each value read whole — is charged the same way.
+fn spend(held: &mut usize, weight: usize) -> Result<(), String> {
     if weight > *held {
         return Err(format!("{TOO_MUCH_ARGUMENT} {MAX_ARGUMENT_BYTES} bytes."));
     }
     *held -= weight;
-    Ok(read)
+    Ok(())
 }
 
 /// Whether `value` nests deeper than `depth` levels.

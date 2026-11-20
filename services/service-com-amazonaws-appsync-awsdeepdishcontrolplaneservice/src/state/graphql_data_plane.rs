@@ -47,8 +47,23 @@ struct ConnectionRecord {
     /// the receiving half, so a delivery is a real write over that socket.
     frames: Sender<String>,
     /// The subscriptions this connection holds, keyed by the subscription id the client
-    /// chose, each the subscription FIELD of the API's schema it was started on.
-    subscriptions: BTreeMap<String, String>,
+    /// chose.
+    subscriptions: BTreeMap<String, SubscriptionRecord>,
+}
+
+/// One subscription a connection holds: the subscription FIELD of the API's schema it was
+/// started on, and the ARGUMENTS the client started it with.
+///
+/// The arguments are kept because they are what a delivery to this subscription is filtered
+/// by: AppSync delivers a published mutation to a subscription only where every argument the
+/// subscription states matches the published object
+/// ([`crate::service::graphql_api::subscriptions`]).
+#[derive(Debug, Clone)]
+pub struct SubscriptionRecord {
+    /// The subscription field of the API's schema this subscription is on.
+    pub field: String,
+    /// The arguments the `start` carried, with the client's own variables substituted.
+    pub arguments: ::serde_json::Map<String, ::serde_json::Value>,
 }
 
 /// The GraphQL API data plane's records: the sockets each API is served on, the
@@ -193,14 +208,15 @@ impl GraphqlDataPlane {
             .map_or(0, |connection| connection.subscriptions.len())
     }
 
-    /// Record that `connection_id` holds a subscription on the schema field `field` under
-    /// the id the client chose.
+    /// Record that `connection_id` holds a subscription on the schema field `field`, started
+    /// with `arguments`, under the id the client chose.
     pub fn start_subscription(
         &mut self,
         api_id: &str,
         connection_id: &str,
         subscription_id: &str,
         field: &str,
+        arguments: ::serde_json::Map<String, ::serde_json::Value>,
     ) -> Result<(), SubscribeRefusal> {
         let connection = self
             .apis
@@ -213,9 +229,13 @@ impl GraphqlDataPlane {
         if connection.subscriptions.len() >= SUBSCRIPTIONS_PER_CONNECTION {
             return Err(SubscribeRefusal::TooMany);
         }
-        connection
-            .subscriptions
-            .insert(subscription_id.to_string(), field.to_string());
+        connection.subscriptions.insert(
+            subscription_id.to_string(),
+            SubscriptionRecord {
+                field: field.to_string(),
+                arguments,
+            },
+        );
         Ok(())
     }
 
@@ -231,14 +251,19 @@ impl GraphqlDataPlane {
             .get_mut(api_id)
             .and_then(|socket| socket.connections.get_mut(connection_id))
             .and_then(|connection| connection.subscriptions.remove(subscription_id))
+            .map(|subscription| subscription.field)
     }
 
-    /// Every subscription of `api_id` on the field `field`: the queue its frames go to,
-    /// paired with the subscription id a `data` frame is addressed by.
+    /// Every subscription of `api_id` on the field `field`: the queue its frames go to, the
+    /// subscription id a `data` frame is addressed by, and the arguments it was started with.
     ///
     /// The queues are CLONED out, so a delivery is made with no store lock held. This is
     /// what a mutation of the API's schema publishes through.
-    pub fn deliveries(&self, api_id: &str, field: &str) -> Vec<(String, Sender<String>)> {
+    pub fn deliveries(
+        &self,
+        api_id: &str,
+        field: &str,
+    ) -> Vec<(String, Sender<String>, SubscriptionRecord)> {
         let Some(socket) = self.apis.get(api_id) else {
             return Vec::new();
         };
@@ -249,8 +274,10 @@ impl GraphqlDataPlane {
                 connection
                     .subscriptions
                     .iter()
-                    .filter(|(_, subscribed)| subscribed.as_str() == field)
-                    .map(|(id, _)| (id.clone(), connection.frames.clone()))
+                    .filter(|(_, subscribed)| subscribed.field == field)
+                    .map(|(id, subscribed)| {
+                        (id.clone(), connection.frames.clone(), subscribed.clone())
+                    })
             })
             .collect()
     }

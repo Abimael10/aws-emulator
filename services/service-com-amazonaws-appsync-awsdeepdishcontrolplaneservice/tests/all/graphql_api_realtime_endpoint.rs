@@ -83,7 +83,7 @@ struct GraphqlApi {
 }
 
 /// The socket a client gets from a completed handshake.
-type ClientSocket = tokio_tungstenite::WebSocketStream<TcpStream>;
+pub(crate) type ClientSocket = tokio_tungstenite::WebSocketStream<TcpStream>;
 
 #[tokio::test]
 async fn the_published_realtime_endpoint_is_the_socket_this_emulator_serves_it_on() {
@@ -536,17 +536,30 @@ fn start_message(id: &str, field: &str) -> Value {
 }
 
 /// The same, carrying whatever GraphQL document the case presents.
-fn query_message(id: &str, query: &str) -> Value {
+///
+/// Shared with the suite that drives a mutation's delivery to a subscriber
+/// ([`crate::graphql_api_subscription_delivery`]), so both send the `start` a client sends.
+pub(crate) fn query_message(id: &str, query: &str) -> Value {
+    started_message(id, query, &json!({}))
+}
+
+/// The same, parameterised by the `variables` the client's own document carries.
+pub(crate) fn started_message(id: &str, query: &str, variables: &Value) -> Value {
     json!({
         "id": id,
         "type": "start",
-        "payload": {"data": json!({"query": query, "variables": {}}).to_string()},
+        "payload": {"data": json!({"query": query, "variables": variables}).to_string()},
     })
 }
 
 /// Open an opening handshake against the published endpoint: the established socket, or the
 /// status the refusal carried.
-async fn handshake(
+///
+/// The ONE real-time client of this crate's GraphQL suites: the suite that drives a
+/// mutation's delivery to a subscriber ([`crate::graphql_api_subscription_delivery`]) dials
+/// through this too, so there is one reading of how a client reaches a published real-time
+/// address.
+pub(crate) async fn handshake(
     case: &str,
     authority: &str,
     path: &str,
@@ -619,12 +632,21 @@ async fn handshake(
 /// Open a connection with the API's own key, ack it, and answer the socket — what every
 /// case that needs a subscriber starts from.
 async fn connected(case: &str, api: &GraphqlApi) -> ClientSocket {
+    connected_with_key(case, &api.realtime, &api.api_key).await
+}
+
+/// The same, over whatever published address and API key the case holds.
+pub(crate) async fn connected_with_key(
+    case: &str,
+    realtime: &str,
+    api_key: &str,
+) -> ClientSocket {
     let mut socket = handshake(
         case,
-        &api.realtime,
+        realtime,
         REALTIME_PATH,
         true,
-        Some(&json!({"host": api.realtime, "x-api-key": api.api_key})),
+        Some(&json!({"host": realtime, "x-api-key": api_key})),
         &[],
     )
     .await
@@ -646,7 +668,7 @@ async fn connected(case: &str, api: &GraphqlApi) -> ClientSocket {
 }
 
 /// Send one message and read the frame the endpoint answers with.
-async fn exchange(case: &str, socket: &mut ClientSocket, message: &Value) -> Option<Value> {
+pub(crate) async fn exchange(case: &str, socket: &mut ClientSocket, message: &Value) -> Option<Value> {
     send_raw(case, socket, &message.to_string()).await
 }
 
@@ -662,7 +684,7 @@ async fn send_raw(case: &str, socket: &mut ClientSocket, body: &str) -> Option<V
 
 /// The next frame the endpoint writes, or `None` when the connection carries no further
 /// frame — which a connection this endpoint ENDED does not.
-async fn next_frame(socket: &mut ClientSocket) -> Option<Value> {
+pub(crate) async fn next_frame(socket: &mut ClientSocket) -> Option<Value> {
     match tokio::time::timeout(FRAME_DEADLINE, socket.next()).await {
         Ok(Some(Ok(Message::Text(text)))) => serde_json::from_str(text.as_str()).ok(),
         Ok(Some(Ok(Message::Binary(bytes)))) => serde_json::from_slice(&bytes).ok(),
