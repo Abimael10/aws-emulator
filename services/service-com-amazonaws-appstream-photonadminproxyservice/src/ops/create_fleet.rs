@@ -5,7 +5,10 @@
 //! returns the modelled `Fleet` rendered FROM that record. A freshly created fleet is
 //! `STOPPED` with no running capacity, and `ComputeCapacityStatus.Desired` comes from
 //! the requested `ComputeCapacity`. A duplicate `Name` answers
-//! `ResourceAlreadyExistsException` (HTTP 400).
+//! `ResourceAlreadyExistsException` (HTTP 400). A fleet RUNS AS the role the request names,
+//! so an `IamRoleArn` this account's IAM does not hold a role under, or holds one under
+//! whose trust policy withholds this service, answers `InvalidRoleException` (HTTP 400)
+//! before anything is written.
 //!
 //! ## Shape of an operation
 //!
@@ -258,6 +261,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("CreateFleet"))?;
         let region = crate::state::request_region(ctx.parts());
+
+        // "The Amazon Resource Name (ARN) of the IAM role to apply to the fleet": a fleet
+        // RUNS AS that role, so whether this account holds a role under the ARN that this
+        // service may assume is IAM's answer, and it is asked BEFORE anything is written
+        // — a request naming a role the service cannot assume creates no fleet. The
+        // reading is the one `create_app_block_builder.rs` asks for the other resource
+        // that runs as a caller-supplied role.
+        if let Some(role_arn) = input.iam_role_arn.as_deref() {
+            if ::service_common::iam_role::role_is_unassumable(
+                ctx,
+                &region,
+                role_arn,
+                crate::state::SERVICE_PRINCIPAL,
+            )
+            .await
+            {
+                return Err(CreateFleetErrorModeled::InvalidRoleException(
+                    InvalidRoleException {
+                        message: Some(crate::state::invalid_role_message(role_arn)),
+                    },
+                )
+                .into());
+            }
+        }
+
         let mut state = state.lock();
 
         if state.fleets.contains_key(&input.name) {

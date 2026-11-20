@@ -17,6 +17,10 @@
 //! stands beside it, which action it names and which kind of principal it names), along
 //! whether the IAM store holds the role at all, and along whether the request names a role
 //! in the first place.
+//!
+//! The same rule governs the OTHER AppStream resource that runs as a caller-supplied role,
+//! a fleet; that suite is `all/appstream_fleet_role_trust.rs`, and it drives both services
+//! through the helpers below rather than standing up a second harness.
 
 use std::sync::Arc;
 
@@ -42,7 +46,7 @@ const SERVICE_PRINCIPAL: &str =
 
 /// One emulator carrying both services over ONE shared engine, exactly as the production
 /// router builds them.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -80,7 +84,7 @@ async fn iam(router: &MultiServiceRouter, action: &str, params: &[(&str, &str)])
 }
 
 /// One awsJson1_1 call to AppStream, answered with the HTTP status and the JSON body.
-async fn appstream(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn appstream(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -113,7 +117,7 @@ async fn appstream(router: &MultiServiceRouter, operation: &str, body: Value) ->
 }
 
 /// The wire error code of a failure body (`__type`, possibly namespace-qualified).
-fn error_code(payload: &Value) -> String {
+pub(crate) fn error_code(payload: &Value) -> String {
     payload
         .get("__type")
         .and_then(Value::as_str)
@@ -125,7 +129,7 @@ fn error_code(payload: &Value) -> String {
 }
 
 /// The `Message` of a failure body.
-fn error_message(payload: &Value) -> String {
+pub(crate) fn error_message(payload: &Value) -> String {
     payload
         .get("Message")
         .or_else(|| payload.get("message"))
@@ -135,7 +139,7 @@ fn error_message(payload: &Value) -> String {
 }
 
 /// A trust policy naming `principals` in one `Allow` statement.
-fn trust_allowing(principals: &[&str]) -> String {
+pub(crate) fn trust_allowing(principals: &[&str]) -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -148,7 +152,7 @@ fn trust_allowing(principals: &[&str]) -> String {
 }
 
 /// Create a role in IAM carrying `document` and hand back its ARN.
-async fn role_with_trust(router: &MultiServiceRouter, name: &str, document: &str) -> String {
+pub(crate) async fn role_with_trust(router: &MultiServiceRouter, name: &str, document: &str) -> String {
     let (status, created) = iam(
         router,
         "CreateRole",
@@ -177,7 +181,7 @@ fn create_builder_body(name: &str, role_arn: Option<&str>) -> Value {
 }
 
 /// AWS's sentence for a role the service cannot assume, as the crate states it.
-fn invalid_role_sentence(role_arn: &str) -> String {
+pub(crate) fn invalid_role_sentence(role_arn: &str) -> String {
     service_com_amazonaws_appstream_photonadminproxyservice::state::invalid_role_message(role_arn)
 }
 
