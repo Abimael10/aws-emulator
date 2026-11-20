@@ -331,6 +331,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(UpdatePipeErrorModeled::ValidationException(violation).into());
         }
 
+        // The same reading of an `InputTemplate` the create does, against the templates
+        // this update would LEAVE in force — the members it carries over the ones the pipe
+        // already holds — so an update cannot install a template `CreatePipe` would have
+        // refused, and a refused update leaves the stored configuration as it was.
+        let enrichment_parameters = input
+            .enrichment_parameters
+            .as_ref()
+            .or(pipe.enrichment_parameters.as_ref());
+        if let Some(violation) =
+            crate::state::input_template_violation(enrichment_parameters, target_parameters)
+        {
+            return Err(UpdatePipeErrorModeled::ValidationException(violation).into());
+        }
+
         // The other half of the bring-up decision, asked here because it is asked of the
         // configuration this update would LEAVE the pipe in rather than of the account's
         // records: an update that stores a dead-letter destination no pipe may name is an

@@ -36,8 +36,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::pipe_data_plane::{
-    collect_at_least, collect_during, counted, emulator, given_queue, sqs, wait_for_visible,
-    QUIET,
+    collect_at_least, collect_during, emulator, given_queue, sqs, wait_for_counted,
+    wait_for_visible, QUIET,
 };
 use crate::pipe_lifecycle::{call, describe, REGION};
 
@@ -252,28 +252,62 @@ async fn run_row(row: &Row) {
 
 /// RULE: the reading is the PATHS' alone — a stage handed the event itself receives the
 /// record envelope with the message body as the producer sent it, whatever that text
-/// spells — and a path that names nothing in the body is a failed delivery rather than a
-/// payload carrying the path: the record stays on the source, undeleted.
+/// spells — and a path that names no one value of the event stands for the EMPTY STRING:
+/// the record is delivered with that placeholder filled by nothing, never with the path
+/// itself, and it is consumed like any other.
+///
+/// The rows differ along what the rule generalises over: whether the pipe renders a
+/// template at all, the format of the body (object, list, plain text), why the path
+/// resolves to nothing (a member the document does not carry, a path into a body that
+/// spells no document, a path under a value that is no document) and where the
+/// unresolved placeholder stands (inside a string literal, as a JSON value, in a template
+/// that is not JSON text).
 #[tokio::test]
-async fn the_payload_keeps_the_body_as_sent_and_an_unresolvable_path_delivers_nothing() {
-    // (case, the template the pipe carries or none at all, the body sent)
-    let rows: Vec<(&str, Option<&str>, &str)> = vec![
-        ("no-template-json-body", None, r#"{"id": "as-sent-1"}"#),
-        ("no-template-json-list-body", None, "[1, 2, 3]"),
-        ("no-template-text-body", None, "as-sent-text"),
+async fn the_payload_keeps_the_body_as_sent_and_an_unresolvable_path_renders_empty() {
+    // (case, the template the pipe carries or none at all, the body sent, the bytes the
+    // target must receive — asserted for a row that renders a template; a row with none
+    // is asserted on the envelope it is handed)
+    let rows: Vec<(&str, Option<&str>, &str, &str)> = vec![
+        ("no-template-json-body", None, r#"{"id": "as-sent-1"}"#, ""),
+        ("no-template-json-list-body", None, "[1, 2, 3]", ""),
+        ("no-template-text-body", None, "as-sent-text", ""),
         (
             "a-path-into-a-text-body",
-            Some("<$.body.id>"),
+            Some(r#"{"id": "<$.body.id>", "from": "<$.eventSource>"}"#),
             "no document here",
+            r#"{"id": "", "from": "aws:sqs"}"#,
         ),
         (
             "a-path-to-an-absent-member",
-            Some("<$.body.missing>"),
+            Some(r#"{"id": "<$.body.missing>", "present": "<$.body.id>"}"#),
             r#"{"id": "present"}"#,
+            r#"{"id": "", "present": "present"}"#,
+        ),
+        (
+            // Standing where a JSON value stands, the empty string is the value the
+            // render writes, so the template's own JSON is still JSON.
+            "an-absent-path-standing-as-a-json-value",
+            Some(r#"{"v": <$.body.missing>, "id": "<$.body.id>"}"#),
+            r#"{"id": "value-1"}"#,
+            r#"{"v": "", "id": "value-1"}"#,
+        ),
+        (
+            "an-absent-path-under-a-member-that-is-no-document",
+            Some(r#"{"deep": "<$.body.id.deeper>", "id": "<$.body.id>"}"#),
+            r#"{"id": "deep-1"}"#,
+            r#"{"deep": "", "id": "deep-1"}"#,
+        ),
+        (
+            // Not JSON text: the characters the template wrote, with nothing where the
+            // unresolved path stood.
+            "an-absent-path-in-a-text-template",
+            Some("missing=<$.body.missing>;id=<$.body.id>"),
+            r#"{"id": "text-1"}"#,
+            "missing=;id=text-1",
         ),
     ];
 
-    for (case, template, body) in rows {
+    for (case, template, body, expected) in rows {
         let router = emulator();
         let (source_url, source_arn) = given_queue(&router, &format!("{case}-src")).await;
         let (target_url, target_arn) = given_queue(&router, &format!("{case}-tgt")).await;
@@ -302,14 +336,14 @@ async fn the_payload_keeps_the_body_as_sent_and_an_unresolvable_path_delivers_no
         );
         send(&router, &source_url, case, body).await;
 
+        let delivered = collect_at_least(&router, &target_url, 1, BUDGET).await;
+        let first = delivered
+            .first()
+            .unwrap_or_else(|| panic!("case {case:?}: nothing was delivered"));
         match template {
             // No template: the envelope itself, carrying the body as the producer sent it
             // — the reading the paths take is theirs alone.
             None => {
-                let delivered = collect_at_least(&router, &target_url, 1, BUDGET).await;
-                let first = delivered
-                    .first()
-                    .unwrap_or_else(|| panic!("case {case:?}: nothing was delivered"));
                 let envelope: Value = serde_json::from_str(first).unwrap_or_else(|error| {
                     panic!("case {case:?}: a delivered body is not JSON ({error}): {first:?}")
                 });
@@ -320,24 +354,87 @@ async fn the_payload_keeps_the_body_as_sent_and_an_unresolvable_path_delivers_no
                      sent, got {envelope}"
                 );
             }
-            // A path that names no one value of the event: nothing is delivered, and the
-            // record is not deleted — it is still one the source holds.
+            // A path that names no one value of the event: the render carries the empty
+            // string for it and the rest of the template as written.
             Some(_) => {
-                let delivered = collect_during(&router, &target_url, QUIET).await;
-                assert!(
-                    delivered.is_empty(),
-                    "case {case:?}: expected no delivery for a path that names nothing, \
-                     got {delivered:?}"
-                );
-                let held = counted(&router, &source_url, &HELD_ATTRIBUTES).await;
                 assert_eq!(
-                    held, 1,
-                    "case {case:?}: expected the record the pipe could not render to stay \
-                     on the source, which holds {held}"
+                    canonical(first),
+                    canonical(expected),
+                    "case {case:?}: expected the target to receive {expected:?}, \
+                     got {first:?}"
                 );
             }
         }
+        // Either way the record the pipe decided about is consumed: an unresolved path is
+        // a routine condition and not a record left behind. Waited for, because the delete
+        // follows the delivery this row already saw.
+        let held = wait_for_counted(&router, &source_url, &HELD_ATTRIBUTES, 0, BUDGET).await;
+        assert_eq!(
+            held, 0,
+            "case {case:?}: expected the delivered record consumed, the source holds {held}"
+        );
     }
+}
+
+/// RULE: the documented whole-event escape hatch renders the event as the JSON document it
+/// is, beside an unresolved path that renders the empty string in the same template — so a
+/// template that reads a member the event does not carry still delivers the event.
+#[tokio::test]
+async fn an_unresolved_path_and_the_whole_event_are_delivered_together() {
+    let case = "unresolved-path-and-whole-event";
+    let router = emulator();
+    let (source_url, source_arn) = given_queue(&router, &format!("{case}-src")).await;
+    let (target_url, target_arn) = given_queue(&router, &format!("{case}-tgt")).await;
+    let template = concat!(
+        r#"{"missing": "<$.body.missing>", "marker": "<$.body.marker>", "#,
+        r#""event": <aws.pipes.event.json>}"#,
+    );
+    let created = call(
+        &router,
+        "POST",
+        &format!("/v1/pipes/{case}"),
+        Some(json!({
+            "Source": source_arn,
+            "Target": target_arn,
+            "RoleArn": ROLE,
+            "DesiredState": "RUNNING",
+            "SourceParameters": source_parameters(&[]),
+            "TargetParameters": { "InputTemplate": template },
+        })),
+        REGION,
+    )
+    .await;
+    assert_eq!(
+        created.status, 200,
+        "case {case:?}: CreatePipe answered {} {}",
+        created.status, created.body
+    );
+
+    let body = r#"{"marker": "carried-1"}"#;
+    send(&router, &source_url, case, body).await;
+    let delivered = collect_at_least(&router, &target_url, 1, BUDGET).await;
+    let first = delivered
+        .first()
+        .unwrap_or_else(|| panic!("case {case:?}: nothing was delivered"));
+    let rendered: Value = serde_json::from_str(first).unwrap_or_else(|error| {
+        panic!("case {case:?}: the delivered payload is not JSON ({error}): {first:?}")
+    });
+    assert_eq!(
+        rendered["missing"],
+        json!(""),
+        "case {case:?}: expected the unresolved path to render the empty string, \
+         got {rendered}"
+    );
+    assert_eq!(
+        rendered["marker"],
+        json!("carried-1"),
+        "case {case:?}: expected the resolved path to render its value, got {rendered}"
+    );
+    assert_eq!(
+        rendered["event"]["body"],
+        json!({ "marker": "carried-1" }),
+        "case {case:?}: expected the whole event rendered as JSON, got {rendered}"
+    );
 }
 
 /// RULE: what a stage is handed for one event is the template's own text with every

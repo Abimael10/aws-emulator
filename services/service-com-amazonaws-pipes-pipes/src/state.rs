@@ -712,6 +712,16 @@ const TARGET_PARAMETERS_MEMBER: &str = "TargetParameters";
 /// model names it — the member a requirement of such a target is reported at.
 const SQS_QUEUE_PARAMETERS_MEMBER: &str = "SqsQueueParameters";
 
+/// The member a template that spells no JSON is reported at: the one that carried it, as
+/// both `PipeTargetParameters` and `PipeEnrichmentParameters` name it — which is why the
+/// refusal reads alike whichever of the two carried the template.
+const INPUT_TEMPLATE_MEMBER: &str = "InputTemplate";
+
+/// What this service reports for an `InputTemplate` that is JSON text and spells no JSON
+/// document: ONE fixed sentence for the class, the offending member's name being the only
+/// part of the refusal that varies ([`input_template_violation`]).
+const MALFORMED_INPUT_TEMPLATE_MESSAGE: &str = "Invalid JSON format for Input Template.";
+
 /// What this service reports for a member the request had to carry and did not, and what it
 /// reports for a TARGET parameter the target resource requires that the configuration does
 /// not supply.
@@ -925,6 +935,38 @@ pub fn cross_resource_violation(
     }
     let field = cross_resource_field(source_parameters, target, target_parameters)?;
     Some(validation_error(vec![field]))
+}
+
+/// The `ValidationException` a pipe configuration is refused with when an `InputTemplate`
+/// it carries does not spell the valid JSON text that member is, or `None` when every
+/// template it carries does.
+///
+/// A template is "Valid JSON text passed to the target" (and the same sentence for the
+/// enrichment's own), with its placeholders standing where a JSON value or a string's
+/// characters stand, so whether it spells that JSON is decided from the template's own text
+/// ([`data_plane::spells_malformed_json`]) and decided at AUTHORING time: a write carrying
+/// one that spells no JSON stores nothing, rather than leaving a broken template to be
+/// discovered by a delivery. Asked of the configuration the pipe would END UP with by both
+/// writes that can configure one, and of BOTH members that carry a template, which are
+/// reported alike — the member's own name is the only part of this refusal that varies.
+pub fn input_template_violation(
+    enrichment_parameters: Option<&PipeEnrichmentParameters>,
+    target_parameters: Option<&PipeTargetParameters>,
+) -> Option<ValidationException> {
+    let templates = [
+        enrichment_parameters.and_then(|parameters| parameters.input_template.as_deref()),
+        target_parameters.and_then(|parameters| parameters.input_template.as_deref()),
+    ];
+    templates
+        .into_iter()
+        .flatten()
+        .any(data_plane::spells_malformed_json)
+        .then(|| {
+            validation_error(vec![validation_field(
+                INPUT_TEMPLATE_MEMBER,
+                MALFORMED_INPUT_TEMPLATE_MESSAGE,
+            )])
+        })
 }
 
 /// The one field [`cross_resource_violation`] reports for the rules that name exactly one,

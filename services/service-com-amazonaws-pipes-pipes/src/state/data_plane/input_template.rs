@@ -36,8 +36,15 @@
 //!   placeholder contributes its value's own characters, nothing escapes them, and every
 //!   character the template wrote is delivered as written.
 //!
-//! A path that selects no one value of the event is a FAILED render — the record stays on
-//! the source — rather than a payload carrying the path itself.
+//! A path that selects no one value of the event stands for the EMPTY STRING: the render
+//! carries that placeholder as nothing at all and the record is still delivered, rather
+//! than the event being failed over a member it happens not to carry — and never a payload
+//! carrying the path itself.
+//!
+//! The template's own JSON, on the other hand, is the AUTHOR's to get right, and it is read
+//! at authoring time rather than at delivery time: a template that is JSON text but spells
+//! no JSON document even once each of its placeholders stands for a value is one no write
+//! stores ([`spells_malformed_json`]).
 //!
 //! The text is walked ONCE, left to right, its length is bounded ([`MAX_TEMPLATE_BYTES`])
 //! and what the placeholders ADD is bounded by [`MAX_RENDERED_PAYLOAD`], because a template
@@ -89,6 +96,17 @@ const RESERVED_VARIABLES: [&str; 8] = [
 /// The characters a template that is JSON TEXT opens with: the ones that open a JSON
 /// object and a JSON array, which are the templates whose own JSON a render keeps.
 const JSON_DOCUMENT_OPENERS: [char; 2] = ['{', '['];
+
+/// The characters a template whose own JSON is READ opens with: the two that open a JSON
+/// document, and the quote that opens a JSON string — every form of the "valid JSON text"
+/// an `InputTemplate` is documented to be ([`spells_malformed_json`]). A template opening
+/// with anything else spells no JSON at all and carries none to read.
+const JSON_TEXT_OPENERS: [char; 3] = ['{', '[', JSON_STRING_QUOTE_CHARACTER];
+
+/// What stands where a placeholder standing as a JSON VALUE stands when the template's own
+/// JSON is read with no event to fill it: a JSON literal, so what is read is the
+/// template's STRUCTURE and not the type of the value a placeholder will carry.
+const JSON_VALUE_STAND_IN: &str = "null";
 
 /// What the reserved variables of an `InputTemplate` render to: the identity of the pipe
 /// whose stage is being handed the payload, and the resources it is configured with.
@@ -211,6 +229,48 @@ fn opens_a_json_document(template: &str) -> bool {
     template.trim_start().starts_with(JSON_DOCUMENT_OPENERS)
 }
 
+/// Whether the JSON an `InputTemplate` spells is BROKEN: the template is JSON text
+/// ([`JSON_TEXT_OPENERS`]) and does not parse as a JSON document even once each of its
+/// placeholders stands for the value it names.
+///
+/// This is the template's own text read as the "valid JSON text" the member is documented to
+/// be, which is a property of the TEMPLATE and of nothing else — no event, no pipe, no
+/// clock — so it is answered for a write that is about to store one, before any record has
+/// been polled. A template that opens no JSON at all is text the author wrote, carries no
+/// JSON to read, and is left alone here.
+///
+/// The parse is `serde_json`'s, over text the member's own `@length` already bounds, and it
+/// answers with an error rather than failing: a template no parser can read is one this
+/// answers `true` for.
+///
+/// `pub(crate)` because the writes that configure a pipe ask it ([`super::super`]'s
+/// configuration rules): the template language lives in this module, so whether a template
+/// spells its own JSON is answered here rather than restated at each call site.
+pub(crate) fn spells_malformed_json(template: &str) -> bool {
+    if !template.trim_start().starts_with(JSON_TEXT_OPENERS) {
+        return false;
+    }
+    ::serde_json::from_str::<Value>(&placeholders_stood_in(template)).is_err()
+}
+
+/// `template` with every placeholder replaced by what STANDS where it stands when the
+/// template's own JSON is read: a JSON literal where a JSON value stands
+/// ([`JSON_VALUE_STAND_IN`]), and nothing at all inside a string literal, whose quotes are
+/// the template's own. What is left is the template's JSON with no placeholder in it.
+fn placeholders_stood_in(template: &str) -> String {
+    let mut text = String::with_capacity(template.len());
+    let mut taken = 0usize;
+    for (span, _) in placeholders_of(template) {
+        text.push_str(&template[taken..span.start]);
+        if !inside_a_json_string(template, span.start) {
+            text.push_str(JSON_VALUE_STAND_IN);
+        }
+        taken = span.end;
+    }
+    text.push_str(&template[taken..]);
+    text
+}
+
 /// What one placeholder of a template STANDS FOR.
 #[derive(Debug, Clone)]
 enum Placeholder {
@@ -276,7 +336,9 @@ fn stands_for(content: &str) -> Option<Placeholder> {
 ///
 /// A path is read through `service_common::json_reference_path`, the one bounded evaluation
 /// of a caller-supplied path in this tree, so a template cannot ask for a walk of the whole
-/// event. A reserved variable is read from the pipe's own configuration, the clock, or the
+/// event; a path that selects no one value of the event stands for the EMPTY STRING, so a
+/// member the event happens not to carry is rendered as nothing rather than failing the
+/// record. A reserved variable is read from the pipe's own configuration, the clock, or the
 /// event as the stage's readers read it:
 ///
 /// * the pipe's ARN and name, and the ARNs of its source, enrichment and target, as the
@@ -292,11 +354,9 @@ fn filled<'a>(
 ) -> Result<Cow<'a, Value>, String> {
     let variable = match placeholder {
         Placeholder::Path(path) => {
-            return ::service_common::json_reference_path::select(path, event)
+            return Ok(::service_common::json_reference_path::select(path, event)
                 .map(Cow::Borrowed)
-                .ok_or_else(|| {
-                    format!("the input template's {path} names no one value of the event")
-                })
+                .unwrap_or_else(|| Cow::Owned(Value::String(String::new()))))
         }
         Placeholder::Reserved(variable) => *variable,
     };
@@ -392,7 +452,7 @@ fn json_string_body(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{render_template, PipeVariables, RESERVED_VARIABLES};
+    use super::{render_template, spells_malformed_json, PipeVariables, RESERVED_VARIABLES};
     use ::serde_json::{json, Value};
 
     /// The pipe every render below belongs to: the identity and the ARNs its reserved
@@ -627,6 +687,100 @@ mod tests {
                 !rendered.body().contains(&format!("<{variable}>")),
                 "case {variable:?}: expected the variable filled, got {:?}",
                 rendered.body()
+            );
+        }
+    }
+
+    /// RULE: a path that selects no one value of the event stands for the EMPTY STRING, so
+    /// the render succeeds and the rest of the template is delivered as written.
+    ///
+    /// The rows differ along where the unresolved placeholder stands (as a JSON value,
+    /// inside a string literal, in a template that is not JSON text), how deep the path
+    /// reaches past what the event carries, and what resolves beside it.
+    #[test]
+    fn a_path_that_selects_nothing_stands_for_the_empty_string() {
+        let event = event();
+        // (case, the template, the bytes the stage is handed)
+        let rows: Vec<(&str, &str, &str)> = vec![
+            (
+                "absent-member-inside-a-string-literal",
+                r#"{"v": "<$.body.missing>"}"#,
+                r#"{"v": ""}"#,
+            ),
+            (
+                "absent-member-as-a-json-value",
+                r#"{"v": <$.body.missing>}"#,
+                r#"{"v": ""}"#,
+            ),
+            (
+                "absent-beside-a-path-that-resolves",
+                r#"{"v": "<$.body.missing>", "t": "<$.body.text>"}"#,
+                r#"{"v": "", "t": "hello"}"#,
+            ),
+            (
+                "a-path-under-a-value-that-is-no-document",
+                r#"{"v": "<$.body.text.deeper>"}"#,
+                r#"{"v": ""}"#,
+            ),
+            (
+                "absent-in-a-text-template",
+                "missing=<$.body.missing>;",
+                "missing=;",
+            ),
+        ];
+        for (case, template, expected) in rows {
+            let rendered = render_template(template, &event, &pipe())
+                .unwrap_or_else(|error| panic!("case {case:?}: {error}"));
+            assert_eq!(
+                rendered.body(),
+                expected,
+                "case {case:?}: expected {expected:?}, got {:?}",
+                rendered.body()
+            );
+        }
+    }
+
+    /// RULE: a template that is JSON TEXT spells a JSON document once each of its
+    /// placeholders stands for a value, and one that does not spells broken JSON; a
+    /// template that opens no JSON at all carries none to read.
+    ///
+    /// The rows differ along the form of the template (object, array, quoted string, bare
+    /// text), where its placeholders stand, and HOW the JSON is broken (an unterminated
+    /// placeholder, an unclosed object or array, a missing value, a trailing comma, an
+    /// unquoted key).
+    #[test]
+    fn a_json_text_template_that_spells_no_json_is_malformed() {
+        // (case, the template, whether its own JSON is broken)
+        let rows: Vec<(&str, &str, bool)> = vec![
+            ("an-object-with-a-quoted-path", r#"{"ok": "<$.body.text>"}"#, false),
+            ("an-object-with-an-unquoted-path", r#"{"ok": <$.body.text>}"#, false),
+            (
+                "an-object-with-a-reserved-variable",
+                r#"{"event": <aws.pipes.event.json>}"#,
+                false,
+            ),
+            ("a-json-array", r#"[<$.body.count>, "<$.body.text>"]"#, false),
+            ("a-constant-object", r#"{"fixed": true}"#, false),
+            ("a-quoted-text-template", "\"order <$.body.text>\"", false),
+            ("a-bare-text-template", "order <$.body.text> received", false),
+            ("a-bare-path", "<$.body>", false),
+            ("a-bare-path-with-no-brackets", "$.body", false),
+            // The template whose placeholder never closes: no placeholder stands in it at
+            // all, and the object it opened is never closed either.
+            ("an-unterminated-placeholder", r#"{"broken": <$.body.marker"#, true),
+            ("an-unclosed-object", r#"{"ok": "<$.body.text>""#, true),
+            ("an-unclosed-array", r#"[<$.body.count>"#, true),
+            ("a-member-with-no-value", r#"{"ok": }"#, true),
+            ("a-trailing-comma", r#"{"ok": "<$.body.text>",}"#, true),
+            ("an-unquoted-key", r#"{ok: "<$.body.text>"}"#, true),
+            ("an-unterminated-string-template", "\"order <$.body.text>", true),
+        ];
+        for (case, template, broken) in rows {
+            assert_eq!(
+                spells_malformed_json(template),
+                broken,
+                "case {case:?}: expected malformed={broken} for {template:?}, got {}",
+                spells_malformed_json(template)
             );
         }
     }

@@ -16,6 +16,12 @@
 //! * a filter pattern is an EventBridge event pattern, so text that is not a JSON object is
 //!   not a pattern at all and is refused with the parser's own diagnostic for why.
 //!
+//! Beside them, the rule a single member carries on its own and no `@length` or `@pattern`
+//! can express: an `InputTemplate` is the valid JSON text its member is documented to be, so
+//! a template that is JSON text and spells no JSON document — with each of its placeholders
+//! standing for the value it names — is refused at authoring time rather than discovered by
+//! a delivery.
+//!
 //! The third such rule — a target parameter the TARGET RESOURCE requires that the
 //! configuration does not supply, which is how a FIFO queue target comes to need its message
 //! group — has its own suite in `tests/all/pipe_target_parameter_refusal.rs`, which reaches
@@ -633,4 +639,266 @@ async fn a_pipe_with_no_source_or_target_parameters_is_accepted() {
         (Value::Null, json!({})),
         "the pipe must report no filter criteria and no target parameters, got {described:?}"
     );
+}
+
+/// The members that carry an `InputTemplate`, as the model names them: the enrichment's and
+/// the target's. Source: `PipeEnrichmentParameters$InputTemplate` and
+/// `PipeTargetParameters$InputTemplate`.
+const ENRICHMENT_PARAMETERS_MEMBER: &str = "EnrichmentParameters";
+const TARGET_PARAMETERS_MEMBER: &str = "TargetParameters";
+
+/// The enrichment a row that carries an enrichment template names.
+const ENRICHMENT_LAMBDA: &str = "arn:aws:lambda:us-west-2:000000000000:function:enrich";
+
+/// What a write that carries a template spelling no JSON is refused with: the member that
+/// carried it, and the one sentence this service words that class of refusal as.
+const MALFORMED_TEMPLATE_MESSAGE: &str = "Invalid JSON format for Input Template.";
+
+/// One row of the input-template table.
+struct Template {
+    /// The case, which is also the pipe's name.
+    case: &'static str,
+    /// The member that carries the template.
+    member: &'static str,
+    /// The `InputTemplate` the write carries.
+    template: &'static str,
+    /// Whether the template's own JSON is broken, so the write must be refused.
+    refused: bool,
+}
+
+/// The `CreatePipe` body of one row: the template on the member that carries it, and the
+/// enrichment resource a row whose template belongs to the enrichment names.
+fn template_body(row: &Template) -> Value {
+    let mut extra = serde_json::Map::new();
+    extra.insert(
+        row.member.to_string(),
+        json!({ "InputTemplate": row.template }),
+    );
+    if row.member == ENRICHMENT_PARAMETERS_MEMBER {
+        extra.insert("Enrichment".to_string(), json!(ENRICHMENT_LAMBDA));
+    }
+    create_body(SOURCE_SQS, TARGET_LAMBDA, Value::Object(extra))
+}
+
+/// RULE: an `InputTemplate` is the valid JSON text its member is documented to be, so a
+/// write carrying one that is JSON text and spells no JSON document — even with each of its
+/// placeholders standing for the value it names — is refused with `ValidationException`
+/// (400) naming that member, and stores nothing; one that spells its JSON is accepted and
+/// read back verbatim.
+///
+/// The rows differ along what the rule generalises over: which member carries the template
+/// (the target's, the enrichment's), the form of the template (JSON object, JSON array,
+/// text that is no JSON at all, the empty string the model admits), where its placeholders
+/// stand (inside a string literal, as a JSON value, a reserved variable) and HOW the JSON is
+/// broken (a placeholder that never closes, an unclosed object or array, a member with no
+/// value, a trailing comma, an unquoted key).
+#[tokio::test]
+async fn an_input_template_that_spells_no_json_is_refused() {
+    let rows = vec![
+        Template {
+            case: "targettemplateobject",
+            member: TARGET_PARAMETERS_MEMBER,
+            template: r#"{"ok": "<$.body.marker>"}"#,
+            refused: false,
+        },
+        Template {
+            case: "targettemplateunquotedpath",
+            member: TARGET_PARAMETERS_MEMBER,
+            template: r#"{"ok": <$.body.marker>}"#,
+            refused: false,
+        },
+        Template {
+            case: "targettemplatereservedvariable",
+            member: TARGET_PARAMETERS_MEMBER,
+            template: r#"{"event": <aws.pipes.event.json>}"#,
+            refused: false,
+        },
+        Template {
+            case: "targettemplatearray",
+            member: TARGET_PARAMETERS_MEMBER,
+            template: r#"[<$.body.count>, "<$.body.marker>"]"#,
+            refused: false,
+        },
+        Template {
+            // A template that opens no JSON is the text its author wrote, and carries no
+            // JSON to read.
+            case: "targettemplatetext",
+            member: TARGET_PARAMETERS_MEMBER,
+            template: "order <$.body.marker> received",
+            refused: false,
+        },
+        Template {
+            // "To remove an input template, specify an empty string."
+            // (`PipeTargetParameters$InputTemplate`).
+            case: "targettemplateempty",
+            member: TARGET_PARAMETERS_MEMBER,
+            template: "",
+            refused: false,
+        },
+        Template {
+            case: "targettemplateunterminatedplaceholder",
+            member: TARGET_PARAMETERS_MEMBER,
+            template: r#"{"broken": <$.body.marker"#,
+            refused: true,
+        },
+        Template {
+            case: "targettemplateunclosedobject",
+            member: TARGET_PARAMETERS_MEMBER,
+            template: r#"{"ok": "<$.body.marker>""#,
+            refused: true,
+        },
+        Template {
+            case: "targettemplateunclosedarray",
+            member: TARGET_PARAMETERS_MEMBER,
+            template: r#"[<$.body.marker>"#,
+            refused: true,
+        },
+        Template {
+            case: "targettemplatenovalue",
+            member: TARGET_PARAMETERS_MEMBER,
+            template: r#"{"ok": }"#,
+            refused: true,
+        },
+        Template {
+            case: "targettemplatetrailingcomma",
+            member: TARGET_PARAMETERS_MEMBER,
+            template: r#"{"ok": "<$.body.marker>",}"#,
+            refused: true,
+        },
+        Template {
+            case: "targettemplateunquotedkey",
+            member: TARGET_PARAMETERS_MEMBER,
+            template: r#"{ok: "<$.body.marker>"}"#,
+            refused: true,
+        },
+        Template {
+            // The same member of the enrichment's parameters carries the same kind of
+            // template, so the rule holds there too and is reported alike.
+            case: "enrichmenttemplateobject",
+            member: ENRICHMENT_PARAMETERS_MEMBER,
+            template: r#"{"ok": "<$.body.marker>"}"#,
+            refused: false,
+        },
+        Template {
+            case: "enrichmenttemplateunclosedobject",
+            member: ENRICHMENT_PARAMETERS_MEMBER,
+            template: r#"{"broken": <$.body.marker"#,
+            refused: true,
+        },
+    ];
+
+    for row in &rows {
+        let router = router();
+        let created = create(&router, row.case, template_body(row)).await;
+
+        if !row.refused {
+            assert_eq!(
+                created.status, 200,
+                "case {:?}: a template that spells its own JSON must be accepted, \
+                 got {created:?}",
+                row.case
+            );
+            let described = describe(&router, row.case).await;
+            if !row.template.is_empty() {
+                assert_eq!(
+                    described.member(row.member)["InputTemplate"],
+                    json!(row.template),
+                    "case {:?}: the accepted template must read back verbatim, \
+                     got {described:?}",
+                    row.case
+                );
+            }
+            continue;
+        }
+
+        assert_refused(
+            row.case,
+            &created,
+            "InputTemplate",
+            MALFORMED_TEMPLATE_MESSAGE,
+        );
+        let described = describe(&router, row.case).await;
+        assert_eq!(
+            described.status, 404,
+            "case {:?}: a refused CreatePipe must have stored no pipe, got {described:?}",
+            row.case
+        );
+        let listed = list(&router, "").await;
+        assert_eq!(
+            listed_names(&listed),
+            Vec::<String>::new(),
+            "case {:?}: a refused CreatePipe must leave the pipe out of ListPipes, \
+             got {listed:?}",
+            row.case
+        );
+    }
+}
+
+/// RULE: the same reading of a template holds for `UpdatePipe` — an update carrying one
+/// that spells no JSON is refused and leaves the stored template as it was, while one
+/// carrying valid JSON text replaces it.
+#[tokio::test]
+async fn an_update_carrying_a_template_that_spells_no_json_changes_nothing() {
+    let stored = r#"{"ok": "<$.body.marker>"}"#;
+    // (the case and pipe name, the TargetParameters the update carries, the template the
+    // pipe must report afterwards — `None` when the update must be refused)
+    let rows: Vec<(&str, Value, Option<&str>)> = vec![
+        (
+            "templateupdatebroken",
+            json!({"InputTemplate": r#"{"broken": <$.body.marker"#}),
+            None,
+        ),
+        (
+            "templateupdateunquotedkey",
+            json!({"InputTemplate": r#"{ok: "<$.body.marker>"}"#}),
+            None,
+        ),
+        (
+            "templateupdatereplaced",
+            json!({"InputTemplate": r#"{"n": <$.body.count>}"#}),
+            Some(r#"{"n": <$.body.count>}"#),
+        ),
+    ];
+
+    for (case, target_parameters, accepted) in rows {
+        let router = router();
+        let created = create(
+            &router,
+            case,
+            create_body(
+                SOURCE_SQS,
+                TARGET_LAMBDA,
+                json!({"TargetParameters": {"InputTemplate": stored}}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: the fixture pipe must be created, got {created:?}"
+        );
+        tokio::time::sleep(PAST_SETTLE).await;
+
+        let answered = update(
+            &router,
+            case,
+            json!({"RoleArn": ROLE, "TargetParameters": target_parameters}),
+        )
+        .await;
+        match accepted {
+            None => assert_refused(case, &answered, "InputTemplate", MALFORMED_TEMPLATE_MESSAGE),
+            Some(_) => assert_eq!(
+                answered.status, 200,
+                "case {case:?}: a template that spells its own JSON must be accepted, \
+                 got {answered:?}"
+            ),
+        }
+        tokio::time::sleep(PAST_SETTLE).await;
+        let described = describe(&router, case).await;
+        assert_eq!(
+            described.member("TargetParameters")["InputTemplate"],
+            json!(accepted.unwrap_or(stored)),
+            "case {case:?}: expected the pipe to report the template in force, \
+             got {described:?}"
+        );
+    }
 }

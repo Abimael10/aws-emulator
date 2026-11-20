@@ -251,6 +251,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreatePipeErrorModeled::ValidationException(violation).into());
         }
 
+        // An `InputTemplate` is the valid JSON text its member is documented to be, and
+        // whether it spells that JSON is a property of the template alone — so it is
+        // decided HERE, before anything is stored, rather than left for a delivery to
+        // discover. Enforced by `UpdatePipe` too, from the same rule.
+        if let Some(violation) = crate::state::input_template_violation(
+            input.enrichment_parameters.as_ref(),
+            input.target_parameters.as_ref(),
+        ) {
+            return Err(CreatePipeErrorModeled::ValidationException(violation).into());
+        }
+
         // The tag rules a write that installs tags enforces for itself: `TagKey`'s and
         // `TagValue`'s `@length` bounds (the boundary validator walks a map's entry count
         // and its values' shapes but not its KEYS), the documented tag character set and

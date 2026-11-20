@@ -166,6 +166,10 @@ mod kinesis_source;
 mod state_machine;
 
 use input_template::*;
+/// Whether a template spells its own JSON, which the writes that CONFIGURE a pipe ask
+/// before they store one: the template language lives in [`input_template`], so the
+/// question is answered there and re-exported here rather than restated.
+pub(crate) use input_template::spells_malformed_json;
 
 /// How long the poller waits before looking at an idle source again. Short enough that
 /// a record sent to the source is moved promptly, long enough not to spin.
@@ -4307,22 +4311,48 @@ mod tests {
         }
     }
 
-    /// RULE: a template whose placeholder selects no one value of the event renders
-    /// nothing — the record stays on the source — rather than a payload carrying the path
-    /// itself.
+    /// RULE: a template whose placeholder selects no one value of the event renders the
+    /// EMPTY STRING for it — never the path itself — and the render succeeds, so the event
+    /// is delivered with that placeholder filled by nothing.
+    ///
+    /// The rows differ along where the unresolved placeholder stands (as a JSON value,
+    /// inside a string literal, in a template that is not JSON text) and what else the
+    /// template carries beside it.
     #[test]
-    fn a_template_placeholder_that_selects_nothing_fails_the_render() {
+    fn a_template_placeholder_that_selects_nothing_renders_the_empty_string() {
         let event = record();
-        // (case, the template)
-        let rows: Vec<(&str, &str)> = vec![
-            ("absent", "<$.detail>"),
-            ("absent-inside-an-object", r#"{"x": <$.attributes.Absent>}"#),
+        // (case, the template, the bytes the stage is handed)
+        let rows: Vec<(&str, &str, &str)> = vec![
+            ("absent-as-the-whole-template", "<$.detail>", ""),
+            (
+                "absent-as-a-json-value",
+                r#"{"x": <$.attributes.Absent>}"#,
+                r#"{"x": ""}"#,
+            ),
+            (
+                "absent-inside-a-string-literal",
+                r#"{"x": "<$.attributes.Absent>"}"#,
+                r#"{"x": ""}"#,
+            ),
+            (
+                "absent-beside-a-path-that-resolves",
+                r#"{"x": "<$.detail>", "id": "<$.messageId>"}"#,
+                r#"{"x": "", "id": "4fd2-1"}"#,
+            ),
+            (
+                "absent-in-a-text-template",
+                "detail=<$.detail>;",
+                "detail=;",
+            ),
         ];
-        for (case, template) in rows {
-            let outcome = render_template(template, &event, &pipe());
-            assert!(
-                outcome.is_err(),
-                "case {case:?}: expected the render to fail, got {outcome:?}"
+        for (case, template, expected) in rows {
+            let rendered = render_template(template, &event, &pipe())
+                .unwrap_or_else(|error| panic!("case {case:?}: {error}"));
+            assert_eq!(
+                rendered.body(),
+                expected,
+                "case {case:?}: expected {expected:?}, got {:?}",
+                rendered.body()
             );
         }
     }
