@@ -214,9 +214,12 @@ struct EventSourceAccess {
 /// What makes a Kinesis `stream/…` ARN name a stream CONSUMER rather than the data stream
 /// itself: `EventSourceArn` admits both ("the ARN of the data stream or a stream
 /// consumer"), and a consumer is read through the consumer's own calls as well as the
-/// stream's, on two different resources — so this module states no reads for one rather
-/// than hold a consumer to the stream's own set, which would refuse a correctly granted
-/// enhanced fan-out role. It is left to the change that implements consumer polling.
+/// stream's, on two different resources — the consumer's `SubscribeToShard`, which is how
+/// such a mapping is delivered its records
+/// ([`crate::state::event_source_poller::kinesis_stream`]), beside the stream's own listing
+/// — so this module states no reads for one rather than hold a consumer to the stream's own
+/// set, which would refuse a correctly granted enhanced fan-out role. Which SET a consumer
+/// is decided on is a question of its own, and no mapping is refused for it here.
 const KINESIS_CONSUMER_SEGMENT: &str = "/consumer/";
 
 /// What the refusal of each KIND of event source names, and which of it the decision is
