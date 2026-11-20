@@ -872,9 +872,13 @@ pub struct DueDelivery {
 ///
 /// ONE construction, so no two operations word the same refusal differently: a
 /// fixed sentence plus a single variable part, the ARN the request addressed.
+///
+/// The sentence names the KIND of resource that was not found followed by
+/// `" not found: "` and the identifier the request supplied, the same way every
+/// other resource of this service words that refusal.
 pub fn subscriber_not_found(subscriber_arn: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!("subscriber {subscriber_arn} does not exist")),
+        message: Some(format!("Subscriber not found: {subscriber_arn}")),
     }
 }
 

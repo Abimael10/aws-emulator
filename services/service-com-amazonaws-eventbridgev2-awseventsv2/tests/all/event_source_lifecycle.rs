@@ -414,7 +414,7 @@ async fn a_created_event_source_is_stored_and_reads_back() {
                 event_bus_arn: bus.clone(),
                 configuration: aws_service_configuration(
                     "aws.ec2",
-                    Some(r#"{"source":["aws.ec2"]}"#),
+                    Some(r#"{"detail-type":["Instance State-change Notification"]}"#),
                     Some(&format!("arn:aws:sqs:{REGION}:{ACCOUNT}:source-dlq")),
                 ),
                 description: Some("every optional member set".to_string()),
@@ -746,7 +746,7 @@ async fn a_repeated_client_token_replays_the_source_it_minted() {
         event_bus_arn: bus.clone(),
         configuration: aws_service_configuration(
             "aws.s3",
-            Some(r#"{"source":["aws.s3"]}"#),
+            Some(r#"{"detail-type":["Object Created"]}"#),
             Some(&format!("arn:aws:sqs:{REGION}:{ACCOUNT}:token-dlq")),
         ),
         description: Some("the first create".to_string()),
@@ -830,7 +830,7 @@ async fn a_repeated_client_token_replays_the_source_it_minted() {
             CreateEventSourceInput {
                 configuration: aws_service_configuration(
                     "aws.s3",
-                    Some(r#"{"source":["aws.ec2"]}"#),
+                    Some(r#"{"detail-type":["Instance State-change Notification"]}"#),
                     Some(&format!("arn:aws:sqs:{REGION}:{ACCOUNT}:token-dlq")),
                 ),
                 ..original()
@@ -841,7 +841,7 @@ async fn a_repeated_client_token_replays_the_source_it_minted() {
             CreateEventSourceInput {
                 configuration: aws_service_configuration(
                     "aws.s3",
-                    Some(r#"{"source":["aws.s3"]}"#),
+                    Some(r#"{"detail-type":["Object Created"]}"#),
                     None,
                 ),
                 ..original()
@@ -1022,7 +1022,7 @@ async fn the_event_source_workflow_runs_over_the_wire() {
         event_bus_arn: bus.clone(),
         configuration: aws_service_configuration(
             "aws.s3",
-            Some(r#"{"source":["aws.s3"]}"#),
+            Some(r#"{"detail-type":["Object Created"]}"#),
             Some(&format!("arn:aws:sqs:{REGION}:{ACCOUNT}:wire-dlq")),
         ),
         description: Some("created over the wire".to_string()),
@@ -1074,7 +1074,7 @@ async fn the_event_source_workflow_runs_over_the_wire() {
         (
             "aws.service",
             "aws.s3".to_string(),
-            Some(r#"{"source":["aws.s3"]}"#.to_string())
+            Some(r#"{"detail-type":["Object Created"]}"#.to_string())
         ),
         "case \"describe source\": the configuration must be read back as created"
     );

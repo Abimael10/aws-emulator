@@ -238,10 +238,91 @@ impl HasOnFailure for PartnerEventsSourceConfiguration {
 ///
 /// ONE construction, so no two operations word the same refusal differently: a
 /// fixed sentence plus a single variable part, the ARN the request addressed.
+///
+/// The sentence names the KIND of resource that was not found followed by
+/// `" not found: "` and the identifier the request supplied, which is how every
+/// resource of this service words that refusal (a bus by its name, a policy by
+/// its name on its bus, a subscriber and an EventSource by their ARN) — the one
+/// thing that tells a caller which of several same-shaped 404s it has.
 pub fn event_source_not_found(event_source_arn: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!("event source {event_source_arn} does not exist")),
+        message: Some(format!("EventSource not found: {event_source_arn}")),
     }
+}
+
+/// The top-level fields of an AWS-service EventSource's forwarding pattern that
+/// the service writes itself, so a caller's pattern may not also set them.
+///
+/// `AwsServiceEventsSourceConfiguration$Pattern` states it: "A filter pattern,
+/// as a JSON string, that defines which of the service's events are forwarded to
+/// the event bus. Do not include source, account, or region as top-level
+/// fields."
+pub const SERVICE_SET_PATTERN_FIELDS: [&str; 3] = ["source", "account", "region"];
+
+/// The whole `Message` of the refusal a forwarding `Pattern` that is not a JSON
+/// document earns.
+///
+/// `Pattern` documents its own form — "A filter pattern, as a JSON string" — so
+/// a text that is not JSON is a request parameter that is not valid. FIXED text:
+/// it quotes neither the submitted pattern (which `Pattern` marks `@sensitive`)
+/// nor the reader's own parse position.
+pub const PATTERN_NOT_VALID_JSON_MESSAGE: &str = "Pattern is not valid JSON";
+
+/// Why `configuration` is not an EventSource configuration this service can
+/// forward with, or `None` when it is one.
+///
+/// The `Some` is the whole `Message` of the refusal, which is why it names the
+/// member the request got wrong. ONE reading of the rule, so the create and the
+/// update of an EventSource cannot accept different configurations.
+pub fn event_source_configuration_fault(
+    configuration: &EventSourceConfiguration,
+) -> Option<String> {
+    match configuration {
+        // An AWS-service source's forwarding rule writes the event's origin
+        // itself, so its pattern may not set those fields.
+        EventSourceConfiguration::AwsServiceEventsConfiguration(configuration) => {
+            forwarding_pattern_fault(
+                configuration.pattern.as_deref(),
+                &SERVICE_SET_PATTERN_FIELDS,
+            )
+        }
+        // A partner source's `Pattern` reserves no field — its doc states only
+        // that it is "A filter pattern, as a JSON string" — so the only thing it
+        // is held to is being one.
+        EventSourceConfiguration::PartnerEventsConfiguration(configuration) => {
+            forwarding_pattern_fault(configuration.pattern.as_deref(), &[])
+        }
+    }
+}
+
+/// Why this forwarding pattern is not one a source can carry, or `None` when it
+/// is one.
+///
+/// Two rules, both the member's own: the text is a JSON document, and it sets
+/// none of the top-level fields `service_set` names. A pattern that satisfies
+/// both is stored as submitted, because what a pattern selects is read by the
+/// shared EventBridge pattern reader when the forwarding rule runs rather than
+/// settled here.
+fn forwarding_pattern_fault(pattern: Option<&str>, service_set: &[&str]) -> Option<String> {
+    // "If no pattern is specified, all events from the service are forwarded":
+    // a member the request omits names no filter, and so does one carrying no
+    // text at all, which the member's modelled `@length` of 0..3753 admits.
+    let pattern = pattern.filter(|pattern| !pattern.is_empty())?;
+    let Ok(parsed) = ::serde_json::from_str::<::serde_json::Value>(pattern) else {
+        return Some(PATTERN_NOT_VALID_JSON_MESSAGE.to_string());
+    };
+    // A reserved field is a TOP-LEVEL member, so a document that names no
+    // members at all sets none of them.
+    let fields = parsed.as_object()?;
+    service_set
+        .iter()
+        .find(|field| fields.contains_key(**field))
+        .map(|field| {
+            format!(
+                "Pattern must not set the key '{field}'; the forwarding rule sets it from the \
+                 requested AwsService and the source account and region"
+            )
+        })
 }
 
 impl ComAmazonawsEventbridgev2Awseventsv2State {

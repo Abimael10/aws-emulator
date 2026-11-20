@@ -139,6 +139,16 @@ impl From<UpdateEventSourceErrorModeled> for UpdateEventSourceError {
     }
 }
 
+/// The whole `Message` of the `InvalidStateException` a mutating operation on a
+/// REVOKED EventSource is refused with.
+///
+/// `Revoked` documents the rule: "Revocation is terminal: it never returns to
+/// false. Mutating operations on a revoked EventSource fail with
+/// InvalidStateException, except DeleteEventSource". FIXED text naming the kind
+/// of resource that is revoked and nothing of the request, the way the sibling
+/// refusal for a revoked subscriber is worded.
+pub const REVOKED_EVENT_SOURCE_MESSAGE: &str = "EventSource is revoked and cannot be updated";
+
 /// The `UpdateEventSource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -188,6 +198,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let now = ::std::time::SystemTime::now();
 
+        // A `Configuration` this service cannot forward with is a request
+        // parameter that is not valid, decided from the request alone — so it is
+        // answered before any resource is resolved, and a refused update leaves
+        // the stored configuration exactly as it stands.
+        if let Some(reason) = input
+            .configuration
+            .as_ref()
+            .and_then(crate::state::event_source_configuration_fault)
+        {
+            return Err(UpdateEventSourceErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(reason),
+                },
+            )
+            .into());
+        }
+
         let mut state = store.lock();
         state.settle_lifecycles(now);
 
@@ -204,10 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if source.revoked {
             return Err(UpdateEventSourceErrorModeled::InvalidStateException(
                 InvalidStateException {
-                    message: Some(format!(
-                        "event source {} is revoked and cannot be updated",
-                        source.arn
-                    )),
+                    message: Some(REVOKED_EVENT_SOURCE_MESSAGE.to_string()),
                 },
             )
             .into());

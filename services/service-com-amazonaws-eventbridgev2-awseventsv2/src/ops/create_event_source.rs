@@ -117,19 +117,22 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eventbridgev2-awsevents
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
 //
-// `InternalException` is widened in with `extra_errors`: this service declares it
-// as a common error for every operation (`AWSEventsV2`'s `errors` list), so it is
-// the modelled answer when the engine cannot hand back this service's store, but
-// the scaffold generated the enum from the OPERATION's own `errors` list only.
+// `InternalException` and `InvalidInputException` are widened in with
+// `extra_errors`: this service declares both as common errors for every
+// operation (`AWSEventsV2`'s `errors` list), so they are the modelled answers
+// when the engine cannot hand back this service's store and when the request
+// carries a parameter this service cannot serve, but the scaffold generated the
+// enum from the OPERATION's own `errors` list only.
 #[smithy_macros::operation_error(
     "com.amazonaws.eventbridgev2#CreateEventSource",
-    extra_errors = ["InternalException"]
+    extra_errors = ["InternalException", "InvalidInputException"]
 )]
 #[derive(Debug)]
 pub enum CreateEventSourceErrorModeled {
     ConcurrentModificationException(ConcurrentModificationException),
     IdempotentParameterMismatchException(IdempotentParameterMismatchException),
     InternalException(InternalException),
+    InvalidInputException(InvalidInputException),
     InvalidStateException(InvalidStateException),
     LimitExceededException(LimitExceededException),
     ResourceAlreadyExistsException(ResourceAlreadyExistsException),
@@ -225,6 +228,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let bus_arn = bus.arn.clone();
         let region = bus.region.clone();
+
+        // A source forwards only with a `Configuration` this service can
+        // forward with: the one reading of that rule both the create and the
+        // update of an EventSource are held to, so a pattern a later update
+        // would be refused for cannot be stored by a create either.
+        if let Some(reason) = crate::state::event_source_configuration_fault(&input.configuration) {
+            return Err(CreateEventSourceErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(reason),
+                },
+            )
+            .into());
+        }
 
         // A retry carrying the same ClientToken replays the EventSource that
         // token minted — identical parameters only; different ones are the
