@@ -183,8 +183,12 @@ const SOURCE_IP_FIELD: &str = "source-ip";
 /// The `ActionTypeEnum` values that END a rule's action list by answering the client,
 /// from `Action$Type`'s own list: the action that renders a response, the one that sends
 /// the client elsewhere, and the one that passes the request to a target group.
-const FIXED_RESPONSE_ACTION: &str = "fixed-response";
-const REDIRECT_ACTION: &str = "redirect";
+///
+/// The first two are `pub(super)` because each has a CloudWatch series of its own, counted
+/// off the action this plane recorded performed ([`super::request_metrics`]), so the value
+/// the series is keyed off and the value the plane evaluates are the same one.
+pub(super) const FIXED_RESPONSE_ACTION: &str = "fixed-response";
+pub(super) const REDIRECT_ACTION: &str = "redirect";
 const FORWARD_ACTION: &str = crate::state::FORWARD_ACTION_TYPE;
 
 /// What a load balancer's own access log records as the action performed for a request its
@@ -1214,6 +1218,22 @@ pub async fn serve<Eng: Send + Sync + 'static>(
         path = %request.path,
         status = served.status,
         "the load balancer answered a request on the name it published"
+    );
+    // ... the series the load balancer publishes for the traffic it carried, which is what a
+    // client watches it by ([`super::request_metrics`]) ...
+    super::request_metrics::counted(
+        engine,
+        &state,
+        &super::request_metrics::Answered {
+            load_balancer_arn: &load_balancer_arn,
+            elb_status: served.status,
+            target_status: served.observed.target_status,
+            target_group_arn: served.observed.target_group_arn.as_deref(),
+            error_reason: served.observed.error_reason.as_deref(),
+            target_elapsed: served.observed.target_elapsed,
+            actions: &served.observed.actions,
+        },
+        now,
     );
     // ... and the record the load balancer's OWN access log carries for it, delivered into
     // the bucket its attributes name ([`super::access_logs`]). A load balancer whose

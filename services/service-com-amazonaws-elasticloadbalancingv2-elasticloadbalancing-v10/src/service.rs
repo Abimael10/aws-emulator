@@ -98,6 +98,11 @@ pub mod data_plane;
 
 pub mod access_logs;
 
+/// The CloudWatch series a load balancer publishes for the traffic it answered: how many
+/// requests it processed, which end produced the status each one ended in, how long the target
+/// took, and what one `lambda` target group's own invocations came to.
+pub mod request_metrics;
+
 /// Whether the Amazon S3 destination a load balancer's log attributes name is one the
 /// delivery could write into, which is what an attribute write that switches one on is
 /// judged against before it is stored.

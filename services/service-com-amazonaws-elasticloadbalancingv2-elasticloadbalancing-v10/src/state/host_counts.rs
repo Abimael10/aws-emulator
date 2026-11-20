@@ -181,7 +181,10 @@ pub const PUBLISH_INTERVAL: Duration = Duration::from_secs(60);
 /// The `StorageResolution` the datapoints are stored at, in seconds: the regular resolution a
 /// metric has unless its publisher asks for the high-resolution one ("This field is optional,
 /// if you do not specify it the default of 60 is used", `MetricDatum$StorageResolution`).
-const STORAGE_RESOLUTION_SECS: i32 = 60;
+///
+/// `pub(crate)` because every series this service publishes is stored at it, including the
+/// per-request ones ([`crate::service::request_metrics`]).
+pub(crate) const STORAGE_RESOLUTION_SECS: i32 = 60;
 
 /// How many datapoints a series OPENS with, stamped one [`PUBLISH_INTERVAL`] apart ahead of
 /// the instant the load balancer began routing to the target group.
@@ -1639,14 +1642,19 @@ fn advance(series: &mut SeriesClock) -> SystemTime {
     stamp
 }
 
-/// Append the datapoints this pass published to the metric store, and make every alarm over
-/// the series they belong to due for evaluation.
+/// Append the datapoints a publisher of this service produced to the metric store, and make
+/// every alarm over the series they belong to due for evaluation.
 ///
 /// Nothing is published on an engine that holds no metric store to reach: a datapoint has one
 /// home, and this path never makes a second one. An alarm is evaluated FROM these datapoints,
 /// so storing a series it watches is what makes its evaluation due — an alarm cannot tell a
 /// service's own metric from one a client published.
-fn append_datapoints<Eng: Send + Sync + 'static>(
+///
+/// `pub(crate)` because this is the ONE write this service makes into that store: the
+/// host-count pass below and the per-request series a load balancer publishes for the traffic
+/// it answered ([`crate::service::request_metrics`]) both go through it, so neither can keep a
+/// second copy of the capacity handling or forget to make an alarm due.
+pub(crate) fn append_datapoints<Eng: Send + Sync + 'static>(
     engine: &Eng,
     published: Vec<(cloudwatch::MetricKey, cloudwatch::StoredDatum)>,
     now: SystemTime,
@@ -1668,7 +1676,7 @@ fn append_datapoints<Eng: Send + Sync + 'static>(
             // can see it.
             ::tracing::warn!(
                 metric = watched.metric_name.as_str(),
-                "the CloudWatch metric store is at capacity, so this host count was dropped"
+                "the CloudWatch metric store is at capacity, so this datapoint was dropped"
             );
             continue;
         }
@@ -1683,7 +1691,10 @@ fn append_datapoints<Eng: Send + Sync + 'static>(
 /// `at` as the epoch seconds a stored datapoint carries, which is the unit the metric store's
 /// own readers window by. An instant before the epoch (which no clock reports) reads as the
 /// epoch itself rather than failing the publish.
-fn epoch_secs(at: SystemTime) -> f64 {
+///
+/// `pub(crate)` for the same reason [`append_datapoints`] is: every series this service
+/// publishes stamps its datapoints through this one reading.
+pub(crate) fn epoch_secs(at: SystemTime) -> f64 {
     at.duration_since(UNIX_EPOCH)
         .map_or(0.0, |since| since.as_secs_f64())
 }
