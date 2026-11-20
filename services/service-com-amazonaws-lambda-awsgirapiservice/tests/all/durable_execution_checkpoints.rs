@@ -177,7 +177,10 @@ async fn get_execution(router: &MultiServiceRouter, arn: &str) -> Answer {
 }
 
 /// `CheckpointDurableExecution` on `arn`, carrying `body`.
-async fn checkpoint(router: &MultiServiceRouter, arn: &str, body: &Value) -> Answer {
+///
+/// `pub(crate)`: the suite that asserts what a checkpoint refused for its KMS key says
+/// (`tests/all/durable_execution_data_key_operations.rs`) sends the same request.
+pub(crate) async fn checkpoint(router: &MultiServiceRouter, arn: &str, body: &Value) -> Answer {
     json_call(
         router,
         "POST",
@@ -596,7 +599,9 @@ struct RefusedCase {
 
 /// Start one durable execution of `function` through the state the `Invoke` handler
 /// registers one in, answering the ARN it is addressed by.
-fn start_execution(
+///
+/// `pub(crate)`: see [`checkpoint`].
+pub(crate) fn start_execution(
     engine: &Arc<engine::InMemoryEngine>,
     function: &str,
     name: &str,
@@ -617,7 +622,9 @@ fn start_execution(
 /// The checkpoint token the stored execution `name` of `function` currently holds — what the
 /// Lambda runtime driving that execution is handed, and the only token a checkpoint of it is
 /// applied against.
-fn current_token(
+///
+/// `pub(crate)`: see [`checkpoint`].
+pub(crate) fn current_token(
     engine: &Arc<engine::InMemoryEngine>,
     function: &str,
     name: &str,

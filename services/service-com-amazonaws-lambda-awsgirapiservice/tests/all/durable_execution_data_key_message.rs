@@ -229,7 +229,13 @@ async fn a_refused_read_names_the_key_the_read_functions_durable_config_carries(
 /// Every read of one execution that asks for its DATA — including the one that asks for it by
 /// leaving `IncludeExecutionData` at its documented default of true — each labelled by how it
 /// asked.
-async fn data_reads(router: &MultiServiceRouter, arn: &str) -> Vec<(&'static str, Answer)> {
+///
+/// `pub(crate)`: the suite that walks the same reads plus the data WRITE
+/// (`tests/all/durable_execution_data_key_operations.rs`) asks for exactly this read axis.
+pub(crate) async fn data_reads(
+    router: &MultiServiceRouter,
+    arn: &str,
+) -> Vec<(&'static str, Answer)> {
     vec![
         (
             "GetDurableExecution, asking for the data by default",
