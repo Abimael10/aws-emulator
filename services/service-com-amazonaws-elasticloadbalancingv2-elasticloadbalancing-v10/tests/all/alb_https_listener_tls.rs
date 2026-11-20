@@ -44,6 +44,8 @@ use std::time::{Duration, SystemTime};
 use service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::state::ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State as ElbState;
 use smithy_server_runtime::MultiServiceRouter;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio_rustls::client::TlsStream;
 
 use crate::provisioning_loop::{action, call, p, REGION};
 
@@ -146,10 +148,30 @@ pub(crate) async fn certificate_manager(
 /// Import one minted certificate through Certificate Manager's own `ImportCertificate`, and
 /// answer the ARN it was stored under.
 pub(crate) async fn import(router: &MultiServiceRouter, case: &str, minted: &Minted) -> String {
-    let body = serde_json::json!({
+    import_material(router, case, None, minted).await
+}
+
+/// Bring minted material in through Certificate Manager's own `ImportCertificate`, and answer
+/// the ARN it is held under.
+///
+/// `replacing` names "the [ARN] of an imported certificate to replace"
+/// (`ImportCertificateRequest$CertificateArn`: "Include this argument only when you want to
+/// replace a previously imported certificate"), which is how the material behind a
+/// certificate a listener already names is rotated
+/// ([`crate::alb_https_listener_live_rotation`]); `None` imports a certificate of its own.
+pub(crate) async fn import_material(
+    router: &MultiServiceRouter,
+    case: &str,
+    replacing: Option<&str>,
+    minted: &Minted,
+) -> String {
+    let mut body = serde_json::json!({
         "Certificate": aws_smithy_types::base64::encode(minted.certificate_pem.as_bytes()),
         "PrivateKey": aws_smithy_types::base64::encode(minted.private_key_pem.as_bytes()),
     });
+    if let Some(arn) = replacing {
+        body["CertificateArn"] = serde_json::Value::String(arn.to_string());
+    }
     let (status, parsed) = certificate_manager(router, "ImportCertificate", &body).await;
     assert_eq!(
         status, 200,
@@ -293,7 +315,10 @@ pub(crate) fn make_active(engine: &Arc<engine::InMemoryEngine>, lb_arn: &str) {
 /// Whether `published` is an address a client on this machine can DIAL: the `host:port` of
 /// a listener this emulator opened, which is the set of values a client dials without
 /// resolving a name.
-fn is_reachable_authority(published: &str) -> bool {
+///
+/// `pub(crate)` so every suite that asserts on a published address reads "an address a client
+/// can dial" from one definition.
+pub(crate) fn is_reachable_authority(published: &str) -> bool {
     published.parse::<std::net::SocketAddr>().is_ok()
 }
 
@@ -403,14 +428,16 @@ pub(crate) struct Presented {
     pub(crate) answer: String,
 }
 
-/// Dial the published address, complete a TLS handshake asking for `server_name` (or asking
-/// for no name at all, which is what a client dialling an address does), send one request
-/// and read the answer.
-pub(crate) async fn tls_exchange(
+/// Dial the published address and complete a TLS handshake asking for `server_name` (or
+/// asking for no name at all, which is what a client dialling an address does), WITHOUT
+/// sending a request: the connection and the leaf it was presented are handed back, so a
+/// suite that needs the connection to stay open across a control-plane change
+/// ([`crate::alb_https_listener_live_rotation`]) sends its request on it later.
+pub(crate) async fn handshake(
     case: &str,
     published: &str,
     server_name: Option<&str>,
-) -> Presented {
+) -> (TlsStream<TcpStream>, Vec<u8>) {
     let conn = dial(published).await;
     // A client that asks for a name sends it as the `ClientHello`'s `server_name`; one that
     // asks for none dials the address itself, which carries no such extension.
@@ -420,7 +447,7 @@ pub(crate) async fn tls_exchange(
         None => rustls::pki_types::ServerName::from(std::net::Ipv4Addr::LOCALHOST),
     };
     let connector = tokio_rustls::TlsConnector::from(client_config());
-    let mut stream = tokio::time::timeout(EXCHANGE_TIMEOUT, connector.connect(asked_for, conn))
+    let stream = tokio::time::timeout(EXCHANGE_TIMEOUT, connector.connect(asked_for, conn))
         .await
         .unwrap_or_else(|_| panic!("case {case}: the handshake did not complete in time"))
         .unwrap_or_else(|error| panic!("case {case}: the handshake must complete, got {error}"));
@@ -430,10 +457,16 @@ pub(crate) async fn tls_exchange(
         .peer_certificates()
         .and_then(|chain| chain.first().map(|leaf| leaf.as_ref().to_vec()))
         .unwrap_or_else(|| panic!("case {case}: the listener presented no certificate"));
-    let version = stream.get_ref().1.protocol_version();
-    // The host a client of a published address sends is the name it asked for, and the
-    // address itself when it asked for none.
-    let host = server_name.unwrap_or(published);
+    (stream, leaf)
+}
+
+/// Send one request on a connection that has already completed its handshake, and answer
+/// what came back.
+pub(crate) async fn answer_on(
+    case: &str,
+    stream: &mut TlsStream<TcpStream>,
+    host: &str,
+) -> String {
     let request = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     stream
         .write_all(request.as_bytes())
@@ -444,10 +477,27 @@ pub(crate) async fn tls_exchange(
         .await
         .unwrap_or_else(|_| panic!("case {case}: the listener did not answer in time"))
         .unwrap_or_else(|error| panic!("case {case}: the answer was not read: {error}"));
+    String::from_utf8_lossy(&answer).to_string()
+}
+
+/// Dial the published address, complete a TLS handshake asking for `server_name` (or asking
+/// for no name at all, which is what a client dialling an address does), send one request
+/// and read the answer — the two halves above, run back to back.
+pub(crate) async fn tls_exchange(
+    case: &str,
+    published: &str,
+    server_name: Option<&str>,
+) -> Presented {
+    let (mut stream, leaf) = handshake(case, published, server_name).await;
+    let version = stream.get_ref().1.protocol_version();
+    // The host a client of a published address sends is the name it asked for, and the
+    // address itself when it asked for none.
+    let host = server_name.unwrap_or(published);
+    let answer = answer_on(case, &mut stream, host).await;
     Presented {
         leaf,
         version,
-        answer: String::from_utf8_lossy(&answer).to_string(),
+        answer,
     }
 }
 
