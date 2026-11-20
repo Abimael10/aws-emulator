@@ -373,6 +373,31 @@ impl Chain {
         }
     }
 
+    /// Invoke `name` once with `payload` and answer the document its handler returned.
+    ///
+    /// `pub(crate)` for the reason the helpers below are, and for one of its own: an
+    /// invocation of a function Lambda has no execution environment standing for pays for
+    /// one to be built — admission to the run envelope, the package expanded, the
+    /// interpreter started, the handler's module imported — while an invocation that finds
+    /// one standing "skips the initialization phase". A suite whose rule is about a span
+    /// MEASURED from a task's hand-over therefore invokes the function through this FIRST,
+    /// before the run its rule is about, so that build is not paid inside a bound that run
+    /// declares and no row of it is decided by how loaded the host is.
+    pub(crate) async fn invoked(&self, case: &str, name: &str, payload: &Value) -> Value {
+        let (status, answered) = self
+            .lambda(
+                "POST",
+                &format!("{FUNCTIONS_URI}/{name}/invocations"),
+                payload,
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: Invoke({name:?}) must answer 200, got {status} with {answered}"
+        );
+        answered
+    }
+
     /// Publish a version of the function `name` and answer the version label Lambda
     /// minted for it.
     ///

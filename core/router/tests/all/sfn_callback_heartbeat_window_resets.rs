@@ -29,10 +29,12 @@
 //!
 //! A worker that reports progress does so as soon as it HOLDS the token, before any of its
 //! work: the window the hand-over opened therefore covers only the span this emulator
-//! itself takes to get the worker running — a package to unpack, an interpreter to start,
-//! an SDK client to build — and the spans the rule turns on are measured from a report the
-//! worker made itself, each of them well inside the window. So neither row's outcome is
-//! decided by how fast the host is.
+//! itself takes to get the worker running, and the spans the rule turns on are measured
+//! from a report the worker made itself, each of them well inside the window. And that
+//! start-up span is paid BEFORE either row, by the warm-up invocation this suite makes once
+//! the function is active: Lambda builds an execution environment for the function once and
+//! keeps it standing, so each row's own invocation is the handler's run alone. So neither
+//! row's outcome is decided by how fast — or how loaded — the host is.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -113,6 +115,23 @@ fn settlement_output() -> Value {
     json!({ "approved": true, "by": "the worker holding the token" })
 }
 
+/// The member that asks the worker for NOTHING but to be running, and what it answers: no
+/// task exists when the warm-up invocation carrying it is made, so the handler reports no
+/// progress and settles nothing, and what the invocation leaves behind is the execution
+/// environment Lambda keeps standing for the function ("Lambda maintains the execution
+/// environment for some time in anticipation of another invocation", and an invocation that
+/// finds one standing "skips the initialization phase").
+///
+/// Both rows are therefore served by a worker this emulator is ALREADY able to start, which
+/// is what keeps the span between the hand-over and the first report of progress made on
+/// its token a span of the handler's own run rather than of a package being expanded and an
+/// interpreter being built.
+const WARMING: &str = "warmup";
+/// See [`WARMING`].
+fn warmed_answer() -> Value {
+    json!({ "warmed": true })
+}
+
 /// The worker both rows invoke: it is handed a task token, reports progress on it at once
 /// where its event asks it to, works, reports progress again, works again and then settles
 /// the task.
@@ -133,6 +152,10 @@ from botocore.exceptions import ClientError
 
 def handler(event, context):
     states = boto3.client("stepfunctions")
+    # The warm-up event, which carries no token: this run exists only so that the
+    # environment it is served in is standing before either row's window opens.
+    if event.get("warmup"):
+        return {"warmed": True}
     token = event["token"]
     beats = []
 
@@ -520,6 +543,36 @@ async fn wait_until_active(router: &MultiServiceRouter, name: &str) {
     panic!("setup: Lambda must report {name:?} {FUNCTION_ACTIVE}, last reported {last}");
 }
 
+/// Invoke `name` once with the warm-up event, so Lambda has an execution environment
+/// standing for it before any task's window opens ([`WARMING`]).
+///
+/// The answer is the handler's own, which is what proves the environment was really built:
+/// a suite that asserted nothing here could be measuring that build inside its rows'
+/// windows without ever saying so.
+async fn warm_the_worker(router: &MultiServiceRouter, name: &str) {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!("/2015-03-31/functions/{name}/invocations"))
+        .header("host", format!("lambda.{REGION}.amazonaws.com"))
+        .header("content-type", "application/json")
+        .header("authorization", authorization("lambda"))
+        .body(Bytes::from(json!({ WARMING: true }).to_string()))
+        .expect("a well-formed request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let answered: Value = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
+    assert_eq!(
+        status, 200,
+        "setup: the warm-up invocation of {name:?} must be served, got {status} with {answered}"
+    );
+    assert_eq!(
+        answered,
+        warmed_answer(),
+        "setup: the warm-up invocation of {name:?} must be the worker's own run, so that both \
+         rows are served by an environment this emulator already has standing, got {answered}"
+    );
+}
+
 /// `execution` once this service reports it in a terminal status, or the last reading taken
 /// before the deadline.
 ///
@@ -575,6 +628,9 @@ async fn a_heartbeating_lambda_worker_settles_its_callback_task() {
     put_role_policy(&router, MACHINE_ROLE, &machine_document()).await;
     let function = deploy_worker(&router, &worker_role).await;
     wait_until_active(&router, &function).await;
+    // The build of the worker's execution environment is paid HERE, where no task's window
+    // is open, rather than inside the window of the first row ([`WARMING`]).
+    warm_the_worker(&router, &function).await;
 
     for (index, row) in ROWS.iter().enumerate() {
         let case = row.case;

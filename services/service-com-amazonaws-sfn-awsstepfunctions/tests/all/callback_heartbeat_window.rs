@@ -25,10 +25,12 @@
 //!
 //! A worker reports progress as soon as it HOLDS the token, before it does any of the work
 //! the token was handed over for: the window the hand-over opens therefore covers only the
-//! span this emulator itself takes to get the worker running — an archive to unpack, an
-//! interpreter to start, an SDK client to build — and every span the rule turns on is one
-//! the worker's own clock measures from a report of progress it made itself. So no row's
-//! outcome is decided by how fast the host is.
+//! span this emulator itself takes to get the worker running, and every span the rule turns
+//! on is one the worker's own clock measures from a report of progress it made itself. And
+//! that start-up span is paid BEFORE the first row, by the warm-up invocation below: Lambda
+//! builds an execution environment for the function once and keeps it standing, so each
+//! row's own invocation is the handler's run alone. So no row's outcome is decided by how
+//! fast — or how loaded — the host is.
 //!
 //! The rows differ along what the rule generalises over: HOW MANY heartbeats the worker
 //! sends (none, one report of progress, one and then more), the length of the window they
@@ -74,6 +76,29 @@ const FUNCTION_TIMEOUT_SECONDS: u64 = 60;
 /// execution's own output says how many of them this service answered.
 const BEAT: &str = "beat";
 
+/// The function the rows invoke, as `CreateFunction` names it — the name the warm-up
+/// invocation addresses as well.
+const WORKER: &str = "heartbeat-window-worker";
+
+/// The member that asks the worker for NOTHING but to be running: no task of any row
+/// exists when it is invoked with it, so the handler reports no progress and settles
+/// nothing, and what the invocation leaves behind is the execution environment Lambda
+/// keeps standing for the function ("Lambda maintains the execution environment for some
+/// time in anticipation of another invocation", and an invocation that finds one "skips
+/// the initialization phase").
+///
+/// Every row below is therefore served by a worker this emulator is ALREADY able to start,
+/// which is what keeps the span between a hand-over and the first report of progress made
+/// on its token a span of the handler's own run rather than of a package being expanded and
+/// an interpreter being built.
+const WARMING: &str = "warming";
+
+/// The case the warm-up is asserted under, and the document its handler answers: the
+/// warm-up is a run of the SAME handler, so an answer that is not this is an environment
+/// that was never built and a suite that would be measuring the build inside its rows'
+/// windows.
+const WARM_UP_CASE: &str = "the warm-up invocation that builds the worker's environment";
+
 /// The worker every row invokes: it is handed a task token, reports progress on it at once
 /// where its event asks it to, works the spans its event names, reports progress after each
 /// of them, works once more and then settles the task with the heartbeats it got answered.
@@ -95,6 +120,10 @@ import botocore.exceptions
 
 def handler(event, context):
     states = boto3.client("stepfunctions")
+    # The warm-up event, which carries no token: this run exists only so that the
+    # environment it is served in is standing before any row's window opens.
+    if event.get("warming"):
+        return {"warmed": True}
     token = event["token"]
     reported = []
 
@@ -280,12 +309,19 @@ async fn history_types(chain: &Chain, case: &str, execution: &str) -> Vec<String
 async fn a_heartbeat_inside_the_window_keeps_a_callback_task_alive() {
     let chain = Chain::new();
     let function = chain
-        .given_function_of(
-            "heartbeat-window-worker",
-            WORKER_SOURCE,
-            Some(FUNCTION_TIMEOUT_SECONDS),
-        )
+        .given_function_of(WORKER, WORKER_SOURCE, Some(FUNCTION_TIMEOUT_SECONDS))
         .await;
+    // The build of the worker's execution environment is paid HERE, where no task's window
+    // is open, rather than inside the first window of the first row ([`WARMING`]).
+    let warmed = chain
+        .invoked(WARM_UP_CASE, WORKER, &json!({ WARMING: true }))
+        .await;
+    assert_eq!(
+        warmed,
+        json!({ "warmed": true }),
+        "case {WARM_UP_CASE:?}: the warm-up must be the worker's own run, so that every row \
+         below is served by an environment this emulator already has standing, got {warmed}"
+    );
 
     for (index, row) in ROWS.iter().enumerate() {
         let case = row.case;
