@@ -377,15 +377,15 @@ async fn a_mapped_role_indexes_what_fits_and_parks_only_the_conflicts() {
     }
     for document in &parked {
         assert_eq!(
-            document["esIndexName"].as_str(),
+            document["osIndexName"].as_str(),
             Some(index.as_str()),
             "case \"a mapped role\": expected the index the delivery used, got {document:?}"
         );
         assert!(
             document["errorCode"]
                 .as_str()
-                .is_some_and(|code| !code.is_empty()),
-            "case \"a mapped role\": expected the engine's error code, got {document:?}"
+                .is_some_and(|code| code.starts_with("OS.")),
+            "case \"a mapped role\": expected Firehose's own namespaced code, got {document:?}"
         );
         assert!(
             document["errorMessage"]
@@ -456,8 +456,15 @@ async fn an_unmapped_role_indexes_nothing_until_a_role_mapping_binds_it() {
     for document in &parked {
         assert_eq!(
             document["errorCode"].as_str(),
-            Some("security_exception"),
-            "case \"an unmapped role\": expected the cluster's authorization error type, got \
+            Some("OS.BulkWritePermissionDenied"),
+            "case \"an unmapped role\": expected Firehose's own code for a denied write, got \
+             {document:?}"
+        );
+        assert!(
+            document["errorMessage"]
+                .as_str()
+                .is_some_and(|message| !message.is_empty()),
+            "case \"an unmapped role\": expected the cluster's reason beside the code, got \
              {document:?}"
         );
     }

@@ -762,7 +762,7 @@ async fn a_delivery_indexes_only_the_documents_the_index_mappings_take() {
                 )
             });
         assert_eq!(
-            found["esIndexName"].as_str(),
+            found["osIndexName"].as_str(),
             Some(index.as_str()),
             "case {:?}: expected the index the delivery used, got {found}",
             record.case

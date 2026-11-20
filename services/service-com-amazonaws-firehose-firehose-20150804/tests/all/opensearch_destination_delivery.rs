@@ -224,7 +224,8 @@ fn strict_schema() -> Value {
 /// RULE: every record of a delivered buffer is offered to the destination's index as one
 /// document; the ones the index's mappings accept are indexed, and each one it refuses is
 /// written to the destination's Amazon S3 backup under the failed-document folder, carrying
-/// the engine's own error type and the record's own bytes.
+/// Firehose's own code for the class of the refusal, the engine's reason and the record's
+/// own bytes.
 ///
 /// The rows span what the index can say about a document: a mapping that accepts it, a
 /// strict mapping that has no field for it, a mapped type that cannot parse its value,
@@ -238,8 +239,8 @@ async fn documents_the_index_refuses_are_parked_in_the_backup() {
         /// The index's schema, or `None` to leave the index to the delivery to create.
         schema: Option<Value>,
         record: &'static [u8],
-        /// The engine error type the backup must report, or `None` when the document is
-        /// expected to be indexed.
+        /// The `errorCode` the backup must report — Firehose's own, in this destination
+        /// kind's `OS.` namespace — or `None` when the document is expected to be indexed.
         refused_with: Option<&'static str>,
     }
 
@@ -254,19 +255,19 @@ async fn documents_the_index_refuses_are_parked_in_the_backup() {
             case: "a field the strict mapping does not carry",
             schema: Some(strict_schema()),
             record: br#"{"level":"info","surprise":"x"}"#,
-            refused_with: Some("strict_dynamic_mapping_exception"),
+            refused_with: Some("OS.AmazonOpenSearchServiceParseException"),
         },
         Case {
             case: "a value the mapped type cannot parse",
             schema: Some(strict_schema()),
             record: br#"{"level":"info","count":"many"}"#,
-            refused_with: Some("mapper_parsing_exception"),
+            refused_with: Some("OS.AmazonOpenSearchServiceParseException"),
         },
         Case {
             case: "bytes that are not a document",
             schema: Some(strict_schema()),
             record: b"not a document at all",
-            refused_with: Some("mapper_parsing_exception"),
+            refused_with: Some("OS.AmazonOpenSearchServiceParseException"),
         },
         Case {
             case: "an unmapped field under a dynamic mapping",
@@ -333,7 +334,7 @@ async fn documents_the_index_refuses_are_parked_in_the_backup() {
                     case.case
                 );
             }
-            Some(error_type) => {
+            Some(error_code) => {
                 let parked = parked_documents(
                     &emulator,
                     case.case,
@@ -350,18 +351,19 @@ async fn documents_the_index_refuses_are_parked_in_the_backup() {
                 let document = &parked[0];
                 assert_eq!(
                     document["errorCode"].as_str(),
-                    Some(error_type),
-                    "case {:?}: expected the engine's error type, got {document:?}",
+                    Some(error_code),
+                    "case {:?}: expected Firehose's own code for the refusal, got \
+                     {document:?}",
                     case.case
                 );
                 assert_eq!(
-                    document["esIndexName"].as_str(),
+                    document["osIndexName"].as_str(),
                     Some(index.as_str()),
                     "case {:?}: expected the index the delivery used, got {document:?}",
                     case.case
                 );
                 assert_eq!(
-                    document["esDocumentId"].as_str(),
+                    document["osDocumentId"].as_str(),
                     Some(record_id.as_str()),
                     "case {:?}: expected the document id the delivery used, got {document:?}",
                     case.case
@@ -509,8 +511,8 @@ async fn a_domain_that_does_not_authorize_the_role_parks_every_document() {
         for document in &parked {
             assert_eq!(
                 document["errorCode"].as_str(),
-                Some("security_exception"),
-                "case {:?}: expected the engine's authorization error type, got {document:?}",
+                Some("OS.BulkWritePermissionDenied"),
+                "case {:?}: expected Firehose's own code for a denied write, got {document:?}",
                 case.case
             );
         }

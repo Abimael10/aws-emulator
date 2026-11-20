@@ -120,6 +120,12 @@ pub mod iceberg;
 /// The data transformation a destination's `ProcessingConfiguration` asks for by naming a
 /// Lambda function, and what that function's verdict does to each record.
 pub mod lambda_processor;
+/// The `errorCode` a document an Amazon OpenSearch Service destination did not take is
+/// reported under.
+pub mod search_error_code;
+/// The error-output document of a document an Amazon OpenSearch Service destination did not
+/// take.
+pub mod search_error_output;
 /// The delivery of a buffer to a destination in Splunk.
 pub mod splunk;
 /// The zone a destination's time fields are rendered in.
@@ -1250,6 +1256,10 @@ pub struct SearchTarget {
     /// The Amazon S3 location the destination's required `S3Configuration` names, where a
     /// document the domain did not index is written.
     pub backup: Option<S3Target>,
+    /// The vocabulary this destination KIND's error output is written in
+    /// ([`search_error_output`]) — the one difference between the current offering and its
+    /// legacy name that reaches that output.
+    pub error_output: search_error_output::SearchErrorOutput,
 }
 
 /// What the `firehose:error-output-type` namespace expands to for a document an Amazon
@@ -1304,6 +1314,7 @@ pub fn search_targets(config: &DestinationConfigKind) -> Vec<SearchTarget> {
                 .as_ref()
                 .and_then(|options| options.duration_in_seconds),
             &config.s3_configuration,
+            search_error_output::ELASTICSEARCH_OUTPUT,
         ),
         DestinationConfigKind::AmazonOpenSearchService(config) => search_target(
             config.domain_arn.as_deref(),
@@ -1324,6 +1335,7 @@ pub fn search_targets(config: &DestinationConfigKind) -> Vec<SearchTarget> {
                 .as_ref()
                 .and_then(|options| options.duration_in_seconds),
             &config.s3_configuration,
+            search_error_output::OPENSEARCH_SERVICE_OUTPUT,
         ),
         _ => None,
     };
@@ -1346,6 +1358,7 @@ fn search_target(
     hints: Option<BufferingHints>,
     retry_duration_in_seconds: Option<i32>,
     s3_configuration: &S3DestinationConfiguration,
+    error_output: search_error_output::SearchErrorOutput,
 ) -> Option<SearchTarget> {
     let domain = domain_arn
         .map(str::to_string)
@@ -1371,6 +1384,7 @@ fn search_target(
             .and_then(|seconds| u64::try_from(seconds).ok())
             .map_or(DEFAULT_SEARCH_RETRY_DURATION, Duration::from_secs),
         backup: plain_target(s3_configuration),
+        error_output,
     })
 }
 
@@ -2257,13 +2271,6 @@ fn backup_object(
     })
 }
 
-/// The `errorCode` the error output names for a buffer whose destination domain answered
-/// NOTHING — it is not provisioned, or this emulator holds no domain at that address — so
-/// no cluster ever judged the documents. Written in the same form as the other
-/// destinations' codes here (`<destination>.<failure>`), because it names the destination
-/// rather than a document's own refusal, whose code is the engine's own error type.
-const SEARCH_DESTINATION_UNAVAILABLE: &str = "AmazonOpenSearchService.ServiceUnavailable";
-
 /// How ONE document of a buffer failed to be indexed, as the error-output document names
 /// it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2275,8 +2282,9 @@ struct SearchDocumentFailure {
     index_name: String,
     /// The id the document was written under, empty where the delivery named none.
     document_id: String,
-    /// The engine's own error type, which is what a consumer of the error output keys
-    /// off.
+    /// The code Firehose reports this failure under: its own, in the destination kind's
+    /// error namespace ([`search_error_code`]), which is what a consumer of the error
+    /// output keys off.
     error_code: String,
     /// The engine's reason for refusing the document.
     error_message: String,
@@ -2302,7 +2310,8 @@ enum Delivered {
 /// which is the one place that decides whether the destination's role may write, which
 /// index the document lands in and whether that index's mappings accept it — so a document
 /// this emulator indexes is readable from the domain that holds it, and a document the
-/// domain refuses comes back with the engine's own error type for the backup to carry.
+/// domain refuses comes back with the engine's own reason for the backup to report under
+/// Firehose's code for its class ([`search_error_code`]).
 ///
 /// A document is offered to the domain ONCE per flush, and a buffer whose backup could not
 /// be written is owed again as a whole: a document that was already indexed is then
@@ -2345,7 +2354,7 @@ async fn index_documents<Eng: Send + Sync + 'static>(
                 record_id: record.record_id.clone(),
                 index_name: index_name.clone(),
                 document_id,
-                error_code: error_type.to_string(),
+                error_code: search.error_output.rejected(error_type),
                 error_message: message,
             }),
             // The domain answered nothing, which is a verdict on the DESTINATION and not
@@ -2361,7 +2370,7 @@ async fn index_documents<Eng: Send + Sync + 'static>(
                     record_id: record.record_id.clone(),
                     index_name,
                     document_id,
-                    error_code: SEARCH_DESTINATION_UNAVAILABLE.to_string(),
+                    error_code: search.error_output.unavailable(),
                     error_message: message,
                 });
             }
@@ -2432,7 +2441,8 @@ fn rotated_index(search: &SearchTarget, now: SystemTime) -> String {
 /// configured Amazon S3 destination" (`S3BackupMode`), which it does under both of that
 /// member's modes.
 ///
-/// Written as the error-output document of each failed document ([`search_error_envelope`]),
+/// Written as the error-output document of each failed document
+/// ([`search_error_output::envelope`]),
 /// so a consumer of the backup learns which index refused it and why, and still holds the
 /// record's own bytes. `None` when the backup cannot be worked out at all, in which case
 /// the records stay owed rather than being dropped.
@@ -2458,7 +2468,7 @@ fn search_backup_object(
         .iter()
         .map(|failure| {
             let record = records.get(failure.record_id.as_str()).copied();
-            search_error_envelope(record, failure, now).to_string()
+            search_error_output::envelope(record, failure, search.error_output, now).to_string()
         })
         .collect();
     let encoded = compressed(documents.join("\n").into_bytes(), target)?;
@@ -2495,32 +2505,6 @@ fn search_error_prefix(target: &S3Target, now: SystemTime) -> Result<String, Del
         now,
         target.time_zone,
     )
-}
-
-/// The error-output document of one document the domain did not index: how the indexing
-/// failed, when it was attempted, which index and document id it was attempted under, and
-/// the record's own data.
-///
-/// The common members are the ones every Firehose error output carries (`errorCode`,
-/// `errorMessage`, `attemptsMade`, `arrivalTimestamp`, `attemptEndingTimestamp`,
-/// `rawData`), and the three `es…` members are the ones the error output of an Amazon
-/// OpenSearch Service destination adds: the index and the document id the delivery used.
-/// `errorCode` is the engine's own error type, which is what the domain's answer carried.
-fn search_error_envelope(
-    record: Option<&StoredRecord>,
-    failure: &SearchDocumentFailure,
-    now: SystemTime,
-) -> ::serde_json::Value {
-    ::serde_json::json!({
-        "attemptsMade": attempts_made(record),
-        "arrivalTimestamp": record.map_or_else(|| epoch_millis(now), |record| epoch_millis(record.received_at)),
-        "errorCode": failure.error_code,
-        "errorMessage": failure.error_message,
-        "attemptEndingTimestamp": epoch_millis(now),
-        "rawData": record.map(|record| ::aws_smithy_types::base64::encode(&record.data)).unwrap_or_default(),
-        "esDocumentId": failure.document_id,
-        "esIndexName": failure.index_name,
-    })
 }
 
 /// How a delivered object is encrypted at rest.
