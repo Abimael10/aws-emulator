@@ -21,7 +21,7 @@
 
 use serde_json::{Map, Value};
 
-use super::{call_rest_json, percent_encoded, Created, Refusal};
+use super::{call_rest_json, lambda_declaration, percent_encoded, Created, Refusal};
 use crate::state::StoredResource;
 
 /// The resource type this module provisions.
@@ -206,13 +206,17 @@ async fn put(
             request.insert((*member).to_string(), value.clone());
         }
     }
+    // The two retry members are modelled as integers, and a template's scalar is text
+    // wherever its author quoted it, so the declaration is read as the types AWS Lambda
+    // states for them ([`lambda_declaration`]) before the put is made.
+    let request = lambda_declaration(&Value::Object(request));
     call_rest_json(
         ctx,
         LAMBDA_SIGNING_NAME,
         region,
         "PUT",
         &addressed.uri(),
-        Some(&Value::Object(request)),
+        Some(&request),
     )
     .await?;
     Ok(())

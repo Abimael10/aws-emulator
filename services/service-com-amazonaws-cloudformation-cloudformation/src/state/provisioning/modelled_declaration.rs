@@ -16,7 +16,9 @@
 //! provisioning module ([`super::service_discovery`] and [`super::application_auto_scaling`]
 //! both reach it). A value that is already of the modelled type travels as written, and one
 //! that is NO such value is left exactly as the template wrote it, because the owning service's
-//! own validation is what judges it.
+//! own validation is what judges it. A member whose keys are the REQUESTER's rather than the
+//! model's — a function's environment variables, a tag set, a weight per version — is classified
+//! as the whole subtree it is, because no name inside it says anything about a modelled type.
 
 use ::serde_json::Value;
 
@@ -32,6 +34,17 @@ pub(super) enum ModelledScalar {
     Number,
     /// A boolean, written `true` or `false` in either case.
     Boolean,
+    /// A member the owning model types as a collection of TEXT whose keys are the
+    /// requester's own (a function's environment variables, a tag set): the member and
+    /// everything under it travels exactly as the declaration wrote it, because a value that
+    /// merely LOOKS like a number is still text there — and the names inside it are the
+    /// requester's, so none of them says anything about a modelled type.
+    TextThroughout,
+    /// A member the owning model types as a collection of NUMBERS whose keys are the
+    /// requester's own (a weight per function version): every scalar under it is read as a
+    /// number, for the same reason — the keys are the requester's, so there is no member name
+    /// the reading could be told about.
+    NumberThroughout,
 }
 
 /// How deep [`modelled_declaration`] walks a declared document.
@@ -65,13 +78,19 @@ fn modelled_at(
     if depth >= MAX_MODELLED_NESTING {
         return value.clone();
     }
-    match value {
-        Value::String(text) => match modelled_as(member) {
-            ModelledScalar::AsWritten => value.clone(),
-            ModelledScalar::Number => as_number(text).unwrap_or_else(|| value.clone()),
-            ModelledScalar::Boolean => as_boolean(text).unwrap_or_else(|| value.clone()),
-        },
-        Value::Object(members) => Value::Object(
+    match (modelled_as(member), value) {
+        // The two classifications that are about the whole SUBTREE under a member rather than
+        // about one scalar: a collection the model types as text, and one it types as numbers,
+        // both keyed by names of the requester's own.
+        (ModelledScalar::TextThroughout, _) => value.clone(),
+        (ModelledScalar::NumberThroughout, _) => numbers_throughout(value, depth),
+        (ModelledScalar::Number, Value::String(text)) => {
+            as_number(text).unwrap_or_else(|| value.clone())
+        }
+        (ModelledScalar::Boolean, Value::String(text)) => {
+            as_boolean(text).unwrap_or_else(|| value.clone())
+        }
+        (_, Value::Object(members)) => Value::Object(
             members
                 .iter()
                 .map(|(name, held)| (name.clone(), modelled_at(name, held, depth + 1, modelled_as)))
@@ -79,10 +98,34 @@ fn modelled_at(
         ),
         // A list's entries are values of the member the list belongs to, so each is read under
         // that same member name.
-        Value::Array(entries) => Value::Array(
+        (_, Value::Array(entries)) => Value::Array(
             entries
                 .iter()
                 .map(|entry| modelled_at(member, entry, depth + 1, modelled_as))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+/// [`ModelledScalar::NumberThroughout`] over one value: every scalar under it read as the
+/// number its text names, at the same bound the rest of the walk keeps.
+fn numbers_throughout(value: &Value, depth: usize) -> Value {
+    if depth >= MAX_MODELLED_NESTING {
+        return value.clone();
+    }
+    match value {
+        Value::String(text) => as_number(text).unwrap_or_else(|| value.clone()),
+        Value::Object(members) => Value::Object(
+            members
+                .iter()
+                .map(|(name, held)| (name.clone(), numbers_throughout(held, depth + 1)))
+                .collect(),
+        ),
+        Value::Array(entries) => Value::Array(
+            entries
+                .iter()
+                .map(|entry| numbers_throughout(entry, depth + 1))
                 .collect(),
         ),
         _ => value.clone(),
@@ -117,6 +160,8 @@ mod tests {
         match member {
             "TTL" | "FailureThreshold" | "MaxCapacity" => ModelledScalar::Number,
             "DisableScaleIn" => ModelledScalar::Boolean,
+            "Variables" => ModelledScalar::TextThroughout,
+            "AdditionalVersionWeights" => ModelledScalar::NumberThroughout,
             _ => ModelledScalar::AsWritten,
         }
     }
@@ -127,7 +172,8 @@ mod tests {
     ///
     /// The rows differ along what the rule generalises over: the scalar's modelled type, the
     /// depth it sits at, whether it stands inside a list, the spelling of a boolean, whether
-    /// the number is whole or fractional, and whether the text names such a value at all.
+    /// the number is whole or fractional, whether the text names such a value at all, and
+    /// whether the member is a collection keyed by names of the requester's own.
     #[test]
     fn a_quoted_scalar_is_read_as_the_type_the_model_declares() {
         let cases: &[(&str, Value, Value)] = &[
@@ -155,6 +201,16 @@ mod tests {
                 "text that names no number",
                 serde_json::json!({"FailureThreshold": "many"}),
                 serde_json::json!({"FailureThreshold": "many"}),
+            ),
+            (
+                "a collection of text, whose own keys name modelled members",
+                serde_json::json!({"Variables": {"TTL": "60", "DisableScaleIn": "true"}}),
+                serde_json::json!({"Variables": {"TTL": "60", "DisableScaleIn": "true"}}),
+            ),
+            (
+                "a collection of numbers, keyed by names of the requester's own",
+                serde_json::json!({"AdditionalVersionWeights": {"2": "0.1", "3": 0.2}}),
+                serde_json::json!({"AdditionalVersionWeights": {"2": 0.1, "3": 0.2}}),
             ),
         ];
         for (case, declared, expected) in cases {

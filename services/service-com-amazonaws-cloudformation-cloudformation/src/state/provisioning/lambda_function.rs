@@ -42,7 +42,10 @@ use std::time::Duration;
 
 use serde_json::{Map, Value};
 
-use super::{call_rest_json, percent_encoded, storable_tags, Created, Readiness, Refusal, Removal};
+use super::{
+    call_rest_json, lambda_declaration, percent_encoded, storable_tags, Created, Readiness,
+    Refusal, Removal,
+};
 use crate::state::StoredResource;
 
 /// The resource type this module provisions.
@@ -219,13 +222,18 @@ pub(super) async fn create(
         );
     }
 
+    // A template's scalar is text wherever its author quoted it or it came through a `Ref`,
+    // while the members of this create are modelled as integers and booleans, so the
+    // declaration is read as the types AWS Lambda states for them ([`lambda_declaration`])
+    // before the request is sent.
+    let request = lambda_declaration(&Value::Object(request));
     let answered = call_rest_json(
         ctx,
         LAMBDA_SIGNING_NAME,
         region,
         "POST",
         FUNCTIONS_URI,
-        Some(&Value::Object(request)),
+        Some(&request),
     )
     .await?;
 
@@ -305,13 +313,14 @@ pub(super) async fn update(
     if let Some(value) = declared_in(declared, KMS_KEY_PROPERTY) {
         configuration.insert(KMS_KEY_MEMBER.to_string(), value.clone());
     }
+    let configuration = lambda_declaration(&Value::Object(configuration));
     let answered = call_rest_json(
         ctx,
         LAMBDA_SIGNING_NAME,
         region,
         "PUT",
         &configuration_uri(&name),
-        Some(&Value::Object(configuration)),
+        Some(&configuration),
     )
     .await?;
 
@@ -544,11 +553,11 @@ async fn configure(
     // "The number of simultaneous executions to reserve for the function"
     // (`PutFunctionConcurrency`).
     if let Some(reserved) = declared(resource, RESERVED_CONCURRENCY_PROPERTY) {
-        let request = Value::Object(
+        let request = lambda_declaration(&Value::Object(
             [(RESERVED_CONCURRENCY_PROPERTY.to_string(), reserved.clone())]
                 .into_iter()
                 .collect::<Map<String, Value>>(),
-        );
+        ));
         call_rest_json(
             ctx,
             LAMBDA_SIGNING_NAME,

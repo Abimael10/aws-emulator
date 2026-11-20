@@ -33,7 +33,10 @@ use std::time::Duration;
 
 use serde_json::{Map, Value};
 
-use super::{call_rest_json, percent_encoded, storable_tags, Created, Readiness, Refusal, Removal};
+use super::{
+    call_rest_json, lambda_declaration, percent_encoded, storable_tags, Created, Readiness,
+    Refusal, Removal,
+};
 use crate::state::StoredResource;
 
 /// The resource type this module provisions.
@@ -225,13 +228,17 @@ pub(super) async fn create(
             ),
         );
     }
+    // The declaration is read as the types AWS Lambda models these members as before the
+    // request is sent ([`lambda_declaration`]): a template's scalar is text wherever its
+    // author quoted it, and these members are integers and booleans.
+    let request = lambda_declaration(&Value::Object(request));
     let answered = call_rest_json(
         ctx,
         LAMBDA_SIGNING_NAME,
         region,
         "POST",
         MAPPINGS_URI,
-        Some(&Value::Object(request)),
+        Some(&request),
     )
     .await?;
     // The id Lambda assigned, which is what `Ref` returns for the type and what every later
@@ -324,6 +331,7 @@ pub(super) async fn update(
     if let Some(value) = declared_in(declared, KMS_KEY_PROPERTY) {
         request.insert(KMS_KEY_MEMBER.to_string(), value.clone());
     }
+    let request = lambda_declaration(&Value::Object(request));
     // Lambda refuses a change to a mapping that is still in a transitional state, so the call
     // is made once that service reports the mapping out of one.
     await_settled(ctx, region, &resource.physical_resource_id).await;
@@ -333,7 +341,7 @@ pub(super) async fn update(
         region,
         "PUT",
         &mapping_uri(&resource.physical_resource_id),
-        Some(&Value::Object(request)),
+        Some(&request),
     )
     .await?;
     // The mapping keeps the id Lambda assigned it, and publishes no attribute this read could

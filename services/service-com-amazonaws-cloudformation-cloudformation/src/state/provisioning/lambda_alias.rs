@@ -36,7 +36,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
-use super::{call_rest_json, percent_encoded, Created, Refusal};
+use super::{call_rest_json, lambda_declaration, percent_encoded, Created, Refusal};
 use crate::state::StoredResource;
 
 /// The resource type this module provisions.
@@ -119,13 +119,17 @@ pub(super) async fn create(
     request
         .entry(NAME_PROPERTY.to_string())
         .or_insert_with(|| Value::String(computed_alias_name(resource)));
+    // The weights an alias routes with are modelled as doubles, and a template's scalar is
+    // text wherever its author quoted it, so the declaration is read as the types AWS Lambda
+    // states for them ([`lambda_declaration`]) before the create is made.
+    let request = lambda_declaration(&Value::Object(request));
     let answered = call_rest_json(
         ctx,
         LAMBDA_SIGNING_NAME,
         region,
         "POST",
         &aliases_uri(&function),
-        Some(&Value::Object(request)),
+        Some(&request),
     )
     .await?;
     let arn = reported_text(&answered, ALIAS_ARN_MEMBER).ok_or_else(missing_arn)?;
@@ -172,13 +176,14 @@ pub(super) async fn update(
             request.insert((*member).to_string(), value.clone());
         }
     }
+    let request = lambda_declaration(&Value::Object(request));
     let answered = call_rest_json(
         ctx,
         LAMBDA_SIGNING_NAME,
         region,
         "PUT",
         &alias_uri(&function, &name),
-        Some(&Value::Object(request)),
+        Some(&request),
     )
     .await?;
     configure(ctx, region, declared_properties, &function, &name).await?;
@@ -250,6 +255,7 @@ async fn configure(
     let Some(Value::Object(config)) = declared(properties, PROVISIONED_CONCURRENCY_PROPERTY) else {
         return Ok(());
     };
+    let config = lambda_declaration(&Value::Object(config.clone()));
     call_rest_json(
         ctx,
         LAMBDA_SIGNING_NAME,
@@ -260,7 +266,7 @@ async fn configure(
             percent_encoded(function),
             percent_encoded(name)
         ),
-        Some(&Value::Object(config.clone())),
+        Some(&config),
     )
     .await?;
     Ok(())

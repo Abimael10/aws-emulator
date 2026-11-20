@@ -304,6 +304,11 @@ mod lambda_event_source_mapping;
 mod lambda_function;
 mod lambda_layer_version;
 mod lambda_permission;
+/// The member catalogue every `AWS::Lambda::*` arm reads its declaration through, so a
+/// quoted number or boolean reaches AWS Lambda as the type that service models it as
+/// ([`lambda_scalars`]).
+mod lambda_scalars;
+use lambda_scalars::lambda_declaration;
 mod lambda_version;
 /// The Amazon CloudWatch Logs types a stack declares — a log group, a stream inside one and
 /// a metric filter on one: visible to the rest of this service's state because the types'
@@ -4427,10 +4432,14 @@ async fn delete_pass(
             .then(|| final_snapshot_identifier(resource));
         if let Some(identifier) = final_snapshot.as_deref() {
             let resource = &outcome.resources[index];
-            let snapshotted = super::service_role::on_resource(
+            // BOXED, for the reason this walk's other provider calls are: the call's future is
+            // the owning service's whole handler, and holding one of those inline in this
+            // walk's state machine is what takes a teardown of a wide stack past the thread's
+            // stack.
+            let snapshotted = Box::pin(super::service_role::on_resource(
                 super::service_role::target_of(resource),
                 take_final_snapshot(ctx, region, resource, identifier),
-            )
+            ))
             .await;
             if let Err(refusal) = snapshotted {
                 // The snapshot the policy asked for could not be taken, so the resource is
@@ -4492,7 +4501,9 @@ async fn delete_pass(
                     // ARE the ones the resource was last declared with.
                     old_properties: None,
                 };
-                custom_resource::send(ctx, region, &call)
+                // BOXED for the same reason the arm below is: the send dispatches the provider
+                // service's whole handler, so its future is of that same size class.
+                Box::pin(custom_resource::send(ctx, region, &call))
                     .await
                     .map(|response_url| Some(call.remembered(&response_url)))
             }

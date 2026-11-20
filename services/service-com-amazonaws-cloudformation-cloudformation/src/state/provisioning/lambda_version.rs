@@ -37,7 +37,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
-use super::{call_rest_json, percent_encoded, Created, Refusal, Removal};
+use super::{call_rest_json, lambda_declaration, percent_encoded, Created, Refusal, Removal};
 use crate::state::StoredResource;
 
 /// The resource type this module provisions.
@@ -206,6 +206,9 @@ async fn configure(
     // a function's version" (`PutProvisionedConcurrencyConfig`), whose `Qualifier` is the
     // version this resource published.
     if let Some(Value::Object(declared)) = declared(resource, PROVISIONED_CONCURRENCY_PROPERTY) {
+        // The concurrency this reserves is modelled as an integer, and a template's scalar is
+        // text wherever its author quoted it ([`lambda_declaration`]).
+        let request = lambda_declaration(&Value::Object(declared.clone()));
         call_rest_json(
             ctx,
             LAMBDA_SIGNING_NAME,
@@ -216,7 +219,7 @@ async fn configure(
                 percent_encoded(function),
                 percent_encoded(version)
             ),
-            Some(&Value::Object(declared.clone())),
+            Some(&request),
         )
         .await?;
     }
