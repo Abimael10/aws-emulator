@@ -634,7 +634,7 @@ fn assert_key_layout(row: &Row, key: &str) {
 /// as every other call this suite makes — so the deployment and the pipeline it deploys are
 /// addressed in one Region. The form components go through the test crate's one awsQuery
 /// encoder, so a template body full of `{`, `"` and `&` survives it.
-async fn cloudformation(
+pub(crate) async fn cloudformation(
     router: &MultiServiceRouter,
     action: &str,
     members: &[(&str, &str)],
