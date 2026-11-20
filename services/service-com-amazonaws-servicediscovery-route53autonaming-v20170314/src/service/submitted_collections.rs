@@ -14,7 +14,9 @@
 use std::sync::Arc;
 
 use service_common::submitted_collections::{StatedClause, StatedClauseTable};
-use smithy_server_runtime::OperationRoutingTable;
+use smithy_server_runtime::{ErasedOperation, Operation, OperationRoutingTable};
+
+use super::data_endpoint::AtTheDataEndpoint;
 
 /// The error code a constraint refusal of this service carries, which is the one
 /// [`super::EmulatedService::override_refusal`] picks for the same class: the restated
@@ -60,6 +62,11 @@ macro_rules! serve {
 /// walk renders as its entry count. The `TagList` members of the tag writes and the creates
 /// are `@length` 0..200 as well, so they are served quoting too; every other operation
 /// takes the cheap path.
+///
+/// The operations the model hosts on an endpoint of their OWN are listed last, served
+/// through the layer that words their constraint refusals the way the validation in front
+/// of that endpoint words one ([`super::data_endpoint`]) — the member an error body reports
+/// its text in is unchanged for them.
 pub(super) fn stated_error_bodies<Eng: Send + Sync + 'static>(
     engine: &Arc<Eng>,
 ) -> OperationRoutingTable {
@@ -84,8 +91,6 @@ pub(super) fn stated_error_bodies<Eng: Send + Sync + 'static>(
         delete_service::DeleteService,
         delete_service_attributes::DeleteServiceAttributes,
         deregister_instance::DeregisterInstance,
-        discover_instances::DiscoverInstances,
-        discover_instances_revision::DiscoverInstancesRevision,
         get_instance::GetInstance,
         get_instances_health_status::GetInstancesHealthStatus,
         get_namespace::GetNamespace,
@@ -104,5 +109,34 @@ pub(super) fn stated_error_bodies<Eng: Send + Sync + 'static>(
         update_public_dns_namespace::UpdatePublicDnsNamespace,
         update_service::UpdateService,
     );
-    table.finish()
+    let mut table = table.finish();
+    // The operations the model hosts on an endpoint of their own, where the generic
+    // request-validation layer words a constraint refusal instead of this service
+    // ([`super::data_endpoint`], whose census test pins which operations those are).
+    at_the_data_endpoint(
+        &mut table,
+        crate::ops::discover_instances::DiscoverInstances::new(Arc::clone(engine)),
+    );
+    at_the_data_endpoint(
+        &mut table,
+        crate::ops::discover_instances_revision::DiscoverInstancesRevision::new(Arc::clone(engine)),
+    );
+    table
+}
+
+/// Serve `operation` at the data endpoint, under its modelled name: a request outside the
+/// constraints the model declares is refused as that endpoint's validation refuses one, and
+/// its responses are answered as this service answers them — the same `AnsweredAs` every
+/// other operation above is served with.
+fn at_the_data_endpoint<O: Operation + ErasedOperation + 'static>(
+    table: &mut OperationRoutingTable,
+    operation: O,
+) {
+    table.add_operation(
+        O::NAME,
+        Box::new(AtTheDataEndpoint::new(
+            operation,
+            super::error_message_member::with_modelled_message_member,
+        )),
+    );
 }

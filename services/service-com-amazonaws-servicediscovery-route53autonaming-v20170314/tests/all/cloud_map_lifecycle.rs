@@ -296,10 +296,12 @@ async fn a_namespace_name_must_satisfy_the_pattern_the_model_declares() {
 }
 
 /// This model declares exactly one error for a bad request — `InvalidInput`, "one or
-/// more specified values aren't valid", which every operation lists — and no
-/// `ValidationException` shape at all, so EVERY refusal of a bad value carries that
-/// code: the ones a handler makes and the ones the centralized walk makes before a
-/// handler runs, whichever constraint class they come from.
+/// more specified values aren't valid", which every operation lists — so every refusal of
+/// a bad value by the service ITSELF carries that code: the ones a handler makes and the
+/// ones the centralized walk makes before a handler runs, whichever constraint class they
+/// come from. (The operations the model hosts on an endpoint of their own are fronted by
+/// AWS's generic request validation instead, which is `data_endpoint_refusals.rs`; every
+/// row below is served by this service's main endpoint.)
 #[tokio::test]
 async fn every_refusal_of_a_bad_value_carries_this_service_s_own_code() {
     let router = emulator();

@@ -15,10 +15,14 @@
 //! here.
 //!
 //! Only the ORDER moves. The counted envelope, the clause, the member path and the value the
-//! clause echoes stay where [`super::EmulatedService::override_refusal`] takes them from
-//! (`aws_smithy_schema_server::envelope`), so this service cannot word a constraint
-//! differently from the services that state the same sentence; a refusal carrying no enum
-//! clause comes back untouched.
+//! clause echoes are the framework's own (`aws_smithy_schema_server::envelope`), so this
+//! service cannot word a constraint differently from the services that state the same
+//! sentence; a refusal carrying no enum clause comes back untouched.
+//!
+//! [`stated_message`] is the whole sentence, and the ONE home for it: both layers that word
+//! a constraint refusal of this service — the service's own seam for its main endpoint and
+//! the generic validation in front of its data endpoint ([`super::data_endpoint`]) — state
+//! it from here, and differ in the error CODE alone.
 
 use ::service_common::validation_message::in_hashed_enum_order;
 use ::smithy_server_runtime::Violation;
@@ -27,4 +31,16 @@ use ::smithy_server_runtime::Violation;
 /// table of the admissible values is walked, and every other violation kind unchanged.
 pub(super) fn as_this_service_states(violations: &[Violation]) -> Vec<Violation> {
     violations.iter().map(in_hashed_enum_order).collect()
+}
+
+/// The WORDS this service refuses `violations` with: the framework's own counted envelope
+/// over its own clauses, each enum value set listed as above. `None` when there is nothing
+/// to state.
+///
+/// The one home for them, so the layer that words a refusal for the service's main
+/// endpoint ([`super::EmulatedService::override_refusal`]) and the one that words it for
+/// the data endpoint ([`super::data_endpoint`]) cannot state the same constraint
+/// differently: the two differ in the error CODE they travel under and in nothing else.
+pub(super) fn stated_message(violations: &[Violation]) -> Option<String> {
+    ::aws_smithy_schema_server::envelope(&as_this_service_states(violations))
 }
