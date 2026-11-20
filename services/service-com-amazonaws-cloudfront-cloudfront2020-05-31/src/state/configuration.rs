@@ -4562,14 +4562,20 @@ pub const DEFAULT_ENABLE_ACCEPT_ENCODING_BROTLI: bool = false;
 /// * `QueryArgProfileConfig` is the mapping every stored configuration carries — an update
 ///   of one cannot leave it out ([`QUERY_ARG_PROFILE_CONFIG_REQUIRED_MESSAGE`]) — so a
 ///   configuration created without one carries the mapping that maps nothing
-///   ([`default_query_arg_profile_config`]).
+///   ([`default_query_arg_profile_config`]);
+/// * `QueryArgProfileConfig$ForwardWhenQueryArgProfileIsUnknown` is the SERVICE's where the
+///   mapping maps anything at all ([`forwards_an_unknown_query_arg_profile`]): a
+///   configuration that maps at least one query argument to a profile is stored forwarding
+///   the requests whose profile it cannot resolve, whatever the request asked for. Recorded
+///   behaviour.
 ///
 /// `ContentTypeProfileConfig` is left exactly as submitted: it is a CHOICE a configuration
 /// either made or did not, and neither the model nor the update rule makes it a member of
-/// every stored configuration. A `QueryArgProfileConfig` the request DID state is stored as
-/// stated, down to its own optional `QueryArgProfiles` wrapper: what the service supplies is
-/// the whole mapping for a configuration that states none, not a member inside one it
-/// states.
+/// every stored configuration — `ForwardWhenContentTypeIsUnknown` inside one it DID state is
+/// stored as stated, since the rule above is the query-argument mapping's own. A
+/// `QueryArgProfileConfig` the request DID state is otherwise stored as stated, down to its
+/// own optional `QueryArgProfiles` wrapper: what the service supplies is the whole mapping
+/// for a configuration that states none, not a member inside one it states.
 pub fn resolve_field_level_encryption_config(
     mut config: FieldLevelEncryptionConfig,
 ) -> FieldLevelEncryptionConfig {
@@ -4577,9 +4583,40 @@ pub fn resolve_field_level_encryption_config(
     config.query_arg_profile_config = Some(
         config
             .query_arg_profile_config
+            .map(resolve_query_arg_profile_config)
             .unwrap_or_else(default_query_arg_profile_config),
     );
     config
+}
+
+/// Resolve the one member of a submitted `QueryArgProfileConfig` the SERVICE supplies:
+/// `ForwardWhenQueryArgProfileIsUnknown` where the mapping maps a query argument to a profile
+/// ([`forwards_an_unknown_query_arg_profile`]). The mapping itself is stored as submitted.
+fn resolve_query_arg_profile_config(mut config: QueryArgProfileConfig) -> QueryArgProfileConfig {
+    config.forward_when_query_arg_profile_is_unknown =
+        forwards_an_unknown_query_arg_profile(&config);
+    config
+}
+
+/// What `ForwardWhenQueryArgProfileIsUnknown` is STORED as for the mapping `config`
+/// describes.
+///
+/// The flag is "Flag to set if you want a request to be forwarded to the origin even if the
+/// profile specified by the field-level encryption query argument, fle-profile, is unknown",
+/// and a mapping that maps at least one query argument to a profile is stored forwarding such
+/// a request whatever the request submitted: the mapping names the profiles this
+/// configuration encrypts for, so a request naming any OTHER profile is one the configuration
+/// has nothing to do with rather than one it means to drop. Recorded behaviour. A mapping
+/// that maps NOTHING carries the value the request stated — the configuration states nothing
+/// about any profile, so there is no mapping for the flag to follow — and the mapping this
+/// service supplies for a configuration that states none forwards too
+/// ([`default_query_arg_profile_config`]).
+pub fn forwards_an_unknown_query_arg_profile(config: &QueryArgProfileConfig) -> bool {
+    config.forward_when_query_arg_profile_is_unknown
+        || config
+            .query_arg_profiles
+            .as_ref()
+            .is_some_and(|profiles| items_len(&profiles.items) > 0)
 }
 
 /// The `QueryArgProfiles` wrapper of a mapping that maps no query argument to a profile:

@@ -17,6 +17,7 @@
 //! no status here is transient and the parent's `settle` has nothing to do for a
 //! function.
 
+use std::collections::VecDeque;
 use std::time::SystemTime;
 
 use crate::ops::types::{
@@ -179,10 +180,32 @@ pub struct StoredFunction {
     /// `DEVELOPMENT` stage into it — `None` until then, which is what makes a read of the
     /// `LIVE` stage of a never-published function a function that does not exist.
     pub live: Option<StoredFunctionStage>,
+    /// The version tokens this function has HELD, oldest first: the one the create handed
+    /// back, and the one each later update minted — the most recent
+    /// [`MAX_HELD_FUNCTION_VERSIONS`] of them.
+    ///
+    /// A version token addresses a version OF THIS FUNCTION, which is what lets an operation
+    /// tell a token that is no version of it ("the If-Match version is missing or not valid
+    /// for the resource") from one it has held that is simply no longer the current one (a
+    /// precondition that evaluated to false) — see [`Self::has_held_version`]. A publish
+    /// COPIES a stage's token rather than minting one, so it adds nothing here.
+    pub versions: VecDeque<String>,
     /// The tags submitted with the create, in the SAME representation every tagged
     /// resource of this service uses, so one tagging rule covers them all.
     pub tags: TagSet,
 }
+
+/// How many of a function's own version tokens one record retains
+/// ([`StoredFunction::versions`]).
+///
+/// Every update of a function mints a token, and a caller may update one as often as it likes,
+/// so the record keeps a WINDOW of the most recent ones rather than all of them: the store's
+/// growth is then bounded by the number of functions ([`MAX_FUNCTIONS`]) times this window,
+/// whatever a caller does. It is this emulator's own ceiling rather than a published quota, and
+/// it is wide enough that the version a caller read before the mutation it is retrying against
+/// is always inside it — a token that has fallen out of the window reads as a version this
+/// function never held, which is the same answer a token it really never held gets.
+pub const MAX_HELD_FUNCTION_VERSIONS: usize = 64;
 
 impl StoredFunction {
     /// The stage `stage` names, or `None` when this function has no such stage — either
@@ -196,6 +219,19 @@ impl StoredFunction {
             FUNCTION_STAGE_LIVE => self.live.as_ref(),
             _ => None,
         }
+    }
+
+    /// Whether `version` is a version token this function has held — the current version of
+    /// either of its stages, or one a later mutation superseded ([`Self::versions`]).
+    ///
+    /// What an `If-Match` resolves to: CloudFront's own sentence for the token it cannot read
+    /// states the condition OF THE RESOURCE ("The If-Match version is missing or not valid
+    /// for the resource"), so a token this function never stood at names no version for a
+    /// precondition to be evaluated against, while one it did stand at is a precondition the
+    /// request stated and the resource has moved past.
+    pub fn has_held_version(&self, version: &str) -> bool {
+        self.versions.iter().any(|held| held == version)
+            || self.stages().any(|stage| stage.etag == version)
     }
 
     /// Every stage record this function holds, the stage it is created in first.
@@ -359,7 +395,16 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         stored.development.config = config;
         stored.development.code = code;
         stored.development.last_modified_time = now;
-        stored.development.etag = etag;
+        stored.development.etag = etag.clone();
+        // The token this function now stands at is one it HAS held from here on, so a caller
+        // that read a version before this update is told its precondition evaluated to false
+        // rather than that the version it read was never one of this function's. The window is
+        // bounded ([`MAX_HELD_FUNCTION_VERSIONS`]): the oldest token leaves it rather than the
+        // record growing with the number of updates a caller makes.
+        if stored.versions.len() >= MAX_HELD_FUNCTION_VERSIONS {
+            stored.versions.pop_front();
+        }
+        stored.versions.push_back(etag);
         Some(stored)
     }
 

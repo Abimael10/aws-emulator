@@ -45,8 +45,8 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::distribution_lifecycle::{call, create_distribution, emulator, Answer, ACCOUNT_ID, API_VERSION};
 use crate::distribution_tenant_lifecycle::escape;
 use crate::resource_policy_lifecycle::{
-    created_vpc_origin_arn, distribution_config, get_resource_policy, message, policy,
-    put_resource_policy, reported_document, stored, OTHER_RESOURCE_TYPES,
+    created_vpc_origin_arn, distribution_config, get_resource_policy, granted_principal, message,
+    policy, put_resource_policy, reported_document, stored, OTHER_RESOURCE_TYPES,
 };
 
 /// `POST /2020-05-31/delete-resource-policy`, removing the policy attached to `arn`.
@@ -126,9 +126,10 @@ async fn rows(router: &MultiServiceRouter) -> Vec<(&'static str, String, String)
                     (0..40)
                         .map(|index| format!(
                             "{{\"Effect\":\"Allow\",\"Sid\":\"statement{index}\",\
-                             \"Principal\":{{\"AWS\":\"arn:aws:iam::111122223333:root\"}},\
+                             \"Principal\":{{\"AWS\":\"{}\"}},\
                              \"Action\":\"cloudfront:GetVpcOrigin\",\
-                             \"Resource\":\"{arn}\"}}"
+                             \"Resource\":\"{arn}\"}}",
+                            granted_principal()
                         ))
                         .collect::<Vec<_>>()
                         .join(",")
@@ -532,8 +533,9 @@ async fn a_resource_takes_a_new_policy_after_its_policy_is_deleted() {
         policy(&arn, "first"),
         format!(
             "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
-             \"Principal\":{{\"AWS\":\"arn:aws:iam::111122223333:root\"}},\
-             \"Action\":[\"cloudfront:GetVpcOrigin\"],\"Resource\":\"{arn}\"}}]}}"
+             \"Principal\":{{\"AWS\":\"{}\"}},\
+             \"Action\":[\"cloudfront:GetVpcOrigin\"],\"Resource\":\"{arn}\"}}]}}",
+            granted_principal()
         ),
         policy(&arn, "third"),
     ];

@@ -266,6 +266,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The LIVE stage exists only once `PublishFunction` has copied the
             // DEVELOPMENT stage into it.
             live: None,
+            // The first version this function holds: a later `If-Match` carrying it is a
+            // version OF THIS FUNCTION, whatever a later update does to the current one. The
+            // window the record keeps is bounded
+            // (`crate::state::MAX_HELD_FUNCTION_VERSIONS`).
+            versions: ::std::collections::VecDeque::from([etag.clone()]),
             // Held as the one tag representation every tagged resource uses: a later read
             // answers from this record, never from the request that is being served.
             tags,

@@ -21,6 +21,12 @@
 //!   ([`CONDITION_ELEMENT`]); a document that breaks any of those describes a grant this
 //!   surface would never enforce, and is refused as an unusable POLICY
 //!   ([`ResourcePolicyDocumentDefect::Policy`]);
+//! * every identity the document grants to has to EXIST, because a share with an identity
+//!   nothing holds grants nothing: each principal a statement names is resolved against the
+//!   one account this emulator serves and that account's IAM
+//!   ([`resource_policy_principal_is_absent`]), and a document naming one that does not
+//!   resolve is refused on its PRINCIPALS
+//!   ([`RESOURCE_POLICY_PRINCIPAL_ABSENT_MESSAGE`]);
 //! * what is stored is the PARSED document rendered in the one canonical layout
 //!   ([`canonical_resource_policy`]), so a read reports the service's own form of the
 //!   document rather than the caller's bytes;
@@ -178,6 +184,111 @@ pub fn invalid_resource_policy_document(
     crate::ops::types::InvalidArgument {
         message: Some(defect.message().to_string()),
     }
+}
+
+/// The sentence a `PolicyDocument` granting to an identity that does not exist is refused
+/// with: what the caller has to fix is the PRINCIPALS of the policy it submitted. Fixed text
+/// in full — it names neither the principal it could not resolve nor the resource.
+pub const RESOURCE_POLICY_PRINCIPAL_ABSENT_MESSAGE: &str =
+    "The specified policy references a principal that doesn't exist. Verify the principals in \
+     the policy and try again.";
+
+/// The modelled `InvalidArgument` (HTTP 400) a submitted `PolicyDocument` that grants to an
+/// identity this account does not hold is refused with — "An argument is invalid." — worded
+/// with the sentence that condition carries ([`RESOURCE_POLICY_PRINCIPAL_ABSENT_MESSAGE`]).
+pub fn invalid_resource_policy_principal() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(RESOURCE_POLICY_PRINCIPAL_ABSENT_MESSAGE.to_string()),
+    }
+}
+
+/// Whether one of the identities the statements of `document` grant to does not exist, so the
+/// surface will not attach it.
+///
+/// A resource policy states WHO the resource is shared with, and a share with an identity
+/// that does not exist grants nothing, so each identity a statement names
+/// ([`::service_common::iam_policy_principals::policy_principals`]) is RESOLVED before the
+/// document is stored:
+///
+/// * an identity of ANOTHER ACCOUNT — a whole account by its id or by that account's root
+///   ARN, and any principal ARN whose account field is not this one's
+///   ([`names_another_account`]) — exists nowhere this emulator can see, since it serves the
+///   one account ([`::engine::emulator_account_id`]);
+/// * an IAM role or user OF THIS ACCOUNT is resolved against the account's own IAM
+///   ([`::service_common::iam_principal::identity_is_absent`]), the tree's one reading of a
+///   policy principal, so a refusal is grounded in what IAM answered;
+/// * every other form — the `*` wildcard, a service principal, a federated or canonical-user
+///   principal, this account's own root — names no identity for either reading to resolve and
+///   refuses nothing.
+///
+/// Read from the request and the account alone, so the answer does not depend on which
+/// resource the policy is being attached to, and the caller applies it before it writes. The
+/// reads it makes of IAM are bounded: each principal is resolved ONCE however many statements
+/// name it, and at most [`MAX_RESOURCE_POLICY_PRINCIPALS_RESOLVED`] of them are put to IAM at
+/// all.
+pub async fn resource_policy_principal_is_absent(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    document: &str,
+) -> bool {
+    let mut resolved: Vec<String> = Vec::new();
+    for principal in ::service_common::iam_policy_principals::policy_principals(document) {
+        if names_another_account(&principal) {
+            return true;
+        }
+        if resolved.contains(&principal) {
+            continue;
+        }
+        if resolved.len() >= MAX_RESOURCE_POLICY_PRINCIPALS_RESOLVED {
+            break;
+        }
+        resolved.push(principal.clone());
+        // CloudFront is a global service, so the account's IAM is read where the partition
+        // publishes the account's global records.
+        if ::service_common::iam_principal::identity_is_absent(
+            ctx,
+            ::service_common::management_events::PARTITION_LEADER_REGION,
+            &principal,
+        )
+        .await
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// How many of a submitted document's principals ONE write may put to the account's IAM.
+///
+/// The account clause above is computed from the request alone, but resolving a role or a user
+/// is a READ of another service, so the number of them one request can cause is bounded here
+/// rather than by the size of the document — the same bound, for the same reason, that this
+/// service puts on the Lambda and IAM reads one stored distribution configuration can cause
+/// ([`super::MAX_EDGE_ROLES_RESOLVED_PER_REQUEST`]). It is this emulator's own ceiling, not a
+/// published quota, and it is a ceiling on the READS: a document naming more identities than
+/// this is stored rather than refused, since a refusal has to be grounded in what IAM
+/// answered.
+pub const MAX_RESOURCE_POLICY_PRINCIPALS_RESOLVED: usize = 64;
+
+/// Whether `principal` names an account other than the one this emulator serves: the account
+/// itself, written as a bare account id or as any ARN whose account field carries one.
+///
+/// This emulator serves a single account, so an identity under another account id — a whole
+/// account, its root, or one of its roles, users or sessions — is an identity nothing holds.
+///
+/// The ARN and account-id readings it is built from are the tree's shared ones
+/// ([`::service_common::arn`]); what is this SURFACE's own is the conclusion it draws from
+/// them. The shared resolution beside it
+/// ([`::service_common::iam_principal::identity_is_absent`]) deliberately refuses nothing for
+/// an account principal, because whether a foreign account is a grantee a service will store is
+/// that service's recorded behaviour rather than a property of the policy language.
+fn names_another_account(principal: &str) -> bool {
+    let this_account = ::engine::emulator_account_id();
+    if ::service_common::arn::is_account_id(principal) {
+        return principal != this_account;
+    }
+    ::service_common::arn::parse(principal).is_some_and(|arn| {
+        ::service_common::arn::is_account_id(arn.account) && arn.account != this_account
+    })
 }
 
 /// The form the surface STORES and reports a policy document in: the parsed document

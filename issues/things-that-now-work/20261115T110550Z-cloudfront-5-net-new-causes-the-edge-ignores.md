@@ -144,3 +144,34 @@ Cause 5 (UpdateAnycastIpList enum):
  1. created = cf.create_anycast_ip_list(Name=N, IpCount=3); id = created["AnycastIpList"]["Id"]; etag = created["ETag"]
  2. cf.update_anycast_ip_list(Id=id, IfMatch=etag, IpAddressType="ipv7-bogus") -> emulator raises MalformedXML with "1 validation error detected: Value 'ipv7-bogus' at 'ipAddressType' failed to satisfy constraint: Member must satisfy enum value set: [ipv4, ipv6, dualstack]"; AWS raises InvalidArgument/400.
  3. cf.get_anycast_ip_list(Id=id) must still report the original IpAddressType and the unchanged ETag, and re-asserting that valid value via UpdateAnycastIpList must succeed.
+
+## Resolution
+
+Causes 2, 3 and 4 are FIXED here; causes 1 and 5 were already fixed on the mainline this
+branch forked from and their checks replay green.
+
+- Cause 1 ALREADY FIXED: the edge judges the viewer's conditional headers over the
+  representation it is about to serve — the entry its cache held or the answer the origin just
+  produced — before the body is written (`service::edge::conditional`, covered end to end by
+  `tests/all/edge_conditional_requests.rs`).
+- Cause 2 FIXED: `DeleteFunction` resolves the submitted `If-Match` against the versions the
+  FUNCTION has held. A header carrying no version token, or a token the function never stood
+  at, names no version for a precondition to be evaluated against, so it is
+  `InvalidIfMatchVersion` (400) — "missing or not valid FOR THE RESOURCE"; a token the function
+  HAS held that is not the version the delete is checked against stays the failed precondition
+  (412). That reading serves both recorded refusals of this one operation.
+- Cause 3 FIXED: `PutResourcePolicy` resolves every identity a submitted document grants to
+  before it stores anything — an account other than the one this emulator serves, and an IAM
+  role or user of this account that IAM does not hold, are identities nothing holds — and
+  refuses such a document `InvalidArgument` (400) with CloudFront's principal sentence, leaving
+  the resource with the policy it carried. The check now runs past every resource-policy
+  assertion and errors in its teardown on `DeleteVpcOrigin`, which is still a scaffold stub
+  owned by `issues/things-that-do-not-work/20261116T052444Z-cloudfront-deletevpcorigin-stub.md`
+  (and by cause 1 of `20261112T003830Z-cloudfront-3-net-new-vpc-origin-causes-deletevpcorigin.md`).
+- Cause 4 FIXED: a field-level encryption configuration whose `QueryArgProfiles` maps at least
+  one query argument to a profile is stored with
+  `ForwardWhenQueryArgProfileIsUnknown` true whatever the request submitted, on the create and
+  the update alike, and every readback reports the stored value.
+- Cause 5 ALREADY FIXED: `UpdateAnycastIpList` answers the modelled `InvalidArgument` for an
+  off-enum `IpAddressType`, and the check replays green.
+

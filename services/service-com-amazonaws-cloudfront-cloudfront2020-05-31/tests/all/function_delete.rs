@@ -12,10 +12,12 @@
 //!   name is free for a later create to claim, while every other function stands;
 //! * the removal only happens at the version its caller read: `IfMatch` is "The current
 //!   version (ETag value) of the function that you are deleting, which you can get using
-//!   DescribeFunction", so a header carrying no version token at all is missing or not valid
-//!   (`InvalidIfMatchVersion`, HTTP 400) while a well-formed token that is superseded or
-//!   foreign is a precondition that evaluated to false (`PreconditionFailed`, HTTP 412), and
-//!   a refused delete removes NOTHING either way;
+//!   DescribeFunction", so a header that names no version of THIS function — one carrying no
+//!   version token at all, and one carrying a token the function never held — is missing or
+//!   not valid for the resource (`InvalidIfMatchVersion`, HTTP 400), while a token the
+//!   function HAS held is a precondition that evaluated to false (`PreconditionFailed`,
+//!   HTTP 412, tabled in [`crate::function_delete_version_resolution`]), and a refused delete
+//!   removes NOTHING either way;
 //! * a name no function holds is "The specified function does not exist."
 //!   (`NoSuchFunctionExists`, HTTP 404), whatever the `If-Match` carries, and removes
 //!   nothing — and a function that was deleted is refused with exactly that sentence, the
@@ -54,8 +56,8 @@ const STAGE_DEVELOPMENT: &str = "DEVELOPMENT";
 const STAGE_LIVE: &str = "LIVE";
 
 /// A version token that is well formed — `E` + 13 characters of the shape this service mints
-/// — but that no function in a fresh emulator holds, so a precondition carrying it is STALE
-/// rather than invalid.
+/// — but that no function in a fresh emulator holds, so a precondition carrying it names no
+/// version of the function it is sent against.
 const UNHELD_VERSION_TOKEN: &str = "E1ABCDEFGHIJKL";
 
 /// The sentence CloudFront answers a read of a function it does not hold with, in the form it
@@ -290,10 +292,15 @@ struct Precondition {
 
 /// The removal only happens at the version its caller read. A header carrying the current
 /// version token — bare, quoted as an HTTP entity tag, or quoted as a weak one — deletes;
-/// anything that is no version token at all is refused as missing or not valid; a well-formed
-/// token that belongs to another version is refused too. A refused delete removes
-/// nothing: the function is still readable at the version it stood at, serving the code it
-/// stored.
+/// anything that is no version of THIS function — a value that is no version token at all, a
+/// well-formed token no function holds, and a token minted for another function — is refused
+/// as missing or not valid for the resource. A refused delete removes nothing: the function is
+/// still readable at the version it stood at, serving the code it stored.
+///
+/// A token this function HELD before a later update is the other half of the rule — a
+/// precondition that evaluated to false — and is tabled in
+/// [`crate::function_delete_version_resolution`], which has to move the function off a version
+/// before it can present it.
 #[tokio::test]
 async fn a_delete_needs_the_current_version_of_the_function() {
     let router = emulator();
@@ -342,12 +349,12 @@ async fn a_delete_needs_the_current_version_of_the_function() {
         Precondition {
             case: "a well-formed token no function holds",
             token: Token::Literal(UNHELD_VERSION_TOKEN.to_string()),
-            refusal: Some((412, "PreconditionFailed")),
+            refusal: Some((400, "InvalidIfMatchVersion")),
         },
         Precondition {
             case: "the version token of another function",
             token: Token::Literal(foreign.clone()),
-            refusal: Some((412, "PreconditionFailed")),
+            refusal: Some((400, "InvalidIfMatchVersion")),
         },
     ];
 

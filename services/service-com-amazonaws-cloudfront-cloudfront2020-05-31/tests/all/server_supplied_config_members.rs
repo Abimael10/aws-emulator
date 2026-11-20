@@ -23,7 +23,12 @@
 //!   `FieldLevelEncryptionConfig$QueryArgProfileConfig`, the mapping every stored
 //!   configuration carries (an update of one cannot leave it out), is the mapping that maps
 //!   nothing: `ForwardWhenQueryArgProfileIsUnknown` true beside a `QueryArgProfiles`
-//!   wrapper stating `Quantity` 0.
+//!   wrapper stating `Quantity` 0;
+//! * one the service DECIDES from the rest of the configuration takes that value whatever
+//!   the request stated — `QueryArgProfileConfig$ForwardWhenQueryArgProfileIsUnknown` is
+//!   true wherever the mapping maps a query argument to a profile, since the mapping names
+//!   the profiles the configuration encrypts for and a request naming any other is one it
+//!   has nothing to do with.
 //!
 //! Each table spans what the rule generalises over: which members the request states at all,
 //! the magnitude of each TTL (zero, one, each documented bound and one past it), both
@@ -455,10 +460,16 @@ impl FleRow {
     }
 
     /// The `ForwardWhenQueryArgProfileIsUnknown` the stored configuration carries: the one
-    /// the request stated, or the forwarding setting the service supplies for a
-    /// configuration that states no mapping at all.
+    /// the request stated, the forwarding setting the service supplies for a configuration
+    /// that states no mapping at all, or — for a section whose wrapper carries a mapping —
+    /// the forwarding setting the service supplies for a mapping that maps a query argument
+    /// to a profile, whatever the request stated.
     fn expected_flag(&self) -> bool {
-        self.query_arg_flag.unwrap_or(true)
+        match (self.query_arg_flag, self.query_arg_mappings) {
+            (None, _) => true,
+            (Some(_), Some(mapped)) if mapped > 0 => true,
+            (Some(stated), _) => stated,
+        }
     }
 
     /// How many mappings the stored `QueryArgProfiles` wrapper carries, or `None` when the

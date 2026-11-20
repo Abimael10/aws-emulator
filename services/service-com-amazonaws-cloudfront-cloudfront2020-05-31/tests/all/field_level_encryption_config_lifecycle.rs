@@ -428,14 +428,28 @@ impl Config {
     }
 
     /// The `QueryArgProfileConfig` the stored configuration carries: the section this
-    /// request submits exactly as submitted, or — for a request that states no section at
-    /// all — the mapping that maps nothing, under the forwarding flag the service supplies
-    /// for it.
+    /// request submits with the forwarding flag the SERVICE supplies for its mapping, or —
+    /// for a request that states no section at all — the mapping that maps nothing, under the
+    /// forwarding flag the service supplies for it.
+    ///
+    /// `ForwardWhenQueryArgProfileIsUnknown` is the service's wherever the mapping maps a
+    /// query argument to a profile: such a configuration is stored forwarding a request whose
+    /// `fle-profile` it cannot resolve, whatever the request submitted (recorded behaviour,
+    /// `state::forwards_an_unknown_query_arg_profile`). A mapping that maps NOTHING keeps the
+    /// submitted value.
     pub(crate) fn effective_query_arg(&self) -> Section<QueryArgMapping> {
-        match &self.query_arg {
+        let mut section = match &self.query_arg {
             Some(section) => section.clone(),
             None => Section::new(true, Some(Vec::new())),
+        };
+        if section
+            .mappings
+            .as_ref()
+            .is_some_and(|mappings| !mappings.is_empty())
+        {
+            section.forward_when_unknown = true;
         }
+        section
     }
 }
 

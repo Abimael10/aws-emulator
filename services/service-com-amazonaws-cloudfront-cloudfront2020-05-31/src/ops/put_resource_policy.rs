@@ -22,9 +22,13 @@
 //! ([`crate::state::resource_policy_document_defect`]): a text that is not a resource-based
 //! policy document is refused on its FORMAT, 400 `InvalidArgument`, and a document whose
 //! statements name another resource or an action this surface does not share is refused as
-//! an unusable POLICY, 400 `InvalidArgument`. What is stored is the document the service
-//! renders from the parsed one ([`crate::state::canonical_resource_policy`]), so a later read
-//! reports the service's canonical form of it.
+//! an unusable POLICY, 400 `InvalidArgument`. Each identity the document grants TO is then
+//! resolved ([`crate::state::resource_policy_principal_is_absent`]) — a share with an
+//! identity nothing holds grants nothing — and a document naming one that does not exist is
+//! refused 400 `InvalidArgument` with the sentence that condition carries, still before
+//! anything is written. What is stored is the document the service renders from the parsed
+//! one ([`crate::state::canonical_resource_policy`]), so a later read reports the service's
+//! canonical form of it.
 //!
 //! ## Shape of an operation
 //!
@@ -167,7 +171,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::state::store_unavailable());
         };
-        let _ = ctx;
 
         // The ARN is judged as an ARGUMENT before anything is written: a value that is no
         // ARN at all is refused on its form, an ARN naming any other resource type is
@@ -175,10 +178,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // against the store, where one naming nothing is reported ABSENT — each with the
         // sentence this operation words that condition in, and the store is left exactly as
         // it was.
-        let mut store = state.lock();
-        if let Some(refusal) =
-            crate::state::resource_policy_arn_refusal(&store, &input.resource_arn)
-        {
+        // Nothing below reads the store until the write, and the resolution of the document's
+        // principals puts its question to the account's IAM — another service's state — so
+        // what this request decides against THIS store is read here, in its own scope, and the
+        // store is not held while that question is asked.
+        let (arn_refusal, over_the_bound) = {
+            let store = state.lock();
+            (
+                crate::state::resource_policy_arn_refusal(&store, &input.resource_arn),
+                !store.resource_policies.contains_key(&input.resource_arn)
+                    && store.resource_policies.len() >= crate::state::MAX_RESOURCE_POLICIES,
+            )
+        };
+        if let Some(refusal) = arn_refusal {
             return Err(match refusal {
                 crate::state::ResourceArnRefusal::Malformed => {
                     PutResourcePolicyErrorModeled::InvalidArgument(crate::state::malformed_arn())
@@ -214,18 +226,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // answer with what this write persisted), so the bound is an entry count refused
         // before the insert. A write that replaces the policy of a resource the store
         // already holds grows nothing, so it is never refused by it.
-        if !store.resource_policies.contains_key(&input.resource_arn)
-            && store.resource_policies.len() >= crate::state::MAX_RESOURCE_POLICIES
-        {
+        if over_the_bound {
             return Err(PutResourcePolicyErrorModeled::InvalidArgument(
                 crate::state::too_many_resource_policies(),
+            )
+            .into());
+        }
+        // The identities the document grants TO are resolved LAST among the request's
+        // refusals and still before anything is written: a share with an identity nothing
+        // holds grants nothing, so such a document is refused and the resource keeps the
+        // policy it had.
+        if crate::state::resource_policy_principal_is_absent(ctx, &input.policy_document).await {
+            return Err(PutResourcePolicyErrorModeled::InvalidArgument(
+                crate::state::invalid_resource_policy_principal(),
             )
             .into());
         }
         // The service's own form of the document the request carried: the submitted text is
         // parsed and rendered again, so what a later read reports is this canonical form
         // rather than the caller's bytes.
-        store.put_resource_policy(
+        state.lock().put_resource_policy(
             &input.resource_arn,
             &crate::state::canonical_resource_policy(&input.policy_document),
         );

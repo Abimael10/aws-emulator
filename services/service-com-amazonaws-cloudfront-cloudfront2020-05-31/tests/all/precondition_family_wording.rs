@@ -18,6 +18,12 @@
 //!   request policies and the key groups) reports the precondition of the operation, and the
 //!   resource-DOCUMENT surface (a distribution, an identity, a function, a key value store, a
 //!   field-level encryption record) reports it of the request's header fields;
+//! * EXCEPT on the operation that resolves the submitted token against the versions the
+//!   addressed resource has HELD ([`resolves_against_its_versions`]): there a well-formed
+//!   token the resource never stood at names no version for a precondition to be evaluated
+//!   against, so it is "missing or not valid" too, and the failed precondition is reached only
+//!   by a version the resource really held (tabled in
+//!   [`crate::function_delete_version_resolution`]);
 //! * every one of those sentences is FIXED text: it carries neither the token the request
 //!   sent nor the resource it addressed, so two callers whose only difference is the token
 //!   they held read the same sentence;
@@ -129,6 +135,17 @@ const OPS: &[(Op, Family)] = &[
         Family::ResourceDocument,
     ),
 ];
+
+/// Whether `op` RESOLVES the submitted token against the versions the addressed resource has
+/// held, rather than only comparing it with the current one.
+///
+/// `DeleteFunction` does: a well-formed token the function never stood at names no version of
+/// it, so that operation answers "missing or not valid for the resource" where every other one
+/// here reports a failed precondition. Recorded behaviour per operation — the relation itself
+/// is tabled in [`crate::function_delete_version_resolution`].
+fn resolves_against_its_versions(op: Op) -> bool {
+    op == Op::DeleteFunction
+}
 
 // ---------------------------------------------------------------------------
 // The mutation each row drives
@@ -409,11 +426,14 @@ async fn a_failed_precondition_is_worded_by_the_operations_api_family() {
                 Some(&token),
             )
             .await;
-            let (status, code, sentence) = if is_version {
+            let (status, code, sentence) = if is_version && !resolves_against_its_versions(*op) {
                 // A WELL-FORMED token the addressed resource does not hold is the failed
                 // precondition, worded by the operation's API family.
                 (412, "PreconditionFailed", family.sentence())
             } else {
+                // No version token at all — and, on an operation that resolves the token
+                // against the versions its resource has held, a well-formed token it never
+                // stood at — is missing or not valid for the resource.
                 (400, "InvalidIfMatchVersion", INVALID_IF_MATCH_VERSION)
             };
             assert_eq!(

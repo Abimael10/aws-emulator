@@ -282,12 +282,20 @@ impl Row {
     }
 
     /// The `QueryArgProfileConfig` the stored configuration carries: the section this row
-    /// submits, or — for a row that states none — the mapping that maps nothing, under the
-    /// forwarding flag the service supplies for it.
+    /// submits, with the forwarding flag the SERVICE supplies for a mapping that maps a query
+    /// argument to a profile, or — for a row that states none — the mapping that maps
+    /// nothing, under the forwarding flag the service supplies for it.
     fn effective_query_arg(&self) -> Section {
-        self.query_arg
-            .clone()
-            .unwrap_or_else(|| Section::new(true, &[], false))
+        let Some(mut section) = self.query_arg.clone() else {
+            return Section::new(true, &[], false);
+        };
+        // Recorded behaviour (`state::forwards_an_unknown_query_arg_profile`): a mapping that
+        // maps anything at all is stored forwarding the requests whose profile it cannot
+        // resolve, whatever the request submitted.
+        if !section.selectors.is_empty() {
+            section.forward_when_unknown = true;
+        }
+        section
     }
 
     /// Assert that one mapping section of a serialised document reports the section this row

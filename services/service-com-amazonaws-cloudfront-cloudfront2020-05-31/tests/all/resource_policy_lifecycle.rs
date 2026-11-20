@@ -151,19 +151,33 @@ pub(crate) fn distribution_config(reference: &str) -> String {
     )
 }
 
+/// The principal every document these suites expect the surface to ATTACH grants to: the
+/// ROOT of the account this emulator serves (`ACCOUNT_ID`), written as the policy language
+/// writes a whole account.
+///
+/// An identity has to EXIST for the surface to attach a grant to it, and this emulator serves
+/// one account — so a grant to any other account's root (the documentation placeholder
+/// account among them) is refused on its principals, which the refusal table asserts. `pub(crate)`
+/// so every suite of this surface grants to the one principal rather than to a copy of it.
+pub(crate) fn granted_principal() -> String {
+    format!("arn:aws:iam::{ACCOUNT_ID}:root")
+}
+
 /// A resource policy document, as a caller would write one: one statement sharing the VPC
-/// origin `resource_arn` names with another account for reading, which is what this surface
+/// origin `resource_arn` names with an account for reading, which is what this surface
 /// grants.
 ///
-/// It NAMES that resource in its `Resource` element and grants the one action the surface
-/// shares, so the document is one the surface attaches — the baseline every row that expects
-/// a write to be accepted starts from.
+/// It NAMES that resource in its `Resource` element, grants the one action the surface
+/// shares, and grants to an identity that exists ([`granted_principal`]), so the document is
+/// one the surface attaches — the baseline every row that expects a write to be accepted
+/// starts from.
 pub(crate) fn policy(resource_arn: &str, statement: &str) -> String {
     format!(
         "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Sid\":\"{statement}\",\
          \"Effect\":\"Allow\",\
-         \"Principal\":{{\"AWS\":\"arn:aws:iam::111122223333:root\"}},\
-         \"Action\":\"cloudfront:GetVpcOrigin\",\"Resource\":\"{resource_arn}\"}}]}}"
+         \"Principal\":{{\"AWS\":\"{}\"}},\
+         \"Action\":\"cloudfront:GetVpcOrigin\",\"Resource\":\"{resource_arn}\"}}]}}",
+        granted_principal()
     )
 }
 
@@ -542,9 +556,10 @@ async fn a_policy_written_under_an_accepted_arn_reads_back() {
                     (0..40)
                         .map(|index| format!(
                             "{{\"Effect\":\"Allow\",\"Sid\":\"statement{index}\",\
-                             \"Principal\":{{\"AWS\":\"arn:aws:iam::111122223333:root\"}},\
+                             \"Principal\":{{\"AWS\":\"{}\"}},\
                              \"Action\":\"cloudfront:GetVpcOrigin\",\
-                             \"Resource\":\"{arn}\"}}"
+                             \"Resource\":\"{arn}\"}}",
+                            granted_principal()
                         ))
                         .collect::<Vec<_>>()
                         .join(",")
@@ -659,8 +674,9 @@ async fn a_second_write_supersedes_the_policy_the_resource_carried() {
         policy(&arn, "second"),
         format!(
             "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
-             \"Principal\":{{\"AWS\":\"arn:aws:iam::111122223333:root\"}},\
-             \"Action\":\"cloudfront:GetVpcOrigin\",\"Resource\":[\"{arn}\"]}}]}}"
+             \"Principal\":{{\"AWS\":\"{}\"}},\
+             \"Action\":\"cloudfront:GetVpcOrigin\",\"Resource\":[\"{arn}\"]}}]}}",
+            granted_principal()
         ),
         policy(&arn, "last"),
     ];

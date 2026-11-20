@@ -41,8 +41,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::distribution_lifecycle::{emulator, Answer, ACCOUNT_ID};
 use crate::resource_policy_lifecycle::{
-    created_vpc_origin_arn, get_resource_policy, message, policy, put_resource_policy,
-    reported_document, stored,
+    created_vpc_origin_arn, get_resource_policy, granted_principal, message, policy,
+    put_resource_policy, reported_document, stored,
 };
 
 /// Every action this service's model defines on a VPC origin, beside whether a resource
@@ -72,8 +72,9 @@ fn granting(action: &str, resource: Option<&str>) -> String {
         .unwrap_or_default();
     format!(
         "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Sid\":\"share\",\"Effect\":\"Allow\",\
-         \"Principal\":{{\"AWS\":\"arn:aws:iam::111122223333:root\"}},\
-         \"Action\":{action}{resource}}}]}}"
+         \"Principal\":{{\"AWS\":\"{}\"}},\
+         \"Action\":{action}{resource}}}]}}",
+        granted_principal()
     )
 }
 
@@ -484,9 +485,10 @@ async fn a_policy_conditioning_the_share_is_refused_and_attaches_nothing() {
         format!(
             "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Sid\":\"share\",\
              \"Effect\":\"Allow\",\
-             \"Principal\":{{\"AWS\":\"arn:aws:iam::111122223333:root\"}},\
+             \"Principal\":{{\"AWS\":\"{}\"}},\
              \"Action\":\"cloudfront:GetVpcOrigin\",\"Resource\":\"{arn}\",\
-             \"Condition\":{condition}}}]}}"
+             \"Condition\":{condition}}}]}}",
+            granted_principal()
         )
     };
     let rows: [(&str, String); 6] = [
@@ -552,6 +554,11 @@ async fn the_stored_document_is_the_services_own_rendering_of_the_submitted_one(
     // The rows differ along the arity of a value list, which element carries it, and the
     // whitespace the document arrived in. Each row states the value the read must report,
     // parsed, so what is asserted is the policy and not its layout.
+    //
+    // The identity every row grants to is the one the surface resolves ([`granted_principal`]),
+    // and the row that keeps a two-value list names the WILDCARD beside it — also a principal
+    // the surface resolves — so each row's only variable is the layout under test.
+    let principal = granted_principal();
     let rows: [(&str, String, ::serde_json::Value); 5] = [
         (
             "a one-value Action list, which collapses to the value alone",
@@ -561,7 +568,7 @@ async fn the_stored_document_is_the_services_own_rendering_of_the_submitted_one(
                 "Statement": [{
                     "Sid": "share",
                     "Effect": "Allow",
-                    "Principal": {"AWS": "arn:aws:iam::111122223333:root"},
+                    "Principal": {"AWS": principal.as_str()},
                     "Action": "cloudfront:GetVpcOrigin",
                     "Resource": arn,
                 }],
@@ -575,7 +582,7 @@ async fn the_stored_document_is_the_services_own_rendering_of_the_submitted_one(
                 "Statement": [{
                     "Sid": "share",
                     "Effect": "Allow",
-                    "Principal": {"AWS": "arn:aws:iam::111122223333:root"},
+                    "Principal": {"AWS": principal.as_str()},
                     "Action": "cloudfront:GetVpcOrigin",
                     "Resource": arn,
                 }],
@@ -586,7 +593,7 @@ async fn the_stored_document_is_the_services_own_rendering_of_the_submitted_one(
             format!(
                 "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Sid\":\"share\",\
                  \"Effect\":\"Allow\",\"Principal\":{{\"AWS\":\
-                 [\"arn:aws:iam::111122223333:root\",\"arn:aws:iam::444455556666:root\"]}},\
+                 [\"{principal}\",\"*\"]}},\
                  \"Action\":\"cloudfront:GetVpcOrigin\",\"Resource\":\"{arn}\"}}]}}"
             ),
             ::serde_json::json!({
@@ -595,8 +602,8 @@ async fn the_stored_document_is_the_services_own_rendering_of_the_submitted_one(
                     "Sid": "share",
                     "Effect": "Allow",
                     "Principal": {"AWS": [
-                        "arn:aws:iam::111122223333:root",
-                        "arn:aws:iam::444455556666:root",
+                        principal.as_str(),
+                        "*",
                     ]},
                     "Action": "cloudfront:GetVpcOrigin",
                     "Resource": arn,
@@ -607,14 +614,14 @@ async fn the_stored_document_is_the_services_own_rendering_of_the_submitted_one(
             "a one-value Resource list and a one-value principal list, which both collapse",
             format!(
                 "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
-                 \"Principal\":{{\"AWS\":[\"arn:aws:iam::111122223333:root\"]}},\
+                 \"Principal\":{{\"AWS\":[\"{principal}\"]}},\
                  \"Action\":\"cloudfront:GetVpcOrigin\",\"Resource\":[\"{arn}\"]}}]}}"
             ),
             ::serde_json::json!({
                 "Version": "2012-10-17",
                 "Statement": [{
                     "Effect": "Allow",
-                    "Principal": {"AWS": "arn:aws:iam::111122223333:root"},
+                    "Principal": {"AWS": principal.as_str()},
                     "Action": "cloudfront:GetVpcOrigin",
                     "Resource": arn,
                 }],
@@ -625,7 +632,7 @@ async fn the_stored_document_is_the_services_own_rendering_of_the_submitted_one(
             format!(
                 "{{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    {{\n      \
                  \"Effect\": \"Allow\",\n      \"Principal\": {{ \"AWS\": \
-                 [ \"arn:aws:iam::111122223333:root\" ] }},\n      \"Action\": \
+                 [ \"{principal}\" ] }},\n      \"Action\": \
                  [ \"cloudfront:GetVpcOrigin\" ],\n      \"Resource\": [ \"{arn}\" ]\n    \
                  }}\n  ]\n}}"
             ),
@@ -633,7 +640,7 @@ async fn the_stored_document_is_the_services_own_rendering_of_the_submitted_one(
                 "Version": "2012-10-17",
                 "Statement": [{
                     "Effect": "Allow",
-                    "Principal": {"AWS": "arn:aws:iam::111122223333:root"},
+                    "Principal": {"AWS": principal.as_str()},
                     "Action": "cloudfront:GetVpcOrigin",
                     "Resource": arn,
                 }],
