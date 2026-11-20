@@ -19,6 +19,13 @@
 //! metric stream whose filters select it exports it ([`super::metric_stream_export`]): a stream
 //! streams "metrics from all metric namespaces in the account", so the namespace being one no
 //! caller may publish into does not keep its metrics out of a stream.
+//!
+//! The namespace is the ACCOUNT's, not this service's: every Amazon Web Services service meters
+//! its own API into it under its own `Service` dimension, and a reader selects one service's
+//! usage by naming it. So the derivation of a usage series ([`api_usage_key`]) and the seam a
+//! call is counted through ([`count_served_call`]) take the service whose usage is counted,
+//! and another emulated service's request path meters its own calls through them — into this
+//! one store, so a usage report of this account reads every API of it from one place.
 
 use super::{
     ComAmazonawsCloudwatchGraniteserviceversion20100801State as State, MetricKey,
@@ -30,6 +37,10 @@ pub const USAGE_NAMESPACE: &str = "AWS/Usage";
 
 /// The usage metric that counts API requests: one observation of 1 per served call, so a
 /// `Sum` over a window is how many calls that window held.
+///
+/// The ONE metric this namespace publishes about an API: how a service's calls were ANSWERED
+/// is not published here but in that service's own namespace, beside the rest of what it
+/// reports about itself.
 pub const CALL_COUNT: &str = "CallCount";
 
 /// The `Service` dimension of every usage series this service publishes: its own name, as the
@@ -56,17 +67,21 @@ const TYPE_DIMENSION: &str = "Type";
 /// The dimension naming the thing used — for an API call count, the operation called.
 const RESOURCE_DIMENSION: &str = "Resource";
 
-/// The series one operation's call count lives in: the usage dimension set, with `operation`
-/// as the resource used.
+/// The series one usage metric of one Amazon Web Services service's API lives in: the usage
+/// dimension set, with `usage_service` as the service whose usage it is and `operation` as the
+/// resource used.
 ///
-/// Derived from the operation name alone, so the call this service counted and the series a
-/// reader asks for by that operation name are the same series.
-pub fn call_count_key(operation: &str) -> MetricKey {
+/// The derivation is shared by every service that meters its own API — this one
+/// ([`call_count_key`]), the emulated services whose usage this store also holds
+/// ([`count_served_call`]), and a service publishing the same counters in its OWN namespace —
+/// so the series a call is counted in and the series a reader asks for by that service and
+/// operation name are the same series.
+pub fn api_usage_key(usage_service: &str, metric_name: &str, operation: &str) -> MetricKey {
     MetricKey {
         namespace: USAGE_NAMESPACE.to_string(),
-        metric_name: CALL_COUNT.to_string(),
+        metric_name: metric_name.to_string(),
         dimensions: [
-            (SERVICE_DIMENSION, USAGE_SERVICE),
+            (SERVICE_DIMENSION, usage_service),
             (CLASS_DIMENSION, USAGE_CLASS),
             (TYPE_DIMENSION, USAGE_TYPE),
             (RESOURCE_DIMENSION, operation),
@@ -75,6 +90,15 @@ pub fn call_count_key(operation: &str) -> MetricKey {
         .map(|(name, value)| (name.to_string(), value.to_string()))
         .collect(),
     }
+}
+
+/// The series one operation's call count lives in: the usage dimension set, with `operation`
+/// as the resource used.
+///
+/// Derived from the operation name alone, so the call this service counted and the series a
+/// reader asks for by that operation name are the same series.
+pub fn call_count_key(operation: &str) -> MetricKey {
+    api_usage_key(USAGE_SERVICE, CALL_COUNT, operation)
 }
 
 impl State {
@@ -92,7 +116,27 @@ impl State {
     /// there is one per operation this service models, and each is held to the store's own
     /// per-series datapoint cap, oldest first ([`State::append_datapoints`]).
     pub fn count_api_call(&mut self, operation: &str, now_secs: f64) {
-        self.append_self_metered_count(call_count_key(operation), 1.0, now_secs);
+        self.count_served_api_call(USAGE_SERVICE, operation, now_secs);
+    }
+
+    /// Count one served call of `operation` into the usage telemetry of the service
+    /// `usage_service` publishes its API usage under, stamped `now_secs`.
+    ///
+    /// The same shape as [`State::count_api_call`] — which is this with CloudWatch's own name —
+    /// so the usage of every service this store holds telemetry for is counted alike: one
+    /// [`CALL_COUNT`] observation of 1 per call, through the seam every count a service
+    /// publishes about itself goes through ([`State::append_self_metered_count`]).
+    pub fn count_served_api_call(
+        &mut self,
+        usage_service: &str,
+        operation: &str,
+        now_secs: f64,
+    ) {
+        self.append_self_metered_count(
+            api_usage_key(usage_service, CALL_COUNT, operation),
+            1.0,
+            now_secs,
+        );
     }
 }
 
@@ -142,8 +186,7 @@ pub async fn count_api_call<Eng: Send + Sync + 'static>(
     // Which series and period this count publishes into, by the derivation an ingested batch's
     // is read with ([`super::metric_stream_export::published_at`]), so one observation owes
     // exactly the record a publish of the same datapoint would.
-    let published =
-        super::metric_stream_export::published_at(call_count_key(operation), now);
+    let published = super::metric_stream_export::published_at(call_count_key(operation), now);
     // BOXED: this seam is awaited on the answer path of every operation of this service
     // ([`crate::service`]), and the export's own future is far larger than the count's. Holding
     // it inline would grow the future of every served call by that much — including the calls
@@ -156,4 +199,36 @@ pub async fn count_api_call<Eng: Send + Sync + 'static>(
         &published,
     ))
     .await;
+}
+
+/// Count one served call of `operation` into the usage telemetry held in `engine`'s store for
+/// the service `usage_service` publishes its API usage under.
+///
+/// [`count_api_call`] with the SERVICE named rather than assumed: the seam another emulated
+/// service's request path meters through, so an account's usage of every API this emulator
+/// serves is counted into one store, in one namespace, under one dimension set
+/// ([`api_usage_key`]) — and a reader of those series cannot tell which crate answered the
+/// call, exactly as it cannot in AWS.
+///
+/// The store's lock is taken for the append alone and nothing is answered, because the count is
+/// published off the response: a call is answered whether or not its own usage datapoint could
+/// be stored, and a store this engine does not hold is counted into nothing.
+///
+/// WHAT THIS SEAM DOES NOT DO is plan a metric-stream export for the datapoint, which
+/// [`count_api_call`] does for this service's own calls. It runs on the answer path of EVERY
+/// call of another service, and an export is an in-process delivery to a stream's destination —
+/// a destination whose own service can log, publish or deliver back through the service being
+/// metered, which would meter another call, and so on without a bound. So what one metered call
+/// of another service costs is its datapoint and nothing else.
+pub fn count_served_call<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    usage_service: &str,
+    operation: &str,
+) {
+    let Some(state) = super::service_state(engine) else {
+        return;
+    };
+    let now = super::now_secs();
+    let mut store = state.lock();
+    store.count_served_api_call(usage_service, operation, now);
 }

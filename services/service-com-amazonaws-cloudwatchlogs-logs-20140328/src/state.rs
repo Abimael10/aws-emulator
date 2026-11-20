@@ -174,6 +174,10 @@ pub mod filter_pattern;
 /// Metric extraction from an ingested Embedded Metric Format log event.
 pub mod emf;
 
+/// The usage telemetry this service publishes about its OWN API: the call and error counts of
+/// each operation it serves.
+pub mod api_usage;
+
 /// Metric extraction from an ingested log event through a log group's metric filters.
 pub mod metric_filters;
 

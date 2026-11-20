@@ -158,6 +158,16 @@
 //! response names ONE request, so the message states no id of its own: it is worded with
 //! [`crate::state::REQUEST_ID_PLACEHOLDER`] and the report above writes the id it reports in
 //! its place ([`stated_request_id`]).
+//!
+//! # The usage this service publishes about itself
+//!
+//! An account's API usage is published in the reserved `AWS/Usage` namespace, per service and
+//! per operation, and CloudWatch Logs publishes its own there like every other service: one
+//! call count per call it serves, and one error count beside it for a call it answered as a
+//! failure, so a client can see how many CloudWatch Logs calls its account made and how many
+//! of them failed. The count is owed by every answer, whichever layer built it, so it is taken
+//! by [`api_usage::Metered`] — one wrapper round each dispatch below — rather than by any one
+//! handler, and the series it lands in belongs to [`crate::state::api_usage`].
 
 use service_common::event_stream::EventStreamRoute;
 use service_common::query_error_envelope::RequestIdEnvelopeDefinition;
@@ -188,6 +198,10 @@ pub mod http_ingestion;
 /// control-plane call recorded in the account's event history where CloudTrail's
 /// `LookupEvents` reads it.
 pub mod management_events;
+
+/// The layer that counts every call this service answers into the usage telemetry it
+/// publishes about its own API ([`crate::state::api_usage`]).
+pub mod api_usage;
 
 /// The operations the generated routing table cannot serve: each one's output member
 /// targets a `@streaming` union (`StartLiveTail$responseStream`,
@@ -657,10 +671,13 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     >,
     /// The dispatch `override_operation` hands back, which carries the served
     /// operation's refusal code into [`Service::override_refusal`] — under the layer that
-    /// names the request its response answers, and over the audited table whose every row is
-    /// served behind the IAM decision. Held on the service because that seam returns a borrow
-    /// of `self`.
-    refusal_scope: stated_request_id::StatedRequestIdOperation<OperationScopedRefusal>,
+    /// names the request its response answers, over the layer that counts the call into this
+    /// service's own usage telemetry ([`api_usage::Metered`]), and over the audited table
+    /// whose every row is served behind the IAM decision. Held on the service because that
+    /// seam returns a borrow of `self`.
+    refusal_scope: stated_request_id::StatedRequestIdOperation<
+        api_usage::Metered<Eng, OperationScopedRefusal>,
+    >,
     /// One of this service's two event-stream operations, `StartLiveTail`. It is NOT in the
     /// entry's routing table in a servable form: the generated `ErasedOperation` shim of
     /// an operation whose output is a `@streaming` union declines the request (it cannot
@@ -676,16 +693,22 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     get_log_object: Dispatch<Eng>,
     /// The HTTP INGESTION endpoints, which no routing table of the model names: a POST of
     /// log records authenticated by a bearer credential rather than by a SigV4 signature.
+    ///
+    /// Unmetered, unlike every dispatch above: such a request names no modelled operation, so
+    /// there is no API this account's usage of it would be counted against
+    /// ([`crate::state::api_usage`]).
     http_ingestion: http_ingestion::HttpIngestion<Eng>,
 }
 
 /// One dispatch this service hands the router for an operation the audited table cannot
 /// serve: whatever serves the request, behind the IAM decision taken in front of every
-/// operation ([`identity_authorization::IamAuthorized`]) and under the layer that names the
-/// request its response answers ([`stated_request_id::StatedRequestIdOperation`]) — so
-/// neither can be forgotten for one route and taken for another.
-type Dispatch<Eng> =
-    stated_request_id::StatedRequestIdOperation<identity_authorization::IamAuthorized<Eng>>;
+/// operation ([`identity_authorization::IamAuthorized`]), counted into the usage telemetry
+/// this service publishes about its own API ([`api_usage::Metered`]) and under the layer that
+/// names the request its response answers ([`stated_request_id::StatedRequestIdOperation`]) —
+/// so none of the three can be forgotten for one route and taken for another.
+type Dispatch<Eng> = stated_request_id::StatedRequestIdOperation<
+    api_usage::Metered<Eng, identity_authorization::IamAuthorized<Eng>>,
+>;
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// Build this service from the shared engine. The engine is threaded into the
@@ -698,14 +721,15 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         // each one carries the IAM decision itself; neither is a management event
         // ([`management_events::NOT_A_MANAGEMENT_EVENT`]), which is what `None` states.
         let authorized = |name: &'static str, served: Box<dyn ErasedOperation>| {
-            stated_request_id::StatedRequestIdOperation::new(
+            stated_request_id::StatedRequestIdOperation::new(api_usage::Metered::new(
+                Arc::clone(&engine),
                 identity_authorization::IamAuthorized::new(
                     name,
                     Arc::clone(&engine),
                     None,
                     served,
                 ),
-            )
+            ))
         };
         // The table every request this service routes is served from: the generated
         // operations, each behind the IAM decision and inside the audit recorder, so no
@@ -720,7 +744,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                 stated_request_id::report,
             ),
             refusal_scope: stated_request_id::StatedRequestIdOperation::new(
-                OperationScopedRefusal,
+                api_usage::Metered::new(Arc::clone(&engine), OperationScopedRefusal),
             ),
             start_live_tail: authorized(
                 START_LIVE_TAIL_OPERATION,
