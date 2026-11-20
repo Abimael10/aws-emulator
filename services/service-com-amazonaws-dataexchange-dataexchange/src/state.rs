@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use ::aws_smithy_schema_server::{envelope, Violation, ViolationKind};
 
 use crate::ops::types::{
-    Action, ApiGatewayApiAsset, AssetConfiguration, AssetDetails, ConflictException, Event,
+    Action, ApiGatewayApiAsset, AssetConfiguration, AssetDetails, ConflictException, Details, Event,
     InternalServerException, JobError, OriginDetails, ResourceNotFoundException, ResponseDetails,
     S3DataAccessAsset, S3SnapshotAsset, ServiceLimitExceededException, ValidationException,
 };
@@ -155,6 +155,10 @@ pub struct Asset {
     /// an import from an upload URL are the bytes a client uploaded to it. Empty for
     /// an asset this emulator holds no bytes for.
     pub content: Vec<u8>,
+    /// The media type of that content, as the source the import read it from declared
+    /// it; `None` where the source declared none. An asset IS a copy of the object it
+    /// was imported from, so an export of it writes a copy that declares the same type.
+    pub content_type: Option<String>,
     /// The API this asset fulfils, as the import that created it recorded it — set
     /// only for an asset imported from an Amazon API Gateway API, whose content is
     /// that API's specification rather than a data file.
@@ -326,9 +330,9 @@ pub struct JobSettlement {
     /// What the execution reports about why it ended there — the `Errors` list a
     /// reader answers with, empty for an execution that carried its work out.
     pub errors: Vec<JobError>,
-    /// The asset the execution puts into the revision it names when it finishes, for
-    /// an import that has content to read; `None` for an execution that adds none.
-    pub import: Option<PendingImport>,
+    /// The assets the execution puts into the revision it names when it finishes, one
+    /// per source its details name; empty for an execution that adds none.
+    pub imports: Vec<PendingImport>,
 }
 
 /// The asset an execution adds to the revision its details name — the one an import
@@ -347,6 +351,13 @@ pub struct PendingImport {
     pub revision_id: String,
     /// The `Name` the asset carries — the name the job's details give the content.
     pub asset_name: String,
+    /// The bytes the execution read from a source that lives OUTSIDE this service —
+    /// the object another service of this emulator holds, read by the call that
+    /// resolved the work. `None` for an import whose bytes are staged in the job's own
+    /// [`JobUpload`], which the settlement takes from there.
+    pub content: Option<Vec<u8>>,
+    /// The media type that source declared for those bytes, where it declared one.
+    pub content_type: Option<String>,
     /// The API the asset fulfils, for an import of an API specification; `None` for
     /// an import of a data file. See [`Asset::api`].
     pub api: Option<ApiGatewayApiAsset>,
@@ -371,38 +382,45 @@ pub struct DueImport {
 
 impl Job {
     /// Materialise the terminal state this job's execution was already owed at `now`,
-    /// handing back the import it finished, for the store to place in its revision.
+    /// handing back the imports it finished, for the store to place in their revision.
     ///
     /// This is the ONE write a reporting operation may make: the transition was due
     /// at the stored instant whether or not anybody called, so `updated_at` moves to
     /// that instant rather than to `now`.
-    pub fn settle(&mut self, now: DateTime) -> Option<DueImport> {
+    pub fn settle(&mut self, now: DateTime) -> Vec<DueImport> {
         let due = self
             .pending_settlement
             .as_ref()
             .is_some_and(|settlement| settlement.due_at.as_secs_f64() <= now.as_secs_f64());
         if !due {
-            return None;
+            return Vec::new();
         }
-        let settlement = self.pending_settlement.take()?;
+        let Some(settlement) = self.pending_settlement.take() else {
+            return Vec::new();
+        };
         self.state = settlement.state;
         self.errors = settlement.errors;
         if settlement.due_at.as_secs_f64() > self.updated_at.as_secs_f64() {
             self.updated_at = settlement.due_at;
         }
-        let plan = settlement.import?;
+        let at = settlement.due_at;
         // The staged bytes BECOME the asset's content, so they are moved out of the
         // upload: a job imports one upload exactly once.
-        let content = self
-            .upload
-            .as_mut()
-            .and_then(|upload| upload.content.take())
-            .unwrap_or_default();
-        Some(DueImport {
-            plan,
-            content,
-            at: settlement.due_at,
-        })
+        let mut staged = self.upload.as_mut().and_then(|upload| upload.content.take());
+        settlement
+            .imports
+            .into_iter()
+            .map(|mut plan| {
+                // An execution that read its source itself carries those bytes; the one
+                // whose bytes were staged against the job takes them out of its upload.
+                let content = plan
+                    .content
+                    .take()
+                    .or_else(|| staged.take())
+                    .unwrap_or_default();
+                DueImport { plan, content, at }
+            })
+            .collect()
     }
 
     /// Whether this job is still waiting to be started — the one `State` from which a
@@ -502,7 +520,7 @@ impl ComAmazonawsDataexchangeDataexchangeState {
         // one writes into a data set while the jobs are being walked.
         let mut due: Vec<(String, DueImport)> = Vec::new();
         for job in self.jobs.values_mut() {
-            if let Some(import) = job.settle(now) {
+            for import in job.settle(now) {
                 due.push((job.id.clone(), import));
             }
         }
@@ -513,7 +531,7 @@ impl ComAmazonawsDataexchangeDataexchangeState {
                 // this job ended in.
                 if let Some(job) = self.jobs.get_mut(&job_id) {
                     job.state = JOB_STATE_ERROR.to_string();
-                    job.errors = vec![error];
+                    job.errors.push(error);
                 }
             }
         }
@@ -527,9 +545,12 @@ impl ComAmazonawsDataexchangeDataexchangeState {
     /// neither can one that was finalized while the import ran — the model's
     /// `Finalized` documentation calls that "this read-only state".
     fn receive_imported_asset(&mut self, import: DueImport) -> Option<JobError> {
+        // Read before the revision is borrowed for the write: how much content the
+        // store is already holding decides whether these bytes can be retained at all.
+        let retained = self.retained_content_bytes();
         let plan = &import.plan;
         let Some(data_set) = self.data_sets.get_mut(&plan.data_set_id) else {
-            return Some(import_target_not_found(
+            return Some(job_resource_not_found(
                 &plan.data_set_id,
                 JOB_ERROR_RESOURCE_TYPE_DATA_SET,
             ));
@@ -538,7 +559,7 @@ impl ComAmazonawsDataexchangeDataexchangeState {
         // to, which is where that type is recorded.
         let asset_type = data_set.asset_type.clone();
         let Some(revision) = data_set.revisions.get_mut(&plan.revision_id) else {
-            return Some(import_target_not_found(
+            return Some(job_resource_not_found(
                 &plan.revision_id,
                 JOB_ERROR_RESOURCE_TYPE_REVISION,
             ));
@@ -553,6 +574,12 @@ impl ComAmazonawsDataexchangeDataexchangeState {
             });
         }
         let asset_id = mint_id();
+        // The content of an asset is held in memory, so content the store cannot retain
+        // is not placed at all: the execution reports the limit it ran into instead of
+        // keeping a truncated copy.
+        if retained + import.content.len() > MAX_CONTENT_BYTES {
+            return Some(asset_size_limit_exceeded());
+        }
         revision.assets.push(Asset {
             arn: asset_arn(
                 &plan.region,
@@ -564,6 +591,7 @@ impl ComAmazonawsDataexchangeDataexchangeState {
             name: plan.asset_name.clone(),
             asset_type,
             content: import.content,
+            content_type: plan.content_type.clone(),
             api: plan.api.clone(),
             s3_data_access: plan.s3_data_access.clone(),
             created_at: import.at,
@@ -878,6 +906,47 @@ pub const JOB_ERROR_CODE_RESOURCE_NOT_FOUND: &str = "RESOURCE_NOT_FOUND_EXCEPTIO
 /// not hold against the state of the resource it names, from the same `Code` value set.
 pub const JOB_ERROR_CODE_VALIDATION: &str = "VALIDATION_EXCEPTION";
 
+/// The `Code` of the job error an execution reports when carrying its work out would
+/// take more of a quota than is left, from the same `Code` value set.
+pub const JOB_ERROR_CODE_SERVICE_QUOTA_EXCEEDED: &str = "SERVICE_QUOTA_EXCEEDED_EXCEPTION";
+
+/// The `LimitName` of the quota on how large an asset's content may be: a value of the
+/// model's `JobErrorLimitName` enum (`smithy_query(query="shape",
+/// shape="JobErrorLimitName")` reports it alongside "Assets per revision"), and the one
+/// a job that reads more content than this store retains runs into.
+pub const JOB_ERROR_LIMIT_ASSET_SIZE_IN_GB: &str = "Asset size in GB";
+
+/// How many bytes one gigabyte is, for stating [`MAX_CONTENT_BYTES`] in the unit the
+/// model's limit name is expressed in.
+const BYTES_PER_GB: f64 = 1_000_000_000.0;
+
+/// The job error an execution reports when the content it read will not fit in what
+/// this store retains: the quota `Code`, with the modelled limit named and its value
+/// given in the unit that name states it in.
+pub fn asset_size_limit_exceeded() -> JobError {
+    let limit_value = MAX_CONTENT_BYTES as f64 / BYTES_PER_GB;
+    JobError {
+        code: JOB_ERROR_CODE_SERVICE_QUOTA_EXCEEDED.to_string(),
+        message: format!(
+            "Service quota exceeded. The limit on {JOB_ERROR_LIMIT_ASSET_SIZE_IN_GB} is \
+             {limit_value}."
+        ),
+        limit_name: Some(JOB_ERROR_LIMIT_ASSET_SIZE_IN_GB.to_string()),
+        limit_value,
+        ..JobError::default()
+    }
+}
+
+/// The same job error as [`asset_size_limit_exceeded`], for an execution that knows
+/// WHICH source it could not retain the content of and reports it in the error's own
+/// `Details`.
+pub fn asset_size_limit_exceeded_for(details: Details) -> JobError {
+    JobError {
+        details: Some(details),
+        ..asset_size_limit_exceeded()
+    }
+}
+
 /// `ResourceType` for a revision ON A JOB ERROR: a value of the model's
 /// `JobErrorResourceTypes` enum (`REVISION | ASSET | DATA_SET`), which is a different
 /// member — and a different value set — from the `ResourceType` the modelled
@@ -888,13 +957,19 @@ pub const JOB_ERROR_RESOURCE_TYPE_REVISION: &str = "REVISION";
 /// `JobErrorResourceTypes` value set.
 pub const JOB_ERROR_RESOURCE_TYPE_DATA_SET: &str = "DATA_SET";
 
-/// The job error an execution reports when the resource it was importing into is not
-/// there any more: the same not-found sentence this service's modelled 404 carries
+/// `ResourceType` for an asset on a job error, from the same `JobErrorResourceTypes`
+/// value set.
+pub const JOB_ERROR_RESOURCE_TYPE_ASSET: &str = "ASSET";
+
+/// The job error an execution reports when a resource it had to work on — the one it
+/// was importing into, or the one whose content it was to write out — is not there any
+/// more: the same not-found sentence this service's modelled 404 carries
 /// ([`RESOURCE_NOT_FOUND_MESSAGE`]), with the identity in the error's own members.
 ///
 /// `resource_type` is a value of the model's `JobErrorResourceTypes` enum
-/// ([`JOB_ERROR_RESOURCE_TYPE_DATA_SET`] / [`JOB_ERROR_RESOURCE_TYPE_REVISION`]).
-fn import_target_not_found(resource_id: &str, resource_type: &str) -> JobError {
+/// ([`JOB_ERROR_RESOURCE_TYPE_DATA_SET`] / [`JOB_ERROR_RESOURCE_TYPE_REVISION`] /
+/// [`JOB_ERROR_RESOURCE_TYPE_ASSET`]).
+pub fn job_resource_not_found(resource_id: &str, resource_type: &str) -> JobError {
     JobError {
         code: JOB_ERROR_CODE_RESOURCE_NOT_FOUND.to_string(),
         message: RESOURCE_NOT_FOUND_MESSAGE.to_string(),

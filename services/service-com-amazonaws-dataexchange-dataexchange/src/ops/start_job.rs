@@ -6,7 +6,10 @@
 //! one execution span later, which any later read materialises — and refuses a job in
 //! any other state with the modelled 409. An import whose content a client uploaded to
 //! the URL `CreateJob` announced carries its work out: it puts that content into the
-//! revision its details name as an asset and completes. A job that publishes an Amazon
+//! revision its details name as an asset and completes. An import from Amazon S3 reads
+//! each source object out of this emulator's own object storage and puts one asset per
+//! object, named by that object's key, into the revision its details name. A job that
+//! publishes an Amazon
 //! S3 data access is decided from what this emulator's own object storage answers about
 //! the bucket it would share — the grant that bucket's policy carries for AWS Data
 //! Exchange, and whether the keys and prefixes it names are there. This is the ONLY
@@ -165,7 +168,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // materialised before this call decides anything: otherwise a second start
             // would be judged against a state the job had already left.
             store.settle_jobs(now);
-            planned_work(waiting_job(&mut store, &input.job_id)?, &region)
+            // The start is admitted only on a job that is still waiting. What that job
+            // asks for is read off its own `Type` and `Details`, and the content an
+            // export writes out of the store that holds it, so both are read here while
+            // the store is held; the bytes an upload staged are left where they are
+            // until the execution comes due.
+            let job = waiting_job(&mut store, &input.job_id)?;
+            let job_type = job.r#type.clone();
+            let details = job.details.clone();
+            let staged = job
+                .upload
+                .as_ref()
+                .is_some_and(|upload| upload.content.is_some());
+            planned_work(&store, &job_type, &details, staged, &region)
         };
 
         // Where that work ends, decided from the source it actually reads.
@@ -185,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             due_at: crate::state::later(now, crate::state::JOB_EXECUTION_SECONDS),
             state: outcome.state.to_string(),
             errors: outcome.errors,
-            import: outcome.import,
+            imports: outcome.imports,
         });
 
         Ok(StartJobOutput {})
@@ -279,9 +294,19 @@ enum Work {
     /// AWS Data Exchange reads in its own name on behalf of every subscriber the data
     /// access entitles — so it turns on the grant that bucket's own policy carries.
     S3DataAccess(Box<DataAccess>),
+    /// Carry the import of objects this emulator's own object storage holds out: each
+    /// source object the details name becomes one asset of the revision they name, so
+    /// it turns on that object storage ANSWERING with the object's bytes.
+    S3Import(Box<S3Import>),
+    /// Write the content of assets this store holds out as objects of the bucket the
+    /// details name, so it turns on that bucket TAKING the write.
+    S3Export(Box<S3Export>),
     /// Read content from a source this emulator holds nothing of, named as the job's
     /// own `Type` names it ([`CONTENT_SOURCE_FOR_TYPE`]).
     UnreadableSource(&'static str),
+    /// Work whose prerequisite the store itself settles — a resource the job's details
+    /// name that is no longer there — carrying the job error that says so.
+    Stopped(Box<JobError>),
 }
 
 /// The Amazon S3 data access one job publishes: where the asset it produces belongs,
@@ -296,7 +321,47 @@ struct DataAccess {
     source: S3DataAccessAssetSourceEntry,
 }
 
-/// Where an execution ends: the terminal `State`, what it reports there, and the asset
+/// The import of objects out of Amazon S3 one job carries out: where the assets it
+/// produces belong, and the source objects it reads.
+struct S3Import {
+    /// The Region the call that started the job was signed for, which is the Region the
+    /// source objects are read in and the one the assets' ARNs carry.
+    region: String,
+    data_set_id: String,
+    revision_id: String,
+    /// The bucket and key pairs the job's own `AssetSources` names, in that order.
+    sources: Vec<AssetSourceEntry>,
+}
+
+/// The export of asset content out of this service one job carries out: the objects it
+/// writes, read out of the store by the call that planned the work, and how the
+/// destination is asked to encrypt them.
+struct S3Export {
+    /// The Region the call that started the job was signed for, which is the Region the
+    /// objects are written in.
+    region: String,
+    /// The `Encryption` the job's details name for the objects it writes, or `None`
+    /// where they name none.
+    encryption: Option<ExportServerSideEncryption>,
+    /// The destination buckets the job's details name, each once: a bucket the storage
+    /// does not hold takes no object, which an export that has none to write for it is
+    /// decided on too.
+    buckets: Vec<String>,
+    /// What to write, in the order the job's destinations name it.
+    objects: Vec<ExportObject>,
+}
+
+/// One object an export writes: where it goes, and the asset content it carries.
+struct ExportObject {
+    bucket: String,
+    key: String,
+    content: Vec<u8>,
+    /// The media type the asset's content was imported declaring, where it declared
+    /// one: an exported object is a copy of it, so it declares the same.
+    content_type: Option<String>,
+}
+
+/// Where an execution ends: the terminal `State`, what it reports there, and the assets
 /// it places in its revision when it finishes.
 struct Outcome {
     /// One of the model's terminal `State` values
@@ -304,18 +369,18 @@ struct Outcome {
     state: &'static str,
     /// The `Errors` a reader answers with — empty for work that was carried out.
     errors: Vec<JobError>,
-    /// The asset the execution adds to the revision, for work that produces one.
-    import: Option<crate::state::PendingImport>,
+    /// The assets the execution adds to the revision, for work that produces any.
+    imports: Vec<crate::state::PendingImport>,
 }
 
 impl Outcome {
     /// The outcome of work that was carried out: the terminal state of a job that is
-    /// over with nothing to report, placing `import`.
-    fn carried_out(import: Option<crate::state::PendingImport>) -> Self {
+    /// over with nothing to report, placing `imports`.
+    fn carried_out(imports: Vec<crate::state::PendingImport>) -> Self {
         Self {
             state: crate::state::JOB_STATE_COMPLETED,
             errors: Vec::new(),
-            import,
+            imports,
         }
     }
 
@@ -325,17 +390,33 @@ impl Outcome {
         Self {
             state: crate::state::JOB_STATE_ERROR,
             errors: vec![error],
-            import: None,
+            imports: Vec::new(),
         }
     }
 }
 
-/// What the stored job asks of its execution.
-fn planned_work(job: &crate::state::Job, region: &str) -> Work {
-    if let Some(import) = staged_import(job, region) {
+/// What the stored job asks of its execution, as the job's own `Type` and `Details`
+/// describe it: `staged` says whether a client has uploaded the content the job
+/// announced a URL for, and `store` is read for the asset content an export writes out.
+fn planned_work(
+    store: &crate::state::ComAmazonawsDataexchangeDataexchangeState,
+    job_type: &str,
+    details: &ResponseDetails,
+    staged: bool,
+    region: &str,
+) -> Work {
+    if let Some(import) = staged_import(details, staged, region) {
         return Work::StagedImport(Box::new(import));
     }
-    if let Some(detail) = job.details.create_s3_data_access_from_s3_bucket.as_ref() {
+    if let Some(detail) = details.import_assets_from_s3.as_ref() {
+        return Work::S3Import(Box::new(S3Import {
+            region: region.to_string(),
+            data_set_id: detail.data_set_id.clone(),
+            revision_id: detail.revision_id.clone(),
+            sources: detail.asset_sources.clone(),
+        }));
+    }
+    if let Some(detail) = details.create_s3_data_access_from_s3_bucket.as_ref() {
         return Work::S3DataAccess(Box::new(DataAccess {
             region: region.to_string(),
             data_set_id: detail.data_set_id.clone(),
@@ -343,25 +424,417 @@ fn planned_work(job: &crate::state::Job, region: &str) -> Work {
             source: detail.asset_source.clone(),
         }));
     }
-    Work::UnreadableSource(source_for(&job.r#type))
+    if let Some(detail) = details.export_assets_to_s3.as_ref() {
+        return exported_assets(store, detail, region);
+    }
+    if let Some(detail) = details.export_revisions_to_s3.as_ref() {
+        return exported_revisions(store, detail, region);
+    }
+    Work::UnreadableSource(source_for(job_type))
 }
+
+/// The objects an export of NAMED ASSETS writes: one per `AssetDestinations` entry,
+/// carrying that asset's own content.
+///
+/// The asset is addressed within the revision of the data set the details name, so a
+/// destination naming an asset that revision does not hold is the job error of a
+/// resource that is not there rather than an empty object.
+fn exported_assets(
+    store: &crate::state::ComAmazonawsDataexchangeDataexchangeState,
+    detail: &ExportAssetsToS3ResponseDetails,
+    region: &str,
+) -> Work {
+    let revision = match exported_revision(store, &detail.data_set_id, &detail.revision_id) {
+        Ok(revision) => revision,
+        Err(error) => return Work::Stopped(error),
+    };
+    let mut objects: Vec<ExportObject> = Vec::with_capacity(detail.asset_destinations.len());
+    let mut budget = crate::state::MAX_CONTENT_BYTES;
+    for destination in &detail.asset_destinations {
+        let Some(asset) = revision.asset(&destination.asset_id) else {
+            return Work::Stopped(Box::new(crate::state::job_resource_not_found(
+                &destination.asset_id,
+                crate::state::JOB_ERROR_RESOURCE_TYPE_ASSET,
+            )));
+        };
+        // The content to write is held until the execution comes due, so one execution
+        // carries no more of it than the whole store retains.
+        let Some(left) = budget.checked_sub(asset.content.len()) else {
+            return Work::Stopped(Box::new(crate::state::asset_size_limit_exceeded()));
+        };
+        budget = left;
+        objects.push(ExportObject {
+            bucket: destination.bucket.clone(),
+            // "When exporting to Amazon S3, the asset name is used as default target
+            // Amazon S3 object key" — `AssetEntry.Name`'s own documentation
+            // (`smithy_query(query="doc", shape="AssetEntry", member="Name")`), so the
+            // destination's own `Key` is what it is written under when it names one.
+            key: destination
+                .key
+                .clone()
+                .unwrap_or_else(|| asset.name.clone()),
+            content: asset.content.clone(),
+            content_type: asset.content_type.clone(),
+        });
+    }
+    Work::S3Export(Box::new(S3Export {
+        region: region.to_string(),
+        encryption: detail.encryption.clone(),
+        buckets: destination_buckets(
+            detail
+                .asset_destinations
+                .iter()
+                .map(|destination| destination.bucket.as_str()),
+        ),
+        objects,
+    }))
+}
+
+/// The objects an export of WHOLE REVISIONS writes: one per asset of each revision the
+/// `RevisionDestinations` name, keyed by that destination's own key pattern.
+fn exported_revisions(
+    store: &crate::state::ComAmazonawsDataexchangeDataexchangeState,
+    detail: &ExportRevisionsToS3ResponseDetails,
+    region: &str,
+) -> Work {
+    let mut objects: Vec<ExportObject> = Vec::new();
+    let mut budget = crate::state::MAX_CONTENT_BYTES;
+    for destination in &detail.revision_destinations {
+        let revision =
+            match exported_revision(store, &detail.data_set_id, &destination.revision_id) {
+                Ok(revision) => revision,
+                Err(error) => return Work::Stopped(error),
+            };
+        let data_set_name = store
+            .data_sets
+            .get(&detail.data_set_id)
+            .map_or(String::new(), |data_set| data_set.name.clone());
+        for asset in &revision.assets {
+            // As above: what one execution holds is bounded by what the store retains.
+            let Some(left) = budget.checked_sub(asset.content.len()) else {
+                return Work::Stopped(Box::new(crate::state::asset_size_limit_exceeded()));
+            };
+            budget = left;
+            objects.push(ExportObject {
+                bucket: destination.bucket.clone(),
+                key: exported_key(
+                    destination.key_pattern.as_deref(),
+                    &detail.data_set_id,
+                    &data_set_name,
+                    revision,
+                    asset,
+                ),
+                content: asset.content.clone(),
+                content_type: asset.content_type.clone(),
+            });
+        }
+    }
+    Work::S3Export(Box::new(S3Export {
+        region: region.to_string(),
+        encryption: detail.encryption.clone(),
+        buckets: destination_buckets(
+            detail
+                .revision_destinations
+                .iter()
+                .map(|destination| destination.bucket.as_str()),
+        ),
+        objects,
+    }))
+}
+
+/// The buckets `named` names, each once and in the order they were named.
+fn destination_buckets<'detail>(named: impl Iterator<Item = &'detail str>) -> Vec<String> {
+    let mut buckets: Vec<String> = Vec::new();
+    for bucket in named {
+        if !buckets.iter().any(|seen| seen == bucket) {
+            buckets.push(bucket.to_string());
+        }
+    }
+    buckets
+}
+
+/// The revision an export reads its content out of, or the job error naming whichever
+/// of the two identifiers the store no longer holds.
+fn exported_revision<'store>(
+    store: &'store crate::state::ComAmazonawsDataexchangeDataexchangeState,
+    data_set_id: &str,
+    revision_id: &str,
+) -> Result<&'store crate::state::Revision, Box<JobError>> {
+    store.revision(data_set_id, revision_id).map_err(|missing| {
+        // The store's lookup reports WHICH identifier missed in the modelled 404's own
+        // `ResourceId`; a job error states the same two facts in its own members.
+        Box::new(crate::state::job_resource_not_found(
+            missing.resource_id.as_deref().unwrap_or(revision_id),
+            match missing.resource_type.as_deref() {
+                Some(crate::state::RESOURCE_TYPE_DATA_SET) => {
+                    crate::state::JOB_ERROR_RESOURCE_TYPE_DATA_SET
+                }
+                _ => crate::state::JOB_ERROR_RESOURCE_TYPE_REVISION,
+            },
+        ))
+    })
+}
+
+/// The Amazon S3 object key one asset of an exported revision is written under:
+/// `pattern` with every variable it names replaced by what that variable stands for.
+///
+/// Source: the key patterns AWS documents for a revision export, which the model's
+/// `RevisionDestinationEntry.KeyPattern` member links to
+/// (`smithy_query(query="doc", shape="RevisionDestinationEntry",
+/// member="KeyPattern")`) — the asset's name and id, the revision's id and creation
+/// date, and the data set's id and name, written `${Asset.Name}` and so on, with the
+/// asset's own name the pattern a destination that names none is written under.
+fn exported_key(
+    pattern: Option<&str>,
+    data_set_id: &str,
+    data_set_name: &str,
+    revision: &crate::state::Revision,
+    asset: &crate::state::Asset,
+) -> String {
+    let created_at = revision
+        .created_at
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_default();
+    // The date components of an ISO 8601 date-time, which is what the created-at
+    // variables above are rendered from.
+    let date = created_at.get(..10).unwrap_or_default();
+    let mut key = pattern.unwrap_or(DEFAULT_REVISION_KEY_PATTERN).to_string();
+    for (variable, value) in [
+        ("${Asset.Id}", asset.id.as_str()),
+        ("${Asset.Name}", asset.name.as_str()),
+        ("${DataSet.Id}", data_set_id),
+        ("${DataSet.Name}", data_set_name),
+        ("${Revision.Id}", revision.id.as_str()),
+        ("${Revision.CreatedAt.Year}", date.get(..4).unwrap_or_default()),
+        (
+            "${Revision.CreatedAt.Month}",
+            date.get(5..7).unwrap_or_default(),
+        ),
+        (
+            "${Revision.CreatedAt.Day}",
+            date.get(8..10).unwrap_or_default(),
+        ),
+        ("${Revision.CreatedAt}", created_at.as_str()),
+    ] {
+        key = key.replace(variable, value);
+    }
+    key
+}
+
+/// The key pattern an exported revision's assets are written under when the destination
+/// names none: the asset's own name, as the key patterns AWS documents for a revision
+/// export default to (see [`exported_key`]).
+const DEFAULT_REVISION_KEY_PATTERN: &str = "${Asset.Name}";
 
 /// Where `work` ends — the outcome the start call records for the clock to materialise
 /// one execution span later.
 ///
 /// An import that takes its content from an upload URL this service announced has that
 /// content exactly when a client has uploaded it, so it ends in the terminal state of
-/// work that was done. A data access is decided from what this emulator's own object
-/// storage answers about the bucket it would share. For every other job the content is
-/// not there to read: this emulator holds no object store of its own for an export's
-/// assets, and a Redshift datashare, a Lake Formation data permission and an upload
-/// nobody uploaded to are all unreadable, so such an execution ends in `ERROR`
-/// reporting exactly that.
+/// work that was done. An import from Amazon S3, an export to Amazon S3 and a data
+/// access are decided from what this emulator's own object storage answers about the
+/// objects they read, the objects they write and the bucket they would share. For every
+/// other job the content is not there to read: a Redshift datashare, a Lake Formation
+/// data permission and an upload nobody uploaded to are all unreadable, so such an
+/// execution ends in `ERROR` reporting exactly that.
 async fn outcome_of(ctx: &smithy_server_runtime::OperationContext<'_>, work: Work) -> Outcome {
     match work {
-        Work::StagedImport(import) => Outcome::carried_out(Some(*import)),
+        Work::StagedImport(import) => Outcome::carried_out(vec![*import]),
         Work::UnreadableSource(source) => Outcome::stopped_by(source_not_found(source)),
         Work::S3DataAccess(access) => data_access_outcome(ctx, &access).await,
+        Work::S3Import(import) => s3_import_outcome(ctx, &import).await,
+        Work::S3Export(export) => s3_export_outcome(ctx, &export).await,
+        Work::Stopped(error) => Outcome::stopped_by(*error),
+    }
+}
+
+/// Where the execution of an export to Amazon S3 ends, decided from whether this
+/// emulator's own object storage TAKES each object the job writes.
+///
+/// The work of such an export is to write the content of the assets the job's details
+/// name into the caller's own bucket, so it is carried out exactly when those writes
+/// are accepted: a destination the storage will not take the object into — a bucket it
+/// does not hold, or one that refuses the write — is a destination that cannot be
+/// found, and nothing of the export is reported as exported.
+async fn s3_export_outcome(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    export: &S3Export,
+) -> Outcome {
+    let client = s3_client(ctx, &export.region);
+    // A destination that is not there takes nothing, which is what an export writing no
+    // object at all into it turns on as much as one writing many.
+    for bucket in &export.buckets {
+        if let Err(failure) = client.head_bucket().bucket(bucket).send().await {
+            ::tracing::warn!(
+                bucket,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&failure),
+                "an export's destination bucket could not be reached"
+            );
+            return Outcome::stopped_by(destination_not_found(bucket));
+        }
+    }
+    for object in &export.objects {
+        let mut write = client
+            .put_object()
+            .bucket(&object.bucket)
+            .key(&object.key)
+            // An exported object is a copy of the one the asset was imported from, so
+            // it declares the media type that one declared; a source that declared
+            // none leaves the destination to answer its own default.
+            .set_content_type(object.content_type.clone())
+            .body(::aws_sdk_s3::primitives::ByteStream::from(
+                object.content.clone(),
+            ));
+        // The job's own `Encryption` is what the destination is asked to encrypt the
+        // objects with, so it travels with the write rather than being dropped.
+        if let Some(encryption) = export.encryption.as_ref() {
+            write = write.server_side_encryption(
+                ::aws_sdk_s3::types::ServerSideEncryption::from(encryption.r#type.as_str()),
+            );
+            if let Some(kms_key_arn) = encryption.kms_key_arn.as_ref() {
+                write = write.ssekms_key_id(kms_key_arn);
+            }
+        }
+        if let Err(failure) = write.send().await {
+            ::tracing::warn!(
+                bucket = object.bucket,
+                key = object.key,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&failure),
+                "an export's destination did not take the object"
+            );
+            return Outcome::stopped_by(destination_not_found(&object.bucket));
+        }
+    }
+    Outcome::carried_out(Vec::new())
+}
+
+/// The job error of an export whose destination did not take the objects: the not-found
+/// `Code` and that error class's sentence, naming the bucket nothing could be written
+/// into.
+///
+/// `ResourceType` is left unset for the reason [`data_exchange_not_granted`] states: an
+/// Amazon S3 bucket is none of the model's `JobErrorResourceTypes`, so the bucket is
+/// named in the sentence instead.
+fn destination_not_found(bucket: &str) -> JobError {
+    JobError {
+        code: crate::state::JOB_ERROR_CODE_RESOURCE_NOT_FOUND.to_string(),
+        message: format!(
+            "Resource not found. Unable to find destination {DESTINATION_S3_BUCKET} {bucket}."
+        ),
+        ..JobError::default()
+    }
+}
+
+/// The destination an export writes into, named as the model names that resource in
+/// `AssetDestinationEntry.Bucket` ("The Amazon S3 bucket that is the destination for
+/// the asset").
+const DESTINATION_S3_BUCKET: &str = "Amazon S3 bucket";
+
+/// Where the execution of an import from Amazon S3 ends, decided from what this
+/// emulator's own object storage ANSWERS about each source object the job names.
+///
+/// The work of such an import is to copy the content of those objects into the revision
+/// the job's details name, so it is carried out exactly when that content can be read:
+/// each object becomes one asset, named by its own Amazon S3 object key (`AssetEntry`'s
+/// `Name`: "When importing from Amazon S3, the Amazon S3 object key is used as the asset
+/// name"), carrying the bytes that were read, which is what the asset's own
+/// `S3SnapshotAsset.Size` then reports. An object the storage answers it does not hold
+/// is a source that cannot be found, and the job error naming it carries that source in
+/// the `Details` member the model gives this job type's errors
+/// (`ImportAssetsFromS3JobErrorDetails`).
+///
+/// The bytes are held in memory until the execution comes due, so one execution reads no
+/// more content than the whole store retains; a source past that budget is the quota the
+/// execution reports instead.
+async fn s3_import_outcome(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    import: &S3Import,
+) -> Outcome {
+    let client = s3_client(ctx, &import.region);
+    let mut budget = crate::state::MAX_CONTENT_BYTES;
+    let mut imports: Vec<crate::state::PendingImport> = Vec::with_capacity(import.sources.len());
+    for source in &import.sources {
+        let answer = client
+            .get_object()
+            .bucket(&source.bucket)
+            .key(&source.key)
+            .send()
+            .await;
+        let object = match answer {
+            Ok(object) => object,
+            Err(failure) => {
+                ::tracing::warn!(
+                    bucket = source.bucket,
+                    key = source.key,
+                    error = %::aws_smithy_types::error::display::DisplayErrorContext(&failure),
+                    "an import source object could not be read"
+                );
+                return Outcome::stopped_by(import_source_not_found(source));
+            }
+        };
+        // What the storage says the object's length is, before any of it is held.
+        if object.content_length().unwrap_or_default() > budget as i64 {
+            return Outcome::stopped_by(import_source_too_large(source));
+        }
+        // The media type the source object declares travels with its content: the asset
+        // IS a copy of that object.
+        let content_type = object.content_type.clone();
+        let content = match object.body.collect().await {
+            Ok(bytes) => bytes.into_bytes().to_vec(),
+            Err(failure) => {
+                ::tracing::warn!(
+                    bucket = source.bucket,
+                    key = source.key,
+                    error = %::aws_smithy_types::error::display::DisplayErrorContext(&failure),
+                    "an import source object's content could not be read"
+                );
+                return Outcome::stopped_by(import_source_not_found(source));
+            }
+        };
+        if content.len() > budget {
+            return Outcome::stopped_by(import_source_too_large(source));
+        }
+        budget -= content.len();
+        imports.push(crate::state::PendingImport {
+            region: import.region.clone(),
+            data_set_id: import.data_set_id.clone(),
+            revision_id: import.revision_id.clone(),
+            asset_name: source.key.clone(),
+            content: Some(content),
+            content_type: content_type.clone(),
+            api: None,
+            s3_data_access: None,
+        });
+    }
+    Outcome::carried_out(imports)
+}
+
+/// The job error of an import whose source object the object storage does not hold: the
+/// sentence every execution of this service reports a missing source with
+/// ([`source_not_found`]), with the bucket and key pair that could not be read in the
+/// `Details` member the model gives an import from Amazon S3.
+///
+/// `ResourceType` is left unset: the model's `JobErrorResourceTypes` is
+/// `REVISION | ASSET | DATA_SET`, and an Amazon S3 object is none of them — which is
+/// why the model carries the source itself in `Details` instead.
+fn import_source_not_found(source: &AssetSourceEntry) -> JobError {
+    JobError {
+        details: Some(import_source_details(source)),
+        ..source_not_found(SOURCE_S3_OBJECT)
+    }
+}
+
+/// The job error of an import whose source object holds more content than this store
+/// retains, naming that source the same way [`import_source_not_found`] does.
+fn import_source_too_large(source: &AssetSourceEntry) -> JobError {
+    crate::state::asset_size_limit_exceeded_for(import_source_details(source))
+}
+
+/// The `Details` of a job error about ONE source of an import from Amazon S3.
+fn import_source_details(source: &AssetSourceEntry) -> Details {
+    Details {
+        import_assets_from_s3_job_error_details: Some(vec![source.clone()]),
+        ..Details::default()
     }
 }
 
@@ -402,13 +875,17 @@ async fn data_access_outcome(
     if shared_data_is_absent(ctx, &access.region, &access.source).await {
         return Outcome::stopped_by(source_not_found(SOURCE_S3_OBJECT));
     }
-    Outcome::carried_out(Some(crate::state::PendingImport {
+    Outcome::carried_out(vec![crate::state::PendingImport {
         region: access.region.clone(),
         data_set_id: access.data_set_id.clone(),
         revision_id: access.revision_id.clone(),
         // The asset IS the data access, and what the model's `S3DataAccessAsset`
         // names it by is the bucket whose data it shares.
         asset_name: bucket.to_string(),
+        // The asset is a VIEW of data that stays in the caller's bucket, so this
+        // service holds no bytes of its own for it.
+        content: None,
+        content_type: None,
         api: None,
         s3_data_access: Some(S3DataAccessAsset {
             bucket: bucket.to_string(),
@@ -421,7 +898,7 @@ async fn data_access_outcome(
             s3_access_point_alias: None,
             s3_access_point_arn: None,
         }),
-    }))
+    }])
 }
 
 /// The job error of an execution whose source is not there: the not-found `Code` and
@@ -712,30 +1189,37 @@ const OBJECT_NOT_FOUND_STATUS: u16 = 404;
 /// imported from an API Gateway API is named by, and records, the API it fulfils
 /// (`smithy_query(query="shape", shape="ApiGatewayApiAsset,AssetEntry")` — an API asset
 /// IS that API, and `AssetEntry.Name` is the name of the asset).
-fn staged_import(job: &crate::state::Job, region: &str) -> Option<crate::state::PendingImport> {
-    if !job
-        .upload
-        .as_ref()
-        .is_some_and(|upload| upload.content.is_some())
-    {
+fn staged_import(
+    details: &ResponseDetails,
+    staged: bool,
+    region: &str,
+) -> Option<crate::state::PendingImport> {
+    if !staged {
         return None;
     }
-    if let Some(detail) = job.details.import_asset_from_signed_url.as_ref() {
+    if let Some(detail) = details.import_asset_from_signed_url.as_ref() {
         return Some(crate::state::PendingImport {
             region: region.to_string(),
             data_set_id: detail.data_set_id.clone(),
             revision_id: detail.revision_id.clone(),
             asset_name: detail.asset_name.clone(),
+            // The bytes are the ones staged against the job itself, which the
+            // settlement takes out of its upload.
+            content: None,
+            content_type: None,
             api: None,
             s3_data_access: None,
         });
     }
-    let detail = job.details.import_asset_from_api_gateway_api.as_ref()?;
+    let detail = details.import_asset_from_api_gateway_api.as_ref()?;
     Some(crate::state::PendingImport {
         region: region.to_string(),
         data_set_id: detail.data_set_id.clone(),
         revision_id: detail.revision_id.clone(),
         asset_name: detail.api_name.clone(),
+        // As above: the specification was uploaded to this job's own URL.
+        content: None,
+        content_type: None,
         api: Some(ApiGatewayApiAsset {
             api_description: detail.api_description.clone(),
             api_id: Some(detail.api_id.clone()),

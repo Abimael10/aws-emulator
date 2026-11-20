@@ -273,6 +273,8 @@ fn store_asset(
         name: name.to_string(),
         asset_type,
         content,
+        // The import this stands in for read a source that declared no media type.
+        content_type: None,
         api: None,
         s3_data_access: None,
         created_at: imported_at,

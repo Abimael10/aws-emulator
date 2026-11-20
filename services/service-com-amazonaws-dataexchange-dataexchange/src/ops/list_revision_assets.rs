@@ -165,7 +165,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        let store = state.lock();
+        let mut store = state.lock();
+        // An import's execution places its assets at an instant the start call fixed, so
+        // that placement is owed at that instant whether or not anybody polled the job:
+        // it is materialised before the revision's assets are read, exactly as the other
+        // readers of an asset do.
+        store.settle_jobs(crate::state::now());
         let Some(data_set) = store.data_sets.get(&input.data_set_id) else {
             return Err(ListRevisionAssetsErrorModeled::ResourceNotFoundException(
                 crate::state::data_set_not_found(&input.data_set_id),

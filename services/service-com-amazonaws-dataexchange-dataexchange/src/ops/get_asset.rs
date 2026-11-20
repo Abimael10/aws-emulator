@@ -191,7 +191,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // never copied out of it: only the members this operation reports are, and the
         // bytes an asset holds are not among them.
         let answered = {
-            let store = state.lock();
+            let mut store = state.lock();
+            // The import that creates an asset finishes at an instant its start call
+            // fixed, so the asset is owed from that instant whether or not anybody
+            // polled the job; `UpdateAsset` and `DeleteAsset` read it the same way.
+            store.settle_jobs(crate::state::now());
             let revision = match store.revision(&input.data_set_id, &input.revision_id) {
                 Ok(revision) => revision,
                 Err(missing) => {

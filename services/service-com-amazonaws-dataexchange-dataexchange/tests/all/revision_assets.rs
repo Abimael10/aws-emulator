@@ -230,6 +230,8 @@ pub(crate) fn store_assets(
             name: (*name).to_string(),
             asset_type: asset_type.clone(),
             content: Vec::new(),
+            // The import this stands in for read a source that declared no media type.
+            content_type: None,
             api: None,
             s3_data_access: None,
             created_at: imported_at,

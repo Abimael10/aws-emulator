@@ -71,53 +71,89 @@ const SETTLE_MARGIN_SECONDS: f64 = 0.5;
 /// instant of the read that materialised it — is what `UpdatedAt` must carry.
 const DUE_INSTANT_TOLERANCE_SECONDS: f64 = 1.0;
 
-/// Where a job of each `Type` takes the content it works on from, as the job error of
-/// a source that cannot be found names it.
+/// What a job of each `Type` reports in its `Errors` once its execution has failed —
+/// which, in a router that mounts this service ALONE, is every type: there is no object
+/// storage to read a source out of or to write a destination into.
 ///
 /// This is the test's own statement of the catalog: every `Type` the model admits
 /// (`smithy_query(query="shape", shape="Type")`, mirrored by
-/// `crate::ops::types::TYPE_VALUES`) paired with the source its `Details` describe —
-/// an Amazon S3 object for every job whose content is an object (the presigned
-/// upload, an asset source key, an asset's own snapshot), and the two resources the
-/// model names in its own `JobErrorLimitName` values for the other two imports.
-const EXPECTED_SOURCE: &[(&str, &str)] = &[
-    ("CREATE_S3_DATA_ACCESS_FROM_S3_BUCKET", "Amazon S3 object"),
-    ("EXPORT_ASSETS_TO_S3", "Amazon S3 object"),
-    ("EXPORT_ASSET_TO_SIGNED_URL", "Amazon S3 object"),
-    ("EXPORT_REVISIONS_TO_S3", "Amazon S3 object"),
-    (
-        "IMPORT_ASSETS_FROM_LAKE_FORMATION_TAG_POLICY",
-        "AWS Lake Formation data permission",
-    ),
-    (
-        "IMPORT_ASSETS_FROM_REDSHIFT_DATA_SHARES",
-        "Amazon Redshift datashare",
-    ),
-    ("IMPORT_ASSETS_FROM_S3", "Amazon S3 object"),
-    ("IMPORT_ASSET_FROM_API_GATEWAY_API", "Amazon S3 object"),
-    ("IMPORT_ASSET_FROM_SIGNED_URL", "Amazon S3 object"),
-];
-
-/// The `Message` a job of `job_type` must report once its execution has failed to
-/// find the content it had to work on.
-fn expected_message(job_type: &str) -> String {
-    let source = EXPECTED_SOURCE
-        .iter()
-        .find(|(value, _)| *value == job_type)
-        .map(|(_, source)| *source)
-        .unwrap_or_else(|| panic!("case {job_type}: the catalog names no source for this Type"));
-    format!("Resource not found. Unable to find source {source}.")
+/// `crate::ops::types::TYPE_VALUES`) paired with the prerequisite its `Details` turn
+/// on. A job whose content is an Amazon S3 object it reads reports that source — the
+/// presigned upload, an asset source key, an asset's own snapshot; the two imports
+/// whose source is neither an object nor an upload report the resource the model names
+/// in its own `JobErrorLimitName` values; an export of NAMED assets reports the asset
+/// its destination names, which the revision does not hold, before any bucket is
+/// reached; and an export of a whole revision reports the destination bucket it cannot
+/// write into.
+///
+/// The one unknown `Type` is a panic, so a value the model gains fails this suite
+/// instead of passing it silently.
+fn expected_failure(job_type: &str) -> ExpectedJobError {
+    let unreadable = |source: &str| ExpectedJobError {
+        message: format!("Resource not found. Unable to find source {source}."),
+        resource_type: None,
+        names_sources: false,
+    };
+    match job_type {
+        "CREATE_S3_DATA_ACCESS_FROM_S3_BUCKET"
+        | "EXPORT_ASSET_TO_SIGNED_URL"
+        | "IMPORT_ASSET_FROM_API_GATEWAY_API"
+        | "IMPORT_ASSET_FROM_SIGNED_URL" => unreadable("Amazon S3 object"),
+        "IMPORT_ASSETS_FROM_LAKE_FORMATION_TAG_POLICY" => {
+            unreadable("AWS Lake Formation data permission")
+        }
+        "IMPORT_ASSETS_FROM_REDSHIFT_DATA_SHARES" => unreadable("Amazon Redshift datashare"),
+        // The source objects an import from Amazon S3 reads are named in the `Details`
+        // member the model gives that job type's errors.
+        "IMPORT_ASSETS_FROM_S3" => ExpectedJobError {
+            names_sources: true,
+            ..unreadable("Amazon S3 object")
+        },
+        // The asset the destination of `jobs.rs`'s catalog entry names is one no import
+        // created, and the error states that identity in its own members.
+        "EXPORT_ASSETS_TO_S3" => ExpectedJobError {
+            message: "The requested resource was not found.".to_string(),
+            resource_type: Some("ASSET"),
+            names_sources: false,
+        },
+        // `destination-bucket`, which `jobs.rs`'s catalog names as the destination of
+        // both export jobs and which no bucket of any object storage answers for.
+        "EXPORT_REVISIONS_TO_S3" => ExpectedJobError {
+            message: "Resource not found. Unable to find destination Amazon S3 bucket \
+                      destination-bucket."
+                .to_string(),
+            resource_type: None,
+            names_sources: false,
+        },
+        other => panic!("case {other}: the catalog names no failure for this Type"),
+    }
 }
 
-/// Assert that `errors` is the `Errors` list of a job whose execution could not find
-/// the content it had to work on: one entry, the modelled not-found `Code`, and that
-/// error class's message for the source a job of `job_type` reads.
+/// The one `JobError` a failed execution of one job `Type` reports, as
+/// [`expected_failure`] states it.
+struct ExpectedJobError {
+    /// The whole `Message`, stated independently of the crate's own constants.
+    message: String,
+    /// The `JobErrorResourceTypes` value the error names, where the resource it is
+    /// about is one of them.
+    resource_type: Option<&'static str>,
+    /// Whether the error names the Amazon S3 sources it is about in `Details`, which
+    /// the model gives an import from Amazon S3 the member for
+    /// (`smithy_query(query="shape", shape="Details")` — `ImportAssetsFromS3JobErrorDetails`,
+    /// a list of `AssetSourceEntry`; the other member carries an asset NAME, not a
+    /// source).
+    names_sources: bool,
+}
+
+/// Assert that `errors` is the `Errors` list of a job whose execution could not carry
+/// its work out: one entry, the modelled not-found `Code`, and the message and members
+/// [`expected_failure`] states for a job of `job_type`.
 ///
-/// The entry carries no other member of `JobError`: those describe a different error
-/// class (a limit that was reached, the resource an error is about). `LimitValue` is
-/// the exception — the model gives that member a `@default`, so it is never absent
-/// from a serialized `JobError`.
+/// `LimitValue` is never absent — the model gives that member a `@default`, so it is
+/// always serialized — while every member the expectation does not name describes a
+/// different error class and must be absent.
 fn assert_unreadable_source(job_type: &str, errors: &Value) {
+    let expected = expected_failure(job_type);
     let entries = errors
         .as_array()
         .unwrap_or_else(|| panic!("case {job_type}: expected an Errors list, got {errors:?}"));
@@ -134,15 +170,64 @@ fn assert_unreadable_source(job_type: &str, errors: &Value) {
     );
     assert_eq!(
         entry.get("Message").and_then(Value::as_str),
-        Some(expected_message(job_type).as_str()),
-        "case {job_type}: expected the message of a source that cannot be found, got {entry:?}"
+        Some(expected.message.as_str()),
+        "case {job_type}: expected the message of the prerequisite that failed, got {entry:?}"
     );
-    for absent in ["Details", "LimitName", "ResourceId", "ResourceType"] {
+    if expected.names_sources {
+        let named = entry
+            .get("Details")
+            .and_then(|details| details.get("ImportAssetsFromS3JobErrorDetails"))
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {job_type}: expected Details.ImportAssetsFromS3JobErrorDetails to \
+                     name the source that could not be read, got {entry:?}"
+                )
+            });
         assert!(
-            entry.get(absent).is_none(),
-            "case {job_type}: expected no {absent} on a not-found job error, got {entry:?}"
+            !named.is_empty()
+                && named
+                    .iter()
+                    .all(|source| source.get("Bucket").is_some() && source.get("Key").is_some()),
+            "case {job_type}: expected each named source to carry its Bucket and Key, \
+             got {named:?}"
+        );
+    } else {
+        assert!(
+            entry.get("Details").is_none(),
+            "case {job_type}: expected no Details on this job error, got {entry:?}"
         );
     }
+    match expected.resource_type {
+        Some(resource_type) => {
+            assert_eq!(
+                entry.get("ResourceType").and_then(Value::as_str),
+                Some(resource_type),
+                "case {job_type}: expected the error to name the kind of resource it is \
+                 about, got {entry:?}"
+            );
+            assert!(
+                entry
+                    .get("ResourceId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !id.is_empty()),
+                "case {job_type}: expected the error to name the resource it is about, \
+                 got {entry:?}"
+            );
+        }
+        None => {
+            for absent in ["ResourceId", "ResourceType"] {
+                assert!(
+                    entry.get(absent).is_none(),
+                    "case {job_type}: expected no {absent} on this job error, got {entry:?}"
+                );
+            }
+        }
+    }
+    assert!(
+        entry.get("LimitName").is_none(),
+        "case {job_type}: expected no LimitName on a job error about no limit, got {entry:?}"
+    );
 }
 
 pub(crate) async fn start_job(router: &MultiServiceRouter, job_id: &str) -> Answer {
@@ -473,18 +558,19 @@ async fn a_job_operation_naming_an_absent_job_is_not_found() {
     }
 }
 
-/// RULE: the source catalog these tests assert against covers every `Type` the model
+/// RULE: the failure catalog these tests assert against covers every `Type` the model
 /// admits, so no job type is left without a stated outcome.
 #[tokio::test]
 async fn the_source_catalog_covers_every_modelled_job_type() {
-    let mut named: Vec<&str> = EXPECTED_SOURCE.iter().map(|(value, _)| *value).collect();
-    named.sort_unstable();
-    let mut modelled: Vec<&str> = dataexchange::ops::types::TYPE_VALUES.to_vec();
-    modelled.sort_unstable();
-    assert_eq!(
-        named, modelled,
-        "case \"the model's Type enum\": expected a source for every modelled Type, got {named:?}"
-    );
+    // `expected_failure` panics on a `Type` it does not state an outcome for, so asking
+    // it for every modelled value is what pins the coverage.
+    for job_type in dataexchange::ops::types::TYPE_VALUES {
+        let stated = expected_failure(job_type);
+        assert!(
+            !stated.message.is_empty(),
+            "case {job_type}: expected a stated failure message for this Type"
+        );
+    }
 
     // Every one of them but the Lake Formation import is exercised above; that one
     // carries a `Details` member no request can satisfy (its `CatalogId` pattern
