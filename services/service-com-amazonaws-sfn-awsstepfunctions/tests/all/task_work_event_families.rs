@@ -66,7 +66,12 @@ use crate::state_machine_lifecycle::string;
 
 /// The handler every row invokes: it returns what the event asked it to carry, and
 /// raises when the event asks for it, so the task's outcome is the run's own.
-const HANDLER_SOURCE: &str = r#"
+///
+/// `pub(crate)`, not private: `tests/all/main.rs` is this binary's crate root, so the
+/// sibling suite whose rule is about the same two families of events drives the same
+/// handler rather than carrying a second copy of it — and so for every item below that
+/// says the same.
+pub(crate) const HANDLER_SOURCE: &str = r#"
 class OrderRejected(Exception):
     pass
 
@@ -78,8 +83,9 @@ def handler(event, context):
 "#;
 
 /// The `errorType` of the error document that handler's exception produces, which is the
-/// name the failed unit of work reports.
-const RAISED_ERROR_TYPE: &str = "OrderRejected";
+/// name the failed unit of work reports. `pub(crate)` for the reason
+/// [`HANDLER_SOURCE`] is.
+pub(crate) const RAISED_ERROR_TYPE: &str = "OrderRejected";
 
 /// One row: a `Resource` form, the input the state is handed, and the events its work
 /// must write.
@@ -100,8 +106,9 @@ struct Row {
 }
 
 /// A `Task` state whose `Resource` is the function's ARN: the legacy form, whose unit of
-/// work is one invocation of that function.
-fn function_arn_task(function: &str) -> Value {
+/// work is one invocation of that function. `pub(crate)` for the reason
+/// [`HANDLER_SOURCE`] is.
+pub(crate) fn function_arn_task(function: &str) -> Value {
     json!({
         "Type": "Task",
         "Resource": function,
@@ -110,8 +117,8 @@ fn function_arn_task(function: &str) -> Value {
 }
 
 /// The same work asked for through the optimized integration, which names the function
-/// in its `Parameters` instead.
-fn optimized_task(function: &str) -> Value {
+/// in its `Parameters` instead. `pub(crate)` for the reason [`HANDLER_SOURCE`] is.
+pub(crate) fn optimized_task(function: &str) -> Value {
     json!({
         "Type": "Task",
         "Resource": "arn:aws:states:::lambda:invoke",
@@ -132,8 +139,9 @@ fn unresolvable_task(function: &str) -> Value {
 }
 
 /// A `Resource` naming an integration of ANOTHER service, which records the `Task*`
-/// family exactly as the optimized Lambda one does.
-fn other_integration_task(_function: &str) -> Value {
+/// family exactly as the optimized Lambda one does. `pub(crate)` for the reason
+/// [`HANDLER_SOURCE`] is.
+pub(crate) fn other_integration_task(_function: &str) -> Value {
     json!({
         "Type": "Task",
         "Resource": "arn:aws:states:::sqs:sendMessage",
@@ -245,8 +253,14 @@ pub(crate) fn detail(events: &[Value], event_type: &str, member: &str, case: &st
         .unwrap_or_else(|| panic!("case {case:?}: expected {member} on {event}"))
 }
 
-/// The events of one execution, read with the members `extra` carries.
-async fn history(chain: &Chain, case: &str, execution: &str, extra: Value) -> Vec<Value> {
+/// The events of one execution, read with the members `extra` carries. `pub(crate)` for
+/// the reason [`HANDLER_SOURCE`] is.
+pub(crate) async fn history(
+    chain: &Chain,
+    case: &str,
+    execution: &str,
+    extra: Value,
+) -> Vec<Value> {
     let mut request = json!({ "executionArn": execution });
     let members = request.as_object_mut().expect("the request is an object");
     for (member, value) in extra.as_object().expect("the extras are an object") {
@@ -509,8 +523,9 @@ pub(crate) fn numbered(events: &[Value]) -> Vec<(String, i64, i64)> {
 /// The numbering a list of event types takes when it is the WHOLE history: "numbered
 /// sequentially, starting at one", each naming the event before it — except the event
 /// written straight after the execution's own `ExecutionStarted`, which has no
-/// predecessor and so names none, exactly as the start itself does.
-fn expected_numbering(types: &[&str]) -> Vec<(String, i64, i64)> {
+/// predecessor and so names none, exactly as the start itself does. `pub(crate)` for the
+/// reason [`HANDLER_SOURCE`] is.
+pub(crate) fn expected_numbering(types: &[&str]) -> Vec<(String, i64, i64)> {
     types
         .iter()
         .enumerate()
