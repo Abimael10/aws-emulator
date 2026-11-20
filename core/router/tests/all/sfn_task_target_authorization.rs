@@ -61,11 +61,14 @@ const PATIENCE: Duration = Duration::from_secs(20);
 pub(crate) const REFUSAL_CODE: &str = "AccessDeniedException";
 
 /// Amazon SQS's own: its front door answers an unauthorized call `AccessDenied`, and names
-/// the action it refused in the lower case its authorization layer reports.
-const SQS_REFUSAL_CODE: &str = "AccessDenied";
+/// the action it refused in the lower case its own authorization layer reports.
+///
+/// `pub(crate)` for the same reason the rest of this harness is: `tests/all/main.rs` is one
+/// crate root, so the code each service's front door words a refusal by is spelled once.
+pub(crate) const SQS_REFUSAL_CODE: &str = "AccessDenied";
 
 /// The status a service that answers an authorization failure as a FORBIDDEN carries.
-const FORBIDDEN: u16 = 403;
+pub(crate) const FORBIDDEN: u16 = 403;
 
 /// How a suite names the id of the refused request: an AWS service names every call it
 /// refuses by an id of that call's own, so no particular value is part of the text and
