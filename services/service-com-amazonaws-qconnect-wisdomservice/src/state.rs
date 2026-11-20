@@ -3312,6 +3312,34 @@ impl ComAmazonawsQconnectWisdomserviceState {
             .filter(|content| content.knowledge_base_id == knowledge_base_id)
     }
 
+    /// Drop a content, together with the `clientToken` entry that created it — a token
+    /// whose resource is gone must not resurrect it on a replay, exactly as
+    /// [`Self::remove_quick_response`] does for a quick response.
+    ///
+    /// The name goes with it, so a later create may take that name again: a duplicate
+    /// name conflicts with a LIVE content of the knowledge base, not with one that is
+    /// gone, and the asset bytes it held come back off [`Self::stored_content_bytes`].
+    /// `None` means the pair named no content of that knowledge base, which is the
+    /// caller's not-found.
+    pub fn remove_content(
+        &mut self,
+        knowledge_base_id: &str,
+        label: &str,
+    ) -> Option<Content> {
+        let content_id = self.content(knowledge_base_id, label)?.content_id.clone();
+        let content = self.contents.remove(&content_id)?;
+        let gone: Vec<String> = self
+            .idempotency
+            .iter()
+            .filter(|(_, created)| created.resource_id == content_id)
+            .map(|(token, _)| token.clone())
+            .collect();
+        for token in gone {
+            self.idempotency.remove(&token);
+        }
+        Some(content)
+    }
+
     /// The asset bytes every content of this store holds together — what
     /// [`MAX_STORED_CONTENT_BYTES`] bounds, so a write that REPLACES an asset is measured
     /// against the same figure a create is.

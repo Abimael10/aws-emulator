@@ -18723,6 +18723,7 @@ dependencies = [
 name = "service-com-amazonaws-qconnect-wisdomservice"
 version = "0.1.0"
 dependencies = [
+ "automod",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",
@@ -21831,6 +21832,7 @@ dependencies = [
 name = "service-com-amazonaws-wisdom-wisdomservice"
 version = "0.1.0"
 dependencies = [
+ "automod",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteContent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteContent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteContent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: removes the content the route names from the knowledge base that holds
+//! it, releasing the `clientToken` entry that created it, the asset bytes it held and the
+//! `name` it held — so every later read of that id, and every request following the asset
+//! URL it published, is the modelled not-found, and the 204 carries no document. A label
+//! pair naming no content of that knowledge base is that same `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -104,6 +100,16 @@ pub enum DeleteContentErrorModeled {
 /// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
 pub type DeleteContentError = crate::scaffolded::Scaffolded<DeleteContentErrorModeled>;
 
+/// The modelled `ResourceNotFoundException` (HTTP 404), naming the resource the request
+/// addressed — the member the model provides for exactly that.
+fn not_found(message: &str, resource_name: &str) -> DeleteContentError {
+    DeleteContentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message.to_string()),
+        resource_name: Some(resource_name.to_string()),
+    })
+    .into()
+}
+
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
 /// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
@@ -150,18 +156,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteContent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteContentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteContent"))
+        // Both path labels' `UuidOrArn` patterns are refused BEFORE this handler runs, so
+        // reaching here means each is a well-formed id or ARN; whether the pair names a
+        // stored record is decided below, out of the store.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteContent",
+            ));
+        };
+        let mut store = state.lock();
+
+        // The knowledge base the route names is resolved first: a content is reachable
+        // only through the knowledge base it lives in, so a label this account holds none
+        // under is the modelled not-found.
+        let Some(knowledge_base_id) = store
+            .knowledge_base(&input.knowledge_base_id)
+            .map(|knowledge_base| knowledge_base.knowledge_base_id.clone())
+        else {
+            return Err(not_found(
+                crate::state::MESSAGE_KNOWLEDGE_BASE_NOT_FOUND,
+                &input.knowledge_base_id,
+            ));
+        };
+        // The record and the `clientToken` entry that created it go together, so a later
+        // read cannot answer out of either. A content of ANOTHER knowledge base is one
+        // this knowledge base does not hold, which is the same not-found as an id nothing
+        // was ever created under — and so is a repeated delete.
+        if store
+            .remove_content(&knowledge_base_id, &input.content_id)
+            .is_none()
+        {
+            return Err(not_found(
+                crate::state::MESSAGE_CONTENT_NOT_FOUND,
+                &input.content_id,
+            ));
+        }
+        Ok(DeleteContentOutput {})
     }
 }

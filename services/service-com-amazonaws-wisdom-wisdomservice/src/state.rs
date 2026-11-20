@@ -2512,6 +2512,35 @@ impl ComAmazonawsWisdomWisdomserviceState {
             .find(|candidate| !self.contents.contains_key(candidate))
     }
 
+    /// Drop a content and every index entry that named it — the ARN index entry the
+    /// tagging surface and the asset plane reach it through, and the `clientToken` entry
+    /// that created it, so a create/delete cycle reclaims everything it allocated and a
+    /// replayed token cannot resurrect a deleted record.
+    ///
+    /// The name goes with it, so a later create may take that name again: a duplicate
+    /// name conflicts with a LIVE content of the knowledge base, not with one that is
+    /// gone, and the asset bytes it held come back off
+    /// [`Self::stored_content_bytes`]. `None` means the pair named no content of that
+    /// knowledge base, which is the caller's not-found.
+    pub fn remove_content(
+        &mut self,
+        knowledge_base_id: &str,
+        content_label: &str,
+    ) -> Option<Content> {
+        let content_id = self
+            .content(knowledge_base_id, content_label)?
+            .content_id
+            .clone();
+        let content = self.contents.remove(&content_id)?;
+        self.content_arn_index.remove(&content.content_arn);
+        self.idempotency
+            .retain(|_, created| created.resource_id != content_id);
+        // The order queue mirrors the map, so it drops exactly the same entries.
+        self.idempotency_order
+            .retain(|key| self.idempotency.contains_key(key));
+        Some(content)
+    }
+
     /// The same content as [`Self::content`], for a caller that WRITES to it: the seam
     /// `UpdateContent` applies its changes through, so an update and a read reach one
     /// record rather than two copies.

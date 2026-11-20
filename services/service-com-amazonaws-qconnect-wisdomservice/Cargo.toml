@@ -34,5 +34,10 @@ hex = { workspace = true }
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
+[dev-dependencies]
+# `automod` roots the one integration-test target at `tests/all/main.rs`, declaring a
+# module per suite file under `tests/all/`.
+automod = { workspace = true }
+
 [lints]
 workspace = true
