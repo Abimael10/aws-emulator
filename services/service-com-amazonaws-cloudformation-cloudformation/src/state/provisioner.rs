@@ -489,6 +489,7 @@ use super::template::{
     BEDROCK_FLOW,
     BEDROCK_GUARDRAIL,
     BEDROCK_KNOWLEDGE_BASE,
+    BEDROCK_SESSION,
     BRAKET_SPENDING_LIMIT, CLEANROOMSML_TRAINING_DATASET,
     CLOUDWATCH_DASHBOARD,
     CLOUDWATCH_METRIC_STREAM, CODEARTIFACT_DOMAIN, CODEARTIFACT_REPOSITORY,
@@ -1169,6 +1170,12 @@ pub(super) enum Provisioner {
     /// alike address a flow by — so both are read off that create's own answer and the ARN is
     /// the identity a `Ref` resolves to.
     BedrockFlow,
+    /// `AWS::Bedrock::Session`: a SESSION of the Bedrock Agent RUNTIME plane, which
+    /// `CreateSession` mints, `UpdateSession` changes and `DeleteSession` removes. That
+    /// service MINTS the `sessionId` (a uuid) and the `session/<uuid>` ARN the type publishes
+    /// — the two forms every call on a session takes as its `sessionIdentifier` — so both are
+    /// read off that create's own answer and the ARN is the identity a `Ref` resolves to.
+    BedrockSession,
     /// `AWS::BedrockAgentCore::WorkloadIdentity`: a workload identity of the Amazon Bedrock
     /// AgentCore control plane, which `CreateWorkloadIdentity` creates under the name the
     /// template states, `UpdateWorkloadIdentity` changes and `DeleteWorkloadIdentity`
@@ -1528,6 +1535,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         BEDROCK_KNOWLEDGE_BASE => Some(Provisioner::BedrockKnowledgeBase),
         BEDROCK_DATA_SOURCE => Some(Provisioner::BedrockDataSource),
         BEDROCK_FLOW => Some(Provisioner::BedrockFlow),
+        BEDROCK_SESSION => Some(Provisioner::BedrockSession),
         BEDROCK_AGENTCORE_WORKLOAD_IDENTITY => {
             Some(Provisioner::BedrockAgentCoreWorkloadIdentity)
         }
@@ -2293,6 +2301,12 @@ impl Provisioner {
             // `CreateFlow`'s own `tags` member takes, so a flow a stack creates carries the
             // tags CloudFormation gives it beside the ones the declaration asks for.
             Self::BedrockFlow => create_bedrock_flow(ctx, region, resource, propagated).await,
+            // `AWS::Bedrock::Session` publishes `Tags` as a MAP, which is the shape
+            // `CreateSession`'s own `tags` member takes, so a session a stack creates carries
+            // the tags CloudFormation gives it beside the ones the declaration asks for.
+            Self::BedrockSession => {
+                create_bedrock_session(ctx, region, resource, propagated).await
+            }
             // `AWS::BedrockAgentCore::WorkloadIdentity` publishes `Tags`, and
             // `CreateWorkloadIdentity` takes a tag MAP of its own, so an identity a stack
             // creates carries the tags CloudFormation gives it beside the ones the
@@ -3485,6 +3499,13 @@ impl Provisioner {
             // included, so a changed declaration is applied to that flow rather than
             // replacing it. Its tags travel separately ([`Self::retag`]).
             Self::BedrockFlow => update_bedrock_flow(ctx, region, resource, declared).await,
+            // `UpdateSession` takes a session's identifier together with the metadata it is to
+            // carry, so a changed declaration is applied to the session the stack created
+            // rather than replacing it; its identity is the ARN the Bedrock Agent runtime
+            // minted, which an update leaves alone.
+            Self::BedrockSession => {
+                update_bedrock_session(ctx, region, resource, declared).await
+            }
             Self::BedrockAgentCoreWorkloadIdentity => {
                 update_workload_identity(ctx, region, resource, declared)
                     .await
@@ -4558,6 +4579,11 @@ impl Provisioner {
             // The delete addresses the flow by the ARN Amazon Bedrock Agent minted for it,
             // which is this resource's physical id.
             Self::BedrockFlow => delete_bedrock_flow(ctx, region, physical_resource_id).await,
+            // The delete addresses the session by the ARN the Bedrock Agent runtime minted for
+            // it, which is this resource's physical id.
+            Self::BedrockSession => {
+                delete_bedrock_session(ctx, region, physical_resource_id).await
+            }
             Self::BedrockAgentCoreWorkloadIdentity => {
                 delete_workload_identity(ctx, region, physical_resource_id).await
             }
@@ -4728,6 +4754,11 @@ mod bedrock_data_sources;
 /// build-time control plane that owns it so the handles the stack publishes resolve — for
 /// that plane's own reads and for the runtime plane that INVOKES the flow.
 mod bedrock_flows;
+/// The Amazon Bedrock SESSION arms: the session an `AWS::Bedrock::Session` declares, minted in
+/// the Bedrock Agent RUNTIME plane that owns it so the identity the stack publishes is one
+/// that service answers for — for its own reads of the session and for every invocation that
+/// stores a checkpoint in it.
+mod bedrock_sessions;
 /// The Amazon SageMaker AI types a stack declares beside the model registry's: the model,
 /// the notebook instance and the lifecycle configuration one of those runs. Visible to the
 /// rest of this service's state because the type NAMES it owns are what the naming rules and
@@ -4928,6 +4959,7 @@ use bedrock_guardrails::*;
 use bedrock_knowledge_bases::*;
 use bedrock_data_sources::*;
 use bedrock_flows::*;
+use bedrock_sessions::*;
 use sagemaker_resources::*;
 use braket_spending_limits::*;
 use bcm_dashboards::*;

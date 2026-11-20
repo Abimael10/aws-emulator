@@ -20,6 +20,10 @@ service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # service writes no part of either.
 service-com-amazonaws-bedrockagent-amazonbedrockagentbuildtimelambda = { workspace = true }
 service-com-amazonaws-s3vectors-s3vectors = { workspace = true }
+# The keys a request's customer-managed encryption-key reference is resolved against, from
+# the service that OWNS keys (`state::encryption_key`). Read-only: this service writes no
+# part of the key store.
+service-com-amazonaws-kms-trentservice = { workspace = true }
 # The objects a knowledge base's documents were ingested from, from the service that owns
 # them: `GetDocumentContent` reports the content type and the length of the one it hands a
 # caller a URL for. Read-only.
@@ -58,6 +62,9 @@ rust-stemmers = "1.2"
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs`, so a new suite is a new file and nothing
+# lists it.
+automod = { workspace = true }
 sha2 = { workspace = true }
 # Decodes one `application/vnd.amazon.eventstream` frame, so the prompt-optimization suite
 # reads the response stream back the way an SDK's decoder does.

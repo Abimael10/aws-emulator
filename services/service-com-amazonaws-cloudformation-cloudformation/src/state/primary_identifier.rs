@@ -96,6 +96,11 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         // the Arn") — the handle every call on either takes; the type's own `Name` is only
         // what the resource is called, and two accounts' reports may share one.
         BCM_DASHBOARD | BCM_SCHEDULED_REPORT => "Arn",
+        // An Amazon Bedrock SESSION, identified by the ARN the Bedrock Agent runtime built
+        // around the uuid it minted ("Ref returns the session ARN") — one of the two forms
+        // every call on a session takes as its `sessionIdentifier`; the type declares no name a
+        // client could name one by.
+        BEDROCK_SESSION => BEDROCK_SESSION_ARN_ATTRIBUTE,
         // An Amazon Braket spending limit, identified by the ARN that service minted for it
         // ("Ref returns the spending limit ARN"), which is the handle every spending-limit
         // API takes — the type declares no name a client could name one by.

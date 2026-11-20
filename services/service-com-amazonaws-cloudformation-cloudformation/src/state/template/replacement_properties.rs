@@ -95,6 +95,11 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         // and a preset's are; every other property of the three is a member of that type's own
         // update.)
         MEDIACONVERT_QUEUE => &["PricingPlan"],
+        // A session is encrypted under the key it was created with: `encryptionKeyArn` is a
+        // member of `CreateSession` and of no member of `UpdateSession` (which takes a
+        // session's identifier and its metadata alone), so a declaration naming another key
+        // asks for a different session.
+        BEDROCK_SESSION => &["EncryptionKeyArn"],
         // A spending limit is a cost control ABOUT one device: `UpdateSpendingLimit` takes
         // the limit's amount and its period and no device at all, so a declaration naming
         // another device asks for a different limit.

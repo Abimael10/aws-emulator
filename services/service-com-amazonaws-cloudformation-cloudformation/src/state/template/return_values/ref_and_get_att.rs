@@ -1797,6 +1797,30 @@ pub(crate) fn return_values(
                 attributes,
             )
         }
+        // Amazon Bedrock Agent's RUNTIME plane: the session an `AWS::Bedrock::Session`
+        // declares. `Ref` returns the session ARN (the type's primary identifier); `Fn::GetAtt`
+        // reads that ARN and the `SessionId` that service minted. `CreateSession` takes no
+        // identifier at all — the declaration states the encryption key, the metadata and the
+        // tags — and answers the `sessionId` it drew (a UUID) with the `session/<uuid>` ARN
+        // built around it, so the two values here are STAND-INS of the forms that service's own
+        // model fixes and `super::provisioning` re-points them at what the create really
+        // answered ([`super::provisioner::Provisioner::BedrockSession`]). The session's status
+        // and the two instants it keeps are that service's to report and reach the resource off
+        // its create's own answer rather than being computed here.
+        BEDROCK_SESSION => {
+            let session_id = generated_uuid(resource_type, name);
+            let arn = ::emulator_server::emulator_arn(
+                BEDROCK_ARN_NAMESPACE,
+                region,
+                &format!("{BEDROCK_SESSION_PATH}/{session_id}"),
+            );
+            attributes.insert(
+                BEDROCK_SESSION_ARN_ATTRIBUTE.to_string(),
+                arn.clone(),
+            );
+            attributes.insert(BEDROCK_SESSION_ID_ATTRIBUTE.to_string(), session_id);
+            (arn, attributes)
+        }
         // The Billing and Cost Management Dashboards control plane: the dashboard an
         // `AWS::BCM::Dashboard` declares and the scheduled report an
         // `AWS::BCM::ScheduledReport` declares. "Ref returns the Arn" for either, and

@@ -296,6 +296,11 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         // clock, which reach the resource off its own report rather than from here.
         BCM_DASHBOARD => BCM_DASHBOARD_ATTRIBUTES,
         BCM_SCHEDULED_REPORT => BCM_SCHEDULED_REPORT_ATTRIBUTES,
+        // A session's ARN and the uuid the Bedrock Agent runtime minted for it are the return
+        // values these naming rules can compute; its `SessionStatus` and the two instants it
+        // keeps are that service's clock and reach the resource off its own report of the
+        // session, exactly as a flow's do.
+        BEDROCK_SESSION => BEDROCK_SESSION_ATTRIBUTES,
         // A spending limit's ARN is the one return value these naming rules can compute; its
         // `CreatedAt` is Amazon Braket's clock, which reaches the resource off that
         // service's own report of the limit rather than from here, exactly as a knowledge
@@ -861,6 +866,14 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // addresses a flow by, so neither the id nor the ARN can be computed from the
         // template.
         || resource_type == BEDROCK_FLOW
+        // An Amazon Bedrock SESSION is one more: `CreateSession` takes no identifier for the
+        // session — the declaration states the encryption key, the metadata and the tags — and
+        // answers the `sessionId` the Bedrock Agent runtime drew for it (a uuid) with the
+        // `session/<uuid>` ARN built around it, which is the ARN that type's `Ref` returns and
+        // one of the two forms every call on a session takes as its `sessionIdentifier`. No
+        // name CloudFormation decides is either, so the identity in force is the one that
+        // service answered.
+        || resource_type == BEDROCK_SESSION
         // An Amazon Braket SPENDING LIMIT is one more: `CreateSpendingLimit` takes no
         // identifier for the limit — the declaration states the device, the amount and the
         // period — and answers the `spendingLimitArn` that service minted, whose resource

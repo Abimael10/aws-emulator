@@ -200,6 +200,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateSessionErrorModeled::AccessDeniedException(denied).into());
         }
 
+        // The key the session's data is to be encrypted under is resolved in the service
+        // that OWNS keys before the session is written: a session encrypted under a key this
+        // account and Region do not hold could never be read back, and the service cannot
+        // encrypt with a key it cannot use ([`crate::state::encryption_key`]).
+        if let Some(denied) = crate::state::encryption_key::unusable_encryption_key(
+            &*self.engine,
+            &crate::state::request_region(ctx),
+            input.encryption_key_arn.as_deref(),
+        ) {
+            return Err(CreateSessionErrorModeled::AccessDeniedException(denied).into());
+        }
+
         let mut guard = state.lock();
         if guard.sessions.len() >= crate::state::MAX_SESSIONS {
             // Resource guard, not an AWS quota: see `state::MAX_SESSIONS`. The store

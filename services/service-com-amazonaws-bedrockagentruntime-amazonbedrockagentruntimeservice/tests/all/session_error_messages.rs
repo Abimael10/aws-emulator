@@ -12,9 +12,9 @@
 //! example:
 //!
 //! 1. A session-scoped operation whose `sessionIdentifier` names no stored session
-//!    answers one template built from the request — `Session with ID
-//!    <sessionIdentifier> not found` — identically for every such operation and for
-//!    either identifier form.
+//!    answers one template built from the request — `Session with ID <session id> not
+//!    found` — identically for every such operation and for either identifier form, the
+//!    ID being the uuid the submitted identifier names.
 //! 2. A WRITE to a session that is no longer `ACTIVE` answers one terminal-state
 //!    sentence naming that session's id, identically for every write.
 //! 3. `DeleteSession` on a session that is still `ACTIVE` answers one CONSTANT
@@ -69,10 +69,14 @@ fn message(body: &Value) -> &str {
 }
 
 /// RULE 1: the template a session-scoped operation states for an unknown session. It is
-/// built from the REQUEST — the identifier as submitted, whichever form it took — and
-/// carries no trailing period.
+/// built from the REQUEST — the session ID the submitted identifier names, which for the
+/// ARN form is the uuid in its `:session/` resource field, so both spellings of one session
+/// are refused with one sentence — and carries no trailing period.
 fn session_not_found(identifier: &str) -> String {
-    format!("Session with ID {identifier} not found")
+    let session_id = identifier
+        .rsplit_once(":session/")
+        .map_or(identifier, |(_, uuid)| uuid);
+    format!("Session with ID {session_id} not found")
 }
 
 /// RULE 2: the ONE terminal-state sentence every write to a non-`ACTIVE` session states,
@@ -179,8 +183,7 @@ fn session_scoped_calls(invocation_id: &str, step_id: &str) -> Vec<SessionCall> 
 
 /// RULE 1, over every operation that resolves a `sessionIdentifier` and every identifier
 /// form the member admits: the refusal is 404 `ResourceNotFoundException` stating
-/// `Session with ID <sessionIdentifier> not found`, with the identifier exactly as
-/// submitted.
+/// `Session with ID <session id> not found`, with the ID the submitted identifier names.
 #[tokio::test]
 async fn an_unknown_session_is_refused_with_one_not_found_template_everywhere() {
     let router = router();

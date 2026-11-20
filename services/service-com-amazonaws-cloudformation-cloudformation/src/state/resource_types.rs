@@ -89,6 +89,7 @@ use super::template::{
     APPLICATION_SIGNALS_GROUPING_CONFIGURATION, APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG,
     APPLICATION_SIGNALS_SERVICE_LEVEL_OBJECTIVE, BACKUP_GATEWAY_HYPERVISOR,
     BCM_DASHBOARD, BCM_SCHEDULED_REPORT,
+    BEDROCK_SESSION,
     BRAKET_SPENDING_LIMIT,
     CLEANROOMSML_TRAINING_DATASET,
     CLOUDFRONT_CONNECTION_FUNCTION, CLOUDFRONT_CONNECTION_GROUP, CLOUDFRONT_FUNCTION,
@@ -316,6 +317,9 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::Bedrock::Flow",
     "AWS::Bedrock::Guardrail",
     "AWS::Bedrock::KnowledgeBase",
+    // The SESSION of the Bedrock Agent RUNTIME plane, whose `CreateSession` a stack's
+    // deployment mints one through (`super::provisioner`).
+    BEDROCK_SESSION,
     // Amazon Bedrock AgentCore — the six types this emulator carries the published return
     // values of (`super::template::IMPLEMENTED_RESOURCE_TYPES`).
     "AWS::BedrockAgentCore::Browser",

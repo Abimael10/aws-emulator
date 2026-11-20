@@ -55,6 +55,9 @@ pub mod agent_memory;
 pub mod agent_invocation;
 /// See the module docs: where the content of one ingested document lives.
 pub mod document_content;
+/// See the module docs: whether the customer managed key a request named for the data it has
+/// encrypted is one AWS KMS holds.
+pub mod encryption_key;
 /// See the module docs: the asynchronous EXECUTION of a flow this plane owns, and the
 /// status machine a start, a read and a stop of one move.
 pub mod flow_execution;
@@ -338,19 +341,45 @@ pub fn session_id_from_identifier(identifier: &str) -> &str {
     }
 }
 
+/// The session ID a `sessionIdentifier` NAMES, which is the value a refusal about the
+/// session states.
+///
+/// `SessionIdentifier` admits two spellings of one session — the session's ARN and its bare
+/// `sessionId` — and what the service's refusals report is the ID: the uuid in a session
+/// ARN's own resource field (`…:session/<uuid>`), or the bare value as submitted. So the two
+/// spellings of one session are refused with ONE sentence, which is also how the terminal-
+/// state refusal of the same slice names a session ([`session_in_terminal_state`]).
+///
+/// Only the resource field is read, so an ARN of another account or another partition still
+/// names the session its own resource field names: which sessions this emulator can RESOLVE is
+/// a different question ([`session_id_from_identifier`]), and a refusal reports the resource
+/// the caller asked for rather than what the lookup could reach.
+pub fn session_id_in_refusal(identifier: &str) -> &str {
+    identifier
+        .rsplit_once(SESSION_ARN_RESOURCE_PREFIX)
+        .map_or(identifier, |(_, session_id)| session_id)
+}
+
+/// The resource field a session ARN carries before the uuid, from `SessionArn`'s own pattern
+/// (`^arn:aws(-[^:]+)?:bedrock:[a-z0-9-]+:[0-9]{12}:session/<uuid>$`).
+const SESSION_ARN_RESOURCE_PREFIX: &str = ":session/";
+
 /// The modelled `ResourceNotFoundException` (HTTP 404) every session-scoped operation
 /// answers when its `sessionIdentifier` names no stored session.
 ///
 /// ONE constructor for all of them: the refusal is worded from the REQUEST — the fixed
-/// template `Session with ID <sessionIdentifier> not found`, interpolating the identifier
-/// the caller submitted and nothing else — and the service states it identically whichever
-/// operation did the lookup (`GetSession`, `UpdateSession`, `EndSession`, `DeleteSession`,
-/// `CreateInvocation`, `PutInvocationStep`, `GetInvocationStep`, `ListInvocationSteps`), so
-/// a client can match one rule rather than one sentence per operation. No trailing period:
-/// the template is the sentence, not prose.
+/// template `Session with ID <session id> not found`, interpolating the ID the submitted
+/// identifier names ([`session_id_in_refusal`]) and nothing else — and the service states it
+/// identically whichever operation did the lookup (`GetSession`, `UpdateSession`,
+/// `EndSession`, `DeleteSession`, `CreateInvocation`, `PutInvocationStep`,
+/// `GetInvocationStep`, `ListInvocationSteps`), so a client can match one rule rather than one
+/// sentence per operation. No trailing period: the template is the sentence, not prose.
 pub fn session_not_found(identifier: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!("Session with ID {identifier} not found")),
+        message: Some(format!(
+            "Session with ID {} not found",
+            session_id_in_refusal(identifier)
+        )),
     }
 }
 

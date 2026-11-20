@@ -284,6 +284,82 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
     ("xray", "XRay", SdkDiagnostic::Envelope),
 ];
 
+/// The SDK service NAME and diagnostic shape for a call on a signing name SEVERAL services
+/// share, keyed by the OPERATION the provider's refused call named.
+///
+/// [`SDK_SERVICE_NAMES`] above is keyed by SIGNING NAME, which identifies the service for
+/// every signing name one service owns. The Bedrock family's does not: Amazon Bedrock's own
+/// control plane, the Bedrock Agent build-time plane and the Bedrock Agent RUNTIME plane all
+/// sign `bedrock` while each serves its own endpoint and carries its own `sdkId`, so which
+/// name the SDK of the refused call states is decided by the OPERATION that was called rather
+/// than by the signing name. A row here answers for that call and nothing else, so no other
+/// claimant of the shared name gains a diagnostic from it.
+///
+/// Read only where the caller NAMED the operation
+/// ([`in_process_calls::call_rest_json_named`]), which is what says which of the services
+/// sharing the name was called.
+const SDK_SHARED_NAME_SERVICES: &[(&str, &str, &str, SdkDiagnostic)] = &[
+    // The Bedrock Agent RUNTIME plane, named by that model's own `sdkId` VERBATIM, the spaces
+    // included (`Bedrock Agent Runtime`, `smithy_query(query="service_info")` on that
+    // service's model), wording its diagnostic with the refused OPERATION and that service's
+    // error code in it — read from the recorded `ResourceStatusReason` of an
+    // `AWS::Bedrock::Session` whose declared encryption key names no key (in the behavioral
+    // corpus `simparity-behavioral-aws-v1`, check `bedrock-agent-runtime__cloudformation.\
+    // deploy-bedrock-agent-runtime-session-nonexistent-kms-key-rejected-and-rolled-back`,
+    // whose handler reason reads `<the service's sentence> (Service: Bedrock Agent Runtime;
+    // Operation: CreateSession; Status Code: 403; Error Code: AccessDeniedException; Request
+    // ID: …)`). The rows beside the create are the same provider's other calls on a session
+    // ([`provisioner::bedrock_sessions`]), which word the shape it words — a recording of one
+    // of them is what would correct them.
+    (
+        "bedrock",
+        "CreateSession",
+        BEDROCK_AGENT_RUNTIME_SDK_NAME,
+        SdkDiagnostic::Operation,
+    ),
+    (
+        "bedrock",
+        "GetSession",
+        BEDROCK_AGENT_RUNTIME_SDK_NAME,
+        SdkDiagnostic::Operation,
+    ),
+    (
+        "bedrock",
+        "UpdateSession",
+        BEDROCK_AGENT_RUNTIME_SDK_NAME,
+        SdkDiagnostic::Operation,
+    ),
+    (
+        "bedrock",
+        "EndSession",
+        BEDROCK_AGENT_RUNTIME_SDK_NAME,
+        SdkDiagnostic::Operation,
+    ),
+    (
+        "bedrock",
+        "DeleteSession",
+        BEDROCK_AGENT_RUNTIME_SDK_NAME,
+        SdkDiagnostic::Operation,
+    ),
+];
+
+/// The name the SDK of the Bedrock Agent runtime states for it, written once so the rows
+/// above cannot spell it differently.
+const BEDROCK_AGENT_RUNTIME_SDK_NAME: &str = "Bedrock Agent Runtime";
+
+/// The service name and shape a call of `operation` on a SHARED signing name takes
+/// ([`SDK_SHARED_NAME_SERVICES`]).
+fn shared_name_service(
+    signing_name: &str,
+    operation: Option<&str>,
+) -> Option<(&'static str, SdkDiagnostic)> {
+    let operation = operation?;
+    SDK_SHARED_NAME_SERVICES
+        .iter()
+        .find(|(name, called, _, _)| *name == signing_name && *called == operation)
+        .map(|(_, _, service, shape)| (*service, *shape))
+}
+
 /// The PROVIDERS whose diagnostic shape differs from the one their service's entry above
 /// carries, keyed by the OPERATION the provider's refused call named.
 ///
@@ -435,7 +511,11 @@ pub(super) fn sdk_diagnostic(
     let (service, shape) = SDK_SERVICE_NAMES
         .iter()
         .find(|(name, _, _)| *name == signing_name)
-        .map(|(_, service, shape)| (*service, *shape))?;
+        .map(|(_, service, shape)| (*service, *shape))
+        // A signing name several services share is identified by the OPERATION that was
+        // called, not by the name ([`SDK_SHARED_NAME_SERVICES`]).
+        .or_else(|| shared_name_service(signing_name, operation))?;
+
     // The shape the PROVIDER that made this call words, where that service's providers do not
     // all word the same one ([`SDK_PROVIDER_SHAPES`]).
     let shape = provider_shape(signing_name, operation).unwrap_or(shape);

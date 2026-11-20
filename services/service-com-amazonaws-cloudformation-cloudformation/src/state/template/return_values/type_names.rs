@@ -132,6 +132,42 @@ pub(super) const BEDROCK_FLOW_DRAFT_VERSION: &str = "DRAFT";
 /// `FlowArn`'s own pattern (`arn:aws:bedrock:<region>:<account>:flow/<id>`).
 pub(super) const BEDROCK_FLOW_PATH: &str = "flow";
 
+/// The `AWS::<cloudFormationName>::<Resource>` type of an Amazon Bedrock SESSION: the store
+/// of a generative-AI conversation's checkpoints that the Bedrock Agent RUNTIME plane's
+/// `CreateSession` mints, `UpdateSession` changes and `DeleteSession` removes.
+///
+/// `Ref` returns the session ARN — the type's primary identifier, and one of the two forms
+/// `SessionIdentifier` admits, so every later call on a session is addressed by it — and
+/// `Fn::GetAtt` reads that ARN and the `SessionId` that service minted. The id is a UUID that
+/// service draws per session (`Uuid`:
+/// `^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`) and the ARN is built
+/// around it, which is why [`identity_is_service_assigned`] names this type.
+pub const BEDROCK_SESSION: &str = "AWS::Bedrock::Session";
+
+/// The resource path a session ARN carries before the uuid that service minted, from
+/// `SessionArn`'s own pattern
+/// (`^arn:aws(-[^:]+)?:bedrock:[a-z0-9-]+:[0-9]{12}:session/<uuid>$`).
+pub(super) const BEDROCK_SESSION_PATH: &str = "session";
+
+/// The attribute carrying the ARN the Bedrock Agent runtime mints for a session, which is
+/// this type's primary identifier.
+pub(crate) const BEDROCK_SESSION_ARN_ATTRIBUTE: &str = "SessionArn";
+
+/// The attribute carrying the uuid that service minted for the session, which is the other
+/// form `SessionIdentifier` admits.
+pub(crate) const BEDROCK_SESSION_ID_ATTRIBUTE: &str = "SessionId";
+
+/// Every `Fn::GetAtt` attribute a [`BEDROCK_SESSION`] publishes that these naming rules can
+/// compute a stand-in for, in the sorted order a resource's own attribute map holds them in.
+///
+/// The session's `SessionStatus` and the two instants it keeps are that service's own to
+/// report and reach the resource off its create's own answer rather than being computed here,
+/// exactly as a flow's status and instants do.
+pub(crate) const BEDROCK_SESSION_ATTRIBUTES: &[&str] = &[
+    BEDROCK_SESSION_ARN_ATTRIBUTE,
+    BEDROCK_SESSION_ID_ATTRIBUTE,
+];
+
 /// The `AWS::BCM::<Resource>` types of the two Billing and Cost Management Dashboards
 /// resources a template declares: the DASHBOARD that service's own `CreateDashboard` makes
 /// under the name the declaration states, and the SCHEDULED REPORT its

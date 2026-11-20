@@ -3421,17 +3421,17 @@ pub async fn reconcile(
             }
             Err(refusal) => {
                 failed.push((resource.logical_id.clone(), reporting.action));
-                outcome.transitions.push(ResourceTransition::failed(
-                    &resource,
-                    reporting.failed,
-                    // A name already in use that THIS REGION's stacks are what hold is
-                    // reported in CloudFormation's own words, naming the stack that manages
-                    // it; everything else the owning service refused is reported as that
-                    // service worded it.
-                    already_managed_reason(&resource, stack, &refusal).unwrap_or_else(|| {
-                        handler_failure_reason(owner, &refusal, &resource.physical_resource_id)
-                    }),
-                ));
+                // A name already in use that THIS REGION's stacks are what hold is
+                // reported in CloudFormation's own words, naming the stack that manages
+                // it; everything else the owning service refused is reported as that
+                // service worded it.
+                let reason = already_managed_reason(&resource, stack, &refusal).unwrap_or_else(
+                    || handler_failure_reason(owner, &refusal, &resource.physical_resource_id),
+                );
+                outcome
+                    .transitions
+                    .push(ResourceTransition::failed(&resource, reporting.failed, reason));
+                forget_unassigned_identity(&mut resource, reporting);
                 outcome.resources.push(resource);
                 continue;
             }
@@ -3600,6 +3600,33 @@ pub async fn reconcile(
     // ([`super::stabilising`]).
     outcome.stabilising.extend(deleted.removing);
     outcome
+}
+
+/// Forget the identifier the naming rules computed for a resource whose FIRST create the
+/// owning service REFUSED, where the identity of its type is one that service assigns.
+///
+/// `StackResource$PhysicalResourceId` is "the name or unique identifier associated with the
+/// physical instance of the resource", and for such a type the only value that is ever is the
+/// one the owning service answered with: the computed value is a STAND-IN a reference was
+/// resolved against until the create answered ([`super::template::return_values`]), and the
+/// create was refused, so no instance exists and nothing assigned an identifier for it. The
+/// resource is therefore reported with none — which is exactly what its failed EVENT already
+/// reports ([`ResourceTransition::failed`]) — rather than with an identifier that resolves to
+/// nothing in the service that would own it.
+///
+/// Only a FIRST create, judged by the status the resource's failure is reported under: a
+/// refused REPLACEMENT leaves the resource the stack already has in place, under the identity
+/// it really carries, and that identity is not this deployment's to forget. A type whose
+/// identity CloudFormation itself decides keeps its computed name, which is the name the
+/// create was attempted under and the one a client looks for.
+fn forget_unassigned_identity(resource: &mut StoredResource, reporting: Reporting) {
+    if reporting.failed != super::resource_status::CREATE_FAILED {
+        return;
+    }
+    if !super::template::identity_is_service_assigned(&resource.resource_type) {
+        return;
+    }
+    resource.physical_resource_id.clear();
 }
 
 /// Record what an owning service already created: the resource exists there with the

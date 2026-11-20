@@ -509,15 +509,17 @@ async fn a_deployment_naming_no_strategy_fails_the_stack() {
         "case {case:?}: expected the failed resource to carry AppConfig's own refusal naming \
          the strategy, got {reason:?}"
     );
-    // Nothing was created for the deployment: its record still carries the identifier
-    // CloudFormation computed as a stand-in rather than the triple AppConfig's own answer would
-    // have given it, so no rollout is reported as having happened.
+    // Nothing was created for the deployment: no identifier was minted for it at all, and the
+    // stand-in CloudFormation computed was only what a reference resolved against until the
+    // create answered — so the stack reports NO physical resource id for it, which is what says
+    // no rollout ever happened.
     let reported = physical_ids(&router, case, stack).await;
-    let deployment_identity = id_of(case, &reported, "Deployment");
     assert!(
-        !deployment_identity.contains(COMPOSITE_IDENTITY_SEPARATOR),
-        "case {case:?}: expected the refused deployment to carry no identity AppConfig minted, \
-         got {deployment_identity:?}"
+        !reported
+            .iter()
+            .any(|(logical_id, _)| logical_id == "Deployment"),
+        "case {case:?}: expected the refused deployment to carry no physical resource id, got \
+         {reported:?}"
     );
     // ...and the hosted version the failed create was rolled back over is gone from AppConfig:
     // the rollback removed what it had made, so the number the stack had published resolves to

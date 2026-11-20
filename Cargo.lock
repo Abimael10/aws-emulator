@@ -10744,6 +10744,7 @@ dependencies = [
 name = "service-com-amazonaws-bedrockagentruntime-amazonbedrockagentruntimeservice"
 version = "0.1.0"
 dependencies = [
+ "automod",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",
@@ -10764,6 +10765,7 @@ dependencies = [
  "service-com-amazonaws-bedrockagent-amazonbedrockagentbuildtimelambda",
  "service-com-amazonaws-bedrockruntime-amazonbedrockfrontendservice",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
+ "service-com-amazonaws-kms-trentservice",
  "service-com-amazonaws-s3-amazons3",
  "service-com-amazonaws-s3vectors-s3vectors",
  "service-com-amazonaws-sts-awssecuritytokenservicev20110615",

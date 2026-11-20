@@ -575,6 +575,11 @@ impl Provisioner {
             // Amazon Bedrock Agent's own read of the flow the stack created, by the ARN it
             // minted for it.
             Self::BedrockFlow => describe_bedrock_flow(ctx, region, physical_resource_id).await,
+            // The Bedrock Agent runtime's own read of the session the stack created, by the
+            // ARN it minted for it.
+            Self::BedrockSession => {
+                describe_bedrock_session(ctx, region, physical_resource_id).await
+            }
             // Amazon Redshift's own read of the parameter group the stack created, by the
             // name it was created under.
             Self::RedshiftClusterParameterGroup => {
