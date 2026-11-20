@@ -1,15 +1,35 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopColumnStatisticsTaskRunSchedule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopColumnStatisticsTaskRunSchedule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopColumnStatisticsTaskRunSchedule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Suspends the column statistics task run schedule of ONE stored table: the schedule a
+//! settings write stated ([`crate::state::ColumnStatisticsTaskSettingsEntry`]) moves out of
+//! the scheduled state, which is the state `GetColumnStatisticsTaskSettings` reports it in —
+//! the opposite write to `StartColumnStatisticsTaskRunSchedule`, deciding the same one
+//! member of the same record and nothing else.
+//!
+//! The cron expression STAYS on the settings: suspending a schedule is not removing it (that
+//! is what deleting the settings does), so the expression is there for a later start to put
+//! back in force. A statistics run already in flight is not this call's to end either — that
+//! is what `StopColumnStatisticsTaskRun` does.
+//!
+//! The schedule is addressed by the same two members the settings read, write and delete
+//! address the settings by, so every address that holds no schedule — a database the catalog
+//! does not hold, a table that database does not hold, a stored table no create has written
+//! settings for, or settings carrying no cron expression to run — is the operation's modelled
+//! `EntityNotFoundException` and writes nothing. WHICH part of the address missed is resolved
+//! once for this operation and the start alike
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::column_statistics_task_run_schedule_miss`]).
+//! A schedule ALREADY suspended is served, for the reason the start is: the state this call
+//! writes is the state it stands in.
+//!
+//! A `CatalogID` the caller may not address is refused BEFORE the lookup, like every other
+//! catalog-addressed operation of this service — and, because this operation declares no
+//! authorization class of its own (the start declares `AccessDeniedException`, this one does
+//! not), in the one class it does declare for a thing the caller cannot act on, carrying the
+//! authorization sentence the decision built. Nothing of that catalog is read or written.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +163,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopColumnStatisticsTaskRunSchedule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopColumnStatisticsTaskRunScheduleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopColumnStatisticsTaskRunSchedule"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server fault, so an unreachable store is reported as
+            // the operation's own timeout error, the same way the settings write reports it.
+            return Err(
+                StopColumnStatisticsTaskRunScheduleErrorModeled::OperationTimeoutException(
+                    OperationTimeoutException {
+                        message: Some("the Glue Data Catalog store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        let region = crate::state::request_region(ctx.parts());
+        // ONE guard for the whole decision, so the authorization decision and the write below
+        // it cannot be separated: whether the caller may address this catalog at all is
+        // decided FIRST, before the entity lookup (see `crate::state::catalog_refusal`).
+        let mut store = state.lock();
+        match crate::state::catalog_refusal(&store, &catalog_id, &region, Self::NAME) {
+            None => {}
+            Some(crate::state::CatalogRefusal::NotFound(message)) => {
+                return Err(not_found(message))
+            }
+            // Unlike the start, this operation models NO authorization class, and an error
+            // code outside an operation's modelled set is one no strongly typed client can
+            // map — so the refusal is answered in the one class it does model for a thing the
+            // caller cannot act on, carrying the authorization sentence the decision above
+            // built. The request is refused HERE: a catalog that is not this account's is
+            // never looked up and never written, whatever it holds.
+            Some(crate::state::CatalogRefusal::NotAuthorized(message)) => {
+                return Err(not_found(message))
+            }
+        }
+
+        // `DatabaseName` and `TableName` are `@required` with `length 1..255`, so reaching
+        // here the only question is what the addressed catalog holds under them. The schedule
+        // this call suspends hangs on the column statistics task settings of the PAIR the
+        // request names, so whether there is a schedule to stop at all is resolved FIRST,
+        // through the resolution this operation shares with the start.
+        if let Some(message) = store.column_statistics_task_run_schedule_miss(
+            &catalog_id,
+            &input.database_name,
+            &input.table_name,
+        ) {
+            return Err(not_found(message));
+        }
+        let Some(settings) = store.column_statistics_task_settings_mut(
+            &catalog_id,
+            &input.database_name,
+            &input.table_name,
+        ) else {
+            // The resolution above walked the SAME address under the SAME guard, so this is
+            // unreachable; the entry's own miss is reported rather than a shape invented for
+            // it.
+            return Err(not_found(
+                crate::state::messages::COLUMN_STATISTICS_TASK_SETTINGS_NOT_FOUND.to_string(),
+            ));
+        };
+        // A schedule already suspended is left suspended: the state this call writes is the
+        // state it stands in, so asking twice is served twice. The cron expression stays on
+        // the settings, and a statistics run in flight is left running —
+        // `StopColumnStatisticsTaskRun` is what ends a run.
+        settings.suspend_schedule();
+        ::tracing::info!(
+            operation = "StopColumnStatisticsTaskRunSchedule",
+            catalog_id = %catalog_id,
+            database = %input.database_name,
+            table = %input.table_name,
+            schedule_state = %settings.schedule_state,
+            "suspended the column statistics task run schedule of a Data Catalog table"
+        );
+
+        Ok(StopColumnStatisticsTaskRunScheduleOutput {})
     }
+}
+
+/// This operation's modelled miss: "A specified entity does not exist".
+fn not_found(message: String) -> StopColumnStatisticsTaskRunScheduleError {
+    StopColumnStatisticsTaskRunScheduleErrorModeled::EntityNotFoundException(
+        EntityNotFoundException {
+            message: Some(message),
+            from_federation_source: None,
+        },
+    )
+    .into()
 }

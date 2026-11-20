@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartColumnStatisticsTaskRunSchedule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartColumnStatisticsTaskRunSchedule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartColumnStatisticsTaskRunSchedule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Puts the column statistics task run schedule of ONE stored table in force: the schedule
+//! a settings write stated ([`crate::state::ColumnStatisticsTaskSettingsEntry`]) moves into
+//! the scheduled state, which is the state `GetColumnStatisticsTaskSettings` reports it in —
+//! the opposite write to `StopColumnStatisticsTaskRunSchedule`, deciding the same one member
+//! of the same record and nothing else.
+//!
+//! The schedule is addressed by the same two members the settings read, write and delete
+//! address the settings by, so every address that holds no schedule — a database the catalog
+//! does not hold, a table that database does not hold, a stored table no create has written
+//! settings for, or settings carrying no cron expression to run — is the operation's modelled
+//! `EntityNotFoundException` and writes nothing: there is no schedule there to start. WHICH
+//! part of the address missed is resolved once for this operation and the stop alike
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::column_statistics_task_run_schedule_miss`]),
+//! each part in its own wording.
+//!
+//! A schedule ALREADY in force is left in force — the state this call writes is the state it
+//! stands in — so the write is idempotent, exactly as `StartCrawlerSchedule` is. Starting a
+//! schedule is not starting a run: the runs already recorded for the table are left as they
+//! are and none is started here (`StartColumnStatisticsTaskRun` is what starts one).
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +158,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartColumnStatisticsTaskRunSchedule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartColumnStatisticsTaskRunScheduleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartColumnStatisticsTaskRunSchedule"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server fault, so an unreachable store is reported as
+            // the operation's own timeout error, the same way the settings write reports it.
+            return Err(
+                StartColumnStatisticsTaskRunScheduleErrorModeled::OperationTimeoutException(
+                    OperationTimeoutException {
+                        message: Some("the Glue Data Catalog store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        let region = crate::state::request_region(ctx.parts());
+        // ONE guard for the whole decision, so the authorization decision and the write below
+        // it cannot be separated: whether the caller may address this catalog at all is
+        // decided FIRST, before the request's own contents and before the entity lookup — a
+        // `CatalogId` of another account is reachable only through that catalog's own resource
+        // policy (see `crate::state::catalog_refusal`).
+        let mut store = state.lock();
+        match crate::state::catalog_refusal(&store, &catalog_id, &region, Self::NAME) {
+            None => {}
+            Some(crate::state::CatalogRefusal::NotFound(message)) => {
+                return Err(not_found(message))
+            }
+            Some(crate::state::CatalogRefusal::NotAuthorized(message)) => {
+                return Err(
+                    StartColumnStatisticsTaskRunScheduleErrorModeled::AccessDeniedException(
+                        AccessDeniedException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // `DatabaseName` and `TableName` are `@required` with `length 1..255`, so reaching
+        // here the only question is what the addressed catalog holds under them. The schedule
+        // this call starts hangs on the column statistics task settings of the PAIR the
+        // request names, so whether there is a schedule to start at all is resolved FIRST,
+        // through the resolution this operation shares with the stop
+        // ([`crate::state::ComAmazonawsGlueAwsglueState::column_statistics_task_run_schedule_miss`]):
+        // it reports whichever step of the address missed in that step's own wording, and
+        // settings carrying no cron expression have no schedule to put in force either — the
+        // expression is what a schedule IS, and this call carries none of its own.
+        if let Some(message) = store.column_statistics_task_run_schedule_miss(
+            &catalog_id,
+            &input.database_name,
+            &input.table_name,
+        ) {
+            return Err(not_found(message));
+        }
+        let Some(settings) = store.column_statistics_task_settings_mut(
+            &catalog_id,
+            &input.database_name,
+            &input.table_name,
+        ) else {
+            // The resolution above walked the SAME address under the SAME guard, so this is
+            // unreachable; the entry's own miss is reported rather than a shape invented for
+            // it.
+            return Err(not_found(
+                crate::state::messages::COLUMN_STATISTICS_TASK_SETTINGS_NOT_FOUND.to_string(),
+            ));
+        };
+        // A schedule already in force is left in force: the state this call writes is the
+        // state it stands in, so asking twice is served twice.
+        settings.resume_schedule();
+        ::tracing::info!(
+            operation = "StartColumnStatisticsTaskRunSchedule",
+            catalog_id = %catalog_id,
+            database = %input.database_name,
+            table = %input.table_name,
+            schedule_state = %settings.schedule_state,
+            "put the column statistics task run schedule of a Data Catalog table in force"
+        );
+
+        Ok(StartColumnStatisticsTaskRunScheduleOutput {})
     }
+}
+
+/// This operation's modelled miss: "A specified entity does not exist".
+fn not_found(message: String) -> StartColumnStatisticsTaskRunScheduleError {
+    StartColumnStatisticsTaskRunScheduleErrorModeled::EntityNotFoundException(
+        EntityNotFoundException {
+            message: Some(message),
+            from_federation_source: None,
+        },
+    )
+    .into()
 }

@@ -1592,6 +1592,39 @@ impl ComAmazonawsGlueAwsglueState {
             .and_then(|table| table.column_statistics_task_settings.as_mut())
     }
 
+    /// Why there is no column statistics task run schedule to start or stop under this
+    /// address, or `None` when the settings it names carry one.
+    ///
+    /// ONE resolution for the two operations that decide that schedule's state
+    /// (`StartColumnStatisticsTaskRunSchedule` and `StopColumnStatisticsTaskRunSchedule`), so
+    /// the address a start is refused for and the address a stop is refused for cannot drift
+    /// apart. Both ADDRESS a table by `DatabaseName` plus `TableName`, so that part of the
+    /// address is resolved by the catalog's own table resolution
+    /// ([`Self::catalog_table_miss`]) rather than walked again here, and is reported in its
+    /// wordings. Past the table, the schedule hangs on that table's column statistics task
+    /// settings, so a stored table no create has written settings for is that entry's own
+    /// recorded miss ([`messages::COLUMN_STATISTICS_TASK_SETTINGS_NOT_FOUND`], the settings
+    /// read's and delete's), and settings that exist while carrying no cron expression
+    /// ([`ColumnStatisticsTaskSettingsEntry::has_schedule`]) are the schedule that does not
+    /// exist ([`messages::COLUMN_STATISTICS_TASK_RUN_SCHEDULE_NOT_FOUND`]).
+    pub fn column_statistics_task_run_schedule_miss(
+        &self,
+        catalog_id: &str,
+        database_name: &str,
+        table_name: &str,
+    ) -> Option<String> {
+        if let Some(message) = self.catalog_table_miss(catalog_id, database_name, table_name) {
+            return Some(message);
+        }
+        let Some(settings) =
+            self.column_statistics_task_settings(catalog_id, database_name, table_name)
+        else {
+            return Some(messages::COLUMN_STATISTICS_TASK_SETTINGS_NOT_FOUND.to_string());
+        };
+        (!settings.has_schedule())
+            .then(|| messages::COLUMN_STATISTICS_TASK_RUN_SCHEDULE_NOT_FOUND.to_string())
+    }
+
     /// Give every data quality rule recommendation run the state the CLOCK already owed
     /// it at `now`, exactly as [`Self::settle_due_column_statistics_task_runs`] does for a
     /// statistics run.

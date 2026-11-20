@@ -1541,6 +1541,22 @@ pub fn column_statistics_limit_exceeded(limit: usize) -> String {
 pub const COLUMN_STATISTICS_TASK_SETTINGS_NOT_FOUND: &str =
     "ColumnStatisticsTaskSettings entry for input DatabaseName and TableName does not exist";
 
+/// `StartColumnStatisticsTaskRunSchedule` or `StopColumnStatisticsTaskRunSchedule` for a
+/// stored table whose column statistics task settings carry NO cron expression
+/// ([`super::ColumnStatisticsTaskSettingsEntry::has_schedule`]): the entry exists, the
+/// schedule those two operations act on does not.
+///
+/// The REFUSAL is the one the model documents for exactly this condition on the service's
+/// other schedule pair: `StartCrawlerSchedule` declares `NoScheduleException`, "there is no
+/// applicable schedule", for a record carrying no expression to run. These two operations
+/// declare no such class (`smithy_query operation=StartColumnStatisticsTaskRunSchedule` lists
+/// `AccessDeniedException`, `EntityNotFoundException`, `InvalidInputException` and
+/// `OperationTimeoutException`), so the absent schedule is reported in the one class they do
+/// declare for a thing that does not exist — and in the SENTENCE the service states when no
+/// schedule was found ([`NO_SCHEDULE_FOUND`]), rather than a second one invented for this
+/// surface.
+pub const COLUMN_STATISTICS_TASK_RUN_SCHEDULE_NOT_FOUND: &str = NO_SCHEDULE_FOUND;
+
 /// `CreateColumnStatisticsTaskSettings` addressed at a `TableName` the addressed
 /// database holds no table under. RECORDED constant: the whole sentence is fixed — it
 /// names the MEMBERS the request addressed the table by rather than the values it

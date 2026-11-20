@@ -454,6 +454,13 @@ pub struct ColumnStatisticsTaskSettingsEntry {
     pub sample_size: f64,
     /// The cron expression of `Schedule`, or `None` when the create stated no schedule.
     pub schedule_expression: Option<String>,
+    /// The state that schedule is in, one of the modelled `ScheduleState` values: a cron
+    /// expression a write states is in force ([`SCHEDULE_STATE_SCHEDULED`]) until the
+    /// operation that stops a schedule moves it to [`SCHEDULE_STATE_NOT_SCHEDULED`], which
+    /// is also where settings carrying no expression sit — the same member a crawler holds
+    /// for the same reason ([`CrawlerEntry::schedule_state`]). Reported as the `Schedule`'s
+    /// `State`, so it is observable only while an expression is there to report it with.
+    pub schedule_state: String,
     /// `ColumnNameList`: "A list of column names for which to run statistics", or `None`
     /// when the create listed none — the settings record what was configured, and the
     /// default of a run that names no column is resolved by the run
@@ -477,6 +484,7 @@ impl ColumnStatisticsTaskSettingsEntry {
             role: input.role.clone(),
             sample_size: input.sample_size,
             schedule_expression: input.schedule.clone(),
+            schedule_state: stated_schedule_state(input.schedule.as_deref()),
             // An empty list states no column either, so it is recorded as none rather
             // than as settings that cover nothing.
             column_name_list: input
@@ -505,6 +513,10 @@ impl ColumnStatisticsTaskSettingsEntry {
         self.sample_size = input.sample_size;
         if let Some(schedule) = &input.schedule {
             self.schedule_expression = Some(schedule.clone());
+            // A schedule a write STATES is in force the moment the write returns, exactly as
+            // it is on a crawler ([`CrawlerEntry::apply_update`]): the expression this update
+            // puts on the settings is the schedule the service runs.
+            self.schedule_state = stated_schedule_state(Some(schedule));
         }
         if let Some(column_name_list) = &input.column_name_list {
             // An empty list states no column either, so it is recorded as none rather than
@@ -532,16 +544,17 @@ impl ColumnStatisticsTaskSettingsEntry {
             database_name: Some(table.database_name.clone()),
             table_name: Some(table.name.clone()),
             catalog_id: Some(table.catalog_id.clone()),
-            // A stated schedule is a schedule the service runs, so it is reported in the
-            // scheduled state, the same state a stated crawler schedule is written in
-            // ([`stated_schedule_state`]). No operation suspends a column-statistics
-            // schedule, so this record never leaves that state.
+            // The schedule is the expression these settings carry, in the state it stands
+            // in: a stated schedule is in force the moment it is written
+            // ([`stated_schedule_state`]) and stays so until the operation that stops a
+            // schedule suspends it ([`Self::suspend_schedule`]) or the one that starts it
+            // puts it back in force ([`Self::resume_schedule`]).
             schedule: self
                 .schedule_expression
                 .as_ref()
                 .map(|expression| Schedule {
                     schedule_expression: Some(expression.clone()),
-                    state: Some(stated_schedule_state(Some(expression))),
+                    state: Some(self.schedule_state.clone()),
                 }),
             schedule_type: self
                 .schedule_expression
@@ -555,6 +568,39 @@ impl ColumnStatisticsTaskSettingsEntry {
             last_execution_attempt: last_attempt
                 .map(ColumnStatisticsTaskRunEntry::to_execution_attempt),
         }
+    }
+
+    /// Whether these settings carry a cron expression at all, which is what a write that
+    /// states a `Schedule` put on them. Settings carrying none have no schedule to start,
+    /// stop or report — the same question a crawler answers
+    /// ([`CrawlerEntry::has_schedule`]).
+    pub fn has_schedule(&self) -> bool {
+        self.schedule_expression.is_some()
+    }
+
+    /// Put the schedule these settings carry in force: its state becomes
+    /// [`SCHEDULE_STATE_SCHEDULED`], which is what `StartColumnStatisticsTaskRunSchedule`
+    /// decides and the only member it writes.
+    ///
+    /// The cron expression is the one already stored — this call carries none of its own —
+    /// so what it starts is the schedule a write stated. Nothing else about the settings or
+    /// about the runs already recorded for the table moves: starting a schedule is not
+    /// starting a run.
+    pub fn resume_schedule(&mut self) {
+        self.schedule_state = SCHEDULE_STATE_SCHEDULED.to_string();
+    }
+
+    /// Suspend the schedule these settings carry: its state becomes
+    /// [`SCHEDULE_STATE_NOT_SCHEDULED`], which is what
+    /// `StopColumnStatisticsTaskRunSchedule` decides and the only member it writes.
+    ///
+    /// The cron expression STAYS on the settings, for the reason
+    /// [`CrawlerEntry::suspend_schedule`] gives: suspending a schedule is not removing it,
+    /// so the expression is there for a later start to put back in force. A statistics run
+    /// already in flight is not this call's to end either — that is what
+    /// `StopColumnStatisticsTaskRun` does.
+    pub fn suspend_schedule(&mut self) {
+        self.schedule_state = SCHEDULE_STATE_NOT_SCHEDULED.to_string();
     }
 }
 
