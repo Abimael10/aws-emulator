@@ -3,10 +3,10 @@
 //! The WIRE FORM of a `PipelineDeclaration`, end to end over the protocol this service
 //! speaks (`awsJson1_1`, `POST /` with `X-Amz-Target: CodePipeline_20150709.<Operation>`).
 //!
-//! Three rules, each asserted over a SET of declarations rather than one recorded call,
-//! and each on EVERY operation that answers with a pipeline structure — `CreatePipeline`,
-//! `UpdatePipeline` and `GetPipeline` report one projection, so a client that reads a
-//! structure back reads what the create or the update answered:
+//! Four rules, the first three asserted over a SET of declarations rather than one
+//! recorded call, and each on EVERY operation that answers with a pipeline structure —
+//! `CreatePipeline`, `UpdatePipeline` and `GetPipeline` report one projection, so a client
+//! that reads a structure back reads what the create or the update answered:
 //!
 //! 1. RESOLVED MEMBERS — every member the SERVICE decides the value of is present on each
 //!    reported action declaration: its `runOrder` (the one it declares, else the first
@@ -18,14 +18,20 @@
 //!    `EncryptionKey`, the structure carries the awsJson `__type` member naming its shape,
 //!    and no structure enclosing one carries a discriminator of its own. The rule is per
 //!    SHAPE, so it is also asserted on another plane's answer (`ListActionExecutions`).
+//! 4. TIMESTAMP RESOLUTION — an instant a read reports is serialized as an epoch-seconds
+//!    number at MILLISECOND resolution, whichever member of whichever plane carries it, so
+//!    an instant the store holds at a finer precision is reported truncated to the
+//!    millisecond it fell in.
 //!
 //! Every read goes through the router, so nothing here can pass by reading a handler's
 //! internals.
 
-use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Value};
+
+use service_com_amazonaws_codepipeline_codepipeline_20150709::ComAmazonawsCodepipelineCodepipeline20150709State as ServiceState;
 
 use crate::pipeline_lifecycle::{source_stage, Emulator, ROLE_ARN};
 
@@ -39,6 +45,40 @@ const RUN_ORDER_RANGE: (i64, i64) = (1, 999);
 
 /// The `PipelineType` the service stores a declaration that states none as.
 const DEFAULT_PIPELINE_TYPE: &str = "V2";
+
+/// How many SUBSECOND digits an instant this service serializes may carry.
+///
+/// `awsJson1_1` carries a `Timestamp` as an epoch-seconds JSON number, and AWS reports
+/// CodePipeline's instants at millisecond resolution — three fractional digits — so a
+/// number carrying a finer digit is one the service never writes.
+const SUBSECOND_DIGITS: u32 = 3;
+
+/// How far a serialized epoch-seconds number may sit from a whole millisecond and still be
+/// one.
+///
+/// The double that carries an instant of this magnitude, and the multiplication by a
+/// thousand the reader below makes, are together exact to far less than a thousandth of a
+/// millisecond, so only a digit finer than a millisecond moves a value outside this
+/// tolerance.
+const MILLIS_TOLERANCE: f64 = 0.01;
+
+/// Every member of this model that carries an instant, so a walk over a response finds the
+/// ones that response reports (`smithy_query query="shape"` for `PipelineSummary`,
+/// `PipelineMetadata`, `PipelineExecutionSummary`, `ActionExecutionDetail`, `ActionState`,
+/// `ActionExecution`, `TransitionState`, `ApprovalResult`, `ActionRevision` and
+/// `ListWebhookItem`).
+const TIMESTAMP_MEMBERS: [&str; 10] = [
+    "approvedAt",
+    "created",
+    "endTime",
+    "lastChangedAt",
+    "lastStatusChange",
+    "lastTriggered",
+    "lastUpdateTime",
+    "pollingDisabledAt",
+    "startTime",
+    "updated",
+];
 
 /// The member names this service binds a discriminated structure to, with the shape name
 /// each one's `__type` carries.
@@ -571,6 +611,206 @@ async fn an_action_type_id_carries_its_shape_name_in_an_action_execution_record(
             Some("ActionTypeId"),
             "case {case:?}: the recorded input's action type id must carry its shape name, \
              got {detail}"
+        );
+    }
+}
+
+/// The epoch-MILLISECONDS a serialized instant carries, asserting on the way that the
+/// number is one of the forms AWS writes: an epoch-seconds number with at most
+/// [`SUBSECOND_DIGITS`] fractional digits.
+fn epoch_millis(case: &str, path: &str, value: &Value) -> i64 {
+    let seconds = value.as_f64().unwrap_or_else(|| {
+        panic!("case {case:?}: {path} must be an epoch-seconds number, got {value}")
+    });
+    let millis = seconds * 1_000.0;
+    let whole = millis.round();
+    assert!(
+        (millis - whole).abs() <= MILLIS_TOLERANCE,
+        "case {case:?}: {path} must carry at most {SUBSECOND_DIGITS} fractional digits, got \
+         {seconds}"
+    );
+    whole as i64
+}
+
+/// RULE 4 as an INVARIANT over a whole response: every member of this model that carries an
+/// instant is serialized at millisecond resolution.
+///
+/// `found` collects the member names checked, so a case can assert the walk was not
+/// vacuous.
+fn assert_timestamp_resolution(
+    case: &str,
+    path: &str,
+    value: &Value,
+    found: &mut BTreeSet<String>,
+) {
+    match value {
+        Value::Object(members) => {
+            for (name, member) in members {
+                let member_path = format!("{path}.{name}");
+                if TIMESTAMP_MEMBERS.contains(&name.as_str()) && !member.is_null() {
+                    epoch_millis(case, &member_path, member);
+                    found.insert(name.clone());
+                }
+                assert_timestamp_resolution(case, &member_path, member, found);
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                assert_timestamp_resolution(case, &format!("{path}[{index}]"), item, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// RULE 4: the instants the pipeline plane reports — the `ListPipelines` summary, the
+/// `GetPipeline` metadata and the `GetPipelineState` answer — are serialized as the
+/// millisecond the stored instant fell in, never at the precision the store holds.
+///
+/// The host's clock is what a create reads, so the row's instant is written into the one
+/// store every handler reads and then read back over the wire: that is what makes the
+/// expected number exact rather than a shape. Rows differ along what the rule generalises
+/// over, the sub-second part of the instant — none at all, the nanosecond above a whole
+/// second, both sides of a single millisecond, a millisecond trailed by finer digits, and
+/// the last nanosecond below a whole second.
+#[tokio::test]
+async fn a_reported_instant_is_serialized_at_millisecond_resolution() {
+    // Two distinct second counts, so a projection reporting one member's instant for the
+    // other's would not pass.
+    const CREATED_SECS: u64 = 1_700_000_000;
+    const UPDATED_SECS: u64 = 1_700_000_123;
+
+    // (case, the sub-second NANOseconds stored, the sub-second MILLIseconds reported)
+    let cases: [(&str, u32, i64); 7] = [
+        ("a whole second", 0, 0),
+        ("one nanosecond past the second", 1, 0),
+        ("the last nanosecond below a millisecond", 999_999, 0),
+        ("exactly one millisecond", 1_000_000, 1),
+        ("a millisecond trailed by finer digits", 272_499_999, 272),
+        ("a sub-microsecond tail under the millisecond", 759_413_700, 759),
+        ("the last nanosecond below a second", 999_999_999, 999),
+    ];
+
+    for (case, nanos, sub_second_millis) in cases {
+        let emulator = Emulator::new();
+        let declaration = declaration_with("demo", approval(None, None));
+        emulator
+            .ok("CreatePipeline", &json!({"pipeline": declaration}))
+            .await;
+        {
+            let state = emulator.engine().state::<ServiceState>();
+            let mut state = state.lock();
+            let pipeline = state.pipelines.get_mut("demo").unwrap_or_else(|| {
+                panic!("case {case:?}: the created pipeline must be in the store")
+            });
+            pipeline.created = SystemTime::UNIX_EPOCH + Duration::new(CREATED_SECS, nanos);
+            pipeline.updated = SystemTime::UNIX_EPOCH + Duration::new(UPDATED_SECS, nanos);
+        }
+
+        let created_millis = CREATED_SECS as i64 * 1_000 + sub_second_millis;
+        let updated_millis = UPDATED_SECS as i64 * 1_000 + sub_second_millis;
+
+        let listed = emulator.ok("ListPipelines", &json!({})).await;
+        let fetched = emulator.ok("GetPipeline", &json!({"name": "demo"})).await;
+        let reported_state = emulator
+            .ok("GetPipelineState", &json!({"name": "demo"}))
+            .await;
+
+        for (projection, reported) in [
+            ("the ListPipelines summary", &listed["pipelines"][0]),
+            ("the GetPipeline metadata", &fetched["metadata"]),
+            ("the GetPipelineState answer", &reported_state),
+        ] {
+            for (member, expected) in [("created", created_millis), ("updated", updated_millis)] {
+                let path = format!("{projection}.{member}");
+                let actual = epoch_millis(case, &path, &reported[member]);
+                assert_eq!(
+                    actual, expected,
+                    "case {case:?}: {projection} must report {member} as the millisecond the \
+                     stored instant fell in, got {reported}"
+                );
+            }
+        }
+    }
+}
+
+/// RULE 4 wherever a read reports an instant, and not only on the three projections above:
+/// the stage-transition record a disabling call writes and the execution plane's own
+/// answers carry one too, and each of them is serialized the same way.
+#[tokio::test]
+async fn every_instant_a_read_reports_carries_at_most_millisecond_resolution() {
+    let emulator = Emulator::new();
+    let declaration = declaration_with("demo", approval(None, None));
+    emulator
+        .ok("CreatePipeline", &json!({"pipeline": declaration}))
+        .await;
+    // A disabled transition is a record carrying an instant of its own.
+    emulator
+        .ok(
+            "DisableStageTransition",
+            &json!({
+                "pipelineName": "demo",
+                "stageName": "Act",
+                "transitionType": "Inbound",
+                "reason": "held while the suite reads",
+            }),
+        )
+        .await;
+
+    // Creating a pipeline runs it once, so the execution plane has a run to report. The
+    // CONDITION the reads below need is that it recorded an action execution, which is
+    // polled for rather than waited out.
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let listed = emulator
+            .ok("ListActionExecutions", &json!({"pipelineName": "demo"}))
+            .await;
+        if listed["actionExecutionDetails"]
+            .as_array()
+            .is_some_and(|details| !details.is_empty())
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no action execution was recorded for the run the pipeline's creation started; \
+             last answer was {listed}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let reads: [(&str, Value); 5] = [
+        ("ListPipelines", json!({})),
+        ("GetPipeline", json!({"name": "demo"})),
+        ("GetPipelineState", json!({"name": "demo"})),
+        ("ListPipelineExecutions", json!({"pipelineName": "demo"})),
+        ("ListActionExecutions", json!({"pipelineName": "demo"})),
+    ];
+
+    let mut found = BTreeSet::new();
+    for (operation, request) in reads {
+        let answer = emulator.ok(operation, &request).await;
+        let mut reported = BTreeSet::new();
+        assert_timestamp_resolution(operation, operation, &answer, &mut reported);
+        assert!(
+            !reported.is_empty(),
+            "case {operation:?}: expected the answer to report an instant, got {answer}"
+        );
+        found.extend(reported);
+    }
+
+    // Without this the walk would satisfy the rule by reaching nothing: these are the
+    // members the five reads together report an instant for.
+    for member in [
+        "created",
+        "updated",
+        "lastChangedAt",
+        "startTime",
+        "lastUpdateTime",
+    ] {
+        assert!(
+            found.contains(member),
+            "expected the reads to report {member}, read {found:?}"
         );
     }
 }
