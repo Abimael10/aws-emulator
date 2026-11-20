@@ -640,7 +640,7 @@ async fn an_id_or_a_name_that_names_no_template_is_refused() {
             "sg-00000000000000001",
         ]),
         ("two ids naming no template", vec![
-            "lt-00000000000000099",
+            "lt-00000000000099999",
             "lt-0fedcba987654321f",
         ]),
     ];
@@ -677,7 +677,7 @@ async fn an_id_or_a_name_that_names_no_template_is_refused() {
         &router,
         &[
             p("LaunchTemplateId.1", known.clone()),
-            p("LaunchTemplateId.2", "lt-00000000000000099"),
+            p("LaunchTemplateId.2", "lt-00000000000099999"),
         ],
     )
     .await;
@@ -688,7 +688,7 @@ async fn an_id_or_a_name_that_names_no_template_is_refused() {
     );
     assert_eq!(
         error_message(&body),
-        "The following launch template ids are malformed: lt-00000000000000099",
+        "The following launch template ids are malformed: lt-00000000000099999",
         "case \"a known id beside an unknown one\": the refusal must name only the id that \
          names no template, got {body}"
     );

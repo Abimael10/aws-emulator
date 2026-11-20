@@ -57,10 +57,10 @@ const PUBLISHED_ARCHITECTURES: &[&str] = &["x86_64", "arm64"];
 
 /// The 64-bit x86 architecture, which is the only one the retired families below were
 /// published for.
-const ARCHITECTURE_X86_64: &str = "x86_64";
+pub(super) const ARCHITECTURE_X86_64: &str = "x86_64";
 
 /// The 64-bit Arm architecture, whose images boot UEFI.
-const ARCHITECTURE_ARM64: &str = "arm64";
+pub(super) const ARCHITECTURE_ARM64: &str = "arm64";
 
 /// The published name of an image whose root volume is a `gp2` EBS volume.
 const FORM_GP2: &str = "gp2";
@@ -122,7 +122,7 @@ fn root_device_name(root_device_type: &str) -> String {
 /// The boot mode an HVM image of `architecture` declares: 64-bit Arm boots UEFI, and x86
 /// boots whichever the instance type supports where the family declares a preference and
 /// the legacy BIOS where it does not.
-fn hvm_boot_mode(architecture: &str, uefi_preferred_on_x86: bool) -> String {
+pub(super) fn hvm_boot_mode(architecture: &str, uefi_preferred_on_x86: bool) -> String {
     if architecture == ARCHITECTURE_ARM64 {
         BOOT_MODE_UEFI.to_string()
     } else if uefi_preferred_on_x86 {

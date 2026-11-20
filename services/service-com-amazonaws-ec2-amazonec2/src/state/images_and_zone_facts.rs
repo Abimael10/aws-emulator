@@ -2210,6 +2210,11 @@ pub(super) fn deprecated_amazon_linux_2_image(days_ago: u64) -> ImageSpec {
 /// `DeprecationTime` their end of standard support fell on, so a deprecated image is part of
 /// the catalog rather than only of a test.
 ///
+/// The third-party enterprise Linux distributions AWS publishes under the same owner alias
+/// ([`super::published_distribution_specs`]) follow, so a client that pins a
+/// non-Amazon-Linux operating system resolves an image of its own family by owner and name
+/// pattern.
+///
 /// The AWS PCS sample AMIs ([`pcs_sample_image_specs`]) close the catalog: they are
 /// published the same way and under the Parameter Store names AWS publishes their ids
 /// under.
@@ -2275,6 +2280,9 @@ pub fn published_image_specs() -> Vec<ImageSpec> {
             )
         },
     ]);
+    // The distributions AWS publishes beside its own, discovered by owner and name pattern
+    // rather than through an alias hierarchy.
+    specs.extend(super::published_distribution_specs());
     specs.extend(pcs_sample_image_specs());
     // The images a service publishes a METADATA hierarchy about rather than a bare alias.
     specs.extend(super::published_image_metadata_specs());

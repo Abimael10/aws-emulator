@@ -2984,6 +2984,11 @@ mod images_and_zone_facts;
 /// declares is re-exported below.
 mod published_amazon_linux;
 pub use published_amazon_linux::*;
+/// The third-party enterprise Linux distributions AWS publishes public AMIs of beside its
+/// own — the rows of the catalog a client resolves by owner and name pattern rather than
+/// through a public parameter alias. Everything it declares is re-exported below.
+mod published_distributions;
+pub use published_distributions::*;
 /// The image-metadata hierarchies AWS publishes in Parameter Store beside an image's id —
 /// the recommended ECS-optimized and Bottlerocket builds — and the ONE projection Parameter
 /// Store reads the whole published catalog through. Everything it declares is re-exported

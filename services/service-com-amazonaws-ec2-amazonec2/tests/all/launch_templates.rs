@@ -1564,7 +1564,7 @@ mod describe_launch_template_versions {
             ),
             (
                 "a well-formed id no mint of this service ever reached",
-                vec![p("LaunchTemplateId", "lt-00000000000000099")],
+                vec![p("LaunchTemplateId", "lt-00000000000099999")],
                 "InvalidLaunchTemplateId.Malformed",
             ),
             (

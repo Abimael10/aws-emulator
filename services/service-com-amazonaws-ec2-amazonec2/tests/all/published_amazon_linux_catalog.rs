@@ -183,7 +183,10 @@ pub(crate) fn resolve_by_name(form: OwnerForm, pattern: Option<&str>) -> Vec<Par
 }
 
 /// The newest of `reported` by `CreationDate`, which is the documented way to pick one.
-fn newest(case: &str, reported: &[Image]) -> Image {
+///
+/// Shared with [`super::published_distribution_catalog`], which resolves the catalog's
+/// third-party distribution families the same way: one reading of "pick the newest match".
+pub(crate) fn newest(case: &str, reported: &[Image]) -> Image {
     reported
         .iter()
         .max_by(|left, right| left.creation_date.cmp(&right.creation_date))
@@ -193,7 +196,14 @@ fn newest(case: &str, reported: &[Image]) -> Image {
 
 /// Launch `image_id` and report the `imageId` the instance is described with — the proof
 /// that the id the catalog resolved to is an AMI this account can actually run.
-async fn launch_and_read_back(case: &str, router: &MultiServiceRouter, image_id: &str) -> String {
+///
+/// Shared with [`super::published_distribution_catalog`], so every suite that resolves an
+/// image out of the catalog proves it launches the one way.
+pub(crate) async fn launch_and_read_back(
+    case: &str,
+    router: &MultiServiceRouter,
+    image_id: &str,
+) -> String {
     let (status, body) = call(
         router,
         REGION,
