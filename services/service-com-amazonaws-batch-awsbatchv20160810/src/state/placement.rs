@@ -373,7 +373,10 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             job.at_position_since = None;
         }
         self.set_job_status(id, JOB_STARTING, at);
-        self.set_job_due(id, Some(at + JOB_PHASE_MILLIS));
+        // One span, or the instant an attempt already running runs out of the time its own
+        // `timeout` allows it, whichever falls first ([`attempt_timeout`]) — the same bound
+        // every other site that arms a placed job's next instant applies.
+        self.set_job_due_bounded_by_attempt_deadline(id, at.saturating_add(JOB_PHASE_MILLIS));
     }
 
     /// Owe `id` its placement, or nothing at all when its queue has no capacity to place it

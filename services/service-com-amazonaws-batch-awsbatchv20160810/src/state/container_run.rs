@@ -428,7 +428,9 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         }
         self.queue_container_output(id, at);
         self.set_job_status(id, JOB_RUNNING, at);
-        self.set_job_due(id, Some(at + JOB_PHASE_MILLIS));
+        // One span, or the instant this attempt runs out of the time its own `timeout`
+        // allows it, whichever falls first ([`super::attempt_timeout`]).
+        self.set_job_due_bounded_by_attempt_deadline(id, at.saturating_add(JOB_PHASE_MILLIS));
     }
 
     /// End `id` at `at` with what its container's program did: the status that program

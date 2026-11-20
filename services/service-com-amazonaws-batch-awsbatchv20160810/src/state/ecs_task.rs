@@ -529,7 +529,7 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                 let task_id = ecs_task_id(&task_arn);
                 self.record_placement(job_id, task_arn, &task_id, &placement.region);
                 self.start_placed_job(job_id, now);
-                self.set_job_due(job_id, Some(now + JOB_TASK_POLL_MILLIS));
+                self.set_job_due_bounded_by_attempt_deadline(job_id, now + JOB_TASK_POLL_MILLIS);
             }
             // Amazon ECS would not run the container at all: no task was created, so nothing
             // of this emulator started the job's container. The refusal is that service's
@@ -588,7 +588,7 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                     let reason = container_lost_its_task_reason();
                     self.finish_job(job_id, JOB_FAILED, Some(&reason), now);
                 } else {
-                    self.set_job_due(job_id, Some(now + JOB_TASK_POLL_MILLIS));
+                    self.set_job_due_bounded_by_attempt_deadline(job_id, now + JOB_TASK_POLL_MILLIS);
                 }
             }
             Outcome::StopAsked => {
@@ -641,8 +641,9 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             }
         }
         if !report.stopped() {
-            // The task is still going, so the next read is owed.
-            self.set_job_due(job_id, Some(now + JOB_TASK_POLL_MILLIS));
+            // The task is still going, so the next read is owed — or the job's own attempt
+            // deadline is, when that falls first ([`super::attempt_timeout`]).
+            self.set_job_due_bounded_by_attempt_deadline(job_id, now + JOB_TASK_POLL_MILLIS);
             return;
         }
         // The task has stopped: what its container produced is final, so it is recorded on the

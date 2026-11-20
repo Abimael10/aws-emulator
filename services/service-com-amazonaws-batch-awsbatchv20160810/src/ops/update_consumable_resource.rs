@@ -296,6 +296,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(resource) = state.consumable_resources.get_mut(&name) {
             resource.total_quantity = new_total;
         }
+        // Raising the total PUBLISHES quantity, so the jobs whose own claim did not fit are
+        // owed their placement from this instant — the same re-arming the release of a
+        // holder's quantity performs (`state::consumable_claims`), because a claimant is
+        // held by what is available and not by which call made it available.
+        state.rearm_resting_jobs(now);
         if let Some(token) = input.client_token.as_deref() {
             state.remember_consumable_resource_update(
                 token,

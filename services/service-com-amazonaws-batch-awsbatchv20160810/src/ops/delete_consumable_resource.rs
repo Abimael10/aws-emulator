@@ -18,6 +18,13 @@
 //! ([`crate::state::unsupported_identifier`]): it names no resource that could ever have
 //! existed, so there is no post-state for it to already hold.
 //!
+//! A resource whose quantity is IN USE is not removed: `inUseQuantity` is "the amount of the
+//! consumable resource that is currently in use", so while a job holds any of it the delete
+//! is refused with the modelled `ClientException`
+//! ([`crate::state::CONSUMABLE_RESOURCE_IN_USE_MESSAGE`]) and the resource stays describable
+//! and still in use. The quantity goes back when the jobs holding it reach a terminal status
+//! ([`crate::state::consumable_claims`]), and the delete then succeeds.
+//!
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -173,6 +180,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Resolved by name or ARN; an identifier that resolves to nothing has already
         // been removed, so this answers the same empty success and writes nothing.
         if let Some(name) = state.consumable_resource_name(&input.consumable_resource) {
+            // A resource jobs still hold quantity of is NOT removed: the delete is refused
+            // and the resource stays exactly as it is.
+            if state
+                .consumable_resources
+                .get(&name)
+                .is_some_and(|resource| resource.in_use_quantity > 0)
+            {
+                return Err(DeleteConsumableResourceErrorModeled::ClientException(
+                    batch::client_exception(batch::CONSUMABLE_RESOURCE_IN_USE_MESSAGE),
+                )
+                .into());
+            }
             if let Some(removed) = state.consumable_resources.remove(&name) {
                 state.consumable_resources_by_arn.remove(&removed.arn);
             }

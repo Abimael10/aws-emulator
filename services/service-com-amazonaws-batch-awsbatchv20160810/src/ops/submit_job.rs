@@ -468,6 +468,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 consumable_resource_properties: input
                     .consumable_resource_properties_override
                     .or(definition.consumable_resource_properties),
+                // And it holds none of what those requirements claim yet: the quantity is
+                // taken when the scheduler ADMITS the job onto capacity
+                // (`state::consumable_claims`).
+                consumable_claims_held: Vec::new(),
                 tags: input.tags,
                 // Filled below for a submit that named `arrayProperties`: this record is
                 // then the array's PARENT and the children hang off it by index.

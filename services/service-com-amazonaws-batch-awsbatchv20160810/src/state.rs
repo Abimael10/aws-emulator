@@ -93,6 +93,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod array_jobs;
+mod attempt_timeout;
+mod consumable_claims;
 mod container_run;
 mod described_collections;
 mod ec2_capacity;
@@ -110,6 +112,8 @@ mod service_job_dispatch;
 mod share_selection;
 
 pub use array_jobs::*;
+pub use attempt_timeout::*;
+pub use consumable_claims::*;
 pub use container_run::*;
 pub use described_collections::*;
 pub use ec2_capacity::*;
@@ -1502,6 +1506,16 @@ pub struct Job {
     /// end differently. `None` for every job whose container ran as an Amazon ECS task
     /// instead, whose moves are read off that task ([`ecs_task`]).
     pub container_run: Option<ContainerRun>,
+    /// What this job HOLDS of the consumable resources its
+    /// `consumableResourceProperties` name ([`consumable_claims`]), and empty for a job that
+    /// holds none — one nothing has admitted onto capacity yet, one that has already given
+    /// its quantity back, and one whose requirements name none.
+    ///
+    /// Internal bookkeeping, not a modelled member: it is what `inUseQuantity` was charged
+    /// with when this job was admitted, recorded here so the release gives back exactly what
+    /// the admission took and so a repeated materialisation cannot charge twice. Bounded by
+    /// the requirement list the job carries.
+    pub consumable_claims_held: Vec<ConsumableClaim>,
 }
 
 /// A consumable resource, exactly as `CreateConsumableResource` stored it.
@@ -3124,6 +3138,15 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
     /// Materialise the ONE transition `id` owes at `now`: `None` when nothing moved,
     /// else whether the job is now in a terminal status.
     fn advance_job(&mut self, id: &str, now: i64) -> Option<Advanced> {
+        // The attempt timeout comes FIRST, because it is a deadline on the attempt rather
+        // than a step of it: "after this time passes, Batch terminates your jobs if they
+        // aren't finished" (`JobTimeout$attemptDurationSeconds`), so a job whose deadline has
+        // passed is ended at that instant whatever else the clock owed it
+        // ([`attempt_timeout`]).
+        if let Some(deadline) = self.attempt_deadline(id).filter(|deadline| *deadline <= now) {
+            self.time_out_attempt(id, deadline);
+            return Some(Advanced::Terminal);
+        }
         let job = self.jobs.get(id)?;
         if is_terminal_status(&job.status) {
             return None;
@@ -3212,10 +3235,13 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                     }
                     // A job resting in `RUNNABLE` owes nothing unless its queue's compute
                     // capacity placed it, which is what this due instant says happened.
-                    // A job resting in `RUNNABLE` owes nothing unless its queue's compute
-                    // capacity placed it, which is what this due instant says happened.
                     JOB_RUNNABLE => {
-                        if !self.job_is_placeable(id) {
+                        // WHETHER it can be placed is the capacity its queue offers AND the
+                        // consumable resources its own requirements claim: a quantity is a
+                        // concurrency bound, so a job whose claim does not fit waits here
+                        // until a job holding that quantity gives it back
+                        // ([`consumable_claims`]).
+                        if !self.job_is_placeable(id) || !self.consumable_claims_admit(id) {
                             self.set_job_due(id, None);
                             None
                         } else if let Some(fetch) = self.image_fetch_of(id) {
@@ -3227,6 +3253,9 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                             // run at all, so such a job takes the placement below and ends
                             // with the fetch failure.
                             if fetch == ImageFetch::Served && self.task_placement(id).is_some() {
+                                // Admitted: the quantity it claims is HELD from this instant,
+                                // which is what `inUseQuantity` reports while it runs.
+                                self.charge_consumable_claims(id);
                                 self.arm_task_dispatch(id);
                                 None
                             } else if self.place_job(id) {
@@ -3235,6 +3264,7 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                                 // `STARTING` — where "the relevant container initiation
                                 // operations are underway" — until what that initiation comes
                                 // to falls due, one span later ([`start_placed_job`]).
+                                self.charge_consumable_claims(id);
                                 self.start_placed_job(id, due);
                                 Some(Advanced::Moved)
                             } else {
@@ -3252,14 +3282,18 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                     // A job whose container RUNS as an Amazon ECS task is moved by that task
                     // and by nothing else: what this clock owes it is the next READ of the
                     // task ([`ecs_task`]), which the drain of this pass performs, so the due
-                    // instant is pointed at the one after that.
+                    // instant is pointed at the one after that — or at its own attempt
+                    // deadline, when that falls first ([`attempt_timeout`]).
                     JOB_STARTING | JOB_RUNNING
                         if self
                             .jobs
                             .get(id)
                             .is_some_and(|job| job.task_dispatch != JobTaskDispatch::Waiting) =>
                     {
-                        self.set_job_due(id, Some(now + JOB_TASK_POLL_MILLIS));
+                        self.set_job_due_bounded_by_attempt_deadline(
+                            id,
+                            now + JOB_TASK_POLL_MILLIS,
+                        );
                         None
                     }
                     // The container initiation a placement started comes to its end here.
@@ -3804,6 +3838,12 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             end_open_attempt(job, reason, ended_at);
         }
         self.record_job_state_change(id, ended_at);
+        // The job can consume nothing more, so what it HELD of each consumable resource goes
+        // back ([`consumable_claims`]) — and the jobs whose own claim did not fit while it
+        // held that quantity are owed their placement from this instant.
+        if self.release_consumable_claims(id) {
+            self.rearm_resting_jobs(ended_at);
+        }
         // The job no longer needs capacity, so the compute environments behind its queue are
         // scaled to the demand that is left ([`ec2_capacity`]) — back to the vCPUs they
         // maintain once nothing of theirs is outstanding any more.
