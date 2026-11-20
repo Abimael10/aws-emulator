@@ -3,7 +3,9 @@
 //! @op AcceptTransitGatewayPeeringAttachment
 //! IMPLEMENTED: accepts the stored transit gateway peering attachment the request names,
 //! moving it out of `pendingAcceptance` towards `available`, and answers with the
-//! attachment as it now stands. This is the ONLY file to touch for this operation.
+//! attachment as it now stands. The acceptance is the ACCEPTER's call: a caller on the
+//! attachment's requester end is refused as the source of the request. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -130,11 +132,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; this operation reads none of it — an
-        // attachment is named by id, which is unique across Regions in this store. The
-        // store is reached through the engine held on `self`.
-        let _ = ctx;
         use crate::state;
+
+        // Which SIDE of the peering this request speaks for is decided by the Region it was
+        // signed for, read off `ctx` the way every other handler of this crate reads it; the
+        // attachment itself is named by an id that is unique across Regions in this store,
+        // which is reached through the engine held on `self`.
+        let region = state::request_region(ctx.parts());
 
         // The request's own form first: an id that is not a transit gateway attachment id
         // at all is refused as malformed, so "not an id of this kind" never reads as "no
@@ -155,6 +159,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let state_handle = state::require_service_state(&*self.engine)?;
         let mut store = state_handle.lock();
+        // The clock first: whether this attachment is still waiting for an acceptance is
+        // asked of the state it is ACTUALLY in, which is also the state the side check below
+        // reads.
+        store.materialize_due_transitions();
+
+        // "After you create the peering attachment, the OWNER OF THE ACCEPTER transit gateway
+        // must accept the attachment request" (`CreateTransitGatewayPeeringAttachment`): the
+        // acceptance is the ACCEPTER's call, so a caller that is the attachment's REQUESTER
+        // end is the SOURCE of the request and has nothing to accept — refused
+        // `InvalidParameterValue`, with the attachment left where it was. Which side a
+        // request speaks for is read off the attachment's two stored ends against the account
+        // and Region the request was signed for (this emulator serves one account), so a
+        // peering whose ends sit in two Regions is accepted from the PEER Region's endpoint
+        // and refused from the one that requested it. A same-account, same-Region peering has
+        // both ends on the caller's side; the requester end is read first, so such a caller
+        // gets the source refusal and the attachment stays `pendingAcceptance`.
+        //
+        // Asked of an attachment that is still WAITING only: an attachment past that state
+        // admits no acceptance from either side, and the state refusal below is the answer
+        // every operation of this family gives for a decision that came at the wrong time.
+        if store
+            .transit_gateway_attachments
+            .get(&input.transit_gateway_attachment_id)
+            .map(|record| &record.view)
+            .is_some_and(|view| requester_side_of_a_waiting_peering(view, &region))
+        {
+            return Err(cannot_accept_as_the_source(
+                &input.transit_gateway_attachment_id,
+            ));
+        }
 
         // "Accepts a transit gateway peering attachment request. The peering attachment
         // must be in the pendingAcceptance state" — the rule every accepting and rejecting
@@ -175,4 +209,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             transit_gateway_peering_attachment: Some(attachment),
         })
     }
+}
+
+/// Whether `view` is a peering attachment still waiting for an acceptance whose REQUESTER end
+/// is the caller: the account this emulator serves, in the Region `region` the request was
+/// signed for.
+///
+/// "Information about the requester transit gateway"
+/// (`TransitGatewayPeeringAttachment$RequesterTgwInfo`) carries that end's owning account and
+/// its Region (`PeeringTgwInfo$OwnerId` / `$Region`), which is what the two ends of a peering
+/// are told apart by — the request carries nothing but the attachment id
+/// (`smithy_query(query="operation",operation="AcceptTransitGatewayPeeringAttachment")`), so
+/// the side is decided from stored attachment state and the request's own credential scope.
+fn requester_side_of_a_waiting_peering(
+    view: &crate::state::TransitGatewayAttachmentView,
+    region: &str,
+) -> bool {
+    let crate::state::TransitGatewayAttachmentView::Peering(attachment) = view else {
+        return false;
+    };
+    if attachment.state.as_deref()
+        != Some(crate::state::TRANSIT_GATEWAY_ATTACHMENT_STATE_PENDING_ACCEPTANCE)
+    {
+        return false;
+    }
+    attachment.requester_tgw_info.as_ref().is_some_and(|end| {
+        end.owner_id.as_deref() == Some(::engine::emulator_account_id())
+            && end.region.as_deref() == Some(region)
+    })
+}
+
+/// `InvalidParameterValue` (HTTP 400): the caller is the SOURCE of this peering request, so it
+/// is not the side that accepts it.
+///
+/// The sentence is the one EC2 answers a requester-side acceptance with — the fixed
+/// `Cannot accept `, the attachment id the REQUEST named, and the fixed ` as the source of the
+/// peering request.`, which closes with a full stop as the recorded refusal of this operation
+/// does — with the id bounded by the one reader every refusal of this crate quotes a
+/// caller-chosen id through.
+fn cannot_accept_as_the_source(
+    attachment_id: &str,
+) -> AcceptTransitGatewayPeeringAttachmentError {
+    crate::state::invalid_parameter_value(format!(
+        "Cannot accept {attachment_id} as the source of the peering request.",
+        attachment_id = crate::state::echoed_resource_id(attachment_id),
+    ))
 }

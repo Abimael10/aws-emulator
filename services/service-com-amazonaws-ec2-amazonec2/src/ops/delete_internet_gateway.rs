@@ -161,10 +161,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state_handle = state::require_service_state(&*self.engine)?;
         let mut store = state_handle.lock();
 
-        // "The ID of the internet gateway" (`$InternetGatewayId`): a delete that removed
-        // nothing must never answer as though it had. `InternetGatewayId` publishes no
-        // pattern, so an id of ANY form that names no gateway of the account is the one
-        // refusal `AttachInternetGateway` and `DescribeInternetGateways` answer for it.
+        // "The ID of the internet gateway" (`$InternetGatewayId`): this delete READS the id
+        // before it resolves anything — EC2's long id form is an obfuscated identifier the
+        // service decodes ahead of the lookup — so a value no issue of this kind ever
+        // produced is `InvalidInternetGatewayId.Malformed` rather than a gateway that is not
+        // there. The ids this service has issued are the long-form values its mint has
+        // counted ([`crate::state::ComAmazonawsEc2Amazonec2State::id_was_issued`]), so the
+        // all-zero placeholder a client reaches for, a value in no issued id form at all, and
+        // a hand-written id above everything the mint reached are each answered here, exactly
+        // as `DeleteDhcpOptions` answers them. This store's mint only ever issues the LONG
+        // form, so a value in the SHORT id form is one no issue of this kind ever produced and
+        // is answered here too.
+        if !store.id_was_issued(state::INTERNET_GATEWAY_ID_PREFIX, internet_gateway_id) {
+            return Err(state::invalid_internet_gateway_id_malformed(
+                internet_gateway_id,
+            ));
+        }
+
+        // Screening the value above is what keeps THIS half of the pair reachable: an id this
+        // service did issue names a gateway that may since have gone, and a delete that
+        // removed nothing must never answer as though it had — which is the one refusal
+        // `AttachInternetGateway` and `DescribeInternetGateways` answer for an id of no
+        // gateway of the account.
         if !store.internet_gateways.contains_key(internet_gateway_id) {
             return Err(state::invalid_internet_gateway_id_not_found(
                 internet_gateway_id,

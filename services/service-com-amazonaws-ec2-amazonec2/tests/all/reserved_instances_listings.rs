@@ -39,7 +39,8 @@ use std::time::SystemTime;
 
 use ec2::state::{
     ComAmazonawsEc2Amazonec2State as Ec2State, IDEMPOTENT_PARAMETER_MISMATCH, INVALID_INPUT,
-    INVALID_PARAMETER_VALUE, MAX_RESERVED_INSTANCES_PRICE_SCHEDULES, MISSING_PARAMETER,
+    INVALID_PARAMETER_VALUE, MAX_ECHOED_RESOURCE_ID_CHARS,
+    MAX_RESERVED_INSTANCES_PRICE_SCHEDULES, MISSING_PARAMETER,
     RESERVED_INSTANCE_STATE_ACTIVE, RESERVED_INSTANCE_STATE_QUEUED, RESERVED_INSTANCE_STATE_RETIRED,
     RESERVED_INSTANCES_LISTING_STATE_AVAILABLE, RESERVED_INSTANCES_LISTING_STATE_CANCELLED,
     RESERVED_INSTANCES_LISTING_STATE_PENDING, RESERVED_INSTANCES_LISTING_STATE_SOLD,
@@ -765,8 +766,11 @@ async fn cancelling_a_listing_withdraws_the_reservations_that_were_for_sale() {
 // ---------------------------------------------------------------------------
 
 /// The rule: a `reservedInstancesListingId` this service cannot act on is refused with HTTP
-/// 400 `InvalidInput` and the one sentence EC2 words that refusal with, and nothing is
-/// written.
+/// 400 `InvalidInput`, and nothing is written. WHICH sentence that refusal carries is decided
+/// by the value's FORM: a value outside the pattern the Marketplace's parameter validator
+/// holds a listing id to is told which constraint it failed, where a value inside that pattern
+/// which names nothing the operation can act on carries the one sentence EC2 words for an
+/// unusable `listingId` (`super::reserved_instances_listing_id_form` owns that split).
 ///
 /// The rows differ along what the rule generalises over: the FORM of the value (a well-formed
 /// listing id that names nothing, a value that is not one at all, an id of another kind of
@@ -785,31 +789,72 @@ async fn a_listing_id_this_operation_cannot_act_on_is_refused_as_an_invalid_list
         AWithdrawnListing,
     }
 
-    let cases: &[(&str, Named)] = &[
+    /// The sentence a row's refusal carries.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Sentence {
+        /// The one EC2 words for a `listingId` it cannot act on, which opens with the SPACE
+        /// the recorded message carries where a reason would go.
+        Unusable,
+        /// The parameter validator's clause for a value outside the published pattern.
+        OutsideThePattern,
+    }
+
+    impl Sentence {
+        /// The whole message this sentence is, for the value the request sent — written out
+        /// here rather than taken from the service.
+        fn message(self, value: &str) -> String {
+            match self {
+                Self::Unusable => " Invalid value for 'listingId'".to_string(),
+                Self::OutsideThePattern => {
+                    let echoed: String =
+                        value.chars().take(MAX_ECHOED_RESOURCE_ID_CHARS).collect();
+                    format!(
+                        "1 validation error detected: Value '{echoed}' at \
+                         'reservedInstanceListingId' failed to satisfy constraint: Member must \
+                         satisfy regular expression pattern: \\w{{8}}(-\\w{{4}}){{3}}-\\w{{12}}"
+                    )
+                }
+            }
+        }
+    }
+
+    let cases: &[(&str, Named, Sentence)] = &[
         (
             "a listing id in the right form that names nothing",
             Named::Literal(UNKNOWN_UUID),
+            Sentence::Unusable,
         ),
         (
             "a value that is not a listing id at all",
             Named::Literal("not-a-listing-id"),
+            Sentence::OutsideThePattern,
         ),
-        ("an empty-looking placeholder", Named::Literal("-")),
+        (
+            "an empty-looking placeholder",
+            Named::Literal("-"),
+            Sentence::OutsideThePattern,
+        ),
         (
             "an over-long value",
             Named::Literal(
                 "0123456789012345678901234567890123456789012345678901234567890123456789\
                  0123456789012345678901234567890123456789012345678901234567890123456789",
             ),
+            Sentence::OutsideThePattern,
         ),
-        ("the Reserved Instance's own id", Named::ThePurchase),
+        (
+            "the Reserved Instance's own id",
+            Named::ThePurchase,
+            Sentence::Unusable,
+        ),
         (
             "a listing that is already withdrawn",
             Named::AWithdrawnListing,
+            Sentence::Unusable,
         ),
     ];
 
-    for (case, named) in cases {
+    for (case, named, sentence) in cases {
         let (router, engine) = super::ec2_query::emulator();
         let reserved_instances_id = seed_standard(&engine, 2);
         let schedules: &[Schedule] = &[(12, 300.0, Some(CURRENCY))];
@@ -840,9 +885,8 @@ async fn a_listing_id_this_operation_cannot_act_on_is_refused_as_an_invalid_list
         );
         assert_eq!(
             error_message(&body),
-            " Invalid value for 'listingId'",
-            "case {case:?}: expected the sentence EC2 refuses a listingId with — which opens \
-             with the SPACE the recorded message carries where a reason would go — got {body}"
+            sentence.message(&listing_id),
+            "case {case:?}: expected the sentence this value's form earns, got {body}"
         );
         assert_eq!(
             stored_listings(&engine),

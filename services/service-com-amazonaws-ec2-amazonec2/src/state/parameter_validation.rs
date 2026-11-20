@@ -103,6 +103,25 @@ pub fn parameter_format_violation_message(path: &str, value: &str) -> String {
     format!("{ONE_PARAMETER_VALIDATION_ERROR}Value '{value}' at '{path}' has an invalid format")
 }
 
+/// The sentence that layer refuses a parameter whose value is outside the PATTERN the
+/// parameter's own validator holds it to: the same envelope and the same `Value '<value>' at
+/// '<path>'` opening as [`parameter_format_violation_message`], closed by the fixed
+/// `failed to satisfy constraint: Member must satisfy regular expression pattern: ` and the
+/// pattern itself.
+///
+/// The clause AWS words when a member is checked against a published regular expression
+/// rather than merely read for its form, so the caller is told WHICH pattern the value has to
+/// satisfy. `pattern` is the pattern that validator publishes, named by the member's own
+/// module beside the reader that enforces it; `value` is what the request sent, bounded the
+/// way every refusal of this crate bounds a value the caller chose the length of.
+pub fn parameter_pattern_violation_message(path: &str, value: &str, pattern: &str) -> String {
+    format!(
+        "{ONE_PARAMETER_VALIDATION_ERROR}Value '{value}' at '{path}' failed to satisfy \
+         constraint: Member must satisfy regular expression pattern: {pattern}",
+        value = echoed_resource_id(value),
+    )
+}
+
 /// Is `allowed` one of the value sets the VPC flow-log surface's parameters take?
 ///
 /// The flow-log operations are the ones whose members this service has recorded the parameter

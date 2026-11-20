@@ -5,10 +5,11 @@
 //! answers whether the delete succeeded. This is the ONLY file to touch for this operation.
 //!
 //! The refusals, in the order the service answers them: a `DryRun` request a caller holds
-//! the permissions for is `DryRunOperation` and deletes nothing; a value outside the form EC2
-//! could have ISSUED an AFI id in is `InvalidFpgaImageID.Malformed`; and an id inside that
-//! form the account holds no AFI for is `InvalidFpgaImageID.NotFound`. `DryRun` sits BEFORE
-//! both of those because the flag asks whether the CALLER MAY make the request — "checks
+//! the permissions for is `DryRunOperation` and deletes nothing; a value that is not an AFI id
+//! this service could have ISSUED is `InvalidFpgaImageID.Malformed`, because this delete
+//! decodes the id before it looks anything up; and an id it did issue that the account holds
+//! no AFI for is `InvalidFpgaImageID.NotFound`. `DryRun` sits BEFORE both of those because the
+//! flag asks whether the CALLER MAY make the request — "checks
 //! whether you have the required permissions for the action, without actually making the
 //! request" (`DeleteFpgaImageRequest$DryRun`) — which is a question about the caller, not
 //! about the value the request carries: the recorded contract answers `DryRunOperation` for a
@@ -138,8 +139,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            dry_run_operation, fpga_image_id_is_well_formed, invalid_fpga_image_id_malformed,
-            invalid_fpga_image_id_not_found, require_service_state,
+            dry_run_operation, invalid_fpga_image_id_malformed, invalid_fpga_image_id_not_found,
+            require_service_state, FPGA_IMAGE_ID_PREFIX,
         };
 
         // An AFI carries no Region member of its own, so nothing here depends on the Region
@@ -152,18 +153,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(dry_run_operation());
         }
 
-        // A value outside the form EC2 issues an AFI id in is refused as malformed, before
-        // there is anything to look up.
-        if !fpga_image_id_is_well_formed(&input.fpga_image_id) {
-            return Err(invalid_fpga_image_id_malformed(&input.fpga_image_id));
-        }
-
         let state = require_service_state(&*self.engine)?;
         let mut store = state.lock();
 
-        // The delete is what takes the AFI out of the store, so the answer reports a
-        // removal that happened rather than one this handler assumed: an id the store holds
-        // nothing for is refused instead.
+        // This delete READS the AFI id before it resolves anything — EC2's long id form is an
+        // obfuscated identifier the service decodes ahead of the lookup — so a value no issue
+        // of this kind ever produced is refused as malformed rather than reported as an AFI
+        // that is not there. The ids this service has issued are the long-form values its
+        // mint has counted ([`crate::state::ComAmazonawsEc2Amazonec2State::id_was_issued`]),
+        // so the all-zero placeholder a client reaches for, a value in no issued id form at
+        // all, and a hand-written id above everything the mint reached are each answered here
+        // — the reading `DeleteDhcpOptions` and `DeleteInternetGateway` take of the ids they
+        // decode. This store's mint only ever issues the LONG form, so a value in the SHORT id
+        // form is one no issue of this kind ever produced and is answered here too.
+        if !store.id_was_issued(FPGA_IMAGE_ID_PREFIX, &input.fpga_image_id) {
+            return Err(invalid_fpga_image_id_malformed(&input.fpga_image_id));
+        }
+
+        // Screening the value above is what keeps THIS half of the pair reachable: an id this
+        // service did issue names an AFI that may since have gone. The delete is what takes
+        // the AFI out of the store, so the answer reports a removal that happened rather than
+        // one this handler assumed.
         if store.remove_fpga_image(&input.fpga_image_id).is_none() {
             return Err(invalid_fpga_image_id_not_found(&input.fpga_image_id));
         }

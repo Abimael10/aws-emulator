@@ -143,8 +143,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // comes from the stored listing itself.
         let _ = ctx;
         use crate::state::{
-            RESERVED_INSTANCES_LISTING_STATUS_ACTIVE, require_service_state,
+            require_service_state, reserved_instances_listing_id_is_well_formed,
+            reserved_instances_listing_id_pattern_violation,
+            RESERVED_INSTANCES_LISTING_STATUS_ACTIVE,
         };
+
+        let listing_id = input.reserved_instances_listing_id.as_str();
+        // The request's own FORM first: a value outside the pattern the Marketplace's
+        // parameter validator holds a listing id to is not a listing id at all, so it is
+        // refused for the constraint it violates BEFORE anything is looked up — a caller that
+        // sent something that is not an id learns that, instead of being told the id names no
+        // listing it can act on.
+        if !reserved_instances_listing_id_is_well_formed(listing_id) {
+            return Err(reserved_instances_listing_id_pattern_violation(listing_id));
+        }
 
         let state = require_service_state(&*self.engine)?;
         let mut store = state.lock();
@@ -152,7 +164,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the same call every sibling mutation of this crate makes.
         store.materialize_due_transitions();
 
-        let listing_id = input.reserved_instances_listing_id.as_str();
         // Only a listing that is still on sale has anything to withdraw. An id that names no
         // listing of this account, and one naming a listing that is already withdrawn, are
         // the same thing to this operation — a `listingId` it cannot act on — so both are

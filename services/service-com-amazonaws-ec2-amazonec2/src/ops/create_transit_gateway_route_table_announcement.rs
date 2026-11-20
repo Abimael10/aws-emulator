@@ -252,20 +252,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An announcement advertises routes ACROSS the peering, so the peering has to be in
         // service: an attachment still waiting for the peer to accept it, or one a rejection
-        // or a delete has acted on, carries no path to advertise over. `IncorrectState` is
-        // this crate's code for "the resource exists, in a state that does not admit this
-        // call" (EC2's model declares no error shape for this operation at all,
-        // `smithy_query(query="operation",operation="CreateTransitGatewayRouteTableAnnouncement")`
-        // answering an empty `errors` list), and nothing is written.
+        // or a delete has acted on, carries no path to advertise over. The refusal is the
+        // attachment family's OWN state refusal — `IncorrectState` with
+        // `<attachmentId> is in invalid state` ([`state::transit_gateway_attachment_invalid_state`]),
+        // the sentence the accepting and rejecting operations of that family answer a decision
+        // that came at the wrong time with — so a caller reads one wording for "this
+        // attachment's state does not admit the call" whichever operation answered it, and
+        // nothing is written.
         let attachment_state = peering.state.as_deref().unwrap_or_default();
         if attachment_state != state::TRANSIT_GATEWAY_ATTACHMENT_STATE_AVAILABLE {
-            return Err(state::incorrect_state(format!(
-                "The transit gateway peering attachment '{attachment_id}' is in state \
-                 '{attachment_state}'; only an attachment in state '{available}' can \
-                 announce a route table",
-                attachment_id = input.peering_attachment_id,
-                available = state::TRANSIT_GATEWAY_ATTACHMENT_STATE_AVAILABLE,
-            )));
+            return Err(state::transit_gateway_attachment_invalid_state(
+                &input.peering_attachment_id,
+            ));
         }
 
         // Which side of the peering announces, and which side is the peer: the announcing

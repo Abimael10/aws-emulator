@@ -8,14 +8,14 @@
 //! as one EC2 could have ISSUED — the `afi-` prefix followed by 8 or 17 lowercase
 //! hexadecimal digits, of which not every digit is `0` — and refuses anything else with HTTP
 //! 400 `InvalidFpgaImageID.Malformed` and the FPGA-image kind's own sentence,
-//! `Image ID '<value>' is invalid.`, built from the value the REQUEST sent; an id inside that
-//! form which the account holds no AFI under is answered by the OPERATION's own refusal —
-//! `InvalidFpgaImageID.NotFound` for the operations that resolve one named AFI of their own
-//! Region, so a client can tell a typo from a missing image, and the unreadable-id refusal
-//! from the copy, whose source is named by a Region and an id together
-//! (`super::fpga_image_unresolvable_id_refusals` holds that per-operation table). The null
-//! (all-zero) id is outside the form because the mint counts from one, so no AFI can ever
-//! hold it.
+//! `Image ID '<value>' is invalid.`, built from the value the REQUEST sent. The operations
+//! that ACT on one named AFI read the id strictly: EC2's long id form is an obfuscated
+//! identifier the service decodes, so a value no issue of this kind ever produced earns that
+//! same unreadable-id refusal from them, and `InvalidFpgaImageID.NotFound` is reserved for an
+//! identifier this service DID issue that the account holds no AFI under, so a client can tell
+//! a typo from an image that has gone (`super::fpga_image_unresolvable_id_refusals` holds that
+//! per-operation table). The null (all-zero) id is outside the form because the mint counts
+//! from one, so no AFI can ever hold it.
 //!
 //! Each row is a distinct input along what the rule generalises over:
 //!
@@ -29,9 +29,9 @@
 //!   [`ec2::state::MAX_ECHOED_RESOURCE_ID_CHARS`] characters of;
 //! * the OPERATION that resolves the id — a delete, a reset, an attribute describe and a
 //!   copy, so no one operation's wording is the specification;
-//! * which SIDE of the form the id is on — the rows that are inside it (both published
-//!   lengths, and a leading digit above zero, which is a clause of some OTHER id kinds and
-//!   not of this one) are answered as not found rather than as malformed.
+//! * which SIDE of the reading the id is on — the rows in the printed form that the mint never
+//!   reached are answered as unreadable by the operations that decode the id, and the id of a
+//!   stored AFI the delete has removed is the row answered as not found.
 //!
 //! The round-trip at the end holds the form to the resource: the AFI a delete removes is the
 //! one a stored id names, and the id that named it is answered as not found once it is gone.
@@ -77,11 +77,11 @@ fn resolver_params(action: &str, fpga_image_id: &str) -> Params {
 
 /// The operations that resolve ONE named AFI: each judges the id's FORM before looking it up.
 ///
-/// What an id inside that form which names no AFI earns is the answering operation's own
-/// ([`unresolved_answer`]): the delete and the reset word it `Image ID '<id>' not found.`, the
-/// attribute describe uses EC2's common missing-id sentence, and the COPY — whose source is
-/// named by a Region and an id together, an addressing this service resolves only for the AFIs
-/// it holds — answers the unreadable-id refusal it answers every unresolved source with.
+/// What a value in the printed id form that this service never ISSUED earns is
+/// [`unissued_answer`]: the delete, the reset and the copy all decode the id before they
+/// resolve anything, so each answers the unreadable-id refusal, while the attribute describe
+/// REPORTS on the id it was given and answers EC2's common missing-id sentence. What an id the
+/// service DID issue that names no stored AFI earns is [`absent_answer`].
 const REGIONAL_RESOLVERS: [&str; 4] = [
     "DeleteFpgaImage",
     "ResetFpgaImageAttribute",
@@ -89,10 +89,26 @@ const REGIONAL_RESOLVERS: [&str; 4] = [
     "CopyFpgaImage",
 ];
 
-/// The code and sentence `action` answers an id inside the issued form that names no AFI
-/// with. Written out here, independently of the service, so the suite pins the refusal and
-/// not the code that composes it.
-fn unresolved_answer(action: &str, fpga_image_id: &str) -> (&'static str, String) {
+/// The code and sentence `action` answers a value in the printed AFI id form that this service
+/// never ISSUED an AFI id as. Written out here, independently of the service, so the suite
+/// pins the refusal and not the code that composes it.
+fn unissued_answer(action: &str, fpga_image_id: &str) -> (&'static str, String) {
+    match action {
+        "DescribeFpgaImageAttribute" => (
+            INVALID_FPGA_IMAGE_ID_NOT_FOUND,
+            format!("The fpga-image ID '{fpga_image_id}' does not exist"),
+        ),
+        _ => (
+            INVALID_FPGA_IMAGE_ID_MALFORMED,
+            format!("Image ID '{fpga_image_id}' is invalid."),
+        ),
+    }
+}
+
+/// The code and sentence `action` answers an id this service DID issue that names no stored
+/// AFI with — the AFI a delete has removed. Written out here for the reason
+/// [`unissued_answer`] is.
+fn absent_answer(action: &str, fpga_image_id: &str) -> (&'static str, String) {
     match action {
         "CopyFpgaImage" => (
             INVALID_FPGA_IMAGE_ID_MALFORMED,
@@ -177,22 +193,23 @@ fn malformed_rows() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// `(case, the value)`: every row is INSIDE the form EC2 issues an AFI id in, and the account
-/// holds no AFI under any of them.
+/// `(case, the value)`: every row is in the PRINTED form EC2 issues an AFI id in, and this
+/// service never issued an AFI id as any of them — a hand-written long form sits above every
+/// identifier the mint has reached.
 fn unknown_rows() -> Vec<(&'static str, String)> {
     vec![
         (
-            "the long id form, which nothing is stored under",
+            "the long id form, which nothing was ever issued under",
             "afi-0123456789abcdef0".to_string(),
         ),
         (
-            "the short id form, which nothing is stored under",
+            "the short id form, which nothing was ever issued under",
             "afi-01234567".to_string(),
         ),
         (
             // A leading digit above zero puts an INSTANCE id outside the form EC2 issues;
-            // that clause is the instance id's own, so an AFI id carrying one is read as an
-            // id of this kind and answered as missing rather than as malformed.
+            // that clause is the instance id's own, so an AFI id carrying one is read as a
+            // value in this kind's printed form.
             "a long-form id whose leading digit is above zero",
             "afi-1234567890abcdef0".to_string(),
         ),
@@ -255,10 +272,11 @@ async fn an_afi_id_outside_the_issued_form_is_refused_as_malformed() {
     );
 }
 
-/// RULE: an id INSIDE the issued form that names no stored AFI is answered by the OPERATION's
-/// own refusal — the not-found code with that operation's sentence from the operations that
-/// resolve one named AFI of their own Region, and the unreadable-id refusal from the copy,
-/// whose source is named by a Region and an id together.
+/// RULE: a value in the printed AFI id form that this service never ISSUED is answered by the
+/// OPERATION's own refusal — the unreadable-id refusal from the three operations that decode
+/// the id before they resolve anything (the delete, the reset and the copy, whose source is
+/// named by a Region and an id together), and EC2's common missing-id sentence from the
+/// attribute describe, which reports on the id it was given.
 #[tokio::test]
 async fn an_afi_id_inside_the_issued_form_is_answered_by_each_operations_own_refusal() {
     let (router, _engine) = emulator();
@@ -272,7 +290,7 @@ async fn an_afi_id_inside_the_issued_form_is_answered_by_each_operations_own_ref
                 "case {case:?} on {action}: expected HTTP {REFUSAL_STATUS}, got {status} with \
                  body {body}"
             );
-            let (expected_code, expected_message) = unresolved_answer(action, &fpga_image_id);
+            let (expected_code, expected_message) = unissued_answer(action, &fpga_image_id);
             let answered_code = error_code(&body);
             assert_eq!(
                 answered_code, expected_code,
@@ -331,10 +349,10 @@ async fn a_stored_afi_id_resolves_until_the_delete_removes_it() {
         stored_afi_count(&engine)
     );
 
-    // The id is still inside the form, so what changed is the resource: both readers answer
+    // The id is one this service ISSUED, so what changed is the resource: both readers answer
     // the missing AFI, not a malformed id — each in its own sentence.
     for action in ["DeleteFpgaImage", "DescribeFpgaImageAttribute"] {
-        let (expected_code, expected_message) = unresolved_answer(action, &fpga_image_id);
+        let (expected_code, expected_message) = absent_answer(action, &fpga_image_id);
         let params = resolver_params(action, &fpga_image_id);
         let (status, body) = op(&router, action, &params).await;
         assert_eq!(

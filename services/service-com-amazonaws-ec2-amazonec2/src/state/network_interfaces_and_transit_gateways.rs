@@ -1951,6 +1951,24 @@ pub fn needs_default_transit_gateway_route_table(options: Option<&TransitGateway
         && options.propagation_default_route_table_id.is_none()
 }
 
+/// The Region a stored transit gateway is in: the one its own ARN names, and
+/// [`DEFAULT_REGION`] for a record whose ARN names none.
+///
+/// `TransitGateway` carries no Region member (`smithy_query(query="shape",shape="TransitGateway")`),
+/// so a gateway's Region is read off the `TransitGatewayArn` the create built from the Region
+/// it was signed for — through the crate's one ARN reader ([`arn_region`]), so the field this
+/// takes is the field the published ARN format gives it. The ONE place that fact is derived,
+/// for every operation that has to place a gateway in a Region rather than assume the
+/// caller's: this store holds the gateways of ONE account across every Region a caller has
+/// created one in.
+pub fn transit_gateway_region(transit_gateway: &TransitGateway) -> &str {
+    transit_gateway
+        .transit_gateway_arn
+        .as_deref()
+        .and_then(arn_region)
+        .unwrap_or(DEFAULT_REGION)
+}
+
 /// Refuse a request that named a transit gateway id no transit gateway of the account has:
 /// HTTP 400 `InvalidTransitGatewayID.NotFound`.
 ///

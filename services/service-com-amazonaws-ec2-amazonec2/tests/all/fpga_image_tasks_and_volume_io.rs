@@ -337,25 +337,27 @@ async fn dry_run_is_answered_before_any_resource_is_resolved() {
 // RULE 3 and RULE 5: the FPGA-image slice
 // ---------------------------------------------------------------------------
 
-/// An AFI id is resolved MALFORMED BEFORE NOT FOUND, and the same two answers come from
-/// every operation that takes one.
+/// An AFI id a request names is DECODED before it is looked up, so a value this service never
+/// issued is answered as malformed by every operation that acts on one named AFI.
 #[tokio::test]
 async fn an_fpga_image_id_is_resolved_malformed_before_not_found() {
     let (router, _engine) = emulator();
 
     // `(case, the id, the code it is answered with)`: the ids differ along prefix, suffix
-    // length and alphabet, and the two accepted id FORMS (8 and 17 hex digits) are the rows
-    // answered as not found.
+    // length and alphabet. Every row is a value this service never ISSUED an AFI id as — a
+    // hand-written long form sits above every identifier the mint has reached — so the two
+    // operations that ACT on one named AFI, which decode the id before they look it up,
+    // answer each of them as malformed.
     let id_rows: [(&str, &str, &str); 9] = [
         (
-            "the long id form, which nothing is stored under",
+            "the long id form, which nothing was ever issued under",
             UNKNOWN_FPGA_IMAGE_ID,
-            "InvalidFpgaImageID.NotFound",
+            "InvalidFpgaImageID.Malformed",
         ),
         (
-            "the short id form, which nothing is stored under",
+            "the short id form, which nothing was ever issued under",
             "afi-01234567",
-            "InvalidFpgaImageID.NotFound",
+            "InvalidFpgaImageID.Malformed",
         ),
         ("no prefix at all", "0123456789abcdef0", "InvalidFpgaImageID.Malformed"),
         (

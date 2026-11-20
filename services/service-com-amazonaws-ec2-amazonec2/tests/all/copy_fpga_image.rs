@@ -10,10 +10,11 @@
 //!    invalid.`. The copy's source is named by a REGION and an id together, which is an
 //!    addressing this service resolves only for the AFIs it holds, so a source it cannot
 //!    resolve is reported as an id it cannot READ rather than as a stored AFI that is
-//!    missing. The operations that act on an AFI OF THEIR OWN REGION are the contrast: the
-//!    same id table run through them is answered by the id kind's malformed-before-not-found
-//!    pair, `Image ID '<id>' not found.` under `InvalidFpgaImageID.NotFound` for an id inside
-//!    the issued form that the store holds no AFI under.
+//!    missing. The operations that act on an AFI OF THEIR OWN REGION decode the id the same
+//!    way, so the same id table run through them is answered as unreadable too, and their
+//!    `Image ID '<id>' not found.` under `InvalidFpgaImageID.NotFound` is reserved for an
+//!    identifier this service DID issue that the store holds no AFI under — the id of a copy
+//!    the delete has removed, which rule 3 drives.
 //! 2. `SourceRegion` HAS TO NAME A REGION of the account's partition — "the Region that
 //!    contains the source AFI" — so a value that names none is refused with
 //!    `InvalidParameterValue` naming the value that is no Region's name.
@@ -56,8 +57,8 @@ const DRY_RUN_STATUS: u16 = 412;
 /// all — the first half of the malformed-before-not-found pair.
 const UNRESOLVABLE_SOURCE_CODE: &str = "InvalidFpgaImageID.Malformed";
 
-/// The answer those same operations have for an id inside the issued form that names no
-/// stored AFI — the second half of that pair.
+/// The answer those same operations have for an identifier this service DID issue that names
+/// no stored AFI — the id of a copy a delete has removed.
 const UNKNOWN_SOURCE_CODE: &str = "InvalidFpgaImageID.NotFound";
 
 /// A well-formed AFI id, in the long (17 hex digit) form EC2 mints today, that the account
@@ -109,21 +110,22 @@ fn stored_afi_count(engine: &engine::InMemoryEngine) -> usize {
 // ---------------------------------------------------------------------------
 
 /// `(case, the id, the code the operations that resolve one named AFI OF THEIR OWN REGION
-/// answer it with)`. The ids differ along prefix, suffix length and alphabet, and the two
-/// accepted id FORMS (8 and 17 hex digits) are the rows those operations answer as not found
-/// — where the COPY answers every row with the one refusal it has for a source it cannot
-/// resolve.
+/// answer it with)`. The ids differ along prefix, suffix length and alphabet; every row is a
+/// value this service never ISSUED an AFI id as — a hand-written long form sits above every
+/// identifier the mint has reached — so the operations that decode the id before they look it
+/// up answer each of them as unreadable, which is also the one refusal the COPY has for a
+/// source it cannot resolve.
 fn unresolvable_source_rows() -> [(&'static str, &'static str, &'static str); 9] {
     [
         (
-            "the long id form, which nothing is stored under",
+            "the long id form, which nothing was ever issued under",
             UNKNOWN_FPGA_IMAGE_ID,
-            UNKNOWN_SOURCE_CODE,
+            UNRESOLVABLE_SOURCE_CODE,
         ),
         (
-            "the short id form, which nothing is stored under",
+            "the short id form, which nothing was ever issued under",
             "afi-01234567",
-            UNKNOWN_SOURCE_CODE,
+            UNRESOLVABLE_SOURCE_CODE,
         ),
         ("no prefix at all", "0123456789abcdef0", UNRESOLVABLE_SOURCE_CODE),
         (
@@ -243,9 +245,9 @@ async fn an_unresolved_source_is_refused_the_same_way_in_every_region() {
     }
 }
 
-/// The pair is the ID's and not one operation's: the operations that resolve an AFI of the
-/// Region they are called in answer the same malformed-before-not-found pair over the same id
-/// table the copy is held to above.
+/// The reading is the ID's and not one operation's: the operations that resolve an AFI of the
+/// Region they are called in decode the same id table the copy is held to above, and answer
+/// every value the mint never issued as unreadable.
 #[tokio::test]
 async fn resolving_an_afi_of_this_region_still_answers_malformed_before_not_found() {
     let (router, _engine) = emulator();
@@ -662,7 +664,7 @@ async fn a_copy_is_pending_and_then_fails_on_the_clock() {
     );
     assert_eq!(
         error_code(&body),
-        "InvalidFpgaImageID.NotFound",
+        UNKNOWN_SOURCE_CODE,
         "a copy that is gone is no longer resolved, got {body}"
     );
 }

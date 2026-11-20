@@ -155,10 +155,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state;
 
-        // "The Region where the peer transit gateway is located" is compared against the
-        // Region this request was signed for, which is the only Region whose gateways this
-        // store holds — so the request's own Region is read off `ctx`, the way every other
-        // handler of this crate reads it.
+        // The REQUESTER end of the peering is the gateway of the Region this request was
+        // signed for — "the ID of the transit gateway" with no Region member beside it — so
+        // that Region is read off `ctx`, the way every other handler of this crate reads it.
+        // The ACCEPTER end carries its own Region in `PeerRegion`, which is resolved below.
         let region = state::request_region(ctx.parts());
 
         // The four `@required` members are modelled `clientOptional`, so a request that left
@@ -234,7 +234,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reads that id as a VALUE it cannot act on rather than as a resource that is
         // missing — the refusal recorded for it is `InvalidParameterValue`, where the PEER
         // gateway below is the one answered with the transit gateway's own `NotFound` code.
-        if !store.transit_gateways.contains_key(&input.transit_gateway_id) {
+        // The requester end is reported as a gateway of THIS Region
+        // (`$RequesterTgwInfo` below), so it is resolved in this Region: a gateway the store
+        // holds for another Region is not one this endpoint can request a peering from.
+        if !store
+            .transit_gateways
+            .get(&input.transit_gateway_id)
+            .is_some_and(|requester| state::transit_gateway_region(requester) == region)
+        {
             return Err(state::invalid_parameter_value(format!(
                 "Invalid value '{transit_gateway_id}' for transitGatewayId. The transit \
                  gateway to request the peering from could not be found",
@@ -243,18 +250,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The peer transit gateway can be in your account or a different Amazon Web
-        // Services account", and `PeerRegion` says which Region it is in. This emulator holds
-        // the gateways of ONE account in ONE Region, so a peer the request places outside
-        // them is one it cannot resolve at all, and a peer it places inside them has to be a
-        // gateway the store holds — either way an id naming no transit gateway this service
-        // can peer with is the transit gateway's own `NotFound` refusal, and nothing is
-        // stored.
-        if input.peer_account_id != ::engine::emulator_account_id()
-            || input.peer_region != region
-            || !store
-                .transit_gateways
-                .contains_key(&input.peer_transit_gateway_id)
-        {
+        // Services account" and "the Region where the peer transit gateway is located"
+        // (`PeerRegion`): a peering joins two gateways that need not sit in the same Region,
+        // so the peer is resolved in the account `PeerAccountId` names IN `PeerRegion` and
+        // never in the Region this request was signed for. This store holds the gateways of
+        // ONE account across every Region a caller has created one in, each carrying the
+        // Region its own ARN names ([`crate::state::transit_gateway_region`]), so the peer
+        // resolves exactly when the store holds a gateway under that id whose owner and
+        // Region are the ones the request named — and an id naming no transit gateway this
+        // service can peer with is the transit gateway's own `NotFound` refusal, with
+        // nothing stored.
+        let peer_resolves = store
+            .transit_gateways
+            .get(&input.peer_transit_gateway_id)
+            .is_some_and(|peer| {
+                peer.owner_id.as_deref() == Some(input.peer_account_id.as_str())
+                    && state::transit_gateway_region(peer) == input.peer_region
+            });
+        if !peer_resolves {
             return Err(state::invalid_transit_gateway_id_not_found(
                 &input.peer_transit_gateway_id,
             ));

@@ -10,8 +10,9 @@
 //!    operations the same way — 400 `InvalidFpgaImageID.Malformed` with the FPGA-image id
 //!    kind's `Image ID '<id>' is invalid.`, naming the value the REQUEST sent — before
 //!    anything is looked up, and nothing is written by the refusal.
-//! 2. An id INSIDE that form which resolves to no AFI is answered by the OPERATION's own
-//!    refusal, because EC2 words a refusal per operation rather than per id kind:
+//! 2. A value in the PRINTED id form that this service never ISSUED is answered by the
+//!    OPERATION's own refusal, because EC2 words a refusal per operation rather than per id
+//!    kind:
 //!    * `DescribeFpgaImages` makes the SAME answer as for a value that is no AFI id at all:
 //!      it reports on "the AFIs available to you", so it judges the id it was given rather
 //!      than resolving one resource of the account's own Region;
@@ -19,9 +20,12 @@
 //!      together, which is an addressing this service resolves only for the AFIs it holds, so
 //!      a source it cannot resolve is an id it cannot read rather than a stored AFI that is
 //!      missing;
-//!    * `DeleteFpgaImage` and `ResetFpgaImageAttribute`, which act on ONE named AFI OF THEIR
-//!      OWN REGION, answer `InvalidFpgaImageID.NotFound` with `Image ID '<id>' not found.`;
-//!    * `DescribeFpgaImageAttribute` answers that same code with EC2's common missing-id
+//!    * `DeleteFpgaImage` and `ResetFpgaImageAttribute`, which ACT on ONE named AFI OF THEIR
+//!      OWN REGION, make it too: EC2's long id form is an obfuscated identifier the service
+//!      decodes before the lookup, so a value no issue of this kind ever produced is one they
+//!      cannot read — their `InvalidFpgaImageID.NotFound` with `Image ID '<id>' not found.` is
+//!      reserved for an identifier this service DID issue, which rule 3 drives;
+//!    * `DescribeFpgaImageAttribute` answers the not-found code with EC2's common missing-id
 //!      sentence instead, naming the `fpga-image` resource type.
 //! 3. The two readings are about the ID and not about the operation's subject: the id of a
 //!    STORED AFI resolves through every one of them, and the same id draws that operation's
@@ -92,9 +96,20 @@ fn unreadable_message(fpga_image_id: &str) -> String {
     format!("Image ID '{fpga_image_id}' is invalid.")
 }
 
-/// Every operation that resolves an AFI id, with the answer it makes for an id inside the
-/// issued form that resolves to no AFI.
+/// Every operation that resolves an AFI id, with the answer it makes for a value in the
+/// printed id form that this service never ISSUED.
 const RESOLVERS: [(&str, Unresolved); 5] = [
+    ("CopyFpgaImage", Unresolved::Unreadable),
+    ("DescribeFpgaImages", Unresolved::Unreadable),
+    ("DeleteFpgaImage", Unresolved::Unreadable),
+    ("ResetFpgaImageAttribute", Unresolved::Unreadable),
+    ("DescribeFpgaImageAttribute", Unresolved::NotFoundResourceType),
+];
+
+/// The same table for an identifier this service DID issue that names no stored AFI — the id
+/// of an AFI a delete has removed: the two operations that act on one named AFI word that
+/// cause `Image ID '<id>' not found.`.
+const RESOLVERS_OF_AN_ISSUED_ID: [(&str, Unresolved); 5] = [
     ("CopyFpgaImage", Unresolved::Unreadable),
     ("DescribeFpgaImages", Unresolved::Unreadable),
     ("DeleteFpgaImage", Unresolved::NotFoundImageId),
@@ -159,16 +174,16 @@ fn unreadable_rows() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// `(case, the value)`: every row is INSIDE the form EC2 issues an AFI id in, and the account
-/// holds no AFI under any of them.
+/// `(case, the value)`: every row is in the PRINTED form EC2 issues an AFI id in, and this
+/// service never issued an AFI id as any of them.
 fn unresolved_rows() -> Vec<(&'static str, String)> {
     vec![
         (
-            "the long id form, which nothing is stored under",
+            "the long id form, which nothing was ever issued under",
             "afi-0123456789abcdef0".to_string(),
         ),
         (
-            "the short id form, which nothing is stored under",
+            "the short id form, which nothing was ever issued under",
             "afi-01234567".to_string(),
         ),
         (
@@ -233,10 +248,10 @@ async fn a_value_outside_the_issued_afi_id_form_is_refused_the_same_way_everywhe
     );
 }
 
-/// RULE 2: an id inside the issued form that resolves to no AFI is answered by the
-/// OPERATION's own refusal — the one it answers an unreadable id with for the listing that
-/// judges the id it was given, and the not-found code with that operation's own sentence for
-/// the four that resolve one named AFI.
+/// RULE 2: a value in the printed id form that this service never ISSUED is answered by the
+/// OPERATION's own refusal — the unreadable-id refusal from the four that judge or decode the
+/// id they were given, and the not-found code with its own sentence from the attribute
+/// describe.
 #[tokio::test]
 async fn an_unresolved_afi_id_is_answered_by_each_operations_own_refusal() {
     let (router, engine) = emulator();
@@ -319,9 +334,10 @@ async fn a_stored_afi_id_resolves_until_the_delete_removes_it() {
         );
     }
 
-    // The id is still inside the issued form, so what changed is the AFI: each operation
-    // answers its own unresolved refusal, naming the id the request carried.
-    for (action, unresolved) in RESOLVERS {
+    // The id is one this service ISSUED, so what changed is the AFI: each operation answers
+    // its own refusal for an identifier that named a resource and no longer does, naming the
+    // id the request carried.
+    for (action, unresolved) in RESOLVERS_OF_AN_ISSUED_ID {
         let params = resolver_params(action, &fpga_image_id);
         let (status, body) = op(&router, action, &params).await;
         assert_eq!(

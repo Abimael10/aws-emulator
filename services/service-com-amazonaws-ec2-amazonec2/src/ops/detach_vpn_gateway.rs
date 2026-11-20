@@ -200,12 +200,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The attachment itself: the gateway's `VpcAttachments` is the only record of it, so
-        // the entry for this VPC is what the detach acts on. A gateway that holds no
-        // attachment of this VPC has nothing to detach, which EC2 answers with
-        // `InvalidAttachment.NotFound`. The entry is left in the TERMINAL `detached` state
-        // rather than dropped, so a caller polling `DescribeVpnGateways` after this call sees
-        // that the attachment is gone rather than nothing at all — and an attachment in that
-        // state attaches nothing, so `AttachVpnGateway` may attach the VPC again.
+        // the entry for this VPC is what the detach acts on. A gateway that holds NO entry
+        // for this VPC has never attached it and so has nothing to detach, which EC2 answers
+        // with `InvalidAttachment.NotFound`. An entry already in the terminal `detached`
+        // state is a detach that has already happened: the request asks for the state the
+        // attachment is already in, so it is an accepted no-op and nothing is written. The
+        // entry is left in that state rather than dropped, so a caller polling
+        // `DescribeVpnGateways` after this call sees that the attachment is gone rather than
+        // nothing at all — and an attachment in that state attaches nothing, so
+        // `AttachVpnGateway` may attach the VPC again.
         let Some(record) = store.vpn_gateways.get_mut(&input.vpn_gateway_id) else {
             return Err(state::internal_error(format!(
                 "the virtual private gateway '{vpn_gateway_id}' resolved a moment ago is not \
@@ -214,23 +217,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         };
         let attachments = record.view.vpc_attachments.get_or_insert_with(Vec::new);
-        let Some(attachment) = attachments.iter_mut().find(|attachment| {
+        let live = attachments.iter_mut().find(|attachment| {
             attachment.vpc_id.as_deref() == Some(input.vpc_id.as_str())
                 && attachment.state.as_deref() != Some(ATTACHMENT_STATE_DETACHED)
-        }) else {
-            return Err(crate::scaffolded::Scaffolded::service_error(
-                state::INVALID_ATTACHMENT_NOT_FOUND,
-                400,
-                format!(
-                    "The vpnGateway '{vpn_gateway_id}' is not attached to the vpc \
-                     '{vpc_id}'.",
-                    vpn_gateway_id = input.vpn_gateway_id,
-                    vpc_id = input.vpc_id,
-                ),
-            ));
-        };
-        attachment.state = Some(ATTACHMENT_STATE_DETACHED.to_string());
-        Ok(DetachVpnGatewayOutput)
+        });
+        if let Some(attachment) = live {
+            attachment.state = Some(ATTACHMENT_STATE_DETACHED.to_string());
+            return Ok(DetachVpnGatewayOutput);
+        }
+        // No attachment of this VPC is in force. Either this gateway attached it and a detach
+        // has already taken it down — the request asks for the state the attachment is
+        // already in, so it is served and nothing is written — or the gateway never attached
+        // this VPC at all, which is what `InvalidAttachment.NotFound` names.
+        if attachments
+            .iter()
+            .any(|attachment| attachment.vpc_id.as_deref() == Some(input.vpc_id.as_str()))
+        {
+            return Ok(DetachVpnGatewayOutput);
+        }
+        Err(crate::scaffolded::Scaffolded::service_error(
+            state::INVALID_ATTACHMENT_NOT_FOUND,
+            400,
+            format!(
+                "The vpnGateway '{vpn_gateway_id}' is not attached to the vpc '{vpc_id}'.",
+                vpn_gateway_id = input.vpn_gateway_id,
+                vpc_id = input.vpc_id,
+            ),
+        ))
     }
 }
 

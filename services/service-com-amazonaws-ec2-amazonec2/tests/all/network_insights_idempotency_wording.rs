@@ -131,7 +131,10 @@ fn the_two_idempotency_sentences_are_distinct() {
 /// creates of this service keep their own — same code, same status, different text.
 #[tokio::test]
 async fn an_idempotency_conflict_is_worded_by_the_operation_s_surface() {
-    let (router, _engine) = emulator();
+    let (router, engine) = emulator();
+    // The ends the paths below name have to resolve, so the account holds a resource under
+    // each of them (`super::path_endpoint_estate` owns that estate).
+    super::path_endpoint_estate::hold_path_endpoints(&router, &engine, REGION).await;
 
     // What the Network Insights analyses are started on: two scopes and two paths, so a
     // token can be replayed naming the OTHER one.

@@ -14,8 +14,8 @@
 //! like every other primitive there.
 
 use super::{
-    id_not_found, tag_list_bytes, ComAmazonawsEc2Amazonec2State, MAX_STORED_RECORDS_PER_STORE,
-    STORED_RECORD_OVERHEAD_BYTES,
+    echoed_resource_id, id_not_found, tag_list_bytes, ComAmazonawsEc2Amazonec2State,
+    MAX_STORED_RECORDS_PER_STORE, STORED_RECORD_OVERHEAD_BYTES,
 };
 use crate::ops::types::{InternetGateway, Tag};
 use crate::scaffolded::Scaffolded;
@@ -46,11 +46,36 @@ pub const MAX_INTERNET_GATEWAYS_PAGE_SIZE: usize = 1_000;
 /// "Error codes": `InvalidInternetGatewayID.NotFound`).
 ///
 /// `InternetGatewayId` publishes no pattern
-/// (`smithy_query(query="shape",shape="InternetGatewayId")`), so there is no spelling to
-/// call an id malformed by: one code covers an id of any shape, the same reading
-/// [`super::INVALID_TRAFFIC_MIRROR_FILTER_ID_NOT_FOUND`] has, because an id this service
-/// never minted names no gateway of the account whether or not it reads like one.
+/// (`smithy_query(query="shape",shape="InternetGatewayId")`), so the operations that look an
+/// id UP answer one code for an id of any shape, the same reading
+/// [`super::INVALID_TRAFFIC_MIRROR_FILTER_ID_NOT_FOUND`] has. The operation that DECODES the
+/// id first — the delete — tells the two apart with
+/// [`INVALID_INTERNET_GATEWAY_ID_MALFORMED`].
 pub const INVALID_INTERNET_GATEWAY_ID_NOT_FOUND: &str = "InvalidInternetGatewayID.NotFound";
+
+/// EC2's code for a value that is not an internet gateway id this service could have ISSUED,
+/// answered BEFORE the id is looked up (EC2 API "Error codes":
+/// `InvalidInternetGatewayId.Malformed` — the `Id` of this spelling is EC2's own, where the
+/// not-found code above spells the same member `ID`).
+pub const INVALID_INTERNET_GATEWAY_ID_MALFORMED: &str = "InvalidInternetGatewayId.Malformed";
+
+/// Refuse a value that is not an internet gateway id this service could have issued: HTTP 400
+/// [`INVALID_INTERNET_GATEWAY_ID_MALFORMED`], in the sentence EC2 answers an unreadable id of
+/// a resource KIND with — the fixed `The `, ` ID '`, `' is malformed` around the kind as the
+/// modelled `ResourceType` spells it ([`INTERNET_GATEWAY_TAGGABLE_RESOURCE`]) and the value
+/// the REQUEST sent, the same template `InvalidDhcpOptionsId.Malformed` carries
+/// ([`super::invalid_dhcp_options_id_malformed`]). The echo is bounded the way every refusal
+/// of this crate bounds a value the caller chose the length of.
+pub fn invalid_internet_gateway_id_malformed<E>(internet_gateway_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_INTERNET_GATEWAY_ID_MALFORMED,
+        400,
+        format!(
+            "The {INTERNET_GATEWAY_TAGGABLE_RESOURCE} ID '{id}' is malformed",
+            id = echoed_resource_id(internet_gateway_id),
+        ),
+    )
+}
 
 /// EC2's quota code for one internet gateway too many (EC2 API "Error codes":
 /// `InternetGatewayLimitExceeded`).

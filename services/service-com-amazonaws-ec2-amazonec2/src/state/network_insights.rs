@@ -933,6 +933,69 @@ fn endpoint_arn_resource(value: &str) -> Option<(&str, &str)> {
     arn_resource(value)
 }
 
+/// Refuse an end of a Reachability Analyzer path whose value names no resource THIS account
+/// holds: the resource kind's own `Invalid<Kind>.NotFound`, built from the id the request
+/// named.
+///
+/// "The ID or ARN of the source. If the resource is in another account, you must specify an
+/// ARN" (`CreateNetworkInsightsPathRequest$Source`): a BARE id names a resource of this
+/// account, so it has to resolve against this store — a path is analyzed BETWEEN resources,
+/// and an end naming a resource that was never issued is an end there is nothing to analyze
+/// from. A value given as an ARN names its own account and Region, which this emulator does
+/// not hold the resources of, so it is left to the operation's type screening
+/// ([`network_insights_endpoint_type`]) alone.
+///
+/// The ONE place a path's ends are resolved, reached from
+/// `crate::ops::create_network_insights_path`, so each kind the catalog
+/// ([`NETWORK_INSIGHTS_ENDPOINT_TYPES`]) admits is resolved in the store that OWNS that kind
+/// and refused with that kind's own code. The caller screens the type FIRST, so a value of no
+/// supported kind never reaches this.
+pub fn require_network_insights_endpoint<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    value: &str,
+) -> Result<(), Scaffolded<E>> {
+    if is_arn(value) {
+        return Ok(());
+    }
+    let Some(resource_type) = network_insights_endpoint_type(value) else {
+        return Ok(());
+    };
+    match resource_type {
+        RESOURCE_TYPE_INSTANCE if !store.instances.contains_key(value) => {
+            Err(Scaffolded::invalid_instance_id_not_found(value))
+        }
+        RESOURCE_TYPE_NETWORK_INTERFACE if !store.network_interfaces.contains_key(value) => {
+            Err(invalid_network_interface_id_not_found(value))
+        }
+        INTERNET_GATEWAY_TAGGABLE_RESOURCE if !store.internet_gateways.contains_key(value) => {
+            Err(invalid_internet_gateway_id_not_found(value))
+        }
+        RESOURCE_TYPE_VPN_GATEWAY if !store.vpn_gateways.contains_key(value) => {
+            Err(invalid_vpn_gateway_id_not_found(value))
+        }
+        RESOURCE_TYPE_VPC_ENDPOINT if !store.vpc_endpoints.contains_key(value) => {
+            Err(invalid_vpc_endpoint_id_not_found(value))
+        }
+        RESOURCE_TYPE_VPC_ENDPOINT_SERVICE if !store.vpc_endpoint_services.contains_key(value) => {
+            Err(invalid_vpc_endpoint_service_id_not_found(value))
+        }
+        RESOURCE_TYPE_VPC_PEERING_CONNECTION
+            if !store.vpc_peering_connections.contains_key(value) =>
+        {
+            Err(invalid_vpc_peering_connection_id_not_found(value))
+        }
+        RESOURCE_TYPE_TRANSIT_GATEWAY if !store.transit_gateways.contains_key(value) => {
+            Err(invalid_transit_gateway_id_not_found(value))
+        }
+        RESOURCE_TYPE_TRANSIT_GATEWAY_ATTACHMENT
+            if !store.transit_gateway_attachments.contains_key(value) =>
+        {
+            Err(invalid_transit_gateway_attachment_id_not_found(value))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// "The status message, if the status is `failed`"
 /// (`NetworkInsightsAnalysis$StatusMessage`) of an analysis this emulator could not run.
 ///

@@ -1427,6 +1427,68 @@ pub const LISTING_ID_MEMBER: &str = "listingId";
 /// The `ReservedInstancesId` member of the Marketplace operations, as a refusal names it.
 pub const LISTING_RESERVED_INSTANCES_ID_MEMBER: &str = "reservedInstancesId";
 
+/// The member the Marketplace's PARAMETER validator paths a listing id by:
+/// `reservedInstanceListingId`, the name EC2 was recorded answering a value outside the
+/// listing-id pattern with — the validator's own name for the member, which is not the wire
+/// name the request sends it under (`reservedInstancesListingId`,
+/// `smithy_query(query="operation",operation="CancelReservedInstancesListing")`).
+pub const RESERVED_INSTANCE_LISTING_ID_PARAMETER: &str = "reservedInstanceListingId";
+
+/// The regular expression the Marketplace's parameter validator holds a listing id to, as
+/// the refusal it answers publishes it: five groups of word characters of lengths 8, 4, 4, 4
+/// and 12, hyphen-separated.
+///
+/// The model puts no `@pattern` on `ReservedInstancesListingId`
+/// (`smithy_query(query="shape",shape="ReservedInstancesListingId")`), so this is the form
+/// the service's own validator is recorded naming, and it is published in the refusal's text
+/// — which is why the pattern is written once, here, beside the reader that enforces it.
+pub const RESERVED_INSTANCES_LISTING_ID_PATTERN: &str = r"\w{8}(-\w{4}){3}-\w{12}";
+
+/// The lengths of the word-character groups [`RESERVED_INSTANCES_LISTING_ID_PATTERN`] spells,
+/// in order.
+const RESERVED_INSTANCES_LISTING_ID_GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+
+/// Whether `listing_id` satisfies [`RESERVED_INSTANCES_LISTING_ID_PATTERN`]: the five
+/// hyphen-separated groups of exactly that many word characters each — `[A-Za-z0-9_]`, which
+/// is what `\w` matches — and nothing after them.
+///
+/// The ONE reading of that form: a value outside it is not a listing id at all, so the
+/// operations that take one refuse it for the constraint it violates rather than reporting it
+/// as a listing the account does not hold.
+pub fn reserved_instances_listing_id_is_well_formed(listing_id: &str) -> bool {
+    let mut groups = listing_id.split('-');
+    for length in RESERVED_INSTANCES_LISTING_ID_GROUPS {
+        let Some(group) = groups.next() else {
+            return false;
+        };
+        if group.len() != length
+            || !group
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return false;
+        }
+    }
+    groups.next().is_none()
+}
+
+/// Refuse a listing id outside [`RESERVED_INSTANCES_LISTING_ID_PATTERN`]: HTTP 400
+/// [`INVALID_INPUT`] with the parameter layer's pattern clause
+/// ([`parameter_pattern_violation_message`]), naming the member that validator paths a
+/// listing id by and the pattern it publishes.
+///
+/// The pair of this and [`invalid_marketplace_value`] is the distinction EC2's two recorded
+/// answers draw: a value that is NOT a listing id is told which constraint it failed, while a
+/// well-formed id that names no listing the operation can act on has nothing to say about
+/// itself beyond being unusable.
+pub fn reserved_instances_listing_id_pattern_violation<E>(listing_id: &str) -> Scaffolded<E> {
+    invalid_input(parameter_pattern_violation_message(
+        RESERVED_INSTANCE_LISTING_ID_PARAMETER,
+        listing_id,
+        RESERVED_INSTANCES_LISTING_ID_PATTERN,
+    ))
+}
+
 /// The `InstanceCount` member of `CreateReservedInstancesListing`, as a refusal names it.
 pub const LISTING_INSTANCE_COUNT_MEMBER: &str = "instanceCount";
 

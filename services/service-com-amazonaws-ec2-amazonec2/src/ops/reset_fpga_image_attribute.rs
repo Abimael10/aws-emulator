@@ -138,7 +138,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::scaffolded::Scaffolded;
         use crate::state::{
             dry_run_operation, fpga_image_id_is_well_formed, invalid_fpga_image_id_malformed,
-            invalid_fpga_image_id_not_found, require_service_state,
+            invalid_fpga_image_id_not_found, require_service_state, FPGA_IMAGE_ID_PREFIX,
         };
 
         // An AFI carries no Region member of its own, so nothing here depends on the Region
@@ -168,6 +168,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let state = require_service_state(&*self.engine)?;
         let mut store = state.lock();
+        // This reset ACTS on one named AFI, so it decodes the id before it resolves anything
+        // — EC2's long id form is an obfuscated identifier the service decodes ahead of the
+        // lookup — and a value no issue of this kind ever produced is refused as malformed
+        // rather than reported as an AFI that is not there. The ids this service has issued
+        // are the long-form values its mint has counted
+        // ([`crate::state::ComAmazonawsEc2Amazonec2State::id_was_issued`]); the ONE reading
+        // `DeleteFpgaImage` takes of the same id, so the two operations that change a named
+        // AFI cannot disagree about which values they can read. The wider check above has
+        // already refused everything outside the printed id form.
+        if !store.id_was_issued(FPGA_IMAGE_ID_PREFIX, &input.fpga_image_id) {
+            return Err(invalid_fpga_image_id_malformed(&input.fpga_image_id));
+        }
         let Some(record) = store.fpga_images.get_mut(&input.fpga_image_id) else {
             return Err(invalid_fpga_image_id_not_found(&input.fpga_image_id));
         };

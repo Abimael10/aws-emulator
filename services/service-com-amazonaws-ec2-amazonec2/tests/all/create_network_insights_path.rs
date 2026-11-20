@@ -498,6 +498,10 @@ fn caller_chosen(path: &ReportedPath) -> ReportedPath {
 async fn the_create_stores_the_path_it_answers_with() {
     for (case, request) in requests() {
         let (router, engine) = super::ec2_query::emulator();
+        // The ends every row names have to resolve, so the account holds one resource of each
+        // kind under the ids this table writes out
+        // (`super::path_endpoint_estate` owns that estate).
+        super::path_endpoint_estate::hold_path_endpoints(&router, &engine, REGION).await;
         assert_eq!(
             stored(&engine),
             0,
@@ -557,7 +561,8 @@ async fn the_create_stores_the_path_it_answers_with() {
 #[tokio::test]
 async fn an_analysis_can_be_started_on_the_path_the_create_stored() {
     for (case, request) in requests() {
-        let (router, _engine) = super::ec2_query::emulator();
+        let (router, engine) = super::ec2_query::emulator();
+        super::path_endpoint_estate::hold_path_endpoints(&router, &engine, REGION).await;
         let body = created(case, &router, &params(&request, "token-analyze")).await;
         let path_id = one_path(case, &body).path_id;
 
@@ -597,6 +602,7 @@ async fn each_create_mints_a_path_of_its_own() {
         let (second_case, second) = &table[(position + 1) % table.len()];
         let case = format!("{first_case} then {second_case}");
         let (router, engine) = super::ec2_query::emulator();
+        super::path_endpoint_estate::hold_path_endpoints(&router, &engine, REGION).await;
 
         let first_body = created(&case, &router, &params(first, "token-one")).await;
         let second_body = created(&case, &router, &params(second, "token-two")).await;
@@ -761,6 +767,7 @@ async fn the_pairings_the_model_does_not_exclude_are_ordinary_requests() {
 
     for (case, request) in cases {
         let (router, engine) = super::ec2_query::emulator();
+        super::path_endpoint_estate::hold_path_endpoints(&router, &engine, REGION).await;
         let body = created(case, &router, &params(&request, "token-allowed")).await;
         assert_eq!(
             caller_chosen(&one_path(case, &body)),
@@ -930,6 +937,7 @@ async fn each_type_the_catalog_names_is_accepted_at_either_end() {
         for member in ["Source", "Destination"] {
             let case = format!("{kind} as {member}");
             let (router, engine) = super::ec2_query::emulator();
+            super::path_endpoint_estate::hold_path_endpoints(&router, &engine, REGION).await;
             let body = created(&case, &router, &one_end_named(member, value)).await;
             let path = one_path(&case, &body);
             let reported_end = if member == "Source" {
@@ -1099,6 +1107,7 @@ async fn a_tag_specification_may_only_name_the_resource_this_action_tags() {
 async fn a_dry_run_stores_nothing_and_reports_the_permitted_outcome() {
     for (case, request) in requests() {
         let (router, engine) = super::ec2_query::emulator();
+        super::path_endpoint_estate::hold_path_endpoints(&router, &engine, REGION).await;
         let mut dry = params(&request, "token-dry-run");
         dry.push(param("DryRun", "true"));
 
@@ -1212,6 +1221,7 @@ async fn a_client_token_past_the_bound_is_refused() {
     ] {
         let case = format!("a {length}-character ClientToken");
         let (router, engine) = super::ec2_query::emulator();
+        super::path_endpoint_estate::hold_path_endpoints(&router, &engine, REGION).await;
         let (status, body) = create(&router, &request, &"t".repeat(length)).await;
         assert_eq!(
             status, expected_status,

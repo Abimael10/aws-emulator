@@ -445,7 +445,8 @@ async fn a_refused_create_persists_nothing_however_the_request_is_shaped() {
     }
 
     // Nothing was minted, so nothing can be reached: the id space is empty, and the
-    // operations that resolve an AFI of this account answer for an id they hold nothing for.
+    // operations that act on an AFI of this account decode the hand-written id they are given
+    // — a value no issue of this kind ever produced — before they look anything up.
     for (action, params) in [
         ("DeleteFpgaImage", vec![p("FpgaImageId", "afi-0123456789abcdef0")]),
         (
@@ -464,8 +465,8 @@ async fn a_refused_create_persists_nothing_however_the_request_is_shaped() {
         );
         assert_eq!(
             error_code(&body),
-            "InvalidFpgaImageID.NotFound",
-            "{action} after the refused creates: expected InvalidFpgaImageID.NotFound, \
+            "InvalidFpgaImageID.Malformed",
+            "{action} after the refused creates: expected InvalidFpgaImageID.Malformed, \
              got {body}"
         );
     }

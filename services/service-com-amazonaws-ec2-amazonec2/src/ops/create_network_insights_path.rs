@@ -209,7 +209,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `Destination`): a path is analyzed BETWEEN resources, and only the kinds of resource
         // an end of a path can BE may be named — so a value naming any other kind, or naming
         // no resource at all, is refused with the catalog that member accepts rather than
-        // stored as an end nothing could be analyzed from.
+        // stored as an end nothing could be analyzed from. Whether each end's resource EXISTS
+        // is resolved below, once the store is in hand.
         for (member, named) in [
             ("Source", Some(input.source.as_str())),
             ("Destination", input.destination.as_deref()),
@@ -255,6 +256,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let service_state = state::require_service_state(&*self.engine)?;
         let mut store = service_state.lock();
+
+        // Each end RESOLVED, now that the store is in hand: "if the resource is in another
+        // account, you must specify an ARN" (`Source`), so a bare id names a resource of THIS
+        // account and has to be one the account holds — an id nothing was ever issued under
+        // is refused with that resource kind's own not-found code, and no path is created.
+        // A path over endpoints that do not exist is a path nothing could be analyzed over.
+        for named in [spec.source.as_deref(), spec.destination.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            state::require_network_insights_endpoint(&store, named)?;
+        }
 
         // A count ceiling first, then the byte budget: a record count on its own admits
         // gigabytes, because each record holds strings the caller chose the length of.

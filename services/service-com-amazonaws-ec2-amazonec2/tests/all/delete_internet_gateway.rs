@@ -387,83 +387,85 @@ async fn a_refused_delete_leaves_every_internet_gateway_where_it_was() {
 
     let before = snapshot(&router, "the population").await;
 
-    // `InternetGatewayId` publishes no pattern, so there is no spelling that tells a
-    // malformed id from an unknown one: every id this service never minted — whatever its
-    // form — names no gateway of the account. The rows span those forms: the prefix with no
+    // This delete DECODES the id before it resolves anything, so every value the mint never
+    // issued — whatever its form — is refused as malformed rather than as a gateway that is
+    // not there. The rows span those forms: both printed id lengths, the prefix with no
     // separator, an empty suffix, a non-hexadecimal suffix, a suffix one digit short of the
     // long form, an upper-case prefix, another resource's id, and a value carrying XML
     // metacharacters (the refusal names the value the request sent, so the response must
-    // still be a well-formed document whose text decodes back to what was sent).
+    // still be a well-formed document whose text decodes back to what was sent). The id of a
+    // gateway this service DID issue is the one that draws the not-found code, which the
+    // round-trip above drives with a second delete.
     let cases = [
         RefusalCase {
-            case: "a well-formed long id of no gateway",
+            case: "a well-formed long id the mint never reached",
             id: RefusedId::Literal("igw-0123456789abcdef0"),
             dry_run: false,
             status: 400,
-            code: "InvalidInternetGatewayID.NotFound",
+            code: "InvalidInternetGatewayId.Malformed",
         },
         RefusalCase {
-            case: "a well-formed short id of no gateway",
+            case: "a well-formed short id the mint never issued",
             id: RefusedId::Literal("igw-12345678"),
             dry_run: false,
             status: 400,
-            code: "InvalidInternetGatewayID.NotFound",
+            code: "InvalidInternetGatewayId.Malformed",
         },
         RefusalCase {
             case: "the prefix with no separator",
             id: RefusedId::Literal("igw"),
             dry_run: false,
             status: 400,
-            code: "InvalidInternetGatewayID.NotFound",
+            code: "InvalidInternetGatewayId.Malformed",
         },
         RefusalCase {
             case: "the prefix with an empty suffix",
             id: RefusedId::Literal("igw-"),
             dry_run: false,
             status: 400,
-            code: "InvalidInternetGatewayID.NotFound",
+            code: "InvalidInternetGatewayId.Malformed",
         },
         RefusalCase {
             case: "a suffix that is not hexadecimal",
             id: RefusedId::Literal("igw-0123456789abcdefg"),
             dry_run: false,
             status: 400,
-            code: "InvalidInternetGatewayID.NotFound",
+            code: "InvalidInternetGatewayId.Malformed",
         },
         RefusalCase {
             case: "a suffix one digit short of the long id form",
             id: RefusedId::Literal("igw-0123456789abcdef"),
             dry_run: false,
             status: 400,
-            code: "InvalidInternetGatewayID.NotFound",
+            code: "InvalidInternetGatewayId.Malformed",
         },
         RefusalCase {
             case: "an upper-case prefix",
             id: RefusedId::Literal("IGW-0123456789abcdef0"),
             dry_run: false,
             status: 400,
-            code: "InvalidInternetGatewayID.NotFound",
+            code: "InvalidInternetGatewayId.Malformed",
         },
         RefusalCase {
             case: "another resource's id",
             id: RefusedId::Literal("vpc-0123456789abcdef0"),
             dry_run: false,
             status: 400,
-            code: "InvalidInternetGatewayID.NotFound",
+            code: "InvalidInternetGatewayId.Malformed",
         },
         RefusalCase {
             case: "a value carrying XML metacharacters",
             id: RefusedId::Literal("igw-<&\"']]>"),
             dry_run: false,
             status: 400,
-            code: "InvalidInternetGatewayID.NotFound",
+            code: "InvalidInternetGatewayId.Malformed",
         },
         RefusalCase {
-            case: "an id of no gateway, as a dry run",
+            case: "an id the mint never reached, as a dry run",
             id: RefusedId::Literal("igw-0123456789abcdef1"),
             dry_run: true,
             status: 400,
-            code: "InvalidInternetGatewayID.NotFound",
+            code: "InvalidInternetGatewayId.Malformed",
         },
         RefusalCase {
             case: "a gateway still attached to a VPC",
@@ -518,6 +520,9 @@ async fn a_refused_delete_leaves_every_internet_gateway_where_it_was() {
                  deleted."
             ),
             "DryRunOperation" => "Request would have succeeded, but DryRun flag is set.".to_string(),
+            "InvalidInternetGatewayId.Malformed" => {
+                format!("The internet-gateway ID '{internet_gateway_id}' is malformed")
+            }
             _ => format!("The internetGateway ID '{internet_gateway_id}' does not exist"),
         };
         assert_eq!(

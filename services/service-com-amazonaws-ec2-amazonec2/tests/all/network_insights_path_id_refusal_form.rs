@@ -221,8 +221,11 @@ async fn the_describes_keep_the_resources_not_found_code_for_every_value() {
 /// code, where before the delete the start succeeded.
 #[tokio::test]
 async fn a_path_this_service_minted_and_deleted_is_reported_as_not_there() {
-    let (router, _engine) = super::ec2_query::emulator();
+    let (router, engine) = super::ec2_query::emulator();
     let case = "a minted path, deleted";
+    // The two ends the create below names have to resolve, so the account holds a resource
+    // under each of them (`super::path_endpoint_estate` owns that estate).
+    super::path_endpoint_estate::hold_path_endpoints(&router, &engine, REGION).await;
 
     let created = ok(
         case,

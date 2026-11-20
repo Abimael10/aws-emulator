@@ -270,17 +270,18 @@ fn malformed_rows() -> Vec<(Call, String, String)> {
 /// The values a call is driven with that are INSIDE its member's form and that the account
 /// resolves nothing for: one id per kind, and the `true` half of the shared Amazon S3 naming
 /// catalogue for the bucket name.
+///
+/// `DeleteFpgaImage` has no row here: it DECODES the AFI id rather than only reading its
+/// printed form, so a value in that form which this service never issued is unreadable to it
+/// rather than merely unresolvable, and the id of an AFI it DID issue and then removed — the
+/// one value that draws its unresolvable code — can only be had from the mint
+/// (`super::fpga_image_id_form` drives that round trip).
 fn well_formed_rows() -> Vec<(Call, String, String)> {
     let mut rows: Vec<(Call, String, String)> = vec![
         (
             Call::CancelExportTask,
             "an instance export task id in the long form",
             "export-i-0123456789abcdef0",
-        ),
-        (
-            Call::DeleteFpgaImage,
-            "an AFI id in the short form",
-            "afi-0123abcd",
         ),
         (
             Call::DeleteImageUsageReport,

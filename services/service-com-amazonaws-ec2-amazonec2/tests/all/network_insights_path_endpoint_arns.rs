@@ -221,7 +221,10 @@ async fn ok(case: &str, router: &MultiServiceRouter, action: &str, params: &[Par
 /// — the store derives them once, so no reader of a path can report one end differently.
 #[tokio::test]
 async fn a_created_path_reports_the_arn_of_each_end_it_names() {
-    let (router, _engine) = super::ec2_query::emulator();
+    let (router, engine) = super::ec2_query::emulator();
+    // Every end the table names has to resolve, so the account holds a resource under each of
+    // those ids (`super::path_endpoint_estate` owns that estate).
+    super::path_endpoint_estate::hold_path_endpoints(&router, &engine, REGION).await;
 
     for (index, row) in rows().iter().enumerate() {
         let case = row.case;
@@ -282,6 +285,7 @@ async fn a_created_path_reports_the_arn_of_each_end_it_names() {
 async fn every_path_of_the_account_carries_its_endpoint_arns() {
     let case = "the whole set of paths";
     let (router, engine) = super::ec2_query::emulator();
+    super::path_endpoint_estate::hold_path_endpoints(&router, &engine, REGION).await;
     let rows = rows();
 
     let mut expected: Vec<ReportedArns> = Vec::new();

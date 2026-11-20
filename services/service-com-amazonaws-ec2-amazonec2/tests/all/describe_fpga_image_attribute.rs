@@ -488,10 +488,11 @@ async fn an_afi_id_and_an_attribute_are_resolved_in_one_order() {
         }
     }
 
-    // The wording of the not-found refusal is the ANSWERING OPERATION's own, and it names the
-    // id the REQUEST carried: this describe answers EC2's common missing-id sentence, naming
-    // the `fpga-image` resource type, while the delete and the reset word the same cause
-    // `Image ID '<id>' not found.`.
+    // The wording is the ANSWERING OPERATION's own, and it names the id the REQUEST carried:
+    // this describe REPORTS on the id it was given, so a hand-written id the account holds no
+    // AFI under draws EC2's common missing-id sentence naming the `fpga-image` resource type,
+    // while the delete and the reset ACT on one named AFI and so decode that id first, which
+    // makes a value the mint never issued unreadable to them.
     let resolver_rows: [(&str, Params, String); 3] = [
         (
             "DescribeFpgaImageAttribute",
@@ -507,12 +508,12 @@ async fn an_afi_id_and_an_attribute_are_resolved_in_one_order() {
                 p("FpgaImageId", UNKNOWN_FPGA_IMAGE_ID),
                 p("Attribute", "loadPermission"),
             ],
-            format!("Image ID '{UNKNOWN_FPGA_IMAGE_ID}' not found."),
+            format!("Image ID '{UNKNOWN_FPGA_IMAGE_ID}' is invalid."),
         ),
         (
             "DeleteFpgaImage",
             vec![p("FpgaImageId", UNKNOWN_FPGA_IMAGE_ID)],
-            format!("Image ID '{UNKNOWN_FPGA_IMAGE_ID}' not found."),
+            format!("Image ID '{UNKNOWN_FPGA_IMAGE_ID}' is invalid."),
         ),
     ];
     for (action, params, expected_message) in resolver_rows {
