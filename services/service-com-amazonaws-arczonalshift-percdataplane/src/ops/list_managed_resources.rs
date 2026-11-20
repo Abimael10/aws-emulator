@@ -65,6 +65,11 @@
 //!   indicates that more output is available. Set this parameter to the value provided by the
 //!   previous call's nextToken response to request the next page of results.
 //!
+//! Beside the members above, every zonal shift AWS reports carries `azGroupId` — the
+//! Availability Zone group of the Region the shifted resource lives in — which this model
+//! snapshot does not declare, so each `zonalShifts` entry carries it. See
+//! `smithy-model/LOCAL-ADDITIONS.md` and `crate::state::az_group_id`.
+//!
 //! ## Errors
 //!
 //! * `AccessDeniedException` (HTTP 403) — You do not have sufficient access to perform this

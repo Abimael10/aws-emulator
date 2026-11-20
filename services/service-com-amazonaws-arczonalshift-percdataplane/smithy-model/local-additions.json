@@ -1,0 +1,132 @@
+{
+  "smithy": "2.0",
+  "shapes": {
+    "com.amazonaws.arczonalshift#ZonalShift": {
+      "type": "structure",
+      "members": {
+        "zonalShiftId": { "target": "com.amazonaws.arczonalshift#ZonalShiftId", "traits": { "smithy.api#required": {} } },
+        "resourceIdentifier": { "target": "com.amazonaws.arczonalshift#ResourceIdentifier", "traits": { "smithy.api#required": {} } },
+        "awayFrom": { "target": "com.amazonaws.arczonalshift#AvailabilityZone", "traits": { "smithy.api#required": {} } },
+        "expiryTime": { "target": "com.amazonaws.arczonalshift#ExpiryTime", "traits": { "smithy.api#required": {} } },
+        "startTime": { "target": "com.amazonaws.arczonalshift#StartTime", "traits": { "smithy.api#required": {} } },
+        "status": { "target": "com.amazonaws.arczonalshift#ZonalShiftStatus", "traits": { "smithy.api#required": {} } },
+        "comment": { "target": "com.amazonaws.arczonalshift#ZonalShiftComment", "traits": { "smithy.api#required": {} } },
+        "azGroupId": { "target": "com.amazonaws.arczonalshift#AzGroupId" }
+      }
+    },
+    "com.amazonaws.arczonalshift#ZonalShiftSummary": {
+      "type": "structure",
+      "members": {
+        "zonalShiftId": { "target": "com.amazonaws.arczonalshift#ZonalShiftId", "traits": { "smithy.api#required": {} } },
+        "resourceIdentifier": { "target": "com.amazonaws.arczonalshift#ResourceIdentifier", "traits": { "smithy.api#required": {} } },
+        "awayFrom": { "target": "com.amazonaws.arczonalshift#AvailabilityZone", "traits": { "smithy.api#required": {} } },
+        "expiryTime": { "target": "com.amazonaws.arczonalshift#ExpiryTime", "traits": { "smithy.api#required": {} } },
+        "startTime": { "target": "com.amazonaws.arczonalshift#StartTime", "traits": { "smithy.api#required": {} } },
+        "status": { "target": "com.amazonaws.arczonalshift#ZonalShiftStatus", "traits": { "smithy.api#required": {} } },
+        "comment": { "target": "com.amazonaws.arczonalshift#ZonalShiftComment", "traits": { "smithy.api#required": {} } },
+        "shiftType": { "target": "com.amazonaws.arczonalshift#ShiftType" },
+        "practiceRunOutcome": { "target": "com.amazonaws.arczonalshift#PracticeRunOutcome" },
+        "azGroupId": { "target": "com.amazonaws.arczonalshift#AzGroupId" }
+      }
+    },
+    "com.amazonaws.arczonalshift#ZonalShiftInResource": {
+      "type": "structure",
+      "members": {
+        "appliedStatus": { "target": "com.amazonaws.arczonalshift#AppliedStatus", "traits": { "smithy.api#required": {} } },
+        "zonalShiftId": { "target": "com.amazonaws.arczonalshift#ZonalShiftId", "traits": { "smithy.api#required": {} } },
+        "resourceIdentifier": { "target": "com.amazonaws.arczonalshift#ResourceIdentifier", "traits": { "smithy.api#required": {} } },
+        "awayFrom": { "target": "com.amazonaws.arczonalshift#AvailabilityZone", "traits": { "smithy.api#required": {} } },
+        "expiryTime": { "target": "com.amazonaws.arczonalshift#ExpiryTime", "traits": { "smithy.api#required": {} } },
+        "startTime": { "target": "com.amazonaws.arczonalshift#StartTime", "traits": { "smithy.api#required": {} } },
+        "comment": { "target": "com.amazonaws.arczonalshift#ZonalShiftComment", "traits": { "smithy.api#required": {} } },
+        "shiftType": { "target": "com.amazonaws.arczonalshift#ShiftType" },
+        "practiceRunOutcome": { "target": "com.amazonaws.arczonalshift#PracticeRunOutcome" },
+        "azGroupId": { "target": "com.amazonaws.arczonalshift#AzGroupId" }
+      }
+    },
+    "com.amazonaws.arczonalshift#StartPracticeRunResponse": {
+      "type": "structure",
+      "members": {
+        "zonalShiftId": { "target": "com.amazonaws.arczonalshift#ZonalShiftId", "traits": { "smithy.api#required": {} } },
+        "resourceIdentifier": { "target": "com.amazonaws.arczonalshift#ResourceIdentifier", "traits": { "smithy.api#required": {} } },
+        "awayFrom": { "target": "com.amazonaws.arczonalshift#AvailabilityZone", "traits": { "smithy.api#required": {} } },
+        "expiryTime": { "target": "com.amazonaws.arczonalshift#ExpiryTime", "traits": { "smithy.api#required": {} } },
+        "startTime": { "target": "com.amazonaws.arczonalshift#StartTime", "traits": { "smithy.api#required": {} } },
+        "status": { "target": "com.amazonaws.arczonalshift#ZonalShiftStatus", "traits": { "smithy.api#required": {} } },
+        "comment": { "target": "com.amazonaws.arczonalshift#ZonalShiftComment", "traits": { "smithy.api#required": {} } },
+        "azGroupId": { "target": "com.amazonaws.arczonalshift#AzGroupId" }
+      },
+      "traits": {
+        "smithy.api#output": {}
+      }
+    },
+    "com.amazonaws.arczonalshift#AzGroupId": {
+      "type": "string"
+    },
+    "com.amazonaws.arczonalshift#ZonalShiftId": {
+      "type": "string",
+      "traits": {
+        "smithy.api#length": { "min": 6, "max": 36 },
+        "smithy.api#pattern": "^[A-Za-z0-9-]+$"
+      }
+    },
+    "com.amazonaws.arczonalshift#ResourceIdentifier": {
+      "type": "string",
+      "traits": {
+        "smithy.api#length": { "min": 8, "max": 1024 }
+      }
+    },
+    "com.amazonaws.arczonalshift#AvailabilityZone": {
+      "type": "string",
+      "traits": {
+        "smithy.api#length": { "max": 20 }
+      }
+    },
+    "com.amazonaws.arczonalshift#ZonalShiftComment": {
+      "type": "string",
+      "traits": {
+        "smithy.api#length": { "max": 128 }
+      }
+    },
+    "com.amazonaws.arczonalshift#ExpiryTime": {
+      "type": "timestamp"
+    },
+    "com.amazonaws.arczonalshift#StartTime": {
+      "type": "timestamp"
+    },
+    "com.amazonaws.arczonalshift#ZonalShiftStatus": {
+      "type": "enum",
+      "members": {
+        "ACTIVE": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "ACTIVE" } },
+        "EXPIRED": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "EXPIRED" } },
+        "CANCELED": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "CANCELED" } }
+      }
+    },
+    "com.amazonaws.arczonalshift#AppliedStatus": {
+      "type": "enum",
+      "members": {
+        "APPLIED": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "APPLIED" } },
+        "NOT_APPLIED": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "NOT_APPLIED" } }
+      }
+    },
+    "com.amazonaws.arczonalshift#ShiftType": {
+      "type": "enum",
+      "members": {
+        "ZONAL_SHIFT": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "ZONAL_SHIFT" } },
+        "PRACTICE_RUN": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "PRACTICE_RUN" } },
+        "FIS_EXPERIMENT": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "FIS_EXPERIMENT" } },
+        "ZONAL_AUTOSHIFT": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "ZONAL_AUTOSHIFT" } }
+      }
+    },
+    "com.amazonaws.arczonalshift#PracticeRunOutcome": {
+      "type": "enum",
+      "members": {
+        "FAILED": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "FAILED" } },
+        "INTERRUPTED": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "INTERRUPTED" } },
+        "PENDING": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "PENDING" } },
+        "SUCCEEDED": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "SUCCEEDED" } },
+        "CAPACITY_CHECK_FAILED": { "target": "smithy.api#Unit", "traits": { "smithy.api#enumValue": "CAPACITY_CHECK_FAILED" } }
+      }
+    }
+  }
+}

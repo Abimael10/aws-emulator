@@ -27,17 +27,7 @@ pub struct ListZonalShiftsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.arczonalshift#ZonalShiftSummary")]
-#[derive(Debug, Clone)]
-pub struct ZonalShiftSummary {
-    pub zonal_shift_id: String,
-    pub resource_identifier: String,
-    pub away_from: String,
-    pub expiry_time: ::aws_smithy_types::DateTime,
-    pub start_time: ::aws_smithy_types::DateTime,
-    pub status: String,
-    pub comment: String,
-    pub shift_type: Option<String>,
-    pub practice_run_outcome: Option<String>,
-}
+// `ZonalShiftSummary` is in `zonal_shift_types`, with every other type this service
+// reports a zonal shift through: AWS carries a member on all of them that the model
+// snapshot does not declare, so they are generated from the overlay model beside it.
 

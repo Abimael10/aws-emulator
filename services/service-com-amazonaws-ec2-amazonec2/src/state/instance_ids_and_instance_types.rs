@@ -1037,9 +1037,9 @@ pub fn availability_zones_in_region(region: &str) -> Vec<AvailabilityZoneRecord>
     (0..AVAILABILITY_ZONES_PER_REGION)
         .map(|index| {
             let letter = char::from(b'a' + u8::try_from(index).unwrap_or(0));
-            // The model's `group-name` filter doc gives the zone group of an
-            // Availability Zone as `<region>-zg-1` (its example: `us-east-1-zg-1`).
-            let group_name = format!("{region}-zg-1");
+            // The zone group a Region's standard zones belong to, named the way every
+            // report of one names it (`service_common::aws_availability_zones`).
+            let group_name = ::service_common::aws_availability_zones::zone_group(region);
             AvailabilityZoneRecord {
                 zone_name: format!("{region}{letter}"),
                 zone_id: format!("{prefix}-az{}", index + 1),

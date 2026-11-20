@@ -84,6 +84,11 @@
 //! * `zonalShiftId` (ZonalShiftId, len 6..36, pattern ^[A-Za-z0-9-]+$) **required** — The
 //!   identifier of a zonal shift.
 //!
+//! Beside the members above, every zonal shift AWS reports carries `azGroupId` — the
+//! Availability Zone group of the Region the shifted resource lives in — which this model
+//! snapshot does not declare. It is declared in this crate instead; see
+//! `smithy-model/LOCAL-ADDITIONS.md` and `crate::state::az_group_id`.
+//!
 //! ## Errors
 //!
 //! * `AccessDeniedException` (HTTP 403) — You do not have sufficient access to perform this
@@ -99,7 +104,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::{as_date_time, zonal_shift_not_active, ZonalShiftStatus};
+use crate::state::{as_date_time, az_group_id, zonal_shift_not_active, ZonalShiftStatus};
 use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -213,6 +218,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let canceled = CancelZonalShiftOutput {
             zonal_shift_id: shift.zonal_shift_id.clone(),
+            // The group of the shifted resource's Region, the same value the create of
+            // this shift reported: one reading of it serves every site.
+            az_group_id: az_group_id(&shift.resource_identifier),
             resource_identifier: shift.resource_identifier.clone(),
             away_from: shift.away_from.clone(),
             expiry_time: as_date_time(shift.expiry_time),

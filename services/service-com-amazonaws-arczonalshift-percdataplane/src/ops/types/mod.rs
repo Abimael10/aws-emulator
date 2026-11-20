@@ -30,6 +30,10 @@ pub mod update_autoshift_observer_notification_status_types;
 pub mod update_practice_run_configuration_types;
 pub mod update_zonal_autoshift_configuration_types;
 pub mod update_zonal_shift_types;
+/// Every type this service reports a ZONAL SHIFT through, generated from the overlay
+/// model beside the snapshot: AWS carries one member on all of them that the snapshot
+/// does not declare (see `smithy-model/LOCAL-ADDITIONS.md`).
+pub mod zonal_shift_types;
 
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use cancel_practice_run_types::*;
@@ -63,4 +67,6 @@ pub use update_practice_run_configuration_types::*;
 pub use update_zonal_autoshift_configuration_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use update_zonal_shift_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use zonal_shift_types::*;
 

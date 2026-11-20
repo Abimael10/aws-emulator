@@ -37,6 +37,17 @@ pub fn availability_zones(region: &str) -> Vec<String> {
         .collect()
 }
 
+/// The ZONE GROUP the Availability Zones of `region` belong to: `<region>-zg-1`.
+///
+/// A zone group gathers the zones a Region exposes together, and the standard zones of a
+/// Region are all in its first group. The form is the one the EC2
+/// `DescribeAvailabilityZones` `group-name` filter documents — "The name of the zone group
+/// for the Availability Zone (for example, us-east-1-zg-1)" — so a report that names the
+/// group of a Region's zones, whichever service reports it, names it the same way.
+pub fn zone_group(region: &str) -> String {
+    format!("{region}-zg-1")
+}
+
 /// The zone LETTERS of `region`: its own entry when [`ZONE_LETTERS`] carries one, else
 /// [`DEFAULT_ZONE_LETTERS`].
 pub fn zone_letters(region: &str) -> &'static [&'static str] {
@@ -91,5 +102,30 @@ mod tests {
             zone_letters("us-west-2"),
             "a Region read off a credential scope matches whatever its case"
         );
+    }
+
+    /// The zone group of a Region's Availability Zones is that Region's first group,
+    /// whatever the Region: the rule is the Region name followed by the group suffix, not
+    /// a table of Regions.
+    #[test]
+    fn a_regions_zones_belong_to_its_first_zone_group() {
+        // Rows differ along the shape of the Region name: a three-part name, a four-part
+        // one, a Region outside the commercial partition, and one this module's zone-letter
+        // table says nothing about.
+        let cases: &[(&str, &str)] = &[
+            ("us-east-1", "us-east-1-zg-1"),
+            ("us-west-2", "us-west-2-zg-1"),
+            ("ap-southeast-4", "ap-southeast-4-zg-1"),
+            ("eu-central-1", "eu-central-1-zg-1"),
+            ("us-gov-west-1", "us-gov-west-1-zg-1"),
+            ("cn-north-1", "cn-north-1-zg-1"),
+        ];
+        for (region, expected) in cases {
+            let group = zone_group(region);
+            assert_eq!(
+                group, *expected,
+                "case {region}: expected zone group {expected}, got {group}"
+            );
+        }
     }
 }

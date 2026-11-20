@@ -88,6 +88,11 @@
 //! * `zonalShifts` (ZonalShiftsInResource) **required** — The zonal shifts that are currently
 //!   active for a resource.
 //!
+//! Beside the members above, every zonal shift AWS reports carries `azGroupId` — the
+//! Availability Zone group of the Region the shifted resource lives in — which this model
+//! snapshot does not declare, so each `zonalShifts` entry carries it. See
+//! `smithy-model/LOCAL-ADDITIONS.md` and `crate::state::az_group_id`.
+//!
 //! ## Errors
 //!
 //! * `AccessDeniedException` (HTTP 403) — You do not have sufficient access to perform this

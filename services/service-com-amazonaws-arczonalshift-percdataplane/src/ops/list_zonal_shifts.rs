@@ -72,6 +72,11 @@
 //!   indicates that more output is available. Set this parameter to the value provided by the
 //!   previous call's nextToken response to request the next page of results.
 //!
+//! Beside the members above, every zonal shift AWS reports carries `azGroupId` — the
+//! Availability Zone group of the Region the shifted resource lives in — which this model
+//! snapshot does not declare. It is declared in this crate instead; see
+//! `smithy-model/LOCAL-ADDITIONS.md` and `crate::state::az_group_id`.
+//!
 //! ## Errors
 //!
 //! * `AccessDeniedException` (HTTP 403) — You do not have sufficient access to perform this
@@ -83,7 +88,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::{as_date_time, encode_page_token, page_request};
+use crate::state::{as_date_time, az_group_id, encode_page_token, page_request};
 use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -206,6 +211,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .map(|shift| ZonalShiftSummary {
                 zonal_shift_id: shift.zonal_shift_id.clone(),
+                // The group of the shifted resource's Region, read the way every other
+                // site that reports this shift reads it.
+                az_group_id: az_group_id(&shift.resource_identifier),
                 resource_identifier: shift.resource_identifier.clone(),
                 away_from: shift.away_from.clone(),
                 expiry_time: as_date_time(shift.expiry_time),

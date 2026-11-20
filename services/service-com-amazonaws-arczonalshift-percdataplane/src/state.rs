@@ -647,9 +647,33 @@ impl ComAmazonawsArczonalshiftPercdataplaneState {
                 comment: shift.comment.clone(),
                 shift_type: Some(shift.shift_type.as_wire().to_string()),
                 practice_run_outcome: shift.practice_run_outcome.clone(),
+                // The group of the shifted resource's Region, read the way every other
+                // site that reports this shift reads it.
+                az_group_id: az_group_id(&shift.resource_identifier),
             })
             .collect()
     }
+}
+
+/// The ZONE GROUP of the Availability Zones of the Region the resource
+/// `resource_identifier` lives in, which every zonal-shift object ARC reports names in
+/// `azGroupId`.
+///
+/// A `resourceIdentifier` is the resource's ARN and nothing else
+/// (`ResourceIdentifier`'s documentation: "The identifier is the Amazon Resource Name
+/// (ARN) for the resource"), so the Region a shift's resource lives in is that ARN's
+/// Region field, and the group its zones belong to is read from the one place this
+/// workspace names a zone group ([`::service_common::aws_availability_zones::zone_group`]).
+///
+/// `None` for an identifier that is not a well-formed ARN, and for one whose Region field
+/// is empty or is not a Region label: such a value names no Region, so it names no zone
+/// group either, and the member is then simply absent rather than filled with text the
+/// caller supplied.
+#[must_use]
+pub fn az_group_id(resource_identifier: &str) -> Option<String> {
+    let arn = ::service_common::arn::parse(resource_identifier)?;
+    let region = ::service_common::arn::region_label(arn.region)?;
+    Some(::service_common::aws_availability_zones::zone_group(region))
 }
 
 /// A stored instant as the wire timestamp the model declares.

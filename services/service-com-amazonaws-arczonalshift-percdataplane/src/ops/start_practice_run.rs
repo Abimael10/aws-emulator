@@ -84,6 +84,11 @@
 //! * `zonalShiftId` (ZonalShiftId, len 6..36, pattern ^[A-Za-z0-9-]+$) **required** — The
 //!   identifier of a practice run zonal shift.
 //!
+//! Beside the members above, every zonal shift AWS reports carries `azGroupId` — the
+//! Availability Zone group of the Region the shifted resource lives in — which this model
+//! snapshot does not declare, and a practice run is a zonal shift. See
+//! `smithy-model/LOCAL-ADDITIONS.md` and `crate::state::az_group_id`.
+//!
 //! ## Errors
 //!
 //! * `AccessDeniedException` (HTTP 403) — You do not have sufficient access to perform this
@@ -100,7 +105,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{
-    active_zonal_shift_exists, alarms_in_alarm_state, invalid_availability_zone,
+    active_zonal_shift_exists, alarms_in_alarm_state, az_group_id, invalid_availability_zone,
     practice_run_blocker, practice_run_configuration_missing, practice_run_expiry_time, ShiftType,
     ZonalShift, ZonalShiftStatus,
 };
@@ -299,6 +304,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(StartPracticeRunOutput {
             zonal_shift_id: shift.zonal_shift_id,
+            // A practice run is a zonal shift, so it reports the group of its resource's
+            // Region the way every other site that reports a shift does.
+            az_group_id: az_group_id(&shift.resource_identifier),
             resource_identifier: shift.resource_identifier,
             away_from: shift.away_from,
             expiry_time: crate::state::as_date_time(shift.expiry_time),
