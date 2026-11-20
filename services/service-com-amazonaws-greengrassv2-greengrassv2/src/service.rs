@@ -40,14 +40,17 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 //!
-//! A sixth seam, `override_protocol`, is one this service DOES take, for one framing the
-//! model's protocol cannot state: an operation whose output structure declares no member
+//! A sixth seam, `override_protocol`, is one this service DOES take, for two framings the
+//! model's protocol cannot state. An operation whose output structure declares no member
 //! (`TagResource`, `UntagResource`) answers `204 No Content`, and a response at that
 //! status carries no body at all rather than the empty JSON object the serializer renders
-//! for a members-less output. The correction is not written here — it is
+//! for a members-less output; the correction is not written here — it is
 //! [`service_common::no_content_responses::without_content`], which owns that framing for
-//! every service that needs it — and it is applied at the one place every response of this
-//! service passes through rather than per operation.
+//! every service that needs it. And a refusal of the LEGACY Greengrass routes this service
+//! co-hosts names no error shape at all, which
+//! [`crate::state::without_error_shape`] states once for both of those refusal classes.
+//! Both are applied at the one place every response of this service passes through rather
+//! than per operation.
 //!
 //! `override_operation` is taken too, for the requests the model's routing key cannot name:
 //! the framework's route lookup withholds a route whose `@required` header or query bindings
@@ -196,8 +199,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     }
 }
 
-/// The protocol this service answers modelled requests in: the model's own, with the one
-/// framing correction the module docs state.
+/// The protocol this service answers modelled requests in: the model's own, with the two
+/// framing corrections the module docs state.
 ///
 /// Implemented on the service itself because the model-derived protocol it delegates to is
 /// owned by the generated entry and reached by reference (`self.entry.protocol()`), and
@@ -254,6 +257,13 @@ impl<Eng: Send + Sync + 'static> ServerProtocol for EmulatedService<Eng> {
             .entry
             .protocol()
             .serialize_error(error, error_schema, error_code, http_status)?;
+        // A refusal the LEGACY Greengrass surface words itself names no error shape, so the
+        // shared renderer's two namings of one are dropped from it; every modelled failure
+        // is returned exactly as that renderer wrote it. See
+        // [`crate::state::without_error_shape`] — the one place that envelope is stated,
+        // reached here because this is the one seam every response of this service passes
+        // through.
+        let response = crate::state::without_error_shape(error_schema, response);
         // Every modelled failure of this service carries its error envelope at a 4xx or
         // 5xx, so nothing here is emptied; the same call is made on both paths rather
         // than leaving one of them to answer differently.

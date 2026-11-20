@@ -162,9 +162,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The list the request carries is the core device's connectivity information, so
         // storing it REPLACES what that device had published and mints the version token
         // this response names — the token a client compares to detect a concurrent
-        // overwrite. A list this surface cannot read as connectivity information is
-        // refused in the legacy envelope, naming the member that could not be read, and
-        // nothing is written.
+        // overwrite. A body this surface cannot read as connectivity information is refused
+        // in the legacy envelope, and nothing is written.
         let endpoints = input.connectivity_info.len();
         let version = match state
             .lock()
@@ -172,10 +171,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             Ok(version) => version,
             Err(st::ConnectivityInfoRefusal::Unparsable) => {
-                return Err(st::LegacyRefusal::bad_request(
-                    st::UNPARSABLE_CONNECTIVITY_INFO_MESSAGE,
+                return Err(
+                    st::LegacyRefusal::bad_request(st::UNREADABLE_REQUEST_BODY_MESSAGE).into(),
                 )
-                .into())
             }
             Err(st::ConnectivityInfoRefusal::StoreFull) => {
                 return Err(UpdateConnectivityInfoErrorModeled::InternalServerException(

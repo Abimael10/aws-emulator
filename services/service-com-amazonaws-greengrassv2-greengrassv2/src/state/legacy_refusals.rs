@@ -9,11 +9,13 @@
 //! (`smithy_query(query="digest")` on both models; `service_common::greengrass` names this
 //! service as the one claimant). AWS co-hosts the two API versions on one endpoint and
 //! answers those routes in the ELDER envelope: a client error carries its sentence in a
-//! `Message` body member, not in the lowercase `message` the 2020-11-30 shapes declare,
-//! and the account service role reports "nothing associated" as a 404 rather than as an
-//! empty success. Neither is expressible as a variant of an operation's
-//! `#[operation_error]` enum: the body member's wire name belongs to the shape, and no
-//! shape of this model carries a 404 at all.
+//! `Message` body member, not in the lowercase `message` the 2020-11-30 shapes declare, it
+//! names NO error shape at all (so the code every SDK reports for it is the HTTP status),
+//! and a legacy fact that is not established — the account's service role, a core device's
+//! connectivity information — is reported as a 404 rather than as an empty success. None of
+//! that is expressible as a variant of an operation's `#[operation_error]` enum: the body
+//! member's wire name belongs to the shape, no shape of this model carries a 404 at all,
+//! and every modelled failure names its shape.
 //!
 //! So the two refusal classes live here, once, rather than in each operation's file: what
 //! a refusal looks like on the wire is a property of the SERVICE, and two operations that
@@ -26,32 +28,39 @@
 //! recorded envelope is this model's own. The two differ because the recorded responses
 //! differ, not because two authors chose differently.
 
+use ::aws_smithy_runtime_api::http::Response as WireResponse;
 use ::aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use ::aws_smithy_schema::{Schema, ShapeId, ShapeType};
+use ::service_common::error_type_locator::{without_error_shape_in_body, ERROR_TYPE_HEADER};
 use ::smithy_server_runtime::OperationError;
 
-/// The `__type` a client-input refusal of the legacy surface is named by: the client-error
-/// shape the 2017-06-07 model declares for both mutating operations of that surface
-/// (`smithy_query(query="operation",operation="AssociateServiceRoleToAccount")` on
-/// `com-amazonaws-greengrass-greengrass` lists `BadRequestException`, `httpError` 400,
-/// whose one documented member is `Message`).
-pub const LEGACY_BAD_REQUEST_CODE: &str = "BadRequestException";
-
-/// The status that refusal carries, from the same `httpError`.
+/// The status a client-input refusal of the legacy surface carries: the `httpError` of the
+/// client-error shape the 2017-06-07 model declares for both mutating operations of that
+/// surface (`smithy_query(query="operation",operation="AssociateServiceRoleToAccount")` on
+/// `com-amazonaws-greengrass-greengrass` lists `BadRequestException`, `httpError` 400, whose
+/// one documented member is `Message`).
 pub const LEGACY_BAD_REQUEST_STATUS: u16 = 400;
 
-/// The `__type` a "nothing is associated" report of the legacy surface is named by.
+/// The status a "that fact is not established" report of the legacy surface carries.
 ///
 /// RECORDED behaviour, not modelled: neither Greengrass model declares a 404 shape for the
-/// account service role, yet the endpoint answers the un-associated account at that status
-/// with a sentence telling the caller to attach a role. The code is the one this service
-/// already answers its other recorded, unmodelled 404 under
-/// ([`super::TAGGING_NOT_FOUND_CODE`]), so one not-found class is named one way across the
-/// service.
-pub const LEGACY_NOT_FOUND_CODE: &str = super::TAGGING_NOT_FOUND_CODE;
-
-/// The status that report carries.
+/// account service role or for a core device's connectivity information, yet the endpoint
+/// answers both at that status, with a sentence saying what is missing.
 pub const LEGACY_NOT_FOUND_STATUS: u16 = 404;
+
+/// What a client reads as the error CODE of a legacy refusal: its HTTP status, as text.
+///
+/// RECORDED behaviour: an answer of this surface names no error shape — the body carries the
+/// one `Message` member and no shape discriminator, and no shape header travels with it — so
+/// every SDK falls back to the status string for the code a client branches on.
+/// [`without_error_shape`] is what holds that true of the RENDERED answer; these two are the
+/// code that answer then surfaces as, and are what the error channel reports as its shape
+/// name, so a refusal is classified under what its client sees rather than under a shape no
+/// response names.
+pub const LEGACY_BAD_REQUEST_CODE: &str = "400";
+
+/// The code a not-found report of this surface surfaces as, for the same reason.
+pub const LEGACY_NOT_FOUND_CODE: &str = "404";
 
 /// What `AssociateServiceRoleToAccount` answers a `RoleArn` that is no IAM role ARN.
 ///
@@ -64,14 +73,22 @@ pub const INVALID_ROLE_ARN_MESSAGE: &str = "That role ARN is invalid.";
 /// request (there is none to name — the operation takes no input).
 pub const NO_SERVICE_ROLE_MESSAGE: &str = "You need to attach an IAM role to this AWS account.";
 
-/// What `UpdateConnectivityInfo` answers a `ConnectivityInfo` list it cannot read as
-/// connectivity information.
+/// What `UpdateConnectivityInfo` answers a request body it cannot read as the connectivity
+/// information the operation takes.
 ///
-/// The sentence names the request MEMBER that could not be read, under the wire name the
-/// legacy API publishes it as (`connectivityInfoList`), which is the form AWS words an
-/// unparsable parameter in.
-pub const UNPARSABLE_CONNECTIVITY_INFO_MESSAGE: &str =
-    "The following required parameter(s) are unparsable: connectivityInfoList.";
+/// Fixed text: the refusal is about the BODY as a whole, so it names no member, value or
+/// limit of the request.
+pub const UNREADABLE_REQUEST_BODY_MESSAGE: &str = "Invalid json format found in the request body.";
+
+/// What `GetConnectivityInfo` answers for a core device that has published no connectivity
+/// information.
+///
+/// The thing name the request carried is the one variable part of the sentence; the rest is
+/// fixed text, and nothing of the stored state appears in it — there is none to report.
+#[must_use]
+pub fn no_connectivity_info_message(thing_name: &str) -> String {
+    format!("No connectivity info found for thing {thing_name}.")
+}
 
 /// The `Message` member of the legacy client-error shape.
 ///
@@ -96,9 +113,9 @@ static LEGACY_BAD_REQUEST_MESSAGE: Schema = Schema::new_member(
 ///
 /// In the `smithy.framework` namespace for the same reason as the scaffold's synthetic
 /// shapes (`crate::scaffolded`): the shape is in no model, so it must not collide with a
-/// modelled one, and its own id never reaches the wire — the `__type` and the
-/// `x-amzn-errortype` header come from [`OperationError::shape_name`], which answers
-/// [`LEGACY_BAD_REQUEST_CODE`].
+/// modelled one, and its own id never reaches the wire. It is what [`without_error_shape`]
+/// recognises a rendered answer of this surface by, so no shape — neither this one nor the
+/// code [`LEGACY_BAD_REQUEST_CODE`] stands in for — is named in the response.
 static LEGACY_BAD_REQUEST_SCHEMA: Schema = Schema::new_struct(
     ShapeId::from_static(
         "smithy.framework#GreengrassLegacyBadRequest",
@@ -137,6 +154,35 @@ static LEGACY_NOT_FOUND_SCHEMA: Schema = Schema::new_struct(
     &[&LEGACY_NOT_FOUND_MESSAGE],
 );
 
+/// Whether a failure rendered against `error_schema` is one of this surface's own refusals.
+///
+/// The two synthetic shapes above are what mark it: a MODELLED failure of these operations
+/// renders against its model's own shape and keeps naming it.
+#[must_use]
+fn is_legacy_refusal(error_schema: &Schema) -> bool {
+    [&LEGACY_BAD_REQUEST_SCHEMA, &LEGACY_NOT_FOUND_SCHEMA]
+        .into_iter()
+        .any(|shape| shape.shape_id() == error_schema.shape_id())
+}
+
+/// `response`, rendered for a failure against `error_schema`, as the LEGACY surface answers
+/// it: a refusal of either class above carries its one `Message` and names no error shape —
+/// neither the body's discriminator nor the header a REST client resolves a shape from — so
+/// the code every SDK reports for it is the HTTP status it carries.
+///
+/// A failure of any other class is returned untouched, status, headers and body alike: a
+/// modelled error of these same operations is named by its modelled shape exactly as its
+/// siblings' are.
+#[must_use]
+pub fn without_error_shape(error_schema: &Schema, response: WireResponse) -> WireResponse {
+    if !is_legacy_refusal(error_schema) {
+        return response;
+    }
+    let mut response = without_error_shape_in_body(response);
+    response.headers_mut().remove(ERROR_TYPE_HEADER);
+    response
+}
+
 /// The body of a legacy client-error refusal: the one sentence it states.
 #[derive(Debug, Clone)]
 pub struct LegacyBadRequest {
@@ -167,10 +213,11 @@ impl SerializableStruct for LegacyNotFound {
 /// wire code, the HTTP status and the body it answers with.
 #[derive(Debug)]
 pub enum LegacyRefusal {
-    /// A request this surface cannot read: the value it carries is not of the form the
-    /// operation takes.
+    /// A request this surface cannot read: the body, or a value it carries, is not of the
+    /// form the operation takes.
     BadRequest(LegacyBadRequest),
-    /// The account-level fact the request asked for is not established.
+    /// The fact the request asked about is not established — for the account, or for the
+    /// core device the request named.
     NotFound(LegacyNotFound),
 }
 
@@ -207,8 +254,9 @@ impl LegacyRefusal {
         }
     }
 
-    /// The code on the wire, which the framework reads from an operation's `shape_name`
-    /// rather than from the schema.
+    /// The code this refusal SURFACES as, which the framework reads from an operation's
+    /// `shape_name`. The rendered answer names no shape ([`without_error_shape`]), so this
+    /// is the status the client falls back to rather than a shape name.
     fn error_code(&self) -> &'static str {
         match self {
             Self::BadRequest(_) => LEGACY_BAD_REQUEST_CODE,

@@ -2,7 +2,9 @@
 
 //! @op GetConnectivityInfo
 //! Reports the connectivity information a Greengrass core device has published: the
-//! endpoint list the last write stored for that thing name, and nothing else.
+//! endpoint list the last write stored for that thing name, and nothing else. A core device
+//! that has published none is reported as the legacy surface's not-found rather than as an
+//! empty list.
 //!
 //! ## Shape of an operation
 //!
@@ -90,14 +92,21 @@ pub enum GetConnectivityInfoErrorModeled {
 
 /// This operation's error channel, as the generated `impl Operation` names it
 /// (`crate::ops::get_connectivity_info::GetConnectivityInfoError`).
-pub type GetConnectivityInfoError = crate::scaffolded::Scaffolded<GetConnectivityInfoErrorModeled>;
+///
+/// The operation's own modelled channel, widened by the refusals the LEGACY Greengrass
+/// surface words itself ([`crate::state::LegacyRefusal`]): this route is one both API
+/// versions publish, and AWS reports a core device that has published no connectivity
+/// information at 404 with its sentence in a `Message` body member — a status no shape of
+/// either Greengrass model carries, so it cannot be a variant of the enum above.
+pub type GetConnectivityInfoError =
+    crate::state::LegacyRefusable<GetConnectivityInfoErrorModeled>;
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
 /// wrapper variant.
 impl From<GetConnectivityInfoErrorModeled> for GetConnectivityInfoError {
     fn from(modeled: GetConnectivityInfoErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        Self::Channel(crate::scaffolded::Scaffolded::Modeled(modeled))
     }
 }
 
@@ -152,14 +161,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A pure REPORT of the one record the core device's thing name holds, so it writes
-        // nothing: the endpoints are reported in the order the write stored them, and a
-        // thing name nothing has been published for reports an EMPTY list — it has no
-        // endpoint a client device could connect to, which is what the caller asked about.
+        // nothing: the endpoints are reported in the order the write stored them. A thing
+        // name nothing has been published for holds NO record, and that is not reported as
+        // a success carrying an empty list — which would be a core device publishing an
+        // endpoint set that happens to be empty: the endpoint reports it at 404, naming the
+        // core device whose connectivity information is missing, so a client can branch on
+        // it instead of connecting nowhere.
         let entries = state
             .lock()
             .connectivity_info(&input.thing_name)
-            .map(|record| record.entries.clone())
-            .unwrap_or_default();
+            .map(|record| record.entries.clone());
+        let Some(entries) = entries else {
+            return Err(st::LegacyRefusal::not_found(st::no_connectivity_info_message(
+                &input.thing_name,
+            ))
+            .into());
+        };
 
         // Only the endpoints: the `message` member reports a remark about the request, and
         // reporting what is stored has no remark to make.

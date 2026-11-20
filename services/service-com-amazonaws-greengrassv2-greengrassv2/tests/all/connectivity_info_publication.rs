@@ -9,12 +9,14 @@
 //!   published and answers the version token minted for the stored list — a fresh token
 //!   per write, so a client can tell one write's list from another's;//! * `GetConnectivityInfo` reports exactly the endpoints the last write stored for that
 //!   thing name, in the order they were written and with every member each entry carried,
-//!   and reports an empty list for a thing name nothing has been published for;
+//!   and reports a thing name nothing has been published for in the legacy surface's
+//!   not-found envelope (HTTP 404 with the sentence in a `Message` body member naming that
+//!   core device) rather than as a success carrying an empty list;
 //! * each core device's record is its own: writing one thing name's endpoints changes no
 //!   other thing name's; and
-//! * a list this surface cannot read as connectivity information — an entry that names no
-//!   endpoint — is refused in the legacy envelope (HTTP 400 with the sentence in a
-//!   `Message` body member) and nothing is stored.
+//! * a body this surface cannot read as connectivity information — a list with an entry
+//!   that names no endpoint — is refused in the legacy envelope (HTTP 400 with the sentence
+//!   in a `Message` body member) and nothing is stored.
 //!
 //! Every assertion drives the real `restJson1` front door: the request is built the way an
 //! SDK builds it, dispatched through [`MultiServiceRouter`], and judged on the HTTP status
@@ -37,12 +39,43 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The region these requests are signed for.
 pub(crate) const REGION: &str = "us-west-2";
 
-/// The status and sentence this surface refuses an unreadable connectivity list with —
-/// written here as the literals AWS answers rather than read from the implementation's
-/// constants, so a wording that drifts away from AWS fails this suite.
-const UNPARSABLE_STATUS: u16 = 400;
-pub(crate) const UNPARSABLE_MESSAGE: &str =
-    "The following required parameter(s) are unparsable: connectivityInfoList.";
+/// The status and sentence this surface refuses a body it cannot read as connectivity
+/// information with — written here as the literals AWS answers rather than read from the
+/// implementation's constants, so a wording that drifts away from AWS fails this suite.
+const UNREADABLE_STATUS: u16 = 400;
+pub(crate) const UNREADABLE_BODY_MESSAGE: &str = "Invalid json format found in the request body.";
+
+/// The status this surface reports a core device that has published no connectivity
+/// information at, and the sentence that report carries — again the literals AWS answers.
+/// The thing name is the one variable part of the sentence.
+pub(crate) const NO_CONNECTIVITY_INFO_STATUS: u16 = 404;
+pub(crate) fn no_connectivity_info_message(thing_name: &str) -> String {
+    format!("No connectivity info found for thing {thing_name}.")
+}
+
+/// Assert that `status` and `body` are this surface's report of a core device that has
+/// published no connectivity information: the status above, that one sentence naming
+/// `thing_name`, and no endpoint list at all.
+pub(crate) async fn assert_no_connectivity_info(
+    router: &MultiServiceRouter,
+    case: &str,
+    thing_name: &str,
+) {
+    let (status, got) = read(router, thing_name).await;
+    assert_eq!(
+        (status, text(&got, "Message")),
+        (
+            NO_CONNECTIVITY_INFO_STATUS,
+            no_connectivity_info_message(thing_name)
+        ),
+        "case {case:?}: expected the no-connectivity-info report, got {status} {got}"
+    );
+    assert!(
+        got.get("ConnectivityInfo").is_none(),
+        "case {case:?}: a report naming no connectivity information carries no endpoint \
+         list, got {got}"
+    );
+}
 
 /// The status the framework refuses a value outside a modelled bound at, before any
 /// handler runs.
@@ -225,16 +258,15 @@ async fn publishing_connectivity_info_replaces_it_and_a_read_reports_what_was_st
     let router = emulator();
     let thing_name = "laser-1";
 
-    // Nothing has been published for this core device yet, so the read reports no
-    // endpoints — and asking does not bring any into being.
+    // Nothing has been published for this core device yet, so the read reports that — and
+    // asking does not bring a record into being.
     for attempt in 1..=2 {
-        let (status, got) = read(&router, thing_name).await;
-        assert_eq!(
-            (status, reported(&got)),
-            (200, Vec::new()),
-            "case nothing published, read {attempt}: expected an empty endpoint list, \
-             got {status} {got}"
-        );
+        assert_no_connectivity_info(
+            &router,
+            &format!("nothing published, read {attempt}"),
+            thing_name,
+        )
+        .await;
     }
 
     // Each row publishes OVER the list the previous row left, so the rule under test is
@@ -398,15 +430,15 @@ async fn a_list_that_is_not_connectivity_info_is_refused_and_stores_nothing() {
         let (status, refused) = publish(&router, thing_name, entries).await;
         assert_eq!(
             (status, text(&refused, "Message").as_str()),
-            (UNPARSABLE_STATUS, UNPARSABLE_MESSAGE),
-            "case {case:?}: expected the unparsable-list refusal, got {status} {refused}"
+            (UNREADABLE_STATUS, UNREADABLE_BODY_MESSAGE),
+            "case {case:?}: expected the unreadable-body refusal, got {status} {refused}"
         );
-        let (status, got) = read(&router, thing_name).await;
-        assert_eq!(
-            (status, reported(&got)),
-            (200, Vec::new()),
-            "case {case:?}: a refused write stores nothing, got {status} {got}"
-        );
+        assert_no_connectivity_info(
+            &router,
+            &format!("{case}: a refused write stores nothing"),
+            thing_name,
+        )
+        .await;
     }
 
     // With endpoints published, a refused write leaves THAT list exactly as it was: the
@@ -417,8 +449,8 @@ async fn a_list_that_is_not_connectivity_info_is_refused_and_stores_nothing() {
         let (status, refused) = publish(&router, thing_name, entries).await;
         assert_eq!(
             (status, text(&refused, "Message").as_str()),
-            (UNPARSABLE_STATUS, UNPARSABLE_MESSAGE),
-            "case {case:?} over a published list: expected the unparsable-list refusal, \
+            (UNREADABLE_STATUS, UNREADABLE_BODY_MESSAGE),
+            "case {case:?} over a published list: expected the unreadable-body refusal, \
              got {status} {refused}"
         );
         let (status, got) = read(&router, thing_name).await;
@@ -457,11 +489,11 @@ async fn a_port_outside_the_modelled_range_is_refused() {
             "case {case:?}: expected {MODELED_REFUSAL_STATUS} for a port outside the \
              modelled range, got {status} {refused}"
         );
-        let (status, got) = read(&router, thing_name).await;
-        assert_eq!(
-            (status, reported(&got)),
-            (200, Vec::new()),
-            "case {case:?}: a refused write stores nothing, got {status} {got}"
-        );
+        assert_no_connectivity_info(
+            &router,
+            &format!("{case}: a refused write stores nothing"),
+            thing_name,
+        )
+        .await;
     }
 }

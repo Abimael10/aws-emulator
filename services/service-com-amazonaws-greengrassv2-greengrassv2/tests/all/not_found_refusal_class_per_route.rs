@@ -19,17 +19,27 @@
 //!   authenticate with an IoT device certificate"), so an IAM caller is refused `403`
 //!   `AccessDeniedException` with the authorization layer's fixed sentence BEFORE any
 //!   resource is looked at — the same answer whether the candidate exists or not, which
-//!   is what makes this refusal the route's and not the resource's.
+//!   is what makes this refusal the route's and not the resource's; and
+//! * the LEGACY Greengrass routes this service co-hosts (`/greengrass/servicerole` and
+//!   `/greengrass/things/{thingName}/connectivityInfo`) answer a client error in the ELDER
+//!   envelope: the sentence travels in a capitalized `Message` body member and the answer
+//!   names NO error shape — neither the body's `__type` discriminator nor the
+//!   `x-amzn-errortype` header a REST client resolves a shape from — so the code every SDK
+//!   reports for it is the HTTP status; and a legacy fact that is not established (the
+//!   account's service role, a core device's connectivity information) is reported in that
+//!   envelope at `404` rather than as a success carrying nothing. The 2020-11-30 routes
+//!   above are the control: each of those names its own shape in both places.
 //!
 //! Every assertion drives the real `restJson1` front door: the request is built the way
 //! an SDK builds it, dispatched through [`MultiServiceRouter`], and judged on the HTTP
-//! status and the JSON body.
+//! status, the response headers and the JSON body.
 //!
-//! The rows differ along what the rules generalise over — the ROUTE asked, and the way a
+//! The rows differ along what the rules generalise over — the ROUTE asked, the way a
 //! request can name nothing (a component version just deleted, a version never published
 //! of a component that exists, a component never created, the same name under another
-//! Region or another account, and several forms of a deployment id nothing minted) — not
-//! along the resource names, which the rules say nothing about.
+//! Region or another account, and several forms of a deployment id nothing minted), and for
+//! the legacy surface the refusal CLASS, the route and the form of the value each row
+//! carries — not along the resource names, which the rules say nothing about.
 
 use std::sync::Arc;
 
@@ -88,17 +98,21 @@ fn emulator() -> MultiServiceRouter {
     router
 }
 
-/// Dispatch one request and return its status and parsed JSON body. `iam` says whether the
-/// request presents the `Authorization` header an AWS SDK signs a control-plane request
-/// with; a request without one is what a core device's own connection looks like, since its
-/// identity is an X.509 certificate rather than an IAM credential.
-async fn call(
+/// Dispatch one request and return the WHOLE response, headers included. `iam` says
+/// whether the request presents the `Authorization` header an AWS SDK signs a control-plane
+/// request with; a request without one is what a core device's own connection looks like,
+/// since its identity is an X.509 certificate rather than an IAM credential.
+///
+/// The one place a request of this suite is built: part of a refusal's envelope travels in
+/// the headers (the shape a REST client resolves an error from), so the raw answer is handed
+/// back and [`call`] reads the status and the body off it.
+async fn dispatch(
     router: &MultiServiceRouter,
     method: &str,
     path: &str,
     iam: bool,
     body: Vec<u8>,
-) -> (u16, Value) {
+) -> http::Response<Bytes> {
     let mut request = http::Request::builder()
         .method(method)
         .uri(format!("https://greengrass.{REGION}.amazonaws.com{path}"))
@@ -112,13 +126,24 @@ async fn call(
             ),
         );
     }
-    let response = router
+    router
         .dispatch(
             request
                 .body(Bytes::from(body))
                 .expect("a well-formed test request"),
         )
-        .await;
+        .await
+}
+
+/// Dispatch one request and return its status and parsed JSON body.
+async fn call(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    iam: bool,
+    body: Vec<u8>,
+) -> (u16, Value) {
+    let response = dispatch(router, method, path, iam, body).await;
     let status = response.status().as_u16();
     let raw = response.into_body();
     let value = if raw.is_empty() {
@@ -613,5 +638,273 @@ async fn the_data_plane_resolution_route_answers_an_iam_caller_the_same_way_rega
         RESOURCE_NOT_FOUND_CODE,
         "case a core device naming a version never published: expected \
          {RESOURCE_NOT_FOUND_CODE}, got {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The LEGACY Greengrass routes' own envelope
+// ---------------------------------------------------------------------------
+
+/// The route the account's service role is published at by BOTH API versions
+/// (`smithy_query(query="operation",operation="GetServiceRoleForAccount")`: `GET`, `PUT` and
+/// `DELETE /greengrass/servicerole`).
+const SERVICE_ROLE_PATH: &str = "/greengrass/servicerole";
+
+/// The route a core device's connectivity information is published at by both
+/// (`smithy_query(query="operation",operation="GetConnectivityInfo")`:
+/// `/greengrass/things/{thingName}/connectivityInfo`).
+fn connectivity_info_path(thing_name: &str) -> String {
+    format!("/greengrass/things/{thing_name}/connectivityInfo")
+}
+
+/// The sentences the legacy surface words its own refusals with, written here as the
+/// literals AWS answers rather than read from the implementation's constants, so a wording
+/// that drifts away from AWS fails this suite. Each is entirely fixed text except the
+/// connectivity-information report, whose one variable part is the core device the request
+/// named.
+const NO_SERVICE_ROLE_MESSAGE: &str = "You need to attach an IAM role to this AWS account.";
+const INVALID_ROLE_ARN_MESSAGE: &str = "That role ARN is invalid.";
+const UNREADABLE_BODY_MESSAGE: &str = "Invalid json format found in the request body.";
+fn no_connectivity_info_message(thing_name: &str) -> String {
+    format!("No connectivity info found for thing {thing_name}.")
+}
+
+/// The header a REST client resolves a failure's error shape from, which a legacy refusal
+/// carries none of.
+const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
+
+/// The value of that header, or `None` when the answer carries it not at all.
+fn error_type_header(response: &http::Response<Bytes>) -> Option<String> {
+    response
+        .headers()
+        .get(ERROR_TYPE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
+/// One refusal of the legacy surface: the request that provokes it, and the status and
+/// sentence it is answered with.
+struct LegacyRefusal {
+    case: &'static str,
+    method: &'static str,
+    path: String,
+    body: Vec<u8>,
+    status: u16,
+    message: String,
+}
+
+/// Serialize a request document.
+fn document(body: &Value) -> Vec<u8> {
+    serde_json::to_vec(body).expect("a serializable request body")
+}
+
+/// The rows span what the legacy-envelope rule generalises over: both legacy ROUTES, both
+/// refusal CLASSES (a fact that is not established, and a body this surface cannot read),
+/// and, within each class, the forms a value can take — the ways a `RoleArn` can be no IAM
+/// role ARN, the forms of a core device thing name
+/// (`smithy_query(query="operation",operation="GetConnectivityInfo")`: `CoreDeviceThingName`,
+/// `length 1..128`), and the ways a published list can name no endpoint.
+fn legacy_refusals() -> Vec<LegacyRefusal> {
+    let mut rows = vec![LegacyRefusal {
+        case: "the account's service role while none is associated",
+        method: "GET",
+        path: SERVICE_ROLE_PATH.to_string(),
+        body: Vec::new(),
+        status: 404,
+        message: NO_SERVICE_ROLE_MESSAGE.to_string(),
+    }];
+    for (case, role_arn) in [
+        ("a bare role name", "GreengrassServiceRole".to_string()),
+        (
+            "an IAM user, which is not a role",
+            format!("arn:aws:iam::{ACCOUNT}:user/greengrass-operator"),
+        ),
+        (
+            "another service's ARN",
+            format!("arn:aws:greengrass:{REGION}:{ACCOUNT}:coreDevices:laser-1"),
+        ),
+    ] {
+        rows.push(LegacyRefusal {
+            case,
+            method: "PUT",
+            path: SERVICE_ROLE_PATH.to_string(),
+            body: document(&json!({ "RoleArn": role_arn })),
+            status: 400,
+            message: INVALID_ROLE_ARN_MESSAGE.to_string(),
+        });
+    }
+    for (case, thing_name) in [
+        ("a plain core device thing name", "laser-1".to_string()),
+        (
+            "a thing name carrying every separator IoT admits",
+            "fleet_a-core.1:probe".to_string(),
+        ),
+        ("a thing name at the modelled length bound", "c".repeat(128)),
+    ] {
+        rows.push(LegacyRefusal {
+            case,
+            method: "GET",
+            path: connectivity_info_path(&thing_name),
+            body: Vec::new(),
+            status: 404,
+            message: no_connectivity_info_message(&thing_name),
+        });
+    }
+    for (case, entries) in [
+        ("a list naming no endpoint at all", json!([])),
+        (
+            "an entry carrying no address",
+            json!([{ "Id": "no-address", "PortNumber": 8_883 }]),
+        ),
+        (
+            "an entry carrying nothing at all",
+            json!([{}]),
+        ),
+    ] {
+        rows.push(LegacyRefusal {
+            case,
+            method: "PUT",
+            path: connectivity_info_path("laser-1"),
+            body: document(&json!({ "ConnectivityInfo": entries })),
+            status: 400,
+            message: UNREADABLE_BODY_MESSAGE.to_string(),
+        });
+    }
+    rows
+}
+
+#[tokio::test]
+async fn the_legacy_routes_refuse_in_the_elder_envelope_and_name_no_error_shape() {
+    let router = emulator();
+
+    // Every row is refused with its own status and sentence, in a body that names no error
+    // shape and under no header naming one: what a client reads as the code of these
+    // refusals is the status itself.
+    for row in legacy_refusals() {
+        let response = dispatch(&router, row.method, &row.path, true, row.body).await;
+        let status = response.status().as_u16();
+        let header = error_type_header(&response);
+        let raw = response.into_body();
+        let body: Value = serde_json::from_slice(&raw)
+            .unwrap_or(Value::String(String::from_utf8_lossy(&raw).into_owned()));
+        assert_eq!(
+            (status, text(&body, "Message")),
+            (row.status, row.message.clone()),
+            "case {:?} on {} {}: expected {} {:?}, got {status} {body}",
+            row.case,
+            row.method,
+            row.path,
+            row.status,
+            row.message
+        );
+        assert_eq!(
+            header, None,
+            "case {:?} on {} {}: the legacy envelope names no error shape in a header, \
+             got {header:?}",
+            row.case, row.method, row.path
+        );
+        assert!(
+            body.get("__type").is_none(),
+            "case {:?} on {} {}: the legacy envelope names no error shape in the body, \
+             got {body}",
+            row.case,
+            row.method,
+            row.path
+        );
+        assert_eq!(
+            text(&body, "message"),
+            "",
+            "case {:?} on {} {}: the legacy envelope carries its sentence under Message \
+             alone, got {body}",
+            row.case,
+            row.method,
+            row.path
+        );
+    }
+
+    // The other way an account comes to hold no service role: disassociating. That is a
+    // success, and the read after it reports the same 404 in the same envelope — so the
+    // report is of the state, not of a store that was never written to.
+    let (status, removed) = iam_call(&router, "DELETE", SERVICE_ROLE_PATH, Vec::new()).await;
+    assert_eq!(
+        status, 200,
+        "case disassociating with nothing associated: expected 200, got {status} {removed}"
+    );
+    let response = dispatch(&router, "GET", SERVICE_ROLE_PATH, true, Vec::new()).await;
+    let status = response.status().as_u16();
+    let header = error_type_header(&response);
+    let raw = response.into_body();
+    let body: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
+    assert_eq!(
+        (status, text(&body, "Message"), header),
+        (404, NO_SERVICE_ROLE_MESSAGE.to_string(), None),
+        "case the service role read after a disassociation: expected the no-role report \
+         naming no error shape, got {status} {body}"
+    );
+
+    // Both legacy routes still SERVE what they are for, so every row above was refused for
+    // what its request carried and not because the route is broken.
+    let role_arn = format!("arn:aws:iam::{ACCOUNT}:role/GreengrassV2TokenExchangeRole");
+    let (status, written) = iam_call(
+        &router,
+        "PUT",
+        SERVICE_ROLE_PATH,
+        document(&json!({ "RoleArn": role_arn })),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case a well-formed role ARN associated: expected 200, got {status} {written}"
+    );
+    let (status, got) = iam_call(&router, "GET", SERVICE_ROLE_PATH, Vec::new()).await;
+    assert_eq!(
+        (status, text(&got, "RoleArn")),
+        (200, role_arn),
+        "case the association just written: expected it reported back, got {status} {got}"
+    );
+
+    let endpoints = json!([{ "Id": "lan", "HostAddress": "10.0.0.1", "PortNumber": 8_883 }]);
+    let (status, published) = iam_call(
+        &router,
+        "PUT",
+        &connectivity_info_path("laser-1"),
+        document(&json!({ "ConnectivityInfo": endpoints })),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case a readable endpoint list published: expected 200, got {status} {published}"
+    );
+    let (status, got) = iam_call(&router, "GET", &connectivity_info_path("laser-1"), Vec::new()).await;
+    assert_eq!(
+        (status, got.get("ConnectivityInfo").cloned()),
+        (200, Some(endpoints)),
+        "case the endpoints just published: expected them reported back, got {status} {got}"
+    );
+
+    // The CONTROL: a 2020-11-30 route's refusal names its own modelled shape in BOTH places
+    // the protocol carries one, so the envelope above belongs to the legacy routes and not
+    // to this service as a whole.
+    let response = dispatch(
+        &router,
+        "GET",
+        "/greengrass/v2/deployments/99999999-9999-9999-9999-999999999999",
+        true,
+        Vec::new(),
+    )
+    .await;
+    let status = response.status().as_u16();
+    let header = error_type_header(&response);
+    let raw = response.into_body();
+    let body: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
+    assert_eq!(
+        (status, error_code(&body), header),
+        (
+            404,
+            RESOURCE_NOT_FOUND_CODE.to_string(),
+            Some(RESOURCE_NOT_FOUND_CODE.to_string())
+        ),
+        "case a deployment id nothing minted on the 2020-11-30 route: expected the \
+         modelled shape named in the body and the header, got {status} {body}"
     );
 }
