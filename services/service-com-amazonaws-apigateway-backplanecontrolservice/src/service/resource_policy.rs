@@ -140,8 +140,16 @@ pub struct Call<'a> {
     pub api_id: &'a str,
     /// The stage within that api.
     pub stage: &'a str,
-    /// The verb the deployed method is addressed by — the request's own, or the `ANY`
-    /// catch-all it matched.
+    /// The HTTP verb the CLIENT ADDRESSED the method by, upper case — never the name the
+    /// deployment holds the serving method under. `ANY` is the stand-in a method is
+    /// configured by for every verb that has no method of its own, and no request on the
+    /// wire carries it, so the verb of the ARN a decision is taken about and a refusal
+    /// reports is the request's own whichever method served it.
+    ///
+    /// What is keyed by the CONFIGURED method instead — a stage's `methodSettings` and the
+    /// entries of its cache — is resolved from that verb rather than from this one
+    /// ([`super::invoke::response_cache::cache_plan`]), because such a record is about the
+    /// deployed method and not about one request to it.
     pub verb: &'a str,
     /// The resource path of the DEPLOYED method the request matched, leading `/` included —
     /// the TEMPLATE, so a method put on `/pets/{petId}` carries that spelling whichever pet

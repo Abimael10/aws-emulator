@@ -111,8 +111,12 @@ fn answers(serial: &str) -> Value {
     json!({ "application/json": format!("{{\"statusCode\":200,\"serial\":\"{serial}\"}}") })
 }
 
-/// One `GET` resource under `parent`, on a `MOCK` integration whose answer carries `serial`
-/// and whose integration response maps that answer through [`ECHO_TEMPLATE`].
+/// One resource under `parent` carrying `verb`, on a `MOCK` integration whose answer carries
+/// `serial` and whose integration response maps that answer through [`ECHO_TEMPLATE`].
+///
+/// `verb` is the verb the method is PUT ON, which the `ANY` catch-all is one value of: the
+/// settings and the cache entries of a method are named by that verb whichever verb a request
+/// it serves carries.
 ///
 /// `namespace` is the integration's `cacheNamespace` where the row groups resources under
 /// one, and `None` leaves it at the per-resource default `PutIntegration` writes.
@@ -121,6 +125,7 @@ async fn echo_resource(
     api: &str,
     parent: &str,
     path_part: &str,
+    verb: &str,
     serial: &str,
     namespace: Option<&str>,
 ) -> String {
@@ -129,7 +134,7 @@ async fn echo_resource(
         gateway,
         api,
         &resource,
-        "GET",
+        verb,
         json!({ "authorizationType": "NONE" }),
     )
     .await;
@@ -137,13 +142,13 @@ async fn echo_resource(
     if let Some(namespace) = namespace {
         integration["cacheNamespace"] = json!(namespace);
     }
-    put_integration(gateway, api, &resource, "GET", integration).await;
-    method_response(gateway, api, &resource, "GET", "200", json!({})).await;
+    put_integration(gateway, api, &resource, verb, integration).await;
+    method_response(gateway, api, &resource, verb, "200", json!({})).await;
     integration_response(
         gateway,
         api,
         &resource,
-        "GET",
+        verb,
         "200",
         json!({ "responseTemplates": json_template(ECHO_TEMPLATE) }),
     )
@@ -209,7 +214,7 @@ impl Deployed {
     /// that is still coming up caches nothing, which is a case of its own below.
     async fn stand_up(gateway: &Gateway, name: &str, cluster: bool) -> Self {
         let (api, root) = create_api(gateway, name).await;
-        let resource = echo_resource(gateway, &api, &root, RESOURCE, FIRST, None).await;
+        let resource = echo_resource(gateway, &api, &root, RESOURCE, "GET", FIRST, None).await;
         let mut request = json!({ "stageName": STAGE });
         if cluster {
             request["cacheClusterEnabled"] = json!(true);
@@ -356,6 +361,7 @@ impl Deployed {
             &self.api,
             &self.root,
             OTHER_RESOURCE,
+            "GET",
             serial,
             namespace,
         )
@@ -565,6 +571,131 @@ async fn the_methods_own_settings_key_caches_it_as_the_whole_stage_key_does() {
             "case {case}: expected the entry these settings had the stage hold, got {:?}",
             cached.body
         );
+    }
+}
+
+/// The verb a method is put on to serve every verb the resource has no method of its own
+/// for: the `ANY` catch-all `PutMethod` admits beside the HTTP methods.
+const ANY_METHOD: &str = "ANY";
+
+/// One api carrying `ANY /items` on a `MOCK` answering [`FIRST`], deployed to [`STAGE`] with
+/// its cache cluster settled; answers the api id and the resource the method sits on.
+async fn any_method_api(gateway: &Gateway, name: &str) -> (String, String) {
+    let (api, root) = create_api(gateway, name).await;
+    let resource = echo_resource(gateway, &api, &root, RESOURCE, ANY_METHOD, FIRST, None).await;
+    let deployed = gateway
+        .call(
+            "POST",
+            &format!("/restapis/{api}/deployments"),
+            Some(json!({
+                "stageName": STAGE,
+                "cacheClusterEnabled": true,
+                "cacheClusterSize": "0.5"
+            })),
+        )
+        .await;
+    assert_eq!(
+        deployed.status, 201,
+        "case CreateDeployment({name}): expected 201, got {} with {:?}",
+        deployed.status, deployed.body
+    );
+    settled_cluster(gateway, &api, STAGE, name).await;
+    (api, resource)
+}
+
+/// Rewrite what the `ANY` method's integration ANSWERS to `serial` and redeploy, as
+/// [`Deployed::rewrite_answer`] does for the method put on its own verb.
+async fn rewrite_any_answer(
+    gateway: &Gateway,
+    api: &str,
+    resource: &str,
+    case: &str,
+    serial: &str,
+) {
+    let patched = gateway
+        .call(
+            "PATCH",
+            &format!("/restapis/{api}/resources/{resource}/methods/{ANY_METHOD}/integration"),
+            Some(json!({
+                "patchOperations": [{
+                    "op": "replace",
+                    "path": "/requestTemplates/application~1json",
+                    "value": answers(serial)["application/json"]
+                }]
+            })),
+        )
+        .await;
+    assert_eq!(
+        patched.status, 200,
+        "case {case}: expected 200 from UpdateIntegration, got {} with {:?}",
+        patched.status, patched.body
+    );
+    deploy(gateway, api, STAGE).await;
+}
+
+/// RULE: what a stage's `methodSettings` and its cache entries are named by is the verb the
+/// serving method is PUT ON — the `ANY` catch-all included, where that is the method serving
+/// the request — and not the verb the client sent, which is what the method ARN the same
+/// request is AUTHORIZED against names. So a setting written under the catch-all's own key
+/// caches every verb it serves, a setting written under the verb a request carried names no
+/// method of the deployment and caches nothing, and the verbs of one `ANY` method share the
+/// entries it holds.
+#[tokio::test]
+async fn an_any_served_request_is_cached_under_the_verb_its_method_is_put_on() {
+    // Rows differ along the METHOD half of the `methodSettings` key caching is turned on
+    // under: the verb the one deployed method is configured by, and the verb the request
+    // itself carries — which names no method here, so nothing is in force for it.
+    let rows: &[(&str, &str, bool)] = &[
+        (
+            "the key naming the ANY the method is put on",
+            "/~1items/ANY",
+            true,
+        ),
+        (
+            "the key naming the verb the request carried",
+            "/~1items/GET",
+            false,
+        ),
+    ];
+
+    for (index, (case, method_path, cached)) in rows.iter().enumerate() {
+        let gateway = Gateway::new();
+        let (api, resource) = any_method_api(&gateway, &format!("any-settings-key-{index}")).await;
+        patch_stage(
+            &gateway,
+            &api,
+            case,
+            Value::Array(caching_on_at(method_path, 300)),
+        )
+        .await;
+
+        let path = format!("/{STAGE}/{RESOURCE}");
+        let filled = invoke(&gateway, &api, "GET", &path, &[]).await;
+        assert_eq!(
+            filled.body, FIRST_BODY,
+            "case {case}: expected the integration's own body first, got {:?}",
+            filled.body
+        );
+        rewrite_any_answer(&gateway, &api, &resource, case, SECOND).await;
+
+        let again = invoke(&gateway, &api, "GET", &path, &[]).await;
+        let expected = if *cached { FIRST_BODY } else { SECOND_BODY };
+        assert_eq!(
+            again.body, expected,
+            "case {case}: expected {expected:?} from the GET the catch-all serves, got {:?}",
+            again.body
+        );
+        if *cached {
+            // One `ANY` method is one method, so the entry it filled is the entry every verb
+            // it serves reads: the POST is answered what the GET had the cluster hold rather
+            // than the rewritten answer.
+            let other_verb = invoke(&gateway, &api, "POST", &path, &[]).await;
+            assert_eq!(
+                other_verb.body, FIRST_BODY,
+                "case {case}: expected the entry the catch-all's GET filled, got {:?}",
+                other_verb.body
+            );
+        }
     }
 }
 

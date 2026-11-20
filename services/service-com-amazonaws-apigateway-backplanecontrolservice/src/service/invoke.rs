@@ -1792,6 +1792,13 @@ async fn serving<Eng: Send + Sync + 'static>(
             // and whether that document lets the caller ask for the stage's cached response
             // to be reloaded.
             let source_ip = source_address_of(req);
+            // The verb the method ARN those decisions are taken about names is the one the
+            // CLIENT SENT, not the name the deployment holds the serving method under: `ANY`
+            // is the stand-in a method is configured by for every verb that has no method of
+            // its own, so it is no verb a request can carry and no verb a grant, a statement
+            // or an authorizer's policy can be written about. The same reading
+            // [`call_context`] gives `$context.httpMethod`, for the same reason.
+            let addressed_verb = wire_verb(req.method());
             let call_of = resource_policy::Call {
                 // The api's own Region, from the record: an api lives in exactly one
                 // Region, so the ARN a statement names its methods by carries the Region
@@ -1801,7 +1808,7 @@ async fn serving<Eng: Send + Sync + 'static>(
                 region: api.arn_region(),
                 api_id: &api.id,
                 stage: &stage.stage_name,
-                verb,
+                verb: &addressed_verb,
                 resource_path: matched_path,
                 // The resource an authorization decision is taken about is the path the
                 // CLIENT addressed, not the template the deployment matched by it: a
@@ -2049,6 +2056,10 @@ async fn serving<Eng: Send + Sync + 'static>(
                 stage,
                 deployed_method.and_then(|method| method.integration.as_ref()),
                 &resource_path,
+                // The verb the SERVING METHOD is put on, which is what a `methodSettings`
+                // key and a cache entry name — not the verb the client addressed, which is
+                // what the ARN a decision is taken about names ([`cache_plan`]).
+                verb,
                 req,
                 attached_policy,
                 &call_of,

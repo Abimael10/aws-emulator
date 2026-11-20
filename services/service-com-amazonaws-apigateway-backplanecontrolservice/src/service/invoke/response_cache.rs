@@ -51,8 +51,15 @@ pub(super) struct CachePlan {
 /// `cacheKeyParameters` say which entry this call is: a method with no integration caches
 /// nothing because there is nothing to cache. `request_path` is the path the request
 /// actually addressed, which is what a `method.request.path.{name}` cache key parameter
-/// reads its value out of — the deployed path TEMPLATE it matched, and the verb the method
-/// is addressed by, are `call`'s own members.
+/// reads its value out of; the deployed path TEMPLATE it matched is `call`'s own member.
+///
+/// `configured_verb` is the verb the SERVING METHOD IS PUT ON — the `ANY` catch-all included,
+/// where that is what serves the request — rather than the verb the client addressed
+/// ([`resource_policy::Call::verb`]): both of this function's readings of a verb are about
+/// the deployed method and not about the request. A stage's `methodSettings` are keyed by the
+/// configured method ([`method_settings_in_force`]), as the execution log's and the metrics'
+/// readings of that same map are, and an entry of the cache belongs to the method whose
+/// response it holds ([`cache_key`]).
 ///
 /// `policy` is the api's own resource policy and `call` the call it decides, which together
 /// say whether this caller may ask for the held entry to be reloaded
@@ -61,12 +68,13 @@ pub(super) fn cache_plan(
     stage: &StageEntry,
     integration: Option<&GetIntegrationOutput>,
     request_path: &str,
+    configured_verb: &str,
     req: &RtRequest,
     policy: Option<&str>,
     call: &resource_policy::Call<'_>,
 ) -> Caching {
     let matched_path = call.resource_path;
-    let verb = call.verb;
+    let verb = configured_verb;
     let Some(settings) = method_settings_in_force(stage, matched_path, verb) else {
         return Caching::Off;
     };
@@ -154,6 +162,10 @@ fn invalidation_refusal(req: &RtRequest, call: &resource_policy::Call<'_>) -> Ga
 /// `matched_path` of this stage: the entry keyed by THAT method, else the one that names
 /// every method of the stage, else none at all.
 ///
+/// `verb` is the verb the method is CONFIGURED under, which for a request the resource's
+/// `ANY` catch-all serves is `ANY`: a `methodSettings` key names a deployed method, and the
+/// settings a patch wrote about that method are in force for every request it serves.
+///
 /// A `methodSettings` key is the method path `Stage$methodSettings` documents —
 /// `{resource_path}/{http_method}` with the resource path carried as one reference token, its
 /// separators escaped — or [`EVERY_METHOD_SETTINGS_KEY`]. It is derived HERE from the deployed
@@ -190,7 +202,10 @@ pub(super) fn method_settings_in_force<'s>(
 /// on them — and then the value this request carries for each `cacheKeyParameters` entry ("a
 /// list of request parameters whose values API Gateway caches"), in the order the integration
 /// lists them. A parameter the request does not carry contributes its absence, so a request
-/// carrying it and one that does not are two entries rather than one.
+/// carrying it and one that does not are two entries rather than one. That verb is the one
+/// the serving method is CONFIGURED under, because the entry belongs to the method whose
+/// response it holds: one `ANY` method is one method, and every verb it serves shares its
+/// entries.
 ///
 /// What is NOT in the key is anything the integration did not name: two requests differing
 /// only in a query parameter, or in a path parameter, that is no cache key parameter are ONE
