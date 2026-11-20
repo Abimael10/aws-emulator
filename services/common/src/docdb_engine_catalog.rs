@@ -30,17 +30,65 @@ pub const ENGINE_DESCRIPTION: &str = "Amazon DocumentDB (with MongoDB compatibil
 /// — and an option of an engine AWS licenses itself carries `na`.
 pub const LICENSE_MODEL: &str = "na";
 
-/// The engine version a cluster created without an `EngineVersion` runs.
+/// The engine version a cluster created without an `EngineVersion` runs: the release this
+/// catalog DESIGNATES as the engine's own default ([`VersionDefault::Engine`]), read off the
+/// rows below so the designation is stated once.
 ///
 /// `CreateDBClusterMessage$EngineVersion` says "the --engine-version will default to the
-/// latest major engine version": the NEWEST release of the latest major line this catalog
-/// publishes an engine-version listing for, so [`is_line_default`] holds of it (the test
-/// below pins that) and both views of the front door resolve that line to the same release.
-/// The 8.0 family is published because it is named as an upgrade target rather than on an
-/// engine-version listing of its own, which is evidence that the family is SERVED and no
-/// evidence of what a create without a version gets, so the default stays on the 5.0 line
-/// until an engine-version listing of 8.0 says otherwise.
-pub const DEFAULT_ENGINE_VERSION: &str = "5.0.2";
+/// latest major engine version", which names the LINE; which release of that line a create
+/// gets is the designation the rows carry, not the newest release the list happens to hold
+/// (see [`VersionDefault`]). The 8.0 family is published because it is named as an upgrade
+/// target rather than on an engine-version listing of its own, which is evidence that the
+/// family is SERVED and no evidence of what a create without a version gets, so the default
+/// stays on the 5.0 line until an engine-version listing of 8.0 says otherwise.
+pub const DEFAULT_ENGINE_VERSION: &str = engine_default_version();
+
+/// [`DEFAULT_ENGINE_VERSION`], read off the one row designated the engine's default.
+const fn engine_default_version() -> &'static str {
+    let mut index = 0;
+    while index < ENGINE_VERSIONS.len() {
+        let row = &ENGINE_VERSIONS[index];
+        if row.default_of.is_engine_default() {
+            return row.version;
+        }
+        index += 1;
+    }
+    panic!("one published release of this engine is designated its default version")
+}
+
+/// Which DEFAULT a published release is: the engine's own default version, the default of
+/// its own major line, or neither.
+///
+/// The designation is published DATA about a release, carried one column per row, rather
+/// than the maximum of the list: AWS promotes a release to be a default, and a later patch
+/// of the same line is published — orderable, and reachable as a minor upgrade target —
+/// before it is promoted. So a request that does not name an exact release (it names none,
+/// or names only a line) runs the designated default, which can be an EARLIER release than
+/// the newest one its line publishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionDefault {
+    /// The engine's own default version — and so the default of its line too, since the
+    /// release a create with no `EngineVersion` runs is a release of the default line.
+    Engine,
+    /// The default release of its own major line, but not the engine's default: what a
+    /// request naming only that line resolves to, and where an automatic minor version
+    /// upgrade inside the line lands.
+    Line,
+    /// Neither: a published release AWS has not designated a default.
+    Neither,
+}
+
+impl VersionDefault {
+    /// Whether this release is the engine's own default version.
+    pub const fn is_engine_default(self) -> bool {
+        matches!(self, Self::Engine)
+    }
+
+    /// Whether this release is the default of its own major line.
+    pub const fn is_line_default(self) -> bool {
+        matches!(self, Self::Engine | Self::Line)
+    }
+}
 
 /// The first MAJOR version Amazon DocumentDB offers an in-place major version upgrade TO.
 ///
@@ -63,6 +111,8 @@ pub struct EngineVersion {
     pub minor: &'static str,
     /// `DBParameterGroupFamily` — the engine name followed by the line (`docdb5.0`).
     pub family: &'static str,
+    /// Which default this release is designated; see [`VersionDefault`].
+    pub default_of: VersionDefault,
 }
 
 /// The engine versions this front door publishes for Amazon DocumentDB, OLDEST FIRST,
@@ -81,30 +131,40 @@ pub struct EngineVersion {
 ///
 /// A version this list does not carry is a version the engine cannot run, so every report
 /// that resolves an `EngineVersion` reads it from here.
+///
+/// The DEFAULT column is each release's own designation ([`VersionDefault`]). The engine's
+/// default is the 5.0 line's FIRST release: the recorded create that named no
+/// `EngineVersion` provisioned it while that line already published later patches, so those
+/// later patches are published without being designated. A line nothing records an
+/// undesignated later patch of carries its designation on its newest release, which is
+/// where an automatic minor version upgrade inside the line lands.
 pub const ENGINE_VERSIONS: &[EngineVersion] = &[
-    version("3.6.0", "3.6", "0", "docdb3.6"),
-    version("4.0.0", "4.0", "0", "docdb4.0"),
-    version("4.0.1", "4.0", "1", "docdb4.0"),
-    version("5.0.0", "5.0", "0", "docdb5.0"),
-    version("5.0.1", "5.0", "1", "docdb5.0"),
-    version("5.0.2", "5.0", "2", "docdb5.0"),
-    version("8.0.0", "8.0", "0", "docdb8.0"),
-    version("8.0.1", "8.0", "1", "docdb8.0"),
+    version("3.6.0", "3.6", "0", "docdb3.6", VersionDefault::Line),
+    version("4.0.0", "4.0", "0", "docdb4.0", VersionDefault::Neither),
+    version("4.0.1", "4.0", "1", "docdb4.0", VersionDefault::Line),
+    version("5.0.0", "5.0", "0", "docdb5.0", VersionDefault::Engine),
+    version("5.0.1", "5.0", "1", "docdb5.0", VersionDefault::Neither),
+    version("5.0.2", "5.0", "2", "docdb5.0", VersionDefault::Neither),
+    version("8.0.0", "8.0", "0", "docdb8.0", VersionDefault::Neither),
+    version("8.0.1", "8.0", "1", "docdb8.0", VersionDefault::Line),
 ];
 
 /// One catalog row, so the table above reads as a table. Columns, in order: engine version,
-/// major engine version, minor engine version, DB parameter group family.
+/// major engine version, minor engine version, DB parameter group family, default
+/// designation.
 const fn version(
     version: &'static str,
     major: &'static str,
     minor: &'static str,
     family: &'static str,
+    default_of: VersionDefault,
 ) -> EngineVersion {
     EngineVersion {
         version,
         major,
         minor,
         family,
+        default_of,
     }
 }
 
@@ -167,26 +227,46 @@ pub fn parameter_group_families() -> Vec<&'static str> {
     families
 }
 
-/// Whether `version` is the DEFAULT release of its major line: the newest release of that
-/// line this catalog publishes.
+/// The major LINES this engine publishes (`5.0`), in catalog order and without repeats.
 ///
-/// It is the release an automatic minor version upgrade moves a cluster of that line onto,
-/// which is what `UpgradeTarget$AutoUpgrade` reports about a target, and the line's own
-/// default that `DefaultOnly` selects when a request narrows the report to one major version.
-/// The ENGINE's default is a separate fact ([`DEFAULT_ENGINE_VERSION`]): it names the version
-/// a create without an `EngineVersion` runs.
-pub fn is_line_default(version: &str) -> bool {
-    let Some(row) = engine_version(version) else {
-        return false;
-    };
-    // Compared as VERSIONS rather than as strings, so a two-digit release orders after a
-    // one-digit one.
+/// A line is what `MajorEngineVersion` reports and what a request naming only "the intended
+/// major engine version" names; [`line_default`] answers which release of one a request
+/// naming it runs.
+pub fn major_lines() -> Vec<&'static str> {
+    let mut lines: Vec<&'static str> = Vec::new();
+    for published in ENGINE_VERSIONS {
+        if !lines.contains(&published.major) {
+            lines.push(published.major);
+        }
+    }
+    lines
+}
+
+/// The release this catalog designates as the default of the major line `line`, or `None`
+/// when it publishes no such line.
+///
+/// This is the one accessor for "which release does that line resolve to": a create or a
+/// modify naming only the line, and a `DefaultOnly` report narrowed to it, answer from here,
+/// so neither view of the front door derives the designation its own way. Matching is
+/// case-insensitive, as every version member of these models is.
+pub fn line_default(line: &str) -> Option<&'static EngineVersion> {
     ENGINE_VERSIONS
         .iter()
-        .filter(|published| published.major == row.major)
-        .all(|published| {
-            !crate::rds_cluster_parameters::engine_version_precedes(row.version, published.version)
-        })
+        .find(|row| row.major.eq_ignore_ascii_case(line) && row.default_of.is_line_default())
+}
+
+/// Whether `version` is the DEFAULT release of its major line: the release of that line this
+/// catalog designates ([`VersionDefault::is_line_default`]), which is not necessarily the
+/// newest one the line publishes.
+///
+/// It is the release an automatic minor version upgrade moves a cluster of that line onto,
+/// which is what `UpgradeTarget$AutoUpgrade` reports about a target; the release a request
+/// naming only the line resolves to; and the line's own default that `DefaultOnly` selects
+/// when a request narrows the report to one major version. The ENGINE's default is the
+/// designation one step up ([`DEFAULT_ENGINE_VERSION`]): it names the version a create
+/// without an `EngineVersion` runs, and it is a line default too.
+pub fn is_line_default(version: &str) -> bool {
+    engine_version(version).is_some_and(|row| row.default_of.is_line_default())
 }
 
 /// The versions `version` can be upgraded to, in catalog order: every LATER MINOR release
@@ -453,9 +533,7 @@ mod tests {
     }
 
     /// The upgrade rule, over every published row: a later minor of the same line, and a
-    /// later major line only from the first line this engine upgrades in place to. The
-    /// default release of a line is its newest, which is where an automatic minor upgrade
-    /// lands.
+    /// later major line only from the first line this engine upgrades in place to.
     #[test]
     fn upgrade_targets_follow_the_published_upgrade_rule() {
         let cases: &[(&str, &[&str])] = &[
@@ -486,19 +564,21 @@ mod tests {
         }
     }
 
-    /// The default release of a line is its newest, and exactly one release of each line is
-    /// it: an automatic minor version upgrade has one destination inside a line.
+    /// Exactly one release of each line is designated its default — an automatic minor
+    /// version upgrade has one destination inside a line, and a request naming the line one
+    /// release to resolve to — and the designation is the row's own, so a line can publish a
+    /// LATER release than the one it designates.
     #[test]
     fn one_release_of_each_line_is_its_default() {
         for (case, version, is_default) in [
             ("the only release of its line", "3.6.0", true),
             ("the first release of the 4.0 line", "4.0.0", false),
-            ("the newest release of the 4.0 line", "4.0.1", true),
-            ("the first release of a line with later ones", "5.0.0", false),
-            ("a middle release", "5.0.1", false),
-            ("the newest release of its line", "5.0.2", true),
+            ("the designated release of the 4.0 line", "4.0.1", true),
+            ("the designated release of the 5.0 line", "5.0.0", true),
+            ("a later patch of the designated line", "5.0.1", false),
+            ("the newest patch of the designated line", "5.0.2", false),
             ("the first release of the newest line", "8.0.0", false),
-            ("the newest release of the newest line", "8.0.1", true),
+            ("the designated release of the newest line", "8.0.1", true),
             ("a version the engine does not publish", "9.9.9", false),
         ] {
             assert_eq!(
@@ -517,6 +597,30 @@ mod tests {
                 "case {family}: exactly one release of a line is its default, got {defaults}"
             );
         }
+        // Structurally, over every row rather than over the table above: the line each row
+        // belongs to designates a default, and it is a release of that line. A line added
+        // here without a designation would leave a request naming it resolving to nothing.
+        for row in ENGINE_VERSIONS {
+            let designated = line_default(row.major);
+            assert_eq!(
+                designated.map(|default| default.major),
+                Some(row.major),
+                "case {}: its line {} must designate a default release of its own, got {:?}",
+                row.version,
+                row.major,
+                designated.map(|default| default.version)
+            );
+        }
+        assert_eq!(
+            major_lines(),
+            vec!["3.6", "4.0", "5.0", "8.0"],
+            "one line per major version, in catalog order, without repeats"
+        );
+        assert_eq!(
+            line_default("9.9").map(|row| row.version),
+            None,
+            "a line the engine does not publish designates nothing"
+        );
         assert!(
             engine_version(DEFAULT_ENGINE_VERSION).is_some(),
             "the engine's default version is one this catalog publishes"
@@ -525,6 +629,38 @@ mod tests {
             is_line_default(DEFAULT_ENGINE_VERSION),
             "the engine's default version is the default release of its own line, so every \
              view of the front door resolves that line to the same release"
+        );
+        let engine_defaults = ENGINE_VERSIONS
+            .iter()
+            .filter(|row| row.default_of.is_engine_default())
+            .count();
+        assert_eq!(
+            engine_defaults, 1,
+            "exactly one published release is designated the engine's default version, got \
+             {engine_defaults}"
+        );
+        // The designation is the row's own datum and not the maximum of the list: the
+        // engine's default line publishes LATER releases than the one it designates, so a
+        // report or a create answering with the newest release of the line would answer with
+        // a version this catalog designates nothing about.
+        let later_in_the_default_line: Vec<&str> = ENGINE_VERSIONS
+            .iter()
+            .filter(|row| {
+                row.major == published_row(DEFAULT_ENGINE_VERSION).major
+                    && crate::rds_cluster_parameters::engine_version_precedes(
+                        DEFAULT_ENGINE_VERSION,
+                        row.version,
+                    )
+            })
+            .map(|row| row.version)
+            .collect();
+        assert!(
+            !later_in_the_default_line.is_empty()
+                && later_in_the_default_line
+                    .iter()
+                    .all(|version| !is_line_default(version)),
+            "case {DEFAULT_ENGINE_VERSION:?}: expected the designated default to have later, \
+             undesignated releases in its own line, got {later_in_the_default_line:?}"
         );
         for row in ENGINE_VERSIONS {
             assert_eq!(

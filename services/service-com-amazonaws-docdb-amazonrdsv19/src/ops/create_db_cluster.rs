@@ -356,8 +356,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the requested engine does not offer cannot be run, so the request is refused with
         // the awsQuery common code for parameters that cannot hold together, and the
         // message is built from the request — the version asked for and the engine it was
-        // asked for. An absent version takes the documented default: "The --engine-version
-        // will default to the latest major engine version."
+        // asked for. A request that names a LINE rather than a release runs the release the
+        // engine catalogue designates as that line's default, and an absent version the one
+        // it designates as the engine's own — "The --engine-version will default to the
+        // latest major engine version" names the line, and the catalogue carries which
+        // release of it a create gets, which is not necessarily the line's newest patch.
         let engine_version = match &input.engine_version {
             Some(requested) => docdb::resolve_engine_version(requested)
                 .ok_or_else(|| {

@@ -203,15 +203,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // own default version when the filters still carry it
         // (`::service_common::docdb_engine_catalog::DEFAULT_ENGINE_VERSION`, the version
         // `CreateDBClusterMessage$EngineVersion` says a create without one gets), and
-        // otherwise the default release of the line the filters narrowed to, which is that
-        // line's newest. The catalogue is held oldest first, so that is the last row left.
+        // otherwise the release the catalogue DESIGNATES as the default of the line the
+        // filters narrowed to — a designation it carries per release rather than the newest
+        // release left, since a line publishes later patches than the one AWS designates. A
+        // selection carrying no designated release at all (a filter keeping only
+        // undesignated patches) has no default to report, so the report is EMPTY rather than
+        // naming a release this engine designates nothing about, which is what the filters
+        // already do when they select nothing.
         let selected = match input.default_only {
             Some(true) => selected
                 .iter()
                 .find(|version| {
                     **version == ::service_common::docdb_engine_catalog::DEFAULT_ENGINE_VERSION
                 })
-                .or(selected.last())
+                .or_else(|| {
+                    selected.iter().find(|version| {
+                        ::service_common::docdb_engine_catalog::is_line_default(version)
+                    })
+                })
                 .copied()
                 .into_iter()
                 .collect(),
@@ -237,8 +246,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// name it as precisely as it likes: an exact published version, or a leading component of
 /// one at a dot boundary (`5.0`, `5`), which is how it asks for a major line. Matching is
 /// case-insensitive, as every version member of this model is; it is the same reading
-/// `crate::state::resolve_engine_version` gives a create's `EngineVersion`, which keeps
-/// the versions a describe reports and the ones a create accepts the same set.
+/// `crate::state::resolve_engine_version` gives a create's `EngineVersion`, except that this
+/// one is a FILTER — a line selects every release of it, where a create resolves the line to
+/// the one release the catalogue designates — so the versions a describe reports and the
+/// ones a create accepts stay the same set.
 fn names_version(version: &str, wanted: &str) -> bool {
     version.eq_ignore_ascii_case(wanted)
         || version

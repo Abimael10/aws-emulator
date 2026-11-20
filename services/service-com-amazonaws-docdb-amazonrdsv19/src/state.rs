@@ -51,8 +51,10 @@ pub const DOCDB_ENGINE: &str = "docdb";
 /// `CreateDBClusterMessage$EngineVersion`: "The --engine-version will default to the
 /// latest major engine version." Read from the shared engine catalog of the front door this
 /// service is a view of ([`::service_common::docdb_engine_catalog::DEFAULT_ENGINE_VERSION`]),
-/// so a cluster created without a version runs the version that door publishes as the
-/// engine's default — whichever view the create arrived at.
+/// so a cluster created without a version runs the release that door DESIGNATES as the
+/// engine's default — whichever view the create arrived at, and whether or not the
+/// designated line publishes a later patch
+/// ([`::service_common::docdb_engine_catalog::VersionDefault`]).
 pub const DEFAULT_ENGINE_VERSION: &str = ::service_common::docdb_engine_catalog::DEFAULT_ENGINE_VERSION;
 
 /// The port DocumentDB listens on when `Port` is absent (the engine's default port, and
@@ -1268,21 +1270,33 @@ pub fn validate_subnet_group_name(member: &str, value: &str) -> Result<(), Strin
 ///
 /// A request may name a version as precisely as it likes: an exact published version
 /// (`5.0.0`) or a leading component of one at a dot boundary (`5.0`, `5`), which is how a
-/// caller asks for "the latest in that line" and how `EngineVersion`'s own documentation
-/// talks about "the intended major engine version". The newest matching version wins, which
-/// is what "The --engine-version will default to the latest major engine version" describes
-/// for the absent case. Anything else names a version the engine cannot run.
+/// caller asks for a LINE rather than a release and how `EngineVersion`'s own documentation
+/// talks about "the intended major engine version". A line resolves to the release the
+/// shared catalog DESIGNATES as that line's default
+/// ([`::service_common::docdb_engine_catalog::line_default`]) — the same release the other
+/// view of this front door provisions for a request naming only the line — and not to the
+/// newest release the line publishes, which can be a patch AWS has designated nothing about.
+/// Anything else names a version the engine cannot run.
 pub fn resolve_engine_version(requested: &str) -> Option<&'static str> {
-    engine_versions()
-        .iter()
+    use ::service_common::docdb_engine_catalog as catalog;
+
+    if let Some(exact) = catalog::engine_version(requested) {
+        return Some(exact.version);
+    }
+    if let Some(designated) = catalog::line_default(requested) {
+        return Some(designated.version);
+    }
+    // A component SHORTER than a line (`5`) names every line that begins with it at a dot
+    // boundary; the newest such line's designated default is the release it asks for.
+    catalog::major_lines()
+        .into_iter()
         .rev()
-        .find(|published| {
-            **published == requested
-                || published
-                    .strip_prefix(requested)
-                    .is_some_and(|rest| rest.starts_with('.'))
+        .filter(|line| {
+            line.strip_prefix(requested)
+                .is_some_and(|rest| rest.starts_with('.'))
         })
-        .copied()
+        .find_map(catalog::line_default)
+        .map(|designated| designated.version)
 }
 
 /// The `DBParameterGroupFamily` of an engine version: the engine name followed by the

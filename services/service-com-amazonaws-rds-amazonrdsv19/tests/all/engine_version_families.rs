@@ -14,7 +14,8 @@
 //!   major-version families and the same builds of them;
 //! * a build that is not the latest of its family offers a MINOR upgrade inside that
 //!   family, so an in-family upgrade chain exists rather than a single build standing in
-//!   for the family;
+//!   for the family, and the AUTOMATIC destination inside a family is one build — the
+//!   family's default — which every earlier build of it takes;
 //!
 //! and the pagination rule the catalogue is read through: whatever the page size, walking
 //! the `Marker` visits the report's own order exactly once, and a `Marker` re-presented
@@ -25,9 +26,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::db_engine_versions::{
-    all_versions_of, page_of_every_version, walk_every_version, Version,
+    all_versions_of, page_of_every_version, versions, walk_every_version, Version,
 };
-use crate::db_instances::{emulator, subtrees, text};
+use crate::db_instances::{call, emulator, expect_ok, subtrees, text};
 
 /// The engines and major-version families this service publishes an Amazon RDS Extended
 /// Support build line for.
@@ -355,39 +356,117 @@ async fn a_build_that_is_not_the_latest_of_its_family_offers_a_minor_upgrade_ins
         );
     }
 
-    // …and the invariant the chain owes, over every engine the whole report names: a
-    // build its family has moved past has exactly one AUTOMATIC upgrade destination, the
-    // family's own later default. (Which targets an entry carries, and how each is
-    // classified, is `an_entrys_upgrade_targets_are_that_engines_later_versions` in
-    // `db_engine_versions.rs`; this is about the automatic one inside the family.)
+    // …and the invariant the chain owes, over every engine the whole report names: the
+    // builds that carry an AUTOMATIC upgrade destination are exactly the ones their family's
+    // DEFAULT build has moved past, and each of them names that one build. (Which targets an
+    // entry carries, and how each is classified, is
+    // `an_entrys_upgrade_targets_are_that_engines_later_versions` in `db_engine_versions.rs`;
+    // this is about the automatic one inside the family.) Which build is the family's default
+    // is read INDEPENDENTLY of the flags under test — from the report's own `DefaultOnly`
+    // answer for that family (see [`family_default_build`]) — so a family that stopped
+    // reporting an automatic destination fails here. A family whose default build is its
+    // newest has every earlier build pointing at it; a family AWS has published builds of
+    // PAST its default — a patch is orderable before it is promoted to the automatic
+    // destination — has that default earlier in the chain, and the builds from it on take no
+    // automatic upgrade at all.
     for engine in engines_reported(&router).await {
-        for (_, builds) in families(&all_versions_of(&router, &engine).await) {
-            for (index, build) in builds.iter().enumerate() {
-                let case = format!("{engine} {}", build.engine_version);
-                let later: BTreeSet<&str> = builds[index + 1..]
-                    .iter()
-                    .map(|build| build.engine_version.as_str())
-                    .collect();
-                let automatic: Vec<String> = subtrees(&build.xml, "UpgradeTarget")
-                    .into_iter()
-                    .filter(|target| text(target, "AutoUpgrade") == "true")
-                    .map(|target| text(&target, "EngineVersion"))
-                    .collect();
-                assert!(
-                    automatic.iter().all(|version| later.contains(version.as_str())),
-                    "case {case:?}: an automatic upgrade stays inside the family, got \
-                     {automatic:?} against the family's later builds {later:?}"
-                );
-                assert_eq!(
-                    automatic.len(),
-                    usize::from(!later.is_empty()),
-                    "case {case:?}: a build the family has moved past has exactly ONE \
-                     automatic destination and the family's latest build has none, got \
-                     {automatic:?} for later builds {later:?}"
-                );
-            }
+        for (family, builds) in families(&all_versions_of(&router, &engine).await) {
+            let case = format!("{engine} {family}");
+            let versions: Vec<&str> = builds
+                .iter()
+                .map(|build| build.engine_version.as_str())
+                .collect();
+            let automatic: Vec<Vec<String>> = builds
+                .iter()
+                .map(|build| {
+                    subtrees(&build.xml, "UpgradeTarget")
+                        .into_iter()
+                        .filter(|target| text(target, "AutoUpgrade") == "true")
+                        .map(|target| text(&target, "EngineVersion"))
+                        .collect()
+                })
+                .collect();
+            let default_build = family_default_build(&router, &case, &engine, &family).await;
+            let at_default = versions
+                .iter()
+                .position(|version| *version == default_build)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {case:?}: the family's default build {default_build:?} must be \
+                         one of its own builds {versions:?}"
+                    )
+                });
+            // Every build BEFORE the family's default takes it automatically, and the
+            // default itself and every build published past it take nothing: an automatic
+            // minor version upgrade has one destination inside a family.
+            let expected: Vec<Vec<String>> = (0..versions.len())
+                .map(|at| {
+                    if at < at_default {
+                        vec![default_build.clone()]
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect();
+            assert_eq!(
+                automatic, expected,
+                "case {case:?}: expected every build before the family's default \
+                 {default_build:?} to take it automatically and the rest to take nothing, got \
+                 {automatic:?} for the family's builds {versions:?}"
+            );
         }
     }
+}
+
+/// The build the report itself names as the DEFAULT of the `major` family of `engine`, read
+/// without looking at the `AutoUpgrade` flags under test: `DefaultOnly` reports "only the
+/// default version of the specified engine or the engine and major version combination", so
+/// narrowing it to one major version names that family's default build.
+///
+/// The document engine is the one engine this door resolves no default version FOR — a
+/// `DefaultOnly` request naming it is refused, which `tests/all/query_catalog_reads.rs`
+/// pins — so the default of one of its families is read from the shared catalogue of that
+/// engine (`service_common::docdb_engine_catalog`), which is where both views of this one
+/// front door carry that designation.
+async fn family_default_build(
+    router: &MultiServiceRouter,
+    case: &str,
+    engine: &str,
+    major: &str,
+) -> String {
+    if engine == ::service_common::docdb_engine_catalog::ENGINE {
+        return ::service_common::docdb_engine_catalog::line_default(major)
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: the shared catalogue designates a default release of \
+                     every line it publishes"
+                )
+            })
+            .version
+            .to_string();
+    }
+    let body = expect_ok(
+        case,
+        call(
+            router,
+            "DescribeDBEngineVersions",
+            &[
+                ("Engine", engine.to_string()),
+                ("EngineVersion", major.to_string()),
+                ("DefaultOnly", "true".to_string()),
+                ("IncludeAll", "true".to_string()),
+            ],
+        )
+        .await,
+    );
+    let reported = versions(&body);
+    assert_eq!(
+        reported.len(),
+        1,
+        "case {case:?}: DefaultOnly narrowed to one major version reports that family's one \
+         default build, got {body}"
+    );
+    reported[0].engine_version.clone()
 }
 
 /// Every engine the whole catalogue reports, in the order it first names them, read by

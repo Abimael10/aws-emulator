@@ -1400,17 +1400,14 @@ const fn row(
 /// SHARED catalog of that engine
 /// ([`::service_common::docdb_engine_catalog::published_row`]).
 ///
-/// The version string, its major line and that line's parameter-group family come from
-/// there, so this view and the DocumentDB view of the same front door publish one version
-/// list rather than two; what stays here is what this report adds — whether AWS still offers
-/// the version for a new cluster, and whether it is a default. The row is keyed by the
-/// VERSION rather than by a position in that catalog, so a version added there cannot
-/// silently re-assign another version's status or default level.
-const fn docdb_row(
-    version: &'static str,
-    status: &'static str,
-    default_level: DefaultLevel,
-) -> CatalogVersion {
+/// The version string, its major line, that line's parameter-group family and which default
+/// the release is designated all come from there, so this view and the DocumentDB view of
+/// the same front door publish one version list rather than two — and cannot disagree about
+/// which release a request naming no version, or only a line, provisions. What stays here is
+/// what this report adds: whether AWS still offers the version for a new cluster. The row is
+/// keyed by the VERSION rather than by a position in that catalog, so a version added there
+/// cannot silently re-assign another version's status.
+const fn docdb_row(version: &'static str, status: &'static str) -> CatalogVersion {
     let published = ::service_common::docdb_engine_catalog::published_row(version);
     row(
         ::service_common::docdb_engine_catalog::ENGINE,
@@ -1418,9 +1415,23 @@ const fn docdb_row(
         published.major,
         published.family,
         status,
-        default_level,
+        docdb_default_level(published.default_of),
         &DOCDB,
     )
+}
+
+/// The [`DefaultLevel`] of an Amazon DocumentDB release, read from the designation the
+/// shared catalog of that engine carries for it: the engine's own default version, the
+/// default of its major line only, or neither.
+const fn docdb_default_level(
+    designation: ::service_common::docdb_engine_catalog::VersionDefault,
+) -> DefaultLevel {
+    use ::service_common::docdb_engine_catalog::VersionDefault;
+    match designation {
+        VersionDefault::Engine => DefaultLevel::Engine,
+        VersionDefault::Line => DefaultLevel::Major,
+        VersionDefault::Neither => DefaultLevel::Neither,
+    }
 }
 
 /// The DB engine versions this service reports.
@@ -1898,33 +1909,32 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
     // rows to that catalog.
     //
     // `CreateDBClusterMessage$EngineVersion` in that model states that "the --engine-version
-    // will default to the latest major engine version"; the engine default below is the
-    // version the shared catalog publishes as the engine's own
-    // (`docdb_engine_catalog::DEFAULT_ENGINE_VERSION`), the newest release of the latest major
-    // line this catalogue publishes an engine-version listing for. The 8.0 family is
+    // will default to the latest major engine version"; which RELEASE of that line a create
+    // gets is the designation the shared catalog carries per version
+    // (`docdb_engine_catalog::VersionDefault`), which `docdb_row` reads, so this view
+    // provisions and reports the same default as the DocumentDB view. The 8.0 family is
     // published because the recorded report of the 3.6 entry names 8.0.x among its
     // major-version upgrade targets, which is evidence the family is SERVED; it is not
     // evidence of which version a cluster created without an `EngineVersion` gets.
     //
-    // The default of a LINE is its newest release, which is what an automatic minor version
-    // upgrade moves onto and what a request naming the line resolves to; the engine's own
-    // default is the line default of the latest line this catalogue lists engine versions
-    // for (`docdb_engine_catalog::DEFAULT_ENGINE_VERSION`), so exactly one row of each line
-    // is its default and the engine default is one of them.
+    // A designated default is NOT the newest release of its line: AWS promotes a release,
+    // and a later patch of the same line is published and orderable before it is promoted.
+    // So exactly one row of each line is its default, the engine's own default is one of
+    // them, and a row published after it in its line is the default of neither.
     // The 3.6 line is `available`, not `deprecated`: the recorded report of this engine
     // publishes its 3.6 record in the DEFAULT listing — the one that carries no `IncludeAll`
     // and so reports only the versions the front door still offers — so a new cluster can
     // still be created with that line and a client enumerating versions to pick one, or
     // reading its upgrade path, sees it. A line this front door no longer offers is the one
     // `deprecated` is for.
-    docdb_row("3.6.0", STATUS_AVAILABLE, DefaultLevel::Major),
-    docdb_row("4.0.0", STATUS_AVAILABLE, DefaultLevel::Neither),
-    docdb_row("4.0.1", STATUS_AVAILABLE, DefaultLevel::Major),
-    docdb_row("5.0.0", STATUS_AVAILABLE, DefaultLevel::Neither),
-    docdb_row("5.0.1", STATUS_AVAILABLE, DefaultLevel::Neither),
-    docdb_row("5.0.2", STATUS_AVAILABLE, DefaultLevel::Engine),
-    docdb_row("8.0.0", STATUS_AVAILABLE, DefaultLevel::Neither),
-    docdb_row("8.0.1", STATUS_AVAILABLE, DefaultLevel::Major),
+    docdb_row("3.6.0", STATUS_AVAILABLE),
+    docdb_row("4.0.0", STATUS_AVAILABLE),
+    docdb_row("4.0.1", STATUS_AVAILABLE),
+    docdb_row("5.0.0", STATUS_AVAILABLE),
+    docdb_row("5.0.1", STATUS_AVAILABLE),
+    docdb_row("5.0.2", STATUS_AVAILABLE),
+    docdb_row("8.0.0", STATUS_AVAILABLE),
+    docdb_row("8.0.1", STATUS_AVAILABLE),
     // --- MariaDB ----------------------------------------------------------
     row(
         "mariadb",

@@ -1724,17 +1724,18 @@ async fn an_engine_version_outside_the_catalogue_is_refused() {
             .rsplit_once('.')
             .map(|(line, _)| line.to_string())
             .expect("every published version carries a major.minor line");
-        // A version named as a LINE asks for the latest release of it, which is the newest
-        // published version carrying that line.
-        let newest_in_line = published_versions
+        // A version named as a LINE asks for that line's own default release, which the
+        // engine catalogue designates per release — not the newest patch the line publishes.
+        let line_default = published_versions
             .iter()
             .rev()
-            .find(|candidate| candidate.starts_with(&format!("{line}.")))
+            .filter(|candidate| candidate.starts_with(&format!("{line}.")))
+            .find(|candidate| ::service_common::docdb_engine_catalog::is_line_default(candidate))
             .copied()
-            .expect("the line of a published version publishes at least that version");
+            .expect("every published line designates one of its releases its default");
         for (shape, requested, expected) in [
             ("in full", (*published).to_string(), *published),
-            ("as a line", line.clone(), newest_in_line),
+            ("as a line", line.clone(), line_default),
         ] {
             let case = format!("{published} {shape}");
             let identifier = format!("version-{index}-{}", shape.replace(' ', "-"));
@@ -1754,8 +1755,8 @@ async fn an_engine_version_outside_the_catalogue_is_refused() {
             assert_eq!(
                 text(&created, "EngineVersion"),
                 expected,
-                "case {case:?}: a version named as a line resolves to the latest published \
-                 version of that line, got {created}"
+                "case {case:?}: a version named as a line resolves to the release that line \
+                 designates as its default, got {created}"
             );
             // And it is the STORED version, not just the create's answer.
             let described = docdb
@@ -1870,10 +1871,9 @@ async fn an_engine_version_outside_the_catalogue_is_refused() {
 // Cluster parameter groups
 // ---------------------------------------------------------------------------
 
-/// The published engine-version catalogue is ordered oldest first, which is what
-/// `resolve_engine_version` relies on to answer the newest version in a named line, and the
-/// engine's documented default is one of its rows — the first release of the latest major
-/// line it publishes an engine-version listing for, not necessarily the last row.
+/// The published engine-version catalogue is ordered oldest first, which is the order every
+/// report publishes it in, and the engine's documented default is one of its rows — the
+/// release the catalogue designates, not necessarily the last row.
 #[test]
 fn the_engine_version_catalogue_is_ordered_oldest_first() {
     let published = state::engine_versions();

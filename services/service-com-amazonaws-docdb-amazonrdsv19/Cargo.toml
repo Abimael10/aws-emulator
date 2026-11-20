@@ -44,6 +44,9 @@ aws-sdk-ec2 = { version = "1", default-features = false }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# One integration-test target rooted at `tests/all/main.rs`: `automod::dir!` declares one
+# module per suite file under `tests/all/`, so a suite is picked up by existing.
+automod = { workspace = true }
 # The percent-encoder the test harness builds its awsQuery form bodies with
 # (`tests/all/cluster_lifecycle.rs`), rather than hand-writing one.
 percent-encoding = "2"
