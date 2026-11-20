@@ -39,19 +39,20 @@
 //!
 //! A READ asks for `kms:Decrypt`, the permission the `includedData` member documents
 //! ("callers must have kms:Decrypt permission to decrypt the definition"). A WRITE of
-//! data the caller supplied asks for the data key the payload is sealed with: "when
-//! the period expires, Step Functions will call `GenerateDataKey`"
-//! (`kmsDataKeyReusePeriodSeconds`), and a data key still inside that period is
-//! RE-USED, which means decrypting the one already minted — so a caller allowed
-//! neither cannot have its data sealed. A request that carries no such data seals
-//! nothing and so asks nothing of the key.
+//! data the caller supplied INTO A RESOURCE THAT ALREADY HOLDS SEALED DATA asks for
+//! that decrypt too: the payload is placed against what the key already sealed — the
+//! execution's own input, and the record the write amends — so it cannot be sealed
+//! without the data key those payloads already go under being OPENED, whatever else
+//! the write makes of the key. On top of that it asks for the mint of the next data
+//! key once the one in use has outlived its reuse period: "when the period expires,
+//! Step Functions will call `GenerateDataKey`" (`kmsDataKeyReusePeriodSeconds`). A
+//! request that carries no such data seals nothing and so asks nothing of the key.
 //!
 //! Two approximations are deliberate here, so a later reader does not take them for
-//! the service's exact rule. Which of the two calls a given write makes is read from the
-//! clock — the data key an execution's payloads go under is minted when it starts, so a
-//! write inside the reuse period opens that data key and one past the period mints the
-//! next ([`write_of_sealed_data`]) — while the data key itself is never held, so every
-//! call that needs the key consults it. And a read or a
+//! the service's exact rule. Whether a write also mints is read from the clock — the
+//! data key an execution's payloads go under is minted when it starts, so a write past
+//! the reuse period mints the next one ([`write_of_sealed_data`]) — while the data key
+//! itself is never held, so every call that needs the key consults it. And a read or a
 //! write of an execution's own data is decided against the identity that signed the
 //! REQUEST, which stands in for the caller the service makes that call as.
 //!
@@ -117,9 +118,27 @@ const READ_OF_SEALED_DATA: &[&str] = &[DECRYPT_OPERATION];
 ///
 /// Reading the key is not part of it: a key is READ where a resource is COMMITTED to it
 /// ([`CONFIGURED_KEY_USE`]), which has already happened by the time anything is sealed,
-/// so a call that only seals asks nothing of the key it does not make — exactly as a
-/// write into an existing execution does ([`write_of_sealed_data`]).
+/// so a call that only seals asks nothing of the key it does not make.
+///
+/// This is the use a call that seals the FIRST of a resource's data makes — the `input` a
+/// start carries. A write INTO data the key already sealed opens that data as well
+/// ([`write_of_sealed_data`]).
 const SEAL_OF_CALLER_DATA: &[&str] = &[GENERATE_DATA_KEY_OPERATION];
+
+/// What sealing caller-supplied data INTO A RESOURCE THAT ALREADY HOLDS SEALED DATA asks
+/// of its key once the data key in use has outlived its reuse period: the decrypt of that
+/// data key AND the mint of the next one.
+///
+/// Such a write is not the first thing sealed under the key: it is placed against data the
+/// key already sealed — the execution's own input, and the record the write amends — so
+/// opening the data key those payloads go under is part of every one of these writes, and
+/// the mint is what the expiry of the reuse period adds to it rather than what it replaces
+/// ([`write_of_sealed_data`]).
+///
+/// The decrypt comes FIRST, because the first use the authorities in force refuse is the
+/// one the caller is told about, and a write whose decrypt is withheld is refused for that
+/// decrypt whether or not the mint is withheld as well.
+const AMEND_PAST_THE_REUSE_PERIOD: &[&str] = &[DECRYPT_OPERATION, GENERATE_DATA_KEY_OPERATION];
 
 /// What a call that neither seals nor unseals anything asks of the key: nothing. The
 /// key's own key state still decides such a call, because a key state is a condition of
@@ -378,15 +397,25 @@ pub fn execution_write_denied<Eng: Send + Sync + 'static>(
 /// its key at `now`, under the reuse period `period_seconds` the resource's configuration
 /// states.
 ///
-/// The data key an execution's payloads go under is minted when the execution starts, and
+/// Every such write OPENS the data key the execution's payloads already go under
+/// ([`READ_OF_SEALED_DATA`]): the payload is recorded against data the key sealed before
+/// it — the execution's own input, and the record the write amends — so a caller the key
+/// no longer lets decrypt cannot have anything sealed INTO that execution, however long
+/// ago it started.
+///
+/// The reuse period adds the mint to that, it does not replace it: the data key an
+/// execution's payloads go under is minted when the execution starts, and
 /// `kmsDataKeyReusePeriodSeconds` is the "maximum duration that Step Functions will reuse
 /// data keys. When the period expires, Step Functions will call `GenerateDataKey`" — so a
-/// write INSIDE that period re-uses the data key already minted, which OPENS it
-/// ([`READ_OF_SEALED_DATA`]), and a write past it mints the next one
-/// ([`SEAL_OF_CALLER_DATA`]). Which of the two a given write makes is therefore a fact of
-/// the clock rather than of the caller, and it is the call this instant really makes: a
-/// write is never judged for a call it did not make.
-fn write_of_sealed_data(
+/// write inside that period re-uses the data key already minted and one past it mints the
+/// next one as well ([`AMEND_PAST_THE_REUSE_PERIOD`]). Whether the mint is part of a given
+/// write is therefore a fact of the clock rather than of the caller, and it is the call
+/// this instant really makes: a write is never judged for a call it did not make.
+///
+/// The KMS operation names it answers are the ones a policy statement's `Action` is
+/// written with, in the order the authorities are consulted in: the first use the
+/// authorities in force refuse is the one the caller is told about.
+pub fn write_of_sealed_data(
     started: ::std::time::SystemTime,
     period_seconds: i32,
     now: ::std::time::SystemTime,
@@ -394,7 +423,7 @@ fn write_of_sealed_data(
     let period = ::std::time::Duration::from_secs(u64::try_from(period_seconds).unwrap_or_default());
     match now.duration_since(started).unwrap_or_default() < period {
         true => READ_OF_SEALED_DATA,
-        false => SEAL_OF_CALLER_DATA,
+        false => AMEND_PAST_THE_REUSE_PERIOD,
     }
 }
 

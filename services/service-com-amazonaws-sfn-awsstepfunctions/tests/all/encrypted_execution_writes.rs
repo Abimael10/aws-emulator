@@ -54,12 +54,15 @@ const REPORTED_ERROR: &str = "WorkerUnavailable";
 /// The cause a worker reports, inside the modelled `cause` length (0..32768).
 const REPORTED_CAUSE: &str = "the worker could not reach the dependency it needs";
 
-/// A key policy that delegates exactly `actions` to the account that owns the key:
-/// the shape of the default key policy ("gives the Amazon Web Services account that
-/// owns the KMS key permission to use it in all cryptographic operations"), narrowed
-/// to the actions named, so one crypto operation can be withheld while the other is
-/// granted.
-fn policy_delegating(actions: &[&str]) -> Value {
+/// A key policy that delegates exactly `actions` to the account that owns the key: the
+/// shape of the default key policy ("gives the Amazon Web Services account that owns the
+/// KMS key permission to use it in all cryptographic operations"), narrowed to the actions
+/// named, so one crypto operation can be withheld while the other is granted.
+///
+/// `pub(crate)`: `tests/all/main.rs` is this binary's crate root, so a sibling suite that
+/// withholds one cryptographic operation from the account reads this document rather than
+/// carrying a second copy of it.
+pub(crate) fn policy_delegating(actions: &[&str]) -> Value {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
