@@ -16,7 +16,9 @@
 //! its own content (`BatchCreateMemoryRecords`), keyed by the `memoryRecordId` this
 //! emulator minted for each one. A record belongs to the container, not to an actor or
 //! a session, so it lives beside the actors rather than under one, and
-//! `GetMemoryRecord` / `DeleteMemoryRecord` address it by that id alone.
+//! `GetMemoryRecord` / `DeleteMemoryRecord` address it by that id alone, while
+//! `ListMemoryRecords` reports the container's records narrowed by what the request asks
+//! for ([`MemoryRecordSelection`]).
 //!
 //! The AgentCore *tools* data plane keeps its own map: a code interpreter holds the
 //! sessions `StartCodeInterpreterSession` started on it, and
@@ -160,6 +162,12 @@ pub use browser_actions::*;
 /// work a memory container holds, derived from the messages its events carry.
 mod extraction_jobs;
 pub use extraction_jobs::*;
+
+/// The query side of the long-term memory RECORD plane: [`MemoryRecordSelection`], the
+/// namespace, strategy and metadata narrowing a listing of a container's records applies,
+/// and the order it reports them in.
+mod memory_record_queries;
+pub use memory_record_queries::*;
 
 /// The payments plane: [`PaymentSessionRecord`], the payment sessions
 /// `CreatePaymentSession` opens under a payment manager and every later read of one reports.

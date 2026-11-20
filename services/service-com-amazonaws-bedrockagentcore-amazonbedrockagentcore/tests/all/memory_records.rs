@@ -18,6 +18,10 @@
 //!   other record of that memory container readable;
 //! * a replayed `clientToken` answers with the records the first batch created and
 //!   stores no second set.
+//! * a LISTING reports the container's stored records — narrowed by the namespace scope,
+//!   the strategy association and the metadata expressions the request carries, every
+//!   filter narrowing together — most recently created first, in pages of `maxResults`,
+//!   and reports no record of another container and none it has deleted.
 //!
 //! Every case drives real HTTP through the same `MultiServiceRouter` the emulator
 //! serves with, so the wire shape (routes, status codes, `restJson1` bodies, modelled
@@ -654,6 +658,633 @@ async fn a_replayed_client_token_creates_no_second_set_of_records() {
         assert_eq!(
             record["memoryRecordId"], *id,
             "case \"both sets readable\": expected {id:?} to be stored, got {record:?}"
+        );
+    }
+}
+
+/// `ListMemoryRecords`: `memoryId` in the path, every filter in the body.
+async fn list_records(router: &MultiServiceRouter, memory: &str, body: Value) -> (u16, Value) {
+    send(
+        router,
+        "POST",
+        &format!("/memories/{}/memoryRecords", label(memory)),
+        Some(body),
+    )
+    .await
+}
+
+/// One `MemoryMetadataFilterExpression`: the metadata key, the relationship, and the
+/// value to compare against (absent for the two operators that take none).
+fn metadata_filter(key: &str, operator: &str, value: Option<Value>) -> Value {
+    let mut expression = json!({"left": {"metadataKey": key}, "operator": operator});
+    if let Some(value) = value {
+        expression["right"] = json!({"metadataValue": value});
+    }
+    expression
+}
+
+/// The records every selection case is run against, created one batch at a time so their
+/// creation order — the order a listing reverses — is known.
+///
+/// Rows differ along the namespace depth, the strategy association (named or left to the
+/// one this emulator reports for a record created with none) and the metadata they carry:
+/// every `MemoryRecordMetadataValue` member a filter can compare against appears.
+/// Answers the label -> `memoryRecordId` pairs, oldest first.
+async fn listed_fixture(router: &MultiServiceRouter) -> Vec<(&'static str, String)> {
+    let entries: Vec<(&'static str, Value)> = vec![
+        (
+            "travel-fact",
+            json!({
+                "requestIdentifier": "listing-1",
+                "namespaces": ["support/facts/actor-1"],
+                "content": {"text": "the user prefers window seats"},
+                "timestamp": 1_700_000_000,
+                "metadata": {
+                    "topic": {"stringValue": "travel"},
+                    "confidence": {"numberValue": 0.4},
+                    "observedAt": {"dateTimeValue": 1_700_000_000},
+                },
+            }),
+        ),
+        (
+            "tagged-fact",
+            json!({
+                "requestIdentifier": "listing-2",
+                "namespaces": ["support/facts/actor-2"],
+                "content": {"text": "lives in Berlin"},
+                "timestamp": 1_700_000_100,
+                "memoryStrategyId": "userPreference-abc123",
+                "metadata": {
+                    "tags": {"stringListValue": ["travel", "seats"]},
+                    "confidence": {"numberValue": 0.9},
+                },
+            }),
+        ),
+        (
+            "preference",
+            json!({
+                "requestIdentifier": "listing-3",
+                "namespaces": ["support/preferences/actor-1"],
+                "content": {"text": "likes aisle seats"},
+                "timestamp": 1_700_000_200,
+                "memoryStrategyId": "userPreference-abc123",
+                "metadata": {
+                    "topic": {"stringValue": "home travel plans"},
+                    "observedAt": {"dateTimeValue": 1_800_000_000},
+                },
+            }),
+        ),
+        (
+            "root-summary",
+            json!({
+                "requestIdentifier": "listing-4",
+                "namespaces": ["support"],
+                "content": {"text": "the account is a frequent flyer"},
+                "timestamp": 1_700_000_300,
+                "memoryStrategyId": "semantic_strategy-9",
+            }),
+        ),
+    ];
+
+    let mut created: Vec<(&'static str, String)> = Vec::new();
+    for (name, entry) in entries {
+        let (status, body) = batch_create(router, MEMORY, json!({"records": [entry]})).await;
+        assert_eq!(
+            status, 201,
+            "creating the fixture record {name:?}: expected HTTP 201, got {status} with {body:?}"
+        );
+        created.push((
+            name,
+            body["successfulRecords"][0]["memoryRecordId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        ));
+    }
+    created
+}
+
+/// The fixture labels of the records one listing reported, in the order it reported them.
+fn reported(listed: &Value, fixture: &[(&'static str, String)]) -> Vec<String> {
+    listed["memoryRecordSummaries"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|summary| {
+            let id = summary["memoryRecordId"].as_str().unwrap_or_default();
+            fixture
+                .iter()
+                .find(|(_, created)| created == id)
+                .map_or_else(
+                    || format!("a record no case created ({id})"),
+                    |(name, _)| (*name).to_string(),
+                )
+        })
+        .collect()
+}
+
+/// A listing reports the container's records narrowed by what the request asks for: the
+/// exact namespace, the namespace hierarchy, the strategy association and the metadata
+/// expressions, each narrowing on its own and all of them narrowing together.
+///
+/// Rows span the filter classes the model declares: both namespace members (source:
+/// smithy_query query="operation" operation="ListMemoryRecords" — `namespace` is "the
+/// exact namespace", `namespacePath` returns "all memory records where namespace falls
+/// under the same parent hierarchy"), `memoryStrategyId`, and one row per
+/// `MemoryRecordOperatorType` value (source: smithy_query query="shape"
+/// shape="MemoryRecordOperatorType": EQUALS_TO | EXISTS | NOT_EXISTS | BEFORE | AFTER |
+/// CONTAINS | GREATER_THAN | GREATER_THAN_OR_EQUALS | LESS_THAN | LESS_THAN_OR_EQUALS),
+/// plus the combinations of several filters and a filter nothing satisfies.
+#[tokio::test]
+async fn a_listing_reports_the_records_the_request_s_filters_select() {
+    let router = emulator();
+    let fixture = listed_fixture(&router).await;
+
+    // (case, the request body, the fixture labels expected back in order)
+    let cases: Vec<(&str, Value, Vec<&str>)> = vec![
+        (
+            "no filter at all",
+            json!({}),
+            vec!["root-summary", "preference", "tagged-fact", "travel-fact"],
+        ),
+        (
+            "the exact namespace of one record",
+            json!({"namespace": "support/facts/actor-1"}),
+            vec!["travel-fact"],
+        ),
+        (
+            "an exact namespace is not a hierarchy: a parent selects only its own record",
+            json!({"namespace": "support"}),
+            vec!["root-summary"],
+        ),
+        (
+            "an exact namespace no record is stored under",
+            json!({"namespace": "support/facts/actor-9"}),
+            vec![],
+        ),
+        (
+            "the namespace path of the whole hierarchy",
+            json!({"namespacePath": "support"}),
+            vec!["root-summary", "preference", "tagged-fact", "travel-fact"],
+        ),
+        (
+            "the namespace path of one level of it",
+            json!({"namespacePath": "support/facts"}),
+            vec!["tagged-fact", "travel-fact"],
+        ),
+        (
+            "the same namespace path written with a trailing separator",
+            json!({"namespacePath": "support/facts/"}),
+            vec!["tagged-fact", "travel-fact"],
+        ),
+        (
+            "the namespace path of a leaf level",
+            json!({"namespacePath": "support/preferences/actor-1"}),
+            vec!["preference"],
+        ),
+        (
+            "a namespace path beneath which nothing is stored",
+            json!({"namespacePath": "support/sessions"}),
+            vec![],
+        ),
+        (
+            "the strategy two records are grouped under",
+            json!({"memoryStrategyId": "userPreference-abc123"}),
+            vec!["preference", "tagged-fact"],
+        ),
+        (
+            "the strategy reported for a record created with none",
+            json!({"memoryStrategyId": CALLER_MANAGED_STRATEGY}),
+            vec!["travel-fact"],
+        ),
+        (
+            "a namespace path and a strategy narrow together",
+            json!({"namespacePath": "support", "memoryStrategyId": "userPreference-abc123"}),
+            vec!["preference", "tagged-fact"],
+        ),
+        (
+            "metadata EXISTS",
+            json!({"metadataFilters": [metadata_filter("topic", "EXISTS", None)]}),
+            vec!["preference", "travel-fact"],
+        ),
+        (
+            "metadata NOT_EXISTS",
+            json!({"metadataFilters": [metadata_filter("topic", "NOT_EXISTS", None)]}),
+            vec!["root-summary", "tagged-fact"],
+        ),
+        (
+            "metadata EQUALS_TO a string",
+            json!({"metadataFilters": [
+                metadata_filter("topic", "EQUALS_TO", Some(json!({"stringValue": "travel"})))
+            ]}),
+            vec!["travel-fact"],
+        ),
+        (
+            "metadata EQUALS_TO a string no record carries",
+            json!({"metadataFilters": [
+                metadata_filter("topic", "EQUALS_TO", Some(json!({"stringValue": "weather"})))
+            ]}),
+            vec![],
+        ),
+        (
+            "metadata EQUALS_TO a number",
+            json!({"metadataFilters": [
+                metadata_filter("confidence", "EQUALS_TO", Some(json!({"numberValue": 0.9})))
+            ]}),
+            vec!["tagged-fact"],
+        ),
+        (
+            "metadata CONTAINS a substring of a string value",
+            json!({"metadataFilters": [
+                metadata_filter("topic", "CONTAINS", Some(json!({"stringValue": "travel"})))
+            ]}),
+            vec!["preference", "travel-fact"],
+        ),
+        (
+            "metadata CONTAINS one element of a string-list value",
+            json!({"metadataFilters": [
+                metadata_filter("tags", "CONTAINS", Some(json!({"stringValue": "seats"})))
+            ]}),
+            vec!["tagged-fact"],
+        ),
+        (
+            "metadata GREATER_THAN a number",
+            json!({"metadataFilters": [
+                metadata_filter("confidence", "GREATER_THAN", Some(json!({"numberValue": 0.5})))
+            ]}),
+            vec!["tagged-fact"],
+        ),
+        (
+            "metadata GREATER_THAN_OR_EQUALS a number, at the value itself",
+            json!({"metadataFilters": [
+                metadata_filter(
+                    "confidence",
+                    "GREATER_THAN_OR_EQUALS",
+                    Some(json!({"numberValue": 0.9})),
+                )
+            ]}),
+            vec!["tagged-fact"],
+        ),
+        (
+            "metadata LESS_THAN a number",
+            json!({"metadataFilters": [
+                metadata_filter("confidence", "LESS_THAN", Some(json!({"numberValue": 0.9})))
+            ]}),
+            vec!["travel-fact"],
+        ),
+        (
+            "metadata LESS_THAN_OR_EQUALS a number, at the value itself",
+            json!({"metadataFilters": [
+                metadata_filter(
+                    "confidence",
+                    "LESS_THAN_OR_EQUALS",
+                    Some(json!({"numberValue": 0.9})),
+                )
+            ]}),
+            vec!["tagged-fact", "travel-fact"],
+        ),
+        (
+            "metadata BEFORE an instant",
+            json!({"metadataFilters": [
+                metadata_filter(
+                    "observedAt",
+                    "BEFORE",
+                    Some(json!({"dateTimeValue": 1_750_000_000_i64})),
+                )
+            ]}),
+            vec!["travel-fact"],
+        ),
+        (
+            "metadata AFTER an instant",
+            json!({"metadataFilters": [
+                metadata_filter(
+                    "observedAt",
+                    "AFTER",
+                    Some(json!({"dateTimeValue": 1_750_000_000_i64})),
+                )
+            ]}),
+            vec!["preference"],
+        ),
+        (
+            "an instant comparison against a value that is not an instant selects nothing",
+            json!({"metadataFilters": [
+                metadata_filter("confidence", "AFTER", Some(json!({"numberValue": 0.1})))
+            ]}),
+            vec![],
+        ),
+        (
+            "a comparison against a value of another kind selects nothing",
+            json!({"metadataFilters": [
+                metadata_filter(
+                    "confidence",
+                    "GREATER_THAN",
+                    Some(json!({"dateTimeValue": 1_700_000_000_i64})),
+                )
+            ]}),
+            vec![],
+        ),
+        (
+            "EQUALS_TO against a value of another kind selects nothing",
+            json!({"metadataFilters": [
+                metadata_filter("tags", "EQUALS_TO", Some(json!({"stringValue": "travel"})))
+            ]}),
+            vec![],
+        ),
+        (
+            "two metadata expressions narrow together",
+            json!({"metadataFilters": [
+                metadata_filter("topic", "EXISTS", None),
+                metadata_filter(
+                    "confidence",
+                    "LESS_THAN_OR_EQUALS",
+                    Some(json!({"numberValue": 0.5})),
+                ),
+            ]}),
+            vec!["travel-fact"],
+        ),
+        (
+            "a namespace and a metadata expression narrow together",
+            json!({
+                "namespace": "support/facts/actor-2",
+                "metadataFilters": [metadata_filter("tags", "EXISTS", None)],
+            }),
+            vec!["tagged-fact"],
+        ),
+        (
+            "filters that select disjoint records select none",
+            json!({
+                "namespace": "support/facts/actor-1",
+                "memoryStrategyId": "userPreference-abc123",
+            }),
+            vec![],
+        ),
+    ];
+
+    for (case, request, expected) in cases {
+        let (status, listed) = list_records(&router, MEMORY, request.clone()).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from ListMemoryRecords, got {status} with {listed:?}"
+        );
+        let seen = reported(&listed, &fixture);
+        assert_eq!(
+            seen,
+            expected.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "case {case:?}: expected the records {expected:?} in that order, got {seen:?} from \
+             {listed:?}"
+        );
+        assert!(
+            listed["nextToken"].is_null(),
+            "case {case:?}: expected no nextToken on a complete page, got {:?}",
+            listed["nextToken"]
+        );
+    }
+}
+
+/// A listing reports each record as it was stored — content, namespaces, strategy,
+/// timestamp and metadata — and the same record a read reports, with no relevance score:
+/// a listing selects records, it ranks nothing.
+#[tokio::test]
+async fn a_listed_summary_reports_what_was_stored() {
+    let router = emulator();
+    let fixture = listed_fixture(&router).await;
+
+    let (status, listed) = list_records(&router, MEMORY, json!({})).await;
+    assert_eq!(
+        status, 200,
+        "expected HTTP 200 from ListMemoryRecords, got {status} with {listed:?}"
+    );
+    let summaries = listed["memoryRecordSummaries"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        summaries.len(),
+        fixture.len(),
+        "expected one summary per stored record ({}), got {summaries:?}",
+        fixture.len()
+    );
+
+    for summary in &summaries {
+        let id = summary["memoryRecordId"].as_str().unwrap_or_default();
+        let case = fixture
+            .iter()
+            .find(|(_, created)| created == id)
+            .map_or_else(|| format!("unknown record {id}"), |(name, _)| (*name).to_string());
+        let record = stored_record(&router, MEMORY, id).await;
+        for member in ["content", "namespaces", "memoryStrategyId", "createdAt", "timestamp"] {
+            assert_eq!(
+                summary[member], record[member],
+                "case {case:?}: expected the summary's {member} to be the stored record's {:?}, \
+                 got {:?}",
+                record[member], summary[member]
+            );
+        }
+        assert_eq!(
+            summary["metadata"], record["metadata"],
+            "case {case:?}: expected the stored metadata back unchanged, got {:?}",
+            summary["metadata"]
+        );
+        assert_eq!(
+            summary["score"],
+            Value::Null,
+            "case {case:?}: a listing ranks nothing, so it reports no score, got {:?}",
+            summary["score"]
+        );
+    }
+}
+
+/// A listing pages deterministically: whatever the page size, the pages walk the same
+/// most-recently-created-first sequence exactly once and the last page carries no token.
+#[tokio::test]
+async fn a_listing_pages_over_every_page_size() {
+    let router = emulator();
+    let fixture = listed_fixture(&router).await;
+    let newest_first: Vec<String> = fixture
+        .iter()
+        .rev()
+        .map(|(name, _)| (*name).to_string())
+        .collect();
+
+    // Rows: every page size from one record per page to more than the container holds,
+    // plus the published maximum of `maxResults` (100) and its minimum (1).
+    for page_size in [1_usize, 2, 3, 4, 5, 100] {
+        let mut collected: Vec<String> = Vec::new();
+        let mut token = Value::Null;
+        let mut pages = 0;
+        loop {
+            let mut request = json!({"maxResults": page_size});
+            if let Some(value) = token.as_str() {
+                request["nextToken"] = json!(value);
+            }
+            let (status, page) = list_records(&router, MEMORY, request).await;
+            assert_eq!(
+                status, 200,
+                "page size {page_size}: expected HTTP 200, got {status} with {page:?}"
+            );
+            let reported_now = reported(&page, &fixture);
+            assert!(
+                reported_now.len() <= page_size,
+                "page size {page_size}: expected at most {page_size} records on a page, got \
+                 {reported_now:?}"
+            );
+            collected.extend(reported_now);
+            token = page["nextToken"].clone();
+            pages += 1;
+            assert!(
+                pages <= 10,
+                "page size {page_size}: expected pagination to terminate, got {pages} pages"
+            );
+            if token.is_null() {
+                break;
+            }
+        }
+        assert_eq!(
+            collected, newest_first,
+            "page size {page_size}: expected every record once, newest first, got {collected:?}"
+        );
+    }
+}
+
+/// A listing reports the records of the container it addresses and nothing else: a
+/// container with nothing stored in it is an empty page, a deleted record is gone from the
+/// listing, and a `memoryId` naming no container at all is refused at the container level.
+#[tokio::test]
+async fn a_listing_is_scoped_to_its_memory_container() {
+    let router = emulator();
+    let fixture = listed_fixture(&router).await;
+
+    // The ARN spelling of the same container addresses the same records.
+    let (status, listed) = list_records(&router, MEMORY_ARN, json!({})).await;
+    assert_eq!(
+        status, 200,
+        "case \"the container's ARN spelling\": expected HTTP 200, got {status} with {listed:?}"
+    );
+    assert_eq!(
+        reported(&listed, &fixture).len(),
+        fixture.len(),
+        "case \"the container's ARN spelling\": expected the same records, got {listed:?}"
+    );
+
+    // A deleted record leaves the listing, and every other record stays in it.
+    let (_, removed) = fixture[1].clone();
+    let (status, deleted) = delete_record(&router, MEMORY, &removed).await;
+    assert_eq!(
+        status, 200,
+        "case \"delete one record\": expected HTTP 200, got {status} with {deleted:?}"
+    );
+    let (status, listed) = list_records(&router, MEMORY, json!({})).await;
+    assert_eq!(
+        status, 200,
+        "case \"list after the delete\": expected HTTP 200, got {status} with {listed:?}"
+    );
+    let seen = reported(&listed, &fixture);
+    assert_eq!(
+        seen,
+        vec![
+            "root-summary".to_string(),
+            "preference".to_string(),
+            "travel-fact".to_string()
+        ],
+        "case \"list after the delete\": expected the deleted record gone and the rest kept, got \
+         {seen:?}"
+    );
+
+    // A container this plane holds nothing for reports nothing — the container exists, so
+    // this is an empty page rather than a refusal.
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    super::harness::create_memory(&engine, OTHER_MEMORY);
+    let mut empty_router = MultiServiceRouter::new();
+    empty_router.set_request_authentication(false);
+    empty_router.register_service(agentcore::EmulatedService::new(engine));
+    let (status, listed) = list_records(&empty_router, OTHER_MEMORY, json!({})).await;
+    assert_eq!(
+        status, 200,
+        "case \"a container with nothing stored\": expected HTTP 200, got {status} with {listed:?}"
+    );
+    assert_eq!(
+        listed["memoryRecordSummaries"],
+        json!([]),
+        "case \"a container with nothing stored\": expected an empty page, got {listed:?}"
+    );
+
+    // A container the account does not hold is refused, with the sentence the memory
+    // records API words its container level with.
+    let (status, body) = list_records(&router, OTHER_MEMORY, json!({})).await;
+    assert_eq!(
+        status, 404,
+        "case \"a container that was never created\": expected HTTP 404, got {status} with {body:?}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ResourceNotFoundException",
+        "case \"a container that was never created\": expected ResourceNotFoundException, got \
+         {body:?}"
+    );
+    assert_eq!(
+        body["message"], "MemoryItem does not exist",
+        "case \"a container that was never created\": expected the container-level not-found \
+         message, got {:?}",
+        body["message"]
+    );
+}
+
+/// A listing refuses a request it cannot answer as asked: a `nextToken` it never issued,
+/// and a metadata expression whose operator compares against a value the request did not
+/// give it (`right` is "required for all operators except EXISTS and NOT_EXISTS").
+#[tokio::test]
+async fn a_listing_refuses_a_request_it_cannot_answer() {
+    let router = emulator();
+    let _ = listed_fixture(&router).await;
+
+    let other_lists_token = aws_smithy_types::base64::encode("events:1");
+    let cases: Vec<(&str, Value)> = vec![
+        ("a token that is not base64", json!({"nextToken": "not a token"})),
+        ("base64 that is not a cursor", json!({"nextToken": "YWJjZGU="})),
+        (
+            "a token another listing issued",
+            json!({"nextToken": other_lists_token.as_str()}),
+        ),
+        (
+            "EQUALS_TO with no value to compare against",
+            json!({"metadataFilters": [metadata_filter("topic", "EQUALS_TO", None)]}),
+        ),
+        (
+            "CONTAINS with no value to compare against",
+            json!({"metadataFilters": [metadata_filter("tags", "CONTAINS", None)]}),
+        ),
+        (
+            "BEFORE with no value to compare against",
+            json!({"metadataFilters": [metadata_filter("observedAt", "BEFORE", None)]}),
+        ),
+    ];
+
+    for (case, request) in cases {
+        let (status, body) = list_records(&router, MEMORY, request).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400 from ListMemoryRecords, got {status} with {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {body:?}"
+        );
+    }
+
+    // The operators that take no value are answered, not refused.
+    for operator in ["EXISTS", "NOT_EXISTS"] {
+        let (status, body) = list_records(
+            &router,
+            MEMORY,
+            json!({"metadataFilters": [metadata_filter("topic", operator, None)]}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {operator:?}: expected HTTP 200 for an operator that needs no value, got \
+             {status} with {body:?}"
         );
     }
 }

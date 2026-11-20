@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMemoryRecords
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMemoryRecords`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMemoryRecords::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the LONG-TERM memory records a memory container holds, narrowed by what the
+//! request asks for and returned one page at a time.
+//!
+//! A record is written by `BatchCreateMemoryRecords` and lives in the container
+//! ([`crate::state::StoredMemoryRecord`]), so this listing computes its answer from what
+//! was stored: the container's records, narrowed by the namespace scope, the strategy
+//! association and the metadata expressions the request carries
+//! ([`crate::state::MemoryRecordSelection`]), most recently created first, in pages of
+//! `maxResults`. It reports nothing it did not read — a container with no record stored in
+//! it, or none the request's filters select, is an EMPTY page rather than a refusal, while
+//! a `memoryId` naming no container at all is refused at the container level, exactly as
+//! `GetMemoryRecord` refuses it.
 //!
 //! ## Shape of an operation
 //!
@@ -110,6 +114,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::MemoryRecordSelection;
+
+/// The list this operation's `nextToken` belongs to, so a token minted by another
+/// paginated operation does not silently resume this one.
+const PAGE_KIND: &str = "memoryRecords";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -184,18 +194,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMemoryRecords` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMemoryRecordsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMemoryRecords"))
+        // Request metadata is not read by this operation: every member it needs is
+        // bound into `input` by the centralized request walk.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListMemoryRecordsErrorModeled::ServiceException(ServiceException {
+                message: "the shared engine does not carry this service's state".to_string(),
+            })
+        })?;
+
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => crate::state::decode_next_token(PAGE_KIND, token).ok_or_else(|| {
+                ListMemoryRecordsErrorModeled::ValidationException(ValidationException {
+                    message: "nextToken is not a token this operation issued".to_string(),
+                    reason: "CannotParse".to_string(),
+                    field_list: None,
+                })
+            })?,
+        };
+        // `@range(1..100)` is refused at the boundary; the clamp keeps this arithmetic
+        // total rather than restating that refusal.
+        let max_results = input.max_results.clamp(1, 100) as usize;
+
+        let selection = MemoryRecordSelection {
+            namespace: input.namespace.as_deref(),
+            namespace_path: input.namespace_path.as_deref(),
+            memory_strategy_id: input.memory_strategy_id.as_deref(),
+            metadata_filters: input.metadata_filters.as_deref().unwrap_or(&[]),
+        };
+        // A selection that cannot be evaluated as asked is refused whether or not the
+        // container holds any record.
+        selection.checked().map_err(|message| {
+            ListMemoryRecordsErrorModeled::ValidationException(ValidationException {
+                message,
+                reason: "FieldValidationFailed".to_string(),
+                field_list: None,
+            })
+        })?;
+
+        // The OUTERMOST step of this path is the memory container, which is created
+        // through the CONTROL plane: whether the account holds one is resolved against the
+        // component that owns it, so a `memoryId` naming no container is refused rather
+        // than answered with an empty page. The inventory is read and released before this
+        // service's own store is taken, which is the lock order every reader of it keeps.
+        crate::state::memory_record_container_resolved(&*self.engine, &input.memory_id).map_err(
+            |missing| match missing {
+                Some(message) => ListMemoryRecordsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(message),
+                    },
+                ),
+                None => ListMemoryRecordsErrorModeled::ServiceException(ServiceException {
+                    message: "the shared engine does not carry the AgentCore resource inventory"
+                        .to_string(),
+                }),
+            },
+        )?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A record expiry is a time-to-live: a record the clock has already run out on is
+        // gone whether or not anybody lists it, so it is not reported back.
+        store.expire_memory_records(now);
+
+        let selected = store.selected_memory_records(&input.memory_id, &selection);
+        // Rendered page-first: only the records of this page are cloned into the response,
+        // however many the container holds.
+        let (memory_record_summaries, next_token) =
+            crate::state::paginate_with(&selected, PAGE_KIND, offset, max_results, |record| {
+                record.to_summary()
+            });
+
+        Ok(ListMemoryRecordsOutput {
+            memory_record_summaries,
+            next_token,
+        })
     }
 }
