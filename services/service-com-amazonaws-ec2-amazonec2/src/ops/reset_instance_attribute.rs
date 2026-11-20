@@ -206,16 +206,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `sourceDestCheck`; an instance on its way to `terminated` has no attributes left
         // to reset, and one that is not stopped cannot have its kernel or RAM disk
         // swapped.
+        //
+        // The two halves are refused in the two sentences EC2 words them with, the way
+        // `crate::ops::modify_instance_attribute` words the same pair: an attribute that can
+        // only be written in ONE state names that state
+        // ([`Scaffolded::incorrect_instance_state_requires`], "is not in the 'stopped'
+        // state."), while an instance on its way out admits no reset at all, which is the
+        // action wording.
         let instance_state = instance.state;
-        let admitted = if attribute == INSTANCE_ATTRIBUTE_SOURCE_DEST_CHECK {
-            !instance_state.is_terminating()
-        } else {
-            instance_state == InstanceStateName::Stopped
-        };
-        if !admitted {
-            return Err(Scaffolded::incorrect_instance_state(
+        if attribute == INSTANCE_ATTRIBUTE_SOURCE_DEST_CHECK {
+            if instance_state.is_terminating() {
+                return Err(Scaffolded::incorrect_instance_state(
+                    &input.instance_id,
+                    &format!("reset for the {attribute} attribute"),
+                ));
+            }
+        } else if instance_state != InstanceStateName::Stopped {
+            return Err(Scaffolded::incorrect_instance_state_requires(
                 &input.instance_id,
-                &format!("reset for the {attribute} attribute"),
+                InstanceStateName::Stopped.as_str(),
             ));
         }
 

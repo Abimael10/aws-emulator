@@ -381,7 +381,7 @@ fn create_rows() -> Vec<CreateRow> {
                 "ImageId": "ami-0a1b2c3d4e5f60718",
                 "InstanceType": "m5.large",
                 "Placement": { "AvailabilityZone": "us-east-1a", "Tenancy": "default" },
-                "CpuOptions": { "CoreCount": 2, "ThreadsPerCore": 2 },
+                "CpuOptions": { "CoreCount": 1, "ThreadsPerCore": 2 },
                 "MetadataOptions": { "HttpTokens": "required", "HttpPutResponseHopLimit": 2 }
             }),
             tags: vec![

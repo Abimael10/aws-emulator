@@ -25,9 +25,16 @@
 //! parameter ([`crate::state::invalid_s3_bucket_name`]) rather than as a location that could
 //! not be reached. An `ImageId` or `Bucket` the request carried EMPTY gave the parameter no
 //! value at all, which is EC2's `MissingParameter`, as it is for every other
-//! `clientOptional` `@required` member of this crate. No
-//! Amazon S3 object is written — this emulator stores none — so the task records the upload
-//! EC2 tracks, and nothing claims an object a later read could not find.
+//! `clientOptional` `@required` member of this crate.
+//!
+//! The AMI OBJECT itself is written where it lives: the bucket is Amazon S3's resource, so
+//! the object the task's key names is stored through the in-process Amazon S3 client
+//! ([`crate::state::write_stored_ami_object`]) and a caller handed that key reads it back
+//! through Amazon S3's own `HeadObject` and `GetObject`. The object holds the AMI's own
+//! stored definition ([`crate::state::stored_ami_object`]). What the object store ANSWERED
+//! is the task's own outcome: a bucket it does not hold, or a policy denying the write,
+//! leaves the task reaching `Failed` with that answer as its
+//! `StoreTaskFailureReason` rather than reporting a store that nothing performed.
 //!
 //! ## Shape of an operation
 //!
@@ -162,13 +169,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::scaffolded::Scaffolded;
         use crate::state::{
             MAX_STORE_IMAGE_TASKS, MAX_STORED_BYTES, invalid_s3_bucket_name, missing_parameter,
-            require_resolvable_image, require_service_state, s3_bucket_name_is_well_formed,
-            store_image_task_limit_exceeded, store_image_task_payload_bytes_for,
+            request_region, require_resolvable_image, require_service_state,
+            s3_bucket_name_is_well_formed, store_image_object_key, store_image_task_limit_exceeded,
+            store_image_task_payload_bytes_for, stored_ami_object, write_stored_ami_object,
         };
 
-        // `ctx` carries request metadata only; this operation reads none of it. The store
-        // is reached through the engine held on `self`.
-        let _ = ctx;
+        // The Region the request was signed for: it addresses the object store the AMI
+        // object is written into, and nothing else of `ctx` is read.
+        let region = request_region(ctx.parts());
 
         // `ImageId` and `Bucket` are both `clientOptional` `@required`, so a request that
         // sends either of them EMPTY reaches a handler with the empty string rather than
@@ -196,58 +204,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_s3_bucket_name());
         }
 
+        // Everything this call needs of the store is read, and the task RECORDED, under ONE
+        // guard, which is then given back so the upload below can await: the image's own
+        // definition is what the object stores ([`crate::state::stored_ami_object`]). The
+        // task is recorded FIRST, so the object is never written for a request this store had
+        // no room for — a refusal leaves neither a task nor an object.
+        let (key, object) = {
+            let state = require_service_state(&*self.engine)?;
+            let mut store = state.lock();
+            store.materialize_due_transitions();
+
+            // "The ID of the AMI" (`ImageId`): an AMI has to be there to be stored, and this
+            // operation's validator asks the FORM question before the EXISTENCE one in this
+            // validator's own wording — a value this service cannot READ as an AMI id is
+            // `InvalidAMIID.Malformed` before any image is looked up, and a readable id the
+            // account can see no image for is `InvalidAMIID.NotFound`
+            // ([`crate::state::require_resolvable_image`], where both halves are worded).
+            let image = require_resolvable_image(&store, &input.image_id)?;
+            let object = stored_ami_object(image);
+
+            // A count ceiling is not a memory bound on its own: the bucket name is
+            // caller-sized, so the bytes this task would hold are asked for BEFORE the
+            // insert, the way every other create in this crate asks, and refused instead of
+            // overshot. EVERY create adds a task, so both ceilings apply to every one of
+            // them. Both are reads, and they sit BEFORE the DryRun branch so a dry run of a
+            // request this store has no room for is refused with that reason rather than
+            // told it would succeed.
+            if !store.has_store_image_task_capacity() {
+                return Err(store_image_task_limit_exceeded(format!(
+                    "This emulator holds the maximum of {MAX_STORE_IMAGE_TASKS} AMI store tasks"
+                )));
+            }
+            let payload_bytes = store_image_task_payload_bytes_for(&input.bucket);
+            if store.would_exceed_stored_bytes(payload_bytes) {
+                return Err(store_image_task_limit_exceeded(format!(
+                    "This emulator holds {held} of at most {MAX_STORED_BYTES} bytes of \
+                     caller-supplied data, so it cannot store {payload_bytes} bytes more",
+                    held = store.stored_bytes(),
+                )));
+            }
+
+            // DryRun sits AFTER every parameter has been validated, the image resolved and
+            // the room for the task checked, and BEFORE the first write: the flag asks
+            // whether the request WOULD have succeeded, so one that would have been refused
+            // is refused with that reason instead, and one that would have succeeded leaves
+            // the store — and the bucket — untouched.
+            if input.dry_run == Some(true) {
+                return Err(Scaffolded::dry_run_operation());
+            }
+
+            // "The tags to apply to the AMI object that will be stored in the Amazon S3
+            // bucket" (`S3ObjectTags`) are tags of an S3 OBJECT, not of anything in EC2: no
+            // EC2 operation reports them — `StoreImageTaskResult` carries no tag member — so
+            // they are not kept in this service's state, where nothing could ever read them
+            // back.
+            let _ = &input.s3_object_tags;
+
+            // The task reports the upload as work the clock owes it rather than as this call
+            // completing, so it is stored on its way to `Completed` and
+            // `DescribeStoreImageTasks` reports it reaching the state the upload reached.
+            (
+                store.insert_store_image_task(&input.image_id, &input.bucket),
+                object,
+            )
+        };
+
+        // The AMI object itself, written where it LIVES: the bucket is Amazon S3's resource,
+        // so the object a caller is handed a key for is stored by the service that serves
+        // `HeadObject` and `GetObject` for it, over the emulator's in-process callback. Made
+        // with NO guard of this service's store held, because it awaits — and what the object
+        // store answered becomes the task's own outcome rather than being dropped.
+        let object_key = store_image_object_key(&input.image_id);
+        let failure_reason =
+            write_stored_ami_object(ctx, &region, &input.bucket, &object_key, object).await;
+
         let state = require_service_state(&*self.engine)?;
         let mut store = state.lock();
-        store.materialize_due_transitions();
-
-        // "The ID of the AMI" (`ImageId`): an AMI has to be there to be stored, and this
-        // operation's validator asks the FORM question before the EXISTENCE one in this
-        // validator's own wording — a value this service cannot READ as an AMI id is
-        // `InvalidAMIID.Malformed` before any image is looked up, and a readable id the
-        // account can see no image for is `InvalidAMIID.NotFound`
-        // ([`crate::state::require_resolvable_image`], where both halves are worded). The
-        // image it hands back is dropped: no member of this response is a fact of the AMI —
-        // the task's object key is derived from its id — so the id is all this operation
-        // reads of it.
-        require_resolvable_image(&store, &input.image_id)?;
-
-        // A count ceiling is not a memory bound on its own: the bucket name is
-        // caller-sized, so the bytes this task would hold are asked for BEFORE the insert,
-        // the way every other create in this crate asks, and refused instead of overshot.
-        // EVERY create adds a task, so both ceilings apply to every one of them. Both are
-        // reads, and they sit BEFORE the DryRun branch so a dry run of a request this store
-        // has no room for is refused with that reason rather than told it would succeed.
-        if !store.has_store_image_task_capacity() {
-            return Err(store_image_task_limit_exceeded(format!(
-                "This emulator holds the maximum of {MAX_STORE_IMAGE_TASKS} AMI store tasks"
-            )));
+        if let Some(reason) = failure_reason {
+            store.fail_store_image_task(&key, reason);
         }
-        let payload_bytes = store_image_task_payload_bytes_for(&input.bucket);
-        if store.would_exceed_stored_bytes(payload_bytes) {
-            return Err(store_image_task_limit_exceeded(format!(
-                "This emulator holds {held} of at most {MAX_STORED_BYTES} bytes of \
-                 caller-supplied data, so it cannot store {payload_bytes} bytes more",
-                held = store.stored_bytes(),
-            )));
-        }
-
-        // DryRun sits AFTER every parameter has been validated, the image resolved and the
-        // room for the task checked, and BEFORE the first write: the flag asks whether the
-        // request WOULD have succeeded, so one that would have been refused is refused with
-        // that reason instead, and one that would have succeeded leaves the store untouched.
-        if input.dry_run == Some(true) {
-            return Err(Scaffolded::dry_run_operation());
-        }
-
-        // The upload is work the clock owes the task rather than this call completing, so
-        // the task is stored `InProgress` and `DescribeStoreImageTasks` reports it moving.
-        let key = store.insert_store_image_task(&input.image_id, &input.bucket);
-
-        // "The tags to apply to the AMI object that will be stored in the Amazon S3 bucket"
-        // (`S3ObjectTags`) are tags of an S3 OBJECT, not of anything in EC2: no EC2
-        // operation reports them — `StoreImageTaskResult` carries no tag member — so they
-        // are not kept in this service's state, where nothing could ever read them back.
-        let _ = &input.s3_object_tags;
 
         // Read the response back OUT of the store, so the caller sees the object key a later
         // `DescribeStoreImageTasks` reports rather than one built beside it.

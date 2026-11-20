@@ -427,10 +427,17 @@ pub fn installed_programs(
     machine: &GuestMachine,
     services: &GuestServices,
 ) -> Box<dyn EnvironmentPrograms> {
-    Box::new(GuestEnvironment {
+    let own: Box<dyn EnvironmentPrograms> = Box::new(GuestEnvironment {
         metadata: super::guest_metadata::guest_programs(machine),
         services: services.clone(),
-    })
+    });
+    // The programs that report the machine's own CPU layout ([`super::guest_cpu`]), for a
+    // machine whose layout this emulator knows: asked AFTER the programs above, so nothing
+    // here can shadow one of them.
+    match super::guest_cpu::cpu_programs(machine) {
+        Some(cpu) => ::service_common::posix_shell_session::layered(own, cpu),
+        None => own,
+    }
 }
 
 /// Everything one guest has installed, as one environment.

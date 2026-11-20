@@ -721,6 +721,18 @@ async fn describe_refuses_what_the_contract_does_not_admit() {
             INVALID_IPAM_RESOURCE_DISCOVERY_ID_MALFORMED,
         ),
         (
+            // The suffix's LENGTH is not what this surface refuses on: a run of hex digits
+            // of another count is an id of this kind, so the account is asked whether it
+            // holds one and absence is the NotFound.
+            "an id of this kind whose digit count is not one this service issues",
+            vec![param(
+                "IpamResourceDiscoveryId.1",
+                "ipam-res-disco-0000000000000000",
+            )],
+            400,
+            INVALID_IPAM_RESOURCE_DISCOVERY_ID_NOT_FOUND,
+        ),
+        (
             "a well-formed id the account holds no discovery for",
             vec![param(
                 "IpamResourceDiscoveryId.1",

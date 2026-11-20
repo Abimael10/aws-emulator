@@ -162,8 +162,14 @@ pub struct GuestMachine {
     /// The device its root volume is attached at, and that volume's size in GiB.
     pub root_device: Option<(String, i32)>,
     /// The vCPUs and the memory (in MiB) the instance type gives the guest, where the
-    /// published catalog holds facts for that type.
+    /// published catalog holds facts for that type — the vCPUs being THIS instance's own
+    /// ([`Self::cpu`]) rather than the type's default, so the kernel's lines and the guest's
+    /// own `nproc` report one count.
     pub processor: Option<(i32, i64)>,
+    /// The CPU layout the guest's operating system sees: the cores the LAUNCH asked for and
+    /// the threads each one runs ([`super::guest_cpu`]), or `None` for a machine whose layout
+    /// this emulator does not know.
+    pub cpu: Option<super::guest_cpu::GuestCpu>,
     /// "The kernel associated with this instance, if applicable" (`Instance$KernelId`),
     /// which the identity document its metadata service publishes carries.
     pub kernel_id: Option<String>,
@@ -242,6 +248,15 @@ impl ComAmazonawsEc2Amazonec2State {
     /// instance profile carries — is left for the caller that reaches the guest to supply
     /// ([`GuestMachine::running_as`]).
     pub fn guest_machine(&self, instance: &InstanceRecord) -> GuestMachine {
+        // The ONE reading of this instance's CPU topology — the cores and threads per core
+        // its launch asked for, and its instance type's published counts for a member the
+        // launch left out — so what `DescribeInstances` reports and what the guest's own
+        // `nproc` and `lscpu` report cannot disagree about one instance.
+        let guest_cpu = instance
+            .detail
+            .cpu_options(&instance.instance_type)
+            .as_ref()
+            .and_then(super::guest_cpu::GuestCpu::of);
         GuestMachine {
             instance_id: instance.instance_id.clone(),
             instance_type: instance.instance_type.clone(),
@@ -256,8 +271,11 @@ impl ComAmazonawsEc2Amazonec2State {
             root_device: self
                 .launched_root_device(instance.image_id.as_deref())
                 .and_then(|(device, ebs)| ebs.volume_size.map(|size| (device, size))),
-            processor: super::instance_type_record(&instance.instance_type)
-                .map(|record| (record.default_vcpus, record.memory_mib)),
+            processor: super::instance_type_record(&instance.instance_type).map(|record| {
+                let vcpus = guest_cpu.map_or(record.default_vcpus, |cpu| cpu.vcpus());
+                (vcpus, record.memory_mib)
+            }),
+            cpu: guest_cpu,
             kernel_id: instance.kernel_id.clone(),
             ramdisk_id: instance.ramdisk_id.clone(),
             metadata_endpoint_enabled: instance.detail.http_endpoint
@@ -726,9 +744,28 @@ pub(super) fn guest_volume(
     boot_id: &str,
     files: &BTreeMap<String, String>,
 ) -> ShellVolume {
+    let published = guest_published_files(machine, boot_id);
+    let published_bytes: usize = published
+        .iter()
+        .map(|(path, contents)| path.len().saturating_add(contents.len()))
+        .sum();
+    // The directories the seed IMPLIES — a machine that holds the file holds the path above
+    // it — counted exactly, so a guest whose machine publishes many of them keeps the whole
+    // directory budget its own program had.
+    let published_directories: usize = published
+        .iter()
+        .flat_map(|(path, _)| directories_above(path))
+        .collect::<::std::collections::BTreeSet<String>>()
+        .len();
+    // The published seed is the SERVICE's own rather than the machine's storage, so its
+    // files, bytes and directories are not charged against the budget the guest's own —
+    // the caller-supplied — files are bounded by.
     let mut volume = ShellVolume::new(VolumeLimits {
-        files: MAX_GUEST_FILES,
-        bytes: MAX_GUEST_FILE_BYTES,
+        files: MAX_GUEST_FILES.saturating_add(published.len()),
+        bytes: MAX_GUEST_FILE_BYTES.saturating_add(published_bytes),
+        directories: VolumeLimits::default()
+            .directories
+            .saturating_add(published_directories),
         device_lines: MAX_BOOT_CONSOLE_LINES,
         device_line_bytes: MAX_BOOT_CONSOLE_LINE_BYTES,
         ..VolumeLimits::default()
@@ -741,14 +778,65 @@ pub(super) fn guest_volume(
     }
     // What the kernel and the init system publish to this guest: readable by its program,
     // never writable by it.
-    volume.seal_file(GUEST_BOOT_ID_PATH, &format!("{boot_id}\n"));
-    volume.seal_file(GUEST_MACHINE_ID_PATH, &format!("{}\n", guest_machine_id(machine)));
-    volume.seal_file(GUEST_HOSTNAME_PATH, &format!("{}\n", machine.private_dns_name));
-    volume.seal_file(GUEST_CMDLINE_PATH, &format!("{}\n", guest_command_line(machine)));
-    volume.seal_file(GUEST_INSTANCE_ID_PATH, &format!("{}\n", machine.instance_id));
+    for (path, contents) in &published {
+        volume.seal_file(path, contents);
+    }
     volume.add_keeping_device(GUEST_CONSOLE_DEVICE);
     volume.add_discarding_device(GUEST_NULL_DEVICE);
     volume
+}
+
+/// Every directory above `path`, as the absolute paths a machine that holds that file has.
+///
+/// `/sys/devices/system/cpu/cpu0/topology/core_id` implies `/sys`, `/sys/devices`,
+/// `/sys/devices/system`, `/sys/devices/system/cpu`, `/sys/devices/system/cpu/cpu0` and its
+/// `topology` — which is what the tree makes when the file is seeded, and so what the budget
+/// above has to account for.
+fn directories_above(path: &str) -> Vec<String> {
+    let mut built = String::new();
+    let mut above = Vec::new();
+    let segments: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    for segment in segments.iter().take(segments.len().saturating_sub(1)) {
+        built.push('/');
+        built.push_str(segment);
+        above.push(built.clone());
+    }
+    above
+}
+
+/// What the kernel and the init system publish TO this guest, as `(path, contents)`: this
+/// boot's own identity, the machine's identity, its host name, the command line it was booted
+/// with, the instance id cloud-init published to it — and, for a machine whose CPU layout this
+/// emulator knows, everything the kernel publishes about its processors
+/// ([`super::guest_cpu::published_cpu_files`]). A machine with no known layout gets none of
+/// the latter rather than a layout nothing derived.
+///
+/// The ONE listing of that seed, so every program a guest runs reads the same published
+/// values and the budget above is computed from exactly what is seeded.
+fn guest_published_files(machine: &GuestMachine, boot_id: &str) -> Vec<(String, String)> {
+    let mut published = vec![
+        (GUEST_BOOT_ID_PATH.to_string(), format!("{boot_id}\n")),
+        (
+            GUEST_MACHINE_ID_PATH.to_string(),
+            format!("{}\n", guest_machine_id(machine)),
+        ),
+        (
+            GUEST_HOSTNAME_PATH.to_string(),
+            format!("{}\n", machine.private_dns_name),
+        ),
+        (
+            GUEST_CMDLINE_PATH.to_string(),
+            format!("{}\n", guest_command_line(machine)),
+        ),
+        (
+            GUEST_INSTANCE_ID_PATH.to_string(),
+            format!("{}\n", machine.instance_id),
+        ),
+    ];
+    if let Some(cpu) = machine.cpu {
+        published.extend(super::guest_cpu::published_cpu_files(cpu));
+    }
+    published
 }
 
 /// The environment a program of this machine's guest is given, as the init system gives one:
@@ -793,6 +881,10 @@ mod tests {
             kernel_release: "6.1.0".to_string(),
             root_device: Some(("/dev/xvda".to_string(), 8)),
             processor: Some((2, 1024)),
+            cpu: Some(super::super::guest_cpu::GuestCpu {
+                cores: 1,
+                threads_per_core: 2,
+            }),
             kernel_id: None,
             ramdisk_id: None,
             metadata_endpoint_enabled: true,

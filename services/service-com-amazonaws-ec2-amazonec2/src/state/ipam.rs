@@ -1826,16 +1826,38 @@ pub const INVALID_IPAM_RESOURCE_DISCOVERY_ID_MALFORMED: &str =
 pub const INVALID_IPAM_RESOURCE_DISCOVERY_ID_NOT_FOUND: &str =
     "InvalidIpamResourceDiscoveryId.NotFound";
 
-/// Whether `id` is a well-formed IPAM resource discovery id — one this service could have
-/// ISSUED.
+/// Whether `id` is an IPAM resource discovery id — one this operation is to LOOK UP rather
+/// than refuse as unreadable.
 ///
-/// `<prefix>-<8 or 17 lowercase hex digits>`, read by the one generic id reader
-/// ([`prefixed_id_is_well_formed`]) under this resource's own prefix
-/// ([`IPAM_RESOURCE_DISCOVERY_ID_PREFIX`]). An ASSOCIATION id is therefore not one:
-/// `ipam-res-disco-assoc-…` leaves a suffix that is no run of hex digits, so the two
-/// resources of that shared prefix cannot be confused.
+/// `<prefix>-<run of lowercase hex digits>`: a value carrying this resource's own prefix
+/// ([`IPAM_RESOURCE_DISCOVERY_ID_PREFIX`]) followed by a non-empty run of hexadecimal digits
+/// is an id of this kind, so whether the account holds a discovery under it is the next
+/// question and absence is answered `…NotFound`
+/// ([`invalid_ipam_resource_discovery_id_not_found`]). The `…Malformed` classification is
+/// reserved for a value that names no discovery at all: one without that prefix, one whose
+/// suffix is no run of hex digits, and one carrying the prefix of the ASSOCIATION resource
+/// ([`IPAM_RESOURCE_DISCOVERY_ASSOCIATION_ID_PREFIX`]), which EXTENDS this one — so the two
+/// resources sharing a prefix cannot be confused, however much of it they share.
+///
+/// The DIGIT COUNT is not part of the question, which is where this parts company with the
+/// generic reading the older EC2 resources are read under
+/// ([`prefixed_id_is_well_formed`], `<prefix>-<8 or 17 digits>`): this surface answers
+/// `…NotFound` for an id of its own form the account holds nothing under, whatever its
+/// length, rather than calling an id of another length malformed.
 pub fn ipam_resource_discovery_id_is_well_formed(id: &str) -> bool {
-    prefixed_id_is_well_formed(IPAM_RESOURCE_DISCOVERY_ID_PREFIX, id)
+    let Some(suffix) = id
+        .strip_prefix(IPAM_RESOURCE_DISCOVERY_ID_PREFIX)
+        .and_then(|rest| rest.strip_prefix('-'))
+    else {
+        return false;
+    };
+    !suffix.is_empty()
+        && suffix
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        && id
+            .strip_prefix(IPAM_RESOURCE_DISCOVERY_ASSOCIATION_ID_PREFIX)
+            .is_none_or(|rest| !rest.starts_with('-'))
 }
 
 /// Refuse something that is not an IPAM resource discovery id at all: HTTP 400
@@ -1853,6 +1875,9 @@ pub fn invalid_ipam_resource_discovery_id_malformed<E>(id: &str) -> Scaffolded<E
 /// Refuse a well-formed IPAM resource discovery id this account holds no discovery for: HTTP
 /// 400 `InvalidIpamResourceDiscoveryId.NotFound`, worded by the one writer of that refusal
 /// ([`id_not_found`]).
+///
+/// The sentence is the recorded one for this resource's NotFound: "The ipam-resource-discovery
+/// ID '<id>' does not exist", with the id taken from the request.
 pub fn invalid_ipam_resource_discovery_id_not_found<E>(id: &str) -> Scaffolded<E> {
     id_not_found(
         INVALID_IPAM_RESOURCE_DISCOVERY_ID_NOT_FOUND,

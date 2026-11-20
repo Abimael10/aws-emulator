@@ -84,7 +84,7 @@ fn delete_rows() -> Vec<DeleteRow> {
                     "ImageId": TEST_IMAGE_ID,
                     "InstanceType": "m5.large",
                     "Placement": { "AvailabilityZone": "us-east-1a", "Tenancy": "default" },
-                    "CpuOptions": { "CoreCount": 2, "ThreadsPerCore": 2 }
+                    "CpuOptions": { "CoreCount": 1, "ThreadsPerCore": 2 }
                 },
                 "BillingConfiguration": { "BillingMode": "MONTHLY" }
             }),
@@ -454,7 +454,7 @@ fn retained_rows() -> Vec<RetainedRow> {
                     "ImageId": TEST_IMAGE_ID,
                     "InstanceType": "m5.large",
                     "Placement": { "AvailabilityZone": "us-east-1a", "Tenancy": "default" },
-                    "CpuOptions": { "CoreCount": 2, "ThreadsPerCore": 2 }
+                    "CpuOptions": { "CoreCount": 1, "ThreadsPerCore": 2 }
                 },
                 "BillingConfiguration": { "BillingMode": "MONTHLY" }
             }),

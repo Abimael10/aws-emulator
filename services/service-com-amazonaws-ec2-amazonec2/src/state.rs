@@ -2723,6 +2723,13 @@ pub use guest_commands::*;
 pub mod guest_metadata;
 pub use guest_metadata::*;
 
+/// What one instance's GUEST sees of its own CPUs: the processors, cores and threads the
+/// launch's `CpuOptions` gave it, published to that guest as the files the kernel publishes
+/// them in and the programs that print them. A SUBMODULE for the same reason
+/// [`image_usage_reports`] is one.
+pub mod guest_cpu;
+pub use guest_cpu::*;
+
 /// The SERVICES one instance's guest runs — the web server its own program installed and
 /// started — and what such a server answers for a request to the port it listens on. A
 /// SUBMODULE for the same reason [`image_usage_reports`] is one.

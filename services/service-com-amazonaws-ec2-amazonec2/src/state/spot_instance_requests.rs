@@ -275,7 +275,9 @@ impl ComAmazonawsEc2Amazonec2State {
     /// Everything the task reports beyond the bucket is derived here rather than taken from
     /// the caller — the object key from the AMI's id, the start time from the clock, and the
     /// state and progress from the task's age — so two readers cannot report one task
-    /// differently.
+    /// differently. The task starts out on its way to `Completed`: the upload the create then
+    /// makes is what can leave it `Failed` instead
+    /// ([`Self::fail_store_image_task`]).
     ///
     /// EVERY call records a task: "you get a paginated list of store tasks from the last 31
     /// days" (`DescribeStoreImageTasks`) is every task started, and AWS publishes no
@@ -288,6 +290,18 @@ impl ComAmazonawsEc2Amazonec2State {
         self.add_stored_bytes(store_image_task_payload_bytes(&record));
         self.store_image_tasks.insert(key.clone(), record);
         key
+    }
+
+    /// Record that the task held under `key` did not store its AMI object, for the `reason`
+    /// the object store answered the upload with ([`write_stored_ami_object`]).
+    ///
+    /// The upload is made with no guard of this store held, so its outcome is written back
+    /// here — the one writer of `StoreImageTaskResult$StoreTaskFailureReason`. A key no task
+    /// is held under is one a later caller cannot see either, so there is nothing to record.
+    pub fn fail_store_image_task(&mut self, key: &str, reason: String) {
+        if let Some(record) = self.store_image_tasks.get_mut(key) {
+            record.failure_reason = Some(reason);
+        }
     }
 
     /// Drop every store task whose window has run out, as of `now`.

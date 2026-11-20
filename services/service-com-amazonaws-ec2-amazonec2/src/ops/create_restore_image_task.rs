@@ -1,18 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRestoreImageTask
-//! IMPLEMENTED: refuses the restore, because the Amazon S3 object it must read does not
-//! exist here. This is the ONLY file to touch for this operation.
+//! IMPLEMENTED: refuses the restore, because this operation does not read the Amazon S3
+//! object the AMI would be restored FROM. This is the ONLY file to touch for this operation.
 //!
 //! "Starts a task that restores an AMI from an Amazon S3 object that was PREVIOUSLY CREATED
 //! by using CreateStoreImageTask" (`CreateRestoreImageTask`): the object is the input of the
-//! restore, not something this call creates. This emulator stores no Amazon S3 objects —
-//! `CreateStoreImageTask` records the store task EC2 tracks but writes no object — so the
-//! object a request names can only be one that cannot be read, and the task is refused at
-//! the start call with EC2's `InvalidRequest` naming it — the code this operation was
-//! recorded answering for a location it cannot read, where the FPGA-image create answers
-//! `InaccessibleStorageLocation` for the same class. No AMI is minted: an AMI
-//! restored from an object nothing read would be an image this emulator invented.
+//! restore, not something this call creates. Reading one back is work this operation does not
+//! do yet — `CreateStoreImageTask` writes the AMI object into the bucket
+//! ([`crate::state::write_stored_ami_object`]), and nothing here fetches it — so the task is
+//! refused at the start call with EC2's `InvalidRequest` naming the location it did not read,
+//! the code this operation was recorded answering for a location it cannot read, where the
+//! FPGA-image create answers `InaccessibleStorageLocation` for the same class. No AMI is
+//! minted: an AMI restored from an object nothing read would be an image this emulator
+//! invented.
 //!
 //! The bucket name is read as a REQUEST PARAMETER before any object is looked for: a value
 //! outside Amazon S3's published naming rules
@@ -215,12 +216,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(dry_run_operation());
         }
 
-        // The object the restore reads is one `CreateStoreImageTask` wrote, and this
-        // emulator stores no Amazon S3 objects at all, so there is nothing to restore from
-        // and no AMI is minted (see the module docs). The location that could not be read is
-        // reported with the code THIS operation answers for that class — EC2's
-        // `InvalidRequest` ([`crate::state::s3_resource_request_invalid`]) — naming the bucket
-        // and the key the request gave.
+        // The object the restore reads is one `CreateStoreImageTask` wrote, and reading one
+        // back is work this operation does not do, so nothing is restored from it and no AMI
+        // is minted (see the module docs). The location that was not read is reported with
+        // the code THIS operation answers for that class — EC2's `InvalidRequest`
+        // ([`crate::state::s3_resource_request_invalid`]) — naming the bucket and the key the
+        // request gave.
         Err(s3_resource_request_invalid(
             &input.bucket,
             &input.object_key,

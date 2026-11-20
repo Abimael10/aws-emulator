@@ -1029,6 +1029,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             maintenance_options: input.maintenance_options.as_ref(),
             network_performance_options: input.network_performance_options.as_ref(),
             private_dns_name_options: input.private_dns_name_options.as_ref(),
+            cpu_options: input.cpu_options.as_ref(),
+            instance_type: Some(instance_type.as_str()),
             tenancy: input
                 .placement
                 .as_ref()

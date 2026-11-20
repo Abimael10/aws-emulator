@@ -19,9 +19,10 @@ pub const STORE_TASK_STATE_IN_PROGRESS: &str = "InProgress";
 /// (`CreateStoreImageTaskRequest$Bucket`).
 pub const STORE_TASK_STATE_COMPLETED: &str = "Completed";
 
-/// `StoreImageTaskResult$StoreTaskState`'s `Failed`: the state of a task that did not
-/// finish, which is the one state this emulator never puts a task into — nothing here can
-/// fail an upload, and a state no work reached is not one to report.
+/// `StoreImageTaskResult$StoreTaskState`'s `Failed`: the state of a task whose upload did
+/// not store the AMI object — the state a task reaches when the object store ANSWERED the
+/// write with a refusal ([`write_stored_ami_object`]), carrying that answer as the task's
+/// `StoreTaskFailureReason`.
 pub const STORE_TASK_STATE_FAILED: &str = "Failed";
 
 /// The percentage `StoreImageTaskResult$ProgressPercentage` reports for an upload that has
@@ -40,6 +41,15 @@ pub const STORE_IMAGE_TASK_MAX_IN_PROGRESS_PERCENTAGE: i32 =
 /// `StoreImageTaskResult$S3objectKey` report. Derived from the AMI's id, never taken from a
 /// request.
 pub const STORE_IMAGE_OBJECT_KEY_SUFFIX: &str = ".bin";
+
+/// The key the object holding the AMI `ami_id` is written under: `<ami-id>.bin`.
+///
+/// The ONE derivation of that key, so the object a task WRITES, the key its create answers
+/// (`CreateStoreImageTaskResult$ObjectKey`) and the key a later describe reports
+/// (`StoreImageTaskResult$S3objectKey`) are the same string by construction.
+pub fn store_image_object_key(ami_id: &str) -> String {
+    format!("{ami_id}{STORE_IMAGE_OBJECT_KEY_SUFFIX}")
+}
 
 /// How long a store task stays in the account's view: "Currently, only tasks from the past
 /// 31 days can be viewed" (`DescribeStoreImageTasks`). A documented duration, so it keeps
@@ -115,32 +125,47 @@ pub struct StoreImageTaskRecord {
     /// ([`STORE_IMAGE_TASK_VISIBILITY`] after it started), at which
     /// [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] drops it.
     pub leaves_view_at: Instant,
+    /// Why this task's upload did not store the AMI object
+    /// (`StoreImageTaskResult$StoreTaskFailureReason`), or `None` for one whose object the
+    /// bucket now holds.
+    ///
+    /// The object store ANSWERED the write, so this records what it answered: the upload is
+    /// the one part of a store task that can really fail here, and a task whose object was
+    /// not written reaches [`STORE_TASK_STATE_FAILED`] rather than reporting a store that
+    /// nothing performed.
+    pub failure_reason: Option<String>,
 }
 
 impl StoreImageTaskRecord {
     /// A task storing `ami_id` into `bucket`, started now: `InProgress`, with its upload
     /// due [`TRANSITION_DELAY`] later — the span this crate gives every clock-owed
-    /// transition, recorded rather than slept for.
+    /// transition, recorded rather than slept for. It carries no failure: the upload the
+    /// create then makes is what records one
+    /// ([`ComAmazonawsEc2Amazonec2State::fail_store_image_task`]).
     pub fn starting_now(ami_id: &str, bucket: &str) -> Self {
         let started_at_monotonic = Instant::now();
         Self {
             ami_id: ami_id.to_string(),
             bucket: bucket.to_string(),
-            object_key: format!("{ami_id}{STORE_IMAGE_OBJECT_KEY_SUFFIX}"),
+            object_key: store_image_object_key(ami_id),
             started_at: SystemTime::now(),
             started_at_monotonic,
             completes_at: started_at_monotonic + TRANSITION_DELAY,
             leaves_view_at: started_at_monotonic + STORE_IMAGE_TASK_VISIBILITY,
+            failure_reason: None,
         }
     }
 
     /// The task's `StoreTaskState` at `now`.
     ///
-    /// [`STORE_TASK_STATE_FAILED`] is never answered: nothing in this emulator fails an
-    /// upload, and a state no work reached is not one to report.
+    /// [`STORE_TASK_STATE_FAILED`] is the state of a task whose upload the object store did
+    /// not take ([`Self::failure_reason`]), reached at the same instant a stored one reaches
+    /// `Completed` — the span being how long the upload takes either way.
     pub fn state_at(&self, now: Instant) -> &'static str {
         if now < self.completes_at {
             STORE_TASK_STATE_IN_PROGRESS
+        } else if self.failure_reason.is_some() {
+            STORE_TASK_STATE_FAILED
         } else {
             STORE_TASK_STATE_COMPLETED
         }
@@ -174,8 +199,10 @@ impl StoreImageTaskRecord {
 
     /// This task as of `now`, as the model shapes it.
     ///
-    /// `StoreTaskFailureReason` stays absent: "If the task succeeds, `null` is returned"
-    /// (`StoreImageTaskResult$StoreTaskFailureReason`), and no task here fails.
+    /// `StoreTaskFailureReason` carries what the object store answered the upload with, and
+    /// only from the instant the task has reached its own state: "If the task succeeds,
+    /// `null` is returned" (`StoreImageTaskResult$StoreTaskFailureReason`), so a task still
+    /// `InProgress` reports no reason either.
     pub fn view_at(&self, now: Instant) -> StoreImageTaskResult {
         StoreImageTaskResult {
             ami_id: Some(self.ami_id.clone()),
@@ -184,9 +211,121 @@ impl StoreImageTaskRecord {
             s3object_key: Some(self.object_key.clone()),
             progress_percentage: Some(self.progress_at(now)),
             store_task_state: Some(self.state_at(now).to_string()),
-            store_task_failure_reason: None,
+            store_task_failure_reason: self
+                .failure_reason
+                .clone()
+                .filter(|_| now >= self.completes_at),
         }
     }
+}
+
+/// The object one store task writes: the AMI's own stored definition.
+///
+/// AWS stores an AMI "as a single object" in the bucket, and what that object has to hold is
+/// what a restore would need to bring the AMI back — so it is the image's own definition as
+/// this account holds it (the members `DescribeImages` reports for it), written as one JSON
+/// document rather than as filler of the right length. Every value is read off the image
+/// record; nothing here comes from a request.
+pub fn stored_ami_object(image: &Image) -> Vec<u8> {
+    let mappings: Vec<::serde_json::Value> = image
+        .block_device_mappings
+        .iter()
+        .flatten()
+        .map(|mapping| {
+            let ebs = mapping.ebs.as_ref();
+            ::serde_json::json!({
+                "deviceName": mapping.device_name,
+                "virtualName": mapping.virtual_name,
+                "snapshotId": ebs.and_then(|ebs| ebs.snapshot_id.clone()),
+                "volumeSize": ebs.and_then(|ebs| ebs.volume_size),
+                "volumeType": ebs.and_then(|ebs| ebs.volume_type.clone()),
+                "encrypted": ebs.and_then(|ebs| ebs.encrypted),
+            })
+        })
+        .collect();
+    ::serde_json::json!({
+        "imageId": image.image_id,
+        "name": image.name,
+        "description": image.description,
+        "ownerId": image.owner_id,
+        "architecture": image.architecture,
+        "imageType": image.image_type,
+        "platformDetails": image.platform_details,
+        "rootDeviceName": image.root_device_name,
+        "rootDeviceType": image.root_device_type,
+        "virtualizationType": image.virtualization_type,
+        "bootMode": image.boot_mode,
+        "enaSupport": image.ena_support,
+        "kernelId": image.kernel_id,
+        "ramdiskId": image.ramdisk_id,
+        "blockDeviceMappings": mappings,
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// Write the stored AMI object `body` into `bucket` under `object_key`, and answer the
+/// reason the upload did not store it — `None` when the object store took it.
+///
+/// "The AMI object appears in the bucket" (`CreateStoreImageTaskRequest$Bucket`) once the
+/// task has stored it, and that bucket is Amazon S3's resource rather than this service's: so
+/// the upload is made WHERE the object lives, through the tree's one construction of the
+/// in-process Amazon S3 client (`service_common::s3_client`), and a caller handed an object
+/// key reads the object back through Amazon S3's own `HeadObject` and `GetObject`. Nothing
+/// here opens a socket or names another service crate.
+///
+/// A refusal the object store ANSWERED — a bucket the account does not hold, a policy denying
+/// the write — is the upload FAILING, which the task REPORTS
+/// (`StoreImageTaskResult$StoreTaskFailureReason`) rather than something the create hides:
+/// the reason carries the answer the service that owns the bucket gave. A failure carrying no
+/// error code is not an answer about the bucket at all — there was no object store to ask —
+/// so it establishes nothing and fails no task, the rule every cross-service hop of this
+/// crate follows ([`crate::state::flow_log_destination_existence`]).
+///
+/// Call it with NO state guard held — it awaits.
+pub async fn write_stored_ami_object(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    bucket: &str,
+    object_key: &str,
+    body: Vec<u8>,
+) -> Option<String> {
+    use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
+
+    let answered = ::service_common::s3_client::s3_client(ctx.callback(), region)
+        .put_object()
+        .bucket(bucket)
+        .key(object_key)
+        .body(::aws_sdk_s3::primitives::ByteStream::from(body))
+        .send()
+        .await;
+    let error = match answered {
+        Ok(_) => return None,
+        Err(error) => error,
+    };
+    let Some(code) = error.code().map(str::to_string) else {
+        ::tracing::warn!(
+            bucket = %bucket,
+            key = %object_key,
+            error = ?error,
+            "nothing answered the write of an AMI object: this emulator has no Amazon S3 to \
+             store it in"
+        );
+        return None;
+    };
+    let answer = match error.message() {
+        Some(message) => format!("{code}: {message}"),
+        None => code,
+    };
+    ::tracing::warn!(
+        bucket = %bucket,
+        key = %object_key,
+        answer = %answer,
+        "the emulator's Amazon S3 refused the write of a store task's AMI object"
+    );
+    Some(format!(
+        "The AMI object could not be stored in the bucket {bucket}: {answer}"
+    ))
 }
 
 impl ComAmazonawsEc2Amazonec2State {

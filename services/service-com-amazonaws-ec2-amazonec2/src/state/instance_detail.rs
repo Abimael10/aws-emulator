@@ -27,15 +27,17 @@
 use std::time::Instant;
 
 use crate::ops::types::{
-    CAPACITY_RESERVATION_PREFERENCE_VALUES, CapacityReservationSpecificationResponse,
-    CapacityReservationTargetResponse, CpuOptions,
+    AMD_SEV_SNP_SPECIFICATION_VALUES, CAPACITY_RESERVATION_PREFERENCE_VALUES,
+    CapacityReservationSpecificationResponse,
+    CapacityReservationTargetResponse, CpuOptions, CpuOptionsRequest,
     EbsInstanceBlockDevice, EnclaveOptions, EnclaveOptionsRequest, HOSTNAME_TYPE_VALUES,
     HTTP_TOKENS_STATE_VALUES, HibernationOptions, INSTANCE_AUTO_RECOVERY_STATE_VALUES,
     INSTANCE_BANDWIDTH_WEIGHTING_VALUES, INSTANCE_METADATA_ENDPOINT_STATE_VALUES,
     INSTANCE_METADATA_PROTOCOL_STATE_VALUES, INSTANCE_METADATA_TAGS_STATE_VALUES, Instance,
     InstanceBlockDeviceMapping, InstanceMaintenanceOptions, InstanceMaintenanceOptionsRequest,
     InstanceMetadataOptionsRequest, InstanceMetadataOptionsResponse,
-    InstanceNetworkPerformanceOptions, InstanceNetworkPerformanceOptionsRequest, Placement,
+    InstanceNetworkPerformanceOptions, InstanceNetworkPerformanceOptionsRequest,
+    NESTED_VIRTUALIZATION_SPECIFICATION_VALUES, Placement,
     PrivateDnsNameOptionsRequest, PrivateDnsNameOptionsResponse, RequestLaunchTemplateData,
     SHUTDOWN_BEHAVIOR_VALUES, TENANCY_VALUES,
 };
@@ -49,7 +51,8 @@ use super::{
     IMDS_SUPPORT_V2, ImageSpec, InstanceRecord, InstanceStateName, MAX_METADATA_HOP_LIMIT,
     MIN_METADATA_HOP_LIMIT,
     TRANSITION_DELAY, catalog_member, due_instant, echoed_resource_id, image_creation_time,
-    instance_type_record, invalid_parameter_value, region_of_zone_name, supported_boot_modes,
+    instance_type_record, invalid_parameter_combination, invalid_parameter_value,
+    region_of_zone_name, supported_boot_modes,
     unmanaged_operator,
     zone_id_for_zone_name,
 };
@@ -251,6 +254,27 @@ pub struct InstanceDetail {
     /// is what makes the host's own `Instances` report that instance
     /// ([`ComAmazonawsEc2Amazonec2State::resync_dedicated_host_instances`]).
     pub host_id: Option<String>,
+    /// "The number of CPU cores for the instance" as the LAUNCH asked for it
+    /// (`CpuOptionsRequest$CoreCount`, reported as `CpuOptions$CoreCount`), or `None` for a
+    /// launch that named none — which leaves the instance on the core count its own
+    /// instance type comes with ([`InstanceDetail::cpu_options`]).
+    pub cpu_core_count: Option<i32>,
+    /// "The number of threads per CPU core" the launch asked for
+    /// (`CpuOptionsRequest$ThreadsPerCore` -> `CpuOptions$ThreadsPerCore`): "to disable
+    /// multithreading for the instance, specify a value of `1`. Otherwise, specify the
+    /// default value of `2`". `None` for a launch that named none, which leaves the instance
+    /// on its instance type's own default.
+    pub cpu_threads_per_core: Option<i32>,
+    /// "Indicates whether the instance is enabled for AMD SEV-SNP"
+    /// (`CpuOptions$AmdSevSnp`), as the launch asked for it
+    /// (`CpuOptionsRequest$AmdSevSnp`) — a catalog member of the modelled
+    /// `AmdSevSnpSpecification` enum, never the request's text. `None` for a launch that
+    /// asked for neither setting, which is a fact AWS reports no member for.
+    pub amd_sev_snp: Option<&'static str>,
+    /// "Indicates whether the instance is enabled for nested virtualization"
+    /// (`CpuOptions$NestedVirtualization`), read on the same terms as
+    /// [`Self::amd_sev_snp`].
+    pub nested_virtualization: Option<&'static str>,
     /// `PrivateDnsNameOptionsResponse$HostnameType`, or `None` to follow the subnet's.
     pub private_dns_hostname_type: Option<&'static str>,
     /// `PrivateDnsNameOptionsResponse$EnableResourceNameDnsARecord`, or `None` to follow
@@ -287,6 +311,10 @@ impl Default for InstanceDetail {
             host_resource_group_arn: None,
             placement_group_name: None,
             host_id: None,
+            cpu_core_count: None,
+            cpu_threads_per_core: None,
+            amd_sev_snp: None,
+            nested_virtualization: None,
             private_dns_hostname_type: None,
             private_dns_a_record: None,
             private_dns_aaaa_record: None,
@@ -368,6 +396,11 @@ impl InstanceDetail {
                     DEFAULT_METADATA_HOP_LIMIT
                 }),
         };
+        // The cores and threads per core this launch asked for, checked ONCE here against
+        // the counts its instance type offers, so both members are resolved before the
+        // record is built and a count the type does not offer refuses the launch.
+        let (cpu_core_count, cpu_threads_per_core) =
+            requested_cpu_topology(spec.instance_type, spec.cpu_options)?;
         Ok(Self {
             http_tokens,
             http_put_response_hop_limit,
@@ -427,6 +460,27 @@ impl InstanceDetail {
             host_resource_group_arn: None,
             placement_group_name: spec.placement_group_name.map(str::to_string),
             host_id: spec.host_id.map(str::to_string),
+            // "The CPU options for the instance" (`RunInstancesRequest$CpuOptions`): the
+            // topology the launch ASKED for, checked against what its instance type can be
+            // configured with ([`requested_cpu_topology`]), so an instance reports the cores
+            // and threads per core its launch chose rather than the type's default — and a
+            // count the type does not offer refuses the launch instead of being stored.
+            cpu_core_count,
+            cpu_threads_per_core,
+            // The two settings of the same member that are WORDS, resolved to a member of
+            // their own modelled catalog like every other word of this record.
+            amd_sev_snp: requested_word(
+                "AmdSevSnp",
+                spec.cpu_options
+                    .and_then(|options| options.amd_sev_snp.as_deref()),
+                AMD_SEV_SNP_SPECIFICATION_VALUES,
+            )?,
+            nested_virtualization: requested_word(
+                "NestedVirtualization",
+                spec.cpu_options
+                    .and_then(|options| options.nested_virtualization.as_deref()),
+                NESTED_VIRTUALIZATION_SPECIFICATION_VALUES,
+            )?,
             private_dns_hostname_type: requested_word(
                 "HostnameType",
                 spec.private_dns_name_options
@@ -491,6 +545,131 @@ impl InstanceDetail {
     /// from that instant on. The due instant is stored; nothing sleeps for it.
     pub fn metadata_options_changed(&mut self) {
         self.metadata_applied_at = due_instant(TRANSITION_DELAY);
+    }
+
+    /// "The CPU options for the instance" (`Instance$CpuOptions`) for an instance of
+    /// `instance_type`: the cores and threads per core its LAUNCH asked for, and the counts
+    /// its instance type comes with for each member the launch left out.
+    ///
+    /// The ONE reading of an instance's CPU topology, so every report of one instance
+    /// answers the same. The type's own counts are read off the one derivation of an
+    /// instance type's facts this crate has ([`instance_type_record`]), so the instance
+    /// report and `DescribeInstanceTypes` cannot disagree about one type; a type this
+    /// emulator does not publish contributes no default, so an instance of one reports only
+    /// what its launch named — and nothing at all where the launch named nothing either.
+    ///
+    /// AMD SEV-SNP and nested virtualization are reported only for a launch that ASKED for
+    /// a setting: neither is a fact of the instance type, so an instance whose launch named
+    /// neither carries neither member.
+    pub fn cpu_options(&self, instance_type: &str) -> Option<CpuOptions> {
+        let record = instance_type_record(instance_type);
+        let core_count = self
+            .cpu_core_count
+            .or_else(|| record.as_ref().map(|record| record.default_cores));
+        let threads_per_core = self
+            .cpu_threads_per_core
+            .or_else(|| record.as_ref().map(|record| record.default_threads_per_core));
+        if core_count.is_none()
+            && threads_per_core.is_none()
+            && self.amd_sev_snp.is_none()
+            && self.nested_virtualization.is_none()
+        {
+            return None;
+        }
+        Some(CpuOptions {
+            core_count,
+            threads_per_core,
+            amd_sev_snp: self.amd_sev_snp.map(str::to_string),
+            nested_virtualization: self.nested_virtualization.map(str::to_string),
+        })
+    }
+}
+
+/// The cores and threads per core a launch asks for, or `None` for each member it named
+/// none of — and `InvalidParameterValue` for a count the instance type cannot be configured
+/// with.
+///
+/// "The CPU options for the instance. Both the core count and threads per core must be
+/// specified in the request" (`CpuOptionsRequest`), whose `CoreCount` is "the number of CPU
+/// cores for the instance" and whose `ThreadsPerCore` is "the number of threads per CPU
+/// core. To disable multithreading for the instance, specify a value of `1`. Otherwise,
+/// specify the default value of `2`" — so what the launch asks for is what the instance
+/// RUNS AS, and a request naming ONE of the two counts without the other asks for a
+/// topology the member does not carry: it is refused rather than completed from the type's
+/// defaults. A launch that names NEITHER count asks for no topology at all and runs on the
+/// counts its instance type comes with, which is also what one naming only an option word of
+/// the same member (`$AmdSevSnp`, `$NestedVirtualization`) asks for.
+///
+/// The counts a type offers are the ones it publishes: "the number of cores that can be
+/// configured for the instance type" (`VCpuInfo$ValidCores`) and the threads per core it
+/// can be configured with (`VCpuInfo$ValidThreadsPerCore`), read off the one derivation of
+/// an instance type's facts this crate has ([`instance_type_record`]) so a launch and
+/// `DescribeInstanceTypes` cannot disagree about one type. A type this emulator does not
+/// publish has no counts to check against, so the request's own values stand.
+pub fn requested_cpu_topology<E>(
+    instance_type: Option<&str>,
+    requested: Option<&CpuOptionsRequest>,
+) -> Result<(Option<i32>, Option<i32>), Scaffolded<E>> {
+    let Some(requested) = requested else {
+        return Ok((None, None));
+    };
+    // The two counts are asked for TOGETHER, so one without the other is a combination the
+    // request cannot carry — stated in the words the member states the requirement in.
+    if requested.core_count.is_some() != requested.threads_per_core.is_some() {
+        return Err(invalid_parameter_combination(
+            "Both the core count and threads per core must be specified in the request",
+        ));
+    }
+    let record = instance_type.and_then(instance_type_record);
+    let offered = |counts: fn(&super::InstanceTypeRecord) -> Vec<i32>| -> Option<Vec<i32>> {
+        record.as_ref().map(counts)
+    };
+    Ok((
+        checked_cpu_count(
+            CPU_CORE_COUNT_MEMBER,
+            requested.core_count,
+            offered(super::InstanceTypeRecord::valid_cores),
+        )?,
+        checked_cpu_count(
+            CPU_THREADS_PER_CORE_MEMBER,
+            requested.threads_per_core,
+            offered(super::InstanceTypeRecord::valid_threads_per_core),
+        )?,
+    ))
+}
+
+/// The name `CpuOptionsRequest$CoreCount` carries in a refusal that names the parameter.
+///
+/// EC2's parameter layer names a NESTED member by its path, in the lower camel case the wire
+/// spells it — which is what the recorded refusal of a launch naming an unknown instance
+/// profile carries for `IamInstanceProfile$Name` ("Value (…) for parameter
+/// iamInstanceProfile.name is invalid …").
+const CPU_CORE_COUNT_MEMBER: &str = "cpuOptions.coreCount";
+
+/// The name `CpuOptionsRequest$ThreadsPerCore` carries in one, read the same way.
+const CPU_THREADS_PER_CORE_MEMBER: &str = "cpuOptions.threadsPerCore";
+
+/// `asked`, when the type `offered` it — and the refusal EC2's parameter layer gives a
+/// member's invalid value otherwise, naming the parameter, the value and the counts the
+/// type does offer ([`unpublished_word_message`] is the same clause for a member whose
+/// values are words).
+fn checked_cpu_count<E>(
+    member: &str,
+    asked: Option<i32>,
+    offered: Option<Vec<i32>>,
+) -> Result<Option<i32>, Scaffolded<E>> {
+    match (asked, offered) {
+        (Some(asked), Some(offered)) if !offered.contains(&asked) => {
+            Err(invalid_parameter_value(format!(
+                "Value ({asked}) for parameter {member} is invalid. Valid values are {}",
+                offered
+                    .iter()
+                    .map(i32::to_string)
+                    .collect::<Vec<String>>()
+                    .join(", ")
+            )))
+        }
+        (asked, _) => Ok(asked),
     }
 }
 
@@ -561,6 +740,13 @@ pub struct InstanceDetailSpec<'request> {
     pub network_performance_options: Option<&'request InstanceNetworkPerformanceOptionsRequest>,
     /// `RunInstancesRequest$PrivateDnsNameOptions`.
     pub private_dns_name_options: Option<&'request PrivateDnsNameOptionsRequest>,
+    /// `RunInstancesRequest$CpuOptions` — the CPU topology the launch asks the instance to
+    /// run as.
+    pub cpu_options: Option<&'request CpuOptionsRequest>,
+    /// The instance type every instance of this launch runs, which decides the counts its
+    /// `CpuOptions` may name ([`requested_cpu_topology`]) and the ones it reports for a
+    /// member the launch left out.
+    pub instance_type: Option<&'request str>,
     /// `Placement$Tenancy`, as the launch named it.
     pub tenancy: Option<&'request str>,
     /// `Placement$GroupName` — the placement group the launch named, already resolved
@@ -753,6 +939,15 @@ impl ComAmazonawsEc2Amazonec2State {
                     enable_resource_name_dns_aaaa_record: options
                         .enable_resource_name_dns_aaaa_record,
                 });
+        // The template's own CPU options, read across into the shape a launch carries them
+        // in, so the topology an instance minted from a version runs as is resolved exactly
+        // as one a launch names itself is ([`requested_cpu_topology`]).
+        let cpu_options = data.cpu_options.as_ref().map(|options| CpuOptionsRequest {
+            core_count: options.core_count,
+            threads_per_core: options.threads_per_core,
+            amd_sev_snp: options.amd_sev_snp.clone(),
+            nested_virtualization: options.nested_virtualization.clone(),
+        });
         let image_imds_support = self.image_imds_support(image_id);
         let placement_group_name = data
             .placement
@@ -798,6 +993,8 @@ impl ComAmazonawsEc2Amazonec2State {
             maintenance_options: maintenance_options.as_ref(),
             network_performance_options: network_performance_options.as_ref(),
             private_dns_name_options: private_dns_name_options.as_ref(),
+            cpu_options: cpu_options.as_ref(),
+            instance_type: data.instance_type.as_deref(),
             tenancy: data
                 .placement
                 .as_ref()
@@ -1018,18 +1215,12 @@ impl ComAmazonawsEc2Amazonec2State {
         });
 
         // "The CPU options for the instance" (`Instance$CpuOptions`): the cores and threads
-        // per core of its own instance type, read off the one derivation of an instance
-        // type's facts this crate has ([`instance_type_record`]), so the instance report and
-        // `DescribeInstanceTypes` cannot disagree about one type. A type this emulator does
-        // not offer has no CPU layout to report.
-        view.cpu_options = instance_type_record(&instance.instance_type).map(|record| CpuOptions {
-            core_count: Some(record.default_cores),
-            threads_per_core: Some(record.default_threads_per_core),
-            // AMD SEV-SNP and nested virtualization are enabled by a launch that asks for
-            // them; nothing here asks, so neither is reported.
-            amd_sev_snp: None,
-            nested_virtualization: None,
-        });
+        // per core the LAUNCH asked for, and its instance type's own counts for each member
+        // it left out — read through the one reading of an instance's CPU topology this
+        // crate has ([`InstanceDetail::cpu_options`]), which takes the type's counts off the
+        // one derivation of an instance type's facts ([`instance_type_record`]) so the
+        // instance report and `DescribeInstanceTypes` cannot disagree about one type.
+        view.cpu_options = detail.cpu_options(&instance.instance_type);
 
         // "The location where the instance launched" (`Instance$Placement`): its zone, that
         // zone's id, the tenancy of the hardware it runs on and the placement group it is

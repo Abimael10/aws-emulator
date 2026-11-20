@@ -496,6 +496,8 @@ async fn associate_ipam_resource_discovery_refuses_what_the_contract_does_not_ad
             INVALID_IPAM_RESOURCE_DISCOVERY_ID_MALFORMED,
         ),
         (
+            // The suffix's ALPHABET is still what says whether the value is an id of this
+            // kind at all: a suffix that is no run of hex digits names no discovery.
             "a resource discovery id with a non-hex suffix",
             vec![
                 param("IpamId", &target.id),
@@ -505,13 +507,15 @@ async fn associate_ipam_resource_discovery_refuses_what_the_contract_does_not_ad
             INVALID_IPAM_RESOURCE_DISCOVERY_ID_MALFORMED,
         ),
         (
-            "a resource discovery id of the wrong length",
+            // Its LENGTH is not: a run of hex digits of another count is an id of this kind,
+            // so the account is asked whether it holds one and absence is the NotFound.
+            "a resource discovery id of another length",
             vec![
                 param("IpamId", &target.id),
                 param("IpamResourceDiscoveryId", "ipam-res-disco-0123456"),
             ],
             400,
-            INVALID_IPAM_RESOURCE_DISCOVERY_ID_MALFORMED,
+            INVALID_IPAM_RESOURCE_DISCOVERY_ID_NOT_FOUND,
         ),
         (
             // The two resources share an id prefix, and an association is not a discovery.
