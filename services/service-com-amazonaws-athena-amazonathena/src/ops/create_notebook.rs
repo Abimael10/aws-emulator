@@ -7,7 +7,9 @@
 //! notebook registry, and `ExportNotebook` answers out of that same record — so the notebook
 //! a later read reports is the one this call persisted. The content comes from no part of
 //! the request; the workgroup, the name and the idempotency token are what the request
-//! decides.
+//! decides. The call's RATE is metered before any of that: Athena serves this API's calls
+//! from a token bucket, and one it does not admit is refused with the modelled
+//! `TooManyRequestsException` and creates nothing (`crate::state::request_quota`).
 //!
 //! ## Shape of an operation
 //!
@@ -153,6 +155,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The request RATE is decided before anything of the request is performed: Athena
+        // serves a metered API's calls from a token bucket, and a call it does not admit is
+        // REFUSED rather than served slowly, so such a call creates nothing and spends
+        // nothing else of the account (see `crate::state::request_quota`). The rate is held
+        // per Region, which is the Region the call was signed for.
+        let region = crate::state::authorization::region_from_request(ctx.parts());
+        if crate::state::request_quota::is_throttled(&*self.engine, Self::NAME, &region) {
+            return Err(throttled());
+        }
+
         // A notebook belongs to a workgroup, and the workgroup is the IAM resource this
         // action is scoped by, so the create is authorized against that workgroup's ARN
         // before anything is stored. See `crate::state::authorization`.
@@ -256,4 +268,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// itself, which is the class [`crate::state::ERROR_CODE_INVALID_INPUT`] names.
 fn invalid_request(message: impl Into<String>) -> CreateNotebookError {
     CreateNotebookError::invalid_request(crate::state::ERROR_CODE_INVALID_INPUT, message)
+}
+
+/// The operation's own THROTTLING refusal (HTTP 400): "Indicates that the request was
+/// throttled."
+///
+/// `TooManyRequestsException` is the error the model declares for a call past a rate, and it
+/// is what a generated client's throttling classification — and so its retry and backoff
+/// path — keys off. The sentence is the one AWS states for that class
+/// ([`crate::state::request_quota::THROTTLE_MESSAGE`]).
+fn throttled() -> CreateNotebookError {
+    CreateNotebookErrorModeled::TooManyRequestsException(TooManyRequestsException {
+        message: Some(crate::state::request_quota::THROTTLE_MESSAGE.to_string()),
+        // `ThrottleReason` declares ONE reason — the concurrent QUERY limit — which is not
+        // what refused this call, so the refusal states no reason rather than a reason that
+        // would misreport which quota was exceeded.
+        reason: None,
+    })
+    .into()
 }

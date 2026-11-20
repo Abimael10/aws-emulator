@@ -40,6 +40,54 @@ const CREATE_OBJECTS: [&str; 8] = [
     "VIEW",
 ];
 
+/// The words Athena's query grammar accepts where a STATEMENT begins, in the order the
+/// grammar lists them.
+///
+/// Source: Athena's own SQL grammar, whose statement production is the choice between the
+/// statements each of these words begins — `ALTER`, `ANALYZE`, `CALL`, `COMMENT`, `COMMIT`,
+/// `CREATE`, `DEALLOCATE`, `DELETE`, `DENY`, `DESC`, `DESCRIBE`, `DROP`, `EXECUTE`,
+/// `EXPLAIN`, `GRANT`, `INSERT`, `MERGE`, `PREPARE`, `REFRESH`, `RESET`, `REVOKE`,
+/// `ROLLBACK`, `SET`, `SHOW`, `START`, `TRUNCATE`, `UNLOAD`, `UPDATE` and `USE` — and a
+/// QUERY, which begins with one of several words (`SELECT`, `WITH`, `TABLE`, `VALUES`) and
+/// so is listed as the production itself ([`QUERY_PRODUCTION`]) rather than by any one of
+/// them. A word outside this set begins no statement that grammar has a production for.
+const STATEMENT_START: [&str; 29] = [
+    "ALTER",
+    "ANALYZE",
+    "CALL",
+    "COMMENT",
+    "COMMIT",
+    "CREATE",
+    "DEALLOCATE",
+    "DELETE",
+    "DENY",
+    "DESC",
+    "DESCRIBE",
+    "DROP",
+    "EXECUTE",
+    "EXPLAIN",
+    "GRANT",
+    "INSERT",
+    "MERGE",
+    "PREPARE",
+    "REFRESH",
+    "RESET",
+    "REVOKE",
+    "ROLLBACK",
+    "SET",
+    "SHOW",
+    "START",
+    "TRUNCATE",
+    "UNLOAD",
+    "UPDATE",
+    "USE",
+];
+
+/// How the grammar names the production it accepts beside the statement-start words: a
+/// QUERY, which is named by the production rather than by a word, and which the diagnostic
+/// therefore states unquoted and last.
+const QUERY_PRODUCTION: &str = "<query>";
+
 /// The tokens Athena's query grammar accepts after the NAME of a `CREATE TABLE`, in the
 /// order the grammar lists them.
 ///
@@ -48,6 +96,14 @@ const CREATE_OBJECTS: [&str; 8] = [
 /// defines a table from a query, the table `COMMENT` and the `WITH` property list. A
 /// token outside this set is one the grammar has no production for at that position.
 const AFTER_TABLE_NAME: [&str; 5] = ["(", ".", "AS", "COMMENT", "WITH"];
+
+/// The words a QUERY may begin with.
+///
+/// Source: Athena's own SQL grammar, whose query production is a `SELECT`, a query prefixed
+/// with a `WITH` clause, a `TABLE <name>` or a `VALUES` list. The grammar lists the query as
+/// a production rather than by these words ([`QUERY_PRODUCTION`]), so they are what tells a
+/// word that begins a query from one that begins no statement at all.
+const QUERY_START: [&str; 4] = ["SELECT", "WITH", "TABLE", "VALUES"];
 
 /// The diagnostic Athena refuses `sql` with, for text no grammar here can read as a
 /// statement.
@@ -83,6 +139,20 @@ pub fn malformed_statement(sql: &str) -> String {
             Some(&expected_one_of(&AFTER_TABLE_NAME)),
         );
     }
+    // Text whose FIRST word begins no statement of this grammar is a mismatch THERE: a
+    // statement-start production is the first thing the grammar reads, so it stops on that
+    // word rather than somewhere later in text it never got to read.
+    let statement_word = tokens
+        .first()
+        .filter(|first| matches!(first.token, Token::Word(..)))
+        .filter(|first| !accepts(&STATEMENT_START, first) && !accepts(&QUERY_START, first));
+    if let Some(first) = statement_word {
+        return mismatched_input(
+            position_of(first),
+            &token_text(first),
+            Some(&expected_statement_start()),
+        );
+    }
     // Everything else is reported where the parser itself stopped reading. A statement
     // past the bound this emulator reads one under is not parsed again here — the bound is
     // what keeps the tree a parse builds, and the recursive walks over it, inside the
@@ -91,10 +161,43 @@ pub fn malformed_statement(sql: &str) -> String {
         Some(past_bound) => Some((position_of(past_bound), token_text(past_bound))),
         None => stopped_at(sql),
     };
+    // Where the grammar stopped at the START of a statement, its accepted set at that
+    // position is known too: every word a statement of this language may begin with, and
+    // the production for a query. Elsewhere the set is the parser's own and is not
+    // reported — and neither is it reported where the parser named no position at all, the
+    // case the diagnostic falls back to the start of the submitted text for, since that
+    // position is not where the reading stopped.
+    let expecting = match &stop {
+        Some((at, _)) => begins_a_statement(&tokens, *at),
+        None => tokens.is_empty(),
+    };
     let (at, token) = stop
         .or_else(|| tokens.first().map(|first| (position_of(first), token_text(first))))
         .unwrap_or_else(|| (Position::START, String::new()));
-    mismatched_input(at, &token, None)
+    let expecting = expecting.then(expected_statement_start);
+    mismatched_input(at, &token, expecting.as_deref())
+}
+
+/// Whether `at` is where a STATEMENT begins in the submitted text.
+///
+/// That is the first token the grammar reads, and the first after a statement separator —
+/// the positions the grammar reads a statement-start production at, and so the ones whose
+/// accepted set is [`STATEMENT_START`]. Text the grammar read no token of at all begins
+/// where a statement would have.
+fn begins_a_statement(tokens: &[TokenWithSpan], at: Position) -> bool {
+    let Some(index) = tokens.iter().position(|token| position_of(token) == at) else {
+        return tokens.is_empty();
+    };
+    index == 0
+        || tokens
+            .get(index - 1)
+            .is_some_and(|previous| matches!(previous.token, Token::SemiColon))
+}
+
+/// The accepted set the grammar reports where a statement begins: its statement-start words,
+/// quoted and in the grammar's own order, and the query production last.
+fn expected_statement_start() -> String {
+    format!("{}, {QUERY_PRODUCTION}", expected_one_of(&STATEMENT_START))
 }
 
 /// Whether one of `accepted` is what `token` states, however it was written.
@@ -241,6 +344,8 @@ mod tests {
         /// The accepted set the grammar reports after `CREATE`.
         const AFTER_CREATE: &str = "Expecting: 'MATERIALIZED', 'MULTI', 'OR', \
                                     'PROTECTED', 'ROLE', 'SCHEMA', 'TABLE', 'VIEW'";
+        // The accepted set the grammar reports where a statement begins.
+        let at_statement_start = format!("Expecting: {}", expected_statement_start());
 
         // (case, the submitted text, the diagnostic)
         let cases: Vec<(&str, String, String)> = vec![
@@ -282,7 +387,22 @@ mod tests {
             (
                 "text that is no statement at all, reported where the parser stopped",
                 "SELEKT 1".to_string(),
-                "line 1:1: mismatched input 'SELEKT'".to_string(),
+                format!("line 1:1: mismatched input 'SELEKT'. {at_statement_start}"),
+            ),
+            (
+                "a misspelled query word, with the rest of the text no statement either",
+                "SELEC 1 FRM dual !!!".to_string(),
+                format!("line 1:1: mismatched input 'SELEC'. {at_statement_start}"),
+            ),
+            (
+                "a word that begins a statement of another engine's dialect",
+                "VACUUM INTO 'copy.db'".to_string(),
+                format!("line 1:1: mismatched input 'VACUUM'. {at_statement_start}"),
+            ),
+            (
+                "a statement that begins after a separator the grammar read",
+                "SELECT 1;\n  SELEKT 2".to_string(),
+                format!("line 2:3: mismatched input 'SELEKT'. {at_statement_start}"),
             ),
             (
                 "a table name the grammar read, followed by a token it does not accept",

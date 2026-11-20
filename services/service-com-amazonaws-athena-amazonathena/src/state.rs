@@ -154,6 +154,10 @@ pub use capacity_assignments::*;
 /// Whether IAM lets a request perform the action it asks for on the workgroup it names.
 pub mod authorization;
 
+/// The rate one account's calls to a metered Athena API are admitted at, and the throttling
+/// refusal of the calls past it.
+pub mod request_quota;
+
 /// Whether IAM lets the caller's query reach the AWS Glue Data Catalog the statement
 /// addresses.
 pub mod catalog_authorization;
@@ -2420,6 +2424,10 @@ pub struct ComAmazonawsAthenaAmazonathenaState {
     /// for different purposes, and neither can be made to stand in for the other. Drawn
     /// from the system's randomness when the store is created and never reported.
     notebook_address_key: PageTokenKey,
+    /// What this account has left to spend of each METERED API's published call rate, per
+    /// Region — [`request_quota::RequestRates`]. Written only by the rate gate in front of a
+    /// metered operation, which is also the only thing that reads it.
+    pub request_rates: request_quota::RequestRates,
     /// Set while one clock pump is publishing this store's query state changes as they fall
     /// due; the claim that keeps a second pump from starting beside it (see
     /// [`query_events`]).
@@ -2452,6 +2460,7 @@ impl Default for ComAmazonawsAthenaAmazonathenaState {
             named_queries: NamedQueryRegistry::default(),
             page_token_key: PageTokenKey::new(),
             notebook_address_key: PageTokenKey::new(),
+            request_rates: request_quota::RequestRates::default(),
             query_clock_pump_running: false,
             query_clock_pump_generation: 0,
             query_clock_pump: None,
