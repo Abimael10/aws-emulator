@@ -43,8 +43,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::event_source_mappings::{
     call, create_function, create_mapping, create_request, get_mapping, given_broker,
-    given_enabled_mapping, list_mappings, router_on, Answer, DYNAMODB_SOURCE, KINESIS_SOURCE,
-    MAPPINGS_URI, MSK_SOURCE, QUEUE_SOURCE,
+    given_enabled_mapping, list_mappings, refusal_message, router_on, Answer, DYNAMODB_SOURCE,
+    KINESIS_SOURCE, MAPPINGS_URI, MSK_SOURCE, QUEUE_SOURCE,
 };
 
 /// The Region the harness signs for, and the account every emulator ARN carries.
@@ -89,12 +89,6 @@ const INVALID_FILTER_MESSAGE: &str = "Invalid filter pattern definition.";
 /// `UpdateEventSourceMapping` on the mapping `uuid` names.
 async fn update_mapping(router: &MultiServiceRouter, uuid: &str, body: &Value) -> Answer {
     call(router, "PUT", &format!("{MAPPINGS_URI}/{uuid}"), body).await
-}
-
-/// The `message` member of a refusal, which is where `InvalidParameterValueException`
-/// carries it, falling back to the `Message` member `ResourceNotFoundException` uses.
-fn refusal_message(answer: &Answer) -> Option<String> {
-    answer.string("message").or_else(|| answer.string("Message"))
 }
 
 /// One row of the batch-and-window table: the source the mapping names, what else that

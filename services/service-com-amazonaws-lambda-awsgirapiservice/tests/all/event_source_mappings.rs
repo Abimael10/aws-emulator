@@ -280,23 +280,25 @@ pub(crate) fn router_on(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRou
     router
 }
 
-/// Create the Amazon MQ broker `name` through THAT service's own `CreateBroker`, so the
-/// broker a mapping's `EventSourceArn` names is one Amazon MQ itself reports.
+/// Dispatch one request to AMAZON MQ, the service that owns brokers, signed for its own
+/// signing name — the one way these suites reach that service, so a suite that reads brokers
+/// back asks it exactly as the suite that creates them does.
 ///
-/// The body carries the members that operation requires plus the one administrative user a
-/// broker is created with, exactly as the Amazon MQ suites write it.
-pub(crate) async fn given_broker(router: &MultiServiceRouter, name: &str) {
-    let body = json!({
-        "brokerName": name,
-        "engineType": "ACTIVEMQ",
-        "deploymentMode": "SINGLE_INSTANCE",
-        "hostInstanceType": "mq.t3.micro",
-        "publiclyAccessible": false,
-        "users": [{ "username": "admin", "password": "SuperSecret123" }],
-    });
+/// `body` is the JSON document the request carries, and `None` a request that carries no body
+/// at all, which is what a read of that service sends.
+pub(crate) async fn mq_call(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: Option<&Value>,
+) -> Answer {
+    let payload = match body {
+        None => Vec::new(),
+        Some(body) => serde_json::to_vec(body).expect("the broker request body must serialize"),
+    };
     let request = http::Request::builder()
-        .method("POST")
-        .uri("http://mq.us-east-1.amazonaws.com/v1/brokers")
+        .method(method)
+        .uri(format!("http://mq.us-east-1.amazonaws.com{uri}"))
         .header("host", "mq.us-east-1.amazonaws.com")
         .header(
             "authorization",
@@ -306,19 +308,46 @@ pub(crate) async fn given_broker(router: &MultiServiceRouter, name: &str) {
             ),
         )
         .header("content-type", "application/json")
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(&body).expect("the broker request body must serialize"),
-        ))
+        .body(bytes::Bytes::from(payload))
         .expect("the broker request must build");
     let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let body = response.into_body();
+    let (parts, body) = response.into_parts();
+    Answer {
+        status: parts.status.as_u16(),
+        headers: parts.headers,
+        body,
+    }
+}
+
+/// Create the Amazon MQ broker `name` through THAT service's own `CreateBroker`, so the
+/// broker a mapping's `EventSourceArn` names is one Amazon MQ itself reports, and answer the
+/// `brokerArn` that service minted for it.
+///
+/// The body carries the members that operation requires plus the one administrative user a
+/// broker is created with, exactly as the Amazon MQ suites write it.
+pub(crate) async fn given_broker(router: &MultiServiceRouter, name: &str) -> String {
+    let body = json!({
+        "brokerName": name,
+        "engineType": "ACTIVEMQ",
+        "deploymentMode": "SINGLE_INSTANCE",
+        "hostInstanceType": "mq.t3.micro",
+        "publiclyAccessible": false,
+        "users": [{ "username": "admin", "password": "SuperSecret123" }],
+    });
+    let created = mq_call(router, "POST", "/v1/brokers", Some(&body)).await;
     assert_eq!(
-        status,
+        created.status,
         200,
-        "CreateBroker for {name:?} must answer 200, got {status} {}",
-        String::from_utf8_lossy(&body)
+        "CreateBroker for {name:?} must answer 200, got {} {}",
+        created.status,
+        created.text()
     );
+    created.string("brokerArn").unwrap_or_else(|| {
+        panic!(
+            "CreateBroker for {name:?} must answer a brokerArn, got {}",
+            created.text()
+        )
+    })
 }
 
 /// Dispatch one JSON request, signed with the credential this harness publishes — a key no
@@ -373,6 +402,15 @@ pub(crate) async fn call_signed_by(
         headers: parts.headers,
         body,
     }
+}
+
+/// The sentence a refusal carries, wherever the error shape puts it: the request-validation
+/// errors of this service carry it in `message` and the not-found ones in `Message`, so a suite
+/// reads whichever member the answer has rather than keeping one reader per error shape.
+pub(crate) fn refusal_message(answer: &Answer) -> Option<String> {
+    answer
+        .string("message")
+        .or_else(|| answer.string("Message"))
 }
 
 /// `CreateEventSourceMapping`.
