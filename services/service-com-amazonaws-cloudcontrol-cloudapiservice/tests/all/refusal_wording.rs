@@ -1085,3 +1085,243 @@ async fn a_type_the_registry_does_not_hold_is_refused_before_anything_it_names_i
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The SDK diagnostic a RELAYED handler exception carries
+// ---------------------------------------------------------------------------
+
+/// The fixed text that opens the diagnostic a relayed exception carries, naming the service
+/// the handler called.
+///
+/// A resource type's handler reaches the service that owns the type through that service's
+/// AWS SDK, so a refusal it relays is the exception that SDK RAISED: the owning service's
+/// own sentence followed by the SDK's diagnostic of the call it made. That diagnostic is
+/// how a client of this API recovers the downstream call, so each of its groups is fixed
+/// text around one per-call value.
+const RELAYED_SERVICE: &str = " (Service: ";
+
+/// The fixed text between the service and the status that service answered.
+const RELAYED_STATUS: &str = ", Status Code: ";
+
+/// The fixed text that introduces the id of the call the handler made.
+const RELAYED_REQUEST_ID: &str = ", Request ID: ";
+
+/// The fixed text between the id of that call and how many attempts the SDK made at it.
+const RELAYED_ATTEMPTS: &str = ") (SDK Attempt Count: ";
+
+/// The sentence the service that owns `AWS::SNS::Topic` words a topic it does not hold in,
+/// which the relayed exception opens with.
+const RELAYED_SENTENCE: &str = "Topic does not exist";
+
+/// The name that service's SDK client carries, which its diagnostic names it by.
+const RELAYED_SDK_SERVICE: &str = "Sns";
+
+/// What a relayed SDK diagnostic states about the refused call, taken apart at the fixed
+/// text between its groups — so a case asserts on each fact rather than on one opaque
+/// sentence, and a diagnostic that drops any group fails here.
+struct RelayedCall {
+    /// The owning service's own sentence, which the SDK's diagnostic follows.
+    sentence: String,
+    /// The service the handler called, as that service's SDK client names it.
+    service: String,
+    /// The HTTP status that service answered.
+    status: u16,
+    /// The id of the call the handler made, which that service mints per call.
+    request_id: String,
+    /// How many attempts the SDK made at that call.
+    attempts: u32,
+}
+
+/// Take `detail` apart as the relayed SDK diagnostic it must be.
+fn relayed_call(detail: &str, case: &str) -> RelayedCall {
+    let (sentence, diagnostic) = detail.split_once(RELAYED_SERVICE).unwrap_or_else(|| {
+        panic!("case {case:?}: expected a diagnostic naming the called service after {RELAYED_SERVICE:?}, got {detail:?}")
+    });
+    let (service, rest) = diagnostic.split_once(RELAYED_STATUS).unwrap_or_else(|| {
+        panic!("case {case:?}: expected the status that service answered after {RELAYED_STATUS:?}, got {detail:?}")
+    });
+    let (status, rest) = rest.split_once(RELAYED_REQUEST_ID).unwrap_or_else(|| {
+        panic!("case {case:?}: expected the id of the call after {RELAYED_REQUEST_ID:?}, got {detail:?}")
+    });
+    let (request_id, attempts) = rest.split_once(RELAYED_ATTEMPTS).unwrap_or_else(|| {
+        panic!("case {case:?}: expected the attempts the SDK made after {RELAYED_ATTEMPTS:?}, got {detail:?}")
+    });
+    let attempts = attempts.strip_suffix(')').unwrap_or_else(|| {
+        panic!("case {case:?}: expected the attempt count to close the diagnostic, got {detail:?}")
+    });
+    assert!(
+        !request_id.is_empty()
+            && !request_id.contains(')')
+            && !request_id.contains(' '),
+        "case {case:?}: expected the diagnostic to name the downstream call, got {request_id:?}"
+    );
+    RelayedCall {
+        sentence: sentence.to_string(),
+        service: service.to_string(),
+        status: status.parse().unwrap_or_else(|_| {
+            panic!("case {case:?}: expected a status the service answered, got {status:?}")
+        }),
+        request_id: request_id.to_string(),
+        attempts: attempts.parse().unwrap_or_else(|_| {
+            panic!("case {case:?}: expected a count of the attempts made, got {attempts:?}")
+        }),
+    }
+}
+
+#[tokio::test]
+async fn a_relayed_handler_exception_states_the_whole_sdk_diagnostic_of_the_refused_call() {
+    let emulator = Emulator::with_sns();
+
+    // A topic created through this API and then deleted through it, which is how a client
+    // reaches a relayed not-found: the lifecycle succeeded and the resource is gone.
+    let deleted = emulator
+        .provision(TOPIC, &json!({ "TopicName": "relayed-diagnostic" }))
+        .await;
+    emulator.delete_and_settle(TOPIC, &deleted).await;
+    // The OWNING service's own API answers the status the relayed diagnostic reports, so
+    // the case reads that status there rather than stating a number of its own.
+    let (downstream_status, _) = emulator
+        .sns("GetTopicAttributes", &[("TopicArn", &deleted)])
+        .await;
+
+    // The rows differ along how the resource came to be absent and along the form of the
+    // ARN the request carried: the one this API deleted, one in the signing region nothing
+    // ever created, and one of another region and account.
+    let rows = [
+        ("a topic deleted through this API", deleted.clone()),
+        (
+            "an ARN nothing ever created",
+            "arn:aws:sns:us-east-1:123456789012:never-created".to_string(),
+        ),
+        (
+            "an ARN of another region and account",
+            "arn:aws:sns:eu-west-1:210987654321:also-never-created".to_string(),
+        ),
+    ];
+
+    let mut downstream_calls = Vec::new();
+    for (row, identifier) in rows {
+        // Every surface that reports a handler verdict about this resource: the two
+        // SYNCHRONOUS operations, which carry the whole verdict in the exception's
+        // `Message`, and the ASYNCHRONOUS delete, which carries the handler's own
+        // diagnostic in `StatusMessage`.
+        let answers = [
+            ("GetResource", emulator.get(TOPIC, &identifier).await),
+            (
+                "UpdateResource",
+                emulator
+                    .update(TOPIC, &identifier, &inert_patch(), None)
+                    .await,
+            ),
+        ];
+        let mut stated = Vec::new();
+        for (operation, (status, body)) in answers {
+            let case = format!("{row} ({operation})");
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected HTTP 400, got {status} with body {body:?}"
+            );
+            assert!(
+                code(&body).contains("ResourceNotFoundException"),
+                "case {case:?}: expected ResourceNotFoundException, got {:?}",
+                code(&body)
+            );
+            let (detail, handler_error_code, _) =
+                handler_failure(&message(&body), TOPIC, &case);
+            assert_eq!(
+                handler_error_code, "NotFound",
+                "case {case:?}: expected the NotFound handler error code, got \
+                 {handler_error_code:?}"
+            );
+            stated.push((case, detail));
+        }
+        let case = format!("{row} (DeleteResource)");
+        let (status, body) = emulator.delete(TOPIC, &identifier).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with body {body:?}"
+        );
+        let failed = emulator
+            .terminal(&text(&progress(&body), "RequestToken"))
+            .await;
+        assert_eq!(
+            text(&failed, "OperationStatus"),
+            STATUS_FAILED,
+            "case {case:?}: the delete of an absent resource must fail, got {failed:?}"
+        );
+        stated.push((case, text(&failed, "StatusMessage")));
+
+        for (case, detail) in stated {
+            let call = relayed_call(&detail, &case);
+            assert_eq!(
+                call.sentence, RELAYED_SENTENCE,
+                "case {case:?}: expected the owning service's sentence {RELAYED_SENTENCE:?}, \
+                 got {:?}",
+                call.sentence
+            );
+            assert_eq!(
+                call.service, RELAYED_SDK_SERVICE,
+                "case {case:?}: expected the diagnostic to name {RELAYED_SDK_SERVICE:?}, got \
+                 {:?}",
+                call.service
+            );
+            assert_eq!(
+                call.status, downstream_status,
+                "case {case:?}: expected the status the owning service answered \
+                 ({downstream_status}), got {}",
+                call.status
+            );
+            assert!(
+                call.attempts > 0,
+                "case {case:?}: expected the attempts the SDK made at the call, got {}",
+                call.attempts
+            );
+            downstream_calls.push(call.request_id);
+        }
+    }
+
+    // Each refusal reports the call ITS handler invocation made, so no two of them name the
+    // same downstream request.
+    let made = downstream_calls.len();
+    downstream_calls.sort();
+    downstream_calls.dedup();
+    assert_eq!(
+        downstream_calls.len(),
+        made,
+        "each relayed diagnostic must name its own downstream call, got {downstream_calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_handler_that_relays_no_client_exception_states_no_sdk_diagnostic() {
+    let emulator = Emulator::new();
+    // The control for the rule above: a handler that states a sentence rather than relaying
+    // its client's rendering of another service's exception reports no call, so none of the
+    // diagnostic's groups appears. The rows differ along whose sentence it is — Cloud
+    // Control's own generic one, an owning service's sentence that names the resource, and
+    // two that name none.
+    let rows = [
+        ("the generic sentence", PARAMETER, "absent-parameter"),
+        ("a queue type reported the same way", QUEUE, "absent-queue"),
+        (
+            "a sentence naming the resource",
+            DYNAMODB_TABLE,
+            "absent-table",
+        ),
+        ("a sentence naming nothing", ALARM, "absent-alarm"),
+        ("a second such sentence", BUCKET, "absent-bucket"),
+    ];
+    for (row, type_name, identifier) in rows {
+        let case = format!("{row} ({type_name})");
+        let (status, body) = emulator.get(type_name, identifier).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body:?}"
+        );
+        let (detail, _, _) = handler_failure(&message(&body), type_name, &case);
+        assert!(
+            !detail.contains(RELAYED_SERVICE) && !detail.contains(RELAYED_ATTEMPTS),
+            "case {case:?}: expected no diagnostic of a downstream call, got {detail:?}"
+        );
+    }
+}

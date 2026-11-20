@@ -1854,6 +1854,15 @@ const HANDLER_ALREADY_EXISTS_DIAGNOSTICS: &[(&str, &str)] = &[(
 /// The status code an owning service reports for a resource that is not there.
 const HANDLER_NOT_FOUND_STATUS: u16 = 404;
 
+/// How many attempts the SDK a handler reaches the owning service through states for a call
+/// refused because the resource is not there.
+///
+/// An SDK counts the attempts it made at the call and retries only a refusal that can clear
+/// on its own — a throttled call, an exhausted limit, a service reporting that it failed. A
+/// resource that is not there is none of those: the answer stands however often it is asked
+/// for, so the SDK raises it from the single attempt it was asked to make.
+const HANDLER_NOT_FOUND_SDK_ATTEMPTS: u32 = 1;
+
 /// How every operation of this service words "a resource with the specified identifier
 /// can't be found", with the type the request named and the resource as the owning
 /// handler names it ([`handler_rendered_identifier`]).
@@ -1883,17 +1892,24 @@ pub fn handler_not_found_detail(type_name: &str, identifier: &str) -> String {
 /// The diagnostic is the HANDLER's, so it is held once for every API that acts through a
 /// type's handlers ([`service_common::cfn_resource_handlers`]); the envelope below is this
 /// API's, which reports a whole handler invocation.
+///
+/// A handler that carries its client's rendering reports the WHOLE diagnostic that client
+/// appends to the exception it raises: the owning service, the status it answered, the id of
+/// the call the handler made of it and how many attempts the SDK made at that call
+/// ([`HANDLER_NOT_FOUND_SDK_ATTEMPTS`]) — the facts a client reading the relayed message
+/// recovers the downstream call by, none of which it could recover from a diagnostic that
+/// dropped one of them.
 fn owning_not_found_detail(type_name: &str, identifier: &str) -> Option<String> {
     let diagnostic =
         ::service_common::cfn_resource_handlers::not_found_diagnostic(type_name, identifier)?;
     let sentence = diagnostic.sentence;
     Some(match diagnostic.sdk_service {
         // The handler carries its client's rendering of the owning service's own
-        // exception, which names the service, the status it answered and the request the
-        // handler made of it.
+        // exception: the service it called, the status that service answered, the id of the
+        // call it made and the attempts its SDK made at it.
         Some(service) => format!(
             "{sentence} (Service: {service}, Status Code: {HANDLER_NOT_FOUND_STATUS}, \
-             Request ID: {})",
+             Request ID: {}) (SDK Attempt Count: {HANDLER_NOT_FOUND_SDK_ATTEMPTS})",
             mint_token()
         ),
         None => sentence,
