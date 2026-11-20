@@ -742,8 +742,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The bucket's own policy, copied out under a guard taken and released here: the
         // decision itself reads no state of this service, and a bucket this emulator does not
         // hold is answered by the initiation below rather than by this gate. The tags it
-        // answers the ABAC condition keys with are copied out under that same guard.
-        let (bucket_policy, addressed_tags) = {
+        // answers the ABAC condition keys with are copied out under that same guard, and so is
+        // the refusal the bucket's BLOCKED ENCRYPTION TYPES owe this initiation, so one guard
+        // answers everything the two decisions below need of the bucket record.
+        let (bucket_policy, addressed_tags, blocked_encryption) = {
             let store = state.lock();
             let bucket = store.bucket(&input.bucket);
             (
@@ -751,6 +753,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 bucket
                     .map(crate::service::request_authorization::AddressedTags::of)
                     .unwrap_or_default(),
+                bucket.and_then(|bucket| {
+                    crate::service::object_write::blocked_customer_key_denial(
+                        bucket,
+                        &caller.arn,
+                        PUT_OBJECT_ACTION,
+                        &input.bucket,
+                        &input.key,
+                        customer_key.as_ref(),
+                    )
+                }),
             )
         };
         if let Some(message) = crate::service::request_authorization::denial(
@@ -761,6 +773,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &crate::state::object_arn(&input.bucket, &input.key),
             &write_context.conditions(),
         ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::ACCESS_DENIED_CODE,
+                crate::state::ACCESS_DENIED_STATUS,
+                message,
+            ));
+        }
+
+        // And whether the bucket SERVES the encryption type this initiation asks for at all: a
+        // bucket whose default encryption configuration blocks uploads that supply their own
+        // key refuses this one — "prevent[s] the upload of new objects encrypted with the
+        // specified server-side encryption type"
+        // (`ServerSideEncryptionRule$BlockedEncryptionTypes`) — through the one place that rule
+        // lives for every write of this service
+        // ([`crate::service::object_write::blocked_customer_key_denial`], asked under the guard
+        // above), and no upload is registered, so no part can be uploaded under an encryption
+        // the finished object could not be stored with. Charged for the action the initiation is
+        // authorized under, because the write this setting prevents is that one.
+        if let Some(message) = blocked_encryption {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 crate::state::ACCESS_DENIED_CODE,
                 crate::state::ACCESS_DENIED_STATUS,

@@ -343,6 +343,36 @@ pub fn part_refusal(
     }
 }
 
+/// Why a COPY cannot read the SOURCE object whose `stored` encryption is given with the
+/// copy-source key `presented`, or `None` when it can.
+///
+/// The same comparison a READ of a stored object is decided by ([`read_refusal`]) — the digest
+/// the object recorded against the digest of the key the request carried — because "the
+/// encryption key provided in this header must be the same one that was used when the source
+/// object was created" (`CopyObjectRequest$CopySourceSSECustomerKey`). What differs is WHAT THE
+/// CALLER IS TOLD when the copy presents ANOTHER key: the `x-amz-copy-source-` members are
+/// parameters of the COPY rather than credentials for reading an object the caller addressed,
+/// so S3 answers that those parameters are not the ones the source was stored under
+/// ([`PARAMETERS_MISMATCH_MESSAGE`], [`super::INVALID_REQUEST_CODE`], HTTP 400) — the same
+/// sentence a PART presenting another key than its upload's is told
+/// ([`part_refusal`]) — instead of the authorization status a read of the object itself earns.
+/// Every other condition is the read's own: a copy presenting NO key for such a source cannot
+/// read it at all, and a copy presenting one for a source stored under some other form of
+/// encryption names parameters that do not apply to it.
+pub fn copy_source_refusal(
+    stored: &super::ObjectEncryption,
+    presented: Option<&CustomerKey>,
+) -> Option<ReadRefusal> {
+    match (stored.sse_customer_key_md5.as_deref(), presented) {
+        (Some(recorded), Some(presented)) if recorded != presented.key_md5 => Some(ReadRefusal {
+            code: super::INVALID_REQUEST_CODE,
+            status: super::INVALID_REQUEST_STATUS,
+            message: PARAMETERS_MISMATCH_MESSAGE,
+        }),
+        _ => read_refusal(stored, presented),
+    }
+}
+
 /// The encryption an object stored under the customer key `key` carries: the algorithm and
 /// the digest, and none of the members another form of encryption has — an SSE-C object
 /// reports no `x-amz-server-side-encryption` at all, which is what tells a client which form

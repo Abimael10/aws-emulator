@@ -403,16 +403,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         // Members whose semantics this emulator cannot carry out faithfully — the same
         // list `PutObject` refuses a write for, minus the destination preconditions:
         //
-        // * the copy-source SSE-C members name a customer-provided KEY the SOURCE object
-        //   would have been sealed with. S3 "doesn't store the encryption key you provide",
-        //   so no object this store holds was encrypted with one and they have nothing to
-        //   decrypt.
         // * the Object Lock EVENT hold members decide when a period starts running from an
         //   event nothing here raises, so no stored version can carry one.
         //
-        // The DESTINATION's own SSE-C members are NOT in this list: whether a copy may ask for
-        // one at all is the DESTINATION BUCKET's to answer — a directory bucket does not serve
-        // that encryption form at all — so they are judged below, once that bucket is resolved.
+        // The copy-source SSE-C members are NOT in this list: a SOURCE object stored under a
+        // customer-provided key is READ with the key they present, which is judged below
+        // against the digest that object recorded — the one comparison every read of such an
+        // object is decided by.
+        //
+        // The DESTINATION's own SSE-C members are NOT in this list either: whether a copy may
+        // ask for one at all is the DESTINATION BUCKET's to answer — a directory bucket does not
+        // serve that encryption form at all — so they are judged below, once that bucket is
+        // resolved.
         //
         // Neither the copy-source PRECONDITIONS nor the DESTINATION's are in this list: both
         // are judged below — the source's against the stored source object, the destination's
@@ -423,14 +425,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         // either: they are the lock the destination version is stored with, recorded on it
         // below exactly as `PutObject` records its own.
         for (member, present) in [
-            (
-                "x-amz-copy-source-server-side-encryption-customer-algorithm",
-                input.copy_source_sse_customer_algorithm.is_some(),
-            ),
-            (
-                "x-amz-copy-source-server-side-encryption-customer-key",
-                input.copy_source_sse_customer_key.is_some(),
-            ),
             (
                 "x-amz-object-lock-event-hold",
                 input.object_lock_event_hold.is_some(),
@@ -450,6 +444,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
                 )));
             }
         }
+
+        // The CUSTOMER-PROVIDED key this copy presents for the SOURCE object, read off the
+        // three `x-amz-copy-source-` members that carry it through the one rule every call of
+        // this service reads such a key by ([`crate::state::requested_customer_key`]): "the
+        // encryption key provided in this header must be the same one that was used when the
+        // source object was created" (`CopyObjectRequest$CopySourceSSECustomerKey`), so the key
+        // itself is judged here — any of the three members that does not hold is a value S3
+        // cannot use, refused before anything is read or written — and WHETHER it is the
+        // source's own below, once that object has been read.
+        let copy_source_key = crate::state::requested_customer_key(
+            input.copy_source_sse_customer_algorithm.as_deref(),
+            input.copy_source_sse_customer_key.as_deref(),
+            input.copy_source_sse_customer_key_md5.as_deref(),
+            None,
+        )
+        .map_err(crate::scaffolded::Scaffolded::customer_key)?;
 
         // The confused-deputy guard for either bucket, judged through the one rule every
         // operation of this service judges it by: "if the account ID that you provide does
@@ -913,6 +923,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
             &source_object,
         ) {
             return Err(crate::scaffolded::Scaffolded::precondition_failed(unmet));
+        }
+
+        // A copy READS the source object's bytes, so a source stored under a CUSTOMER-PROVIDED
+        // key is read with the key the `x-amz-copy-source-` members present: "the encryption
+        // key provided in this header must be the same one that was used when the source object
+        // was created" (`CopyObjectRequest$CopySourceSSECustomerKey`). The decision is the
+        // digest the source object recorded against the digest of the key this request carried
+        // — the one comparison every read of such an object is decided by
+        // ([`crate::state::sse_customer::copy_source_refusal`], which words the key that is not
+        // the source's as the COPY's parameters not matching the ones the source was stored
+        // under). Judged BEFORE the destination is written, so a copy that cannot read its
+        // source leaves no object at the destination key.
+        if let Some(refusal) = crate::state::sse_customer::copy_source_refusal(
+            &source_object.encryption,
+            copy_source_key.as_ref(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::customer_key_read(refusal));
         }
 
         // A copy READS the source object's bytes, so an SSE-KMS source is read through the

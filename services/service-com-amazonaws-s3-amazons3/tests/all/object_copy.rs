@@ -1194,7 +1194,11 @@ async fn a_copy_the_emulator_cannot_serve_is_refused_with_the_code_s3_answers() 
             code: "NotImplemented",
         },
         RefusalRow {
-            case: "a customer-provided key for the source object",
+            // A copy-source customer key is SERVED now (the source is read with it), so what is
+            // refused here is a key whose three members do not name one usable key — the
+            // algorithm with no key beside it — exactly as a write's own members are
+            // (`super::object_customer_key_encryption` holds the whole copy-source rule).
+            case: "a customer-provided key for the source object with no key beside it",
             destination_bucket: "copy-refusal-target",
             destination_key: "copies/source-sse-c.csv",
             copy_source: "copy-refusal-origin/source.csv",
@@ -1202,8 +1206,8 @@ async fn a_copy_the_emulator_cannot_serve_is_refused_with_the_code_s3_answers() 
                 "x-amz-copy-source-server-side-encryption-customer-algorithm",
                 "AES256",
             )],
-            status: 501,
-            code: "NotImplemented",
+            status: 400,
+            code: "InvalidArgument",
         },
         RefusalRow {
             case: "an Object Lock event hold for the copy",

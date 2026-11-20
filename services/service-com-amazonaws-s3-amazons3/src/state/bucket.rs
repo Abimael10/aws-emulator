@@ -1916,6 +1916,38 @@ impl Bucket {
         }
     }
 
+    /// Whether the bucket's default encryption configuration BLOCKS an upload that supplies
+    /// its own encryption key (SSE-C).
+    ///
+    /// `BlockedEncryptionTypes` is "a bucket-level setting for Amazon S3 general purpose
+    /// buckets used to prevent the upload of new objects encrypted with the specified
+    /// server-side encryption type" (`ServerSideEncryptionRule$BlockedEncryptionTypes`), and
+    /// "currently, this parameter only supports blocking or unblocking server-side encryption
+    /// with customer-provided keys (SSE-C)" (same member) — so the question a write asks of the
+    /// bucket is whether [`SSE_C_ENCRYPTION_TYPE`] is among the types any rule in force blocks.
+    ///
+    /// Read off the rules IN FORCE ([`Self::effective_encryption_rules`]), the same accessor
+    /// `GetBucketEncryption` reports from, so what a write is refused for is exactly what a read
+    /// of the subresource says the bucket blocks. A DIRECTORY bucket carries no such setting —
+    /// it is a general purpose bucket setting, and that kind of bucket refuses a
+    /// customer-provided key for its own reason
+    /// ([`crate::service::object_write::directory_bucket_customer_key_refusal`]) — so it blocks
+    /// nothing here.
+    ///
+    /// Reading it writes nothing, exactly as reading the rules does.
+    pub fn blocks_customer_key_encryption(&self) -> bool {
+        !self.is_directory()
+            && self.effective_encryption_rules().iter().any(|rule| {
+                rule.blocked_encryption_types
+                    .as_deref()
+                    .is_some_and(|blocked| {
+                        blocked
+                            .iter()
+                            .any(|encryption_type| encryption_type == SSE_C_ENCRYPTION_TYPE)
+                    })
+            })
+    }
+
     /// The encryption an object written to this bucket WITHOUT naming any encryption of its
     /// own is stored under: the bucket's default encryption configuration.
     ///

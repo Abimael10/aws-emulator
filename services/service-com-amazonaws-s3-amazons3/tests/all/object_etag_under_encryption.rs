@@ -40,6 +40,7 @@ use super::kms_key_references::{
 };
 use super::multipart_upload_completion::completion_payload;
 use super::object_and_tagging_roundtrip::{bucket, get_object, put_object, text};
+use super::object_customer_key_encryption::bucket_permitting_customer_keys;
 
 /// The header `ServerSideEncryption` binds to
 /// (`smithy_query(query="operation",operation="PutObject")`).
@@ -331,7 +332,7 @@ async fn a_written_object_reports_the_digest_of_its_bytes_only_where_s3_holds_th
     for (index, row) in rows(&router).await.iter().enumerate() {
         let case = row.case;
         let name = format!("etag-write-{index}");
-        bucket(&router, &name).await;
+        bucket_permitting_customer_keys(&router, &name).await;
         let headers = row.write_headers();
         let reads = row.read_headers();
 
@@ -434,7 +435,7 @@ async fn a_multipart_object_keeps_its_part_count_suffix_whatever_seals_it() {
     for (index, row) in rows(&router).await.iter().enumerate() {
         let case = row.case;
         let name = format!("etag-multipart-{index}");
-        bucket(&router, &name).await;
+        bucket_permitting_customer_keys(&router, &name).await;
         // The INITIATION settles the encryption of the whole upload; a write under the
         // caller's own key presents that key again on every call of the upload.
         let initiated =
@@ -485,7 +486,7 @@ async fn one_payload_sealed_under_two_keys_carries_two_tags() {
     let router = router_with_kms();
     let (_, first_arn) = created_key(&router, "the first key the payload is sealed under").await;
     let (_, second_arn) = created_key(&router, "the second key the payload is sealed under").await;
-    bucket(&router, "etag-two-keys").await;
+    bucket_permitting_customer_keys(&router, "etag-two-keys").await;
     let plaintext = object_etag(BODY);
 
     let first_customer = presenting(&customer_key(11));

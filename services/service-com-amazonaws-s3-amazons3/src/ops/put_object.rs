@@ -920,6 +920,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObject<Eng> {
             ));
         }
 
+        // And whether the bucket SERVES the encryption type this write asks for at all: a
+        // bucket whose default encryption configuration blocks uploads that supply their own
+        // key refuses this one — "prevent[s] the upload of new objects encrypted with the
+        // specified server-side encryption type"
+        // (`ServerSideEncryptionRule$BlockedEncryptionTypes`) — through the one place that rule
+        // lives for every write of this service
+        // ([`crate::service::object_write::blocked_customer_key_denial`]), and nothing is
+        // stored.
+        if let Some(message) = crate::service::object_write::blocked_customer_key_denial(
+            bucket_record,
+            &caller.arn,
+            PUT_OBJECT_ACTION,
+            &input.bucket,
+            &input.key,
+            customer_key.as_ref(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                ACCESS_DENIED_CODE,
+                ACCESS_DENIED_STATUS,
+                message,
+            ));
+        }
+
         // The CLASS this write asks for has to be one a write may name, and one the addressed
         // bucket can host: a class only another AWS service places objects in is refused
         // `InvalidArgument` and a class belonging to another kind of bucket

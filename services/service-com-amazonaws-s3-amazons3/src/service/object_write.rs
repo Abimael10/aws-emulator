@@ -435,6 +435,50 @@ pub fn directory_bucket_customer_key_refusal(
     })
 }
 
+/// The sentence S3 refuses a write that asks `bucket` to store the object `key` under the
+/// CUSTOMER-PROVIDED key `presented` with when that bucket BLOCKS that encryption type, or
+/// `None` for a write presenting no such key or into a bucket that serves it.
+///
+/// `BlockedEncryptionTypes` "prevent[s] the upload of new objects encrypted with the specified
+/// server-side encryption type" (`ServerSideEncryptionRule$BlockedEncryptionTypes`), so what
+/// refuses the write is the bucket's own setting rather than a missing grant: S3 answers the
+/// authorization refusal (`AccessDenied`, HTTP 403) naming the principal, the write action, the
+/// object it addressed and that setting as the reason
+/// ([`state::SSE_C_BLOCKED_REASON`]). Whether the bucket blocks it is read off the rules in
+/// force ([`Bucket::blocks_customer_key_encryption`]), the same ones `GetBucketEncryption`
+/// reports.
+///
+/// Judged on the key the request's three SSE-C members really name, so a write whose members do
+/// not name one usable key is refused for the member that does not hold
+/// ([`state::requested_customer_key`]) and only a write that asks for this encryption type
+/// reaches the setting at all.
+///
+/// The ONE place that refusal is built, so every write that reaches it is refused identically,
+/// and before anything is stored: `PutObject` and `CreateMultipartUpload`, the two writes that
+/// can ask for this encryption type today. `CopyObject` does not reach it — the DESTINATION's own
+/// SSE-C members are still refused 501 for the member itself in that handler, so no bucket
+/// setting can decide a copy that names one — and the calls of an upload already initiated
+/// (`UploadPart`, `UploadPartCopy`, `CompleteMultipartUpload`) do not ask for the type at all:
+/// they present the key the INITIATION recorded, and an initiation into a bucket that blocks it
+/// is refused here, so no part of such an upload can exist.
+pub fn blocked_customer_key_denial(
+    bucket: &Bucket,
+    principal: &str,
+    action: &str,
+    bucket_name: &str,
+    key: &str,
+    presented: Option<&state::CustomerKey>,
+) -> Option<String> {
+    (presented.is_some() && bucket.blocks_customer_key_encryption()).then(|| {
+        state::authorization_denial(
+            principal,
+            action,
+            &state::object_arn(bucket_name, key),
+            state::SSE_C_BLOCKED_REASON,
+        )
+    })
+}
+
 /// The sentence S3 refuses a Zonal endpoint write naming `requested` under a session
 /// established with `committed` with, or `None` when the two name one encryption.
 ///

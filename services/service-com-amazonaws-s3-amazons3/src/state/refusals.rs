@@ -913,6 +913,21 @@ pub fn default_blocked_encryption_types() -> Vec<String> {
     vec![SSE_C_ENCRYPTION_TYPE.to_string()]
 }
 
+/// The REASON clause S3 refuses an upload that supplies its own encryption key into a bucket
+/// whose default encryption configuration blocks that type with, as [`authorization_denial`]
+/// words the sentence around it: the setting prevented the write, and what the caller is told
+/// to do instead is ask for an encryption type the bucket does serve.
+///
+/// `BlockedEncryptionTypes` "prevent[s] the upload of new objects encrypted with the specified
+/// server-side encryption type" (`ServerSideEncryptionRule$BlockedEncryptionTypes`), so the
+/// refusal is the authorization one — the caller may not perform the write action on that
+/// resource — with this clause naming the bucket setting that refused it rather than a missing
+/// grant. Fixed text: the principal and the object the sentence names come from the request,
+/// and nothing in the clause itself does.
+pub const SSE_C_BLOCKED_REASON: &str =
+    "because this bucket has blocked upload requests that specify Server Side Encryption with \
+     Customer provided keys (SSE-C). Please specify a different server-side encryption type.";
+
 /// The `ServerSideEncryption` values a `KMSMasterKeyID` may accompany in a default
 /// encryption rule.
 ///

@@ -570,10 +570,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the source object was created"
         // (`UploadPartCopyRequest$CopySourceSSECustomerKey`). The decision is the digest the
         // source object recorded against the digest of the key this request carried — the one
-        // comparison every read of such an object is decided by
-        // ([`crate::state::sse_customer::read_refusal`]), so a copy and a `GetObject` of the
-        // same version are refused alike.
-        if let Some(refusal) = crate::state::sse_customer::read_refusal(
+        // comparison every read of such an object is decided by, and the one rule a COPY's
+        // source key is judged by ([`crate::state::sse_customer::copy_source_refusal`]), so a
+        // part copy and a `CopyObject` of the same version are refused alike.
+        if let Some(refusal) = crate::state::sse_customer::copy_source_refusal(
             &source_object.encryption,
             source_key.as_ref(),
         ) {

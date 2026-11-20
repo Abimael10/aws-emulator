@@ -16,6 +16,13 @@ Issue-Commit: 41bd6c476a5fe40a474aadc7e47c434277d677d7
 
 > _Note: this issue was identified against the code base at commit `41bd6c476a5fe40a474aadc7e47c434277d677d7`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+> _RESOLVED (causes 1-4), RE-FILED (causes 5-6): causes 1 and 2 are fixed on the write and copy
+> paths, and causes 3 and 4 were already fixed by drift (their replay keys pass). Causes 5
+> (plaintext HTTP on the endpoint) and 6 (a published, served website endpoint) are NOT fixed:
+> both need the emulator core's single TLS data listener to accept a plaintext connection, which
+> is read-only from a service crate, so they are re-filed with their own replay keys as
+> `issues/things-that-do-not-work/20261118T010000Z-s3-the-rest-endpoint-serves-no-plaintext-http-and-no-website-endpoint.md`._
+
 ## Operation
 PutObject
 

@@ -52,9 +52,12 @@
 
 use ::base64::Engine as _;
 use ::md5::Digest as _;
+use service_com_amazonaws_s3_amazons3::state::caller_principal_arn;
 use smithy_server_runtime::MultiServiceRouter;
 
+use super::bucket_encryption::{put_encryption, Rule, ENCRYPTION_TYPE_VALUES};
 use super::bucket_lifecycle::{put_bucket_policy, router, send, send_bytes, Answer};
+use super::kms_key_references::copy_object;
 use super::multipart_part_copy::upload_part_copy;
 use super::object_and_tagging_roundtrip::{bucket, get_object, put_object, text};
 use super::object_write_authorization::{explicit_deny_message, policy_document, statement};
@@ -130,6 +133,51 @@ fn presenting(key: &str) -> Vec<(&'static str, String)> {
     ]
 }
 
+/// The `EncryptionType` value a bucket that PERMITS uploads supplying their own key names as
+/// the set its default encryption configuration blocks, and the value that BLOCKS them.
+///
+/// The enum publishes two values, `[NONE, SSE-C]` (`ENCRYPTION_TYPE_VALUES`, re-derived from
+/// the model by `super::bucket_encryption`): the second names server-side encryption with
+/// customer-provided keys — "currently, this parameter only supports blocking or unblocking
+/// server-side encryption with customer-provided keys (SSE-C)",
+/// `ServerSideEncryptionRule$BlockedEncryptionTypes` — so the first is the set that blocks no
+/// upload at all.
+const PERMITTED_ENCRYPTION_TYPE: &str = ENCRYPTION_TYPE_VALUES[0];
+const BLOCKED_ENCRYPTION_TYPE: &str = ENCRYPTION_TYPE_VALUES[1];
+
+/// `CreateBucket` of `name`, followed by the default encryption configuration that PERMITS
+/// uploads supplying their own key.
+///
+/// Every general purpose bucket comes into being with the customer-key type among the types its
+/// default encryption configuration BLOCKS — `BlockedEncryptionTypes` "prevent[s] the upload of
+/// new objects encrypted with the specified server-side encryption type"
+/// (`ServerSideEncryptionRule$BlockedEncryptionTypes`), and that is the set a never-configured
+/// bucket carries (`super::bucket_encryption` pins what a read of the subresource reports) —
+/// so a write that supplies such a key into such a bucket is refused, which is the rule
+/// [`a_write_supplying_its_own_key_is_refused_where_the_bucket_blocks_that_type`] pins. Every
+/// table below that is about the KEY rather than about that setting therefore runs against a
+/// bucket whose configuration names a blocked set the customer-key type is not in.
+///
+/// `pub(crate)`: the entity-tag suite beside this one seals its objects with a caller-supplied
+/// key too ([`super::object_etag_under_encryption`]), so it stands its buckets up through this
+/// one rather than keeping a second copy of the same configuration.
+pub(crate) async fn bucket_permitting_customer_keys(router: &MultiServiceRouter, name: &str) {
+    bucket(router, name).await;
+    let configured = put_encryption(
+        router,
+        name,
+        &[Rule::default().blocking(&[PERMITTED_ENCRYPTION_TYPE])],
+    )
+    .await;
+    assert_eq!(
+        configured.status, 200,
+        "bucket {name:?}: the configuration permitting customer keys must be accepted, got {} \
+         with body {:?}",
+        configured.status,
+        text(&configured)
+    );
+}
+
 /// `headers` as the borrowed pairs the request harness takes.
 fn borrowed<'a>(headers: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
     headers
@@ -162,7 +210,7 @@ struct Stored {
 #[tokio::test]
 async fn an_object_stored_under_a_customer_key_is_served_only_to_that_key() {
     let router = router();
-    bucket(&router, "sse-c-bucket").await;
+    bucket_permitting_customer_keys(&router, "sse-c-bucket").await;
 
     // The rows differ along the key material, the FORM of the object key and the size of the
     // object — none of which the rule depends on.
@@ -508,7 +556,7 @@ async fn members_that_do_not_name_one_usable_key_are_refused_and_store_nothing()
 #[tokio::test]
 async fn a_multipart_upload_under_a_customer_key_is_carried_out_with_that_key() {
     let router = router();
-    bucket(&router, "sse-c-multipart").await;
+    bucket_permitting_customer_keys(&router, "sse-c-multipart").await;
     let key = customer_key(21);
     let digest = key_digest(&key);
     let headers = presenting(&key);
@@ -712,7 +760,7 @@ async fn a_policy_over_the_customer_key_condition_decides_the_write_and_the_init
     ];
 
     for row in &rows {
-        bucket(&router, row.bucket).await;
+        bucket_permitting_customer_keys(&router, row.bucket).await;
         let resource = format!("arn:aws:s3:::{}/*", row.bucket);
         let document = policy_document(&statement(
             "Deny",
@@ -864,7 +912,7 @@ type CopyRow = (
 #[tokio::test]
 async fn a_part_copy_re_keys_an_ssec_source_into_an_ssec_upload() {
     let router = router();
-    bucket(&router, "sse-c-part-copy").await;
+    bucket_permitting_customer_keys(&router, "sse-c-part-copy").await;
     let source_seed = 41_u8;
     let upload_seed = 42_u8;
     let source_key = customer_key(source_seed);
@@ -939,7 +987,7 @@ async fn a_part_copy_re_keys_an_ssec_source_into_an_ssec_upload() {
             "another key for the source",
             Some(source_seed.wrapping_add(7)),
             Some(upload_seed),
-            Some((403, ACCESS_DENIED, WRONG_SECRET_KEY_MESSAGE)),
+            Some((400, INVALID_REQUEST, PARAMETERS_MISMATCH_MESSAGE)),
         ),
     ];
     for (case, source, upload, refused) in rows {
@@ -1098,7 +1146,7 @@ async fn a_directory_bucket_does_not_serve_a_customer_provided_key() {
     let directory = "ssec--use1-az4--x-s3";
     super::directory_bucket_sessions_and_appends::directory_bucket(&router, directory, "use1-az4")
         .await;
-    bucket(&router, "ssec-general-purpose").await;
+    bucket_permitting_customer_keys(&router, "ssec-general-purpose").await;
     let source = put_object(
         &router,
         "ssec-general-purpose",
@@ -1420,7 +1468,7 @@ async fn rekeyed_by_part_copy(
 #[tokio::test]
 async fn a_wrong_customer_key_is_refused_with_the_secret_key_sentence() {
     let router = router();
-    bucket(&router, WRONG_KEY_BUCKET).await;
+    bucket_permitting_customer_keys(&router, WRONG_KEY_BUCKET).await;
 
     // A one-shot write, a nested object key and an empty object: the shapes a plain SSE-C
     // object comes in.
@@ -1576,12 +1624,17 @@ async fn a_wrong_customer_key_is_refused_with_the_secret_key_sentence() {
     }
 }
 
-/// THE SAME SENTENCE for the call that presents a key for a SOURCE object rather than for a
-/// plain read: a part copy whose `x-amz-copy-source-` key is not the source object's.
+/// THE COPY-SOURCE SENTENCE for the call that presents a key for a SOURCE object rather than
+/// for a plain read: a part copy whose `x-amz-copy-source-` key is not the source object's is
+/// told its PARAMETERS are not the ones the source was stored under
+/// ([`PARAMETERS_MISMATCH_MESSAGE`], 400 `InvalidRequest`), because those members are
+/// parameters of the copy rather than the credential of a read the caller addressed — the same
+/// sentence the UPLOAD's own key earns when it is not the upload's, and the one a `CopyObject`
+/// of the same source is refused with ([`a_copy_reads_its_ssec_source_with_the_copy_source_key`]).
 #[tokio::test]
-async fn a_part_copy_presenting_another_source_key_is_refused_the_secret_key_sentence() {
+async fn a_part_copy_presenting_another_source_key_is_refused_the_copy_source_sentence() {
     let router = router();
-    bucket(&router, "sse-c-wrong-source-key").await;
+    bucket_permitting_customer_keys(&router, "sse-c-wrong-source-key").await;
     let source_key = customer_key(61);
     let upload_key = customer_key(62);
     let body = vec![0x17_u8; 512];
@@ -1639,12 +1692,12 @@ async fn a_part_copy_presenting_another_source_key_is_refused_the_secret_key_sen
         assert_eq!(
             (copied.status, copied.error_code(), copied.error_message()),
             (
-                403,
-                ACCESS_DENIED.to_string(),
-                WRONG_SECRET_KEY_MESSAGE.to_string()
+                400,
+                INVALID_REQUEST.to_string(),
+                PARAMETERS_MISMATCH_MESSAGE.to_string()
             ),
-            "case {case:?}: expected 403 {ACCESS_DENIED:?} with the secret-key sentence, got {} \
-             with body {:?}",
+            "case {case:?}: expected 400 {INVALID_REQUEST:?} with the copy-source sentence, got \
+             {} with body {:?}",
             copied.status,
             text(&copied)
         );
@@ -1670,4 +1723,444 @@ async fn a_part_copy_presenting_another_source_key_is_refused_the_secret_key_sen
         served.status,
         text(&served)
     );
+}
+
+/// The sentence S3 answers a request that presents a well-formed customer key for an object
+/// stored under some OTHER form of encryption: the parameters are usable and simply have
+/// nothing to do with that object.
+const KEY_NOT_APPLICABLE_MESSAGE: &str = "The encryption parameters are not applicable to this \
+                                          object.";
+
+/// The S3-managed algorithm a copy of an SSE-C source asks its DESTINATION to be stored under
+/// travels in this header; its value here is the `ServerSideEncryption` value for SSE-S3, which
+/// is the algorithm name itself (`smithy_query(query="shape",shape="ServerSideEncryption")`).
+const MANAGED_ALGORITHM_HEADER: &str = "x-amz-server-side-encryption";
+
+/// The sentence S3 answers a write that supplies its own key into a bucket whose default
+/// encryption configuration BLOCKS that encryption type, for the object `key` in `bucket`.
+///
+/// Spelled out here rather than read from the crate, so the wording a client branches on has
+/// something to be wrong about. Its only variable parts are the PRINCIPAL the request signed
+/// for (as `sts:GetCallerIdentity` reports it) and the ARN of the object the write addressed —
+/// both from the request — and the rest is the fixed text of this refusal class.
+fn blocked_customer_key_message(bucket: &str, key: &str) -> String {
+    format!(
+        "User: {} is not authorized to perform: {PUT_OBJECT_ACTION} on resource: \
+         \"arn:aws:s3:::{bucket}/{key}\" because this bucket has blocked upload requests that \
+         specify Server Side Encryption with Customer provided keys (SSE-C). Please specify a \
+         different server-side encryption type.",
+        caller_principal_arn()
+    )
+}
+
+/// Which write of the blocked-type table one row makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockedWrite {
+    /// `PutObject` — a one-shot write.
+    Object,
+    /// `CreateMultipartUpload` — the initiation that settles what every part is stored under.
+    Initiation,
+}
+
+/// One row of the blocked-type table: the case, the bucket it addresses, the write it makes,
+/// the object key that write addresses, the key material it presents and the payload it carries.
+struct BlockedRow {
+    case: &'static str,
+    bucket: &'static str,
+    write: BlockedWrite,
+    object_key: &'static str,
+    key_seed: u8,
+    body: Vec<u8>,
+}
+
+/// RULE: a bucket's default encryption configuration decides whether a write may supply its OWN
+/// encryption key at all — `BlockedEncryptionTypes` "prevent[s] the upload of new objects
+/// encrypted with the specified server-side encryption type"
+/// (`ServerSideEncryptionRule$BlockedEncryptionTypes`) — so a write presenting such a key into a
+/// bucket whose configuration in force blocks that type is refused 403 `AccessDenied` naming the
+/// principal, the write action, the object and that setting, and stores nothing; the same write
+/// into a bucket whose blocked set does not name that type is served.
+///
+/// The rows differ along WHICH write presents the key (`PutObject` and the multipart
+/// `CreateMultipartUpload`, both authorized under the same `s3:PutObject` action), the FORM of
+/// the object key, the key material and the size of the payload — none of which the rule depends
+/// on — and the bucket's state spans the two ways the type comes to be blocked: a bucket nothing
+/// has configured, and one a configuration explicitly blocks it on.
+#[tokio::test]
+async fn a_write_supplying_its_own_key_is_refused_where_the_bucket_blocks_that_type() {
+    let router = router();
+    // A bucket nothing has configured, which carries the blocked set anyway, and one a
+    // configuration names that set on: the rule is about the set in force, however it got there.
+    let never_configured = "sse-c-blocked-default";
+    let configured = "sse-c-blocked-configured";
+    bucket(&router, never_configured).await;
+    bucket(&router, configured).await;
+    let blocking = put_encryption(
+        &router,
+        configured,
+        &[Rule::by_default(ALGORITHM).blocking(&[BLOCKED_ENCRYPTION_TYPE])],
+    )
+    .await;
+    assert_eq!(
+        blocking.status, 200,
+        "the configuration blocking the customer-key type must be accepted, got {} with body \
+         {:?}",
+        blocking.status,
+        text(&blocking)
+    );
+
+    let rows = [
+        BlockedRow {
+            case: "a one-shot write into a never-configured bucket",
+            bucket: never_configured,
+            write: BlockedWrite::Object,
+            object_key: "secret.bin",
+            key_seed: 81,
+            body: b"the bytes a blocked key would have sealed".to_vec(),
+        },
+        BlockedRow {
+            case: "a one-shot write of a nested key",
+            bucket: never_configured,
+            write: BlockedWrite::Object,
+            object_key: "deep/dir/secret.bin",
+            key_seed: 82,
+            body: vec![0x5A; 4_096],
+        },
+        BlockedRow {
+            case: "a one-shot write of an empty object",
+            bucket: never_configured,
+            write: BlockedWrite::Object,
+            object_key: "empty.bin",
+            key_seed: 83,
+            body: Vec::new(),
+        },
+        BlockedRow {
+            case: "a multipart initiation into a never-configured bucket",
+            bucket: never_configured,
+            write: BlockedWrite::Initiation,
+            object_key: "ssec-multipart-object.bin",
+            key_seed: 84,
+            body: Vec::new(),
+        },
+        BlockedRow {
+            case: "a multipart initiation into a bucket configured to block the type",
+            bucket: configured,
+            write: BlockedWrite::Initiation,
+            object_key: "blocked/multipart.bin",
+            key_seed: 85,
+            body: Vec::new(),
+        },
+    ];
+
+    for row in &rows {
+        let BlockedRow {
+            case,
+            bucket: name,
+            write,
+            object_key,
+            key_seed,
+            body,
+        } = row;
+        let headers = presenting(&customer_key(*key_seed));
+        let refused = match write {
+            BlockedWrite::Object => {
+                put_object(&router, name, object_key, body, &borrowed(&headers)).await
+            }
+            BlockedWrite::Initiation => {
+                send_bytes(
+                    &router,
+                    "POST",
+                    &format!("/{name}/{object_key}?uploads"),
+                    &borrowed(&headers),
+                    b"",
+                )
+                .await
+            }
+        };
+        assert_eq!(
+            (
+                refused.status,
+                refused.error_code(),
+                refused.error_message()
+            ),
+            (
+                403,
+                ACCESS_DENIED.to_string(),
+                blocked_customer_key_message(name, object_key)
+            ),
+            "case {case:?}: expected 403 {ACCESS_DENIED:?} naming the blocked encryption type, \
+             got {} with body {:?}",
+            refused.status,
+            text(&refused)
+        );
+    }
+
+    // Nothing was stored and no upload was registered: neither bucket holds an object or an
+    // upload after the refusals above.
+    for name in [never_configured, configured] {
+        let listed = send(&router, "GET", &format!("/{name}?list-type=2"), &[], "").await;
+        assert!(
+            listed.elements("Key").is_empty(),
+            "bucket {name:?}: a refused write must store nothing, got {:?}",
+            text(&listed)
+        );
+        let uploads = send(&router, "GET", &format!("/{name}?uploads"), &[], "").await;
+        assert!(
+            uploads.elements("UploadId").is_empty(),
+            "bucket {name:?}: a refused initiation must register no upload, got {:?}",
+            text(&uploads)
+        );
+    }
+
+    // The setting is about the ENCRYPTION TYPE and not about the bucket: a write that supplies
+    // no key of its own is served by the same bucket, and reads back.
+    let plain = put_object(&router, never_configured, "plain.bin", b"plain bytes", &[]).await;
+    assert_eq!(
+        plain.status, 200,
+        "case \"a write supplying no key of its own\": the same bucket must serve it, got {} \
+         with body {:?}",
+        plain.status,
+        text(&plain)
+    );
+    let read_back = get_object(&router, never_configured, "plain.bin", "", &[]).await;
+    assert_eq!(
+        read_back.body.as_ref(),
+        b"plain bytes".as_slice(),
+        "case \"a write supplying no key of its own\": the object must read back, got {} with \
+         status {}",
+        String::from_utf8_lossy(&read_back.body),
+        read_back.status
+    );
+
+    // And the refusal is the bucket's recorded set rather than anything about the request: the
+    // byte-identical writes into a bucket whose blocked set does not name the customer-key type
+    // are served.
+    let permitting = "sse-c-permitted";
+    bucket_permitting_customer_keys(&router, permitting).await;
+    for row in &rows {
+        let headers = presenting(&customer_key(row.key_seed));
+        let served = match row.write {
+            BlockedWrite::Object => {
+                put_object(
+                    &router,
+                    permitting,
+                    row.object_key,
+                    &row.body,
+                    &borrowed(&headers),
+                )
+                .await
+            }
+            BlockedWrite::Initiation => {
+                send_bytes(
+                    &router,
+                    "POST",
+                    &format!("/{permitting}/{}?uploads", row.object_key),
+                    &borrowed(&headers),
+                    b"",
+                )
+                .await
+            }
+        };
+        assert_eq!(
+            served.status, 200,
+            "case {:?}: a bucket that does not block the type must serve the same write, got {} \
+             with body {:?}",
+            row.case,
+            served.status,
+            text(&served)
+        );
+    }
+}
+
+/// One row of the copy-source table: the case, the source object the copy reads, the key
+/// material the copy presents for that source (`None` for a copy presenting none), and the
+/// refusal expected as `(status, code, message)`.
+type CopySourceRow<'a> = (&'a str, &'a str, Option<u8>, (u16, &'a str, &'a str));
+
+/// RULE: a copy READS its source object, so a source stored under a customer-provided key is
+/// read with the key the `x-amz-copy-source-` members present — "the encryption key provided in
+/// this header must be the same one that was used when the source object was created"
+/// (`CopyObjectRequest$CopySourceSSECustomerKey`) — and a copy that presents none, or another
+/// key, is refused 400 `InvalidRequest` with nothing written at the destination.
+///
+/// The rows differ along which key the copy presents for the source (none, another one, and the
+/// source's own), the encryption the SOURCE was stored under (a customer key and the clear),
+/// the key material and the size of the source object.
+#[tokio::test]
+async fn a_copy_reads_its_ssec_source_with_the_copy_source_key() {
+    let router = router();
+    let name = "sse-c-copy-source";
+    bucket_permitting_customer_keys(&router, name).await;
+
+    // Two sealed sources, under different keys and of different sizes, and one stored in the
+    // clear: what the copy-source members mean depends on what the SOURCE was stored under.
+    let sealed = [("sealed/small.bin", 71_u8, b"the sealed bytes".to_vec()),
+                  ("sealed/large.bin", 72_u8, vec![0xA5; 4_096])];
+    for (object_key, key_seed, body) in &sealed {
+        let stored = put_object(
+            &router,
+            name,
+            object_key,
+            body,
+            &borrowed(&presenting(&customer_key(*key_seed))),
+        )
+        .await;
+        assert_eq!(
+            stored.status, 200,
+            "the source {object_key:?} must be stored under its key, got {} with body {:?}",
+            stored.status,
+            text(&stored)
+        );
+    }
+    let clear = put_object(&router, name, "clear/source.bin", b"plain bytes", &[]).await;
+    assert_eq!(
+        clear.status, 200,
+        "the source stored in the clear must be stored, got {} with body {:?}",
+        clear.status,
+        text(&clear)
+    );
+
+    let rows: [CopySourceRow<'_>; 5] = [
+        (
+            "no copy-source key for a sealed source",
+            "sealed/small.bin",
+            None,
+            (400, INVALID_REQUEST, KEY_REQUIRED_MESSAGE),
+        ),
+        (
+            "no copy-source key for the other sealed source",
+            "sealed/large.bin",
+            None,
+            (400, INVALID_REQUEST, KEY_REQUIRED_MESSAGE),
+        ),
+        (
+            "another key for a sealed source",
+            "sealed/small.bin",
+            Some(73),
+            (400, INVALID_REQUEST, PARAMETERS_MISMATCH_MESSAGE),
+        ),
+        (
+            "the OTHER sealed source's key",
+            "sealed/small.bin",
+            Some(72),
+            (400, INVALID_REQUEST, PARAMETERS_MISMATCH_MESSAGE),
+        ),
+        (
+            "a copy-source key for a source stored in the clear",
+            "clear/source.bin",
+            Some(71),
+            (400, INVALID_REQUEST, KEY_NOT_APPLICABLE_MESSAGE),
+        ),
+    ];
+
+    for (index, (case, source_key, presented, (status, code, message))) in rows.iter().enumerate()
+    {
+        let destination = format!("copies/row-{index}.bin");
+        let presented_headers = presented
+            .map(|seed| presenting_source(&customer_key(seed)))
+            .unwrap_or_default();
+        let mut headers = borrowed(&presented_headers);
+        headers.push((MANAGED_ALGORITHM_HEADER, ALGORITHM));
+        let refused = copy_object(
+            &router,
+            name,
+            &destination,
+            &format!("{name}/{source_key}"),
+            &headers,
+        )
+        .await;
+        assert_eq!(
+            (
+                refused.status,
+                refused.error_code(),
+                refused.error_message()
+            ),
+            (*status, code.to_string(), message.to_string()),
+            "case {case:?}: expected {status} {code:?} with that class's sentence, got {} with \
+             body {:?}",
+            refused.status,
+            text(&refused)
+        );
+        // A refused copy wrote nothing: the destination key holds no object.
+        let absent = get_object(&router, name, &destination, "", &[]).await;
+        assert_eq!(
+            absent.status, 404,
+            "case {case:?}: a refused copy must leave the destination empty, got {} with body \
+             {:?}",
+            absent.status,
+            text(&absent)
+        );
+    }
+
+    // And the copy presenting the SOURCE's own key is served: the destination is stored under
+    // the S3-managed algorithm the request asked for — not under the source's key, which S3
+    // does not keep — so it reads back with no key at all, and the source's key is not
+    // applicable to it.
+    for (source_key, key_seed, body) in &sealed {
+        let destination = format!("copied/{key_seed}.bin");
+        let source_headers = presenting_source(&customer_key(*key_seed));
+        let mut headers = borrowed(&source_headers);
+        headers.push((MANAGED_ALGORITHM_HEADER, ALGORITHM));
+        let copied = copy_object(
+            &router,
+            name,
+            &destination,
+            &format!("{name}/{source_key}"),
+            &headers,
+        )
+        .await;
+        assert_eq!(
+            copied.status, 200,
+            "case {source_key:?}: the copy presenting the source's key must be served, got {} \
+             with body {:?}",
+            copied.status,
+            text(&copied)
+        );
+        assert_eq!(
+            copied.header(MANAGED_ALGORITHM_HEADER).as_deref(),
+            Some(ALGORITHM),
+            "case {source_key:?}: the destination must report the algorithm it was stored \
+             under, got {:?}",
+            copied.header(MANAGED_ALGORITHM_HEADER)
+        );
+        assert_eq!(
+            copied.header(ALGORITHM_HEADER),
+            None,
+            "case {source_key:?}: the destination is not stored under a customer key, got {:?}",
+            copied.header(ALGORITHM_HEADER)
+        );
+        let served = get_object(&router, name, &destination, "", &[]).await;
+        assert_eq!(
+            served.body.as_ref(),
+            body.as_slice(),
+            "case {source_key:?}: the copy must hold the source's bytes, got {} bytes with \
+             status {}",
+            served.body.len(),
+            served.status
+        );
+        let offered = get_object(
+            &router,
+            name,
+            &destination,
+            "",
+            &borrowed(&presenting(&customer_key(*key_seed))),
+        )
+        .await;
+        assert_eq!(
+            (
+                offered.status,
+                offered.error_code(),
+                offered.error_message()
+            ),
+            (
+                400,
+                INVALID_REQUEST.to_string(),
+                KEY_NOT_APPLICABLE_MESSAGE.to_string()
+            ),
+            "case {source_key:?}: the source's key is not applicable to the copy, got {} with \
+             body {:?}",
+            offered.status,
+            text(&offered)
+        );
+    }
 }
