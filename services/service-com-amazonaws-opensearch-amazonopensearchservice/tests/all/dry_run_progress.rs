@@ -27,26 +27,26 @@
 //! the run left implicit, both sides of the analysis span, and five ways for a request
 //! to name no run at all.
 //!
-//! A dry run also CONCLUDES on its own and is superseded by a change the domain really
-//! applies, which [`a_dry_run_concludes_on_its_own_and_an_applied_change_supersedes_it`]
-//! asserts over three of those option containers.
+//! A dry run is also TERMINAL from the call that minted it and is superseded by a change
+//! the domain really applies, which
+//! [`a_dry_run_is_terminal_from_the_start_and_an_applied_change_supersedes_it`] asserts
+//! over three of those option containers.
 
 use serde_json::{json, Value};
 
 use super::domain_lifecycle::{
-    change_rows, create_baseline, error_code, poll_until, settled_domain, string_member, Answer,
-    Emulator, CHANGE_LOG_GROUP, PREFIX, RECORDED_NOT_FOUND_STATUS,
+    change_rows, create_baseline, error_code, settled_domain, string_member, Answer, Emulator,
+    CHANGE_LOG_GROUP, PREFIX, RECORDED_NOT_FOUND_STATUS,
 };
 
 /// A well-formed `GUID` that names no dry run: the id space is 128 bits wide and the
 /// store mints v4 UUIDs, so the nil-shaped id below is never one of them.
 const ABSENT_DRY_RUN_ID: &str = "00000000-0000-4000-8000-000000000000";
 
-/// `DryRunProgressStatus$DryRunStatus` while the analysis is still running, and the
-/// terminal value it converges to once it has finished. The member is a free `String`
-/// in the model, so the value set is the service's own: lowercase, and terminal at
-/// `succeeded` for an analysis that found the proposed configuration applicable.
-const IN_PROGRESS: &str = "in-progress";
+/// `DryRunProgressStatus$DryRunStatus` for a run whose pre-update check found the
+/// proposed configuration applicable. The member is a free `String` in the model, so the
+/// value set is the service's own: lowercase, and terminal at `succeeded` for a check
+/// that found no validation failure.
 const SUCCEEDED: &str = "succeeded";
 
 /// `GET /2021-01-01/opensearch/domain/{DomainName}/dryRun`, with the `dryRunId` and
@@ -154,7 +154,7 @@ async fn a_verbose_dry_run_is_reported_from_the_record_the_update_minted() {
 
     for (index, (option, value, deployment)) in rows.into_iter().enumerate() {
         let name = format!("verbose-{index}");
-        let case = format!("DescribeDryRunProgress({option}, in flight)");
+        let case = format!("DescribeDryRunProgress({option})");
 
         let started = start_verbose_dry_run(&emulator, &name, json!({ option: value.clone() })).await;
         let started_status = &started["DryRunProgressStatus"];
@@ -162,8 +162,9 @@ async fn a_verbose_dry_run_is_reported_from_the_record_the_update_minted() {
         assert_guid(&dry_run_id, &case);
         assert_eq!(
             started_status["DryRunStatus"].as_str(),
-            Some(IN_PROGRESS),
-            "case {case}: the run the update started is still being analysed, got {started:?}"
+            Some(SUCCEEDED),
+            "case {case}: the check ran in the call that asked for it, so the run it minted is \
+             terminal at {SUCCEEDED}, got {started:?}"
         );
 
         // The read reports the run the update minted, by the id it handed back and with
@@ -178,9 +179,9 @@ async fn a_verbose_dry_run_is_reported_from_the_record_the_update_minted() {
             );
             assert_eq!(
                 status["DryRunStatus"].as_str(),
-                Some(IN_PROGRESS),
-                "case {case} ({named:?}): expected {IN_PROGRESS} inside the analysis span, got \
-                 {body:?}"
+                Some(SUCCEEDED),
+                "case {case} ({named:?}): expected the same terminal {SUCCEEDED} the update \
+                 reported, got {body:?}"
             );
             assert_eq!(
                 status["ValidationFailures"].as_array().map(Vec::len),
@@ -232,50 +233,97 @@ async fn a_verbose_dry_run_is_reported_from_the_record_the_update_minted() {
             live.body["DomainStatus"]
         );
 
-        // The clock, not the reader, concludes the analysis — and the conclusion moves
-        // `UpdateDate` without moving `CreationDate`. Waited for as the CONDITION the
-        // clock owes, so the case does not depend on how fast the host runs.
-        poll_until(&case, || async {
-            let body = progress_body(&emulator, &name, Some(&dry_run_id), None).await;
-            body["DryRunProgressStatus"]["DryRunStatus"].as_str() != Some(IN_PROGRESS)
-        })
-        .await;
-        let case = format!("DescribeDryRunProgress({option}, concluded)");
-        let concluded = progress_body(&emulator, &name, Some(&dry_run_id), None).await;
-        let status = &concluded["DryRunProgressStatus"];
+        // The record does not move: a run whose check has already concluded reports the
+        // instant it was created as both its `CreationDate` and its `UpdateDate`, and a
+        // second read answers exactly what the first did.
+        let reported = progress_body(&emulator, &name, Some(&dry_run_id), None).await;
+        let status = &reported["DryRunProgressStatus"];
+        let update_date = string_member(status, "UpdateDate", &case);
+        assert_timestamp_text(&update_date, &case);
         assert_eq!(
             (
                 status["DryRunId"].as_str(),
                 status["DryRunStatus"].as_str(),
                 status["CreationDate"].as_str(),
+                status["UpdateDate"].as_str(),
             ),
             (
                 Some(dry_run_id.as_str()),
                 Some(SUCCEEDED),
                 Some(creation_date.as_str()),
+                Some(creation_date.as_str()),
             ),
-            "case {case}: the same run is now {SUCCEEDED} and was still created when it was, got \
-             {concluded:?}"
-        );
-        let update_date = string_member(status, "UpdateDate", &case);
-        assert_timestamp_text(&update_date, &case);
-        assert_ne!(
-            update_date, creation_date,
-            "case {case}: concluding the analysis moved it, so UpdateDate is past CreationDate, \
-             got {concluded:?}"
+            "case {case}: the run is terminal and nothing has moved it since it was created, got \
+             {reported:?}"
         );
         assert_eq!(
-            concluded["DryRunResults"]["DeploymentType"].as_str(),
+            reported["DryRunResults"]["DeploymentType"].as_str(),
             Some(deployment),
-            "case {case}: a concluded run reports the analysis it performed, got {concluded:?}"
+            "case {case}: the run reports the analysis it performed, got {reported:?}"
         );
 
         // A read does not move the record: the second answer is the first.
         let again = progress_body(&emulator, &name, Some(&dry_run_id), None).await;
         assert_eq!(
-            again, concluded,
-            "case {case}: a read must not change the run: {concluded:?} then {again:?}"
+            again, reported,
+            "case {case}: a read must not change the run: {reported:?} then {again:?}"
         );
+    }
+}
+
+/// RULE: the pre-update check a verbose dry run performs runs INSIDE the call that asks
+/// for it, so the run is terminal from the moment its record exists: its `DryRunStatus`
+/// is the service's terminal value for the failures that check recorded — `succeeded`
+/// where it recorded none — and that is the value the update's own answer carries and the
+/// value every read after it answers, with no wait anywhere.
+#[tokio::test]
+async fn a_verbose_dry_run_reports_its_terminal_status_with_no_wait() {
+    let emulator = Emulator::with_log_groups();
+    // The log-publishing row of the shared table publishes to a log group, which has to
+    // exist before an option enabling it is accepted.
+    emulator.created_log_group(CHANGE_LOG_GROUP).await;
+    let rows = change_rows();
+
+    // One domain per option container, all created up front so the waits below overlap.
+    for index in 0..rows.len() {
+        create_baseline(&emulator, &format!("terminal-{index}")).await;
+    }
+    for index in 0..rows.len() {
+        settled_domain(&emulator, &format!("terminal-{index}")).await;
+    }
+
+    for (index, (option, value, _)) in rows.into_iter().enumerate() {
+        let name = format!("terminal-{index}");
+        let case = format!("DescribeDryRunProgress({option}, no wait)");
+        let started = start_verbose_dry_run(&emulator, &name, json!({ option: value })).await;
+        let minted = &started["DryRunProgressStatus"];
+        let dry_run_id = string_member(minted, "DryRunId", &case);
+        let minted_status = minted["DryRunStatus"].as_str().map(str::to_owned);
+
+        // Read straight after that call, three looks over, by the id it handed back and
+        // with the request naming none: nothing waits, so a client that never polls still
+        // reads a terminal status — the one the update answered with.
+        for look in 0..3 {
+            for named in [Some(dry_run_id.as_str()), None] {
+                let body = progress_body(&emulator, &name, named, None).await;
+                let status = &body["DryRunProgressStatus"];
+                assert_eq!(
+                    (
+                        status["DryRunStatus"].as_str(),
+                        status["ValidationFailures"].as_array().map(Vec::len),
+                    ),
+                    (Some(SUCCEEDED), Some(0)),
+                    "case {case} (look {look}, {named:?}): a check that recorded no validation \
+                     failure leaves the run terminal at {SUCCEEDED}, got {body:?}"
+                );
+                assert_eq!(
+                    status["DryRunStatus"].as_str().map(str::to_owned),
+                    minted_status,
+                    "case {case} (look {look}, {named:?}): the read and the call that minted the \
+                     run cannot report it differently, got {body:?} after {started:?}"
+                );
+            }
+        }
     }
 }
 
@@ -567,14 +615,14 @@ async fn a_malformed_dry_run_id_is_refused_by_the_modelled_constraint() {
     );
 }
 
-/// RULE: an analysis the clock owes a verbose dry run CONCLUDES on its own, so a client
-/// that polls the run reaches the service's terminal `DryRunStatus` without anything
-/// else happening to the domain; and a configuration change the domain really applies
-/// supersedes the analyses it was holding, so a request naming one of them afterwards is
-/// the operation's own not-found refusal — while a dry run asked for after that change
-/// is reportable again.
+/// RULE: a verbose dry run's pre-update check runs in the call that asks for it, so the
+/// record that call mints is TERMINAL from the start — a client reads the service's
+/// terminal `DryRunStatus` on its first look, and no later read moves it; and a
+/// configuration change the domain really applies supersedes the analyses it was holding,
+/// so a request naming one of them afterwards is the operation's own not-found refusal —
+/// while a dry run asked for after that change is reportable again.
 #[tokio::test]
-async fn a_dry_run_concludes_on_its_own_and_an_applied_change_supersedes_it() {
+async fn a_dry_run_is_terminal_from_the_start_and_an_applied_change_supersedes_it() {
     let emulator = Emulator::new();
     // Three of the shared change table's option containers, spanning both deployment
     // kinds and three forms of value: two structures and an enum string.
@@ -590,22 +638,17 @@ async fn a_dry_run_concludes_on_its_own_and_an_applied_change_supersedes_it() {
         create_baseline(&emulator, &name).await;
         settled_domain(&emulator, &name).await;
 
-        let case = format!("DescribeDryRunProgress({option}, concluding)");
+        let case = format!("DescribeDryRunProgress({option}, terminal)");
         let started = start_verbose_dry_run(&emulator, &name, json!({ option: value.clone() })).await;
         let dry_run_id = string_member(&started["DryRunProgressStatus"], "DryRunId", &case);
         assert_eq!(
             started["DryRunProgressStatus"]["DryRunStatus"].as_str(),
-            Some(IN_PROGRESS),
-            "case {case}: the call that starts the analysis reports it in flight, got {started:?}"
+            Some(SUCCEEDED),
+            "case {case}: the call that ran the check reports its conclusion, got {started:?}"
         );
 
-        // Nothing but the clock concludes it: the reads below ask for the same record
-        // until the analysis the clock owed has landed.
-        poll_until(&case, || async {
-            let body = progress_body(&emulator, &name, Some(&dry_run_id), None).await;
-            body["DryRunProgressStatus"]["DryRunStatus"].as_str() != Some(IN_PROGRESS)
-        })
-        .await;
+        // The first read a client can make already answers that conclusion, and reading
+        // it again answers the same.
         let concluded = progress_body(&emulator, &name, Some(&dry_run_id), None).await;
         let status = &concluded["DryRunProgressStatus"];
         assert_eq!(
@@ -620,6 +663,11 @@ async fn a_dry_run_concludes_on_its_own_and_an_applied_change_supersedes_it() {
                 Some(deployment),
             ),
             "case {case}: expected the same run terminal at {SUCCEEDED}, got {concluded:?}"
+        );
+        let again = progress_body(&emulator, &name, Some(&dry_run_id), None).await;
+        assert_eq!(
+            again, concluded,
+            "case {case}: the terminal run stays as it is: {concluded:?} then {again:?}"
         );
 
         // The change the run analysed, this time APPLIED.

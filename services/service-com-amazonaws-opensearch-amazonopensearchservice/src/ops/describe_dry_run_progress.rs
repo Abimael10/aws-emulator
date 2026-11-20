@@ -174,9 +174,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // Reporting progress materialises only what the clock already owed at `now`: a
-        // dry run whose analysis span has passed has concluded whether or not anybody
-        // asked. Nothing else about the record changes on a read.
+        // Reporting progress materialises only what the clock already owed the DOMAIN at
+        // `now` — a configuration change of it that has fallen due concludes whether or
+        // not anybody asked. The dry run itself is owed nothing: the analysis it reports
+        // ran in the call that asked for it. Nothing else about the record changes on a
+        // read.
         let domain = store
             .settled_mut(&input.domain_name, now)
             .ok_or_else(|| {

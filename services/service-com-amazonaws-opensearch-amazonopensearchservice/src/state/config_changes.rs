@@ -168,18 +168,17 @@ pub const DRY_RUN_HISTORY: usize = 50;
 /// nothing to report on.
 pub const DRY_RUN_MODE_VERBOSE: &str = "Verbose";
 
-/// `DryRunProgressStatus$DryRunStatus` while the validation check the dry run runs
-/// has not finished — the status the call that started it answers with, so a caller
-/// polling straight after it still observes the analysis in flight.
+/// `DryRunProgressStatus$DryRunStatus` for a run whose validation check found the
+/// proposed configuration applicable — the terminal value a client polls a dry run to.
 ///
 /// `DryRunStatus` is a free `String` in the model, so its value set is recorded
-/// behaviour: the service reports it in LOWERCASE, with the terminal values below, and
-/// an analysis still running reports this one.
-pub const DRY_RUN_STATUS_IN_PROGRESS: &str = "in-progress";
-
-/// `DryRunProgressStatus$DryRunStatus` once that check has finished and found the
-/// proposed configuration applicable — the terminal value a client polls a dry run to.
+/// behaviour: the service reports it in LOWERCASE, terminal at this value and at
+/// [`DRY_RUN_STATUS_FAILED`].
 pub const DRY_RUN_STATUS_SUCCEEDED: &str = "succeeded";
+
+/// `DryRunProgressStatus$DryRunStatus` for a run whose validation check found a
+/// failure the change cannot proceed past — the other terminal value.
+pub const DRY_RUN_STATUS_FAILED: &str = "failed";
 
 /// One verbose dry run on a domain: the analysis an `UpdateDomainConfig` carrying
 /// `DryRun` with `DryRunMode` [`DRY_RUN_MODE_VERBOSE`] started, which
@@ -189,21 +188,25 @@ pub const DRY_RUN_STATUS_SUCCEEDED: &str = "succeeded";
 /// A dry run applies NOTHING: it is "a pre-update dry run analysis", so the record
 /// holds the configuration the change WOULD have left the domain in — computed by
 /// the same merge the real update performs, on a copy of the domain — beside the
-/// deployment kind that change would need. It is [`DRY_RUN_STATUS_IN_PROGRESS`] from the
-/// call that started it until the span the clock owes the analysis has passed
-/// ([`PROVISIONING`]), and
-/// [`DRY_RUN_STATUS_SUCCEEDED`] after — materialised by whichever later call reads
-/// the record ([`Self::settle`]), so nothing sleeps.
+/// deployment kind that change would need. The analysis RAN in the call that asked
+/// for it — that same answer already carries its `DryRunResults` — so the record it
+/// mints is terminal from the start: [`DRY_RUN_STATUS_SUCCEEDED`] for an analysis
+/// that found no validation failure and [`DRY_RUN_STATUS_FAILED`] for one that did,
+/// and nothing about the run moves afterwards.
 #[derive(Debug, Clone)]
 pub struct DryRun {
     /// `DryRunProgressStatus$DryRunId`: the GUID this run is addressed by.
     pub dry_run_id: String,
     /// `CreationDate`: the instant of the call that started the run.
     pub started_at: SystemTime,
-    /// `UpdateDate`: the instant this run's status last moved.
+    /// `UpdateDate`: the instant this run's status last moved — the instant it was
+    /// created, because the analysis it reports concluded within that call.
     pub last_updated_at: SystemTime,
-    /// When the clock owes this run its conclusion; `None` once it has concluded.
-    pub completes_at: Option<SystemTime>,
+    /// `ValidationFailures`: "the validation failures that occurred as a result of the
+    /// dry run", as the pre-update check this run performed found them. The status
+    /// below is derived from this ONE list, so what the run reports and what it is
+    /// cannot disagree.
+    pub validation_failures: Vec<ValidationFailure>,
     /// The `DomainStatus` of the configuration the change would leave the domain in
     /// — "details about the changes you're planning to make on the domain", which
     /// `DescribeDryRunProgress` answers as `DryRunConfig`.
@@ -223,39 +226,16 @@ pub struct DryRun {
 }
 
 impl DryRun {
-    /// Materialise the conclusion the clock owes this run, if `now` is past its due
-    /// instant.
-    ///
-    /// Dated at the DUE instant rather than at `now`, for the same reason a
-    /// configuration change's completion is ([`ConfigChange::settle`]): the
-    /// `UpdateDate` a caller reads does not move with the moment it happened to look.
-    pub(super) fn settle(&mut self, now: SystemTime) {
-        let Some(due) = self.completes_at else {
-            return;
-        };
-        if now < due {
-            return;
-        }
-        self.completes_at = None;
-        self.last_updated_at = due;
-    }
-
-    /// Whether the analysis is still running.
-    pub fn in_progress(&self) -> bool {
-        self.completes_at.is_some()
-    }
-
     /// `DryRunProgressStatus$DryRunStatus` for this run.
     ///
-    /// A configuration this service cannot apply is refused by the update path itself,
-    /// so every run that was started analyses a configuration that validated: the
-    /// conclusion the clock owes such a run is the terminal value for an analysis that
-    /// found nothing to report.
+    /// Terminal either way: the pre-update check ran in the call that asked for the
+    /// run, so its conclusion is the failures it found — none, and the proposed
+    /// configuration is applicable; any, and the change it analysed cannot proceed.
     pub fn status(&self) -> &'static str {
-        if self.in_progress() {
-            DRY_RUN_STATUS_IN_PROGRESS
-        } else {
+        if self.validation_failures.is_empty() {
             DRY_RUN_STATUS_SUCCEEDED
+        } else {
+            DRY_RUN_STATUS_FAILED
         }
     }
 
@@ -268,13 +248,9 @@ impl DryRun {
             dry_run_status: self.status().to_string(),
             creation_date: datetime_text(self.started_at),
             update_date: datetime_text(self.last_updated_at),
-            // "The validation failures that occurred as a result of the dry run": a
-            // configuration this service cannot apply is refused by the update path
-            // itself, under the modelled error class for the rule it broke, and only
-            // a configuration that passed every one of those checks reaches a dry
-            // run — so a run that concluded found no failure, and one still running
-            // has found none yet.
-            validation_failures: Some(Vec::new()),
+            // The failures the pre-update check recorded, which is the same list the
+            // status above is derived from.
+            validation_failures: Some(self.validation_failures.clone()),
             accepted_warnings: Some(self.accepted_warnings.clone()),
         }
     }

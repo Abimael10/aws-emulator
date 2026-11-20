@@ -561,10 +561,10 @@ impl Domain {
     /// `config` is the `DomainStatus` of the configuration the change would leave the
     /// domain in and `deployment_type` the deployment kind it would need, both
     /// computed by the update path's own analysis of a COPY of this record — nothing
-    /// about the domain itself moves, because a dry run applies nothing. The run is
-    /// [`DRY_RUN_STATUS_IN_PROGRESS`] and the clock owes it its conclusion
-    /// ([`DryRun::settle`]), so a caller reading straight after the call still
-    /// observes the analysis in flight.
+    /// about the domain itself moves, because a dry run applies nothing. That analysis
+    /// is what the run REPORTS, and it has already run by the time this record exists,
+    /// so the run is terminal from here on: its status is derived from the validation
+    /// failures the check found ([`DryRun::status`]).
     pub fn begin_dry_run(
         &mut self,
         config: DomainStatus,
@@ -576,7 +576,12 @@ impl Domain {
             dry_run_id: new_dry_run_id(),
             started_at: now,
             last_updated_at: now,
-            completes_at: Some(now + PROVISIONING),
+            // "The validation failures that occurred as a result of the dry run": a
+            // configuration this service cannot apply is refused by the update path
+            // itself, under the modelled error class for the rule it broke, and only a
+            // configuration that passed every one of those checks reaches a dry run —
+            // so this check finds nothing a refusal did not already state.
+            validation_failures: Vec::new(),
             config,
             deployment_type: deployment_type.to_string(),
             accepted_warnings,
@@ -718,12 +723,9 @@ impl Domain {
         for change in &mut self.changes {
             change.settle(now);
         }
-        // A verbose dry run is owed its conclusion by the same clock, and on the same
-        // span: it analyses a change rather than applying one, so it is not one of the
-        // domain's configuration changes.
-        for run in &mut self.dry_runs {
-            run.settle(now);
-        }
+        // A verbose dry run is owed nothing by the clock: the analysis it reports ran
+        // in the call that asked for it, so the record it minted is already terminal.
+
         // A node maintenance action is owed its run by the same clock, on its own
         // spans: it is not one of the domain's configuration changes.
         for maintenance in &mut self.maintenances {
