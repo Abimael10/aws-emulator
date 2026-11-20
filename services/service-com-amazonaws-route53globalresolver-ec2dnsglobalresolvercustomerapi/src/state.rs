@@ -43,6 +43,37 @@ pub const DNS_VIEW_RESOURCE: &str = "dns-view";
 /// The ARN resource prefix of a DNS Firewall domain list.
 pub const FIREWALL_DOMAIN_LIST_RESOURCE: &str = "firewall-domain-list";
 
+/// How this service's own refusal messages spell the Global Resolver resource
+/// kind. The ARN prefix of the same resource is a DIFFERENT spelling
+/// ([`GLOBAL_RESOLVER_RESOURCE`]) and never reaches a message: a client reads the
+/// kind out of a refusal, so the refusal states it the way the API does.
+pub const GLOBAL_RESOLVER_KIND: &str = "GlobalResolver";
+
+/// How this service's own refusal messages spell the DNS View resource kind.
+pub const DNS_VIEW_KIND: &str = "DnsView";
+
+/// How this service's own refusal messages spell the DNS Firewall domain list
+/// resource kind.
+pub const FIREWALL_DOMAIN_LIST_KIND: &str = "FirewallDomainList";
+
+/// The error code this service leads the message of a not-found refusal with when
+/// an operation resolved a resource id and the store held no such resource.
+///
+/// Route 53 Global Resolver words its refusal bodies itself: a message opens with
+/// a bracketed `[GR-ERRnnnnn]` code, which is the documented way a client tells
+/// one refusal class of this service from another. The code belongs to the
+/// service, not to the model, so it is stated here once for every path that
+/// resolves an id.
+const NOT_FOUND_BY_ID_CODE: &str = "GR-ERR00309";
+
+/// The error code the DNS View LIST path leads its own not-found message with.
+///
+/// Resolving the parent resolver of a page is a distinct refusal from resolving a
+/// resource by its id, and this service gives it its own code and its own wording
+/// — so a client branching on the code can tell a list whose parent is gone from
+/// a read of a resource that never existed.
+const LISTED_PARENT_NOT_FOUND_CODE: &str = "GR-ERR02300";
+
 /// The leading characters of every Global Resolver id this service mints, and so
 /// of every `ListGlobalResolvers` page token.
 pub const RESOLVER_ID_PREFIX: &str = "gr-";
@@ -627,26 +658,38 @@ pub fn state_unavailable() -> InternalServerException {
     }
 }
 
-/// The modelled 404 for a resource id that names nothing in the store.
-pub fn not_found(resource_type: &str, id: &str) -> ResourceNotFoundException {
+/// The modelled 404 for a resource id that names nothing in the store: this
+/// service's own [`NOT_FOUND_BY_ID_CODE`], the kind the id was looked up as
+/// (`kind`, one of [`GLOBAL_RESOLVER_KIND`] and its siblings) and the id the
+/// REQUEST named, verbatim.
+///
+/// `message` is the whole body. The shape models `resourceId` and `resourceType`
+/// as well, but this service sends neither, so the struct carries no field for
+/// them (see `ops/types/shared_types.rs`).
+pub fn not_found(kind: &str, id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: format!("{resource_type} {id} was not found"),
-        resource_id: Some(id.to_string()),
-        resource_type: resource_type.to_string(),
+        message: format!("[{NOT_FOUND_BY_ID_CODE}] No {kind} found with the ID: {id}"),
     }
 }
 
 /// The modelled 404 for a Global Resolver id that names nothing in the store.
 ///
-/// Route 53 Global Resolver words this one itself: its own error code for a
-/// Global Resolver that does not exist, then the id the request named. Every
-/// handler that resolves a `globalResolverId` answers with it, so one error class
-/// has one wording whichever operation reports it.
+/// Every handler that resolves a `globalResolverId` to a resolver answers with
+/// it, so one error class has one wording whichever operation reports it. The
+/// DNS View list path is the exception the service itself makes: see
+/// [`listed_global_resolver_not_found`].
 pub fn global_resolver_not_found(id: &str) -> ResourceNotFoundException {
+    not_found(GLOBAL_RESOLVER_KIND, id)
+}
+
+/// The modelled 404 the DNS View LIST path answers for a parent resolver the
+/// store does not hold: its own [`LISTED_PARENT_NOT_FOUND_CODE`] and its own
+/// wording, which states the id without a colon before it.
+pub fn listed_global_resolver_not_found(id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: format!("[GR-ERR00309] No GlobalResolver found with the ID: {id}"),
-        resource_id: Some(id.to_string()),
-        resource_type: GLOBAL_RESOLVER_RESOURCE.to_string(),
+        message: format!(
+            "[{LISTED_PARENT_NOT_FOUND_CODE}] No {GLOBAL_RESOLVER_KIND} found with ID {id}"
+        ),
     }
 }
 

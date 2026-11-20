@@ -57,6 +57,25 @@ impl Answer {
         self.member(name).as_str().unwrap_or_default().to_string()
     }
 
+    /// The MODELLED members this answer's body carries, sorted. `__type` is the
+    /// protocol's own error discriminator rather than a member of the shape, so it
+    /// is left out: what is left is exactly what the service put on the wire.
+    fn modelled_members(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .body
+            .as_object()
+            .map(|members| {
+                members
+                    .keys()
+                    .filter(|name| name.as_str() != "__type")
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
     /// The `firewallDomainLists` ids this answer carries, in the order they came.
     fn listed_ids(&self) -> Vec<String> {
         self.member("firewallDomainLists")
@@ -659,11 +678,20 @@ async fn a_page_honours_max_results_and_resumes_at_its_token() {
 }
 
 /// One row of the missing-parent table: the operation's name, its HTTP method,
-/// and the request it makes against a `globalResolverId`.
+/// the request it makes against a `globalResolverId`, and the message the service
+/// words that refusal with.
 struct ParentRoute {
     operation: &'static str,
     method: &'static str,
     request: fn(&str) -> (String, Option<Value>),
+    message: fn(&str) -> String,
+}
+
+/// The body of a not-found refusal of a resource addressed by its id: the
+/// service's own error code, the kind the id was looked up as, and the id the
+/// request named.
+fn not_found_by_id(kind: &str, id: &str) -> String {
+    format!("[GR-ERR00309] No {kind} found with the ID: {id}")
 }
 
 #[tokio::test]
@@ -677,21 +705,27 @@ async fn a_global_resolver_id_that_names_nothing_is_worded_one_way_everywhere() 
             operation: "GetGlobalResolver",
             method: "GET",
             request: |id| (format!("/global-resolver/{id}"), None),
+            message: |id| not_found_by_id("GlobalResolver", id),
         },
         ParentRoute {
             operation: "DeleteGlobalResolver",
             method: "DELETE",
             request: |id| (format!("/global-resolver/{id}"), None),
+            message: |id| not_found_by_id("GlobalResolver", id),
         },
         ParentRoute {
             operation: "CreateDNSView",
             method: "POST",
             request: |id| (format!("/dns-views/{id}"), Some(json!({ "name": "a-view" }))),
+            message: |id| not_found_by_id("GlobalResolver", id),
         },
         ParentRoute {
             operation: "ListDNSViews",
             method: "GET",
             request: |id| (format!("/dns-views/resolver/{id}"), None),
+            // The DNS View list path words its missing parent with its OWN error
+            // code, and states the id without a colon before it.
+            message: |id| format!("[GR-ERR02300] No GlobalResolver found with ID {id}"),
         },
         ParentRoute {
             operation: "CreateFirewallDomainList",
@@ -702,6 +736,7 @@ async fn a_global_resolver_id_that_names_nothing_is_worded_one_way_everywhere() 
                     Some(json!({ "name": "a-list" })),
                 )
             },
+            message: |id| not_found_by_id("GlobalResolver", id),
         },
         ParentRoute {
             operation: "ListFirewallDomainLists",
@@ -712,6 +747,7 @@ async fn a_global_resolver_id_that_names_nothing_is_worded_one_way_everywhere() 
                     None,
                 )
             },
+            message: |id| not_found_by_id("GlobalResolver", id),
         },
     ];
 
@@ -734,16 +770,16 @@ async fn a_global_resolver_id_that_names_nothing_is_worded_one_way_everywhere() 
             );
             assert_eq!(
                 answer.text("message"),
-                format!("[GR-ERR00309] No GlobalResolver found with the ID: {missing}"),
+                (route.message)(missing),
                 "case {case:?}: expected the service's own wording for a missing Global \
                  Resolver, got {:?}",
                 answer.text("message")
             );
             assert_eq!(
-                answer.text("resourceId"),
-                missing,
-                "case {case:?}: the refusal names the id the request carried, got {:?}",
-                answer.text("resourceId")
+                answer.modelled_members(),
+                vec!["message".to_string()],
+                "case {case:?}: the refusal body carries `message` alone, got {:?}",
+                answer.modelled_members()
             );
         }
     }
@@ -773,10 +809,17 @@ async fn a_domain_list_id_that_names_nothing_is_the_modelled_404() {
             answer.error_type
         );
         assert_eq!(
-            answer.text("resourceId"),
-            missing,
-            "case {missing:?}: the refusal names the id the request carried, got {:?}",
-            answer.text("resourceId")
+            answer.text("message"),
+            not_found_by_id("FirewallDomainList", missing),
+            "case {missing:?}: expected the service's own wording naming the id the request \
+             carried, got {:?}",
+            answer.text("message")
+        );
+        assert_eq!(
+            answer.modelled_members(),
+            vec!["message".to_string()],
+            "case {missing:?}: the refusal body carries `message` alone, got {:?}",
+            answer.modelled_members()
         );
     }
 

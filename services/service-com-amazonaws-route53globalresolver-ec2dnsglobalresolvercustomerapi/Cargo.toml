@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# `validation::unanchored`: the shared rendering of a `@pattern` requirement's expression
+# — the model's text without the whole-value anchors it writes around it — so this
+# service's refusal wording cannot drift from the other services that state it.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

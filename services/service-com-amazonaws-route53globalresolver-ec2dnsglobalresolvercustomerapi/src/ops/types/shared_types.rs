@@ -32,12 +32,22 @@ pub struct InternalServerException {
     pub retry_after_seconds: Option<i32>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.route53globalresolver#ResourceNotFoundException")]
+// `ResourceNotFoundException` models `resourceId` and a @required `resourceType`, but this
+// service puts neither on the wire for THIS error: every recorded 404 of it — the Global
+// Resolver reads and the delete, the DNS View read and the create and list addressed by a
+// resolver id — carries `message` alone, and that message already names the kind the id was
+// looked up as and the id itself. Both members are therefore declared unsupported, which keeps
+// them out of the shape's schema and so out of the body the framework writes, rather than
+// filling them with an id and an internal resource-type token a client reading them would take
+// for the service's own. The sibling `ConflictException` and `ServiceQuotaExceededException`
+// keep both: nothing recorded shows this service dropping them there.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.route53globalresolver#ResourceNotFoundException",
+    unsupported = ["resourceId", "resourceType"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ResourceNotFoundException {
     pub message: String,
-    pub resource_id: Option<String>,
-    pub resource_type: String,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.route53globalresolver#ThrottlingException")]

@@ -187,7 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(view) = state.dns_views.get(&input.dns_view_id) else {
             return Err(GetDNSViewErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(crate::state::DNS_VIEW_RESOURCE, &input.dns_view_id),
+                crate::state::not_found(crate::state::DNS_VIEW_KIND, &input.dns_view_id),
             )
             .into());
         };

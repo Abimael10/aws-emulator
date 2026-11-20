@@ -180,7 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(GetFirewallDomainListErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(
-                    crate::state::FIREWALL_DOMAIN_LIST_RESOURCE,
+                    crate::state::FIREWALL_DOMAIN_LIST_KIND,
                     &input.firewall_domain_list_id,
                 ),
             )

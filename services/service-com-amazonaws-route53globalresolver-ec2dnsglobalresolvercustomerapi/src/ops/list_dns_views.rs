@@ -196,7 +196,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if !state.global_resolvers.contains_key(&input.global_resolver_id) {
             return Err(ListDNSViewsErrorModeled::ResourceNotFoundException(
-                crate::state::global_resolver_not_found(&input.global_resolver_id),
+                // The LIST path words this refusal with its own error code, not
+                // the one a read of a resolver by its id answers with.
+                crate::state::listed_global_resolver_not_found(&input.global_resolver_id),
             )
             .into());
         }
