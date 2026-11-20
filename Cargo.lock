@@ -11373,6 +11373,7 @@ dependencies = [
  "service-com-amazonaws-lambda-awsgirapiservice",
  "service-com-amazonaws-memorydb-amazonmemorydb",
  "service-com-amazonaws-neptunegraph-amazonneptunegraph",
+ "service-com-amazonaws-networksecuritymanager-piccolocustomerapiservice",
  "service-com-amazonaws-organizations-awsorganizationsv20161128",
  "service-com-amazonaws-rbin-amazonrecyclebin",
  "service-com-amazonaws-rds-amazonrdsv19",

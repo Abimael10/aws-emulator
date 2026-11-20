@@ -522,6 +522,8 @@ use super::template::{
     MSK_CONFIGURATION_REVISION_CREATION_TIME, MSK_CONFIGURATION_REVISION_DESCRIPTION,
     MSK_CONFIGURATION_REVISION_NUMBER,
     MSK_SERVERLESS_CLUSTER, MWAA_ENVIRONMENT, NEPTUNE_GRAPH_GRAPH, NEPTUNE_GRAPH_GRAPH_SNAPSHOT,
+    NETWORK_SECURITY_MANAGER_POLICY, NETWORK_SECURITY_MANAGER_RULE,
+    NETWORK_SECURITY_MANAGER_SCOPE, NETWORK_SECURITY_MANAGER_TEMPLATE,
     OPENSEARCH_DOMAIN, PIPES_PIPE, RBIN_RULE,
     REDSHIFT_CLUSTER,
     REDSHIFT_CLUSTER_SUBNET_GROUP, RESOURCE_GROUPS_GROUP, ROUTE53RESOLVER_ENDPOINT,
@@ -1305,6 +1307,15 @@ pub(super) enum Provisioner {
     /// identifier inside it is the handle every call on a rule takes
     /// ([`rbin_rules`]).
     RbinRule,
+    /// `AWS::NetworkSecurityManager::{Rule,Template,Policy,Scope}`: the rule, the template,
+    /// the policy and the scope AWS Network Security Manager's own `CreateRule`,
+    /// `CreateTemplate`, `CreatePolicy` and `CreateScope` make, the matching `Update…`
+    /// reconfigures and `Delete…` removes. That service MINTS each entity's `…Id` — every
+    /// create takes the entity's name and no identifier at all — and the ARN built around it
+    /// is the `…Identifier` every later call on the entity takes, so that ARN is the
+    /// resource's physical id. Which entity it is travels with the variant
+    /// ([`network_security_manager::Entity`]).
+    NetworkSecurityManagerEntity(network_security_manager::Entity),
     /// `AWS::CustomerProfiles::Domain`: the customer-data domain Amazon Connect Customer
     /// Profiles' own `CreateDomain` makes under the name the template states, `UpdateDomain`
     /// reconfigures and `DeleteDomain` removes. The name IS the handle every call on a domain
@@ -1591,6 +1602,20 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         NEPTUNE_GRAPH_GRAPH => Some(Provisioner::NeptuneGraphGraph),
         NEPTUNE_GRAPH_GRAPH_SNAPSHOT => Some(Provisioner::NeptuneGraphGraphSnapshot),
         RBIN_RULE => Some(Provisioner::RbinRule),
+        // Each AWS Network Security Manager entity names which of the four it is, so the one
+        // set of arms serves every type; the catalogue still lists every provisioned type here.
+        NETWORK_SECURITY_MANAGER_RULE => Some(Provisioner::NetworkSecurityManagerEntity(
+            network_security_manager::Entity::Rule,
+        )),
+        NETWORK_SECURITY_MANAGER_TEMPLATE => Some(Provisioner::NetworkSecurityManagerEntity(
+            network_security_manager::Entity::Template,
+        )),
+        NETWORK_SECURITY_MANAGER_POLICY => Some(Provisioner::NetworkSecurityManagerEntity(
+            network_security_manager::Entity::Policy,
+        )),
+        NETWORK_SECURITY_MANAGER_SCOPE => Some(Provisioner::NetworkSecurityManagerEntity(
+            network_security_manager::Entity::Scope,
+        )),
         BACKUP_GATEWAY_HYPERVISOR => Some(Provisioner::BackupGatewayHypervisor),
         MEDIACONVERT_CERTIFICATE_ASSOCIATION => {
             Some(Provisioner::MediaConvertCertificateAssociation)
@@ -2450,6 +2475,12 @@ impl Provisioner {
             // own, so a retention rule a stack creates carries the tags CloudFormation gives
             // it beside the ones the declaration asks for.
             Self::RbinRule => create_rbin_rule(ctx, region, resource, propagated).await,
+            // Every `AWS::NetworkSecurityManager::*` type publishes `Tags`, and each of their
+            // creates takes a `tags` MAP of its own, so an entity a stack creates carries the
+            // tags CloudFormation gives it beside the ones the declaration asks for.
+            Self::NetworkSecurityManagerEntity(entity) => {
+                create_entity(ctx, region, entity, resource, propagated).await
+            }
             // Both `AWS::NeptuneGraph::*` types publish `Tags`, and each of their creates
             // takes a `TagMap` of its own, so a graph and a snapshot a stack creates each
             // carry the tags CloudFormation gives them beside the ones their declaration asks
@@ -3453,6 +3484,11 @@ impl Provisioner {
             // The delete addresses the rule by the identifier inside the ARN Recycle Bin
             // minted for it, which is this resource's physical id.
             Self::RbinRule => delete_rbin_rule(ctx, region, physical_resource_id).await,
+            // The delete addresses the entity by the ARN AWS Network Security Manager minted
+            // for it, which is this resource's physical id.
+            Self::NetworkSecurityManagerEntity(entity) => {
+                delete_entity(ctx, region, entity, physical_resource_id).await
+            }
             // Each delete addresses its resource by the id Neptune Analytics minted for it,
             // which is this resource's physical id.
             Self::NeptuneGraphGraph => {
@@ -3568,6 +3604,12 @@ mod customer_profiles_domains;
 /// Visible to the rest of this service's state because the LOCK STATE a declaration asks for
 /// is read by the return-value catalogue too, beside the arms that provision the rule.
 pub(in crate::state) mod rbin_rules;
+/// The AWS Network Security Manager arms: the rule, the template, the policy and the scope an
+/// `AWS::NetworkSecurityManager::*` declares, created in the service that owns them so a
+/// client's own `ListRules`, `ListTemplates`, `ListPolicies` and `Get…` resolve the identities
+/// the stack publishes. Visible to the rest of this service's state because WHICH of the four
+/// entities a resource is travels with the dispatch variant.
+pub(in crate::state) mod network_security_manager;
 /// The Neptune Analytics arms: the graph an `AWS::NeptuneGraph::Graph` declares and the
 /// snapshot of one an `AWS::NeptuneGraph::GraphSnapshot` declares, created in the service that
 /// owns them so a client's own reads resolve the identities the stack publishes.
@@ -3743,6 +3785,7 @@ use amplify_branches::*;
 use mwaa_environments::*;
 use customer_profiles_domains::*;
 use rbin_rules::*;
+use network_security_manager::*;
 use neptune_graphs::*;
 use glue_table_optimizers::*;
 use mediaconvert_certificates::*;

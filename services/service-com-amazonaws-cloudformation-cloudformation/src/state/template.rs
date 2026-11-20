@@ -3048,6 +3048,12 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     // The Recycle Bin retention rule, publishing the ARN and the identifier that service
     // mints for it and the lock state it keeps.
     RBIN_RULE,
+    // The four AWS Network Security Manager entities, each publishing the ARN that service
+    // mints for it and the id inside that ARN.
+    NETWORK_SECURITY_MANAGER_RULE,
+    NETWORK_SECURITY_MANAGER_TEMPLATE,
+    NETWORK_SECURITY_MANAGER_POLICY,
+    NETWORK_SECURITY_MANAGER_SCOPE,
     // The Neptune Analytics graph, publishing the id that service mints for it, the ARN built
     // around that id and the endpoint it serves the graph on, and the SNAPSHOT of one, whose
     // `Ref` is the id that service minted for it.

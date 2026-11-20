@@ -130,6 +130,14 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         // identifier it minted ("Ref returns the rule ARN") — the type declares no name a
         // client could name one by.
         RBIN_RULE => "Arn",
+        // Each AWS Network Security Manager entity, identified by the ARN that service built
+        // around the id it minted — the `…Identifier` every call on the entity takes, which is
+        // what its ARN member's own `resourceIdentifier` declares. The entity's own name is
+        // only what it is called.
+        NETWORK_SECURITY_MANAGER_RULE => "RuleArn",
+        NETWORK_SECURITY_MANAGER_TEMPLATE => "TemplateArn",
+        NETWORK_SECURITY_MANAGER_POLICY => "PolicyArn",
+        NETWORK_SECURITY_MANAGER_SCOPE => "ScopeArn",
         // A Neptune Analytics graph, identified by the id that service minted for it ("Ref
         // returns the graph id"), which is the `graphIdentifier` every call on a graph takes,
         // and a SNAPSHOT of one by the id it minted for the snapshot, which is the

@@ -687,6 +687,11 @@ impl Provisioner {
             }
             // Recycle Bin's own read of the rule, by the identifier it minted for it.
             Self::RbinRule => describe_rbin_rule(ctx, region, physical_resource_id).await,
+            // AWS Network Security Manager's own read of the entity, by the ARN it minted for
+            // it.
+            Self::NetworkSecurityManagerEntity(entity) => {
+                describe_entity(ctx, region, entity, physical_resource_id).await
+            }
             // Neptune Analytics' own reads of the graph and of the snapshot, each by the id it
             // minted for the resource.
             Self::NeptuneGraphGraph => {

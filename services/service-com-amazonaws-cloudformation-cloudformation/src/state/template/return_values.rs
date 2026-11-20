@@ -336,6 +336,13 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         // the lock state it keeps, all three of which these naming rules compute a stand-in
         // for before the rule exists.
         RBIN_RULE => RBIN_RULE_ATTRIBUTES,
+        // Each AWS Network Security Manager entity publishes the ARN that service minted for
+        // it and the id inside that ARN, both of which these naming rules compute a stand-in
+        // for before the entity exists.
+        NETWORK_SECURITY_MANAGER_RULE => NETWORK_SECURITY_MANAGER_RULE_ATTRIBUTES,
+        NETWORK_SECURITY_MANAGER_TEMPLATE => NETWORK_SECURITY_MANAGER_TEMPLATE_ATTRIBUTES,
+        NETWORK_SECURITY_MANAGER_POLICY => NETWORK_SECURITY_MANAGER_POLICY_ATTRIBUTES,
+        NETWORK_SECURITY_MANAGER_SCOPE => NETWORK_SECURITY_MANAGER_SCOPE_ATTRIBUTES,
         // A Neptune Analytics graph publishes the endpoint, the ARN and the id that service
         // produces for it, all three of which these naming rules compute a stand-in for
         // before the graph exists; a SNAPSHOT of one publishes the ARN and the id that
@@ -927,6 +934,17 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // `UpdateRule` and `DeleteRule` each address a rule by. A name CloudFormation decides
         // satisfies neither, so the identity in force is the one that service answered.
         || resource_type == RBIN_RULE
+        // The four AWS NETWORK SECURITY MANAGER entities are four more: `CreateRule`,
+        // `CreateTemplate`, `CreatePolicy` and `CreateScope` each take the entity's NAME and
+        // no identifier at all, and each answers the `…Id` that service minted
+        // (`^[a-z0-9]{1,64}$`) with the ARN built around it — the value that type's `Ref`
+        // returns and the `…Identifier` every later call on the entity takes, which is what
+        // its ARN member's own `resourceIdentifier` says. No name CloudFormation decides is
+        // such an ARN, so the identity in force is the one that service answered.
+        || resource_type == NETWORK_SECURITY_MANAGER_RULE
+        || resource_type == NETWORK_SECURITY_MANAGER_TEMPLATE
+        || resource_type == NETWORK_SECURITY_MANAGER_POLICY
+        || resource_type == NETWORK_SECURITY_MANAGER_SCOPE
         // A BACKUP GATEWAY hypervisor is one more: `ImportHypervisorConfiguration` takes no
         // identifier for the hypervisor — the declaration states the host, the name and the
         // credentials — and answers the `HypervisorArn` that service minted, which is what

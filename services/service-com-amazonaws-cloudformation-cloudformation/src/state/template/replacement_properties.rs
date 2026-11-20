@@ -148,6 +148,28 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         // "currently not supported. You can't update a retention rule's resource type after
         // creation" — so a declaration naming another type asks for a different rule.
         RBIN_RULE => &["ResourceType"],
+        // Each AWS Network Security Manager entity keeps the FIREWALL TYPE it was created for:
+        // `firewallType` is a member of `CreateRule`, `CreateTemplate` and `CreatePolicy`, and
+        // of no member of the matching `Update…` (each takes the entity's description and the
+        // configuration or associations it enforces, and no firewall type —
+        // `smithy_query(query="operation",operation="CreateRule,UpdateRule,CreateTemplate,\
+        // UpdateTemplate,CreatePolicy,UpdatePolicy,CreateScope,UpdateScope")`) — so a
+        // declaration naming another firewall type asks for a different entity, which
+        // CloudFormation replaces. (Each entity's NAME is in that position through
+        // [`name_is_create_only`]: no call of that service renames one. A SCOPE declares no
+        // firewall type at all, so its only create-only property beside its name is the tag
+        // set below.)
+        //
+        // Their `Tags` are here for the same reason a training dataset's are rather than as an
+        // exception: that service does change an entity's tags in place, through its own
+        // `TagResource`/`UntagResource`, but no arm of [`crate::state::provisioner`] calls them
+        // for these types yet — so a changed tag set is applied by replacing the entity, whose
+        // create carries the tags, rather than reported as applied by nothing. A tag arm
+        // retires these entries.
+        NETWORK_SECURITY_MANAGER_RULE
+        | NETWORK_SECURITY_MANAGER_TEMPLATE
+        | NETWORK_SECURITY_MANAGER_POLICY => &["FirewallType", "Tags"],
+        NETWORK_SECURITY_MANAGER_SCOPE => &["Tags"],
         // A Neptune Analytics graph keeps the replicas, the encryption key and the vector
         // index it was made with: each is a member of `CreateGraph` and of no member of
         // `UpdateGraph` (which takes the provisioned memory and the two flags), so a

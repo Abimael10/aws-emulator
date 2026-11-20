@@ -1675,6 +1675,54 @@ pub const MEDIACONVERT_QUEUE_SEGMENT: &str = "queues";
 pub const MEDIACONVERT_JOB_TEMPLATE_SEGMENT: &str = "jobTemplates";
 pub const MEDIACONVERT_PRESET_SEGMENT: &str = "presets";
 
+/// The `AWS::NetworkSecurityManager::<Resource>` types of the AWS Network Security Manager
+/// estate a stack declares: the rule that carries one firewall configuration, the template
+/// that groups rules, the policy that enforces templates and rules with its own settings, and
+/// the scope that selects the accounts and resources a deployment applies to.
+///
+/// The middle segment is that model's own `awsService.sdkId` with its spaces dropped
+/// (`Network Security Manager`, `smithy_query(query="service_info")` on
+/// `services/service-com-amazonaws-networksecuritymanager-piccolocustomerapiservice/\
+/// smithy-model/com-amazonaws-networksecuritymanager-piccolocustomerapiservice.json`), and the
+/// resource segment is the entity each of that service's `Create…`/`Get…`/`Delete…`
+/// operations is named for.
+///
+/// `Ref` returns the resource's ARN — the type's primary identifier — and `Fn::GetAtt` reads
+/// that ARN and the id inside it ([`NETWORK_SECURITY_MANAGER_RULE_ATTRIBUTES`] and its
+/// siblings). That service MINTS both: each create takes no identifier for the entity and
+/// answers the id it assigned (`^[a-z0-9]{1,64}$`) with the ARN built around it, which is the
+/// `…Identifier` every later call on the entity takes (its ARN member carries the model's own
+/// `resourceIdentifier`), so neither value can be computed from the template — that is what
+/// [`identity_is_service_assigned`] names these four types for.
+pub const NETWORK_SECURITY_MANAGER_RULE: &str = "AWS::NetworkSecurityManager::Rule";
+pub const NETWORK_SECURITY_MANAGER_TEMPLATE: &str = "AWS::NetworkSecurityManager::Template";
+pub const NETWORK_SECURITY_MANAGER_POLICY: &str = "AWS::NetworkSecurityManager::Policy";
+pub const NETWORK_SECURITY_MANAGER_SCOPE: &str = "AWS::NetworkSecurityManager::Scope";
+
+/// AWS Network Security Manager's ARN namespace, which is that model's own
+/// `awsService.arnNamespace` (`network-security-manager`), and the resource paths its ARNs
+/// carry before the id that service minted — the paths its own ARNs are built from
+/// (`rule/<ruleId>`, `template/<templateId>`, `policy/<policyId>`, `scope/<scopeId>`).
+pub const NETWORK_SECURITY_MANAGER_ARN_NAMESPACE: &str = "network-security-manager";
+pub(super) const NETWORK_SECURITY_MANAGER_RULE_PATH: &str = "rule";
+pub(super) const NETWORK_SECURITY_MANAGER_TEMPLATE_PATH: &str = "template";
+pub(super) const NETWORK_SECURITY_MANAGER_POLICY_PATH: &str = "policy";
+pub(super) const NETWORK_SECURITY_MANAGER_SCOPE_PATH: &str = "scope";
+
+/// How many characters the stand-in for one of those minted ids carries: the 32 lower-case
+/// hexadecimal digits that service's own ids are drawn as, which is inside the
+/// `^[a-z0-9]{1,64}$` its `RuleId`, `TemplateId`, `PolicyId` and `ScopeId` shapes declare.
+pub(super) const NETWORK_SECURITY_MANAGER_ID_DIGITS: usize = 32;
+
+/// Every `Fn::GetAtt` attribute one of those four types publishes, in the sorted order a
+/// resource's own attribute map holds them in: the ARN that service minted and the id inside
+/// it, which are the two read-only values its create answers the entity's identity in.
+pub(super) const NETWORK_SECURITY_MANAGER_RULE_ATTRIBUTES: &[&str] = &["RuleArn", "RuleId"];
+pub(super) const NETWORK_SECURITY_MANAGER_TEMPLATE_ATTRIBUTES: &[&str] =
+    &["TemplateArn", "TemplateId"];
+pub(super) const NETWORK_SECURITY_MANAGER_POLICY_ATTRIBUTES: &[&str] = &["PolicyArn", "PolicyId"];
+pub(super) const NETWORK_SECURITY_MANAGER_SCOPE_ATTRIBUTES: &[&str] = &["ScopeArn", "ScopeId"];
+
 /// Amazon MemoryDB's ARN namespace, which is its model's own `awsService.arnNamespace`
 /// (`memorydb`) rather than the `MemoryDB` its resource types are spelled with.
 pub const MEMORYDB_ARN_NAMESPACE: &str = "memorydb";

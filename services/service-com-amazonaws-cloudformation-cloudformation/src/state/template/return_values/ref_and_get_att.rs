@@ -2064,6 +2064,52 @@ pub(crate) fn return_values(
             attributes.insert("HypervisorArn".to_string(), arn.clone());
             (arn, attributes)
         }
+        // AWS Network Security Manager's own control plane: the rule, the template, the
+        // policy and the scope an `AWS::NetworkSecurityManager::*` declares. "Ref returns the
+        // ARN" of the entity — each type's primary identifier, and the `…Identifier` every
+        // call of that service on one takes (its ARN member carries the model's own
+        // `resourceIdentifier`) — and `Fn::GetAtt` reads that ARN and the id inside it
+        // ([`NETWORK_SECURITY_MANAGER_RULE_ATTRIBUTES`] and its siblings). That service MINTS
+        // the id: each create takes no identifier for the entity and answers the `…Id` it
+        // assigned (`^[a-z0-9]{1,64}$`) with the ARN built around it, so the two values here
+        // are STAND-INS of the forms its own model fixes, which `super::provisioning`
+        // re-points at what the create really answered
+        // ([`super::provisioner::Provisioner::NetworkSecurityManagerEntity`]).
+        NETWORK_SECURITY_MANAGER_RULE
+        | NETWORK_SECURITY_MANAGER_TEMPLATE
+        | NETWORK_SECURITY_MANAGER_POLICY
+        | NETWORK_SECURITY_MANAGER_SCOPE => {
+            let (path, arn_attribute, id_attribute) = match resource_type {
+                NETWORK_SECURITY_MANAGER_TEMPLATE => (
+                    NETWORK_SECURITY_MANAGER_TEMPLATE_PATH,
+                    "TemplateArn",
+                    "TemplateId",
+                ),
+                NETWORK_SECURITY_MANAGER_POLICY => (
+                    NETWORK_SECURITY_MANAGER_POLICY_PATH,
+                    "PolicyArn",
+                    "PolicyId",
+                ),
+                NETWORK_SECURITY_MANAGER_SCOPE => {
+                    (NETWORK_SECURITY_MANAGER_SCOPE_PATH, "ScopeArn", "ScopeId")
+                }
+                // The RULE, which is the fourth of the four types this arm serves.
+                _ => (NETWORK_SECURITY_MANAGER_RULE_PATH, "RuleArn", "RuleId"),
+            };
+            let id = service_assigned_label(
+                resource_type,
+                name,
+                NETWORK_SECURITY_MANAGER_ID_DIGITS,
+            );
+            let arn = ::emulator_server::emulator_arn(
+                NETWORK_SECURITY_MANAGER_ARN_NAMESPACE,
+                region,
+                &format!("{path}/{id}"),
+            );
+            attributes.insert(arn_attribute.to_string(), arn.clone());
+            attributes.insert(id_attribute.to_string(), id);
+            (arn, attributes)
+        }
         // Recycle Bin's own control plane: the retention rule an `AWS::Rbin::Rule` declares.
         // "Ref returns the rule ARN" (the type's primary identifier); Fn::GetAtt reads `Arn`,
         // `Identifier` and `LockState`. That service MINTS the identifier —

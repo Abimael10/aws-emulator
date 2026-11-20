@@ -316,6 +316,12 @@ service-com-amazonaws-route53-awsdnsv20130401 = { workspace = true }
 # service mounted beside CloudFormation, or the create is refused and the stack fails — and the
 # dashboard and the report the stack published are read back through that service's own wire.
 service-com-amazonaws-bcmdashboards-awsbcmdashboardsservice = { workspace = true }
+# AWS Network Security Manager, for the `AWS::NetworkSecurityManager::Rule`, `::Template`,
+# `::Policy` and `::Scope` a stack really creates there
+# (`state::provisioner::network_security_manager`): a suite that deploys one must have its
+# owning service mounted beside CloudFormation, or the create is refused and the stack fails —
+# and the entities the stack published are read back through that service's own wire.
+service-com-amazonaws-networksecuritymanager-piccolocustomerapiservice = { workspace = true }
 
 [lints]
 workspace = true

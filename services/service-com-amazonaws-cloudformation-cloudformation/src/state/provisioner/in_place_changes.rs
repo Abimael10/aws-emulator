@@ -581,6 +581,18 @@ impl Provisioner {
             Self::RbinRule => update_rbin_rule(ctx, region, resource, declared)
                 .await
                 .map(Some),
+            // Each entity's own `Update…` reconfigures the one the stack created, by the ARN
+            // AWS Network Security Manager minted for it, taking the description and the
+            // configuration or associations it enforces — so a changed declaration of one of
+            // those is applied to that entity rather than replacing it. (Its tags have no arm
+            // in [`Self::retag`]: that service changes them through its own
+            // `TagResource`/`UntagResource`, which no arm calls yet, so a changed tag set
+            // replaces the entity — see [`template::replacement_properties`].)
+            Self::NetworkSecurityManagerEntity(entity) => {
+                update_entity(ctx, region, entity, resource, declared)
+                    .await
+                    .map(Some)
+            }
             // `UpdateHypervisor` reconfigures the hypervisor the stack imported, by the ARN
             // Backup Gateway minted for it, taking the host, the credentials, the name and the
             // log group — so a changed declaration of one of those is applied to that

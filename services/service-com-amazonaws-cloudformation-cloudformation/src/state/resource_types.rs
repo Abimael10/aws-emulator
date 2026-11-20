@@ -99,7 +99,10 @@ use super::template::{
     CLOUDFRONT_KEY_VALUE_STORE, CLOUDFRONT_MONITORING_SUBSCRIPTION,
     CUSTOMER_PROFILES_DOMAIN, GLUE_TABLE_OPTIMIZER, MEDIACONVERT_CERTIFICATE_ASSOCIATION,
     MWAA_ENVIRONMENT, NEPTUNE_GRAPH_GRAPH,
-    NEPTUNE_GRAPH_GRAPH_SNAPSHOT, RBIN_RULE, SES_EMAIL_IDENTITY,
+    NEPTUNE_GRAPH_GRAPH_SNAPSHOT,
+    NETWORK_SECURITY_MANAGER_POLICY, NETWORK_SECURITY_MANAGER_RULE,
+    NETWORK_SECURITY_MANAGER_SCOPE, NETWORK_SECURITY_MANAGER_TEMPLATE,
+    RBIN_RULE, SES_EMAIL_IDENTITY,
 };
 
 /// The namespace Amazon Web Services' own resource types live under: a type spelled with
@@ -789,6 +792,13 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::NetworkManager::GlobalNetwork",
     "AWS::NetworkManager::Link",
     "AWS::NetworkManager::Site",
+    // AWS Network Security Manager. All four entities are created in the owning service
+    // (`super::provisioner`): `CreateRule` POST /rules, `CreateTemplate` POST /templates,
+    // `CreatePolicy` POST /policies and `CreateScope` POST /scopes.
+    NETWORK_SECURITY_MANAGER_RULE,
+    NETWORK_SECURITY_MANAGER_TEMPLATE,
+    NETWORK_SECURITY_MANAGER_POLICY,
+    NETWORK_SECURITY_MANAGER_SCOPE,
     // Amazon OpenSearch Serverless
     "AWS::OpenSearchServerless::AccessPolicy",
     "AWS::OpenSearchServerless::Collection",

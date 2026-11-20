@@ -350,6 +350,15 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
             Arc::clone(&engine),
         ),
     );
+    // AWS Network Security Manager, for the rule, the template, the policy and the scope an
+    // `AWS::NetworkSecurityManager::*` a stack declares is really created there, so a suite
+    // that deploys one reads those entities back through that service's own wire, by the ARNs
+    // the stack publishes.
+    router.register_service(
+        service_com_amazonaws_networksecuritymanager_piccolocustomerapiservice::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
     (router, engine)
 }
 
