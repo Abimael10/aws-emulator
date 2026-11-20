@@ -267,6 +267,21 @@ pub const AWS_MANAGED_POLICIES: &[AwsManagedPolicy] = &[
         is_attachable: true,
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#,
     },
+    // The policy AWS documents for the pull half of an Amazon ECR registry ("Amazon
+    // ECR managed policies", Amazon ECR User Guide): the grants a container runtime
+    // needs to log in to the registry and fetch a manifest and its layers, which is
+    // why the node role of an Amazon EKS node group carries it and why a node whose
+    // role does not cannot pull a private image at all.
+    AwsManagedPolicy {
+        path: "/",
+        policy_name: "AmazonEC2ContainerRegistryReadOnly",
+        policy_id: "ANPAJ4ZMKQWT7VPNHLRDB",
+        default_version_id: "v3",
+        published: "2015-12-21T17:06:46Z",
+        revised: "2019-12-10T20:51:32Z",
+        is_attachable: true,
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ecr:GetAuthorizationToken","ecr:BatchCheckLayerAvailability","ecr:GetDownloadUrlForLayer","ecr:GetRepositoryPolicy","ecr:DescribeRepositories","ecr:ListImages","ecr:DescribeImages","ecr:BatchGetImage","ecr:GetLifecyclePolicy","ecr:GetLifecyclePolicyPreview","ecr:ListTagsForResource","ecr:DescribeImageScanFindings"],"Resource":"*"}]}"#,
+    },
     AwsManagedPolicy {
         path: "/",
         policy_name: "AmazonEC2ReadOnlyAccess",
@@ -289,6 +304,22 @@ pub const AWS_MANAGED_POLICIES: &[AwsManagedPolicy] = &[
         revised: "2023-02-16T20:20:03Z",
         is_attachable: true,
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["autoscaling:DescribeAutoScalingGroups","autoscaling:UpdateAutoScalingGroup","ec2:AttachVolume","ec2:AuthorizeSecurityGroupIngress","ec2:CreateRoute","ec2:CreateSecurityGroup","ec2:CreateTags","ec2:CreateVolume","ec2:DeleteRoute","ec2:DeleteSecurityGroup","ec2:DeleteVolume","ec2:Describe*","ec2:DetachVolume","ec2:ModifyInstanceAttribute","ec2:ModifyVolume","ec2:RevokeSecurityGroupIngress","elasticloadbalancing:Add*","elasticloadbalancing:Apply*","elasticloadbalancing:Attach*","elasticloadbalancing:Configure*","elasticloadbalancing:Create*","elasticloadbalancing:Delete*","elasticloadbalancing:Deregister*","elasticloadbalancing:Describe*","elasticloadbalancing:Detach*","elasticloadbalancing:Modify*","elasticloadbalancing:Register*","elasticloadbalancing:Set*","kms:DescribeKey"],"Resource":"*"},{"Effect":"Allow","Action":"iam:CreateServiceLinkedRole","Resource":"*","Condition":{"StringEquals":{"iam:AWSServiceName":"elasticloadbalancing.amazonaws.com"}}}]}"#,
+    },
+    // The policy AWS documents for the NODE role of an Amazon EKS node group ("Amazon
+    // EKS node IAM role", Amazon EKS User Guide): the Amazon EC2 describes the
+    // in-cluster AWS cloud provider makes, the cluster read a joining node makes, and
+    // the pod identity exchange a pod of that node makes. It carries no Amazon ECR
+    // grant — "your nodes need permissions to pull images from Amazon ECR", which is
+    // the separate policy a node role is given beside this one.
+    AwsManagedPolicy {
+        path: "/",
+        policy_name: "AmazonEKSWorkerNodePolicy",
+        policy_id: "ANPAVKZ4TJWQM7PNHLRBD",
+        default_version_id: "v3",
+        published: "2018-05-27T21:09:01Z",
+        revised: "2023-11-27T21:40:31Z",
+        is_attachable: true,
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ec2:DescribeInstances","ec2:DescribeInstanceTypes","ec2:DescribeRouteTables","ec2:DescribeSecurityGroups","ec2:DescribeSubnets","ec2:DescribeVolumes","ec2:DescribeVolumesModifications","ec2:DescribeVpcs","eks:DescribeCluster","eks-auth:AssumeRoleForPodIdentity"],"Resource":"*"}]}"#,
     },
     // Recommended by the EKS add-on catalog for the `vpc-cni` add-on's `aws-node`
     // service account.

@@ -16,9 +16,24 @@
 //! added or removed. There must be at least one container in a Pod". A manifest
 //! that names none, or names one with no name or no image, is refused with the
 //! validation `Status` the API server refuses it with rather than stored as a Pod
-//! with no workload.
+//! with no workload — and so is one that names more containers than this server
+//! holds a pod to ([`MAX_CONTAINERS_PER_POD`]), because every container of an
+//! admitted pod is one more image its node's kubelet pulls
+//! ([`super::kubernetes_image_pull`]).
 
 use super::kubernetes_objects::ApiRefusal;
+
+/// How many containers ONE pod may declare.
+///
+/// CHOSEN, not published: the Kubernetes API puts no limit on a pod's container
+/// list, so the only bound on it would be the body ceiling the API server reads a
+/// request under — which admits a pod declaring enough containers that the pull of
+/// each one (an image reference resolved against a registry, over the policy
+/// documents in force on the node's role) is work one caller chose for the cluster.
+/// It is far above the handful a pod of this emulator is driven with, and a manifest
+/// past it is refused with the validation `Status` apimachinery refuses a list past
+/// its limit with rather than stored in part.
+pub const MAX_CONTAINERS_PER_POD: usize = 64;
 
 /// The `spec` the Pod `name` is ADMITTED with: the submitted one, validated,
 /// carrying the service account the API server resolved for it.
@@ -63,6 +78,13 @@ fn validate_containers(
         .and_then(::serde_json::Value::as_array)
         .filter(|entries| !entries.is_empty())
         .ok_or_else(|| required_value(name, "spec.containers"))?;
+    if entries.len() > MAX_CONTAINERS_PER_POD {
+        return Err(ApiRefusal::invalid(format!(
+            "Pod \"{name}\" is invalid: spec.containers: Too many: {}: must have at most \
+             {MAX_CONTAINERS_PER_POD} items",
+            entries.len()
+        )));
+    }
     let mut named: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
     for (index, entry) in entries.iter().enumerate() {
         let container = entry

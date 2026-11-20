@@ -270,22 +270,67 @@ pub(crate) const EKS_ENCRYPTION_CONFIG_MEMBERS: &[(&str, &str)] = &[("Resources"
 /// `Provider`) takes them.
 pub(crate) const EKS_ENCRYPTION_PROVIDER_MEMBERS: &[(&str, &str)] = &[("KeyArn", "keyArn")];
 
+/// The property an `AWS::EKS::Cluster` states its control plane logging under, and the
+/// members that declaration nests the enabled log types in.
+///
+/// The type spells it `Logging.ClusterLogging.EnabledTypes`, a LIST whose entries each name
+/// one log type under `Type`, while `CreateCluster` takes `logging.clusterLogging`, a list of
+/// `LogSetup`s each carrying a `types` list and the `enabled` flag that applies to it
+/// (`smithy_query(query="shape",shape="Logging,LogSetup")`) — so the declaration's entries
+/// are the types of ONE enabled setup ([`eks_cluster_logging`]).
+pub(crate) const EKS_LOGGING_PROPERTY: &str = "Logging";
+pub(crate) const EKS_CLUSTER_LOGGING_PROPERTY: &str = "ClusterLogging";
+pub(crate) const EKS_ENABLED_LOG_TYPES_PROPERTY: &str = "EnabledTypes";
+pub(crate) const EKS_LOG_TYPE_PROPERTY: &str = "Type";
+
+/// The `logging` member `CreateCluster` takes for the log types an `AWS::EKS::Cluster`
+/// declaration ENABLES, and `None` for a declaration that enables none — which is also what
+/// a cluster created without the property gets, every log type of a cluster being disabled
+/// until something enables it.
+///
+/// "If a log type is enabled, that log type exports its control plane logs to CloudWatch
+/// Logs. If a log type isn't enabled, that log type doesn't export its control plane logs"
+/// (`LogSetup$enabled`), and the type's own property declares exactly the ENABLED types — so
+/// the declared types travel as one setup with `enabled` true and nothing is sent for the
+/// types it does not name. The type names themselves are passed through as the declaration
+/// spells them: which values `LogType` admits is Amazon EKS's to decide, and that service
+/// refuses an unmodelled one rather than this arm dropping it.
+pub(crate) fn eks_cluster_logging(properties: &Map<String, Value>) -> Option<Value> {
+    let declared: Vec<Value> = properties
+        .get(EKS_LOGGING_PROPERTY)
+        .and_then(|logging| logging.get(EKS_CLUSTER_LOGGING_PROPERTY))
+        .and_then(|cluster_logging| cluster_logging.get(EKS_ENABLED_LOG_TYPES_PROPERTY))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|entry| entry.get(EKS_LOG_TYPE_PROPERTY).cloned())
+        .collect();
+    if declared.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "clusterLogging": [{ "types": Value::Array(declared), "enabled": true }],
+    }))
+}
+
 /// Every `AWS::EKS::Cluster` property this arm maps onto `CreateCluster`, so a declared
 /// property it does NOT map is refused rather than dropped
 /// ([`refuse_unmapped_properties`]): a cluster created without what its declaration asked
 /// for is not the cluster the template declared.
 ///
-/// `ComputeConfig`, `StorageConfig`, `RemoteNetworkConfig`, `OutpostConfig` and `Logging`
-/// are the properties no arm maps: each is a nested configuration of a cluster this
-/// emulator holds no state for (auto mode's compute and storage, a hybrid remote network,
-/// an Outpost control plane, control-plane log export to Amazon CloudWatch Logs), so a
-/// declaration that asks for one is refused rather than silently created without it.
+/// `ComputeConfig`, `StorageConfig`, `RemoteNetworkConfig` and `OutpostConfig` are the
+/// properties no arm maps: each is a nested configuration of a cluster this emulator holds
+/// no state for (auto mode's compute and storage, a hybrid remote network, an Outpost
+/// control plane), so a declaration that asks for one is refused rather than silently
+/// created without it.
 pub(crate) const EKS_CLUSTER_MAPPED_PROPERTIES: &[&str] = &[
     "AccessConfig",
     "BootstrapSelfManagedAddons",
     "DeletionProtection",
     "EncryptionConfig",
     "KubernetesNetworkConfig",
+    EKS_LOGGING_PROPERTY,
     "Name",
     "ResourcesVpcConfig",
     "RoleArn",
@@ -406,6 +451,12 @@ pub(crate) async fn create_eks_cluster(
         .collect();
     if !encryption.is_empty() {
         request.insert("encryptionConfig".to_string(), Value::Array(encryption));
+    }
+    // The control plane log types the declaration enables, which Amazon EKS exports from the
+    // moment it provisions the control plane — so they travel on the create rather than
+    // being applied to the cluster afterwards.
+    if let Some(logging) = eks_cluster_logging(&properties) {
+        request.insert("logging".to_string(), logging);
     }
     let tags = tags_as_map(&tags_of(&resource.properties, propagated));
     if !tags.is_empty() {

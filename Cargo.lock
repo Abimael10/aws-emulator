@@ -13700,6 +13700,7 @@ dependencies = [
 name = "service-com-amazonaws-eks-awswesleyfrontend"
 version = "0.1.0"
 dependencies = [
+ "automod",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",
@@ -13726,6 +13727,8 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "serde_json",
+ "service-com-amazonaws-ecr-amazonec2containerregistry-v20150921",
+ "service-com-amazonaws-ecrpublic-spencerfrontendservice",
  "service-com-amazonaws-eksauth-eksauthfrontend",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-sts-awssecuritytokenservicev20110615",

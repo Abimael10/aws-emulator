@@ -25,6 +25,14 @@
 //! them — and a selector this server cannot read (the set-based half of the
 //! grammar, a key or a value outside the label syntax) is REFUSED the way the API
 //! server refuses an unparsable one, never answered with an empty list.
+//!
+//! `fieldSelector` narrows the same answer by the objects' OWN members — "field
+//! selectors let you select Kubernetes objects based on the value of one or more
+//! resource fields" — which is how a client asks for the events about ONE pod. It
+//! is read here as well, and WHICH fields a collection may be selected by is that
+//! collection's own answer ([`ListRequest::fields_limited_to`]), because the API
+//! server serves a field label per resource and refuses the ones it does not
+//! index.
 
 use super::kubernetes_api::MAX_REQUEST_BYTES;
 use super::kubernetes_objects::{ApiRefusal, CORE_API_VERSION};
@@ -188,6 +196,81 @@ fn check(key: &str, value: Option<&str>) -> Result<(), String> {
     }
 }
 
+/// ONE requirement of a `fieldSelector`: what a FIELD of the object itself must
+/// say for it to be in the answer.
+///
+/// "Field selectors let you select Kubernetes objects based on the value of one or
+/// more resource fields", with the `=`/`==` and `!=` operators the field selector
+/// grammar defines and a `,` between requirements — so a requirement names a
+/// field by the dotted path of the member it is ([`field_value`]) and the value
+/// that member must carry.
+#[derive(Debug)]
+enum FieldRequirement {
+    Equals(String, String),
+    NotEquals(String, String),
+}
+
+impl FieldRequirement {
+    /// The requirement `term` states, and `None` for a term that states none (an
+    /// empty one, which is what a trailing comma leaves).
+    fn parse(term: &str) -> Option<Self> {
+        let term = term.trim();
+        if term.is_empty() {
+            return None;
+        }
+        if let Some((field, value)) = term.split_once("!=") {
+            return Some(Self::NotEquals(
+                field.trim().to_string(),
+                value.trim().to_string(),
+            ));
+        }
+        let (field, value) = term.split_once('=')?;
+        Some(Self::Equals(
+            field.trim().to_string(),
+            value.strip_prefix('=').unwrap_or(value).trim().to_string(),
+        ))
+    }
+
+    /// The field this requirement is about.
+    fn field(&self) -> &str {
+        match self {
+            Self::Equals(field, _) | Self::NotEquals(field, _) => field,
+        }
+    }
+
+    /// Rename the field this requirement is about to the member of the object it
+    /// names, for a field label the resource serves under another path.
+    fn addressing(&mut self, member: &str) {
+        match self {
+            Self::Equals(field, _) | Self::NotEquals(field, _) => *field = member.to_string(),
+        }
+    }
+
+    /// Whether `item` satisfies this requirement. A field the object does not
+    /// carry reads as the empty value, which is how the API server compares an
+    /// unset field.
+    fn admits(&self, item: &::serde_json::Value) -> bool {
+        match self {
+            Self::Equals(field, value) => field_value(item, field) == value.as_str(),
+            Self::NotEquals(field, value) => field_value(item, field) != value.as_str(),
+        }
+    }
+}
+
+/// The value the object `item` carries at the dotted path `field`, and the empty
+/// string for a path it does not carry a scalar at — which is how the API server
+/// compares a field an object has not set.
+fn field_value<'item>(item: &'item ::serde_json::Value, field: &str) -> &'item str {
+    let mut held = item;
+    for segment in field.split('.') {
+        match held.get(segment) {
+            Some(next) => held = next,
+            None => return "",
+        }
+    }
+    held.as_str().unwrap_or_default()
+}
+
 /// What a list request asked for: the chunk size, where to resume, and which
 /// objects' labels it asked for.
 #[derive(Debug, Default)]
@@ -203,6 +286,10 @@ pub struct ListRequest {
     /// the answer satisfies. Empty for a request that named none, which is that
     /// default.
     selector: Vec<LabelRequirement>,
+    /// `fieldSelector`: "a selector to restrict the list of returned objects by
+    /// their fields; defaults to everything" — the requirements over the objects'
+    /// OWN members that every object in the answer satisfies.
+    fields: Vec<FieldRequirement>,
 }
 
 impl ListRequest {
@@ -272,6 +359,30 @@ impl ListRequest {
                     }
                     parsed.selector = requirements;
                 }
+                // A field selector is written with the same escaped characters a
+                // label selector is, so it is read through the same decoder. Its
+                // grammar has no form this server cannot read — only `=`, `==`
+                // and `!=` — and WHICH fields a resource may be selected by is
+                // the resource's own answer ([`ListRequest::fields_limited_to`]).
+                "fieldSelector" if !value.is_empty() => {
+                    let selector = ::smithy_server_runtime::percent_decode(value);
+                    let mut requirements = Vec::new();
+                    for term in selector.split(',') {
+                        // The same bound the label selector is read under: what
+                        // one list costs must not grow with what a caller wrote
+                        // in the query.
+                        if requirements.len() >= MAX_LABEL_REQUIREMENTS {
+                            return Err(unparsable_selector(&format!(
+                                "unable to parse requirement: at most \
+                                 {MAX_LABEL_REQUIREMENTS} requirements are read"
+                            )));
+                        }
+                        if let Some(requirement) = FieldRequirement::parse(term) {
+                            requirements.push(requirement);
+                        }
+                    }
+                    parsed.fields = requirements;
+                }
                 _ => {}
             }
         }
@@ -279,12 +390,10 @@ impl ListRequest {
     }
 
     /// Whether `item` is an object this request asked for: one whose
-    /// `metadata.labels` satisfies every requirement of its selector. True for a
-    /// request that named no selector, which asked for everything.
+    /// `metadata.labels` satisfies every requirement of its selector, and whose
+    /// own fields satisfy every requirement of its field selector. True for a
+    /// request that named neither, which asked for everything.
     fn admits(&self, item: &::serde_json::Value) -> bool {
-        if self.selector.is_empty() {
-            return true;
-        }
         let labels = item
             .get("metadata")
             .and_then(|metadata| metadata.get("labels"))
@@ -292,6 +401,35 @@ impl ListRequest {
         self.selector
             .iter()
             .all(|requirement| requirement.admits(labels))
+            && self
+                .fields
+                .iter()
+                .all(|requirement| requirement.admits(item))
+    }
+
+    /// Hold this request's `fieldSelector` to the fields the resource being listed
+    /// is selectable by: each pair is `(the field label, the member of the object
+    /// it names)`, which are the same path for every field a resource serves under
+    /// its own name and differ for the one it serves under another.
+    ///
+    /// A requirement naming a field the resource does not serve is REFUSED in the
+    /// API server's own wording, rather than answered with an empty list: a client
+    /// that selected on a field this server cannot index is told so.
+    pub fn fields_limited_to(&mut self, served: &[(&str, &str)]) -> Result<(), ApiRefusal> {
+        for requirement in &mut self.fields {
+            let member = served
+                .iter()
+                .find(|(label, _)| *label == requirement.field())
+                .map(|(_, member)| *member)
+                .ok_or_else(|| ApiRefusal {
+                    status: 400,
+                    reason: "BadRequest",
+                    message: format!("field label not supported: {}", requirement.field()),
+                    resource: None,
+                })?;
+            requirement.addressing(member);
+        }
+        Ok(())
     }
 }
 

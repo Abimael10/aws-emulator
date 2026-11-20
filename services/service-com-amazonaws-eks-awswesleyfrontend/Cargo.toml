@@ -104,6 +104,19 @@ http-body-util = { version = "0.1", default-features = false }
 # endpoint beside it. `tokio-rustls` drives that handshake on the core's connection.
 rustls = { workspace = true }
 tokio-rustls = "0.26"
+# The Amazon ECR registry in that same shared engine: a node's kubelet pulls the
+# image a pod's container runs before it starts that container, and an image held
+# in this account's private registry is pulled AS THE NODE'S IAM ROLE — so that
+# registry decides the pull (the policies in force on the role, its own
+# repository policy, the reference, and the image it holds) through its own
+# in-process entry point (`src/state/kubernetes_image_pull.rs` ->
+# `…ecr…::state::registry_pull::PullPlane`).
+service-com-amazonaws-ecr-amazonec2containerregistry-v20150921 = { workspace = true }
+# The Amazon ECR Public gallery in that same shared engine: one address of this
+# emulator serves both registries it holds, so whether a reference carrying that
+# address names the gallery rather than the private registry is the gallery's own
+# answer (`src/state/kubernetes_image_pull.rs`).
+service-com-amazonaws-ecrpublic-spencerfrontendservice = { workspace = true }
 # `html-escape`: the AWS Marketplace listing page this emulator serves at the
 # address `DescribeAddonVersions` publishes as a Marketplace add-on's
 # `marketplaceInformation.productUrl` (`src/state/addon_marketplace_listing.rs`)
@@ -112,6 +125,9 @@ tokio-rustls = "0.26"
 html-escape = "0.2"
 
 [dev-dependencies]
+# The integration-test target is rooted at `tests/all/main.rs`, which declares one
+# module per `tests/all/<name>.rs` through `automod`.
+automod = { workspace = true }
 # The clock-owed `CREATING` -> `ACTIVE` test waits with `tokio::time::sleep`, so
 # this target declares tokio's `time` feature rather than inheriting it
 # transitively from another crate's feature set. The Kubernetes API suite dials the

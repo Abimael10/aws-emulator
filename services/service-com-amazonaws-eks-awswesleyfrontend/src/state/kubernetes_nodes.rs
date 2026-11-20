@@ -226,9 +226,19 @@ fn node_json(
     })
 }
 
+/// The fields a NODE may be SELECTED by, as `(the field label a client writes, the
+/// member of the node document it names)`: its own name — a node belongs to no
+/// namespace — and whether it was marked unschedulable, which are the fields the
+/// Kubernetes API server's own node registry indexes. A `fieldSelector` naming
+/// anything else is refused the way the API server refuses a field label it does not
+/// index.
+pub const NODE_FIELD_SELECTORS: &[(&str, &str)] = &[
+    ("metadata.name", "metadata.name"),
+    ("spec.unschedulable", "spec.unschedulable"),
+];
+
 /// One node of a cluster, as the SCHEDULER needs it: the name it registered
 /// under and the instant it joined the cluster.
-///
 /// Reported without rendering the node's whole document, because binding a pod to
 /// a node needs neither the node's labels nor its conditions — and the instant is
 /// what makes the pod's own start instant a value read from stored state rather
@@ -237,6 +247,13 @@ fn node_json(
 pub struct ClusterNode {
     pub name: String,
     pub joined_at: SystemTime,
+    /// The IAM role the node runs under: the `nodeRole` of the node group that
+    /// launched it ("the IAM role associated with your node group"), which is the
+    /// principal the node's kubelet makes its AWS calls as — the image pull of a
+    /// pod scheduled onto this node among them
+    /// ([`super::kubernetes_image_pull`]). Empty for a node group that states
+    /// none.
+    pub node_role: String,
 }
 
 impl ComAmazonawsEksAwswesleyfrontendState {
@@ -299,6 +316,9 @@ impl ComAmazonawsEksAwswesleyfrontendState {
                     // The instant the node joined the cluster, which is what the
                     // node itself reports as its `creationTimestamp`.
                     joined_at: nodegroup.created_at,
+                    // The role the node group launched its instances under, which
+                    // is what the node's kubelet acts as.
+                    node_role: nodegroup.node_role.clone(),
                 })
             })
             .collect();

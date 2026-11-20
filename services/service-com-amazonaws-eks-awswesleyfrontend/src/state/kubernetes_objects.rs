@@ -24,6 +24,13 @@
 //! later in-process caller answer from one place.
 
 use super::kubernetes_config_maps::ConfigMapObject;
+use super::kubernetes_events::{
+    EventObject, RecordedEvent, EVENT_SOURCE_SCHEDULER, EVENT_TYPE_NORMAL, EVENT_TYPE_WARNING,
+    INVOLVED_KIND_POD,
+};
+use super::kubernetes_image_pull::{
+    back_off_message, ImagePullRecord, WAITING_REASON_IMAGE_PULL_BACK_OFF,
+};
 use super::kubernetes_lists::{listed, ListRequest};
 use super::kubernetes_metadata::ObjectMetadata;
 use super::kubernetes_pod_spec::admitted_pod_spec;
@@ -128,6 +135,11 @@ pub struct NamespaceObject {
     /// [`MAX_CONFIG_MAPS_PER_NAMESPACE`]; the objects and the answers
     /// about them live in [`super::kubernetes_config_maps`].
     pub config_maps: BTreeMap<String, ConfigMapObject>,
+    /// The events this namespace holds, by the name the cluster gave each — what
+    /// the cluster's own components recorded about the objects above
+    /// ([`super::kubernetes_events`]). Bounded by
+    /// [`super::kubernetes_events::MAX_EVENTS_PER_NAMESPACE`].
+    pub events: BTreeMap<String, EventObject>,
 }
 
 impl NamespaceObject {
@@ -153,6 +165,7 @@ impl NamespaceObject {
             .collect(),
             pods: BTreeMap::new(),
             config_maps: BTreeMap::new(),
+            events: BTreeMap::new(),
             rbac: RbacScope::new(),
         }
     }
@@ -203,6 +216,54 @@ pub const POD_PHASE_FAILED: &str = "Failed";
 /// which the pod carries beside it.
 pub const POD_START_ERROR_REASON: &str = "StartError";
 
+/// The `reason` the `PodScheduled` condition of a pod no node can take carries, and
+/// the sentence Kubernetes words it in — one source for the condition the pod
+/// reports and the event the scheduler recorded ([`scheduling_event`]).
+pub const POD_UNSCHEDULABLE_REASON: &str = "Unschedulable";
+pub const POD_UNSCHEDULABLE_MESSAGE: &str = "no nodes available to schedule pods";
+
+/// The `reason` the scheduler records for a pod it ASSIGNED to a node, and the one
+/// it records for a pod it could place on none.
+pub const SCHEDULING_REASON_SCHEDULED: &str = "Scheduled";
+pub const SCHEDULING_REASON_FAILED: &str = "FailedScheduling";
+
+/// The event the scheduler recorded about `pod`: the node it assigned the pod to,
+/// or the reason a pod it could place nowhere stays unscheduled.
+fn scheduling_event(
+    namespace: &str,
+    pod_name: &str,
+    pod: &PodObject,
+    at: SystemTime,
+) -> EventObject {
+    let (reason, message, event_type) = match pod.node_name.as_deref() {
+        // The sentence the Kubernetes scheduler words a binding in, naming the pod
+        // it bound and the node it bound it to.
+        Some(node) => (
+            SCHEDULING_REASON_SCHEDULED,
+            format!("Successfully assigned {namespace}/{pod_name} to {node}"),
+            EVENT_TYPE_NORMAL,
+        ),
+        None => (
+            SCHEDULING_REASON_FAILED,
+            POD_UNSCHEDULABLE_MESSAGE.to_string(),
+            EVENT_TYPE_WARNING,
+        ),
+    };
+    EventObject::of(RecordedEvent {
+        involved_kind: INVOLVED_KIND_POD,
+        involved_name: pod_name,
+        involved_uid: &pod.uid,
+        // The pod as a whole, which is what a scheduling decision is about.
+        field_path: None,
+        reason,
+        message,
+        event_type,
+        component: EVENT_SOURCE_SCHEDULER,
+        host: None,
+        at,
+    })
+}
+
 /// What a pod of this emulator ends with: the condition that stopped it, naming
 /// nothing from the pod itself.
 pub const POD_NO_CONTAINER_RUNTIME_MESSAGE: &str =
@@ -251,6 +312,15 @@ pub struct PodObject {
     /// reports ("when the object was acknowledged by the Kubelet") and when its
     /// containers' start was attempted. `None` until the clock owes that move.
     pub started_at: Option<SystemTime>,
+    /// What the node's kubelet made of the images this pod's containers run,
+    /// recorded when that node took the pod
+    /// ([`super::kubernetes_image_pull::settle_due_pulls`]); `None` until it has.
+    ///
+    /// A pull a registry of this emulator REFUSED is what holds the pod where a
+    /// pod whose image cannot be fetched stays: its containers are never created,
+    /// so it does not reach the phase a pod whose containers were started and
+    /// terminated reports.
+    pub pull: Option<ImagePullRecord>,
 }
 
 impl PodObject {
@@ -282,6 +352,9 @@ impl PodObject {
         self.phase = POD_PHASE_PENDING.to_string();
         self.concludes_at = None;
         self.started_at = None;
+        // The pull was the kubelet's of THAT node; the pod is one waiting for
+        // capacity again, and whichever node takes it next pulls its images.
+        self.pull = None;
     }
 
     /// Materialise the phase move the clock already owes at `now`.
@@ -291,7 +364,14 @@ impl PodObject {
     /// change what a later caller sees. `started_at` is the DUE instant rather
     /// than the instant of the call that noticed it, so every caller reads the
     /// same instants.
+    ///
+    /// A pod whose image the registry REFUSED the node's kubelet is not moved: its
+    /// containers were never created, so it stays in the phase a pod waiting on an
+    /// image is in and keeps the due instant the kubelet pulls again at.
     pub fn materialize_due_transitions(&mut self, now: SystemTime) {
+        if self.pull.as_ref().is_some_and(ImagePullRecord::stopped_the_pod) {
+            return;
+        }
         if let Some(due) = self.concludes_at.filter(|due| now >= *due) {
             self.phase = POD_PHASE_FAILED.to_string();
             self.started_at = Some(due);
@@ -303,6 +383,21 @@ impl PodObject {
     #[must_use]
     pub fn has_concluded(&self) -> bool {
         self.phase == POD_PHASE_FAILED
+    }
+
+    /// The id the registry resolved one container's image to when the node's
+    /// kubelet pulled it — `<repository>@<digest>`, the way a container runtime
+    /// reports the identity of an image it has pulled — and the empty string for a
+    /// container whose image no registry of this emulator answered for.
+    fn pulled_image_id(&self, container: &str, image: &str) -> String {
+        let Some(digest) = self
+            .pull
+            .as_ref()
+            .and_then(|pull| pull.digests.get(container))
+        else {
+            return String::new();
+        };
+        format!("{}@{digest}", repository_of(image))
     }
 
     /// The containers the pod's spec declares, as `status.containerStatuses`
@@ -326,8 +421,23 @@ impl PodObject {
                     .get("image")
                     .and_then(::serde_json::Value::as_str)
                     .unwrap_or_default();
-                let state = match (concluded, finished_at.as_ref()) {
-                    (true, Some(at)) => ::serde_json::json!({
+                // The pull the node's kubelet made for THIS container, when it
+                // was the one that could not be fetched: a container has no image
+                // to be created from, so it waits on the pull the kubelet backs
+                // off and tries again — which is what Kubernetes reports for it.
+                let withheld = self
+                    .pull
+                    .as_ref()
+                    .and_then(|pull| pull.failure.as_ref())
+                    .filter(|failure| failure.container == name);
+                let state = match (withheld, concluded, finished_at.as_ref()) {
+                    (Some(failure), _, _) => ::serde_json::json!({
+                        "waiting": {
+                            "reason": WAITING_REASON_IMAGE_PULL_BACK_OFF,
+                            "message": back_off_message(&failure.image),
+                        }
+                    }),
+                    (None, true, Some(at)) => ::serde_json::json!({
                         "terminated": {
                             "reason": POD_START_ERROR_REASON,
                             "message": POD_NO_CONTAINER_RUNTIME_MESSAGE,
@@ -343,14 +453,17 @@ impl PodObject {
                     "name": name,
                     "image": image,
                     // `ContainerStatus.imageID` is "ImageID of the container's
-                    // image", which is the id the runtime resolved the reference
-                    // to when it PULLED it. Nothing here pulls an image, so there
-                    // is no resolved id to report and the member is reported as
-                    // it is for a container whose image has not been pulled —
-                    // empty, rather than an id nothing produced. It is reported
-                    // rather than left out because the member is a required one
-                    // of the status a client deserialises.
-                    "imageID": "",
+                    // image", which is the id the registry resolved the reference
+                    // to when the kubelet PULLED it — the manifest digest that
+                    // pull served ([`super::kubernetes_image_pull`]), written the
+                    // way a runtime reports a pulled image's id. A container
+                    // whose image no registry of this emulator answers for has no
+                    // resolved id to report, so the member is reported as it is
+                    // for an image that has not been pulled — empty, rather than
+                    // an id nothing produced. It is reported rather than left out
+                    // because the member is a required one of the status a client
+                    // deserialises.
+                    "imageID": self.pulled_image_id(name, image),
                     // A container that never ran is neither ready nor started,
                     // whatever phase the pod has reached.
                     "ready": false,
@@ -381,12 +494,13 @@ impl PodObject {
                 "lastTransitionTime": scheduled_at,
             })),
             // The reason and the sentence Kubernetes reports for a pod no node
-            // can take.
+            // can take, which the scheduler's own event carries too
+            // ([`scheduling_event`]).
             None => conditions.push(::serde_json::json!({
                 "type": "PodScheduled",
                 "status": "False",
-                "reason": "Unschedulable",
-                "message": "no nodes available to schedule pods",
+                "reason": POD_UNSCHEDULABLE_REASON,
+                "message": POD_UNSCHEDULABLE_MESSAGE,
                 "lastTransitionTime": scheduled_at,
             })),
         }
@@ -457,8 +571,12 @@ impl ClusterObjects {
         now: SystemTime,
         nodes: &[super::kubernetes_nodes::ClusterNode],
     ) {
-        for namespace in self.namespaces.values_mut() {
-            for pod in namespace.pods.values_mut() {
+        // The events the scheduler recorded for the pods it bound here, recorded
+        // once the namespaces are no longer borrowed for the walk.
+        let mut scheduled: Vec<(String, EventObject)> = Vec::new();
+        for (namespace, held) in &mut self.namespaces {
+            for (pod_name, pod) in &mut held.pods {
+                let was_bound = pod.node_name.is_some();
                 match pod
                     .node_name
                     .as_deref()
@@ -475,8 +593,17 @@ impl ClusterObjects {
                         }
                     }
                 }
+                if !was_bound && pod.node_name.is_some() {
+                    scheduled.push((
+                        namespace.clone(),
+                        scheduling_event(namespace, pod_name, pod, now),
+                    ));
+                }
                 pod.materialize_due_transitions(now);
             }
+        }
+        for (namespace, event) in scheduled {
+            self.record_event(&namespace, event);
         }
     }
 
@@ -703,6 +830,7 @@ impl ClusterObjects {
                 phase: POD_PHASE_PENDING.to_string(),
                 concludes_at: None,
                 started_at: None,
+                pull: None,
             },
         );
         // Scheduling: the pod is bound to a node of this CLUSTER, which is what
@@ -724,6 +852,16 @@ impl ClusterObjects {
         };
         if let (Some(node), Some(pod)) = (bound, held.pods.get_mut(&name)) {
             pod.bind_to(node);
+        }
+        // What the scheduler DID with the pod, as the scheduler records it: the
+        // node it assigned the pod to, or the reason a pod it could place nowhere
+        // stays unscheduled ([`super::kubernetes_events`]).
+        let scheduling = held
+            .pods
+            .get(&name)
+            .map(|pod| scheduling_event(namespace, &name, pod, now));
+        if let Some(event) = scheduling {
+            self.record_event(namespace, event);
         }
         self.pod_json(namespace, &name)
     }
@@ -1210,6 +1348,59 @@ fn generated_name_suffix() -> String {
         .take(5)
         .map(|byte| char::from(ALPHABET[usize::from(byte) % ALPHABET.len()]))
         .collect()
+}
+
+/// The fields a POD may be SELECTED by, as `(the field label a client writes, the
+/// member of the pod document it names)` — the fields the Kubernetes API server's
+/// own pod registry indexes.
+///
+/// A `fieldSelector` naming anything else is refused the way the API server refuses
+/// a field label it does not index ([`ListRequest::fields_limited_to`]). A field the
+/// stored object does not carry compares as the empty value, which is how the API
+/// server compares an unset field.
+pub const POD_FIELD_SELECTORS: &[(&str, &str)] = &[
+    ("metadata.name", "metadata.name"),
+    ("metadata.namespace", "metadata.namespace"),
+    ("spec.nodeName", "spec.nodeName"),
+    ("spec.restartPolicy", "spec.restartPolicy"),
+    ("spec.schedulerName", "spec.schedulerName"),
+    ("spec.serviceAccountName", "spec.serviceAccountName"),
+    ("status.nominatedNodeName", "status.nominatedNodeName"),
+    ("status.phase", "status.phase"),
+    ("status.podIP", "status.podIP"),
+];
+
+/// The fields a NAMESPACE may be selected by: its own name — a namespace belongs to
+/// no namespace — and the phase it is in.
+pub const NAMESPACE_FIELD_SELECTORS: &[(&str, &str)] = &[
+    ("metadata.name", "metadata.name"),
+    ("status.phase", "status.phase"),
+];
+
+/// The fields a SERVICE ACCOUNT may be selected by, which are the two every
+/// namespaced object's registry indexes.
+pub const SERVICE_ACCOUNT_FIELD_SELECTORS: &[(&str, &str)] = &NAMESPACED_FIELD_SELECTORS;
+
+/// The two fields EVERY namespaced object may be selected by: its own name and the
+/// namespace it belongs to.
+pub const NAMESPACED_FIELD_SELECTORS: [(&str, &str); 2] = [
+    ("metadata.name", "metadata.name"),
+    ("metadata.namespace", "metadata.namespace"),
+];
+
+/// The REPOSITORY part of an image reference: the reference without the tag or the
+/// digest it asked for, which is what a pulled image's id names the digest in.
+///
+/// A reference whose last `:` belongs to the registry's PORT rather than to a tag
+/// (`host:5000/repository`) names no tag, so it is the repository as it stands.
+fn repository_of(image: &str) -> &str {
+    if let Some((repository, _)) = image.split_once('@') {
+        return repository;
+    }
+    match image.rsplit_once(':') {
+        Some((repository, tag)) if !tag.contains('/') => repository,
+        _ => image,
+    }
 }
 
 /// A fresh `metadata.uid`: the version-4 UUID Kubernetes gives every object.

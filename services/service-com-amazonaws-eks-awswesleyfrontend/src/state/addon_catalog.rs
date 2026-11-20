@@ -297,8 +297,11 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         ],
         schema_dialect: ADDON_SCHEMA_DIALECT_DRAFT_06,
         first_cluster_version: None,
-        // The agent and its operator crossed three major versions over these
-        // Kubernetes releases, so the published history spans all of them.
+        // The agent and its operator crossed four major versions over these
+        // Kubernetes releases, so the published history spans all of them — up
+        // to and including the 5 line the Container Insights install runs on,
+        // which is the line the builds published for the newest calendar rows
+        // are of.
         releases: &[
             (1, 5, 0),
             (2, 1, 0),
@@ -306,8 +309,8 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
             (3, 2, 0),
             (3, 6, 0),
             (4, 0, 0),
-            (4, 2, 0),
-            (4, 4, 0),
+            (5, 0, 0),
+            (5, 2, 0),
         ],
     },
     AddonCatalogSeed {

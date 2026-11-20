@@ -91,8 +91,15 @@ use ::tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::kubernetes_audit::{AuditDelivery, AuditedRequest, ClusterAuditLog};
 use super::kubernetes_authentication::{self as authentication, ApiServerPrincipals};
+use super::kubernetes_events::EVENT_FIELD_SELECTORS;
+use super::kubernetes_image_pull;
 use super::kubernetes_lists::ListRequest;
+use super::kubernetes_objects::{
+    NAMESPACED_FIELD_SELECTORS, NAMESPACE_FIELD_SELECTORS, POD_FIELD_SELECTORS,
+    SERVICE_ACCOUNT_FIELD_SELECTORS,
+};
 use super::kubernetes_objects::{ApiRefusal, ClusterObjects};
+use super::kubernetes_openapi;
 use super::kubernetes_rbac::{self as rbac, RbacResource};
 use super::kubernetes_self_subject_review as self_review;
 use super::pod_identity_plane::AuthPlane;
@@ -163,6 +170,10 @@ pub struct KubernetesApiPlane {
     /// plane log group. Every request is recorded there while the `audit` log type
     /// is enabled, and none while it is not.
     audit: Option<ClusterAuditLog>,
+    /// The Amazon ECR registries the kubelet of a node of this cluster pulls a
+    /// pod's images from, as the stores that decide a pull
+    /// ([`kubernetes_image_pull::settle_due_pulls`]).
+    registry: kubernetes_image_pull::PullRegistries,
     /// The TLS server this address answers a `https://` client with: the
     /// certificate the cluster's own certificate authority issued, and its key.
     /// `None` when the material could not be loaded, in which case a client that
@@ -279,6 +290,7 @@ pub async fn publish<Eng: Send + Sync + 'static>(
         // the create is running within — the same seam every other cross-service
         // call of this service goes over.
         audit: Some(ClusterAuditLog::new(callback, &key.0, &key.1)),
+        registry: kubernetes_image_pull::PullRegistries::of(engine),
         tls,
         _listener: listener,
     };
@@ -497,6 +509,7 @@ async fn answer(
     };
     let authorization = header_value(::http::header::AUTHORIZATION);
     let user_agent = header_value(::http::header::USER_AGENT);
+    let accept = header_value(::http::header::ACCEPT);
     let query = request.uri().query().map(str::to_string);
     // The media type the client wrote its body in, which is what says how the
     // body is read ([`read_manifest`]).
@@ -541,6 +554,7 @@ async fn answer(
                 authorization: authorization.as_deref(),
                 user_agent: user_agent.as_deref(),
                 query: query.as_deref(),
+                accept: accept.as_deref(),
                 content_type: &content_type,
                 body: &body,
             },
@@ -580,6 +594,10 @@ pub struct ApiRequest<'request> {
     pub user_agent: Option<&'request str>,
     /// The query string, which is where a list states the chunk it asks for.
     pub query: Option<&'request str>,
+    /// The `Accept` header: the encodings the client can read, which is what the
+    /// published OpenAPI documents are negotiated by
+    /// ([`super::kubernetes_openapi::admits_json`]).
+    pub accept: Option<&'request str>,
     /// The media type the client wrote its body in, which is what says how the body is
     /// read.
     pub content_type: &'request str,
@@ -618,6 +636,22 @@ pub fn serve(
 ) -> Served {
     let received_at = SystemTime::now();
     let attributes = rbac::request_attributes(request.method, request.path);
+    // The pulls the clock already owes this cluster's pods: the kubelet of the node
+    // that took a pod fetches the images its containers run, which the registry each
+    // reference names decides ([`kubernetes_image_pull`]). It runs here, before the
+    // request is routed, because the verdict is taken with no store of this service
+    // held — and every pull it settles was due at a stored instant whether or not
+    // anybody called.
+    let registry = {
+        let store = state.lock();
+        store
+            .kubernetes_api
+            .get(key)
+            .map(|plane| plane.registry.clone())
+    };
+    if let Some(registry) = registry {
+        kubernetes_image_pull::settle_due_pulls(state, &registry, key, received_at);
+    }
     // The plane's own handles, read and RELEASED: resolving the credential asks the
     // other services' stores, which is never done with this one's lock held.
     let plane_handles = {
@@ -777,6 +811,38 @@ fn route(
                 }),
             ));
         }
+        // The OpenAPI documents a client validates a manifest against before it
+        // sends one ([`super::kubernetes_openapi`]). A client that cannot read them
+        // sends nothing, whatever this server serves.
+        [segment, version] if *segment == kubernetes_openapi::OPENAPI_V3_SEGMENT => {
+            if method != ::http::Method::GET.as_str() {
+                return Err(ApiRefusal::method_not_allowed(method, path));
+            }
+            unacceptable(request.accept)?;
+            let kubernetes_version = cluster_kubernetes_version(state, key);
+            return match *version {
+                kubernetes_openapi::OPENAPI_V3_VERSION => {
+                    Ok((200, kubernetes_openapi::v3_index(&kubernetes_version)))
+                }
+                kubernetes_openapi::OPENAPI_V2_VERSION => {
+                    Ok((200, kubernetes_openapi::v2_document(&kubernetes_version)))
+                }
+                _ => Err(ApiRefusal::no_such_path(path)),
+            };
+        }
+        [segment, version, document @ ..]
+            if *segment == kubernetes_openapi::OPENAPI_V3_SEGMENT
+                && *version == kubernetes_openapi::OPENAPI_V3_VERSION =>
+        {
+            if method != ::http::Method::GET.as_str() {
+                return Err(ApiRefusal::method_not_allowed(method, path));
+            }
+            unacceptable(request.accept)?;
+            let kubernetes_version = cluster_kubernetes_version(state, key);
+            return kubernetes_openapi::v3_document(&kubernetes_version, &document.join("/"))
+                .map(|document| (200, document))
+                .ok_or_else(|| ApiRefusal::no_such_path(path));
+        }
         // The discovery documents of the two groups beside the core API this server
         // serves: a client reads them before it addresses a group at all.
         ["apis", group] if *group == rbac::RBAC_API_GROUP => {
@@ -858,7 +924,10 @@ fn route(
                         .map(str::to_string)
                 })
                 .collect();
-            let listing = ListRequest::from_query(query)?;
+            let listing = selected(
+                ListRequest::from_query(query)?,
+                super::kubernetes_nodes::NODE_FIELD_SELECTORS,
+            )?;
             return Ok((
                 200,
                 super::kubernetes_lists::listed("NodeList", &names, &listing, |name| {
@@ -932,7 +1001,10 @@ fn route(
             Ok((201, objects.create_namespace(&document, now)?))
         }
         (method, ["namespaces"]) if method == ::http::Method::GET.as_str() => {
-            Ok((200, objects.namespace_list_json(&list_request?)))
+            Ok((
+                200,
+                objects.namespace_list_json(&selected(list_request?, NAMESPACE_FIELD_SELECTORS)?),
+            ))
         }
         (method, ["namespaces", namespace]) if method == ::http::Method::GET.as_str() => {
             Ok((200, objects.namespace_json(namespace)?))
@@ -942,7 +1014,13 @@ fn route(
             Ok((201, objects.create_pod(namespace, &document, now, &nodes)?))
         }
         (method, ["namespaces", namespace, "pods"]) if method == ::http::Method::GET.as_str() => {
-            Ok((200, objects.pod_list_json(namespace, &list_request?)?))
+            Ok((
+                200,
+                objects.pod_list_json(
+                    namespace,
+                    &selected(list_request?, POD_FIELD_SELECTORS)?,
+                )?,
+            ))
         }
         (method, ["namespaces", namespace, "pods", name])
             if method == ::http::Method::GET.as_str() =>
@@ -960,7 +1038,10 @@ fn route(
         {
             Ok((
                 200,
-                objects.config_map_list_json(namespace, &list_request?)?,
+                objects.config_map_list_json(
+                    namespace,
+                    &selected(list_request?, &NAMESPACED_FIELD_SELECTORS)?,
+                )?,
             ))
         }
         (method, ["namespaces", namespace, "configmaps", name])
@@ -991,13 +1072,33 @@ fn route(
         {
             Ok((
                 200,
-                objects.service_account_list_json(namespace, &list_request?)?,
+                objects.service_account_list_json(
+                    namespace,
+                    &selected(list_request?, SERVICE_ACCOUNT_FIELD_SELECTORS)?,
+                )?,
             ))
         }
         (method, ["namespaces", namespace, "serviceaccounts", name])
             if method == ::http::Method::GET.as_str() =>
         {
             Ok((200, objects.service_account_json(namespace, name)?))
+        }
+        // The EVENTS of a namespace: what the cluster's own components recorded
+        // about its objects ([`super::kubernetes_events`]). They are not objects a
+        // client creates — the cluster records them — so the collection is read.
+        (method, ["namespaces", namespace, "events"]) if method == ::http::Method::GET.as_str() => {
+            Ok((
+                200,
+                objects.event_list_json(
+                    namespace,
+                    &selected(list_request?, EVENT_FIELD_SELECTORS)?,
+                )?,
+            ))
+        }
+        (method, ["namespaces", namespace, "events", name])
+            if method == ::http::Method::GET.as_str() =>
+        {
+            Ok((200, objects.event_json(namespace, name)?))
         }
         // A path this API server does serve, asked for with a method that
         // addresses nothing, is told apart from a path it does not serve at all:
@@ -1119,6 +1220,9 @@ fn core_api_resource_list() -> ::serde_json::Value {
             resource("nodes", "Node", false, &["no"], &read),
             resource("pods", "Pod", true, &["po"], &read_create),
             resource("configmaps", "ConfigMap", true, &["cm"], &read_create_update),
+            // The events the cluster's own components record about its objects:
+            // a client READS them, so the row names the verbs this server serves.
+            resource("events", "Event", true, &["ev"], &read),
             resource(
                 "serviceaccounts",
                 "ServiceAccount",
@@ -1237,6 +1341,50 @@ fn version_document(
         "gitVersion": format!("v{version}"),
         "platform": "emulator",
     })
+}
+
+/// `Ok(())` when `accept` admits the encoding the published documents are written
+/// in, else the `Status` the API server refuses an unacceptable `Accept` with: a
+/// client that can read only an encoding this server does not produce is told so
+/// rather than handed a body it cannot decode
+/// ([`kubernetes_openapi::admits_json`]).
+fn unacceptable(accept: Option<&str>) -> Result<(), ApiRefusal> {
+    if kubernetes_openapi::admits_json(accept) {
+        return Ok(());
+    }
+    Err(ApiRefusal {
+        status: 406,
+        reason: "NotAcceptable",
+        message: kubernetes_openapi::unacceptable_message(),
+        resource: None,
+    })
+}
+
+/// One list request held to the fields the collection it addresses is SELECTABLE by
+/// ([`ListRequest::fields_limited_to`]): a `fieldSelector` naming a field that
+/// collection's registry does not index is refused rather than answered with a list
+/// narrowed by a field nothing indexes.
+fn selected(
+    mut listing: ListRequest,
+    served: &[(&str, &str)],
+) -> Result<ListRequest, ApiRefusal> {
+    listing.fields_limited_to(served)?;
+    Ok(listing)
+}
+
+/// The Kubernetes version the cluster keyed `key` runs, which every document this
+/// server publishes about itself reports — the record's own version, so the version
+/// a client reads from the API and from `DescribeCluster` is one value.
+fn cluster_kubernetes_version(
+    state: &::engine::ServiceState<ServiceStore>,
+    key: &(String, String),
+) -> String {
+    let store = state.lock();
+    store
+        .clusters
+        .get(key)
+        .and_then(|record| record.version.clone())
+        .unwrap_or_else(|| super::DEFAULT_KUBERNETES_VERSION.to_string())
 }
 
 /// One object document as the HTTP answer a Kubernetes client reads.

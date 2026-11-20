@@ -189,37 +189,124 @@ pub fn serve_pull<Eng: Send + Sync + 'static>(
     principal: Option<PullPrincipal<'_>>,
     now: SystemTime,
 ) -> Result<Option<String>, PullRefusal> {
-    if let Some(refusal) = withheld_pull(engine, reference, principal) {
-        return Err(refusal);
+    PullPlane::of(engine).serve_pull(reference, principal, now)
+}
+
+/// The stores a pull is decided from, as HANDLES: this registry's own and the IAM store the
+/// pulling principal's documents are held in.
+///
+/// A compute service that stands in for a container runtime does not always hold the engine
+/// when the pull happens — a pull a workload's own clock owes is decided from a plane that
+/// service opened earlier — so the two stores a pull reads are taken once
+/// ([`PullPlane::of`], with a handler's `&*self.engine`) and kept. They are the SAME stores
+/// the engine-borne entry points resolve, so a pull decided through either answers alike.
+#[derive(Clone)]
+pub struct PullPlane {
+    /// This registry's store, and `None` for an engine that carries none.
+    registry: Option<::engine::ServiceState<ComAmazonawsEcrAmazonec2containerregistryV20150921State>>,
+    /// The IAM store the principal's identity documents are read from, and `None` for an
+    /// engine with no IAM — which shows nothing about the role, so nothing is withheld on it.
+    identities: Option<
+        ::engine::ServiceState<
+            iam_store::ComAmazonawsIamAwsidentitymanagementv20100508State,
+        >,
+    >,
+}
+
+/// Written by hand rather than derived: what is diagnosable is whether the stores are there
+/// at all, not what they hold.
+impl ::std::fmt::Debug for PullPlane {
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        formatter
+            .debug_struct("PullPlane")
+            .field("registry", &self.registry.is_some())
+            .field("identities", &self.identities.is_some())
+            .finish()
     }
-    let Some(state) = service_state(engine) else {
-        // No store of this service to ask: nothing is known about the image, so the pull
-        // is not refused on it.
-        return Ok(None);
-    };
-    let mut store = state.lock();
-    let identifier = reference.identifier();
-    if let Ok(repository) = store.repository(&reference.region, &reference.repository_name) {
-        if let Ok(image) = repository.lookup_image(&identifier) {
-            return Ok(Some(image.digest.clone()));
+}
+
+impl PullPlane {
+    /// The stores in `engine`.
+    #[must_use]
+    pub fn of<Eng: Send + Sync + 'static>(engine: &Eng) -> Self {
+        Self {
+            registry: service_state(engine),
+            identities: iam_store::service_state(engine),
         }
     }
-    match import_covered_image(
-        &mut store,
-        &reference.region,
-        &reference.repository_name,
-        reference.tag.as_deref(),
-        now,
-    ) {
-        CacheImport::Imported(digest) => Ok(Some(digest)),
-        // A rule covers the repository and nothing was cached through it: the container
-        // cannot start either way, and what it is told is why.
-        CacheImport::Unavailable(message) | CacheImport::AtCapacity(message) => {
-            Err(PullRefusal::NotFound { message })
+
+    /// [`serve_reference_pull`], decided from these stores.
+    pub fn serve_reference_pull(
+        &self,
+        image: &str,
+        principal: Option<PullPrincipal<'_>>,
+        now: SystemTime,
+    ) -> Option<Result<Option<String>, PullRefusal>> {
+        let (addressed_registry, reference) = parse_registry_reference(image)?;
+        if addressed_registry != registry_id() {
+            return Some(Err(cross_account_refusal(
+                &addressed_registry,
+                &reference,
+                principal,
+            )));
         }
-        CacheImport::NotCovered => Err(PullRefusal::NotFound {
-            message: not_found_message(&store, reference),
-        }),
+        Some(self.serve_pull(&reference, principal, now))
+    }
+
+    /// [`withheld_registry_authorization`], decided from these stores.
+    pub fn withheld_registry_authorization(
+        &self,
+        principal: Option<PullPrincipal<'_>>,
+    ) -> Option<String> {
+        match PreparedPrincipal::prepare(self, principal)?
+            .withheld(GET_AUTHORIZATION_TOKEN_ACTION, ANY_RESOURCE, None)?
+        {
+            PullRefusal::NotAuthorized { message, .. } => Some(message),
+            // [`PreparedPrincipal::withheld`] words every refusal it takes as the withheld
+            // call it is; nothing there answers about the contents of a repository.
+            PullRefusal::NotFound { .. } => None,
+        }
+    }
+
+    /// [`serve_pull`], decided from these stores.
+    pub fn serve_pull(
+        &self,
+        reference: &RegistryReference,
+        principal: Option<PullPrincipal<'_>>,
+        now: SystemTime,
+    ) -> Result<Option<String>, PullRefusal> {
+        if let Some(refusal) = self.withheld_pull(reference, principal) {
+            return Err(refusal);
+        }
+        let Some(state) = self.registry.clone() else {
+            // No store of this service to ask: nothing is known about the image, so the pull
+            // is not refused on it.
+            return Ok(None);
+        };
+        let mut store = state.lock();
+        let identifier = reference.identifier();
+        if let Ok(repository) = store.repository(&reference.region, &reference.repository_name) {
+            if let Ok(image) = repository.lookup_image(&identifier) {
+                return Ok(Some(image.digest.clone()));
+            }
+        }
+        match import_covered_image(
+            &mut store,
+            &reference.region,
+            &reference.repository_name,
+            reference.tag.as_deref(),
+            now,
+        ) {
+            CacheImport::Imported(digest) => Ok(Some(digest)),
+            // A rule covers the repository and nothing was cached through it: the container
+            // cannot start either way, and what it is told is why.
+            CacheImport::Unavailable(message) | CacheImport::AtCapacity(message) => {
+                Err(PullRefusal::NotFound { message })
+            }
+            CacheImport::NotCovered => Err(PullRefusal::NotFound {
+                message: not_found_message(&store, reference),
+            }),
+        }
     }
 }
 
@@ -250,15 +337,7 @@ pub fn serve_reference_pull<Eng: Send + Sync + 'static>(
     principal: Option<PullPrincipal<'_>>,
     now: SystemTime,
 ) -> Option<Result<Option<String>, PullRefusal>> {
-    let (addressed_registry, reference) = parse_registry_reference(image)?;
-    if addressed_registry != registry_id() {
-        return Some(Err(cross_account_refusal(
-            &addressed_registry,
-            &reference,
-            principal,
-        )));
-    }
-    Some(serve_pull(engine, &reference, principal, now))
+    PullPlane::of(engine).serve_reference_pull(image, principal, now)
 }
 
 /// The refusal a pull of `reference` into the registry of the account `registry_id` earns,
@@ -425,32 +504,34 @@ fn not_found_message(
     }
 }
 
-/// The first of the calls a pull makes that no policy in force on `principal` permits, or
-/// `None` when every one of them is permitted — or when nothing of the kind can be shown
-/// (see the module docs).
-fn withheld_pull<Eng: Send + Sync + 'static>(
-    engine: &Eng,
-    reference: &RegistryReference,
-    principal: Option<PullPrincipal<'_>>,
-) -> Option<PullRefusal> {
-    let decided = PreparedPrincipal::prepare(engine, principal)?;
-    // The document the repository SHARES itself with, which is the other way a pull is
-    // allowed: a repository policy naming the role grants it with no identity-based grant
-    // at all.
-    let shared = service_state(engine).and_then(|state| {
-        let store = state.lock();
-        store
-            .repository(&reference.region, &reference.repository_name)
-            .ok()
-            .and_then(|repository| repository.policy_text.clone())
-    });
-    let repository = repository_arn(&reference.region, &reference.repository_name);
-    // The registry-level call first, the way the agent makes them: a role that cannot
-    // obtain a token never reaches a manifest. A registry-level action is granted on the
-    // registry, which no repository policy is the document for.
-    decided
-        .withheld(GET_AUTHORIZATION_TOKEN_ACTION, ANY_RESOURCE, None)
-        .or_else(|| decided.withheld(BATCH_GET_IMAGE_ACTION, &repository, shared.as_deref()))
+impl PullPlane {
+    /// The first of the calls a pull makes that no policy in force on `principal`
+    /// permits, decided from these stores — and `None` when every one of them is
+    /// permitted, or when nothing of the kind can be shown (see the module docs).
+    fn withheld_pull(
+        &self,
+        reference: &RegistryReference,
+        principal: Option<PullPrincipal<'_>>,
+    ) -> Option<PullRefusal> {
+        let decided = PreparedPrincipal::prepare(self, principal)?;
+        // The document the repository SHARES itself with, which is the other way a pull is
+        // allowed: a repository policy naming the role grants it with no identity-based grant
+        // at all.
+        let shared = self.registry.as_ref().and_then(|state| {
+            let store = state.lock();
+            store
+                .repository(&reference.region, &reference.repository_name)
+                .ok()
+                .and_then(|repository| repository.policy_text.clone())
+        });
+        let repository = repository_arn(&reference.region, &reference.repository_name);
+        // The registry-level call first, the way the agent makes them: a role that cannot
+        // obtain a token never reaches a manifest. A registry-level action is granted on the
+        // registry, which no repository policy is the document for.
+        decided
+            .withheld(GET_AUTHORIZATION_TOKEN_ACTION, ANY_RESOURCE, None)
+            .or_else(|| decided.withheld(BATCH_GET_IMAGE_ACTION, &repository, shared.as_deref()))
+    }
 }
 
 /// Why no policy in force on `principal` permits it the REGISTRY-level authorization token
@@ -470,14 +551,7 @@ pub fn withheld_registry_authorization<Eng: Send + Sync + 'static>(
     engine: &Eng,
     principal: Option<PullPrincipal<'_>>,
 ) -> Option<String> {
-    match PreparedPrincipal::prepare(engine, principal)?
-        .withheld(GET_AUTHORIZATION_TOKEN_ACTION, ANY_RESOURCE, None)?
-    {
-        PullRefusal::NotAuthorized { message, .. } => Some(message),
-        // [`PreparedPrincipal::withheld`] words every refusal it takes as the withheld call
-        // it is; nothing there answers about the contents of a repository.
-        PullRefusal::NotFound { .. } => None,
-    }
+    PullPlane::of(engine).withheld_registry_authorization(principal)
 }
 
 /// The principal a pull is made as.
@@ -540,13 +614,10 @@ impl<'role> PreparedPrincipal<'role> {
     /// of the kind can be shown: a pull made with no principal, an engine carrying no IAM
     /// store, a role that store holds no record for, or one carrying an attachment whose
     /// document this account does not hold (see the module docs).
-    fn prepare<Eng: Send + Sync + 'static>(
-        engine: &Eng,
-        principal: Option<PullPrincipal<'role>>,
-    ) -> Option<Self> {
+    fn prepare(plane: &PullPlane, principal: Option<PullPrincipal<'role>>) -> Option<Self> {
         let principal = principal?;
         let role_arn = principal.role_arn;
-        let iam = iam_store::service_state(engine)?;
+        let iam = plane.identities.clone()?;
         let (statements, boundary) = {
             let store = iam.lock();
             // A role this account's IAM holds no record for may belong to another account, so

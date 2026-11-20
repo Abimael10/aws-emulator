@@ -806,10 +806,11 @@ async fn a_stack_fails_when_the_declared_cluster_cannot_be_created() {
     // (case, the cluster's extra properties, the subnets it names)
     let cases: [(&str, Value, usize); 3] = [
         (
-            "a control-plane logging configuration the emulator holds no state for",
+            "a compute configuration the emulator holds no state for",
             json!({
-                "Logging": {
-                    "ClusterLogging": { "EnabledTypes": [{ "Type": "api" }] }
+                "ComputeConfig": {
+                    "Enabled": true,
+                    "NodePools": ["general-purpose"]
                 }
             }),
             2,
