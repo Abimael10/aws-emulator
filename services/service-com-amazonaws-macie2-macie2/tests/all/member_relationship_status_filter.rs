@@ -97,7 +97,10 @@ const STATUS_CATALOG: [StatusRow; 10] = [
 
 /// One emulator, with the shared engine kept so a case can seed an association
 /// in a status no implemented operation reaches yet.
-fn seed_association(
+///
+/// `pub(crate)` so a sibling suite seeds an association the same way rather
+/// than building a second copy of this.
+pub(crate) fn seed_association(
     engine: &engine::InMemoryEngine,
     region: &str,
     account: &str,

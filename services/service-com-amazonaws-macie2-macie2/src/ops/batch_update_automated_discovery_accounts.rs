@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchUpdateAutomatedDiscoveryAccounts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchUpdateAutomatedDiscoveryAccounts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchUpdateAutomatedDiscoveryAccounts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +144,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchUpdateAutomatedDiscoveryAccounts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchUpdateAutomatedDiscoveryAccountsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchUpdateAutomatedDiscoveryAccounts"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                BatchUpdateAutomatedDiscoveryAccountsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the Macie automated discovery store is unavailable on this engine"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        // Macie, and so the accounts whose automated sensitive data discovery
+        // it administers, is per account and Region; a request names the region
+        // it addresses.
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = store.lock();
+        if state.session(&region).is_none() {
+            // Nothing has enabled Macie in this region, so this account
+            // administers no automated sensitive data discovery here.
+            return Err(
+                BatchUpdateAutomatedDiscoveryAccountsErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(crate::state::MACIE_NOT_ENABLED_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Both members of `AutomatedDiscoveryAccountUpdate` are optional in the
+        // model, so an update naming no account, or no status to give it, states
+        // no change and is refused BEFORE anything is written: the whole request
+        // leaves the store as it was.
+        let updates = input.accounts.clone().unwrap_or_default();
+        for update in &updates {
+            if update.account_id.as_deref().unwrap_or_default().is_empty() {
+                return Err(
+                    BatchUpdateAutomatedDiscoveryAccountsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                crate::state::UPDATE_WITHOUT_ACCOUNT_ID_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            if update.status.is_none() {
+                return Err(
+                    BatchUpdateAutomatedDiscoveryAccountsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                crate::state::UPDATE_WITHOUT_STATUS_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // Each account is changed, or explained, on its own: this operation
+        // reports "an array of objects, one for each account whose status
+        // wasn't changed" rather than refusing the whole request because one
+        // account could not be reached.
+        let mut errors: Vec<AutomatedDiscoveryAccountUpdateError> = Vec::new();
+        for update in updates {
+            let (Some(account_id), Some(status)) = (update.account_id, update.status) else {
+                continue;
+            };
+            match state.automated_discovery_account_administration(&region, &account_id) {
+                crate::state::AccountAdministration::Administered => {
+                    // `status` is validated against its enum before this
+                    // handler runs, so a present value is one the wire allows.
+                    state.set_automated_discovery_account_status(
+                        &region,
+                        &account_id,
+                        status,
+                        now,
+                    );
+                }
+                crate::state::AccountAdministration::MacieSuspended => {
+                    errors.push(AutomatedDiscoveryAccountUpdateError {
+                        account_id: Some(account_id),
+                        error_code: Some(
+                            crate::state::UPDATE_ERROR_ACCOUNT_PAUSED.to_string(),
+                        ),
+                    });
+                }
+                crate::state::AccountAdministration::NotAdministered => {
+                    errors.push(AutomatedDiscoveryAccountUpdateError {
+                        account_id: Some(account_id),
+                        error_code: Some(
+                            crate::state::UPDATE_ERROR_ACCOUNT_NOT_FOUND.to_string(),
+                        ),
+                    });
+                }
+            }
+        }
+
+        // "This value is null if the request succeeded for all specified
+        // accounts."
+        Ok(BatchUpdateAutomatedDiscoveryAccountsOutput {
+            errors: (!errors.is_empty()).then_some(errors),
+        })
     }
 }

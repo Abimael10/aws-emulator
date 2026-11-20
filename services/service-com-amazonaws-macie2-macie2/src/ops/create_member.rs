@@ -247,7 +247,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let arn = member.arn.clone();
         state
             .members
-            .insert((region, input.account.account_id.clone()), member);
+            .insert((region.clone(), input.account.account_id.clone()), member);
+        // The account has just joined this administrator, so the region's
+        // automated-discovery configuration decides whether automated sensitive
+        // data discovery is enabled for it: the modes that auto-enable a new
+        // member account do, the others leave it to a batch update.
+        state.auto_enable_automated_discovery_for_new_account(
+            &region,
+            &input.account.account_id,
+            now,
+        );
 
         Ok(CreateMemberOutput { arn: Some(arn) })
     }

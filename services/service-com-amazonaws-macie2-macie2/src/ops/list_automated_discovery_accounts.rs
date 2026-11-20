@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAutomatedDiscoveryAccounts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAutomatedDiscoveryAccounts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAutomatedDiscoveryAccounts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +150,144 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAutomatedDiscoveryAccounts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAutomatedDiscoveryAccountsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAutomatedDiscoveryAccounts"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListAutomatedDiscoveryAccountsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the Macie automated discovery store is unavailable on this engine"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        // Macie, and so the accounts whose automated sensitive data discovery
+        // it administers, is per account and Region; a request names the region
+        // it addresses.
+        let region = crate::state::request_region(ctx);
+
+        let state = store.lock();
+        if state.session(&region).is_none() {
+            // Nothing has enabled Macie in this region, so this account
+            // administers no automated sensitive data discovery here.
+            return Err(
+                ListAutomatedDiscoveryAccountsErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(crate::state::MACIE_NOT_ENABLED_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The Amazon Web Services account ID for each account, for as many as
+        // 50 accounts": a request naming more accounts than one call may ask
+        // about is refused rather than silently truncated.
+        let requested: Option<::std::collections::BTreeSet<&str>> =
+            match input.account_ids.as_deref() {
+                Some(ids) if !ids.is_empty() => {
+                    if ids.len() > crate::state::MAX_LISTED_AUTOMATED_DISCOVERY_ACCOUNT_IDS {
+                        return Err(
+                            ListAutomatedDiscoveryAccountsErrorModeled::ValidationException(
+                                ValidationException {
+                                    message: Some(
+                                        crate::state::TOO_MANY_ACCOUNT_IDS_MESSAGE.to_string(),
+                                    ),
+                                },
+                            )
+                            .into(),
+                        );
+                    }
+                    Some(ids.iter().map(String::as_str).collect())
+                }
+                // "To retrieve the status for all the accounts in an
+                // organization, omit this parameter" — which a parameter
+                // naming no account is.
+                _ => None,
+            };
+
+        // A `nextToken` is this service's own opaque encoding of the cursor, so
+        // one it did not issue names no page and is refused rather than silently
+        // read as "start again".
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(cursor) => Some(cursor),
+                None => {
+                    return Err(
+                        ListAutomatedDiscoveryAccountsErrorModeled::ValidationException(
+                            ValidationException {
+                                message: Some(
+                                    crate::state::FOREIGN_PAGE_TOKEN_MESSAGE.to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+            None => None,
+        };
+
+        // `maxResults` carries a modelled range of 1 to 25, so the boundary
+        // validator has already refused anything outside it; a request naming
+        // none takes the page that range caps this read at.
+        let page_size = match input.max_results {
+            Some(asked) if asked > 0 => usize::try_from(asked)
+                .unwrap_or(crate::state::MAX_AUTOMATED_DISCOVERY_ACCOUNT_PAGE_SIZE)
+                .min(crate::state::MAX_AUTOMATED_DISCOVERY_ACCOUNT_PAGE_SIZE),
+            _ => crate::state::MAX_AUTOMATED_DISCOVERY_ACCOUNT_PAGE_SIZE,
+        };
+
+        // The accounts this administrator administers in the region, which
+        // `automated_discovery_accounts_of` hands back in account-id order:
+        // this page key is ascending, so a cursor names one position in it and
+        // the next page starts just past the account the last one ended on.
+        let administered = state.automated_discovery_accounts_of(&region);
+        let accounts: Vec<&str> = administered
+            .iter()
+            .map(String::as_str)
+            .filter(|account| {
+                requested
+                    .as_ref()
+                    .is_none_or(|wanted| wanted.contains(account))
+            })
+            .collect();
+        let start = match resume_after.as_deref() {
+            Some(cursor) => accounts.partition_point(|account| *account <= cursor),
+            None => 0,
+        };
+        let end = start.saturating_add(page_size).min(accounts.len());
+        let page = accounts.get(start..end).unwrap_or_default();
+
+        // Every member of each reported object is read back out of the store:
+        // the account id the association carries, and the status last written
+        // for that account.
+        let items: Vec<AutomatedDiscoveryAccount> = page
+            .iter()
+            .map(|account| AutomatedDiscoveryAccount {
+                account_id: Some((*account).to_string()),
+                status: Some(
+                    state
+                        .automated_discovery_account_status(&region, account)
+                        .to_string(),
+                ),
+            })
+            .collect();
+
+        // "This value is null if there are no additional pages", so a token
+        // only when accounts remain after this page.
+        let next_token = (end < accounts.len())
+            .then(|| {
+                page.last()
+                    .map(|account| crate::state::encode_page_token(account))
+            })
+            .flatten();
+
+        Ok(ListAutomatedDiscoveryAccountsOutput {
+            items: Some(items),
+            next_token,
+        })
     }
 }

@@ -28,7 +28,13 @@
 //! defines, which `GetFindingsFilter` projects, `UpdateFindingsFilter` edits and
 //! `DeleteFindingsFilter` deletes.
 //!
-//! Three planes of this state have a file of their own. The findings plane
+//! The per-account status of automated sensitive data discovery lives in
+//! [`automated_discovery_accounts`]: the accounts this administrator
+//! administers in a region carry one each, which
+//! `BatchUpdateAutomatedDiscoveryAccounts` writes and
+//! `ListAutomatedDiscoveryAccounts` enumerates.
+//!
+//! Three further planes of this state have a file of their own. The findings plane
 //! lives in [`findings`], because it carries a query of its own — the
 //! conditions a `findingCriteria` names and the order a `sortCriteria` asks for
 //! — beside the records themselves, with the aggregation a statistics query
@@ -42,10 +48,16 @@
 //! here, so a handler reaches all of this service's state through
 //! `crate::state::…` whichever plane it touches.
 
+/// The per-ACCOUNT status of automated sensitive data discovery, which
+/// `BatchUpdateAutomatedDiscoveryAccounts` writes and
+/// `ListAutomatedDiscoveryAccounts` reports — a different fact from the
+/// per-region [`AutomatedDiscoveryConfiguration`] beside it.
+pub mod automated_discovery_accounts;
 pub mod classification_jobs;
 pub mod finding_statistics;
 pub mod findings;
 
+pub use automated_discovery_accounts::*;
 pub use classification_jobs::*;
 pub use finding_statistics::*;
 
@@ -674,6 +686,14 @@ pub struct ComAmazonawsMacie2Macie2State {
     /// [`Self::sessions`]: Macie has to be enabled in a region before its
     /// automated discovery can be configured there.
     pub automated_discovery: BTreeMap<String, AutomatedDiscoveryConfiguration>,
+    /// The status of automated sensitive data discovery for each account this
+    /// administrator administers, keyed by the region the account's association
+    /// belongs to and that account's id — the same key shape as
+    /// [`Self::members`], because these are the accounts an entry of that map
+    /// names. An account is absent here until something enables or disables it
+    /// for the account; see [`automated_discovery_accounts`].
+    pub automated_discovery_accounts:
+        BTreeMap<(String, String), AutomatedDiscoveryAccountSetting>,
     /// The findings-publication configuration of each region something has
     /// written one for (`PutFindingsPublicationConfiguration`), which
     /// `GetFindingsPublicationConfiguration` reports. A key of this map is
@@ -741,6 +761,74 @@ impl ComAmazonawsMacie2Macie2State {
         region: &str,
     ) -> Option<&AutomatedDiscoveryConfiguration> {
         self.automated_discovery.get(region)
+    }
+
+    /// Write the status of automated sensitive data discovery for THIS account
+    /// in `region`, under `auto_enable_organization_members`, moving the stamps
+    /// those members document and materialising the classification scope and
+    /// the sensitivity inspection template the analyses use the first time a
+    /// region is configured.
+    ///
+    /// This is the ONE place that status is written, because it is ONE fact:
+    /// the configuration `UpdateAutomatedDiscoveryConfiguration` states, and
+    /// the status of automated sensitive data discovery for the
+    /// ADMINISTRATOR'S OWN ACCOUNT, which `ListAutomatedDiscoveryAccounts`
+    /// reports for that account and `BatchUpdateAutomatedDiscoveryAccounts`
+    /// changes when it names it.
+    pub fn configure_automated_discovery(
+        &mut self,
+        region: &str,
+        status: String,
+        auto_enable_organization_members: String,
+        now: SystemTime,
+    ) {
+        let enabled = status == AUTOMATED_DISCOVERY_ENABLED;
+        if let Some(configuration) = self.automated_discovery.get_mut(region) {
+            let settings_changed =
+                configuration.auto_enable_organization_members != auto_enable_organization_members;
+            let status_changed = configuration.status != status;
+            if status_changed {
+                configuration.status = status;
+                if enabled {
+                    // `firstEnabledAt` records when automated sensitive data
+                    // discovery was INITIALLY enabled, so a later re-enable
+                    // leaves it alone; `disabledAt` is null while it runs.
+                    configuration.first_enabled_at.get_or_insert(now);
+                    configuration.disabled_at = None;
+                } else {
+                    configuration.disabled_at = Some(now);
+                }
+            }
+            configuration.auto_enable_organization_members = auto_enable_organization_members;
+            // `lastUpdatedAt` records when the settings or the status most
+            // recently CHANGED, so a call asking for the configuration the
+            // account already has does not move it.
+            if status_changed || settings_changed {
+                configuration.last_updated_at = now;
+            }
+            return;
+        }
+
+        // The first call that configures automated sensitive data discovery for
+        // this region also materialises the classification scope and the
+        // sensitivity inspection template its analyses use, whose identifiers a
+        // read reports.
+        let classification_scope_seed = self.next_id_seed();
+        let sensitivity_inspection_template_seed = self.next_id_seed();
+        let configuration = AutomatedDiscoveryConfiguration {
+            status,
+            auto_enable_organization_members,
+            classification_scope_id: new_resource_id(classification_scope_seed, now),
+            sensitivity_inspection_template_id: new_resource_id(
+                sensitivity_inspection_template_seed,
+                now,
+            ),
+            first_enabled_at: enabled.then_some(now),
+            disabled_at: (!enabled).then_some(now),
+            last_updated_at: now,
+        };
+        self.automated_discovery
+            .insert(region.to_string(), configuration);
     }
 
     /// The findings-publication configuration of `region`, or `None` when
@@ -910,6 +998,8 @@ impl ComAmazonawsMacie2Macie2State {
     pub fn forget_region(&mut self, region: &str) {
         self.sessions.remove(region);
         self.automated_discovery.remove(region);
+        self.automated_discovery_accounts
+            .retain(|(account_region, _), _| account_region != region);
         self.findings_publication.remove(region);
         self.classification_export.remove(region);
         self.custom_data_identifiers
@@ -966,6 +1056,10 @@ impl ComAmazonawsMacie2Macie2State {
     /// nothing of it is reported afterwards, by a read of that account or by an
     /// enumeration of the region's members.
     pub fn remove_member(&mut self, region: &str, account_id: &str) -> Option<Member> {
+        // The account's automated sensitive data discovery status goes with the
+        // association: an account this administrator no longer administers has
+        // no status for it to report.
+        self.forget_automated_discovery_account(region, account_id);
         self.members
             .remove(&(region.to_string(), account_id.to_string()))
     }

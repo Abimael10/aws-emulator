@@ -191,53 +191,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .auto_enable_organization_members
             .clone()
             .unwrap_or_else(|| crate::state::DEFAULT_AUTO_ENABLE_ORGANIZATION_MEMBERS.to_string());
+        let auto_enable_all = auto_enable_organization_members == crate::state::AUTO_ENABLE_ALL;
 
-        if let Some(configuration) = state.automated_discovery.get_mut(&region) {
-            let settings_changed =
-                configuration.auto_enable_organization_members != auto_enable_organization_members;
-            let status_changed = configuration.status != status;
-            if status_changed {
-                configuration.status = status;
-                if enabled {
-                    // `firstEnabledAt` records when automated sensitive data
-                    // discovery was INITIALLY enabled, so a later re-enable
-                    // leaves it alone; `disabledAt` is null while it runs.
-                    configuration.first_enabled_at.get_or_insert(now);
-                    configuration.disabled_at = None;
-                } else {
-                    configuration.disabled_at = Some(now);
-                }
-            }
-            configuration.auto_enable_organization_members = auto_enable_organization_members;
-            // `lastUpdatedAt` records when the settings or the status most
-            // recently CHANGED, so a call asking for the configuration the
-            // account already has does not move it.
-            if status_changed || settings_changed {
-                configuration.last_updated_at = now;
-            }
-        } else {
-            // The first call that configures automated sensitive data
-            // discovery for this region also materialises the classification
-            // scope and the sensitivity inspection template its analyses use,
-            // whose identifiers a read reports.
-            let classification_scope_seed = state.next_id_seed();
-            let sensitivity_inspection_template_seed = state.next_id_seed();
-            let configuration = crate::state::AutomatedDiscoveryConfiguration {
-                status,
-                auto_enable_organization_members,
-                classification_scope_id: crate::state::new_resource_id(
-                    classification_scope_seed,
-                    now,
-                ),
-                sensitivity_inspection_template_id: crate::state::new_resource_id(
-                    sensitivity_inspection_template_seed,
-                    now,
-                ),
-                first_enabled_at: enabled.then_some(now),
-                disabled_at: (!enabled).then_some(now),
-                last_updated_at: now,
-            };
-            state.automated_discovery.insert(region, configuration);
+        // The status this call states is the status of automated sensitive data
+        // discovery for the administrator's own account too, so it is written
+        // through the ONE writer of that fact.
+        state.configure_automated_discovery(
+            &region,
+            status,
+            auto_enable_organization_members,
+            now,
+        );
+
+        // Under `ALL` the configuration this call leaves in place auto-enables
+        // automated sensitive data discovery for the accounts this
+        // administrator administers: "ALL (default), enable it for all existing
+        // accounts and new member accounts". Under `NEW` or `NONE` the existing
+        // accounts are left exactly as they are — "automated sensitive data
+        // discovery continues to be enabled for any existing accounts that it's
+        // currently enabled for" — and a batch update is what changes one of
+        // them.
+        if enabled && auto_enable_all {
+            state.auto_enable_automated_discovery_for_existing_accounts(&region, now);
         }
 
         // `UpdateAutomatedDiscoveryConfigurationResponse` models no members:
