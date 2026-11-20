@@ -19,6 +19,13 @@
 //!
 //! The rows differ along what the recipients of the one send do with it — a failure and a
 //! delivery — which is what decides which email events the pipeline carries.
+//!
+//! The second table carries the same rule one step narrower, the way a client that reacts to
+//! ONE email event wires it: the rule's own pattern names that event's `detail-type`, so the
+//! function is invoked with exactly the event of that type the send produced and with no other
+//! event of the same send. Its rows are the recorded case — the report a recipient of the
+//! mailbox simulator makes — under a destination publishing just that event type and under one
+//! publishing every value of `EventType` onto the same bus.
 
 use std::io::Write as _;
 use std::sync::Arc;
@@ -26,6 +33,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine as _;
 use serde_json::{json, Value};
+
+use crate::event_bridge_event_destination_delivery::{
+    assert_event, Expected, BOUNCING, COMPLAINING, EVERY_EVENT_TYPE, SES_EVENT_SOURCE, SUCCESS,
+};
 use service_com_amazonaws_sesv2_simpleemailservice_v2::state::ComAmazonawsSesv2SimpleemailserviceV2State;
 use service_com_amazonaws_sesv2_simpleemailservice_v2::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -37,13 +48,15 @@ const REGION: &str = "us-east-1";
 const SENDER: &str = "sender@senders.example.com";
 const SENDER_DOMAIN: &str = "senders.example.com";
 
-/// The `source` Amazon SES publishes a configuration set's email events under, which is what
-/// the rule matches on.
-const SES_EVENT_SOURCE: &str = "aws.ses";
+/// The event types the destination of a row of the FIRST table matches: the acceptance of a
+/// message and the two reactions those rows' recipients produce.
+const MATCHED_EVENT_TYPES: &[&str] = &["SEND", "DELIVERY", "BOUNCE"];
 
-/// The mailbox-simulator addresses the rows send to.
-const SUCCESS: &str = "success@simulator.amazonses.com";
-const BOUNCING: &str = "bounce@simulator.amazonses.com";
+/// How many further reads confirm that what the relay queue holds has settled, for a rule
+/// naming ONE detail-type: an event of any other type the same destination published must
+/// never reach the function. Each pass reads the queue again and yields to the runtime;
+/// nothing here waits for a span.
+const SETTLED_READS: usize = 64;
 
 /// The principal EventBridge invokes a resource-policy-governed target as, and the action
 /// such an invocation performs.
@@ -56,7 +69,8 @@ const HANDLER: &str = "lambda_function.lambda_handler";
 /// How long each observation of work the clock owes — the function becoming `Active`, the
 /// publication, the delivery and the handler's own relay — waits before giving up, and how
 /// long between two looks. The deadline is generous: what is under test is that the work
-/// happens at all, never how fast this host gets to it.
+/// happens at all, never how fast this host gets to it, and nothing waits for the deadline —
+/// each loop stops as soon as what it waits for is there.
 const BUDGET: Duration = Duration::from_secs(120);
 const LOOK_AGAIN: Duration = Duration::from_millis(25);
 
@@ -82,15 +96,7 @@ def lambda_handler(event, context):
     return {"relayed": event["detail-type"]}
 "#;
 
-/// One event a row expects to be relayed: its `detail-type` and the `eventType` its detail
-/// is of.
-#[derive(Clone, Copy)]
-struct Relayed {
-    detail_type: &'static str,
-    event_type: &'static str,
-}
-
-/// One row of the table.
+/// One row of the first table.
 struct Row {
     case: &'static str,
     /// The configuration set the row creates and sends through.
@@ -98,7 +104,7 @@ struct Row {
     /// The one recipient of the send.
     recipient: &'static str,
     /// The events the handler must be invoked with, and nothing besides.
-    expected: &'static [Relayed],
+    expected: &'static [Expected],
 }
 
 const ROWS: &[Row] = &[
@@ -107,13 +113,17 @@ const ROWS: &[Row] = &[
         set: "relay-bounce-set",
         recipient: BOUNCING,
         expected: &[
-            Relayed {
+            Expected {
                 detail_type: "Email Sent",
                 event_type: "Send",
+                addresses: &[BOUNCING],
+                bounce: None,
             },
-            Relayed {
+            Expected {
                 detail_type: "Email Bounced",
                 event_type: "Bounce",
+                addresses: &[BOUNCING],
+                bounce: Some(("Permanent", "General")),
             },
         ],
     },
@@ -122,13 +132,17 @@ const ROWS: &[Row] = &[
         set: "relay-delivery-set",
         recipient: SUCCESS,
         expected: &[
-            Relayed {
+            Expected {
                 detail_type: "Email Sent",
                 event_type: "Send",
+                addresses: &[SUCCESS],
+                bounce: None,
             },
-            Relayed {
+            Expected {
                 detail_type: "Email Delivered",
                 event_type: "Delivery",
+                addresses: &[SUCCESS],
+                bounce: None,
             },
         ],
     },
@@ -316,8 +330,8 @@ impl Emulator {
     }
 
     /// A configuration set whose one event destination publishes the events of this send onto
-    /// the account's default bus.
-    async fn given_destination(&self, case: &str, set: &str) {
+    /// the account's default bus, for the event types `matching` names.
+    async fn given_destination(&self, case: &str, set: &str, matching: &[&str]) {
         self.ses(
             case,
             "POST",
@@ -333,7 +347,7 @@ impl Emulator {
                 "EventDestinationName": "relay-bus",
                 "EventDestination": {
                     "Enabled": true,
-                    "MatchingEventTypes": ["SEND", "DELIVERY", "BOUNCE"],
+                    "MatchingEventTypes": matching,
                     "EventBridgeDestination": {"EventBusArn": default_bus_arn()},
                 },
             })),
@@ -480,15 +494,15 @@ impl Emulator {
         );
     }
 
-    /// A rule of the default bus matching this service's event source, with `function_arn` as
-    /// its one target.
-    async fn given_rule(&self, case: &str, name: &str, function_arn: &str) {
+    /// A rule of the default bus whose `EventPattern` is `pattern`, with `function_arn` as its
+    /// one target.
+    async fn given_rule(&self, case: &str, name: &str, pattern: &Value, function_arn: &str) {
         self.events(
             case,
             "PutRule",
             &json!({
                 "Name": name,
-                "EventPattern": json!({"source": [SES_EVENT_SOURCE]}).to_string(),
+                "EventPattern": pattern.to_string(),
                 "State": "ENABLED",
             }),
         )
@@ -536,7 +550,11 @@ impl Emulator {
         message_id
     }
 
-    /// Every envelope waiting on the relay queue right now.
+    /// Every envelope waiting on the relay queue right now, each DELETED as it is read.
+    ///
+    /// A message a client has read and acted on is deleted — otherwise the queue hands it back
+    /// once its visibility timeout runs out, and a later read of the same queue cannot tell a
+    /// redelivery of what was already observed from a fresh invocation of the function.
     async fn relayed(&self, case: &str, url: &str) -> Vec<Value> {
         let answered = self
             .sqs(
@@ -545,18 +563,25 @@ impl Emulator {
                 &json!({"QueueUrl": url, "MaxNumberOfMessages": 10}),
             )
             .await;
-        answered["Messages"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .iter()
-            .map(|message| {
-                let body = message["Body"].as_str().unwrap_or_default();
+        let messages = answered["Messages"].as_array().cloned().unwrap_or_default();
+        let mut envelopes = Vec::with_capacity(messages.len());
+        for message in &messages {
+            let body = message["Body"].as_str().unwrap_or_default();
+            envelopes.push(
                 serde_json::from_str::<Value>(body).unwrap_or_else(|error| {
                     panic!("case {case:?}: a relayed event is not JSON ({error}): {body:?}")
-                })
-            })
-            .collect()
+                }),
+            );
+            if let Some(handle) = message["ReceiptHandle"].as_str() {
+                self.sqs(
+                    case,
+                    "DeleteMessage",
+                    &json!({"QueueUrl": url, "ReceiptHandle": handle}),
+                )
+                .await;
+            }
+        }
+        envelopes
     }
 }
 
@@ -631,19 +656,19 @@ async fn an_email_events_rule_invokes_its_function_with_the_published_envelope()
     for row in ROWS {
         let case = row.case;
         let emulator = Emulator::new();
-        let (relay_url, relay_arn) = emulator.given_relay_queue(case, "ses-event-relay").await;
-        let role_arn = emulator
-            .given_execution_role(case, "ses-event-relay-role", &relay_arn)
-            .await;
-        let function_arn = emulator
-            .given_function(case, "ses-event-relay-fn", &role_arn, &relay_url)
-            .await;
-        emulator.given_invoke_grant(case, "ses-event-relay-fn").await;
-        emulator
-            .given_rule(case, "ses-events-relay-rule", &function_arn)
-            .await;
+        let relay_url = given_relay(
+            case,
+            &emulator,
+            &[(
+                "ses-events-relay-rule",
+                json!({"source": [SES_EVENT_SOURCE]}),
+            )],
+        )
+        .await;
         emulator.given_verified_sender(case).await;
-        emulator.given_destination(case, row.set).await;
+        emulator
+            .given_destination(case, row.set, MATCHED_EVENT_TYPES)
+            .await;
 
         let message_id = emulator.send(case, row.set, row.recipient).await;
         let held = drained(&emulator, case, &relay_url, row.expected.len()).await;
@@ -663,25 +688,169 @@ async fn an_email_events_rule_invokes_its_function_with_the_published_envelope()
                         expected.detail_type
                     )
                 });
-            assert_eq!(
-                envelope["source"],
-                json!(SES_EVENT_SOURCE),
-                "case {case:?}: expected source {SES_EVENT_SOURCE:?}, got {:?}",
-                envelope["source"]
-            );
-            assert_eq!(
-                envelope["detail"]["eventType"],
-                json!(expected.event_type),
-                "case {case:?}: expected detail.eventType {:?}, got {:?}",
-                expected.event_type,
-                envelope["detail"]["eventType"]
-            );
-            assert_eq!(
-                envelope["detail"]["mail"]["messageId"],
-                json!(message_id),
-                "case {case:?}: expected detail.mail.messageId {message_id:?}, got {:?}",
-                envelope["detail"]["mail"]["messageId"]
-            );
+            // The whole envelope, as the handler was handed it — the same reading of a
+            // published email event every other suite of this pipeline makes.
+            assert_event(case, expected, envelope, row.set, &message_id);
         }
+    }
+}
+
+/// One row of the second table: the send it makes, the event types its destination publishes,
+/// and the one event the rule names by that event's own `detail-type` — which is the one
+/// envelope the function has to be invoked with.
+struct Selected {
+    case: &'static str,
+    /// The configuration set the row creates and sends through.
+    set: &'static str,
+    /// The event types the row's event destination matches, as the definition names them: the
+    /// row's own event alone, or every value of `EventType`.
+    matching: &'static [&'static str],
+    /// The one recipient of the send, whose reaction produces the row's event.
+    recipient: &'static str,
+    /// The event the rule selects: its documented `detail-type`, the `eventType` its detail is
+    /// of, and the addresses that detail itself names.
+    expected: Expected,
+}
+
+const SELECTED_ROWS: &[Selected] = &[
+    Selected {
+        case: "a destination publishing just the report",
+        set: "complaint-relay-set",
+        matching: &["COMPLAINT"],
+        recipient: COMPLAINING,
+        expected: Expected {
+            detail_type: "Email Complaint Received",
+            event_type: "Complaint",
+            addresses: &[COMPLAINING],
+            bounce: None,
+        },
+    },
+    Selected {
+        case: "a destination publishing every event type onto the same bus",
+        set: "complaint-every-type-relay-set",
+        matching: EVERY_EVENT_TYPE,
+        recipient: COMPLAINING,
+        expected: Expected {
+            detail_type: "Email Complaint Received",
+            event_type: "Complaint",
+            addresses: &[COMPLAINING],
+            bounce: None,
+        },
+    },
+];
+
+/// The rule both rows read their event off: the one rule of the bus, naming the report's own
+/// documented `detail-type`.
+const SELECTING_RULE: &str = "complaint-relay-rule";
+
+/// Assert that `held` is the ONE envelope `expected` describes, relayed by the function the
+/// rule targets for the send that minted `message_id` through `set`.
+fn assert_relayed(
+    case: &str,
+    expected: &Expected,
+    held: &[Value],
+    set: &str,
+    message_id: &str,
+    recipient: &str,
+) {
+    assert_eq!(
+        held.len(),
+        1,
+        "case {case:?}: expected the function to be invoked with exactly the {:?} event, got \
+         {held:?}",
+        expected.detail_type
+    );
+    // The whole envelope, as the handler was handed it: this service's source, the documented
+    // detail-type, and the notification document the email event is of.
+    assert_event(case, expected, &held[0], set, message_id);
+    let destination = held[0]["detail"]["mail"]["destination"].clone();
+    assert_eq!(
+        destination,
+        json!([recipient]),
+        "case {case:?}: expected the relayed event's mail.destination to name {recipient:?}, got \
+         {destination:?}"
+    );
+}
+
+/// Assert that the relay queue has settled: the function was invoked with nothing beyond
+/// `held`. Each pass reads the queue again and yields to the runtime — nothing waits for a
+/// span, and the loop makes no claim about how fast this host runs.
+async fn assert_settled(emulator: &Emulator, case: &str, url: &str, held: &[Value]) {
+    for _ in 0..SETTLED_READS {
+        ::tokio::task::yield_now().await;
+        let again = emulator.relayed(case, url).await;
+        assert!(
+            again.is_empty(),
+            "case {case:?}: the rule's function was invoked again, with {again:?} on top of \
+             {held:?}"
+        );
+    }
+}
+
+/// The relay a case drives: ONE emulator carrying the queue the handler forwards onto, the
+/// execution role, the relay function, EventBridge's grant to invoke it, and one rule per
+/// entry of `rules` — `(the rule's name, its `EventPattern`)`. Answers the queue's url.
+///
+/// One function serves however many rules a case installs, so a case that spans several email
+/// events deploys one relay rather than one per event.
+async fn given_relay(case: &str, emulator: &Emulator, rules: &[(&str, Value)]) -> String {
+    let (relay_url, relay_arn) = emulator.given_relay_queue(case, "ses-event-relay").await;
+    let role_arn = emulator
+        .given_execution_role(case, "ses-event-relay-role", &relay_arn)
+        .await;
+    let function_arn = emulator
+        .given_function(case, "ses-event-relay-fn", &role_arn, &relay_url)
+        .await;
+    emulator.given_invoke_grant(case, "ses-event-relay-fn").await;
+    for (name, pattern) in rules {
+        emulator
+            .given_rule(case, name, pattern, &function_arn)
+            .await;
+    }
+    relay_url
+}
+
+/// The `EventPattern` of a rule over ONE email event: this service's source and that event's
+/// own documented `detail-type`.
+fn one_email_event(detail_type: &str) -> Value {
+    json!({"source": [SES_EVENT_SOURCE], "detail-type": [detail_type]})
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rule_naming_one_email_event_invokes_its_function_with_that_envelope() {
+    for row in SELECTED_ROWS {
+        let case = row.case;
+        // An emulator of its own per row: a report puts the recipient on the account's
+        // suppression list, so a second send to the same address under the same account is
+        // answered from that list instead of by the mailbox that reports it.
+        let emulator = Emulator::new();
+        let relay_url = given_relay(
+            case,
+            &emulator,
+            &[(
+                SELECTING_RULE,
+                one_email_event(row.expected.detail_type),
+            )],
+        )
+        .await;
+        emulator.given_verified_sender(case).await;
+        emulator
+            .given_destination(case, row.set, row.matching)
+            .await;
+
+        let message_id = emulator.send(case, row.set, row.recipient).await;
+        let held = drained(&emulator, case, &relay_url, 1).await;
+        assert_relayed(
+            case,
+            &row.expected,
+            &held,
+            row.set,
+            &message_id,
+            row.recipient,
+        );
+        // The rule names one detail-type, so no other event of the same send reaches the
+        // function — the acceptance and the delivery a destination matching every event type
+        // publishes onto this very bus included.
+        assert_settled(&emulator, case, &relay_url, &held).await;
     }
 }
