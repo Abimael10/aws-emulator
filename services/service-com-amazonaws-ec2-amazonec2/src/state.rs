@@ -1687,6 +1687,18 @@
 //! [`ComAmazonawsEc2Amazonec2State::capacity_manager_at`], so the operation that reports
 //! the settings and the operations that change them cannot disagree.
 //!
+//! The cross-account aggregation flag turns on a fact of the ORGANIZATION, which is not this
+//! service's resource: `UpdateCapacityManagerOrganizationsAccess` asks the service that owns
+//! one whether this account is in an organization at all
+//! ([`capacity_manager_organization::account_is_in_an_organization`], over the emulator's
+//! in-process callback) and refuses an account that is not
+//! ([`capacity_manager_organization_trusted_access_disabled`]) rather than recording an
+//! aggregation nothing could perform; a narrowing that has nothing to turn off is refused too
+//! ([`capacity_manager_organizations_access_not_enabled`]). The flag itself is written on its
+//! own through
+//! [`ComAmazonawsEc2Amazonec2State::set_capacity_manager_organizations_access`], which leaves
+//! the status and the ingestion where they are.
+//!
 //! The INGESTION an enable starts is a clock-owed move rather than a stored word: "this
 //! starts data ingestion for your EC2 capacity usage" and "initial data processing may
 //! take several hours to complete" (`EnableCapacityManager`), so the enable records when
@@ -2764,6 +2776,14 @@ pub use capacity_manager_metrics::*;
 /// `crate::state::<name>`.
 pub mod capacity_manager_monitored_tags;
 pub use capacity_manager_monitored_tags::*;
+
+/// Whether the account can reach EC2 Capacity Manager through AWS Organizations: the question
+/// `UpdateCapacityManagerOrganizationsAccess` puts to the service that OWNS the organization,
+/// rather than a flag this store keeps. A SUBMODULE for the same reason
+/// [`acm_certificates`] is one, and `pub use` keeps every name reachable as
+/// `crate::state::<name>`.
+pub mod capacity_manager_organization;
+pub use capacity_manager_organization::*;
 
 // ---------------------------------------------------------------------------
 // Managed resource visibility (the account-wide setting)

@@ -725,6 +725,25 @@ impl ComAmazonawsEc2Amazonec2State {
         self.capacity_manager.view_at(now)
     }
 
+    /// Set the account's `OrganizationsAccess` — the scope Capacity Manager aggregates data
+    /// over — and answer the settings as they now stand as of `now`.
+    ///
+    /// The one writer of that flag on its own, leaving the status and the ingestion an
+    /// earlier enable started exactly where they are: changing the scope of the aggregation
+    /// neither turns Capacity Manager on nor restarts its ingestion.
+    ///
+    /// Whether the account MAY aggregate across its organization is not a fact of this store
+    /// ([`account_is_in_an_organization`] asks the component that owns it); this writes what
+    /// it is given, so one flag is written in one place.
+    pub fn set_capacity_manager_organizations_access(
+        &mut self,
+        organizations_access: bool,
+        now: Instant,
+    ) -> CapacityManagerView {
+        self.capacity_manager.organizations_access = organizations_access;
+        self.capacity_manager.view_at(now)
+    }
+
     /// Turn Capacity Manager OFF for the account, and answer the settings as they now stand
     /// as of `now`.
     ///
@@ -771,6 +790,46 @@ pub fn capacity_manager_disabled<E>() -> Scaffolded<E> {
         400,
         "Capacity Manager isn't enabled for this account.",
     )
+}
+
+/// `CapacityManager.OrganizationTrustedAccessDisabled` (HTTP 400): the account's organization
+/// has no trusted access for Capacity Manager, so there is no organization for it to aggregate
+/// data over.
+///
+/// EC2's own code for that condition, in the same `<Feature>.<Condition>` form as
+/// [`CAPACITY_MANAGER_DISABLED_ERROR`]: the recorded contract for
+/// `UpdateCapacityManagerOrganizationsAccess` answers it for a request asking for cross-account
+/// aggregation from an account that cannot reach Capacity Manager through Organizations
+/// ([`account_is_in_an_organization`] is where this crate reads that from).
+pub const CAPACITY_MANAGER_ORGANIZATION_TRUSTED_ACCESS_DISABLED_ERROR: &str =
+    "CapacityManager.OrganizationTrustedAccessDisabled";
+
+/// Refuse a request asking Capacity Manager to aggregate across the organization while the
+/// organization has no trusted access for it: HTTP 400
+/// [`CAPACITY_MANAGER_ORGANIZATION_TRUSTED_ACCESS_DISABLED_ERROR`].
+///
+/// One place the sentence is worded, so every operation that has to report that condition
+/// reports it the same way.
+pub fn capacity_manager_organization_trusted_access_disabled<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        CAPACITY_MANAGER_ORGANIZATION_TRUSTED_ACCESS_DISABLED_ERROR,
+        400,
+        "This account can't access Capacity Manager with AWS Organizations. Enable trusted \
+         access or use account mode.",
+    )
+}
+
+/// Refuse a request that asks Capacity Manager to stop aggregating across the organization
+/// while the account is not aggregating across it at all: HTTP 400 `InvalidParameterValue`,
+/// the code EC2 answers for a parameter value it cannot act on.
+///
+/// There is nothing to turn off, so the value the request named is not one the account can be
+/// moved to — the same reading `DisableCapacityManager` gives a disable of an account that
+/// never enabled Capacity Manager ([`capacity_manager_disabled`]). The sentence is EC2's own
+/// for this condition, in the wording its recorded refusal of
+/// `UpdateCapacityManagerOrganizationsAccess` carries, and echoes no part of the request.
+pub fn capacity_manager_organizations_access_not_enabled<E>() -> Scaffolded<E> {
+    invalid_parameter_value("Capacity Manager doesn't have organizations access enabled.")
 }
 
 // ---------------------------------------------------------------------------

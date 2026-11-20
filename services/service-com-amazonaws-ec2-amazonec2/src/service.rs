@@ -126,6 +126,11 @@ pub mod audited_documents;
 /// it rather than of any one operation.
 pub mod management_events;
 
+/// The `@required` BOOLEAN members of this model and the refusal a request that names no value
+/// for one already gets from the framework's own reader — the rule the handlers that read such
+/// a member rest on, pinned here rather than restated as a second refusal of this front door.
+pub mod required_boolean_parameters;
+
 /// How this front door words the refusals the FRAMEWORK gives for the rules the MODEL declares
 /// — an absent `@required` member, a value outside a declared catalog or `@range` — in EC2's
 /// own vocabulary: the choice [`Service::override_refusal`] makes, and the input shape it is

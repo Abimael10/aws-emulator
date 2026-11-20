@@ -1,15 +1,37 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCapacityManagerOrganizationsAccess
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCapacityManagerOrganizationsAccess`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCapacityManagerOrganizationsAccess::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! MUTATING, as the spec says: this operation "updates the Organizations access setting for
+//! EC2 Capacity Manager", so it writes the account's `OrganizationsAccess` through
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::set_capacity_manager_organizations_access`]
+//! and answers "the current status of Capacity Manager after the update operation"
+//! (`UpdateCapacityManagerOrganizationsAccessResult$CapacityManagerStatus`) together with
+//! that flag, both read back out of the store. Only the flag moves: the update neither turns
+//! Capacity Manager on nor restarts the ingestion an enable started.
+//!
+//! The update must have SOMETHING to change, and which of the two scopes the request asks for
+//! decides what that is:
+//!
+//! * asking for cross-account aggregation — the setting "controls whether Capacity Manager can
+//!   aggregate data from all accounts in your Amazon Web Services Organization" — is a
+//!   statement about an ORGANIZATION, which is not EC2's resource, so it is asked of the
+//!   service that owns one ([`crate::state::account_is_in_an_organization`], over the
+//!   emulator's in-process callback): an account that cannot reach Capacity Manager through
+//!   Organizations is refused `CapacityManager.OrganizationTrustedAccessDisabled`
+//!   ([`crate::state::capacity_manager_organization_trusted_access_disabled`]) rather than
+//!   answered with a scope nothing could aggregate across;
+//! * asking to aggregate "only from the current account" while the account is not aggregating
+//!   across the organization leaves nothing to turn off, so it is refused
+//!   `InvalidParameterValue`
+//!   ([`crate::state::capacity_manager_organizations_access_not_enabled`]) — the reading
+//!   `DisableCapacityManager` gives a disable of an account that never enabled Capacity
+//!   Manager.
+//!
+//! `OrganizationsAccess` is `@required`, so a request that names no value for it is refused
+//! `MissingParameter` by the framework's own reader before this handler runs, worded for the
+//! member's surface ([`crate::service::required_boolean_parameters`] pins that rule): a boolean
+//! is the one member type whose absence a handler could not otherwise tell from `false`.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +164,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCapacityManagerOrganizationsAccess` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCapacityManagerOrganizationsAccessErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCapacityManagerOrganizationsAccess"))
+        use crate::state;
+        use std::time::Instant;
+
+        // `ctx` carries request metadata only, and this operation reads none of it: the
+        // Organizations access setting is a fact of the account — one of the settings
+        // `EnableCapacityManager` records, whose docs name no Region — rather than of the
+        // Region the request was signed for.
+        let _ = ctx;
+
+        // "Unique, case-sensitive identifier that you provide to ensure the idempotency of
+        // the request" (`UpdateCapacityManagerOrganizationsAccessRequest$ClientToken`), held
+        // to the published constraint every client token of this crate is held to
+        // ([`state::MAX_CLIENT_TOKEN_CHARS`]). Nothing is stored for it, and nothing needs to
+        // be: this update mints no resource, so a token names no result to replay — the answer
+        // a repeat gets is decided by the settings the account holds when it arrives, like any
+        // other request's — and no caller-chosen bytes are added to the store.
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "clientToken accepts at most {} characters",
+                state::MAX_CLIENT_TOKEN_CHARS
+            )));
+        }
+
+        // "Specifies whether to enable or disable cross-account access for Amazon Web
+        // Services Organizations. When enabled, Capacity Manager aggregates data from all
+        // accounts in your organization"
+        // (`UpdateCapacityManagerOrganizationsAccessRequest$OrganizationsAccess`) is the one
+        // thing this operation is asked to set, and it is `@required`. A request that names no
+        // value for it never reaches here: the framework's own reader refuses an absent
+        // required member before any handler runs, and this service words that refusal as
+        // EC2's `MissingParameter` for the member's surface
+        // ([`crate::service::required_boolean_parameters`], which pins that rule — a boolean
+        // is the one member type whose absence a handler could not otherwise tell from
+        // `false`). So this is the scope the REQUEST named.
+        let organizations_access = input.organizations_access;
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE the write: the
+        // flag asks whether the request WOULD have worked, so one that would have succeeded
+        // leaves the settings untouched. "If you have the required permissions, the error
+        // response is DryRunOperation"
+        // (`UpdateCapacityManagerOrganizationsAccessRequest$DryRun`).
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        let store = state::require_service_state(&*self.engine)?;
+
+        // "Updates the Organizations access setting for EC2 Capacity Manager. This controls
+        // whether Capacity Manager can aggregate data from all accounts in your Amazon Web
+        // Services Organization or only from the current account"
+        // (`UpdateCapacityManagerOrganizationsAccess`): asking for the organization's scope is
+        // a statement about an ORGANIZATION, which is not EC2's resource. So it is asked of
+        // the service that owns it ([`state::account_is_in_an_organization`]) — before the
+        // store is touched, since that hop awaits — and an account that cannot reach Capacity
+        // Manager through Organizations is refused rather than recorded with a scope nothing
+        // could aggregate across.
+        if organizations_access && !state::account_is_in_an_organization(ctx).await {
+            return Err(state::capacity_manager_organization_trusted_access_disabled());
+        }
+
+        let mut store = store.lock();
+        let now = Instant::now();
+
+        // Asking to aggregate "only from the current account" while the account is not
+        // aggregating across its organization leaves nothing to turn off, so EC2 refuses the
+        // value rather than reporting a change it did not make — the reading
+        // `DisableCapacityManager` gives a disable of an account that never enabled Capacity
+        // Manager.
+        if !organizations_access && !store.capacity_manager_at(now).organizations_access {
+            return Err(state::capacity_manager_organizations_access_not_enabled());
+        }
+
+        // Answer the settings read back OUT of the store, so the caller sees what a later
+        // `GetCapacityManagerAttributes` will see rather than what the request asked for.
+        let settings = store.set_capacity_manager_organizations_access(organizations_access, now);
+        Ok(UpdateCapacityManagerOrganizationsAccessOutput {
+            capacity_manager_status: Some(settings.status.to_string()),
+            organizations_access: Some(settings.organizations_access),
+        })
     }
 }
