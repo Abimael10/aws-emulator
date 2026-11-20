@@ -238,7 +238,7 @@ pub fn schema_of(call: &Call) -> Option<&'static ResultSchema> {
     // A job's final description, a task reply's payload, a function's own response and
     // an endpoint's answer are each the result of something other than the call's
     // operation, so none of them is that operation's output document.
-    if call.job.is_some() || call.callback || call.invokes.is_some() || call.endpoint {
+    if call.job.is_some() || call.callback || call.invokes.is_some() || call.endpoint.is_some() {
         return None;
     }
     RESULT_SCHEMAS

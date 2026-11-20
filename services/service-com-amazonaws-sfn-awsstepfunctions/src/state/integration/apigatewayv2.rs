@@ -29,10 +29,10 @@ use super::*;
 /// `services/service-com-amazonaws-apigatewayv2-apigatewayv2/smithy-model/
 /// com-amazonaws-apigatewayv2-apigatewayv2.json`
 /// (`smithy_query(query="service_info")`): restJson1, sigv4Name `apigateway`,
-/// endpointPrefix `apigateway`, arnNamespace `apigateway`, sdkId `ApiGatewayV2` — the one
-/// entry whose signing name and endpoint are NOT its SDK id, the two API Gateway control
-/// planes answering on one endpoint and being told apart by their paths (this one's are
-/// bound under `/v2/…`).
+/// endpointPrefix `apigateway`, arnNamespace `apigateway` ([`APIGATEWAY_NAMESPACE`]), sdkId
+/// `ApiGatewayV2` — the one entry whose signing name and endpoint are NOT its SDK id, the
+/// two API Gateway control planes answering on one endpoint and being told apart by their
+/// paths (this one's are bound under `/v2/…`).
 pub(super) static APIGATEWAYV2_API: Api = Api {
     namespace: APIGATEWAY_NAMESPACE,
     action_prefix: None,
@@ -61,10 +61,6 @@ pub(super) static APIGATEWAYV2_API: Api = Api {
     member_case: MemberCase::LowerCamel,
     query_compatible: false,
 };
-
-/// The ARN namespace, signing name and endpoint prefix of the API Gateway control planes,
-/// which this service answers on beside the earlier one.
-pub(super) const APIGATEWAY_NAMESPACE: &str = "apigateway";
 
 /// The operation that lists an account's apis, as that model spells it.
 pub(super) const GET_APIS_OPERATION: &str = "GetApis";

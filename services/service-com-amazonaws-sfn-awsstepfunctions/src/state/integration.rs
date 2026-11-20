@@ -96,6 +96,13 @@
 //! class out of the document the run produced and that document as its cause
 //! ([`function_error`]).
 //!
+//! ## The API Gateway invoke
+//!
+//! `arn:aws:states:::apigateway:invoke` names no operation of a service's API either:
+//! the unit of work is one HTTP request to a DEPLOYED API STAGE, which the state's own
+//! parameters address and describe, so it is read and made by the module that owns that
+//! reading ([`api_gateway`]) over this same in-process transport.
+//!
 //! ## The run-a-job (`.sync`) pattern
 //!
 //! A `Resource` ending in `.sync` (or `.sync:2`) asks for the run-a-job pattern:
@@ -309,6 +316,15 @@ const SQS_NAMESPACE: &str = "sqs";
 /// (`awsService.arnNamespace`).
 const SNS_NAMESPACE: &str = "sns";
 
+/// The ARN namespace, signing name and endpoint prefix of the API Gateway control planes,
+/// which both of them answer on and are told apart by their paths.
+///
+/// It is the token the OPTIMIZED family names the API Gateway invoke integration by
+/// ([`api_gateway`]), and the namespace the entries of both planes carry
+/// ([`apigatewayv2::APIGATEWAYV2_API`]), so it is stated once here for every module that
+/// reads it.
+const APIGATEWAY_NAMESPACE: &str = "apigateway";
+
 /// The `<namespace>:<action>` the optimized family names the publish to a topic by,
 /// which is the key its [`TARGET_RESOURCES`] and [`FORM_MAPS`] entries are carried
 /// under.
@@ -344,6 +360,23 @@ const MAX_NAME_BYTES: usize = 80;
 /// The header an AWS JSON service names its error shape in, beside the `__type`
 /// member of the body.
 const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
+
+/// The first value `headers` carries `name` under, compared without regard to case as
+/// HTTP field names are (RFC 9110); `None` for an answer that carried none.
+///
+/// `pub(crate)` and stated once here, because BOTH kinds of answer this crate reads a
+/// header off hold their headers as the pairs the wire carried — the answer of an
+/// integration call ([`Answered`]) and the answer of a request to an endpoint
+/// ([`super::http_task`]) — and one comparison serves both.
+pub(crate) fn carried_header<'a>(
+    headers: &'a [(String, String)],
+    name: &str,
+) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(carried, _)| carried.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
 
 /// The header an AWS JSON client names the operation it calls in
 /// (`<target prefix>.<OperationName>`).
@@ -1189,7 +1222,7 @@ pub fn dataset_call(operation: &str) -> Option<Call> {
         epoch_millis: &[],
         targets: None,
         invokes: None,
-        endpoint: false,
+        endpoint: None,
         // The caller hands this call the object's own BYTES, already rendered: the
         // dataset this writes is the text that writer built ([`super::result_writer`]),
         // not a value out of a state's document.
@@ -1280,24 +1313,40 @@ pub struct Call {
     /// CLIENT wrote ([`aws_sdk_call`]), where a payload member is written as the text
     /// of the bytes it carries.
     pub payload_document: bool,
-    /// Whether the work is an HTTP REQUEST the state's own parameters describe rather
-    /// than an API call to an operation of a service ([`super::http_task`]).
+    /// Which of the two integrations whose work is a REQUEST TO AN ENDPOINT the state's
+    /// own parameters describe this call is, rather than an API call to an operation of a
+    /// service ([`EndpointTask`]); `None` for every call on an operation.
     ///
-    /// True for exactly one `Resource`, Step Functions' own HTTP Task
-    /// (`arn:aws:states:::http:invoke`): its endpoint, method, headers, query and body
-    /// are the task's parameters and its result is that endpoint's own response, so
-    /// NONE of the wire facts an [`Api`] states is read for it — no operation's input
-    /// is built ([`wired`]), no response document is read as an operation's output
+    /// For such a call NONE of the wire facts an [`Api`] states is read — no operation's
+    /// input is built ([`wired`]), no response document is read as an operation's output
     /// ([`answer_of`]) and no [`TARGET_RESOURCES`] entry names a resource it acts on.
-    /// The entry it carries is this service's own, because `http:invoke` is Step
-    /// Functions' own integration, served by Step Functions.
     ///
     /// The endpoint such a call names comes from a caller's own definition, and it stays
     /// INSIDE this process: the request is handed to the in-process transport every
     /// emulated service reaches another by, so nothing is resolved or dialled and an
     /// endpoint this emulator does not serve is answered by the front door's own refusal
     /// ([`super::http_task`], "Where the request goes").
-    pub endpoint: bool,
+    pub endpoint: Option<EndpointTask>,
+}
+
+/// The two `Resource` forms whose unit of work is one HTTP REQUEST to an endpoint the
+/// state's own parameters describe, rather than a call on an operation of a service's
+/// API ([`Call::endpoint`]).
+///
+/// Both are served over the in-process transport and report what the endpoint answered
+/// under the same four members ([`super::http_task`]); what differs is WHICH endpoint
+/// the parameters name, what authorization the request carries, and how a non-2xx answer
+/// is named to the state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointTask {
+    /// `arn:aws:states:::http:invoke`, Step Functions' own HTTP Task: the parameters
+    /// name the absolute URL of any endpoint and the request is authorized by an
+    /// EventBridge connection ([`super::http_task`]).
+    Http,
+    /// `arn:aws:states:::apigateway:invoke`, the optimized Amazon API Gateway
+    /// integration: the parameters name a deployed API STAGE and the request is signed
+    /// as the execution role where the parameters ask for it ([`api_gateway`]).
+    ApiGateway,
 }
 
 /// The member of `Invoke`'s input that names the function to invoke, which that
@@ -1446,8 +1495,11 @@ impl Call {
     /// it declines to make a SECOND time ([`super::asl`]).
     pub(crate) fn described(&self) -> String {
         match self.endpoint {
-            true => "the HTTP request this task makes".to_string(),
-            false => format!("the '{}' call of {}", self.operation, self.api.sdk_id),
+            Some(EndpointTask::Http) => "the HTTP request this task makes".to_string(),
+            Some(EndpointTask::ApiGateway) => {
+                "the API Gateway request this task makes".to_string()
+            }
+            None => format!("the '{}' call of {}", self.operation, self.api.sdk_id),
         }
     }
 
@@ -2720,6 +2772,15 @@ pub fn read(resource: &str) -> Result<Call, String> {
             "'{shown}' names no action of its service, so nothing was run for it"
         ));
     }
+    // The OPTIMIZED `apigateway:invoke` integration calls a deployed API STAGE rather
+    // than an operation of a service's API: the stage, the path, the method, the headers,
+    // the query and the body are the task's own parameters, so it is read there and none
+    // of the per-operation wire facts below is read for it ([`api_gateway`]). The AWS SDK
+    // family's token for the same service names that service's CONTROL plane instead, and
+    // is resolved with every other operation call below.
+    if !aws_sdk && service == APIGATEWAY_NAMESPACE {
+        return api_gateway::read_invoke(&shown, action, pattern);
+    }
     // Each family names the service by its OWN token: the optimized one by the
     // service's ARN namespace, the AWS SDK one by the name the SDKs give it
     // ([`Api::sdk_token`]), and two services are reached through the AWS SDK family
@@ -2821,7 +2882,7 @@ pub fn read(resource: &str) -> Result<Call, String> {
         // Only a `Resource` that names a function itself invokes one directly; this
         // one named an integration, whose request is the document the state built.
         invokes: None,
-        endpoint: false,
+        endpoint: None,
         // The request IS the document this state built, so its payload member carries
         // the text of the value that document holds for it.
         payload_document: true,
@@ -2970,7 +3031,7 @@ fn http_invoke(shown: &str, action: &str) -> Result<Call, String> {
         epoch_millis: &[],
         targets: None,
         invokes: None,
-        endpoint: true,
+        endpoint: Some(EndpointTask::Http),
         // No operation's input is built for this call at all ([`Call::endpoint`]), so
         // there is no payload member to put on the wire.
         payload_document: false,
@@ -3026,7 +3087,9 @@ fn direct_invocation(function: &str, shown: &str) -> Result<Call, String> {
             .iter()
             .find(|entry| entry.integration == LAMBDA_INVOKE_INTEGRATION),
         invokes: Some(function.to_string()),
-        endpoint: false,
+        // The work is Lambda's own `Invoke` operation, bound to that service's REST
+        // protocol above, rather than a request to an endpoint the parameters name.
+        endpoint: None,
         // The function's EVENT is the document this state built
         // ([`Call::operation_input`]), and the payload member carries that document's
         // own text.
@@ -3149,7 +3212,7 @@ fn pattern_call(api: &'static Api, family: Family, operation: &str) -> Call {
         epoch_millis: &[],
         targets: None,
         invokes: None,
-        endpoint: false,
+        endpoint: None,
         // Every such call is to an AWS JSON service, whose request body IS the
         // operation's input document: no payload member is bound for one.
         payload_document: false,
@@ -3659,7 +3722,7 @@ where
                 // carries is the emulated connection's own.
                 let made = async {
                     match handover.call.endpoint {
-                        true => {
+                        Some(EndpointTask::Http) => {
                             super::http_task::invoke(
                                 &callback,
                                 connections.as_ref(),
@@ -3667,7 +3730,19 @@ where
                             )
                             .await
                         }
-                        false => {
+                        // The API Gateway invoke goes over that same transport, to the
+                        // stage the parameters name, signed as the execution role where
+                        // the parameters ask for it ([`api_gateway`]).
+                        Some(EndpointTask::ApiGateway) => {
+                            api_gateway::invoke(
+                                &callback,
+                                &region,
+                                &handover.request,
+                                signing.as_ref(),
+                            )
+                            .await
+                        }
+                        None => {
                             call_api_as(
                                 &callback,
                                 &region,
@@ -4455,6 +4530,10 @@ mod apigatewayv2;
 
 /// Amazon RDS's own wire facts, reached through the AWS SDK integration family alone.
 mod rds;
+
+/// The optimized Amazon API Gateway integration: the `Task` state whose work is a
+/// request to a deployed API stage.
+mod api_gateway;
 
 /// The BODY of a call to a service whose protocol carries a payload member as an XML
 /// document.

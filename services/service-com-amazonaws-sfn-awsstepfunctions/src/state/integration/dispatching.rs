@@ -169,12 +169,10 @@ impl Answered {
     }
 
     /// The first value the answer carried `name` under, compared without regard to
-    /// case as HTTP field names are.
+    /// case as HTTP field names are, through this crate's one reading of a carried
+    /// header ([`carried_header`]).
     pub(super) fn header(&self, name: &str) -> Option<String> {
-        self.headers
-            .iter()
-            .find(|(carried, _)| carried.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.clone())
+        carried_header(&self.headers, name).map(str::to_string)
     }
 
     /// The LEGACY query code a query-compatible service named this refusal's class by,

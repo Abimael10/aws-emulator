@@ -371,7 +371,9 @@ impl Asked {
 /// drop the first. Names are compared without regard to case, as an HTTP field name is
 /// (RFC 9110); a query parameter's name is compared the same way the merge of a
 /// connection's parameters compares one.
-fn replacing(carried: &mut Vec<(String, String)>, incoming: &[(String, String)]) {
+///
+/// `pub(super)` for the reason [`required_text`] is.
+pub(super) fn replacing(carried: &mut Vec<(String, String)>, incoming: &[(String, String)]) {
     carried.retain(|(name, _)| {
         !incoming
             .iter()
@@ -383,7 +385,13 @@ fn replacing(carried: &mut Vec<(String, String)>, incoming: &[(String, String)])
 /// The text `document` names `member` with, or why the request cannot be made without
 /// it: these are the members that SAY the request, so one missing or written as
 /// something other than text leaves no request to make.
-fn required_text(document: &Value, member: &str) -> Result<String, Failed> {
+///
+/// `pub(super)`, with the four readings below it and the two halves of the call: the
+/// OPTIMIZED API Gateway integration is the other `Task` state whose work is a request
+/// to an endpoint its parameters describe
+/// ([`super::integration::api_gateway`]), and it reads its parameters, makes its request
+/// and reports its answer through these rather than through a second copy of them.
+pub(super) fn required_text(document: &Value, member: &str) -> Result<String, Failed> {
     match document.get(member) {
         Some(Value::String(text)) if !text.is_empty() => Ok(text.clone()),
         Some(Value::String(_)) | None => Err(unsent(format!(
@@ -404,7 +412,9 @@ fn required_text(document: &Value, member: &str) -> Result<String, Failed> {
 /// becomes one pair per element, in the order written. A value that is not text is
 /// carried as its own JSON text, which is how a URI component or a field value carries
 /// one. A member carrying something other than a map leaves no request to make.
-fn pairs(document: &Value, member: &str) -> Result<Vec<(String, String)>, Failed> {
+///
+/// `pub(super)` for the reason [`required_text`] is.
+pub(super) fn pairs(document: &Value, member: &str) -> Result<Vec<(String, String)>, Failed> {
     let carried = match document.get(member) {
         None | Some(Value::Null) => return Ok(Vec::new()),
         Some(Value::Object(members)) => members,
@@ -579,7 +589,9 @@ fn encoded(text: &str) -> String {
 /// A FRAGMENT is not part of the request-target a query is written into, so one the
 /// endpoint carries is split off before the parameters are appended and re-attached
 /// after them — otherwise a parameter would be written inside the fragment.
-fn with_query(endpoint: &str, parameters: &[(String, String)]) -> String {
+///
+/// `pub(super)` for the reason [`required_text`] is.
+pub(super) fn with_query(endpoint: &str, parameters: &[(String, String)]) -> String {
     if parameters.is_empty() {
         return endpoint.to_string();
     }
@@ -772,18 +784,31 @@ fn connection_named(arn: &str) -> Option<&str> {
 }
 
 /// What one request to an endpoint of this emulator came back with.
+///
+/// `pub(super)` for the reason [`required_text`] is.
 #[derive(Debug, Clone)]
-struct Answered {
+pub(super) struct Answered {
     /// The HTTP status the endpoint answered.
-    status: u16,
+    pub(super) status: u16,
     /// Every header of the answer, in the order it carried them.
-    headers: Vec<(String, String)>,
+    pub(super) headers: Vec<(String, String)>,
     /// Its body.
-    payload: Vec<u8>,
+    pub(super) payload: Vec<u8>,
+}
+
+impl Answered {
+    /// The first value the answer carried `name` under, through this crate's one reading
+    /// of a carried header ([`super::integration::carried_header`], which compares a
+    /// field name without regard to case as RFC 9110 does).
+    pub(super) fn header(&self, name: &str) -> Option<&str> {
+        super::integration::carried_header(&self.headers, name)
+    }
 }
 
 /// Hand `built` to the in-process transport and read what the endpoint answered.
-async fn dispatch(
+///
+/// `pub(super)` for the reason [`required_text`] is.
+pub(super) async fn dispatch(
     callback: &::smithy_server_runtime::EmbeddedEmulator,
     built: ::http::Request<Vec<u8>>,
 ) -> Result<Answered, Failed> {
@@ -856,7 +881,10 @@ async fn dispatch(
 /// in-process answer carries no reason line at all.
 ///
 /// Pure, so the shape of the result is pinned by this module's own tests.
-fn reported(answered: &Answered) -> Value {
+///
+/// `pub(super)` for the reason [`required_text`] is: an API Gateway invoke reports its
+/// answer under those very four members, so one rendering serves both.
+pub(super) fn reported(answered: &Answered) -> Value {
     let mut members = Map::new();
     let mut headers: Map<String, Value> = Map::new();
     for (name, value) in &answered.headers {
@@ -901,7 +929,9 @@ fn reported(answered: &Answered) -> Value {
 /// the one the parameters describe, which is its own gap rather than an endpoint
 /// refusing, so it carries the name the interpreter raises its own failures under and a
 /// cause that never claims the work happened.
-fn unsent(cause: String) -> Failed {
+///
+/// `pub(super)` for the reason [`required_text`] is.
+pub(super) fn unsent(cause: String) -> Failed {
     Failed {
         error: super::asl::RUNTIME_ERROR.to_string(),
         cause,
