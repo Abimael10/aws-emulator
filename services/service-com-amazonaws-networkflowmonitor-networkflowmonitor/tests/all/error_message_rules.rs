@@ -18,16 +18,29 @@
 //! envelope, the member path, the echoed value, and the requirement of every other
 //! constraint class — is the framework's and is unchanged.
 //!
+//! RULE 3 (how every client-error refusal CLOSES): a refusal this service's handlers
+//! answer states its sentence and then the envelope the layer that made the call states
+//! around a refused one — the service that answered, the HTTP status it answered with,
+//! the id of the request it answered and the attempts that call took. The three varying
+//! facts are the RESPONSE's, so the status in the text is the status the response carries
+//! and the id in the text is the id the response's own header reports.
+//!
 //! Each suite is a TABLE whose rows differ along what the rule generalizes over:
 //! rule 1 over the resource type, the operation that reports it, the identifier's
 //! form and length, and the Region the request is signed for; rule 2 over the enum
 //! (its value count, and whether sorted order differs from declared order), the
 //! member, and whether the member is bound to the query string, to the body, or to a
-//! structure nested inside a list in the body.
+//! structure nested inside a list in the body; rule 3 over the error class and its
+//! status (400, 402, 403, 404, 409), the operation that answers it, and whether the
+//! sentence it closes carries anything built from the request.
+
+use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
-use crate::harness::{client_token, targets, Emulator, ACCOUNT_ID, REGION, SIGNING_NAME};
+use crate::harness::{
+    client_token, refusal_envelope, targets, Emulator, ACCOUNT_ID, REGION, SIGNING_NAME,
+};
 
 /// How a missing MONITOR is worded: the fixed prefix `Monitor [`, the monitor's ARN,
 /// and `] doesn't exist`. The ARN namespace comes from the harness constant the other
@@ -83,6 +96,9 @@ struct EnumRow {
 }
 
 /// A `ResourceNotFoundException` answer: 404, that code, and nothing else.
+///
+/// The SENTENCE is what rule 1 is about, so that is what is compared; the envelope that
+/// closes it is rule 3's, and is asserted whole by rule 3's own suites below.
 fn assert_not_found(case: &str, answer: &crate::harness::Answer, expected_message: &str) {
     assert_eq!(
         answer.status, 404,
@@ -95,10 +111,10 @@ fn assert_not_found(case: &str, answer: &crate::harness::Answer, expected_messag
         answer.error_type
     );
     assert_eq!(
-        answer.text("message"),
+        answer.sentence(),
         expected_message,
         "case {case:?}: expected message {expected_message:?}, got {:?}",
-        answer.text("message")
+        answer.sentence()
     );
 }
 
@@ -509,5 +525,240 @@ async fn a_requirement_that_is_not_an_enum_keeps_the_frameworks_wording() {
         &absent,
         "1 validation error detected: Value null at 'metricName' failed to satisfy constraint: \
          Member must not be null",
+    );
+}
+
+/// The whole message rule 3 requires: `sentence`, then the envelope stating the service
+/// that answered, the status it answered with, the id of the request it answered and the
+/// attempts that one refused call took.
+///
+/// The envelope's form is spelled once, in the harness ([`refusal_envelope`]), because the
+/// suites that assert how a condition is worded strip that same form off the message they
+/// compare; naming the service by its `sdkId` (`smithy_query(query="service_info")`:
+/// `NetworkFlowMonitor`) is part of it.
+fn with_envelope(sentence: &str, status: u16, request_id: &str) -> String {
+    format!("{sentence}{}", refusal_envelope(status, request_id))
+}
+
+/// Assert `answer` is a client error whose message is `sentence` closed by the envelope of
+/// its OWN call, and report the request id it stated.
+///
+/// The status and the id are read off the answer rather than written down, so the two
+/// values inside the text are asserted to be the two the response itself carries.
+fn assert_envelope(case: &str, answer: &crate::harness::Answer, sentence: &str) -> String {
+    assert!(
+        (400..500).contains(&answer.status),
+        "case {case:?}: expected a client error, got {} with body {}",
+        answer.status,
+        answer.body
+    );
+    assert!(
+        ::service_common::query_error_envelope::is_request_id(&answer.request_id),
+        "case {case:?}: the response must name its request in the header AWS reports it in, \
+         got {:?}",
+        answer.request_id
+    );
+    let expected = with_envelope(sentence, answer.status, &answer.request_id);
+    assert_eq!(
+        answer.text("message"),
+        expected,
+        "case {case:?}: expected {expected:?}, got {:?}",
+        answer.text("message")
+    );
+    answer.request_id.clone()
+}
+
+/// RULE 3: every client-error refusal this service's handlers answer closes with the
+/// envelope of the call it refused.
+///
+/// The rows span the error classes this service refuses a client with and their statuses —
+/// `ValidationException` (400), `ServiceQuotaExceededException` (402),
+/// `AccessDeniedException` (403), `ResourceNotFoundException` (404) and
+/// `ConflictException` (409) — the operations that answer them, and both kinds of
+/// sentence: one built from the request (an ARN, a limit) and one wholly fixed.
+#[tokio::test]
+async fn every_client_error_refusal_closes_with_the_envelope_of_its_own_call() {
+    let emulator = Emulator::new();
+    let scope_arn = emulator.scope_for_monitors().await;
+
+    // A monitor that EXISTS, so the conflict row below is refused for the name it names.
+    let held = "envelope-probe";
+    let created = emulator
+        .create_monitor(json!({
+            "monitorName": held,
+            "scopeArn": scope_arn,
+            "localResources": [{ "type": "AWS::EC2::VPC", "identifier": "vpc-envelope" }],
+            "clientToken": client_token(11),
+        }))
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "the held monitor must be created: got {} with body {}",
+        created.status, created.body
+    );
+
+    // Identifiers of the shape this service mints that the store holds nothing under.
+    let missing_monitor = "sim2real-probe-missing-monitor";
+    let missing_scope = "00000000-0000-4000-8000-0000000000ff";
+    let absent_scope_arn =
+        format!("arn:aws:{SIGNING_NAME}:{REGION}:{ACCOUNT_ID}:scope/{missing_scope}");
+    let untagged_arn =
+        format!("arn:aws:{SIGNING_NAME}:{REGION}:{ACCOUNT_ID}:monitor/{missing_monitor}");
+    let monitor_body = |name: &str, scope: &str| {
+        json!({
+            "monitorName": name,
+            "scopeArn": scope,
+            "localResources": [{ "type": "AWS::EC2::VPC", "identifier": "vpc-row" }],
+        })
+    };
+
+    // (case, the answer, the sentence that answer must word)
+    let rows: Vec<(&str, crate::harness::Answer, String)> = vec![
+        (
+            "GetMonitor on a name the store holds nothing under",
+            emulator.get_monitor(missing_monitor).await,
+            monitor_not_found(REGION, missing_monitor),
+        ),
+        (
+            "DeleteMonitor on that same name",
+            emulator.delete_monitor(missing_monitor).await,
+            monitor_not_found(REGION, missing_monitor),
+        ),
+        (
+            "UpdateMonitor on that same name",
+            emulator
+                .update_monitor(missing_monitor, json!({ "clientToken": client_token(12) }))
+                .await,
+            monitor_not_found(REGION, missing_monitor),
+        ),
+        (
+            "GetScope on a well-formed id the store holds nothing under",
+            emulator.get_scope(missing_scope).await,
+            scope_not_found(REGION, missing_scope),
+        ),
+        (
+            "DeleteScope on that same id",
+            emulator.delete_scope(missing_scope).await,
+            scope_not_found(REGION, missing_scope),
+        ),
+        (
+            "GetScope on an identifier of another form",
+            emulator.get_scope("not-a-scope-identifier").await,
+            "The provided Scope ARN is not valid".to_string(),
+        ),
+        (
+            "CreateMonitor naming a scope nothing resolves",
+            emulator
+                .create_monitor(monitor_body("unparented", &absent_scope_arn))
+                .await,
+            "scope supplied doesn't exist".to_string(),
+        ),
+        (
+            "ListMonitors resuming from a cursor this service never issued",
+            emulator.list_monitors("?nextToken=zzzz").await,
+            "NextToken provided isn't valid.".to_string(),
+        ),
+        (
+            "ListTagsForResource on an ARN the store holds nothing under",
+            emulator.list_tags(&untagged_arn).await,
+            format!("Resource [{untagged_arn}] doesn't exist"),
+        ),
+        (
+            "CreateScope claiming a second slot in the Region",
+            emulator
+                .create_scope(json!({
+                    "targets": targets(&[("123456789012", "us-east-1")]),
+                    "clientToken": client_token(13),
+                }))
+                .await,
+            // `state::SCOPE_QUOTA` is one scope per account and Region.
+            format!(
+                "Maximum limit of [1] for resource [scope] exceeded for account [{ACCOUNT_ID}]."
+            ),
+        ),
+        (
+            "CreateMonitor of a name the store already holds",
+            emulator.create_monitor(monitor_body(held, &scope_arn)).await,
+            "Cannot create a monitor which already exists".to_string(),
+        ),
+    ];
+
+    let mut statuses: BTreeSet<u16> = BTreeSet::new();
+    let mut request_ids: Vec<String> = Vec::new();
+    for (case, answer, sentence) in &rows {
+        request_ids.push(assert_envelope(case, answer, sentence));
+        statuses.insert(answer.status);
+    }
+
+    // The table spans the five client-error statuses this service refuses with.
+    assert_eq!(
+        statuses,
+        BTreeSet::from([400u16, 402, 403, 404, 409]),
+        "the rows must span every client-error status this service answers, got {statuses:?}"
+    );
+    // Per REFUSAL, not per condition: no two of the refusals above stated one request id.
+    let distinct: BTreeSet<&String> = request_ids.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        request_ids.len(),
+        "each refusal states the id of its own call, got {request_ids:?}"
+    );
+}
+
+/// RULE 3's two halves that one refusal cannot show: the id is the response's OWN and a
+/// fresh one per call, and only a refusal this service's handlers word carries the
+/// envelope at all.
+#[tokio::test]
+async fn the_envelope_states_this_response_s_id_and_only_a_worded_refusal_carries_it() {
+    let emulator = Emulator::new();
+    let missing = "repeated-probe";
+    let sentence = monitor_not_found(REGION, missing);
+
+    // The same condition, refused twice: one sentence, two calls, two ids.
+    let mut ids: Vec<String> = Vec::new();
+    for attempt in 0..3 {
+        let answer = emulator.get_monitor(missing).await;
+        let case = format!("attempt {attempt}");
+        ids.push(assert_envelope(&case, &answer, &sentence));
+    }
+    let distinct: BTreeSet<&String> = ids.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        ids.len(),
+        "three refusals of one condition are three calls, so each states its own id, got \
+         {ids:?}"
+    );
+
+    // A refusal raised at the request BOUNDARY keeps the framework's wording, which words
+    // no envelope: the sentence a client reads there is the constraint clause alone.
+    for (case, answer) in [
+        (
+            "a page size past the declared maximum",
+            emulator.list_monitors("?maxResults=26").await,
+        ),
+        (
+            "a value outside a declared enum",
+            emulator.list_monitors("?monitorStatus=NOT_A_REAL_VALUE").await,
+        ),
+    ] {
+        let message = answer.text("message");
+        assert!(
+            !message.contains("(Service: "),
+            "case {case:?}: a refusal the framework raises words no envelope, got {message:?}"
+        );
+    }
+
+    // And a SUCCESS still names the request it answered, so a client correlating on the
+    // header reads one id whether the call was served or refused.
+    let served = emulator.list_monitors("").await;
+    assert_eq!(
+        served.status, 200,
+        "the listing must succeed, got {} with body {}",
+        served.status, served.body
+    );
+    assert!(
+        ::service_common::query_error_envelope::is_request_id(&served.request_id),
+        "a served call names its request too, got {:?}",
+        served.request_id
     );
 }

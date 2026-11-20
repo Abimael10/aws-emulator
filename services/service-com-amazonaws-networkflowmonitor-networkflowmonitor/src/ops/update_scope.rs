@@ -301,11 +301,10 @@ fn holds_owner(targets: &[TargetResource], owner: &str) -> bool {
 /// caller's own input, and the rule is the same for every one of them.
 fn cross_region_target() -> ValidationException {
     ValidationException {
-        message: Some(
+        message: Some(crate::state::refusal_message(
             "invalid input -> (invalid targets -> (The target region must match the \
-             service region -> (for the specified target resource)))"
-                .to_string(),
-        ),
+             service region -> (for the specified target resource)))",
+        )),
     }
 }
 
@@ -313,9 +312,9 @@ fn cross_region_target() -> ValidationException {
 /// naming the account the request asked to remove.
 fn owner_not_removable(account_id: &str) -> ValidationException {
     ValidationException {
-        message: Some(format!(
+        message: Some(crate::state::refusal_message(format!(
             "invalid input -> (owner [{account_id}] cannot be removed from scope.)"
-        )),
+        ))),
     }
 }
 
@@ -337,11 +336,11 @@ fn targets_already_in_scope(present: &[&TargetResource]) -> ValidationException 
         })
         .collect();
     ValidationException {
-        message: Some(format!(
+        message: Some(crate::state::refusal_message(format!(
             "invalid input -> (cannot add account/region pairs=[[{}]] as they are already in \
              scope.)",
             pairs.join(", ")
-        )),
+        ))),
     }
 }
 

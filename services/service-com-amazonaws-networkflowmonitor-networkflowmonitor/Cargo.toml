@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The workspace's one request-id reporting and one rendering of the envelope an SDK
+# states around a refused call (see `service::sdk_envelope`), rather than a second
+# spelling of either in this crate.
+service-common = { path = "../common" }
 # The codec behind this service's opaque `nextToken` (see `state::page_token`):
 # a maintained encoder rather than a hand-rolled one.
 hex = { workspace = true }

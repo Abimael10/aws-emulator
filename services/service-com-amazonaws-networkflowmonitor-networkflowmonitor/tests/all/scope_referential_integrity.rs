@@ -159,10 +159,10 @@ fn assert_in_use(case: &str, answer: &crate::harness::Answer) {
         answer.body
     );
     assert_eq!(
-        answer.text("message"),
+        answer.sentence(),
         SCOPE_IN_USE,
         "case {case:?}: expected the fixed in-use wording, got {:?}",
-        answer.text("message")
+        answer.sentence()
     );
 }
 

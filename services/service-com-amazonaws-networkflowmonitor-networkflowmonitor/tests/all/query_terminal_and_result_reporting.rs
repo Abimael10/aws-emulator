@@ -431,10 +431,10 @@ async fn a_query_id_that_names_no_query_is_reported_in_one_wording() {
                 results.body
             );
             assert_eq!(
-                results.text("message"),
+                results.sentence(),
                 expected,
                 "case {family:?}/{case:?}: expected the message {expected:?}, got {:?}",
-                results.text("message")
+                results.sentence()
             );
 
             // `GetQueryStatus*` models no 404, so the same condition is that
@@ -453,10 +453,10 @@ async fn a_query_id_that_names_no_query_is_reported_in_one_wording() {
                 status.body
             );
             assert_eq!(
-                status.text("message"),
+                status.sentence(),
                 expected,
                 "case {family:?}/{case:?}: expected the message {expected:?}, got {:?}",
-                status.text("message")
+                status.sentence()
             );
         }
     }
@@ -554,10 +554,10 @@ async fn an_update_that_adds_and_removes_one_item_is_refused_in_one_wording() {
             answer.body
         );
         assert_eq!(
-            answer.text("message"),
+            answer.sentence(),
             expected,
             "case {case:?}: expected the message {expected:?}, got {:?}",
-            answer.text("message")
+            answer.sentence()
         );
     }
 

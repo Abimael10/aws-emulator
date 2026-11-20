@@ -61,11 +61,11 @@ fn assert_quota_refusal(case: &str, answer: &Answer) {
         answer.body
     );
     assert_eq!(
-        answer.text("message"),
+        answer.sentence(),
         quota_message(),
         "case {case:?}: expected {:?}, got {:?}",
         quota_message(),
-        answer.text("message")
+        answer.sentence()
     );
 }
 
@@ -85,10 +85,10 @@ fn assert_already_in_scope(case: &str, answer: &Answer, pairs: &[(&str, &str)]) 
     );
     let expected = already_in_scope_message(pairs);
     assert_eq!(
-        answer.text("message"),
+        answer.sentence(),
         expected,
         "case {case:?}: expected {expected:?}, got {:?}",
-        answer.text("message")
+        answer.sentence()
     );
 }
 
@@ -353,12 +353,12 @@ async fn the_store_is_bounded_across_regions_too() {
         past.body
     );
     assert_eq!(
-        past.text("message"),
+        past.sentence(),
         format!(
             "Maximum limit of [{MAX_SCOPES}] for resource [scope] exceeded for account [{ACCOUNT_ID}]."
         ),
         "the refusal names the limit that was reached, got {:?}",
-        past.text("message")
+        past.sentence()
     );
 }
 

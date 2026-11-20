@@ -82,17 +82,34 @@ pub fn extra_region(index: usize) -> &'static str {
 /// clock already owes the terminal status to.
 pub const PAST_PROVISIONING: Duration = Duration::from_millis(900);
 
+/// The envelope a client-error refusal of this service closes with: the service that
+/// answered (this one, as its `sdkId` names it), the HTTP status it answered with, the id
+/// of the request it answered and the attempts that one refused call took
+/// (`service::sdk_envelope`).
+///
+/// It is stated here, once, because every suite that asserts how one condition is worded
+/// asserts the whole message a client reads — the sentence AND this envelope — through
+/// [`Answer::sentence`].
+pub fn refusal_envelope(status: u16, request_id: &str) -> String {
+    format!(
+        " (Service: NetworkFlowMonitor, Status Code: {status}, Request ID: {request_id}) \
+         (SDK Attempt Count: 1)"
+    )
+}
+
 /// One emulator holding exactly this service, dispatched over HTTP.
 pub struct Emulator {
     router: MultiServiceRouter,
     region: String,
 }
 
-/// A dispatched response: status, the `x-amzn-errortype` header (empty on success)
-/// and the parsed JSON body.
+/// A dispatched response: status, the `x-amzn-errortype` header (empty on success),
+/// the id the response names its request by (empty when it names none) and the parsed
+/// JSON body.
 pub struct Answer {
     pub status: u16,
     pub error_type: String,
+    pub request_id: String,
     pub body: Value,
 }
 
@@ -114,6 +131,25 @@ impl Answer {
     /// body's `__type`).
     pub fn is_error(&self, code: &str) -> bool {
         self.error_type.contains(code) || self.text("__type").contains(code)
+    }
+
+    /// The SENTENCE a refusal words: its `message` with the envelope THIS RESPONSE must
+    /// close it with stripped off ([`refusal_envelope`], over the status and the request id
+    /// this very response carries).
+    ///
+    /// A suite asserting what one condition is worded as reads this, because the envelope's
+    /// request id differs per call and cannot be written down. It is not a weaker
+    /// assertion: the suffix stripped is the one exact envelope this response owes, so a
+    /// message that closes with anything else — a different service, status or id, or no
+    /// envelope at all — is returned WHOLE and fails the comparison. A message that words
+    /// no envelope (a refusal the framework raised at the request boundary) is likewise
+    /// returned whole, which is what those suites assert.
+    pub fn sentence(&self) -> String {
+        let message = self.text("message");
+        match message.strip_suffix(&refusal_envelope(self.status, &self.request_id)) {
+            Some(sentence) => sentence.to_string(),
+            None => message,
+        }
     }
 }
 
@@ -170,6 +206,13 @@ impl Emulator {
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default()
             .to_string();
+        // The id this response names its request by, in the header AWS reports it in.
+        let request_id = response
+            .headers()
+            .get("x-amzn-requestid")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
         let bytes = response.body();
         let body = if bytes.is_empty() {
             Value::Null
@@ -179,6 +222,7 @@ impl Emulator {
         Answer {
             status,
             error_type,
+            request_id,
             body,
         }
     }

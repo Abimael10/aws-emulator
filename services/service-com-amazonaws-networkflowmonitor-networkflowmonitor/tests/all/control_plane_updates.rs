@@ -782,10 +782,10 @@ async fn a_tagged_resource_the_store_does_not_hold_is_named_in_the_refusal() {
                 answer.status, answer.body
             );
             assert_eq!(
-                answer.text("message"),
+                answer.sentence(),
                 expected,
                 "case {case:?}/{operation}: expected {expected:?}, got {:?}",
-                answer.text("message")
+                answer.sentence()
             );
         }
     }
@@ -851,10 +851,10 @@ async fn a_second_create_of_one_monitor_name_carries_the_constant_conflict_text(
             second.body
         );
         assert_eq!(
-            second.text("message"),
+            second.sentence(),
             expected,
             "case {case:?}: expected {expected:?}, got {:?}",
-            second.text("message")
+            second.sentence()
         );
         // The refused create did not overwrite the monitor that exists.
         let read = emulator.get_monitor(name).await;
@@ -935,10 +935,10 @@ async fn an_unissued_next_token_carries_the_constant_invalid_token_text() {
             };
             assert_refused(&case, &answer);
             assert_eq!(
-                answer.text("message"),
+                answer.sentence(),
                 expected,
                 "case {case:?} ({token:?}): expected {expected:?}, got {:?}",
-                answer.text("message")
+                answer.sentence()
             );
         }
     }

@@ -1217,7 +1217,37 @@ pub fn resource_arn(region: &str, resource_type: &str, id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("{resource_type}/{id}"))
 }
 
+/// What a refusal worded here writes where the envelope stated around the refused call
+/// goes ([`crate::service::sdk_envelope`]).
+///
+/// That envelope names the SERVICE that answered, the HTTP STATUS it answered with and the
+/// ID OF THE REQUEST being answered — three facts about the response, not about the
+/// request, and none of them known where a sentence is worded. So a refusal words its
+/// sentence and writes this marker after it, and the layer that finishes the response
+/// renders the envelope in its place, from the status that response carries and the one id
+/// that response names its request by. Nothing a request carries decides any part of it,
+/// and the message can hold no id of its own beside the one the response reports.
+pub const SDK_ENVELOPE_MARKER: &str = "{sdk-envelope}";
+
+/// `sentence` as a client is answered it: this service's own wording for the condition,
+/// then [`SDK_ENVELOPE_MARKER`] for the envelope the response is finished with.
+///
+/// Every CLIENT-ERROR refusal of this service is worded through here, so a client parses
+/// the serving service, the status and the request id back out of one form whichever
+/// operation refused and whichever class it refused under. A SERVER error is not: the
+/// envelope states the attempts the refused call took, and only a refusal of the caller's
+/// own request is the one attempt there will ever be — a 500 is retried, so the count
+/// stated beside it would be a guess at how many times the caller will have tried.
+pub fn refusal_message(sentence: impl Into<String>) -> String {
+    let mut message = sentence.into();
+    message.push_str(SDK_ENVELOPE_MARKER);
+    message
+}
+
 /// The modelled 500 for a request that could not reach this service's store.
+///
+/// Worded WITHOUT the envelope ([`refusal_message`]): see the note there on why a server
+/// error states no attempt count.
 pub fn state_unavailable() -> InternalServerException {
     InternalServerException {
         message: Some("the Network Flow Monitor state store is unavailable".to_string()),
@@ -1234,7 +1264,10 @@ pub fn state_unavailable() -> InternalServerException {
 /// addressed BY its ARN, so the id this message carries is that ARN.
 pub fn not_found(resource_type: &str, id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!("{} [{id}] doesn't exist", capitalized(resource_type))),
+        message: Some(refusal_message(format!(
+            "{} [{id}] doesn't exist",
+            capitalized(resource_type)
+        ))),
     }
 }
 
@@ -1262,10 +1295,10 @@ fn capitalized(word: &str) -> String {
 /// resource type.
 pub fn monitor_not_found(region: &str, monitor_name: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!(
+        message: Some(refusal_message(format!(
             "Monitor [{}] doesn't exist",
             resource_arn(region, MONITOR_RESOURCE, monitor_name)
-        )),
+        ))),
     }
 }
 
@@ -1274,10 +1307,10 @@ pub fn monitor_not_found(region: &str, monitor_name: &str) -> ResourceNotFoundEx
 /// same builder, in this service's own wording for a missing SCOPE.
 pub fn scope_not_found(region: &str, scope_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!(
+        message: Some(refusal_message(format!(
             "There's no scope with ARN: [{}]",
             resource_arn(region, SCOPE_RESOURCE, scope_id)
-        )),
+        ))),
     }
 }
 
@@ -1298,7 +1331,7 @@ fn no_such_query(query_id: &str) -> String {
 /// `ResourceNotFoundException`.
 pub fn query_not_found(query_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(no_such_query(query_id)),
+        message: Some(refusal_message(no_such_query(query_id))),
     }
 }
 
@@ -1308,7 +1341,7 @@ pub fn query_not_found(query_id: &str) -> ResourceNotFoundException {
 /// query with.
 pub fn unknown_query(query_id: &str) -> ValidationException {
     ValidationException {
-        message: Some(no_such_query(query_id)),
+        message: Some(refusal_message(no_such_query(query_id))),
     }
 }
 
@@ -1322,9 +1355,9 @@ pub fn unknown_query(query_id: &str) -> ValidationException {
 /// with it, so the pair of lists it was found in does not change the wording.
 pub fn add_remove_overlap() -> ValidationException {
     ValidationException {
-        message: Some(
-            "invalid input -> (detected overlap between add/remove resources)".to_string(),
-        ),
+        message: Some(refusal_message(
+            "invalid input -> (detected overlap between add/remove resources)",
+        )),
     }
 }
 
@@ -1335,9 +1368,9 @@ pub fn add_remove_overlap() -> ValidationException {
 /// one it was.
 pub fn already_exists(resource_type: &str) -> ConflictException {
     ConflictException {
-        message: Some(format!(
+        message: Some(refusal_message(format!(
             "Cannot create a {resource_type} which already exists"
-        )),
+        ))),
     }
 }
 
@@ -1345,10 +1378,10 @@ pub fn already_exists(resource_type: &str) -> ConflictException {
 /// not match the resource it already minted.
 pub fn idempotency_conflict(resource_type: &str, id: &str) -> ConflictException {
     ConflictException {
-        message: Some(format!(
+        message: Some(refusal_message(format!(
             "the clientToken of this request already created {resource_type} {id}, \
              with different parameters"
-        )),
+        ))),
     }
 }
 
@@ -1363,10 +1396,10 @@ pub fn idempotency_conflict(resource_type: &str, id: &str) -> ConflictException 
 /// limit was reached.
 pub fn quota_exceeded(resource_type: &str, limit: usize) -> ServiceQuotaExceededException {
     ServiceQuotaExceededException {
-        message: Some(format!(
+        message: Some(refusal_message(format!(
             "Maximum limit of [{limit}] for resource [{resource_type}] exceeded for account [{}].",
             owner_account_id()
-        )),
+        ))),
     }
 }
 
@@ -1375,7 +1408,7 @@ pub fn quota_exceeded(resource_type: &str, limit: usize) -> ServiceQuotaExceeded
 /// request from it alone.
 pub fn field_validation(member: &str, message: impl Into<String>) -> ValidationException {
     ValidationException {
-        message: Some(format!("{member}: {}", message.into())),
+        message: Some(refusal_message(format!("{member}: {}", message.into()))),
     }
 }
 
@@ -1387,7 +1420,7 @@ pub fn field_validation(member: &str, message: impl Into<String>) -> ValidationE
 /// anything out of the message.
 pub fn invalid_next_token() -> ValidationException {
     ValidationException {
-        message: Some("NextToken provided isn't valid.".to_string()),
+        message: Some(refusal_message("NextToken provided isn't valid.")),
     }
 }
 
@@ -1407,7 +1440,7 @@ pub const INVALID_SCOPE_ID: &str = "The provided Scope ARN is not valid";
 /// absence of a resource (404) would tell a reconciling client to retry or recreate.
 pub fn invalid_scope_id() -> ValidationException {
     ValidationException {
-        message: Some(INVALID_SCOPE_ID.to_string()),
+        message: Some(refusal_message(INVALID_SCOPE_ID)),
     }
 }
 
@@ -1428,7 +1461,7 @@ pub const SCOPE_IN_USE: &str = "Scope can't be deleted as there's monitors assoc
 /// own wording for the condition, and the caller deletes the monitors first.
 pub fn scope_in_use() -> ValidationException {
     ValidationException {
-        message: Some(SCOPE_IN_USE.to_string()),
+        message: Some(refusal_message(SCOPE_IN_USE)),
     }
 }
 
@@ -1444,7 +1477,9 @@ pub fn scope_in_use() -> ValidationException {
 /// answers this condition with.
 pub fn reference_denied(resource_type: &str) -> AccessDeniedException {
     AccessDeniedException {
-        message: Some(format!("{resource_type} supplied doesn't exist")),
+        message: Some(refusal_message(format!(
+            "{resource_type} supplied doesn't exist"
+        ))),
     }
 }
 
@@ -1462,11 +1497,11 @@ pub fn results_unavailable(query: &Query) -> Option<ValidationException> {
         return None;
     }
     Some(ValidationException {
-        message: Some(format!(
+        message: Some(refusal_message(format!(
             "query {} is {}; results are reported once a query has SUCCEEDED",
             query.query_id,
             query.status.as_wire()
-        )),
+        ))),
     })
 }
 
@@ -1495,7 +1530,7 @@ pub fn inverted_window(
     let instant = |at: ::aws_smithy_types::DateTime| (at.secs(), at.subsec_nanos());
     if instant(end_time) < instant(start_time) {
         return Some(ValidationException {
-            message: Some(END_BEFORE_START.to_string()),
+            message: Some(refusal_message(END_BEFORE_START)),
         });
     }
     None

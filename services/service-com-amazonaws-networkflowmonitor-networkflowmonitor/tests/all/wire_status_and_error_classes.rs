@@ -299,10 +299,10 @@ async fn a_scope_id_of_another_form_is_refused_for_its_shape() {
             let answer = op.call(&emulator, scope_id).await;
             assert_refusal(&case, &answer, BAD_REQUEST, VALIDATION);
             assert_eq!(
-                answer.text("message"),
+                answer.sentence(),
                 nfm::state::INVALID_SCOPE_ID,
                 "case {case:?}: expected the invalid-identifier wording, got {:?}",
-                answer.text("message")
+                answer.sentence()
             );
         }
     }
@@ -318,7 +318,7 @@ async fn a_scope_id_of_another_form_is_refused_for_its_shape() {
             .await;
         let answer = op.call(&emulator, &live.text("scopeId")).await;
         assert_ne!(
-            answer.text("message"),
+            answer.sentence(),
             nfm::state::INVALID_SCOPE_ID,
             "case {case:?}: a well-formed id must not be refused for its form, got {} with \
              body {}",

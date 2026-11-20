@@ -1168,10 +1168,10 @@ async fn a_create_past_the_store_s_ceiling_is_refused() {
         refused.body
     );
     assert_eq!(
-        refused.text("message"),
+        refused.sentence(),
         format!("Maximum limit of [{MAX_MONITORS}] for resource [monitor] exceeded for account [{ACCOUNT_ID}]."),
         "a quota refusal names the limit, the resource and the account, got {:?}",
-        refused.text("message")
+        refused.sentence()
     );
     // The refusal stored nothing, and deleting a monitor frees a slot again.
     let read = emulator.get_monitor("one-too-many").await;

@@ -422,11 +422,11 @@ async fn an_inverted_window_is_refused_with_the_relation_that_failed() {
                 answer.body
             );
             assert_eq!(
-                answer.text("message"),
+                answer.sentence(),
                 "EndTime cannot be before StartTime",
                 "case {family:?}/{case:?}: expected the fixed refusal for an inverted \
                  window, got {:?}",
-                answer.text("message")
+                answer.sentence()
             );
             assert_eq!(
                 answer.member("queryId"),

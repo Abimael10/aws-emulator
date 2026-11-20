@@ -20,9 +20,11 @@
 //!   request's resolved route key against this service's signing name. Edit it
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
-//! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//! - `override_operation` — EDITED HERE. It serves the operation the generated routing
+//!   table names, under the layer that finishes every response of this service: one
+//!   request id, reported in the header and stated inside the envelope a client-error
+//!   refusal words (see [`sdk_envelope`]). The routing decision itself is still the
+//!   model's.
 //! - `override_refusal` — EDITED HERE. How this service words a request the
 //!   framework refused before any handler ran: AWS's own envelope and clauses, with
 //!   an enum's admissible value set listed in ascending order of its values. See
@@ -42,10 +44,13 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use aws_smithy_schema_server::{envelope, Violation, ViolationKind};
+use service_common::query_error_envelope::RequestIdEnvelopeDefinition;
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+pub mod sdk_envelope;
 
 /// The error code this service answers a boundary constraint refusal with.
 ///
@@ -102,7 +107,15 @@ fn sorted_enum_value_sets(violations: &[Violation]) -> Vec<Violation> {
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
+    /// The generated entry, with its three framework-level error renderers wrapped so a
+    /// response no operation produced still names the request it answers. Identity, the
+    /// protocol and the routing table are that entry's own, untouched.
+    entry: RequestIdEnvelopeDefinition<crate::ServiceDefinition<Eng>>,
+    /// The dispatch `override_operation` hands back: the operation the generated routing
+    /// table names, under the layer that finishes every response this service's operations
+    /// produce ([`sdk_envelope`]). Held on the service because that seam returns a borrow of
+    /// `self`.
+    served: sdk_envelope::SdkEnvelopeOperation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -111,7 +124,13 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            // The SAME report for the responses an operation produced and the responses no
+            // operation produced, so one request is named one way whichever layer answered.
+            entry: RequestIdEnvelopeDefinition::reporting(
+                crate::ServiceDefinition::new(engine),
+                sdk_envelope::report,
+            ),
+            served: sdk_envelope::SdkEnvelopeOperation,
         }
     }
 }
@@ -120,7 +139,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn definition(&self) -> &dyn smithy_server_runtime::ErasedServiceDefinition {
         // The model-derived half of this service — identity, protocol, routing
         // table, and the default error renderers — lives in the generated entry.
-        // The router reads it through this one accessor. Do not edit the entry.
+        // The router reads it through this one accessor. Do not edit the entry: what is
+        // handed back is the shared `RequestIdEnvelopeDefinition`, which reads identity,
+        // protocol and the routing table straight off that entry and names the request each
+        // of the three framework-level error renderers answers ([`sdk_envelope::report`]).
         &self.entry
     }
 
@@ -138,12 +160,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Serve the operation the generated routing table names, under the layer that
+        // finishes the response ([`sdk_envelope`]). The routing DECISION is not overridden:
+        // the key is resolved by the model's own protocol, and a request the table cannot
+        // serve is declined here so the framework's routing-error path stays as it was.
+        self.entry
+            .routes(req)
+            .then_some(&self.served as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -161,6 +184,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         //
         // An authentication refusal keeps the framework's wording and its 403: it is
         // not an input-constraint failure.
+        //
+        // A boundary refusal also keeps the framework's SHAPE whole: it closes at the
+        // constraint clause, with none of the envelope a refusal of this service's own
+        // carries (`sdk_envelope`). That envelope is stated by the layer that words a
+        // refusal this service DECIDED, and a constraint clause is not one of those: it
+        // is the framework's sentence about the request, reordered here in one respect
+        // and otherwise passed through.
         match refusal {
             Refusal::Invalid(violations) => Some(Refused {
                 code: VALIDATION_EXCEPTION.to_string(),
