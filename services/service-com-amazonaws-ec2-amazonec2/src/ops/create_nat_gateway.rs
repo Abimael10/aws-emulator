@@ -241,10 +241,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "CreateNatGateway with availabilityZoneAddresses",
             ));
         }
-        // The secondary PRIVATE addresses of a private gateway: nobody has written the
-        // assignment of those either (`AssignPrivateNatGatewayAddress` is still a scaffold),
-        // so a request naming them is answered 501 rather than with a gateway that holds
-        // fewer addresses than it asked for.
+        // The secondary PRIVATE addresses of a private gateway at CREATE time: nobody has
+        // written those yet — `AssignPrivateNatGatewayAddress` adds them to a gateway that
+        // already serves — so a create naming them is answered 501 rather than with a
+        // gateway that holds fewer addresses than it asked for.
         if input.secondary_private_ip_address_count.is_some()
             || input
                 .secondary_private_ip_addresses

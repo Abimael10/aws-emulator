@@ -1138,6 +1138,169 @@ impl NatGatewayAddressTransition {
     }
 }
 
+/// The transient `NatGatewayAddressStatus` of a private address being taken off a gateway:
+/// `unassigning`, the `NatGatewayAddressStatus` member that names an unassignment
+/// (`crate::ops::types::NAT_GATEWAY_ADDRESS_STATUS_VALUES`). An address stays in it while
+/// its connections drain — "The private IP addresses stay associated and support the
+/// existing connections, but do not support any new connections"
+/// (`UnassignPrivateNatGatewayAddress`) — and is RELEASED at the end of that drain rather
+/// than reaching a terminal status, because the address is gone from the gateway by then.
+pub const NAT_GATEWAY_ADDRESS_STATUS_UNASSIGNING: &str = "unassigning";
+
+/// How many SECONDARY private IPv4 addresses one private NAT gateway holds.
+///
+/// "The number of private IP addresses to assign to the NAT gateway"
+/// (`AssignPrivateNatGatewayAddressRequest$PrivateIpAddressCount`) is modelled
+/// `@range(min: 1, max: 31)`, so 31 is the most any one call may ask the service for, and
+/// the most a gateway holds beside the primary private address it was created with — the
+/// one an unassignment cannot take off it ("You cannot unassign your primary private IP",
+/// `UnassignPrivateNatGatewayAddress`).
+pub const MAX_SECONDARY_PRIVATE_IPS_PER_NAT_GATEWAY: usize = 31;
+
+/// How long an unassignment drains a private address for when the request names no
+/// maximum: "Default value is 350 seconds"
+/// (`UnassignPrivateNatGatewayAddressRequest$MaxDrainDurationSeconds`).
+pub const DEFAULT_NAT_GATEWAY_DRAIN_SECONDS: u64 = 350;
+
+/// Refuse an unassignment of the PRIMARY private IPv4 address of a NAT gateway: HTTP 400
+/// [`INVALID_PARAMETER`] — the code this class of refusal carries, a member's value that
+/// cannot be honoured given the state of the resource it names rather than a value that is
+/// wrong in itself.
+///
+/// "You cannot unassign your primary private IP" (`UnassignPrivateNatGatewayAddress`), and
+/// the sentence states exactly that: the address is the NAT's primary private address and
+/// unassigning the primary address is not supported. Its only variable part is the address,
+/// taken from the request.
+pub fn nat_gateway_primary_private_ip_is_not_unassignable<E>(private_ip: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_PARAMETER,
+        400,
+        format!(
+            "Private IP address {private_ip} is primary private IP of NAT, unassigning \
+             primary IP is not supported."
+        ),
+    )
+}
+
+/// Refuse an unassignment naming a private IPv4 address the NAT gateway does not hold: HTTP
+/// 400 [`INVALID_PARAMETER`], in the same form as the primary-address refusal above — the
+/// other state of the same member, so the two are worded alike and the address is the only
+/// variable part.
+pub fn nat_gateway_private_ip_is_not_assigned<E>(private_ip: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_PARAMETER,
+        400,
+        format!("Private IP address {private_ip} is not assigned to NAT."),
+    )
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Every private IPv4 address the NAT gateway `nat_gateway_id` holds, primary and
+    /// secondary alike: one per `NatGatewayAddress` on it.
+    ///
+    /// What tells "an address this gateway does not hold" from "the primary address, which
+    /// cannot be unassigned" ([`Self::nat_gateway_secondary_private_ips`] is the second of
+    /// those two sets).
+    pub fn nat_gateway_private_ips(&self, nat_gateway_id: &str) -> Vec<String> {
+        self.nat_gateways
+            .get(nat_gateway_id)
+            .and_then(|gateway| gateway.nat_gateway_addresses.as_ref())
+            .map(|addresses| {
+                addresses
+                    .iter()
+                    .filter_map(|address| address.private_ip.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The SECONDARY private IPv4 addresses the NAT gateway `nat_gateway_id` holds: every
+    /// private address on it but the primary one it was created with
+    /// (`NatGatewayAddress$IsPrimary`).
+    ///
+    /// The ONE definition of "an address an assignment added", so the per-gateway ceiling
+    /// [`MAX_SECONDARY_PRIVATE_IPS_PER_NAT_GATEWAY`] and the unassignment that refuses the
+    /// primary address cannot disagree about which addresses those are.
+    pub fn nat_gateway_secondary_private_ips(&self, nat_gateway_id: &str) -> Vec<String> {
+        self.nat_gateways
+            .get(nat_gateway_id)
+            .and_then(|gateway| gateway.nat_gateway_addresses.as_ref())
+            .map(|addresses| {
+                addresses
+                    .iter()
+                    .filter(|address| address.is_primary != Some(true))
+                    .filter_map(|address| address.private_ip.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether any private address of the NAT gateway `nat_gateway_id` is still draining.
+    ///
+    /// "While unassigning is in progress, you cannot assign/unassign additional IP
+    /// addresses while the connections are being drained"
+    /// (`UnassignPrivateNatGatewayAddress`): both address calls ask this before they write.
+    pub fn nat_gateway_is_draining(&self, nat_gateway_id: &str) -> bool {
+        self.nat_gateway_address_drains
+            .keys()
+            .any(|(gateway, _)| gateway == nat_gateway_id)
+    }
+
+    /// Start the drain of the private address `private_ip` of `nat_gateway_id`: the address
+    /// stays ON the gateway, and its release falls due `drain` from now.
+    ///
+    /// "A private IP address will only be released at the end of MaxDrainDurationSeconds …
+    /// After the existing connections drain out, the private IP addresses are released"
+    /// (`UnassignPrivateNatGatewayAddress`) — recorded rather than waited for, so a caller
+    /// reading the gateway straight after the call still sees the address in the transient
+    /// [`NAT_GATEWAY_ADDRESS_STATUS_UNASSIGNING`] status the drain starts in.
+    pub fn begin_nat_gateway_address_drain(
+        &mut self,
+        nat_gateway_id: &str,
+        private_ip: &str,
+        drain: Duration,
+    ) {
+        // The address is going away, so the move the clock owed it while it was being
+        // assigned is owed no longer: leaving it would put an address that is draining back
+        // into a terminal `succeeded`.
+        self.nat_gateway_address_transitions.remove(private_ip);
+        self.nat_gateway_address_drains.insert(
+            (nat_gateway_id.to_string(), private_ip.to_string()),
+            Instant::now() + drain,
+        );
+    }
+
+    /// Release every draining private address whose wait has run out as of `now`: take it
+    /// off the gateway it was assigned to and hand it back to the subnet's pool, so the
+    /// address the gateway no longer holds is one something else can be given.
+    ///
+    /// Applied by [`Self::materialize_due_transitions`], the one place every move this store
+    /// owes the clock is materialised.
+    pub(super) fn release_drained_nat_gateway_addresses(&mut self, now: Instant) {
+        let due: Vec<(String, String)> = self
+            .nat_gateway_address_drains
+            .iter()
+            .filter(|(_, due_at)| now >= **due_at)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for (nat_gateway_id, private_ip) in due {
+            self.nat_gateway_address_drains
+                .remove(&(nat_gateway_id.clone(), private_ip.clone()));
+            if let Some(addresses) = self
+                .nat_gateways
+                .get_mut(&nat_gateway_id)
+                .and_then(|gateway| gateway.nat_gateway_addresses.as_mut())
+            {
+                addresses.retain(|address| {
+                    address.private_ip.as_deref() != Some(private_ip.as_str())
+                });
+            }
+            self.nat_gateway_address_transitions.remove(&private_ip);
+            self.release_private_ip(&private_ip);
+        }
+    }
+}
+
 // =============================================================================
 // Capacity Reservation Fleets
 // =============================================================================

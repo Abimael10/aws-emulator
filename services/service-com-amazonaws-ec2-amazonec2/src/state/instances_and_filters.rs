@@ -2133,6 +2133,12 @@ impl ComAmazonawsEc2Amazonec2State {
             // The move is applied once; nothing is owed on this gateway any more.
             false
         });
+        // The end of the drain an `UnassignPrivateNatGatewayAddress` started: the private
+        // address it took out of service is RELEASED once its wait has run out, whether or
+        // not anybody called again — "A private IP address will only be released at the end
+        // of MaxDrainDurationSeconds" — which takes it off the gateway and hands it back to
+        // the subnet's pool.
+        self.release_drained_nat_gateway_addresses(now);
         // An Elastic IP address transfer the clock has taken past the end of what the
         // source account is shown: the offer expired and ownership returned to that
         // account, or an accepted transfer's 14 days of visibility ran out. Both were due

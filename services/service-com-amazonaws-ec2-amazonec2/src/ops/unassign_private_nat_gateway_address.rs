@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UnassignPrivateNatGatewayAddress
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UnassignPrivateNatGatewayAddress`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: unassigns the SECONDARY private IPv4 addresses the request names from a
+//! serving PRIVATE NAT gateway — never its primary one — leaving each in the transient
+//! `unassigning` `NatGatewayAddressStatus` while its connections drain, and RELEASING it at
+//! the end of the drain the request asked for
+//! (see [`crate::state::ComAmazonawsEc2Amazonec2State::begin_nat_gateway_address_drain`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UnassignPrivateNatGatewayAddress::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +146,179 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UnassignPrivateNatGatewayAddress` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UnassignPrivateNatGatewayAddressErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UnassignPrivateNatGatewayAddress"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            CONNECTIVITY_TYPE_PRIVATE, CONNECTIVITY_TYPE_PUBLIC,
+            DEFAULT_NAT_GATEWAY_DRAIN_SECONDS, NAT_GATEWAY_ADDRESS_STATUS_UNASSIGNING,
+            NAT_GATEWAY_STATE_AVAILABLE, incorrect_state, internal_error, is_ipv4_address,
+            nat_gateway_primary_private_ip_is_not_unassignable,
+            nat_gateway_private_ip_is_not_assigned, require_known_nat_gateway,
+            require_service_state,
+        };
+
+        // Nothing this call decides is a fact of the Region the request was signed for: the
+        // addresses it takes off the gateway are the gateway's own, so `ctx` carries nothing
+        // this handler reads.
+        let _ = ctx;
+
+        // "The private IPv4 addresses you want to unassign" (`$PrivateIpAddresses`,
+        // required): a call naming none would unassign nothing at all. The member is
+        // `clientOptional`, so an empty list reaches the handler and is answered here with
+        // the same code the boundary validator answers an absent one.
+        let named: Vec<&str> = input
+            .private_ip_addresses
+            .iter()
+            .map(String::as_str)
+            .collect();
+        if named.is_empty() {
+            return Err(Scaffolded::missing_parameter(
+                "The request must name at least one private IPv4 address in privateIpAddress",
+            ));
+        }
+        // One address is unassigned once, so naming it twice in one call asks for one
+        // address to be taken off the gateway twice.
+        let mut unique = ::std::collections::BTreeSet::new();
+        for private_ip in &named {
+            if !is_ipv4_address(private_ip) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{private_ip}' for privateIpAddress. \
+                     It must be an IPv4 address"
+                )));
+            }
+            if !unique.insert(*private_ip) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{private_ip}' for privateIpAddress. \
+                     It is named more than once in this request"
+                )));
+            }
+        }
+        // "The maximum amount of time to wait (in seconds) before forcibly releasing the IP
+        // addresses if connections are still in progress. Default value is 350 seconds"
+        // (`$MaxDrainDurationSeconds`), whose modelled `@range(min: 1, max: 4000)` the
+        // boundary validator has already held the request to.
+        let drain = ::std::time::Duration::from_secs(
+            input
+                .max_drain_duration_seconds
+                .and_then(|seconds| u64::try_from(seconds).ok())
+                .unwrap_or(DEFAULT_NAT_GATEWAY_DRAIN_SECONDS),
+        );
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // Every move the clock already owed is applied before anything is read — including
+        // the release of an address whose own drain has run out — so this call acts on the
+        // gateway as it stands NOW.
+        store.materialize_due_transitions();
+
+        let gateway = require_known_nat_gateway(&store, &input.nat_gateway_id)?;
+        let gateway_state = gateway.state.clone().unwrap_or_default();
+        let connectivity = gateway
+            .connectivity_type
+            .clone()
+            .unwrap_or_else(|| CONNECTIVITY_TYPE_PUBLIC.to_string());
+
+        // "available: The NAT gateway is able to process traffic. This status remains until
+        // you delete the NAT gateway" (`NatGateway$State`): in every other state the gateway
+        // is still coming up, has failed, or is going away, so its addresses are not the
+        // caller's to change.
+        if gateway_state != NAT_GATEWAY_STATE_AVAILABLE {
+            return Err(incorrect_state(format!(
+                "The NAT gateway '{}' is in state '{gateway_state}', which is not a state \
+                 in which a private IPv4 address can be unassigned from it",
+                input.nat_gateway_id
+            )));
+        }
+        // "Unassigns secondary private IPv4 addresses from a private NAT gateway"
+        // (`UnassignPrivateNatGatewayAddress`): a public gateway's addresses come and go with
+        // the Elastic IP addresses `DisassociateNatGatewayAddress` takes off it.
+        if connectivity != CONNECTIVITY_TYPE_PRIVATE {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The NAT gateway '{}' has connectivityType '{connectivity}'. A private IPv4 \
+                 address is unassigned from a private NAT gateway",
+                input.nat_gateway_id
+            )));
+        }
+        // "While unassigning is in progress, you cannot assign/unassign additional IP
+        // addresses while the connections are being drained" (above).
+        if store.nat_gateway_is_draining(&input.nat_gateway_id) {
+            return Err(incorrect_state(format!(
+                "The NAT gateway '{}' is already unassigning a private IPv4 address, so no \
+                 additional address can be unassigned while the connections are being \
+                 drained",
+                input.nat_gateway_id
+            )));
+        }
+
+        // "You cannot unassign your primary private IP" (above) — the address the gateway was
+        // created with — and an address the gateway does not hold at all is nothing this
+        // gateway can unassign. Both are asked of every address BEFORE the first write, so a
+        // call naming one address it may unassign and one it may not leaves the gateway
+        // exactly as it was.
+        let secondary = store.nat_gateway_secondary_private_ips(&input.nat_gateway_id);
+        for private_ip in &named {
+            if secondary.iter().any(|held| held == private_ip) {
+                continue;
+            }
+            return Err(
+                if store
+                    .nat_gateway_private_ips(&input.nat_gateway_id)
+                    .iter()
+                    .any(|held| held == private_ip)
+                {
+                    nat_gateway_primary_private_ip_is_not_unassignable(private_ip)
+                } else {
+                    nat_gateway_private_ip_is_not_assigned(private_ip)
+                },
+            );
+        }
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE the first write:
+        // the request that would have succeeded changes nothing at all.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // "The private IP addresses stay associated and support the existing connections, but
+        // do not support any new connections" (above): each address stays ON the gateway in
+        // the transient status of an unassignment, and the clock owes its RELEASE at the end
+        // of the drain.
+        let gateway = store
+            .nat_gateways
+            .get_mut(&input.nat_gateway_id)
+            .ok_or_else(|| {
+                internal_error(format!(
+                    "the NAT gateway '{}' could not be read back",
+                    input.nat_gateway_id
+                ))
+            })?;
+        let answered_id = gateway.nat_gateway_id.clone();
+        let mut unassigning: Vec<NatGatewayAddress> = Vec::new();
+        for address in gateway.nat_gateway_addresses.iter_mut().flatten() {
+            let Some(private_ip) = address.private_ip.clone() else {
+                continue;
+            };
+            if !named.contains(&private_ip.as_str()) {
+                continue;
+            }
+            address.status = Some(NAT_GATEWAY_ADDRESS_STATUS_UNASSIGNING.to_string());
+            unassigning.push(address.clone());
+        }
+        for address in &unassigning {
+            if let Some(private_ip) = address.private_ip.as_deref() {
+                store.begin_nat_gateway_address_drain(
+                    &input.nat_gateway_id,
+                    private_ip,
+                    drain,
+                );
+            }
+        }
+
+        // "Information about the NAT gateway IP addresses" (`$NatGatewayAddresses`): the
+        // addresses THIS call is unassigning, each as it was just stored — so what the caller
+        // is told is what a later reader of the gateway will see for them.
+        Ok(UnassignPrivateNatGatewayAddressOutput {
+            nat_gateway_id: answered_id,
+            nat_gateway_addresses: Some(unassigning),
+        })
     }
 }

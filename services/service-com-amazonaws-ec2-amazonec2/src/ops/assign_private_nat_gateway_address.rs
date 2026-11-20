@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssignPrivateNatGatewayAddress
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssignPrivateNatGatewayAddress`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: assigns SECONDARY private IPv4 addresses — the ones the request names, or
+//! the number of them it asks the service to choose out of the gateway's own subnet — to a
+//! serving PRIVATE NAT gateway, each on the gateway's network interface in the transient
+//! `assigning` `NatGatewayAddressStatus` the clock owes `succeeded`
+//! (see [`crate::state::ComAmazonawsEc2Amazonec2State::nat_gateway_secondary_private_ips`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssignPrivateNatGatewayAddress::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +138,282 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssignPrivateNatGatewayAddress` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssignPrivateNatGatewayAddressErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssignPrivateNatGatewayAddress"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            CONNECTIVITY_TYPE_PRIVATE, CONNECTIVITY_TYPE_PUBLIC,
+            MAX_SECONDARY_PRIVATE_IPS_PER_NAT_GATEWAY, NAT_GATEWAY_ADDRESS_STATUS_ASSIGNING,
+            NAT_GATEWAY_ADDRESS_STATUS_SUCCEEDED, NAT_GATEWAY_STATE_AVAILABLE,
+            NETWORK_INTERFACE_ID_PREFIX, NatGatewayAddressTransition, incorrect_state,
+            internal_error, is_assignable_subnet_address, is_ipv4_address,
+            require_known_nat_gateway, require_service_state, resource_count_exceeded,
+        };
+
+        // Nothing this call decides is a fact of the Region the request was signed for: a
+        // private address of a NAT gateway comes out of the gateway's OWN subnet, which the
+        // gateway itself names, so `ctx` carries nothing this handler reads.
+        let _ = ctx;
+
+        // "The private IPv4 addresses you want to assign to the private NAT gateway"
+        // (`$PrivateIpAddresses`) against "The number of private IP addresses to assign to
+        // the NAT gateway. You can't specify this parameter when also specifying private IP
+        // addresses" (`$PrivateIpAddressCount`): the ask is NAMED or COUNTED, never both,
+        // and a request that is neither asks for nothing at all.
+        let named: Vec<&str> = input
+            .private_ip_addresses
+            .iter()
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        // The modelled `@range(min: 1, max: 31)` on the count is refused by the boundary
+        // validator before this handler runs, so a count that reaches here is a real ask.
+        let wanted_count =
+            usize::try_from(input.private_ip_address_count.unwrap_or_default()).unwrap_or_default();
+        if !named.is_empty() && wanted_count > 0 {
+            return Err(Scaffolded::invalid_parameter_combination(
+                "You cannot specify privateIpAddressCount when also specifying \
+                 privateIpAddress",
+            ));
+        }
+        if named.is_empty() && wanted_count == 0 {
+            return Err(Scaffolded::missing_parameter(
+                "Either 'privateIpAddress' or 'privateIpAddressCount' must be specified",
+            ));
+        }
+        // `IpList` carries no `@length`, so the list a caller may send is unbounded; the
+        // per-gateway ceiling is asked of it HERE, before any work proportional to its size
+        // — parsing an address, probing the in-use set — is done. The same ceiling is asked
+        // again below of what the gateway would then HOLD, which is the question the limit
+        // is about.
+        if named.len() > MAX_SECONDARY_PRIVATE_IPS_PER_NAT_GATEWAY {
+            return Err(resource_count_exceeded(format!(
+                "A private NAT gateway holds at most \
+                 {MAX_SECONDARY_PRIVATE_IPS_PER_NAT_GATEWAY} private IPv4 addresses beside \
+                 its primary one, so {} cannot be assigned to it",
+                named.len()
+            )));
+        }
+        for private_ip in &named {
+            if !is_ipv4_address(private_ip) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{private_ip}' for privateIpAddress. \
+                     It must be an IPv4 address"
+                )));
+            }
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // Every move the clock already owed is applied before anything is read, so this call
+        // acts on the gateway as it stands NOW rather than as it stood when something last
+        // asked about it.
+        store.materialize_due_transitions();
+
+        // The NAT gateway is the resource this call acts on, so it is resolved before
+        // anything is read off the network it sits in, through the one reader every
+        // operation of this family resolves its gateway with.
+        let gateway = require_known_nat_gateway(&store, &input.nat_gateway_id)?;
+        let gateway_state = gateway.state.clone().unwrap_or_default();
+        // "The default is public connectivity" (`CreateNatGatewayRequest$ConnectivityType`),
+        // so a gateway stored without the member reads as that default rather than as a
+        // refusal.
+        let connectivity = gateway
+            .connectivity_type
+            .clone()
+            .unwrap_or_else(|| CONNECTIVITY_TYPE_PUBLIC.to_string());
+        let gateway_subnet_id = gateway.subnet_id.clone().unwrap_or_default();
+        let held_addresses = gateway.nat_gateway_addresses.clone().unwrap_or_default();
+
+        // "available: The NAT gateway is able to process traffic. This status remains until
+        // you delete the NAT gateway" (`NatGateway$State`): in every other state the gateway
+        // is still coming up, has failed, or is going away, so its addresses are not the
+        // caller's to change.
+        if gateway_state != NAT_GATEWAY_STATE_AVAILABLE {
+            return Err(incorrect_state(format!(
+                "The NAT gateway '{}' is in state '{gateway_state}', which is not a state \
+                 in which a private IPv4 address can be assigned to it",
+                input.nat_gateway_id
+            )));
+        }
+        // "Assigns private IPv4 addresses to a private NAT gateway"
+        // (`AssignPrivateNatGatewayAddress`): a PUBLIC gateway's addresses are the Elastic
+        // IP addresses `AssociateNatGatewayAddress` gives it, each with the private address
+        // that comes with it, so it has no private address of its own to add.
+        if connectivity != CONNECTIVITY_TYPE_PRIVATE {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The NAT gateway '{}' has connectivityType '{connectivity}'. A private IPv4 \
+                 address is assigned to a private NAT gateway",
+                input.nat_gateway_id
+            )));
+        }
+        // "While unassigning is in progress, you cannot assign/unassign additional IP
+        // addresses while the connections are being drained"
+        // (`UnassignPrivateNatGatewayAddress`).
+        if store.nat_gateway_is_draining(&input.nat_gateway_id) {
+            return Err(incorrect_state(format!(
+                "The NAT gateway '{}' is unassigning a private IPv4 address, so no \
+                 additional address can be assigned while the connections are being drained",
+                input.nat_gateway_id
+            )));
+        }
+
+        // "This action creates a network interface in the specified subnet with a private IP
+        // address from the IP address range of the subnet" (`CreateNatGateway`): every
+        // address of the gateway comes out of the block of the subnet the gateway is in, so
+        // a gateway whose subnet this store no longer holds has no range to take one from.
+        let subnet = store.subnets.get(&gateway_subnet_id).ok_or_else(|| {
+            internal_error(format!(
+                "the NAT gateway '{}' is in the subnet '{gateway_subnet_id}', \
+                 which this account holds no subnet for",
+                input.nat_gateway_id
+            ))
+        })?;
+        let zone_name = subnet.availability_zone.clone();
+        let zone_id = subnet.availability_zone_id.clone();
+        let subnet_cidr = subnet.cidr_block.clone().ok_or_else(|| {
+            internal_error(format!(
+                "the subnet '{gateway_subnet_id}' of NAT gateway '{}' holds no CIDR block",
+                input.nat_gateway_id
+            ))
+        })?;
+
+        // The ceiling asked of what the gateway would HOLD after the call, so the secondary
+        // addresses it already has count towards it.
+        let held_secondary = store
+            .nat_gateway_secondary_private_ips(&input.nat_gateway_id)
+            .len();
+        let asking = named.len().max(wanted_count);
+        if held_secondary + asking > MAX_SECONDARY_PRIVATE_IPS_PER_NAT_GATEWAY {
+            return Err(resource_count_exceeded(format!(
+                "The NAT gateway '{}' holds {held_secondary} of at most \
+                 {MAX_SECONDARY_PRIVATE_IPS_PER_NAT_GATEWAY} private IPv4 addresses beside \
+                 its primary one, so it cannot take {asking} more",
+                input.nat_gateway_id
+            )));
+        }
+
+        // A named address has to be one of the subnet's that an interface may be given — AWS
+        // reserves five of every block — and one NOTHING in the account holds, which is the
+        // one question `subnet_address_in_use` answers for every resource of the subnet at
+        // once. An address named twice in one request is in use the second time: nothing has
+        // been written yet, so the request's own plan answers for it.
+        let mut planned = ::std::collections::BTreeSet::new();
+        for private_ip in &named {
+            if !is_assignable_subnet_address(&subnet_cidr, private_ip) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{private_ip}' for privateIpAddress. It is not an \
+                     assignable address of the subnet '{gateway_subnet_id}' \
+                     ('{subnet_cidr}')"
+                )));
+            }
+            if store.subnet_address_in_use(private_ip) || !planned.insert(*private_ip) {
+                return Err(Scaffolded::invalid_ip_address_in_use(private_ip));
+            }
+        }
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE the first write:
+        // the flag asks whether the request WOULD have worked, so one that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // Every address is taken BEFORE the first one is stored, and handed back when the
+        // subnet runs out, so a call that cannot be finished does not leave the subnet short
+        // of addresses nothing holds. Each source has its own failure: a named address
+        // something took is `InvalidIPAddress.InUse`, and a subnet with no free address left
+        // is EC2's own `InsufficientFreeAddressesInSubnet`.
+        let mut taken: Vec<String> = Vec::new();
+        for private_ip in &named {
+            if !store.reserve_private_ip(private_ip) {
+                store.release_private_ips(&taken);
+                return Err(Scaffolded::invalid_ip_address_in_use(private_ip));
+            }
+            taken.push((*private_ip).to_string());
+        }
+        while taken.len() < wanted_count {
+            match store.mint_private_ip_in_cidr(&subnet_cidr) {
+                Some(private_ip) => taken.push(private_ip),
+                None => {
+                    store.release_private_ips(&taken);
+                    return Err(Scaffolded::insufficient_free_addresses());
+                }
+            }
+        }
+
+        // "The ID of the network interface associated with the NAT gateway"
+        // (`NatGatewayAddress$NetworkInterfaceId`): a NAT gateway handles its traffic through
+        // ONE network interface, so an address assigned to it goes on the interface the
+        // gateway already has, and a gateway holding no address yet gets a fresh one.
+        let network_interface_id = held_addresses
+            .iter()
+            .find_map(|address| address.network_interface_id.clone())
+            .unwrap_or_else(|| store.next_id(NETWORK_INTERFACE_ID_PREFIX));
+
+        let assigned: Vec<NatGatewayAddress> = taken
+            .iter()
+            .map(|private_ip| NatGatewayAddress {
+                // "[Public NAT gateway only] The allocation ID of the Elastic IP address"
+                // (`NatGatewayAddress$AllocationId`), and the association id that names it:
+                // a private address of a private gateway associates no Elastic IP address,
+                // so it carries neither, nor a public address.
+                allocation_id: None,
+                association_id: None,
+                network_interface_id: Some(network_interface_id.clone()),
+                private_ip: Some(private_ip.clone()),
+                public_ip: None,
+                // "Defines if the IP address is the primary address"
+                // (`NatGatewayAddress$IsPrimary`): the primary address of a NAT gateway is
+                // the one it was created with, so an assigned address is a secondary one.
+                is_primary: Some(false),
+                // Nothing has gone wrong with this assignment, so there is no "address
+                // failure message" to report.
+                failure_message: None,
+                // The call REPORTS the work it has just started, not the end of it: the
+                // address is in the transient status of an assignment, which the clock owes
+                // the terminal `succeeded` below.
+                status: Some(NAT_GATEWAY_ADDRESS_STATUS_ASSIGNING.to_string()),
+                availability_zone: zone_name.clone(),
+                availability_zone_id: zone_id.clone(),
+            })
+            .collect();
+
+        let gateway = store
+            .nat_gateways
+            .get_mut(&input.nat_gateway_id)
+            .ok_or_else(|| {
+                internal_error(format!(
+                    "the NAT gateway '{}' could not be read back",
+                    input.nat_gateway_id
+                ))
+            })?;
+        let answered_id = gateway.nat_gateway_id.clone();
+        gateway
+            .nat_gateway_addresses
+            .get_or_insert_with(Vec::new)
+            .extend(assigned.iter().cloned());
+
+        // What the clock now owes each new address: `succeeded`, one `TRANSITION_DELAY` from
+        // now — recorded rather than slept for, so a caller that reads the gateway straight
+        // away still sees the `assigning` status an assignment starts in. An address that
+        // associates no Elastic IP address is named in that move by the private address
+        // itself, which is what it carries instead of an association id.
+        for private_ip in &taken {
+            store.nat_gateway_address_transitions.insert(
+                private_ip.clone(),
+                NatGatewayAddressTransition::starting_now(
+                    &input.nat_gateway_id,
+                    NAT_GATEWAY_ADDRESS_STATUS_SUCCEEDED,
+                ),
+            );
+        }
+
+        // "NAT gateway IP addresses" (`$NatGatewayAddresses`): the addresses THIS call
+        // assigned, each as it was just stored — so what the caller is told is what a later
+        // reader of the gateway will see for them.
+        Ok(AssignPrivateNatGatewayAddressOutput {
+            nat_gateway_id: answered_id,
+            nat_gateway_addresses: Some(assigned),
+        })
     }
 }

@@ -3480,6 +3480,21 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// the modelled shape itself, which carries no member for when a transient
     /// `NatGatewayState` resolves. A gateway whose state is terminal has no entry here.
     pub nat_gateway_moves: BTreeMap<String, PendingStateMove>,
+    /// When the RELEASE of one NAT gateway private IPv4 address an
+    /// `UnassignPrivateNatGatewayAddress` is draining falls due, by `(NatGatewayId, private
+    /// address)`: "A private IP address will only be released at the end of
+    /// MaxDrainDurationSeconds … After the existing connections drain out, the private IP
+    /// addresses are released" (`UnassignPrivateNatGatewayAddress`). Until then the address
+    /// stays ON the gateway, in the transient
+    /// [`NAT_GATEWAY_ADDRESS_STATUS_UNASSIGNING`] status.
+    ///
+    /// Beside the gateway store for the same reason the moves above are: that store holds the
+    /// modelled shape itself, which carries no member for when a drain runs out. Monotonic
+    /// ([`Instant`]), because it is only ever compared against the clock and never reported.
+    /// An address nobody is unassigning has no entry here
+    /// ([`ComAmazonawsEc2Amazonec2State::release_drained_nat_gateway_addresses`] drops each
+    /// one as it is applied).
+    pub nat_gateway_address_drains: BTreeMap<(String, String), Instant>,
     /// Where the CloudWatch series each available NAT gateway publishes has got to, and the
     /// one in-process clock that advances them ([`NatGatewayMetricPublisher`]).
     ///
@@ -4182,6 +4197,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             nat_gateways: BTreeMap::new(),
             nat_gateway_address_transitions: BTreeMap::new(),
             nat_gateway_moves: BTreeMap::new(),
+            // A fresh account is unassigning no NAT gateway address, so none is draining.
+            nat_gateway_address_drains: BTreeMap::new(),
             // A fresh account holds no NAT gateway, so no series is running and no clock
             // advances one.
             nat_gateway_metrics: NatGatewayMetricPublisher::default(),
