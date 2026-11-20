@@ -46,9 +46,9 @@ use crate::harness::{
 /// outcome on and the dimension it reports that series per — the names of the AWS Lambda metric
 /// reference, written as literals so a series published under a name no AWS reader asks for fails
 /// here instead of agreeing with itself.
-const NAMESPACE: &str = "AWS/Lambda";
-const ERRORS_METRIC: &str = "Errors";
-const FUNCTION_DIMENSION: &str = "FunctionName";
+pub const NAMESPACE: &str = "AWS/Lambda";
+pub const ERRORS_METRIC: &str = "Errors";
+pub const FUNCTION_DIMENSION: &str = "FunctionName";
 
 /// The three states an alarm reports (`StateValue`).
 const ALARM: &str = "ALARM";
@@ -79,7 +79,7 @@ const EVALUATION_PERIODS: i64 = 1;
 /// `core/router/src/lib.rs` mounts them: the series Lambda publishes about its invocations is the
 /// one CloudWatch grades, and the notification an alarm action publishes reaches the queue
 /// subscribed to its topic.
-fn emulator_with_lambda_and_notifications() -> Emulator {
+pub fn emulator_with_lambda_and_notifications() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -165,7 +165,7 @@ fn package() -> String {
 
 /// Create the function `name`, and wait until Lambda reports it `Active` — the state an
 /// invocation needs. The wait is for that service's own report rather than for a span.
-async fn given_function(emulator: &Emulator, case: &str, name: &str) {
+pub async fn given_function(emulator: &Emulator, case: &str, name: &str) {
     let (status, _, created) = lambda(
         emulator,
         "POST",
@@ -205,7 +205,7 @@ async fn given_function(emulator: &Emulator, case: &str, name: &str) {
 }
 
 /// Invoke `name` once, synchronously, with a handler that raises when `raises`.
-async fn invoke(emulator: &Emulator, case: &str, name: &str, raises: bool) {
+pub async fn invoke(emulator: &Emulator, case: &str, name: &str, raises: bool) {
     let (status, headers, answered) = lambda(
         emulator,
         "POST",
