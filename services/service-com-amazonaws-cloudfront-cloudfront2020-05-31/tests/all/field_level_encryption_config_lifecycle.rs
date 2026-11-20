@@ -67,8 +67,8 @@ const URL_ENCODED: &str = "URLEncoded";
 /// than taken from the crate, so a reworded refusal fails this suite.
 const NO_SUCH_CONFIG_MESSAGE: &str = "The specified field level encryption config does not exist.";
 
-/// The sentence a read of this surface answers a value outside the form CloudFront ISSUES
-/// this resource's identifiers in: the identifier the service reports it cannot read,
+/// The sentence a read of this surface answers a value written outside the ALPHABET
+/// CloudFront writes an identifier in: the identifier the service reports it cannot read,
 /// naming the member that carried it.
 pub(crate) const UNREADABLE_ID_MESSAGE: &str = "Id format is invalid";
 const NO_SUCH_PROFILE_MESSAGE: &str = "The specified field level encryption profile does not exist.";
@@ -1313,13 +1313,14 @@ async fn an_id_no_configuration_holds_is_refused_by_the_reader() {
     // The rows span the ways an id can name no configuration: a well-shaped configuration id
     // that was never minted, an id in another namespace and of a width no identifier of this
     // kind is issued at, a minted id of another kind — the profile's, a different resource
-    // under the same surface — and a value of no CloudFront identifier form at all. Only an id
-    // of the form CloudFront ISSUES a configuration id in is the configuration reported absent;
-    // every other value is the id this read reports it cannot read.
+    // under the same surface — and a value of no CloudFront identifier form at all. Every value
+    // written in the identifier ALPHABET is the configuration reported absent, whatever letter
+    // it opens with and however wide it is; only a value outside that alphabet is the id this
+    // read reports it cannot read.
     for (case, expected) in [
         ("C3V3PVOY5NSBVE", NO_SUCH_CONFIG_MESSAGE),
-        ("EDFDVBD6EXAMPLE", UNREADABLE_ID_MESSAGE),
-        (profile.as_str(), UNREADABLE_ID_MESSAGE),
+        ("EDFDVBD6EXAMPLE", NO_SUCH_CONFIG_MESSAGE),
+        (profile.as_str(), NO_SUCH_CONFIG_MESSAGE),
         ("not-a-configuration-id", UNREADABLE_ID_MESSAGE),
     ] {
         let answer = get_config(&router, case).await;
@@ -1475,9 +1476,9 @@ async fn an_id_no_configuration_holds_is_refused_by_the_configuration_reader() {
     // that was never minted, an id in another namespace and of a width no identifier of this
     // kind is issued at, a minted id of another kind (the profile's, a different resource
     // under the same surface), the configuration's own id with a character changed, a bare
-    // digit, and a value outside the identifier alphabet. Only an id of the form CloudFront
-    // ISSUES a configuration id in is the configuration reported absent; every other value is
-    // reported unreadable.
+    // digit, and a value outside the identifier alphabet. Every value written in the identifier
+    // ALPHABET is the configuration reported absent; only a value outside it is reported
+    // unreadable.
     let mut mangled: Vec<char> = stored_id.chars().collect();
     if let Some(last) = mangled.last_mut() {
         *last = if *last == 'A' { 'B' } else { 'A' };
@@ -1485,11 +1486,11 @@ async fn an_id_no_configuration_holds_is_refused_by_the_configuration_reader() {
     let mangled: String = mangled.into_iter().collect();
     for (case, expected) in [
         ("C3V3PVOY5NSBVE", NO_SUCH_CONFIG_MESSAGE),
-        ("EDFDVBD6EXAMPLE", UNREADABLE_ID_MESSAGE),
-        (profile.as_str(), UNREADABLE_ID_MESSAGE),
+        ("EDFDVBD6EXAMPLE", NO_SUCH_CONFIG_MESSAGE),
+        (profile.as_str(), NO_SUCH_CONFIG_MESSAGE),
         (mangled.as_str(), NO_SUCH_CONFIG_MESSAGE),
         ("not-a-configuration-id", UNREADABLE_ID_MESSAGE),
-        ("0", UNREADABLE_ID_MESSAGE),
+        ("0", NO_SUCH_CONFIG_MESSAGE),
     ] {
         let answer = get_config_document(&router, case).await;
         assert_eq!(

@@ -9,16 +9,17 @@
 //!
 //! The rule under test: a call that finds nothing stored under the ARN it names in the
 //! calling Region is refused with the not-found error this service models
-//! (`ResourceNotFoundException`, HTTP 404), and the message that refusal carries is the
-//! template of the RESOURCE KIND the ARN identifies, not of the operation that looked it up:
+//! (`ResourceNotFoundException`, HTTP 404), and the message that refusal carries is the one
+//! the ROUTE's own recorded contract gives it:
 //!
-//! * the INFRASTRUCTURE configuration is reported by the ARN the request carried, quoted,
-//!   naming no kind — "The resource ARN '<arn>' was not found." — for its read and for its
-//!   delete alike;
-//! * every other resource of this service, the DISTRIBUTION configuration included, is
-//!   reported as the required resource it is, naming the kind its ARN identifies — "The
-//!   following required resource '<Kind>' cannot be found: '<arn>'." — whether the call
-//!   reads one, deletes one, updates one, tags one or resolves a reference to one.
+//! * a READ addressed by a CONFIGURATION resource's own ARN — the infrastructure
+//!   configuration's and the distribution configuration's alike — reports the ARN the request
+//!   carried, quoted, naming no kind: "The resource ARN '<arn>' was not found."; the
+//!   infrastructure configuration's DELETE reports it the same way;
+//! * every other report names the resource KIND the ARN identifies — "The following required
+//!   resource '<Kind>' cannot be found: '<arn>'." — whether the call reads one of the
+//!   versioned families, deletes a distribution configuration, updates one, tags one or
+//!   resolves a reference to one.
 //!
 //! The rows span what the rule generalises over: which configuration family the ARN names,
 //! which operation performs the lookup, the form of the configuration name the ARN carries,
@@ -152,7 +153,8 @@ fn assert_ok(case: &str, status: u16, body: Value) -> Value {
 /// Which of this service's two missing-resource sentences an answer has to carry.
 #[derive(Clone, Copy)]
 enum Sentence {
-    /// The one the infrastructure configuration carries: the ARN the request named, quoted.
+    /// The one a call addressed by a configuration's own ARN carries: the ARN the request
+    /// named, quoted.
     Arn,
     /// The one every other report carries: the kind the ARN identifies, and the ARN.
     Kind(&'static str),
@@ -284,7 +286,7 @@ struct Family {
     read: &'static str,
     /// The delete that clears one, up to the ARN it takes in its query string.
     delete: &'static str,
-    /// The sentence a report of this family's missing resource carries.
+    /// The sentence a report of this family's missing resource carries on its READ.
     sentence: Sentence,
 }
 
@@ -309,7 +311,7 @@ const DISTRIBUTION: Family = Family {
     minted: "distributionConfigurationArn",
     read: "/GetDistributionConfiguration?distributionConfigurationArn=",
     delete: "/DeleteDistributionConfiguration?distributionConfigurationArn=",
-    sentence: Sentence::Kind("DistributionConfiguration"),
+    sentence: Sentence::Arn,
 };
 
 /// The ARN a configuration of `family` named `name` carries in `region`, as the modelled
@@ -324,7 +326,7 @@ fn arn_of(family: Family, region: &str, name: &str) -> String {
 }
 
 #[tokio::test]
-async fn a_read_of_a_configuration_this_region_holds_nothing_under_carries_its_kinds_sentence()
+async fn a_read_of_a_configuration_this_region_holds_nothing_under_quotes_the_arn()
 {
     for family in [INFRASTRUCTURE, DISTRIBUTION] {
         let router = emulator();

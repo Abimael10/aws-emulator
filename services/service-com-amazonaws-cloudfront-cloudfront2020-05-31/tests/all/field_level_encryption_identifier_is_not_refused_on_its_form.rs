@@ -4,14 +4,14 @@
 //!
 //! The rule under test is the other half of the one
 //! `field_level_encryption_identifier_width_and_namespace.rs` states: an operation addressed by
-//! a field-level encryption `Id` reads the form CloudFront ISSUES that record's identifiers in
-//! — the record's own namespace letter (the configuration's `C`, the profile's `P`) over a body
-//! of the issued width, written in the digits and uppercase letters CloudFront writes an
-//! identifier in — and that judgement must never stand between a caller and an identifier the
-//! service really handed it. So every identifier OF that form is carried through to the store:
-//! it is SERVED where a record answers to it, and reported ABSENT ("The specified field level
-//! encryption config/profile does not exist.") where none does — never "Id format is invalid",
-//! which tells a caller its own identifier handling is broken.
+//! a field-level encryption `Id` reads the ALPHABET CloudFront writes an identifier in — its
+//! digits and uppercase letters, carrying no separator and no lower case — and nothing else of
+//! the value's form, and that judgement must never stand between a caller and an identifier the
+//! service really handed it. So every identifier this service ISSUES, whose namespace letter
+//! (the configuration's `C`, the profile's `P`) and whose body are written in that alphabet, is
+//! carried through to the store: it is SERVED where a record answers to it, and reported ABSENT
+//! ("The specified field level encryption config/profile does not exist.") where none does —
+//! never "Id format is invalid", which tells a caller its own identifier handling is broken.
 //!
 //! The rows vary what the rule generalises over, in the dimension that matters here — which
 //! identifier of the issued form is submitted, and whether anything answers to it:

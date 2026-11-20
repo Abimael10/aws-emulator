@@ -199,9 +199,9 @@ fn assert_refusal(answer: &Answer, case: &str, status: u16, code: &str, message:
 
 /// Every path that reports a field-level encryption profile id as naming nothing answers
 /// `NoSuchFieldLevelEncryptionProfile`, with the absent-profile wire sentence where the id is
-/// of the form CloudFront ISSUES a profile id in and the unreadable-identifier sentence where
-/// it is not — while an id that travels in a submitted DOCUMENT as a mapping's `ProfileId`
-/// addresses nothing, so it reports the absent profile whatever shape it takes.
+/// written in the ALPHABET CloudFront writes an identifier in and the unreadable-identifier
+/// sentence where it is not — while an id that travels in a submitted DOCUMENT as a mapping's
+/// `ProfileId` addresses nothing, so it reports the absent profile whatever shape it takes.
 #[tokio::test]
 async fn every_path_that_reports_a_missing_profile_sends_the_wire_sentence() {
     let router = emulator();
@@ -340,10 +340,11 @@ async fn every_path_that_reports_a_missing_profile_sends_the_wire_sentence() {
 }
 
 /// A READ of a profile answers its one not-found code for every `Id` it cannot resolve, and
-/// the identifier's ISSUED FORM decides the sentence: a value written as CloudFront issues a
-/// PROFILE id — the profile namespace letter over a body of the issued width — that nothing
-/// answers to reports the profile that is ABSENT, while every other value, a minted id of
-/// another resource kind of this service included, is the identifier reported UNREADABLE.
+/// the identifier's ALPHABET decides the sentence: a value written in the characters
+/// CloudFront writes an identifier in that nothing answers to reports the profile that is
+/// ABSENT — a minted id of another resource kind of this service included, since neither the
+/// letter an identifier opens with nor the width of its body is read — while a value written
+/// outside that alphabet is the identifier reported UNREADABLE.
 ///
 /// The rows span the shapes an `Id` takes outside a profile id's: the namespaces of this
 /// service a profile id's is disjoint from, taking two of them from ids this emulator really
@@ -369,17 +370,17 @@ async fn a_profile_read_answers_one_sentence_for_every_id_it_cannot_resolve() {
         (
             "the sibling configuration's own id",
             config_id.clone(),
-            UNREADABLE_PROFILE_ID_MESSAGE,
+            NO_SUCH_PROFILE_MESSAGE,
         ),
         (
             "a public key id this service minted",
             key.clone(),
-            UNREADABLE_PROFILE_ID_MESSAGE,
+            NO_SUCH_PROFILE_MESSAGE,
         ),
         (
             "a distribution id's namespace",
             "E1234567890ABC".to_string(),
-            UNREADABLE_PROFILE_ID_MESSAGE,
+            NO_SUCH_PROFILE_MESSAGE,
         ),
         (
             "a UUID, the namespace the policy kinds are keyed by",

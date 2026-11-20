@@ -1,19 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! A field-level encryption identifier in the REQUEST PATH earns the sentence its own ISSUED
-//! FORM decides, end to end over HTTP.
+//! A field-level encryption identifier in the REQUEST PATH earns the sentence its own
+//! ALPHABET decides, end to end over HTTP.
 //!
 //! The rule under test: an operation ADDRESSED by a field-level encryption identifier answers
 //! its one modelled not-found code (404) for every identifier it cannot resolve — these
 //! operations model no argument error
 //! (`smithy_query(query="operation",operation="GetFieldLevelEncryptionConfig")` reports
 //! `errors: [AccessDenied, NoSuchFieldLevelEncryptionConfig]`) — so the MESSAGE is what tells
-//! the two conditions apart: an identifier written as CloudFront ISSUES that record's
-//! identifiers (the record's own namespace letter over a body of the issued width, in the
-//! digits and uppercase letters it writes identifiers in) that the store holds nothing for is
-//! the ABSENT resource ("The specified field level encryption config/profile does not exist."),
-//! and every other value is the identifier the service reports it cannot READ ("Id format is
-//! invalid"). Both sentences are fixed text: neither echoes the value submitted.
+//! the two conditions apart: a value written in the characters CloudFront writes an identifier
+//! in (its digits and uppercase letters, carrying no separator and no lower case) that the
+//! store holds nothing for is the ABSENT resource ("The specified field level encryption
+//! config/profile does not exist."), and a value written OUTSIDE that alphabet is the
+//! identifier the service reports it cannot READ ("Id format is invalid"). `Id` is a plain
+//! `string` `@httpLabel` with no `@pattern` and no `@length`, so neither the letter an
+//! identifier opens with nor the width of its body is a property these routes refuse a value
+//! on. Both sentences are fixed text: neither echoes the value submitted.
 //!
 //! So the rows span what the rule generalises over:
 //!
@@ -21,15 +23,15 @@
 //!   (`P`-prefixed) — each with its own sentence;
 //! * every OPERATION that addresses one by a path identifier: both readers of each kind, its
 //!   update and its delete;
-//! * the identifiers of the kind's own issued form the store holds nothing for: one of the
-//!   kind's own namespace that was never minted, and the minted id with its last character
-//!   changed — each the ABSENT resource;
-//! * and the values that are not of that form: bodies one character short of and one character
-//!   past the width the kind is issued at, a namespace letter no kind of this service issues an
-//!   identifier under, the sibling kind's own minted id, a public key id, the `E`-prefixed
-//!   namespace the other CloudFront entity ids are drawn from, a minted id in lower case, a
-//!   body outside the id alphabet, a UUID, a bare word and the resource's own caller reference
-//!   — each the identifier reported UNREADABLE.
+//! * the values written in the identifier alphabet the store holds nothing for: one of the
+//!   kind's own namespace that was never minted, the minted id with its last character
+//!   changed, bodies one character short of and one character past the width the kind is issued
+//!   at, a namespace letter no kind of this service issues an identifier under, the sibling
+//!   kind's own minted id, a public key id and the `E`-prefixed namespace the other CloudFront
+//!   entity ids are drawn from — each the ABSENT resource;
+//! * and the values written outside it: a minted id in lower case, a body outside the id
+//!   alphabet, a UUID, a bare word and the resource's own caller reference — each the
+//!   identifier reported UNREADABLE.
 //!
 //! Each kind's width and alphabet are read off an id this emulator really MINTED rather than
 //! written out here, so the table cannot drift from what the service issues.
@@ -57,8 +59,8 @@ use crate::field_level_encryption_profile_lifecycle::{
 const NO_SUCH_CONFIG: &str = "The specified field level encryption config does not exist.";
 const NO_SUCH_PROFILE: &str = "The specified field level encryption profile does not exist.";
 
-/// The sentence these operations answer a value that is not of the kind's issued identifier
-/// form, naming the member that carried it.
+/// The sentence these operations answer a value written outside the identifier alphabet,
+/// naming the member that carried it.
 const UNREADABLE_IDENTIFIER: &str = "Id format is invalid";
 
 /// The caller references the two stored resources of each case are held under.
@@ -121,7 +123,7 @@ impl Op {
         }
     }
 
-    /// The sentence the operation answers an identifier of its kind's ISSUED FORM that the
+    /// The sentence the operation answers a value written in the identifier alphabet that the
     /// store holds no resource for.
     fn absent(self) -> &'static str {
         match self.kind() {
@@ -244,38 +246,38 @@ async fn seed(router: &MultiServiceRouter) -> Stored {
 }
 
 /// One identifier a case submits where an identifier of the addressed kind belongs, and
-/// whether it is written as CloudFront ISSUES that kind's identifiers — which is what decides
-/// the sentence it earns.
+/// whether it is written in the ALPHABET CloudFront writes an identifier in — which is what
+/// decides the sentence it earns.
 struct Shape {
     case: String,
     id: String,
-    in_the_issued_form: bool,
+    in_the_identifier_alphabet: bool,
 }
 
 impl Shape {
-    /// An identifier of the kind's own issued form: the store holding nothing for it is the
+    /// A value written in the identifier alphabet: the store holding nothing for it is the
     /// absent resource.
     fn own(case: impl Into<String>, id: impl Into<String>) -> Self {
         Self {
             case: case.into(),
             id: id.into(),
-            in_the_issued_form: true,
+            in_the_identifier_alphabet: true,
         }
     }
 
-    /// A value of another form, which this kind's identifiers are never issued in: the
+    /// A value written outside that alphabet, which no identifier CloudFront issues is: the
     /// identifier the service reports it cannot read.
     fn foreign(case: impl Into<String>, id: impl Into<String>) -> Self {
         Self {
             case: case.into(),
             id: id.into(),
-            in_the_issued_form: false,
+            in_the_identifier_alphabet: false,
         }
     }
 
     /// The sentence this identifier earns from `op`.
     fn expected(&self, op: Op) -> &'static str {
-        if self.in_the_issued_form {
+        if self.in_the_identifier_alphabet {
             op.absent()
         } else {
             UNREADABLE_IDENTIFIER
@@ -305,38 +307,38 @@ fn shapes(kind: Kind, stored: &Stored, public_key: &str) -> Vec<Shape> {
     let changed: String = changed.into_iter().collect();
 
     vec![
-        // Identifiers of the kind's own issued form, which the store holds nothing for.
+        // Values written in the identifier alphabet, which the store holds nothing for.
         Shape::own(
             "an id of this kind that was never minted",
             format!("{prefix}{}", "0".repeat(body.len())),
         ),
         Shape::own("the minted id with its last character changed", changed),
-        // And every value that is not of that form.
-        Shape::foreign(
+        Shape::own(
             "this kind's prefix with a body one character short",
             format!("{prefix}{}", &body[..body.len() - 1]),
         ),
-        Shape::foreign(
+        Shape::own(
             "this kind's prefix with a body one character too long",
             format!("{prefix}{body}A"),
         ),
-        Shape::foreign(
+        Shape::own(
             "a namespace letter no kind of this service mints",
             format!("W{body}"),
         ),
-        Shape::foreign(
+        Shape::own(
             "a namespace letter no kind of this service mints and a far longer body",
             format!("W{body}{body}"),
         ),
-        Shape::foreign(
+        Shape::own(
             "the sibling field-level encryption kind's own minted id",
             sibling,
         ),
-        Shape::foreign("a public key id this service minted", public_key),
-        Shape::foreign(
+        Shape::own("a public key id this service minted", public_key),
+        Shape::own(
             "the namespace every other CloudFront entity id is drawn from",
             format!("E{body}"),
         ),
+        // And every value written outside that alphabet.
         Shape::foreign("the minted id in lower case", minted.to_lowercase()),
         Shape::foreign(
             "this kind's prefix with a body outside the id alphabet",
@@ -379,10 +381,10 @@ fn assert_refusal(answer: &Answer, case: &str, code: &str, message: &str) {
 // ---------------------------------------------------------------------------
 
 /// Every operation addressed by a field-level encryption identifier answers its one not-found
-/// code for an identifier it cannot resolve, and the identifier's ISSUED FORM decides which of
-/// that code's two sentences: the absent-resource sentence for an identifier written as
-/// CloudFront issues that record's identifiers, and the unreadable-identifier sentence for
-/// every other value.
+/// code for an identifier it cannot resolve, and the identifier's ALPHABET decides which of
+/// that code's two sentences: the absent-resource sentence for a value written in the
+/// characters CloudFront writes an identifier in, and the unreadable-identifier sentence for a
+/// value written outside them.
 #[tokio::test]
 async fn a_path_identifier_that_resolves_to_nothing_earns_the_sentence_its_form_decides() {
     let router = emulator();

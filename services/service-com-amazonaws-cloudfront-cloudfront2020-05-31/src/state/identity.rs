@@ -959,6 +959,28 @@ pub fn is_namespaced_resource_id(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+/// Whether `value` is written in the characters CloudFront writes an ENTITY IDENTIFIER in:
+/// a non-empty run of the id alphabet ([`is_token_byte`] — decimal digits and uppercase
+/// ASCII letters), carrying no separator and no lower case.
+///
+/// The ALPHABET alone, with no namespace letter and no width: the members that carry such an
+/// identifier are plain `string` `@httpLabel`s in the model — no `@pattern`, no `@length` —
+/// so neither the letter an identifier opens with nor the width of its body is a property a
+/// route may refuse a value on. The identifiers this emulator MINTS are one form of that
+/// alphabet, never the only form CloudFront writes an identifier in, and WHICH identifier of
+/// it was ever issued is a property of the STORE: a value of this alphabet is therefore
+/// carried through to the store and reported as the resource that is ABSENT, while a value
+/// written outside it — in lower case, around a separator, as a UUID or as a word — was
+/// never an identifier at all and is the identifier a route reports it cannot READ
+/// ([`invalid_id_format`]).
+///
+/// How much of an identifier's form a route reads is each resource kind's own recorded
+/// contract (see the `path_identifiers` module): this is the half the field-level encryption
+/// records read.
+pub fn is_entity_id_form(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(is_token_byte)
+}
+
 /// Whether `value` has the shape of a key group id this service mints
 /// ([`ComAmazonawsCloudfrontCloudfront20200531State::allocate_key_group_id`] draws a UUID).
 ///

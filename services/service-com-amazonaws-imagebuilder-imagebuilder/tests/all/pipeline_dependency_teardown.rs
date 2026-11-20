@@ -211,8 +211,9 @@ fn resource_dependency_message(arn: &str) -> String {
     )
 }
 
-/// The missing-resource sentence the INFRASTRUCTURE configuration carries: the ARN the request
-/// named, quoted.
+/// The missing-resource sentence a call ADDRESSED by a configuration's own ARN carries: the
+/// ARN the request named, quoted — both families' reads, and the infrastructure
+/// configuration's delete.
 fn configuration_not_found_message(arn: &str) -> String {
     format!("The resource ARN '{arn}' was not found.")
 }
@@ -238,8 +239,11 @@ struct Dependent {
     echoed: &'static str,
     /// The refusal the delete earns while the pipeline still reaches it.
     dependency: String,
-    /// What a lookup answers once it is gone, for a read and a repeat of the delete alike.
+    /// What a READ answers once it is gone.
     missing: String,
+    /// What a repeat of the DELETE answers once it is gone, which the distribution
+    /// configuration words differently from its read.
+    missing_on_delete: String,
 }
 
 /// `CreateComponent` for one build version of `name`, answering its build version ARN.
@@ -410,13 +414,19 @@ async fn assert_released(router: &MultiServiceRouter, case: &str, dependent: &De
     let (status, deleted) = call(router, "DELETE", &uri, None).await;
     assert_deleted(&case, status, &deleted, dependent.echoed, &dependent.arn);
 
-    for (what, method, uri) in [
+    for (what, method, uri, expected) in [
         (
             "read after the delete",
             "GET",
             format!("{}{}", dependent.read, dependent.arn),
+            &dependent.missing,
         ),
-        ("deleted a second time", "DELETE", uri),
+        (
+            "deleted a second time",
+            "DELETE",
+            uri,
+            &dependent.missing_on_delete,
+        ),
     ] {
         let (status, missing) = call(router, method, &uri, None).await;
         assert_refused(
@@ -425,7 +435,7 @@ async fn assert_released(router: &MultiServiceRouter, case: &str, dependent: &De
             &missing,
             404,
             "ResourceNotFoundException",
-            &dependent.missing,
+            expected,
         );
     }
 }
@@ -471,6 +481,7 @@ async fn a_pipeline_protects_every_resource_it_references_until_it_is_gone() {
                 echoed: "imageRecipeArn",
                 dependency: resource_dependency_message(&recipe),
                 missing: required_resource_message("ImageRecipe", &recipe),
+                missing_on_delete: required_resource_message("ImageRecipe", &recipe),
             },
             Dependent {
                 label: "the infrastructure configuration it builds in",
@@ -481,6 +492,7 @@ async fn a_pipeline_protects_every_resource_it_references_until_it_is_gone() {
                 echoed: "infrastructureConfigurationArn",
                 dependency: configuration_dependency_message(&infrastructure),
                 missing: configuration_not_found_message(&infrastructure),
+                missing_on_delete: configuration_not_found_message(&infrastructure),
             },
             Dependent {
                 label: "the distribution configuration it distributes with",
@@ -489,7 +501,11 @@ async fn a_pipeline_protects_every_resource_it_references_until_it_is_gone() {
                 read: "/GetDistributionConfiguration?distributionConfigurationArn=",
                 echoed: "distributionConfigurationArn",
                 dependency: resource_dependency_message(&distribution),
-                missing: required_resource_message("DistributionConfiguration", &distribution),
+                missing: configuration_not_found_message(&distribution),
+                missing_on_delete: required_resource_message(
+                    "DistributionConfiguration",
+                    &distribution,
+                ),
             },
         ];
 
@@ -557,6 +573,7 @@ async fn a_recipe_is_released_the_instant_the_pipeline_stops_naming_it() {
             echoed: "imageRecipeArn",
             dependency: resource_dependency_message(&held),
             missing: required_resource_message("ImageRecipe", &held),
+            missing_on_delete: required_resource_message("ImageRecipe", &held),
         };
         let replacement_dependent = Dependent {
             label: "the recipe the pipeline was pointed at",
@@ -566,6 +583,7 @@ async fn a_recipe_is_released_the_instant_the_pipeline_stops_naming_it() {
             echoed: "imageRecipeArn",
             dependency: resource_dependency_message(&replacement),
             missing: required_resource_message("ImageRecipe", &replacement),
+            missing_on_delete: required_resource_message("ImageRecipe", &replacement),
         };
 
         // Before the update, the recipe the pipeline names is protected and the other is not

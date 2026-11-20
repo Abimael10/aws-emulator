@@ -228,9 +228,9 @@ fn required_resource_message(resource_type: &str, arn: &str) -> String {
     format!("The following required resource '{resource_type}' cannot be found: '{arn}'.")
 }
 
-/// The not-found report the INFRASTRUCTURE configuration carries, quoting the ARN the request
-/// named: the one resource of this service reported by its ARN alone, for its read and for
-/// its delete alike.
+/// The not-found report a call ADDRESSED by a configuration's own ARN carries, quoting the ARN
+/// the request named: both families' reads word a missing configuration this way, and so does
+/// the infrastructure configuration's delete.
 fn configuration_not_found_message(arn: &str) -> String {
     format!("The resource ARN '{arn}' was not found.")
 }
@@ -812,10 +812,7 @@ async fn a_dependency_refusal_quotes_only_the_arn_the_request_asked_to_delete() 
                     echoed: "distributionConfigurationArn",
                     delete_referrer: "/DeleteImagePipeline?imagePipelineArn=",
                     dependency: dependency_message(&distribution),
-                    missing: required_resource_message(
-                        "DistributionConfiguration",
-                        &distribution,
-                    ),
+                    missing: configuration_not_found_message(&distribution),
                     missing_on_delete: required_resource_message(
                         "DistributionConfiguration",
                         &distribution,

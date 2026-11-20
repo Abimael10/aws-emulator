@@ -11,10 +11,10 @@
 //!
 //! * the FORM — how much of the way CloudFront writes that kind's identifiers a route reads of
 //!   the value, which is a property of the value alone. The two field-level encryption records
-//!   read the whole form their identifiers are ISSUED in — the record's own namespace letter
-//!   over a body of the issued width ([`super::is_field_level_encryption_config_id`],
-//!   [`super::is_field_level_encryption_profile_id`],
-//!   [`super::unresolved_field_level_encryption_config`]); the distribution reads the whole
+//!   read the ALPHABET an identifier is written in and nothing more — neither the letter it
+//!   opens with nor the width of its body ([`super::is_entity_id_form`],
+//!   [`super::unresolved_field_level_encryption_config`],
+//!   [`super::unresolved_field_level_encryption_profile`]); the distribution reads the whole
 //!   form its ids are minted in ([`super::is_distribution_id`]); and the origin access
 //!   control reads NONE of it, so every id it cannot resolve is the control reported absent
 //!   ([`ComAmazonawsCloudfrontCloudfront20200531State::unresolved_origin_access_control`]);

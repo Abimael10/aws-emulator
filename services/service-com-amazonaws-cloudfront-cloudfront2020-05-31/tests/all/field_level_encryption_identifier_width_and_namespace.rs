@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The WIDTH and the NAMESPACE LETTER of a field-level encryption path identifier are BOTH
+//! The WIDTH and the NAMESPACE LETTER of a field-level encryption path identifier are NEITHER
 //! read when the one not-found code's two sentences are told apart, end to end over HTTP.
 //!
 //! The rule under test: an operation addressed by a field-level encryption identifier reads the
-//! form CloudFront ISSUES that record's identifiers in — the record's own namespace letter (the
-//! configuration's `C`, the profile's `P`) over a body of the issued width, in the digits and
-//! uppercase letters CloudFront writes an identifier in. An identifier of that form the store
-//! holds no record for is the record reported ABSENT ("The specified field level encryption
-//! config/profile does not exist."), and every other value — another width, another namespace
-//! letter, another kind's minted identifier, anything outside the alphabet — is the identifier
-//! the service reports it cannot READ ("Id format is invalid"). Both sentences travel under the
+//! ALPHABET CloudFront writes an identifier in and nothing more — the digits and uppercase
+//! letters an identifier is written in, carrying no separator and no lower case. `Id` is a
+//! plain `string` `@httpLabel` with no `@pattern` and no `@length`, so neither the letter an
+//! identifier opens with (the configuration's `C`, the profile's `P`) nor the width of its body
+//! is a property a route may refuse a value on: every value of that alphabet is carried through
+//! to the store and, where nothing answers to it, is the record reported ABSENT ("The specified
+//! field level encryption config/profile does not exist."), while a value written outside the
+//! alphabet — in lower case, around a separator, as a UUID or as a word — is the identifier the
+//! service reports it cannot READ ("Id format is invalid"). Both sentences travel under the
 //! kind's one modelled not-found code and its 404
 //! (`smithy_query(query="operation",operation="GetFieldLevelEncryption,GetFieldLevelEncryptionConfig,GetFieldLevelEncryptionProfile,GetFieldLevelEncryptionProfileConfig")`
 //! reports the kind's not-found error and `AccessDenied` and nothing else), so the MESSAGE is
@@ -20,14 +22,16 @@
 //!
 //! * the BODY at the issued width, written in digits and letters never minted, in zeros, in one
 //!   letter, and as the minted identifier with its last character changed — each the record
-//!   reported absent, since WHICH identifier of that form was issued is a property of the store;
+//!   reported absent, since WHICH identifier of that alphabet was issued is a property of the
+//!   store;
 //! * the BODY WIDTH, from one character up to three times the width this service issues,
-//!   including one short of and one past it;
+//!   including one short of and one past it — each still carried through to the store;
 //! * the NAMESPACE LETTER: the addressed kind's own, one no kind of this service issues an
 //!   identifier under, the one every other CloudFront entity id is drawn from, and a leading
 //!   digit — the last three at the issued width as well as at every other;
 //! * the identifiers of the NEIGHBOURING kinds this service really minted — the sibling
-//!   field-level encryption record's and a public key's — each issued under another letter;
+//!   field-level encryption record's and a public key's — each issued under another letter and
+//!   each still a value this surface resolves against its own store;
 //! * both RESOURCE KINDS of this surface, each through every operation that addresses it by a
 //!   path identifier — both readers, the update and the delete;
 //! * and the values that are outside the alphabet altogether: a minted identifier in lower
@@ -56,8 +60,8 @@ use crate::field_level_encryption_profile_lifecycle::{
 const NO_SUCH_CONFIG: &str = "The specified field level encryption config does not exist.";
 const NO_SUCH_PROFILE: &str = "The specified field level encryption profile does not exist.";
 
-/// The sentence every one of these operations answers a value that is not of the kind's issued
-/// identifier form, naming the member that carried it.
+/// The sentence every one of these operations answers a value written outside the alphabet
+/// CloudFront writes an identifier in, naming the member that carried it.
 pub(crate) const UNREADABLE_IDENTIFIER: &str = "Id format is invalid";
 
 /// The caller references the two seeded resources are held under.
@@ -85,8 +89,8 @@ impl Kind {
         }
     }
 
-    /// The sentence this kind answers an identifier of its issued form it holds no resource
-    /// for.
+    /// The sentence this kind answers a value written in the identifier alphabet it holds no
+    /// resource for.
     pub(crate) fn absent(self) -> &'static str {
         match self {
             Self::Config => NO_SUCH_CONFIG,
@@ -330,12 +334,12 @@ fn identifiers_of_the_issued_form(kind: Kind, seeded: &Seeded) -> Vec<(String, S
     rows
 }
 
-/// Every value this suite submits where an identifier of `kind` belongs that is NOT of that
-/// kind's issued form: the kind's own namespace letter at every width in [`other_widths`], a
-/// letter no kind of this service issues an identifier under, the letter every other entity id
-/// of this service is drawn from and a leading digit — each at the issued width and at every
-/// other one — so neither the width nor the namespace letter alone carries a value into the
-/// form.
+/// Every value this suite submits where an identifier of `kind` belongs that is written in the
+/// identifier alphabet at ANOTHER width or under ANOTHER namespace letter: the kind's own
+/// namespace letter at every width in [`other_widths`], a letter no kind of this service issues
+/// an identifier under, the letter every other entity id of this service is drawn from and a
+/// leading digit — each at the issued width and at every other — so neither the width nor the
+/// namespace letter keeps a value of the alphabet from reaching the store.
 fn values_of_other_widths_and_namespaces(kind: Kind, seeded: &Seeded) -> Vec<(String, String)> {
     let minted = seeded.minted(kind);
     let namespace = minted.chars().next().unwrap_or(UNMINTED_NAMESPACE);
@@ -364,9 +368,10 @@ fn values_of_other_widths_and_namespaces(kind: Kind, seeded: &Seeded) -> Vec<(St
 }
 
 /// The identifiers of the NEIGHBOURING kinds this emulator really minted, submitted where an
-/// identifier of `kind` belongs: each was issued under ANOTHER kind's namespace letter, so each
-/// is the identifier the addressed operation reports it cannot read — an identifier of one kind
-/// is never an identifier of another.
+/// identifier of `kind` belongs: each was issued under ANOTHER kind's namespace letter, and each
+/// is still a value of the identifier alphabet — so the addressed operation resolves it against
+/// its own store and reports the record that is absent, the letter it opens with being no part
+/// of the judgement.
 fn neighbouring_minted_identifiers(
     kind: Kind,
     seeded: &Seeded,
@@ -460,12 +465,13 @@ async fn an_identifier_of_the_issued_form_the_store_cannot_resolve_reads_as_abse
     );
 }
 
-/// Both the WIDTH and the NAMESPACE LETTER are read: a body at any other width under the kind's
-/// own letter, any width under a letter this kind's identifiers are not issued under, and the
-/// identifiers the neighbouring kinds were really minted under are each the identifier reported
-/// UNREADABLE, through every operation addressed by one.
+/// Neither the WIDTH nor the NAMESPACE LETTER is read: a body at any other width under the
+/// kind's own letter, any width under a letter this kind's identifiers are not issued under, and
+/// the identifiers the neighbouring kinds were really minted under are each carried through to
+/// the store and reported as the record that is ABSENT, through every operation addressed by
+/// one.
 #[tokio::test]
-async fn a_value_of_another_width_or_namespace_is_reported_unreadable() {
+async fn a_value_of_another_width_or_namespace_is_carried_through_to_the_store() {
     let router = emulator();
     let seeded = seed(&router).await;
     let public_key = upload_key(&router, 1).await;
@@ -480,7 +486,7 @@ async fn a_value_of_another_width_or_namespace_is_reported_unreadable() {
                     &answer,
                     &format!("{operation} with {case} ({id:?})"),
                     kind.code(),
-                    UNREADABLE_IDENTIFIER,
+                    kind.absent(),
                 );
             }
         }

@@ -25,8 +25,8 @@
 //! released (the pipeline was pointed at another configuration, the optional reference was
 //! dropped, the pipeline was deleted), why an ARN resolves to nothing (deleted, or stored in
 //! another Region than the endpoint the call reached) and which of this service's two
-//! missing-resource sentences each answer carries — the infrastructure configuration quoting
-//! the ARN the request named, the distribution configuration naming the kind its ARN
+//! missing-resource sentences each answer carries — a read of either family quoting the ARN
+//! the request named, the distribution configuration's delete naming the kind its ARN
 //! identifies.
 
 use std::sync::Arc;
@@ -247,14 +247,16 @@ fn resource_dependency_message(arn: &str) -> String {
     )
 }
 
-/// The missing-resource sentence the INFRASTRUCTURE configuration carries, for its read and
-/// for its delete alike: the ARN the request named, quoted.
+/// The missing-resource sentence a call ADDRESSED by a configuration's own ARN carries: the
+/// ARN the request named, quoted, naming no kind — both families' reads, and the
+/// infrastructure configuration's delete.
 fn configuration_not_found_message(arn: &str) -> String {
     format!("The resource ARN '{arn}' was not found.")
 }
 
-/// The missing-resource sentence that names the kind the ARN identifies — what every lookup
-/// of the DISTRIBUTION configuration carries, whether it reads one or deletes one.
+/// The missing-resource sentence that names the kind the ARN identifies — what the
+/// DISTRIBUTION configuration's delete carries, as every report of a resource a call had to
+/// resolve does.
 fn required_resource_message(kind: &str, arn: &str) -> String {
     format!("The following required resource '{kind}' cannot be found: '{arn}'.")
 }
@@ -338,7 +340,7 @@ const DISTRIBUTION: Family = Family {
     echoed: "distributionConfigurationArn",
     reference: Reference::Distribution,
     dependency: resource_dependency_message,
-    missing_on_read: |arn| required_resource_message("DistributionConfiguration", arn),
+    missing_on_read: configuration_not_found_message,
     missing_on_delete: |arn| required_resource_message("DistributionConfiguration", arn),
 };
 
