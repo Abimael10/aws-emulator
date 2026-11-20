@@ -6,8 +6,8 @@
 //! refusing one GraphQL cannot read, one that declares no single type, and one that
 //! declares a type other than the addressed one. The type keeps its identity (its name,
 //! its ARN and its place among the API's types); the `format` the request names chooses
-//! how the answer reports the definition the request stated
-//! (`crate::state::TypeRecord::to_stated_type`).
+//! how the answer reports the definition the request stated, through this operation's own
+//! projection, which carries no `name` (`crate::state::TypeRecord::to_updated_type`).
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -273,12 +273,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Answer from the STORED record, with the definition in the format the request
         // asked for — the definition as this request stated it (or, for a request that
         // stated none, the one that was already stored); a later read answers the
-        // service's own rendering of it.
+        // service's own rendering of it. The `Type` an update reports carries no `name`
+        // (`crate::state::TypeRecord::to_updated_type`).
         Ok(UpdateTypeOutput {
             r#type: api
                 .types
                 .get(&input.type_name)
-                .map(|record| record.to_stated_type(&input.format, &api.types)),
+                .map(|record| record.to_updated_type(&input.format, &api.types)),
         })
     }
 }

@@ -145,6 +145,45 @@ impl TypeRecord {
         self.projected(format, self.stated_definition(format, api_types))
     }
 
+    /// This record as the modelled `Type` shape an UPDATE of its definition answers with.
+    ///
+    /// Recorded behaviour: the `Type` an update reports carries NO `name` — the member is
+    /// absent from the body, unlike the one a read answers with — while its definition is
+    /// the one the request stated ([`Self::to_stated_type`]). `Type$name` is an optional
+    /// member, so the projection a call answers with is the operation's own.
+    pub fn to_updated_type(&self, format: &str, api_types: &BTreeMap<String, TypeRecord>) -> Type {
+        Type {
+            name: None,
+            ..self.to_stated_type(format, api_types)
+        }
+    }
+
+    /// This record as the modelled `Type` shape a report that reaches the type THROUGH
+    /// another API answers with: the definition and every other member exactly as
+    /// [`Self::to_type`] reports them, named under the API `api_id` in `region`.
+    ///
+    /// A type is named under the API it is addressed through
+    /// ([`type_resource`]), so a report reached through another API — an association
+    /// listing, which addresses a Merged API and reports the types its source API's schema
+    /// contributes — names each type under THAT API's own path, which is also the ARN the
+    /// merged copy of the type carries (`super::schema_merge`).
+    pub fn to_type_under_api(
+        &self,
+        format: &str,
+        api_types: &BTreeMap<String, TypeRecord>,
+        api_id: &str,
+        region: &str,
+    ) -> Type {
+        Type {
+            arn: Some(::engine::emulator_arn(
+                super::ARN_SERVICE,
+                region,
+                &type_resource(api_id, &self.parsed.name),
+            )),
+            ..self.to_type(format, api_types)
+        }
+    }
+
     /// This record as the modelled `Type` shape carrying `definition`: every other member
     /// comes from the stored record whichever call is answering.
     fn projected(&self, format: &str, definition: String) -> Type {

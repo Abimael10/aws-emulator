@@ -15,8 +15,9 @@
 //!    account does not hold a 404 `NotFoundException`, and one that cannot name an API at
 //!    all a 400;
 //! 3. `ListTypesByAssociation` answers the types the SOURCE API of the named association
-//!    holds, under the same paging rule, and refuses a pair that names no association of
-//!    the addressed Merged API with the refusal the shared lookup rule states (a 404 for
+//!    holds, each named under the MERGED API the request addresses, under the same paging
+//!    rule, and refuses a pair that names no association of the addressed Merged API with
+//!    the refusal the shared lookup rule states (a 404 for
 //!    an `associationId` the Merged API does not hold and for a Merged API nothing holds,
 //!    a 400 for an identifier that can name neither).
 //!
@@ -408,9 +409,10 @@ async fn a_listing_by_association_answers_the_source_apis_types() {
                 names, expected_names,
                 "case {case}: expected the source API's types in order, got {names:?}"
             );
-            // Each type is the source API's own, named under the source API's path.
+            // Each type is the source API's own definition, named under the MERGED API
+            // this listing is reached through.
             for (row, reported) in held.iter().zip(collected.iter()) {
-                assert_projects(row, &source.id, format, reported, &case);
+                assert_projects(row, &merged.id, format, reported, &case);
             }
         }
     }

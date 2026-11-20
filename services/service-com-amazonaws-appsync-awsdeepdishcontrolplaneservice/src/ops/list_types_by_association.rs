@@ -5,7 +5,9 @@
 //! `associationId` name through the shared lookup rule
 //! (`crate::state::…::resolve_association`) and answers the types the SOURCE API of that
 //! association holds in [`crate::state`], cut into the page the request's `nextToken` and
-//! `maxResults` select and reported in the `format` the request names. This is the ONLY
+//! `maxResults` select and reported in the `format` the request names, each named under
+//! the MERGED API the request addresses — the API the association's types are reached
+//! through (`crate::state::TypeRecord::to_type_under_api`). This is the ONLY
 //! file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -200,6 +202,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A type is named under the API it is addressed through, and this listing is
+        // reached through the MERGED API, so each type is reported under that API's own
+        // path — the ARN the merged copy of the type carries — in the Region the Merged
+        // API was created in.
+        let merged_api_id = association.merged_api_id.clone();
+        let merged_region = guard
+            .graphql_apis
+            .get(&merged_api_id)
+            .and_then(|merged| crate::state::arn_region(&merged.arn))
+            .unwrap_or(crate::state::DEFAULT_REGION)
+            .to_string();
+
         // The listing walks that API's types in the order they were added
         // (`crate::state::TypeRecord::seq`), which is the total order the cursor resumes
         // from, exactly as `ListTypes` walks an API's own types.
@@ -223,12 +237,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Each type is reported through the one projection every type report uses, in the
         // format the request asked for, resolved against the definitions the source API
-        // holds.
+        // holds, and named under the Merged API this listing is reached through.
         Ok(ListTypesByAssociationOutput {
             types: Some(
                 page.items
                     .iter()
-                    .map(|record| record.to_type(&input.format, &source.types))
+                    .map(|record| {
+                        record.to_type_under_api(
+                            &input.format,
+                            &source.types,
+                            &merged_api_id,
+                            &merged_region,
+                        )
+                    })
                     .collect(),
             ),
             next_token: page.next_token,

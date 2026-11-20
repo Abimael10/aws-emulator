@@ -7,7 +7,8 @@
 //! request that exposed the defect: an update REPLACES the definition of the type the
 //! request addresses by name under its API with the definition the request carries, keeps
 //! everything that identifies that type (its name, its ARN, its place among the API's
-//! types) and answers the stored type in the `TypeDefinitionFormat` the request names, so
+//! types) and answers the stored type in the `TypeDefinitionFormat` the request names
+//! through the update's own projection, which carries no `name`, so
 //! every later reader answers the new definition; an update the service cannot carry out
 //! changes nothing — a definition it cannot read as one type definition is a 400
 //! `BadRequestException`, so is one that declares a type other than the addressed one, a
@@ -44,7 +45,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::graphql_api_lifecycle::router;
 use super::graphql_types::{
-    assert_projects, assert_states, call, create_api, create_type, get_type, rendered_sdl, rows,
+    assert_projects, assert_updates, call, create_api, create_type, get_type, rendered_sdl, rows,
     Answer, Row, FORMATS,
 };
 use super::schema_creation::await_creation;
@@ -79,7 +80,7 @@ const PROCESSING: &str = "PROCESSING";
 ///
 /// `definition` is optional on the wire (`smithy_query` operation `UpdateType`:
 /// `definition` is not required), so `None` sends a body that carries only the format.
-async fn update_type(
+pub(crate) async fn update_type(
     router: &MultiServiceRouter,
     api_id: &str,
     type_name: &str,
@@ -348,7 +349,7 @@ async fn an_update_replaces_the_definition_of_the_addressed_type() {
                 updated.status, 200,
                 "case {case}: expected UpdateType 200, got {updated:?}"
             );
-            assert_states(
+            assert_updates(
                 &change.updated,
                 &api_id,
                 format,
@@ -394,7 +395,7 @@ async fn an_update_without_a_definition_leaves_the_type_as_it_is() {
                 answer.status, 200,
                 "case {case}: expected UpdateType 200, got {answer:?}"
             );
-            assert_states(&row, &api_id, format, &answer.body["type"], &case);
+            assert_updates(&row, &api_id, format, &answer.body["type"], &case);
             assert_reads_back(&router, &api_id, &row, &case).await;
         }
     }
@@ -692,8 +693,9 @@ async fn an_update_during_a_schema_creation_is_refused_then_allowed() {
             updated.status, 200,
             "case {case}: expected UpdateType 200 once the creation is performed, got {updated:?}"
         );
+        // The update's own projection carries no `name` — the read below does — so the
+        // members asserted here are the ones it carries.
         for (member, expected) in [
-            ("name", json!(row.name)),
             ("definition", json!(replacement)),
             ("description", json!("Updated after the creation.")),
             ("format", json!(state::SDL_FORMAT)),
@@ -704,6 +706,11 @@ async fn an_update_during_a_schema_creation_is_refused_then_allowed() {
                 updated.body["type"][member]
             );
         }
+        assert!(
+            updated.body["type"]["name"].is_null(),
+            "case {case}: expected no name member at all, got {:?}",
+            updated.body["type"]["name"]
+        );
 
         let read = get_type(&router, &api_id, row.name, state::SDL_FORMAT).await;
         assert_eq!(

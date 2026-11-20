@@ -285,6 +285,34 @@ pub(crate) fn assert_states(
     source: &str,
 ) {
     assert_members(row, api_id, format, reported, source);
+    assert_stated_definition(row, format, reported, source);
+}
+
+/// Assert `reported` is the type `row` declares as an UPDATE of its definition reports
+/// it, in `format` under `api_id`.
+///
+/// An update's `Type` carries NO `name`: the member is absent from the body, unlike the
+/// one a read or a create answers with. Every other member is the one the call that
+/// stated the definition reports.
+pub(crate) fn assert_updates(
+    row: &Row,
+    api_id: &str,
+    format: &str,
+    reported: &Value,
+    source: &str,
+) {
+    assert!(
+        reported.get("name").is_none_or(Value::is_null),
+        "case {row:?} ({source}, {format}): expected no name member at all, got {:?}",
+        reported.get("name")
+    );
+    assert_unnamed_members(row, api_id, format, reported, source);
+    assert_stated_definition(row, format, reported, source);
+}
+
+/// Assert the definition `reported` carries is the one the call that STATED it answers
+/// with: the request's own SDL text, or the type's introspection JSON.
+fn assert_stated_definition(row: &Row, format: &str, reported: &Value, source: &str) {
     let definition = definition_text(row, format, reported, source);
     if format == state::JSON_FORMAT {
         assert_json_definition(row, &definition, format, source);
@@ -316,6 +344,13 @@ fn assert_members(row: &Row, api_id: &str, format: &str, reported: &Value, sourc
         row.name,
         reported["name"]
     );
+    assert_unnamed_members(row, api_id, format, reported, source);
+}
+
+/// Assert every member of `reported` other than the definition and the NAME is the type
+/// `row` declares: the members every projection of a stored type carries, whichever call
+/// answered.
+fn assert_unnamed_members(row: &Row, api_id: &str, format: &str, reported: &Value, source: &str) {
     let expected_arn = format!(
         "arn:aws:appsync:{REGION}:{ACCOUNT}:{}",
         state::type_resource(api_id, row.name)
