@@ -183,6 +183,11 @@ fn rows(source_here: &str, source_there: &str) -> Vec<Row> {
                         "Namespace": "events",
                         "TableName": "records",
                         "CompressionType": "SNAPPY",
+                        "PartitionSpec": {
+                            "PartitionFields": [
+                                { "Transform": "TIME_HOUR", "SourceName": "written_at" },
+                            ],
+                        },
                     }],
                 },
             }),

@@ -16,6 +16,15 @@
 //! nowhere for its table and gets none, and a name a caller's own table holds is left to that
 //! caller — a table name is unique inside its namespace.
 //!
+//! RULE 2: that table is created partitioned the way its configuration asks for ("Specifies how
+//! the destination table is partitioned", `smithy_query(query="shape",shape="PartitionSpec")`),
+//! so a create whose `S3TablesConfigurationList` holds a configuration naming no `PartitionSpec`
+//! describes a table that cannot be created and is refused — HTTP 400, `ValidationException`,
+//! "PartitionSpec is required." — before any channel is stored and before any table is
+//! provisioned, so the name it asked for holds no channel and the destination holds no table. A
+//! configuration that does name one is accepted whatever that specification holds, reaches
+//! `ACTIVE`, and reports the partitioning it was created with.
+//!
 //! The recorded flow this was derived from creates ONE channel with ONE streaming table
 //! configuration and then reads that table back, which is one row of the table below. The
 //! rows differ along what the rule generalises over: the form and length of the destination
@@ -34,13 +43,13 @@ use std::sync::Arc;
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_kinesis_kinesis_20131202::state::{
-    managing_service_principal, CHANNEL_ACTIVE, STREAM_ACTIVE, STREAM_MODE_ON_DEMAND,
+    channel_arn, managing_service_principal, CHANNEL_ACTIVE, STREAM_ACTIVE, STREAM_MODE_ON_DEMAND,
 };
 use service_com_amazonaws_kinesis_kinesis_20131202::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::channel_lifecycle::{dead_letter_queue, role_arn, schema_arn, stream_configuration};
-use crate::stream_tags::{poll_until, stream_arn, REGION};
+use crate::stream_tags::{error_code, error_message, poll_until, stream_arn, REGION};
 
 /// The `X-Amz-Target` prefix of this service (`OPERATIONS.md`, "Wire protocol").
 const TARGET_PREFIX: &str = "Kinesis_20131202";
@@ -53,6 +62,14 @@ const TABLE_TYPE_AWS: &str = "aws";
 /// (`smithy_query(query="shape",shape="S3TablesConfiguration")` -> `TableName` and
 /// `Namespace`, both len 1..255, pattern `^[0-9a-z_]+$`).
 const DESTINATION_NAME_MAX_LENGTH: usize = 255;
+
+/// The error this service answers for an input it validates before it provisions anything.
+const VALIDATION: &str = "ValidationException";
+
+/// The sentence the service answers for a streaming table configuration that names no
+/// partitioning specification. FIXED text, written out here rather than borrowed from the crate,
+/// so a drift away from it fails rather than comparing the handler against itself.
+const PARTITION_SPEC_REQUIRED: &str = "PartitionSpec is required.";
 
 /// Kinesis and S3 Tables over ONE engine, so the table bucket a destination names and the
 /// table the create provisions in it are the records S3 Tables' own handlers hold.
@@ -246,20 +263,63 @@ fn name_of_length(seed: &str, length: usize) -> String {
     seed.chars().cycle().take(length).collect()
 }
 
-/// One streaming table destination, with the dead-letter queue the model makes required.
-fn tables_destination(bucket_arn: &str, namespace: &str, table: &str, compression: &str) -> Value {
+/// The one transform a partition field may ask for: "The partition transform to apply. The only
+/// valid value is TIME_HOUR" (`smithy_query(query="shape",shape="PartitionField")` ->
+/// `Transform`).
+const PARTITION_TRANSFORM: &str = "TIME_HOUR";
+
+/// The most partition fields one specification may carry
+/// (`smithy_query(query="shape",shape="PartitionSpec")` -> `PartitionFields`, len 1..10).
+const MAX_PARTITION_FIELDS: usize = 10;
+
+/// A `PartitionSpec` partitioning the destination table on `sources`, one field per source
+/// column.
+fn partition_spec(sources: &[&str]) -> Value {
+    let fields: Vec<Value> = sources
+        .iter()
+        .map(|source| json!({ "Transform": PARTITION_TRANSFORM, "SourceName": source }))
+        .collect();
+    json!({ "PartitionFields": fields })
+}
+
+/// One streaming table configuration, carrying a `PartitionSpec` only where `spec` names one.
+fn table_configuration(
+    bucket_arn: &str,
+    namespace: &str,
+    table: &str,
+    compression: &str,
+    spec: Option<Value>,
+) -> Value {
+    let mut configuration = json!({
+        "TableBucketARN": bucket_arn,
+        "Namespace": namespace,
+        "TableName": table,
+        "CompressionType": compression,
+    });
+    if let (Some(members), Some(spec)) = (configuration.as_object_mut(), spec) {
+        members.insert("PartitionSpec".to_string(), spec);
+    }
+    configuration
+}
+
+/// One streaming table destination delivering to `configurations`, with the dead-letter queue
+/// the model makes required.
+fn tables_destination_of(configurations: Vec<Value>) -> Value {
     json!({
         "DeadLetterQueueS3Configuration": dead_letter_queue("channel-dlq", "tables/"),
-        "S3TablesConfigurationList": [{
-            "TableBucketARN": bucket_arn,
-            "Namespace": namespace,
-            "TableName": table,
-            "CompressionType": compression,
-            "PartitionSpec": {
-                "PartitionFields": [{ "Transform": "TIME_HOUR", "SourceName": "written_at" }],
-            },
-        }],
+        "S3TablesConfigurationList": configurations,
     })
+}
+
+/// One streaming table destination, partitioned on a single source column.
+fn tables_destination(bucket_arn: &str, namespace: &str, table: &str, compression: &str) -> Value {
+    tables_destination_of(vec![table_configuration(
+        bucket_arn,
+        namespace,
+        table,
+        compression,
+        Some(partition_spec(&["written_at"])),
+    )])
 }
 
 /// The `CreateChannel` request body for a channel delivering to `destination`.
@@ -677,4 +737,263 @@ async fn a_second_channel_to_one_destination_reaches_the_same_table() {
         1,
         "case {case}: expected the namespace to hold exactly one table, got {listed:?}"
     );
+}
+
+/// One row of the unpartitioned table: the configurations a destination carries, and the table
+/// of them whose absence afterwards proves nothing was provisioned.
+struct Unpartitioned {
+    case: &'static str,
+    /// `(namespace, table, compression, whether it names a PartitionSpec)` per configuration.
+    configurations: Vec<(&'static str, &'static str, &'static str, bool)>,
+    record_format: &'static str,
+}
+
+/// A create whose streaming table destination holds a configuration naming no partitioning
+/// specification is refused with the modelled `ValidationException`, and leaves behind neither a
+/// channel nor a table.
+#[tokio::test]
+async fn a_configuration_without_a_partition_spec_is_refused_and_provisions_nothing() {
+    let emulator = Emulator::new();
+    let bucket_arn = emulator
+        .table_bucket("partitioning", "ch-tables-partitioning")
+        .await;
+    for namespace in ["events", "raw_events_2026"] {
+        emulator.namespace("partitioning", &bucket_arn, namespace).await;
+    }
+    let source = emulator.on_demand_stream("partitioning", "partitioning-source").await;
+
+    // The rows differ along which configuration of the list names no specification, and along
+    // the destination names, the compression and the record format around it.
+    let rows = [
+        Unpartitioned {
+            case: "the only configuration names no spec",
+            configurations: vec![("events", "records", "ZSTD", false)],
+            record_format: "GSR_JSON",
+        },
+        Unpartitioned {
+            case: "another namespace, table and compression, still no spec",
+            configurations: vec![("raw_events_2026", "clickstream_v2", "NONE", false)],
+            record_format: "JSON",
+        },
+        Unpartitioned {
+            case: "the second of two configurations names no spec",
+            configurations: vec![
+                ("events", "first_records", "SNAPPY", true),
+                ("events", "second_records", "SNAPPY", false),
+            ],
+            record_format: "GSR_JSON",
+        },
+        Unpartitioned {
+            case: "the first of two configurations names no spec",
+            configurations: vec![
+                ("events", "third_records", "ZSTD", false),
+                ("events", "fourth_records", "ZSTD", true),
+            ],
+            record_format: "JSON",
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let configurations: Vec<Value> = row
+            .configurations
+            .iter()
+            .map(|(namespace, table, compression, partitioned)| {
+                table_configuration(
+                    &bucket_arn,
+                    namespace,
+                    table,
+                    compression,
+                    partitioned.then(|| partition_spec(&["written_at"])),
+                )
+            })
+            .collect();
+        let name = format!("unpartitioned-channel-{index}");
+        let (status, response) = emulator
+            .call(
+                "CreateChannel",
+                &create_channel_body(
+                    &name,
+                    &source,
+                    row.record_format,
+                    tables_destination_of(configurations),
+                ),
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case}: expected a client error, got {status} with body {response}"
+        );
+        assert_eq!(
+            error_code(&response),
+            VALIDATION,
+            "case {case}: expected {VALIDATION}, got {response}"
+        );
+        let message = error_message(&response);
+        assert_eq!(
+            message, PARTITION_SPEC_REQUIRED,
+            "case {case}: expected the message {PARTITION_SPEC_REQUIRED:?}, got {message:?}"
+        );
+
+        // The refusal is taken before anything is persisted, so the name it asked for holds no
+        // channel ...
+        let (status, described) = emulator
+            .call(
+                "DescribeChannel",
+                &json!({ "ChannelARN": channel_arn(REGION, &name) }),
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case}: expected the refused create to have stored no channel, got {status} \
+             with body {described}"
+        );
+        assert_eq!(
+            error_code(&described),
+            "ResourceNotFoundException",
+            "case {case}: expected the refused create to have stored no channel, got {described}"
+        );
+
+        // ... and S3 Tables holds no table of ANY configuration the refused request named,
+        // including the one that did name a specification.
+        for (namespace, table, _, _) in &row.configurations {
+            let (status, body) = emulator.get_table(&bucket_arn, namespace, table).await;
+            assert_eq!(
+                status, 404,
+                "case {case}: expected the refused create to have provisioned no table {table}, \
+                 got {status} with body {body}"
+            );
+        }
+    }
+}
+
+/// One row of the partitioned table: the destination a create names and the partitioning it asks
+/// for.
+struct Partitioned {
+    case: &'static str,
+    namespace: &'static str,
+    table: &'static str,
+    compression: &'static str,
+    record_format: &'static str,
+    sources: Vec<&'static str>,
+}
+
+/// A configuration that DOES name its partitioning is accepted whatever that specification holds,
+/// reports it back, reaches `ACTIVE`, and gets its table.
+#[tokio::test]
+async fn a_configuration_with_a_partition_spec_is_accepted_whatever_its_fields() {
+    let emulator = Emulator::new();
+    let bucket_arn = emulator
+        .table_bucket("partitioned", "ch-tables-partitioned")
+        .await;
+    let rows = [
+        Partitioned {
+            case: "one partition field",
+            namespace: "events",
+            table: "records",
+            compression: "ZSTD",
+            record_format: "GSR_JSON",
+            sources: vec!["written_at"],
+        },
+        Partitioned {
+            case: "two partition fields on another destination",
+            namespace: "raw_events_2026",
+            table: "clickstream_v2",
+            compression: "SNAPPY",
+            record_format: "JSON",
+            sources: vec!["written_at", "ingested.at_utc"],
+        },
+        Partitioned {
+            case: "partition fields at the modelled count bound",
+            namespace: "n",
+            table: "t",
+            compression: "NONE",
+            record_format: "GSR_JSON",
+            sources: vec![
+                "ts_0", "ts_1", "ts_2", "ts_3", "ts_4", "ts_5", "ts_6", "ts_7", "ts_8", "ts_9",
+            ],
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        assert!(
+            !row.sources.is_empty() && row.sources.len() <= MAX_PARTITION_FIELDS,
+            "case {case}: a row stays inside the modelled 1..{MAX_PARTITION_FIELDS} field count, \
+             got {}",
+            row.sources.len()
+        );
+        emulator.namespace(case, &bucket_arn, row.namespace).await;
+        let source = emulator
+            .on_demand_stream(case, &format!("partitioned-source-{index}"))
+            .await;
+        let spec = partition_spec(&row.sources);
+
+        let created = emulator
+            .ok(
+                case,
+                "CreateChannel",
+                &create_channel_body(
+                    &format!("partitioned-channel-{index}"),
+                    &source,
+                    row.record_format,
+                    tables_destination_of(vec![table_configuration(
+                        &bucket_arn,
+                        row.namespace,
+                        row.table,
+                        row.compression,
+                        Some(spec.clone()),
+                    )]),
+                ),
+            )
+            .await;
+        let reported = &created["ChannelDescription"]["S3TablesDestinationConfiguration"]
+            ["S3TablesConfigurationList"][0]["PartitionSpec"];
+        assert_eq!(
+            reported, &spec,
+            "case {case}: expected the channel to report the partitioning {spec}, got {reported}"
+        );
+
+        let channel_arn = created["ChannelDescription"]["ChannelARN"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case}: the create answers a ChannelARN, got {created}"))
+            .to_string();
+        poll_until(
+            case,
+            &format!("the channel {channel_arn} reports {CHANNEL_ACTIVE}"),
+            || async {
+                let (status, response) = emulator
+                    .call("DescribeChannel", &json!({ "ChannelARN": channel_arn }))
+                    .await;
+                status == 200
+                    && response["ChannelDescription"]["ChannelStatus"].as_str()
+                        == Some(CHANNEL_ACTIVE)
+            },
+        )
+        .await;
+
+        let described = emulator
+            .ok(
+                case,
+                "DescribeChannel",
+                &json!({ "ChannelARN": channel_arn }),
+            )
+            .await;
+        let read_back = &described["ChannelDescription"]["S3TablesDestinationConfiguration"]
+            ["S3TablesConfigurationList"][0]["PartitionSpec"];
+        assert_eq!(
+            read_back, &spec,
+            "case {case}: expected a read of the channel to report the partitioning {spec}, got \
+             {read_back}"
+        );
+
+        let (status, table) = emulator
+            .get_table(&bucket_arn, row.namespace, row.table)
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: expected the accepted create to have provisioned its table, got \
+             {status} with body {table}"
+        );
+    }
 }

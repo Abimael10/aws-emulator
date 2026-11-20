@@ -52,6 +52,27 @@ pub fn managing_service_principal() -> String {
     format!("{}.amazonaws.com", super::SERVICE_ARN_NAMESPACE)
 }
 
+/// How a create refuses a streaming table destination whose configuration names no
+/// partitioning specification.
+///
+/// The destination table is created partitioned the way its configuration asks for
+/// ("Specifies how the destination table is partitioned", `PartitionSpec`), so a
+/// configuration that names none describes no table this service can create and is refused
+/// instead — which is the behaviour recorded for the service, and not something the model's
+/// optionality on the member states. FIXED text: it names no request- or state-derived
+/// value, since what it reports is that the specification itself is missing.
+pub const PARTITION_SPEC_REQUIRED_MESSAGE: &str = "PartitionSpec is required.";
+
+/// Whether `configurations` describes a destination table this service cannot create for want
+/// of a partitioning specification. EVERY configuration in the list carries its own table, so
+/// one of them naming no specification is enough: the request is refused whole and no table
+/// of it is provisioned.
+pub fn partition_spec_missing(configurations: &[S3TablesConfiguration]) -> bool {
+    configurations
+        .iter()
+        .any(|configuration| configuration.partition_spec.is_none())
+}
+
 /// Create the destination table of every configuration in `configurations`.
 ///
 /// Idempotent for this service's own tables: a destination whose table this service already

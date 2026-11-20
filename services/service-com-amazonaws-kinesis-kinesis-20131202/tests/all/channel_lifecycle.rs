@@ -433,6 +433,12 @@ async fn a_created_channel_is_what_a_describe_reports() {
                         "Namespace": "events",
                         "TableName": "json_records",
                         "CompressionType": "NONE",
+                        "PartitionSpec": {
+                            "PartitionFields": [{
+                                "Transform": "TIME_HOUR",
+                                "SourceName": "written_at",
+                            }],
+                        },
                     }],
                 },
                 "EncryptionConfiguration": {
@@ -449,6 +455,12 @@ async fn a_created_channel_is_what_a_describe_reports() {
                     "Namespace": "events",
                     "TableName": "json_records",
                     "CompressionType": "NONE",
+                    "PartitionSpec": {
+                        "PartitionFields": [{
+                            "Transform": "TIME_HOUR",
+                            "SourceName": "written_at",
+                        }],
+                    },
                 }],
             }),
             logging: json!({ "CloudWatchLogs": { "Enabled": false } }),
@@ -775,6 +787,9 @@ async fn a_refused_create_stores_nothing() {
             "Namespace": "events",
             "TableName": "records",
             "CompressionType": "ZSTD",
+            "PartitionSpec": {
+                "PartitionFields": [{ "Transform": "TIME_HOUR", "SourceName": "written_at" }],
+            },
         }],
     });
     let malformed_key = "channel-key";

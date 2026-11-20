@@ -123,6 +123,9 @@ fn tables_create(case: &str, source: &str) -> Value {
                 "Namespace": "events",
                 "TableName": "records",
                 "CompressionType": "SNAPPY",
+                "PartitionSpec": {
+                    "PartitionFields": [{ "Transform": "TIME_HOUR", "SourceName": "written_at" }],
+                },
             }],
         },
     })

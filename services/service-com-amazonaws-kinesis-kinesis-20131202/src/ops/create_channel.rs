@@ -18,7 +18,12 @@
 //! Streams creates this table in the specified table bucket"
 //! (`S3TablesConfiguration$TableName`), so the create provisions each configured table in S3
 //! Tables — marked as managed by this service — as it stores the channel
-//! ([`crate::state::provision_streaming_tables`]).
+//! ([`crate::state::provision_streaming_tables`]). That table is created partitioned the way
+//! its configuration asks for ("Specifies how the destination table is partitioned",
+//! `PartitionSpec`), so a streaming table configuration naming no partitioning specification
+//! describes no table this service can create and is refused with the modelled
+//! `ValidationException` ([`crate::state::PARTITION_SPEC_REQUIRED_MESSAGE`]), before any
+//! channel is stored and any table provisioned.
 //!
 //! The `ServiceExecutionRoleARN` is resolved against this account's IAM records
 //! SYNCHRONOUSLY, before any channel state is written and before anything the request says
@@ -365,11 +370,24 @@ fn destination(input: &CreateChannelInput) -> Result<Destination, CreateChannelE
                 s3_tables: None,
             })
         }
-        (None, Some(tables)) => Ok(Destination {
-            kind: crate::state::CHANNEL_DESTINATION_S3_TABLES,
-            s3: None,
-            s3_tables: Some(s3_tables_description(tables)),
-        }),
+        (None, Some(tables)) => {
+            // A streaming table destination is a table this service CREATES, partitioned the
+            // way the configuration asks for ("Specifies how the destination table is
+            // partitioned", `PartitionSpec`), so a configuration naming no partitioning
+            // specification is refused here — before any channel is stored and before any
+            // table is provisioned — with the sentence the service states for it
+            // ([`crate::state::PARTITION_SPEC_REQUIRED_MESSAGE`]).
+            if crate::state::partition_spec_missing(&tables.s3_tables_configuration_list) {
+                return Err(validation(
+                    crate::state::PARTITION_SPEC_REQUIRED_MESSAGE.to_string(),
+                ));
+            }
+            Ok(Destination {
+                kind: crate::state::CHANNEL_DESTINATION_S3_TABLES,
+                s3: None,
+                s3_tables: Some(s3_tables_description(tables)),
+            })
+        }
         _ => Err(validation(
             crate::state::CHANNEL_DESTINATION_REQUIRED_MESSAGE.to_string(),
         )),
