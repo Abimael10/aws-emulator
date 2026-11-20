@@ -59,8 +59,8 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use super::{
-    call_query, xml_element, xml_member_list, xml_scalar_children, Created, Readiness, Refusal,
-    Removal,
+    call_query, xml_element, xml_member_list, xml_member_structures, xml_scalar_children, Created,
+    Readiness, Refusal, Removal,
 };
 use crate::state::provisioner::{
     arn_resource, declared_name, push_list, push_structure, push_tag_list, query_members, tags_of,
@@ -764,22 +764,115 @@ pub(super) fn removal() -> Removal {
 
 /// The resource's configuration as Elastic Load Balancing reports it, for drift detection.
 ///
-/// A load balancer is reported as a structure whose scalar members are its own configuration
-/// (its scheme, its family, its address type), so those are the actual configuration the
-/// declared one is compared against. The other three types report no configuration of their
-/// own to compare yet, so nothing of them is reported as drifted rather than guessed at.
+/// Every one of the four types is read back from Elastic Load Balancing itself, by the ARN the
+/// create minted, through that type's own plural read ([`describe`]) — so what a drift check
+/// compares a declaration against is the configuration the OWNING service reports, and the one
+/// answer that reports a resource as gone is that service's own not-found code for it.
+///
+/// Each read reports its resource as a structure whose SCALAR members are its configuration (a
+/// load balancer's scheme, family and address type; a target group's port, protocol, target
+/// type and health check; a listener's port and protocol; a rule's priority), so those are the
+/// actual side of the comparison. A declared property the read spells under another name, or
+/// reports as a nested document rather than as a scalar, is reported by it in no comparable
+/// form — [`super::super::drift`] compares only the properties BOTH sides name, so such a
+/// property establishes nothing rather than being guessed at.
+///
+/// The one declared property that is not a member of any of these reads is the type's own
+/// ATTRIBUTE collection, which is a second call of the owning service on both sides
+/// ([`apply_attributes`]): it is read back through that call's own read
+/// ([`attribute_collection`]), so an attribute set outside the stack is compared too.
 pub(super) async fn actual_configuration(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     kind: Kind,
     resource: &StoredResource,
 ) -> Result<Option<Value>, Refusal> {
-    if kind != Kind::LoadBalancer {
+    let arn = &resource.physical_resource_id;
+    let Some(described) = describe_one(ctx, region, kind, arn).await? else {
         return Ok(None);
+    };
+    let mut reported = xml_scalar_children(&described, ENTRY);
+    if let Some((property, action, identity_member)) = attribute_collection(kind) {
+        // Only a declaration that STATES the collection is compared against it: "only
+        // resource properties explicitly defined in the stack template are checked for
+        // drift", and that service reports every attribute of the resource — the ones its
+        // defaults decide included — so the entries compared are the ones the template
+        // explicitly names.
+        if let Some(declared) = resource.properties.get(property).and_then(Value::as_array) {
+            let answered = call_elb(
+                ctx,
+                region,
+                action,
+                &[(identity_member.to_string(), arn.to_string())],
+            )
+            .await?;
+            reported.insert(property.to_string(), declared_attributes(declared, &answered));
+        }
     }
-    let described =
-        describe_load_balancer(ctx, region, &resource.physical_resource_id).await?;
-    Ok(described.map(|document| Value::Object(xml_scalar_children(&document, "member"))))
+    Ok(Some(Value::Object(reported)))
+}
+
+/// The declared property holding a type's ATTRIBUTE collection, the read that answers what the
+/// resource's attributes ARE and the member that read takes the resource's ARN under — or
+/// `None` for a type that publishes no such collection.
+///
+/// Source: each type's attribute read in that service's model
+/// (`smithy_query(query="operation",operation="DescribeLoadBalancerAttributes,DescribeTargetGroupAttributes,DescribeListenerAttributes")`),
+/// paired with the property whose declaration the matching `Modify…Attributes` applies
+/// ([`LOAD_BALANCER_PROPERTIES_NOT_SENT`] and its siblings). A rule carries no attributes.
+fn attribute_collection(kind: Kind) -> Option<(&'static str, &'static str, &'static str)> {
+    match kind {
+        Kind::LoadBalancer => Some((
+            "LoadBalancerAttributes",
+            "DescribeLoadBalancerAttributes",
+            "LoadBalancerArn",
+        )),
+        Kind::TargetGroup => Some((
+            "TargetGroupAttributes",
+            "DescribeTargetGroupAttributes",
+            "TargetGroupArn",
+        )),
+        Kind::Listener => Some((
+            "ListenerAttributes",
+            "DescribeListenerAttributes",
+            "ListenerArn",
+        )),
+        Kind::ListenerRule => None,
+    }
+}
+
+/// The attribute collection as the comparison takes it: one entry per entry the DECLARATION
+/// names, carrying that entry's key and the value Elastic Load Balancing reports the resource
+/// holding that key at.
+///
+/// The declared order is kept, because a difference is reported at the path of the entry it is
+/// in: an attribute the template declares at a value the resource no longer holds is that
+/// entry's own `Value` differing, rather than the whole collection being replaced by a reported
+/// list the service happens to order its own way. An entry whose key that service reports
+/// nothing under carries no value at all, which the comparison reports as that value having
+/// been removed.
+fn declared_attributes(declared: &[Value], answered: &str) -> Value {
+    let held: BTreeMap<String, String> = xml_member_structures(answered, "Attributes")
+        .into_iter()
+        .filter_map(|entry| {
+            let key = entry.get("Key")?.as_str()?.to_string();
+            let value = entry.get("Value").and_then(Value::as_str).unwrap_or_default();
+            Some((key, value.to_string()))
+        })
+        .collect();
+    let entries = declared
+        .iter()
+        .map(|entry| {
+            let key = entry.get("Key").and_then(Value::as_str).unwrap_or_default();
+            let mut reported = ::serde_json::Map::new();
+            reported.insert("Key".to_string(), Value::String(key.to_string()));
+            if let Some(value) = held.get(key) {
+                reported.insert("Value".to_string(), Value::String(value.clone()));
+            }
+            Value::Object(reported)
+        })
+        .collect();
+    Value::Array(entries)
 }
 
 /// Whether a property of the type that cannot change on the resource that exists is declared
@@ -932,10 +1025,58 @@ async fn describe_load_balancer(
     region: &str,
     arn: &str,
 ) -> Result<Option<String>, Refusal> {
-    let parameters = vec![("LoadBalancerArns.member.1".to_string(), arn.to_string())];
-    match call_elb(ctx, region, "DescribeLoadBalancers", &parameters).await {
+    describe_one(ctx, region, Kind::LoadBalancer, arn).await
+}
+
+/// The element one of these plural reads carries each reported resource in, which is the Smithy
+/// default list member name every list of this model uses.
+const ENTRY: &str = "member";
+
+/// How one of the four types is read back from Elastic Load Balancing: its own plural read, the
+/// member that selects ONE resource by ARN, and the code that read refuses an ARN that service
+/// holds nothing under with.
+///
+/// Source: each type's own read in that service's model
+/// (`smithy_query(query="operation",operation="DescribeTargetGroups,DescribeListeners,DescribeRules")`),
+/// whose selection member is the plural of the resource's ARN; the codes are the
+/// `awsQueryError` of each read's own not-found exception ([`NOT_FOUND_CODES`]).
+fn describe(kind: Kind) -> (&'static str, &'static str, &'static str) {
+    match kind {
+        Kind::LoadBalancer => (
+            "DescribeLoadBalancers",
+            "LoadBalancerArns.member.1",
+            "LoadBalancerNotFound",
+        ),
+        Kind::TargetGroup => (
+            "DescribeTargetGroups",
+            "TargetGroupArns.member.1",
+            "TargetGroupNotFound",
+        ),
+        Kind::Listener => (
+            "DescribeListeners",
+            "ListenerArns.member.1",
+            "ListenerNotFound",
+        ),
+        Kind::ListenerRule => ("DescribeRules", "RuleArns.member.1", "RuleNotFound"),
+    }
+}
+
+/// ONE resource of `kind`, as Elastic Load Balancing's own read of the ARN it minted for it, or
+/// `None` for one that service answers it no longer holds.
+///
+/// The absence is judged on the read's own not-found CODE and never on a message, exactly as
+/// [`delete`] judges a deletion that has already happened.
+async fn describe_one(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    kind: Kind,
+    arn: &str,
+) -> Result<Option<String>, Refusal> {
+    let (action, member, not_found) = describe(kind);
+    let parameters = vec![(member.to_string(), arn.to_string())];
+    match call_elb(ctx, region, action, &parameters).await {
         Ok(answered) => Ok(Some(answered)),
-        Err(refusal) if refusal.code == "LoadBalancerNotFound" => Ok(None),
+        Err(refusal) if refusal.code == not_found => Ok(None),
         Err(refusal) => Err(refusal),
     }
 }
