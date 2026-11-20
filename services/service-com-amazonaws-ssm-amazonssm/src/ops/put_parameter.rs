@@ -43,6 +43,17 @@
 //! that sends an array replaces it. `KeyId` is the same: an update of a `SecureString`
 //! that names none seals the new value under the key the parameter already carries.
 //!
+//! ## Tags belong to the parameter
+//!
+//! A parameter's tag set is the PARAMETER's, not a version's: nothing in the model ties one
+//! to a version, and "to add tags to an existing Systems Manager parameter, use the
+//! AddTagsToResource operation" (the `Tags` doc). So a put writes tags only where it CREATES
+//! the parameter, and a put that supplies none — the member absent, or present and carrying
+//! nothing, which is what "optional metadata" supplies — leaves the set exactly as it was.
+//! A put that supplies tags beside `Overwrite` is refused outright
+//! ([`TAGS_WITH_OVERWRITE_REJECTION`]), before anything is read or written, so neither an
+//! existing parameter's value, versions and tags nor a new parameter come of it.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -320,6 +331,20 @@ const COMPILED_PATTERN_LIMIT: usize = 64 * 1024;
 
 /// See [`COMPILED_PATTERN_LIMIT`].
 const PATTERN_DFA_LIMIT: usize = 64 * 1024;
+
+/// What a put that carries both `Overwrite` and tags is refused with: entirely fixed text,
+/// with no part of it taken from the request.
+///
+/// `PutParameter` models no error for the conflict, so this is the service-common
+/// `ValidationException`. The sentence names the two remedies the service offers — drop the
+/// flag to create a parameter with tags, or change an existing parameter's tags through the
+/// tag plane — which is the same reading of the `Tags` doc the refusal is taken on ("To add
+/// tags to an existing Systems Manager parameter, use the AddTagsToResource operation").
+const TAGS_WITH_OVERWRITE_REJECTION: &str = "Invalid request: tags and overwrite can't be used \
+                                             together. To create a parameter with tags, please \
+                                             remove overwrite flag. To update tags for an \
+                                             existing parameter, please use AddTagsToResource or \
+                                             RemoveTagsFromResource.";
 
 /// Why the `Policies` document is one Parameter Store will not take, named by the
 /// modelled error that reports it.
@@ -651,16 +676,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service's store is read.
         let writer = crate::state::identity_authorization::caller_arn(&*self.engine, ctx);
         let overwrite = input.overwrite.unwrap_or(false);
+        // The tags this request SUPPLIES. `Tags` is "optional metadata that you assign to a
+        // resource", so a request that supplies none — the member absent, or present and
+        // carrying nothing — asks for no tag to be written, and the parameter's own tag set
+        // is left exactly as it was: the set belongs to the parameter rather than to one of
+        // its versions, and `AddTagsToResource`/`RemoveTagsFromResource` are what change it.
+        // Read once here, so the refusal below and the write further down cannot disagree
+        // about what "supplied tags" is.
+        let supplied_tags = input.tags.filter(|tags| !tags.is_empty());
         // Tags belong to the parameter, and `AddTagsToResource` is how an existing one
         // is tagged: "To add tags to an existing Systems Manager parameter, use the
         // AddTagsToResource operation." So a request may create a parameter with tags
         // or update one's value, never both at once — an update that carried tags would
-        // otherwise silently replace the set.
-        if overwrite && input.tags.as_ref().is_some_and(|tags| !tags.is_empty()) {
+        // otherwise silently replace the set. Refused before anything is read or written,
+        // so an existing name keeps its value, its versions and its tags and a new one is
+        // not created.
+        if overwrite && supplied_tags.is_some() {
             return Err(crate::scaffolded::Scaffolded::validation(
-                "Tags and Overwrite can't be used together; use AddTagsToResource to tag an \
-                 existing parameter"
-                    .to_string(),
+                TAGS_WITH_OVERWRITE_REJECTION.to_string(),
             ));
         }
         let requested_policies = match policy_count(input.policies.as_deref()) {
@@ -1008,12 +1041,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         match store.parameter_mut(&region, name) {
             Some(record) => {
                 record.push_version(stored_version);
-                // Tags are a property of the parameter rather than of one version, so
-                // a put that carries them replaces the set and one that carries none
-                // leaves it as it was.
-                if let Some(tags) = input.tags {
-                    record.tags = crate::state::to_btree_map(Some(tags));
-                }
+                // Tags are a property of the parameter rather than of one version, and a
+                // put that supplies tags beside `Overwrite` is refused above, so an update
+                // never rewrites the set: the parameter keeps the tags it carries.
             }
             None => store.insert_parameter(crate::state::ParameterRecord {
                 // The name is rendered the one way the service renders a parameter name
@@ -1022,7 +1052,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // than the spelling one create happened to use.
                 name: crate::state::reported_name(name).to_string(),
                 region,
-                tags: crate::state::to_btree_map(input.tags),
+                tags: crate::state::to_btree_map(supplied_tags),
                 versions: vec![stored_version],
             }),
         }

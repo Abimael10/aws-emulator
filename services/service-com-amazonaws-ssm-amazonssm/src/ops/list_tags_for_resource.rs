@@ -10,7 +10,10 @@
 //! and the report is that record's own tag set — so what a tag write persisted is what
 //! this reads back, and a resource nothing has tagged reports the empty list it holds.
 //!
-//! An id naming no resource the Region holds is the modelled `InvalidResourceId`. This
+//! An id naming no resource the Region holds is the modelled `InvalidResourceId` — which a
+//! resource addressed by NAME is spared for every spelling of that name the service's own
+//! reads accept, so a parameter's tags are reported for its name with or without the leading
+//! hierarchy separator and for its ARN alike. This
 //! operation only reports: it writes nothing, so two reads of one resource answer alike.
 //!
 //! ## Shape of an operation

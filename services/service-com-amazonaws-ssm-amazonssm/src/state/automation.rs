@@ -743,13 +743,26 @@ impl AutomationExecutionRecord {
         step.to_step_execution(at.map(|at| self.valid_next_steps(at)).unwrap_or_default())
     }
 
+    /// The step the walk enters after the step at `index` when nothing NAMES one: the step
+    /// that step's own `nextStep` names, or the step the runbook declares after it — the
+    /// ordering [`Self::step_after`] resolves for the walk, read here as a step NAME so the
+    /// projection below can report it. `None` for the last step of a runbook that names none.
+    fn unnamed_successor(&self, index: usize, definition: &runbook::RunbookStep) -> Option<String> {
+        definition.next_step.clone().or_else(|| {
+            self.steps
+                .get(index.saturating_add(1))
+                .map(|next| next.definition.name.clone())
+        })
+    }
+
     /// The steps the walk may enter after the step at `index`, by name, in the order the
     /// runbook's own graph offers them ("Strings that describe the step's valid next steps",
     /// `StepExecution$ValidNextSteps`).
     ///
     /// Where the walk goes from a step is what [`Self::succeed_step`] and [`Self::fail_step`]
     /// decide, so the same members decide this: a choice of an `aws:branch` names the step it
-    /// goes to and the branch its own default; any other step goes to the step its `nextStep`
+    /// goes to and the branch its own default, or — where it declares none — the step it falls
+    /// through to ([`Self::unnamed_successor`]); any other step goes to the step its `nextStep`
     /// names, or to the step the runbook declares after it, and a `step:` `onFailure` adds the
     /// step a failure sends the walk to. A step that ends the automation (`isEnd`) is followed
     /// by nothing, and neither is the last step of a runbook that names no successor.
@@ -766,17 +779,19 @@ impl AutomationExecutionRecord {
         let mut named: Vec<String> = Vec::new();
         if definition.action == ACTION_BRANCH {
             // "If no choices match and a Default is specified, the automation goes to that
-            // step": a branch goes to one of its choices, or to its default.
+            // step": a branch goes to one of its choices, or to its default — and a branch
+            // that declares NO default names nowhere of its own, so it goes where every step
+            // goes when nothing names a successor ([`Self::succeed_step`]).
             if let Ok(branch) = runbook::branch_of(&definition.inputs) {
                 named.extend(branch.choices.into_iter().map(|choice| choice.next_step));
-                named.extend(branch.default);
+                named.extend(
+                    branch
+                        .default
+                        .or_else(|| self.unnamed_successor(index, &definition)),
+                );
             }
         } else {
-            named.extend(definition.next_step.clone().or_else(|| {
-                self.steps
-                    .get(index.saturating_add(1))
-                    .map(|next| next.definition.name.clone())
-            }));
+            named.extend(self.unnamed_successor(index, &definition));
             // "With conditional branching, we add step:stepName to support the automation
             // to go to another specific step": a failure of this step goes there.
             if let Some(on_failure) = definition
@@ -1012,13 +1027,13 @@ impl AutomationExecutionRecord {
             }
         }
         // "If no choices match and a Default is specified, the automation goes to that
-        // step"; with no default there is nowhere left to go, so the automation ends.
+        // step". With no `Default` the branch names nowhere of its own, so the step takes
+        // the ordering every step of a runbook takes when nothing names a successor: the
+        // walk goes on to the step declared after it, which is also what its own `nextStep`
+        // and `isEnd` are read against ([`Self::succeed_step`]).
         match branch.default.clone() {
             Some(default) => self.succeed_step(index, now, Some(default)),
-            None => {
-                self.end_step(index, now, STATUS_SUCCESS);
-                Walked::Moved(None)
-            }
+            None => self.succeed_step(index, now, None),
         }
     }
 

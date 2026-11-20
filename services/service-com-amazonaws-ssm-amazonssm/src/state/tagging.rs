@@ -22,6 +22,12 @@
 //! already carries takes the submitted value rather than appearing twice, which is what
 //! makes the set a map from key to value ([`merge_tags`]).
 //!
+//! A type whose id is a NAME is addressed by every spelling of that name the service's own
+//! reads of the resource accept, because all of them name the one resource: a parameter
+//! resolves through [`parameter_name_of_id`] — the name with its leading hierarchy
+//! separator, the name without it, or the parameter's ARN — while an id that selects one
+//! VERSION of it names no taggable resource, because the tag set belongs to the parameter.
+//!
 //! The pair is read in two steps, and each step has its own refusal: the id is first read
 //! against the form the DECLARED type's ids are published in
 //! ([`resource_id_format_violation`]) — an id of another type's form names no resource of
@@ -117,6 +123,31 @@ pub fn resource_id_format(resource_type: &str) -> Option<&'static str> {
         TAGGING_TYPE_PATCH_BASELINE => Some("pb-[0-9a-f]{17}"),
         _ => None,
     }
+}
+
+/// The parameter a tag request's `ResourceId` names, as the store keys it, or `None` when
+/// that value names no parameter at all.
+///
+/// A resource whose "ID of the resource" is a NAME is addressed by every spelling of that
+/// name the service's own reads of the resource accept, because it is the one resource
+/// behind all of them: a parameter is reached by its name with the leading hierarchy
+/// separator, by that name without it — the two are the one parameter
+/// ([`super::canonical_name`]) — and by its ARN, which is "the name or Amazon Resource Name
+/// (ARN) of the parameter" every read of a parameter resolves through
+/// ([`super::parse_parameter_query`]). An ARN naming another account or another Region than
+/// the request was signed for names nothing reachable through this endpoint
+/// ([`super::arn_names_this_endpoint`]).
+///
+/// A `name:version` or `name:label` SELECTOR names one version of a parameter, and a tag set
+/// belongs to the parameter rather than to any one of its versions ("Tags" of
+/// `AddTagsToResource`, which addresses the parameter alone), so a selected id names no
+/// taggable resource.
+fn parameter_name_of_id<'a>(region: &str, resource_id: &'a str) -> Option<&'a str> {
+    let query = super::parse_parameter_query(resource_id)?;
+    if query.selector.is_some() || !query.names_this_endpoint(region) {
+        return None;
+    }
+    Some(query.name)
 }
 
 /// Whether `resource_id` has the form [`resource_id_format`] states for `resource_type`.
@@ -237,7 +268,9 @@ impl ComAmazonawsSsmAmazonssmState {
         resource_id: &str,
     ) -> Option<&BTreeMap<String, String>> {
         match resource_type {
-            TAGGING_TYPE_PARAMETER => self.parameter(region, resource_id).map(|held| &held.tags),
+            TAGGING_TYPE_PARAMETER => parameter_name_of_id(region, resource_id)
+                .and_then(|name| self.parameter(region, name))
+                .map(|held| &held.tags),
             TAGGING_TYPE_DOCUMENT => self.document(region, resource_id).map(|held| &held.tags),
             TAGGING_TYPE_MANAGED_INSTANCE => self
                 .managed_node(region, resource_id)
@@ -271,8 +304,8 @@ impl ComAmazonawsSsmAmazonssmState {
         resource_id: &str,
     ) -> Option<&mut BTreeMap<String, String>> {
         match resource_type {
-            TAGGING_TYPE_PARAMETER => self
-                .parameter_mut(region, resource_id)
+            TAGGING_TYPE_PARAMETER => parameter_name_of_id(region, resource_id)
+                .and_then(|name| self.parameter_mut(region, name))
                 .map(|held| &mut held.tags),
             TAGGING_TYPE_DOCUMENT => self
                 .document_mut(region, resource_id)
