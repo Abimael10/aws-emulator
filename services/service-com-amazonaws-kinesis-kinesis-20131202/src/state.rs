@@ -3956,6 +3956,26 @@ pub fn record_sequence_number(shard_starting_sequence_number: &str, written: u64
     )
 }
 
+/// Whether `sequence_number` is one of the SHARD whose own numbers start at
+/// `shard_starting_sequence_number`.
+///
+/// A sequence number is shard-scoped: "the unique identifier of the record within its shard"
+/// (`Record$SequenceNumber`), minted from the shard's own starting number and its write
+/// counter ([`record_sequence_number`]), so the shard a value names is read back off the high
+/// digits it carries. The shard's PUBLISHED starting number is one of its own too — it is what
+/// a read of the shard reports as the beginning of its range
+/// (`SequenceNumberRange$StartingSequenceNumber`) — and a value of any other shard of the
+/// stream, or of none, is a position in this shard no more than a value outside its range is.
+pub fn sequence_number_of_shard(
+    shard_starting_sequence_number: &str,
+    sequence_number: &str,
+) -> bool {
+    sequence_number == shard_starting_sequence_number
+        || (sequence_number.len()
+            == shard_starting_sequence_number.len() + RECORD_SEQUENCE_NUMBER_DIGITS
+            && sequence_number.starts_with(shard_starting_sequence_number))
+}
+
 /// Whether `left` is a sequence number no larger than `right`.
 ///
 /// `SequenceNumber` is a decimal integer without leading zeros (`^(0|([1-9]\d{0,128}))$`),

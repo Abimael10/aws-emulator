@@ -26,10 +26,11 @@
 use ::std::time::SystemTime;
 
 use super::{
-    epoch_millis, sequence_number_le, DataRecord, ShardPosition, ShardRecord,
-    SHARD_ITERATOR_TYPE_AFTER_SEQUENCE_NUMBER, SHARD_ITERATOR_TYPE_AT_SEQUENCE_NUMBER,
-    SHARD_ITERATOR_TYPE_AT_TIMESTAMP, SHARD_ITERATOR_TYPE_LATEST,
-    SHARD_ITERATOR_TYPE_TRIM_HORIZON, TIMESTAMP_NOT_AN_EPOCH_DATE_MESSAGE,
+    epoch_millis, sequence_number_le, sequence_number_of_shard, DataRecord, ShardPosition,
+    ShardRecord, SHARD_ITERATOR_TYPE_AFTER_SEQUENCE_NUMBER,
+    SHARD_ITERATOR_TYPE_AT_SEQUENCE_NUMBER, SHARD_ITERATOR_TYPE_AT_TIMESTAMP,
+    SHARD_ITERATOR_TYPE_LATEST, SHARD_ITERATOR_TYPE_TRIM_HORIZON,
+    TIMESTAMP_NOT_AN_EPOCH_DATE_MESSAGE,
 };
 use crate::ops::types::SHARD_ITERATOR_TYPE_VALUES;
 
@@ -141,9 +142,14 @@ pub fn requested_shard_position(
             ));
         };
         // A sequence number is "the identifier associated with every record ingested in the
-        // stream", and every one a shard can hold lies inside the range the shard publishes
-        // (`Shard$SequenceNumberRange`): a value outside it names a position in no shard.
-        let inside = sequence_number_le(&shard.starting_sequence_number, sequence_number)
+        // stream", and it identifies that record WITHIN ITS SHARD (`Record$SequenceNumber`):
+        // the shard a value belongs to is read back off the value itself, so one minted on
+        // another shard of the stream names a position in this one no more than a value
+        // outside the range the shard publishes does (`Shard$SequenceNumberRange`) — both are
+        // refused here rather than answered with an iterator into another shard's records
+        // ([`sequence_number_of_shard`]).
+        let inside = sequence_number_of_shard(&shard.starting_sequence_number, sequence_number)
+            && sequence_number_le(&shard.starting_sequence_number, sequence_number)
             && shard
                 .ending_sequence_number
                 .as_deref()
@@ -301,5 +307,118 @@ pub fn read_shard_from<'store>(
         last_seen,
         drained,
         millis_behind_latest,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{hash_key_ranges, record_sequence_number, shard_id};
+
+    /// The members `GetShardIterator` spells a position with, which is what a refusal here
+    /// names.
+    const MEMBERS: PositionMembers = PositionMembers {
+        position_type: "ShardIteratorType",
+        sequence_number: "StartingSequenceNumber",
+        timestamp: "Timestamp",
+    };
+
+    /// One stream's shard map, as a create lays it down: `count` open shards of one instant.
+    fn shard_map(count: u32) -> Vec<ShardRecord> {
+        let created_at = SystemTime::UNIX_EPOCH + ::std::time::Duration::from_millis(1_700_000_000_000);
+        hash_key_ranges(count)
+            .into_iter()
+            .enumerate()
+            .map(|(index, (starting, ending))| {
+                ShardRecord::open_at(
+                    u32::try_from(index).unwrap_or_default(),
+                    created_at,
+                    starting,
+                    ending,
+                )
+            })
+            .collect()
+    }
+
+    /// RULE: a sequence number names a position only in the SHARD it belongs to — the shard
+    /// whose own numbers it is one of — so a reader naming another shard's number, or one of
+    /// no shard, is refused rather than handed an iterator into records it did not ask for.
+    #[test]
+    fn a_sequence_number_names_a_position_only_in_its_own_shard() {
+        let shards = shard_map(4);
+        let owner = &shards[2];
+        // The numbers a reader can hold of ONE shard: the one the map publishes as the
+        // beginning of its range, and the one a record written to it carries.
+        let published = owner.starting_sequence_number.clone();
+        let of_a_record = record_sequence_number(&owner.starting_sequence_number, 0);
+        for position_type in [
+            SHARD_ITERATOR_TYPE_AT_SEQUENCE_NUMBER,
+            SHARD_ITERATOR_TYPE_AFTER_SEQUENCE_NUMBER,
+        ] {
+            for sequence_number in [&published, &of_a_record] {
+                let resolved = requested_shard_position(
+                    MEMBERS,
+                    position_type,
+                    Some(sequence_number),
+                    None,
+                    owner,
+                    SystemTime::UNIX_EPOCH,
+                );
+                assert!(
+                    resolved.is_ok(),
+                    "case {position_type:?} at {sequence_number:?} in its own shard {}: \
+                     expected a position, got {resolved:?}",
+                    owner.shard_id
+                );
+            }
+            // Rows differ along WHOSE number it is: every other shard of the same map (one
+            // below the owner's and two above it), and a value of no shard at all.
+            let foreign: Vec<String> = shards
+                .iter()
+                .filter(|shard| shard.shard_id != owner.shard_id)
+                .map(|shard| record_sequence_number(&shard.starting_sequence_number, 0))
+                .chain(::std::iter::once("1".to_string()))
+                .collect();
+            for sequence_number in &foreign {
+                let resolved = requested_shard_position(
+                    MEMBERS,
+                    position_type,
+                    Some(sequence_number),
+                    None,
+                    owner,
+                    SystemTime::UNIX_EPOCH,
+                );
+                let expected = format!(
+                    "{} {sequence_number} is not a sequence number of shard {}",
+                    MEMBERS.sequence_number, owner.shard_id
+                );
+                assert_eq!(
+                    resolved,
+                    Err(expected.clone()),
+                    "case {position_type:?} at {sequence_number:?}, which is no number of \
+                     shard {}: expected {expected:?}, got {resolved:?}",
+                    owner.shard_id
+                );
+            }
+        }
+        // And the same number IS a position in the shard it was minted on, whichever shard of
+        // the map that is: nothing here is a fact about one shard's place in the map.
+        for (index, shard) in shards.iter().enumerate() {
+            let own = record_sequence_number(&shard.starting_sequence_number, 7);
+            let resolved = requested_shard_position(
+                MEMBERS,
+                SHARD_ITERATOR_TYPE_AT_SEQUENCE_NUMBER,
+                Some(&own),
+                None,
+                shard,
+                SystemTime::UNIX_EPOCH,
+            );
+            assert_eq!(
+                resolved,
+                Ok(ShardPosition::AtSequenceNumber(own.clone())),
+                "case {own:?} in {}: expected the position it names, got {resolved:?}",
+                shard_id(u32::try_from(index).unwrap_or_default())
+            );
+        }
     }
 }

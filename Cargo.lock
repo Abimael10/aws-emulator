@@ -9628,6 +9628,7 @@ dependencies = [
  "aws-sdk-acm",
  "aws-sdk-ec2",
  "aws-sdk-eventbridge",
+ "aws-sdk-kinesis",
  "aws-sdk-lambda",
  "aws-sdk-sfn",
  "aws-sdk-sqs",

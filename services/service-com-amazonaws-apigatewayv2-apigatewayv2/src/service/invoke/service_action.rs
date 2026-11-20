@@ -39,8 +39,8 @@
 //! and its answer is the only thing the gateway has to report. Which form that is belongs to
 //! each action's own module, from what is recorded for its subtype, because it is a fact
 //! about the api API Gateway performs the action over and not about this gateway: for
-//! [`eventbridge`] and [`stepfunctions`] it is the JSON document that service's protocol
-//! answers with, and for
+//! [`eventbridge`], [`kinesis`] and [`stepfunctions`] it is the JSON document that service's
+//! protocol answers with, and for
 //! [`sqs`] the `{Action}Response` envelope the queue api's query interface answers with. An
 //! action the service serving it
 //! ANSWERED a refusal for is that refusal, RELAYED: that service's own status, the error
@@ -53,7 +53,8 @@
 //! does.
 //!
 //! The subtypes performed here are the ones whose service this emulator mounts and whose
-//! parameters are the action's own: [`eventbridge`], [`sqs`] and [`stepfunctions`]. Any other
+//! parameters are the action's own: [`eventbridge`], [`kinesis`], [`sqs`] and
+//! [`stepfunctions`]. Any other
 //! subtype is reported as an integration this emulator cannot perform, which is the answer it
 //! already had — never a success for a call nothing made.
 //!
@@ -140,6 +141,7 @@ macro_rules! action_client {
 
 pub mod credentials;
 mod eventbridge;
+mod kinesis;
 pub mod parameters;
 mod sqs;
 mod stepfunctions;
@@ -357,6 +359,8 @@ pub async fn perform<Eng: Send + Sync + 'static>(
 enum Action {
     /// `EventBridge-PutEvents`: publish the mapped event onto the bus it names.
     EventBridgePutEvents,
+    /// `Kinesis-PutRecord`: put the mapped record on the stream it names.
+    KinesisPutRecord,
     /// `SQS-SendMessage`: send the mapped message to the queue it names.
     SqsSendMessage,
     /// `SQS-ReceiveMessage`: read the queue it names.
@@ -382,6 +386,7 @@ impl Action {
     fn named(subtype: &str) -> Option<Self> {
         match subtype {
             eventbridge::PUT_EVENTS_SUBTYPE => Some(Self::EventBridgePutEvents),
+            kinesis::PUT_RECORD_SUBTYPE => Some(Self::KinesisPutRecord),
             sqs::SEND_MESSAGE_SUBTYPE => Some(Self::SqsSendMessage),
             sqs::RECEIVE_MESSAGE_SUBTYPE => Some(Self::SqsReceiveMessage),
             sqs::DELETE_MESSAGE_SUBTYPE => Some(Self::SqsDeleteMessage),
@@ -400,6 +405,7 @@ impl Action {
     fn parameters(self) -> &'static [&'static str] {
         match self {
             Self::EventBridgePutEvents => eventbridge::PUT_EVENTS_PARAMETERS,
+            Self::KinesisPutRecord => kinesis::PUT_RECORD_PARAMETERS,
             Self::SqsSendMessage => sqs::SEND_MESSAGE_PARAMETERS,
             Self::SqsReceiveMessage => sqs::RECEIVE_MESSAGE_PARAMETERS,
             Self::SqsDeleteMessage => sqs::DELETE_MESSAGE_PARAMETERS,
@@ -417,6 +423,7 @@ impl Action {
     fn required_parameters(self) -> &'static [&'static str] {
         match self {
             Self::EventBridgePutEvents => eventbridge::PUT_EVENTS_REQUIRED_PARAMETERS,
+            Self::KinesisPutRecord => kinesis::PUT_RECORD_REQUIRED_PARAMETERS,
             Self::SqsSendMessage => sqs::SEND_MESSAGE_REQUIRED_PARAMETERS,
             Self::SqsReceiveMessage => sqs::RECEIVE_MESSAGE_REQUIRED_PARAMETERS,
             Self::SqsDeleteMessage => sqs::DELETE_MESSAGE_REQUIRED_PARAMETERS,
@@ -446,6 +453,7 @@ impl Action {
             Self::EventBridgePutEvents => {
                 eventbridge::put_events(ctx, region, identity, mapped).await
             }
+            Self::KinesisPutRecord => kinesis::put_record(ctx, region, identity, mapped).await,
             Self::SqsSendMessage => sqs::send_message(ctx, region, identity, mapped).await,
             Self::SqsReceiveMessage => sqs::receive_message(ctx, region, identity, mapped).await,
             Self::SqsDeleteMessage => sqs::delete_message(ctx, region, identity, mapped).await,
@@ -525,6 +533,11 @@ mod tests {
                 "the EventBridge publication",
                 eventbridge::PUT_EVENTS_SUBTYPE,
                 Some("Detail"),
+            ),
+            (
+                "the Kinesis put",
+                kinesis::PUT_RECORD_SUBTYPE,
+                Some("PartitionKey"),
             ),
             ("the SQS send", sqs::SEND_MESSAGE_SUBTYPE, Some("MessageBody")),
             (

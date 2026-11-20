@@ -51,6 +51,10 @@ aws-sdk-lambda = { version = "1", default-features = false }
 aws-sdk-eventbridge = { version = "1", default-features = false }
 aws-sdk-sqs = { version = "1", default-features = false }
 aws-sdk-sfn = { version = "1", default-features = false }
+# And the same for Amazon Kinesis Data Streams, whose `Kinesis-PutRecord` subtype a route
+# performs by putting the mapped record on the stream THAT service holds
+# (`src/service/invoke/service_action/kinesis.rs`).
+aws-sdk-kinesis = { version = "1", default-features = false }
 # Base64, for the one encoding an HTTP api's proxy event states a payload in when it is not
 # text (`isBase64Encoded`), in both directions.
 base64 = "0.22"
