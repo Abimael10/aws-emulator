@@ -58,7 +58,15 @@ const LIMITS_EXCEEDED: &str = "LimitsExceeded";
 const INVALID_INPUT: &str = "InvalidInput";
 
 /// Create a CIDR collection.
-async fn create_collection(router: &MultiServiceRouter, name: &str, caller_reference: &str) -> Reply {
+///
+/// `pub(crate)` so a sibling suite that has to CHOOSE the caller reference — one
+/// sending the same create twice, to be served the collection the first one
+/// persisted — drives this request rather than growing a second copy of its body.
+pub(crate) async fn create_collection(
+    router: &MultiServiceRouter,
+    name: &str,
+    caller_reference: &str,
+) -> Reply {
     call(
         router,
         "POST",

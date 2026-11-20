@@ -30,6 +30,14 @@
 //!    page of it, so it is the modelled `InvalidInput` (HTTP 400) rather than a page.
 //!    Being a read, repeating it reports the same collections and a refused request
 //!    leaves the listing exactly as it was.
+//! 4. Rule 1 over the SERVICE rather than over one response member: no response of this
+//!    service renders an ARN of its own in any other layout. The sweep drives every
+//!    response that carries one — the create, the create served as the retry of a
+//!    collection the account already holds, the whole listing and one page of it — beside
+//!    the responses that must carry none (the change, the two reads over a collection's
+//!    contents, the hosted-zone paths, a refusal), and holds every ARN any of them renders
+//!    to the layout, to the set of resources the account actually holds, and to the id its
+//!    own response identifies that resource by.
 //!
 //! Every test drives the service through the real router, using the SAME harness the
 //! sibling CIDR-collection suites use, so what is asserted is the HTTP/restXml behaviour a
@@ -40,7 +48,8 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_route53_awsdnsv20130401::state::DEFAULT_PAGE_SIZE;
 
 use crate::cidr_collection_blocks::{change, change_collection, create_collection, DELETE_IF_EXISTS, PUT};
-use crate::hosted_zone_records::{call, router, Reply};
+use crate::cidr_collections::create_collection as create_collection_under;
+use crate::hosted_zone_records::{call, create_zone_ok, router, Reply};
 
 /// The wire error code of the refusal of a collection id the account does not hold
 /// (`NoSuchCidrCollectionException`, the shape name the model declares).
@@ -780,4 +789,286 @@ async fn a_next_token_this_listing_never_minted_names_no_page_of_it() {
             reply.body
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The layout over the whole service, rather than over one response member
+// ---------------------------------------------------------------------------
+
+/// The service field of an ARN this service renders, which is this service's own name in
+/// one. A token naming another service is that service's to lay out, not this rule's.
+const ARN_SERVICE_FIELD: &str = "route53";
+
+/// Every `arn:`-prefixed token of `body`, as it reaches a caller: an ARN is element text,
+/// so a token runs up to the next `<` or whitespace.
+///
+/// Read off the BODY rather than off a member path, because the rule is about every ARN
+/// the response carries — including one a member this suite does not name would carry.
+fn arn_tokens(body: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut rest = body;
+    while let Some(start) = rest.find("arn:") {
+        let tail = &rest[start..];
+        let end = tail
+            .find(|character: char| character == '<' || character.is_whitespace())
+            .unwrap_or(tail.len());
+        tokens.push(&tail[..end]);
+        rest = &tail[end..];
+    }
+    tokens
+}
+
+/// Hold every ARN of this service's own resources that `reply` renders to the layout, and
+/// answer them in document order.
+///
+/// `held` is every collection the account holds, so an ARN naming a resource the account
+/// does not hold is caught beside one laid out wrongly; the resource each token names is
+/// resolved out of the token's RESOURCE field, so a token carrying a region or an account
+/// is still resolved and then reported against the layout.
+fn asserted_arns(case: &str, reply: &Reply, held: &[ListedCollection]) -> Vec<String> {
+    let reported_ids = reply.all("Id");
+    let mut rendered = Vec::new();
+    for token in arn_tokens(&reply.body) {
+        let fields: Vec<&str> = token.split(':').collect();
+        if fields.get(2) != Some(&ARN_SERVICE_FIELD) {
+            continue;
+        }
+        let named = fields
+            .last()
+            .and_then(|resource| resource.rsplit('/').next())
+            .and_then(|id| held.iter().find(|row| row.id == id))
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: every ARN this service renders names a resource the account \
+                     holds (one of {held:?}), got {token:?}; body {}",
+                    reply.body
+                )
+            });
+        assert_collection_arn(case, token, &named.id);
+        // The ARN's only variable part is the resource's own id, and it is the id this
+        // very response identifies the resource by — so a client keying the response by
+        // ARN and one keying it by id agree about what it reported.
+        assert!(
+            reported_ids.contains(&named.id.as_str()),
+            "case {case:?}: the ARN {token:?} must name a resource this response identifies, \
+             whose Ids are {reported_ids:?}; body {}",
+            reply.body
+        );
+        rendered.push(token.to_string());
+    }
+    rendered
+}
+
+/// One row of the sweep: a request this service serves, the status it answers and how many
+/// ARNs of its own resources its response renders.
+struct SweepRow {
+    case: &'static str,
+    uri: String,
+    status: u16,
+    arns: usize,
+}
+
+/// The collections the sweep seeds: a case, the collection's name and how many changes
+/// move it after it is created.
+///
+/// The names span the length and character classes `CollectionName` admits (`len 1..64,
+/// pattern ^[0-9A-Za-z_\-]+$`) and the rows differ in how far the version counter has
+/// moved, because the layout holds for every resource of the service rather than for one
+/// collection in one state.
+const SWEPT_COLLECTIONS: &[(&str, &str, usize)] = &[
+    ("the shortest name the model allows", "a", 0),
+    ("a hyphenated name", "swept-ranges", 1),
+    ("an underscored name with digits", "swept_ranges_2", 2),
+];
+
+/// The caller reference a swept collection is created under, derived from its name so that
+/// sending the same create again is the RETRY the token exists for.
+fn swept_reference(name: &str) -> String {
+    format!("swept-{name}")
+}
+
+#[tokio::test]
+async fn no_response_of_the_service_renders_an_arn_in_another_layout() {
+    let router = router();
+
+    // Seed the account's collections, holding the ARN each create renders to the rule as
+    // the holdings GROW: the later creates are answered out of a store that already holds
+    // collections of its own.
+    let mut held: Vec<ListedCollection> = Vec::new();
+    for (case, name, changes) in SWEPT_COLLECTIONS {
+        let created = create_collection_under(&router, name, &swept_reference(name)).await;
+        assert_eq!(
+            created.status, 201,
+            "case {case:?}: expected 201 from CreateCidrCollection, got {} with body {}",
+            created.status, created.body
+        );
+        let id = created
+            .first("Collection/Id")
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: the create must answer the collection's id; body {}",
+                    created.body
+                )
+            })
+            .to_string();
+        held.push(ListedCollection {
+            arn: format!("{COLLECTION_ARN_PREFIX}{id}"),
+            id: id.clone(),
+            name: (*name).to_string(),
+            version: (1 + changes).to_string(),
+        });
+        let rendered = asserted_arns(case, &created, &held);
+        assert_eq!(
+            rendered,
+            vec![format!("{COLLECTION_ARN_PREFIX}{id}")],
+            "case {case:?}: the create must render the new collection's own ARN; body {}",
+            created.body
+        );
+
+        // A change moves the collection's version; the ARN names the resource, so
+        // `ChangeCidrCollection` — which models no ARN member — renders none.
+        for index in 0..*changes {
+            let applied = change_collection(
+                &router,
+                &id,
+                None,
+                &change("east", PUT, &[&format!("203.0.113.{}/32", index * 4)]),
+            )
+            .await;
+            assert_eq!(
+                applied.status, 200,
+                "case {case:?}: expected 200 from ChangeCidrCollection, got {} with body {}",
+                applied.status, applied.body
+            );
+            assert!(
+                asserted_arns(case, &applied, &held).is_empty(),
+                "case {case:?}: ChangeCidrCollection models no ARN member; body {}",
+                applied.body
+            );
+        }
+    }
+
+    // The create sent AGAIN is served with the collection the first one persisted, so it
+    // renders that collection's ARN rather than a fresh one.
+    let (_, first_name, _) = SWEPT_COLLECTIONS[0];
+    let retried = create_collection_under(&router, first_name, &swept_reference(first_name)).await;
+    assert_eq!(
+        retried.status, 201,
+        "case \"the create served as a retry\": expected 201, got {} with body {}",
+        retried.status, retried.body
+    );
+    assert_eq!(
+        asserted_arns("the create served as a retry", &retried, &held),
+        vec![held[0].arn.clone()],
+        "case \"the create served as a retry\": expected the held collection's ARN; body {}",
+        retried.body
+    );
+
+    // A hosted zone, so the sweep also covers the responses over a resource of this
+    // service of ANOTHER kind.
+    let zone = create_zone_ok(&router, "swept.example.com.", "swept-zone").await;
+    let first = held[0].id.clone();
+    // A `UUID` no collection of the account has, so the read over it is the modelled
+    // refusal rather than a listing.
+    let unknown = "00000000-0000-4000-8000-000000000000";
+
+    let rows = [
+        SweepRow {
+            case: "the whole collection listing",
+            uri: "/2013-04-01/cidrcollection".to_string(),
+            status: 200,
+            arns: SWEPT_COLLECTIONS.len(),
+        },
+        SweepRow {
+            case: "one page of the collection listing",
+            uri: "/2013-04-01/cidrcollection?maxresults=1".to_string(),
+            status: 200,
+            arns: 1,
+        },
+        SweepRow {
+            case: "the location listing of one collection",
+            uri: format!("/2013-04-01/cidrcollection/{first}"),
+            status: 200,
+            arns: 0,
+        },
+        SweepRow {
+            case: "the block listing of one collection",
+            uri: format!("/2013-04-01/cidrcollection/{first}/cidrblocks"),
+            status: 200,
+            arns: 0,
+        },
+        SweepRow {
+            case: "the hosted zone read back",
+            uri: format!("/2013-04-01/hostedzone/{zone}"),
+            status: 200,
+            arns: 0,
+        },
+        SweepRow {
+            case: "the whole hosted zone listing",
+            uri: "/2013-04-01/hostedzone".to_string(),
+            status: 200,
+            arns: 0,
+        },
+        SweepRow {
+            case: "a refusal over a collection the account does not hold",
+            uri: format!("/2013-04-01/cidrcollection/{unknown}/cidrblocks"),
+            status: 404,
+            arns: 0,
+        },
+    ];
+
+    for row in &rows {
+        let reply = call(&router, "GET", &row.uri, "").await;
+        assert_eq!(
+            reply.status, row.status,
+            "case {:?}: expected status {}, got {} with body {}",
+            row.case, row.status, reply.status, reply.body
+        );
+        let rendered = asserted_arns(row.case, &reply, &held);
+        assert_eq!(
+            rendered.len(),
+            row.arns,
+            "case {:?}: expected {} ARN(s) of this service's resources, got {rendered:?}; \
+             body {}",
+            row.case,
+            row.arns,
+            reply.body
+        );
+    }
+
+    // A collection taken away is reported by nothing, so the ARN a client holds for it
+    // resolves to no row of the listing — the same reconciliation, at the other end of the
+    // resource's life.
+    let deleted = delete_collection(&router, &first).await;
+    assert_eq!(
+        deleted.status, 200,
+        "case \"the delete\": expected 200, got {} with body {}",
+        deleted.status, deleted.body
+    );
+    let gone = held[0].arn.clone();
+    let remaining: Vec<ListedCollection> = held
+        .into_iter()
+        .filter(|row| row.arn != gone)
+        .collect();
+    let listed = list_collections(&router, "").await;
+    assert_eq!(
+        listed.status, 200,
+        "case \"the listing after the delete\": expected 200, got {} with body {}",
+        listed.status, listed.body
+    );
+    let rendered = asserted_arns("the listing after the delete", &listed, &remaining);
+    assert_eq!(
+        rendered.len(),
+        remaining.len(),
+        "case \"the listing after the delete\": expected the {} collection(s) the account \
+         still holds, got {rendered:?}; body {}",
+        remaining.len(),
+        listed.body
+    );
+    assert!(
+        !rendered.contains(&gone),
+        "case \"the listing after the delete\": the deleted collection's ARN {gone:?} must be \
+         reported by nothing, got {rendered:?}; body {}",
+        listed.body
+    );
 }
