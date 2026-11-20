@@ -18,6 +18,10 @@
 //! * a client-token record is released with the resource it minted, so once a rule is
 //!   gone its token is free again, while a record whose rule is still stored keeps
 //!   replaying that rule;
+//! * one link holds one rule per priority: a create asking for a number another of
+//!   that link's non-deleted rules holds is refused with the modelled
+//!   `ConflictException` (HTTP 409) and stores nothing, while the same number on
+//!   another link, and the number a released rule held, are free;
 //! * every refusal for a gateway, a link or a rule this store does not hold is the
 //!   service's one not-found: HTTP 404 with fixed text naming nothing from the
 //!   request.
@@ -35,8 +39,8 @@ use bytes::Bytes;
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde_json::{json, Value};
 use service_com_amazonaws_rtbfabric_rtbfabric::state::{
-    RESOURCE_NOT_FOUND_MESSAGE, RULE_STATUS_ACTIVE, RULE_STATUS_CREATION_IN_PROGRESS,
-    RULE_STATUS_DELETION_IN_PROGRESS,
+    priority_conflict_message, RESOURCE_NOT_FOUND_MESSAGE, RULE_STATUS_ACTIVE,
+    RULE_STATUS_CREATION_IN_PROGRESS, RULE_STATUS_DELETION_IN_PROGRESS,
 };
 use service_com_amazonaws_rtbfabric_rtbfabric::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -1318,4 +1322,350 @@ async fn deleting_a_rule_the_store_does_not_hold_is_the_one_not_found() {
         "case {:?}: expected the stored rule to survive the refusals, got {} {:?}",
         "the stored rule", read.status, read.body
     );
+}
+
+/// Assert `answered` is the refusal of a priority the addressed link already holds:
+/// the modelled `ConflictException` (HTTP 409), naming the rule that holds the
+/// number, and minting nothing.
+fn assert_priority_conflict(
+    case: &str,
+    answered: &Answer,
+    held_by: &str,
+    link_id: &str,
+    priority: i64,
+) {
+    assert_eq!(
+        answered.status, 409,
+        "case {case:?}: expected HTTP 409, got {} {:?}",
+        answered.status, answered.body
+    );
+    assert_eq!(
+        answered.code, "ConflictException",
+        "case {case:?}: expected ConflictException, got {:?}",
+        answered.code
+    );
+    let expected = priority_conflict_message(
+        held_by,
+        link_id,
+        i32::try_from(priority).expect("a priority inside the modelled range"),
+    );
+    assert_eq!(
+        answered.message(),
+        expected,
+        "case {case:?}: expected {expected:?}, got {:?}",
+        answered.message()
+    );
+    assert!(
+        answered.body["ruleId"].is_null(),
+        "case {case:?}: expected the refusal to mint no rule, got {:?}",
+        answered.body
+    );
+}
+
+/// One row of the priority-uniqueness table: the number the link's first rule takes,
+/// and two different `RuleCondition` members, so what the second create collides on
+/// is the number alone and not what either rule matches on.
+struct PriorityRow {
+    name: &'static str,
+    priority: i64,
+    held: fn() -> Value,
+    asked: fn() -> Value,
+}
+
+/// Both published bounds of `RulePriority` (1..1000) and a number between them
+/// (`smithy_query(query="doc", shape="RulePriority")`), each asked for twice on one
+/// link with different conditions.
+const PRIORITY_ROWS: &[PriorityRow] = &[
+    PriorityRow {
+        name: "the lowest priority",
+        priority: 1,
+        held: || json!({ "hostHeader": "bids.example.com" }),
+        asked: || json!({ "pathPrefix": "/bid" }),
+    },
+    PriorityRow {
+        name: "a priority between the bounds",
+        priority: 10,
+        held: || json!({ "pathPrefix": "/bid" }),
+        asked: || json!({ "pathExact": "/bid/openrtb" }),
+    },
+    PriorityRow {
+        name: "the highest priority",
+        priority: 1000,
+        held: || json!({ "queryStringExists": "debug" }),
+        asked: || json!({ "hostHeaderWildcard": "*.example.com" }),
+    },
+];
+
+#[tokio::test]
+async fn one_link_holds_one_rule_per_priority() {
+    for row in PRIORITY_ROWS {
+        let case = row.name;
+        let fabric = Fabric::new();
+        let pair = fabric.linked_pair(case, "token").await;
+        // A second link, to see that the number is unique per LINK rather than
+        // across the store.
+        let other = fabric.linked_pair(case, "token-other").await;
+
+        let held = fabric
+            .create_rule(
+                &pair.responder_id,
+                &pair.link_id,
+                "token-held",
+                row.priority,
+                (row.held)(),
+                None,
+            )
+            .await;
+        assert_eq!(
+            held.status, 200,
+            "case {case:?}: expected CreateLinkRoutingRule to answer 200, got {} {:?}",
+            held.status, held.body
+        );
+        let held_id = text(&held.body, "ruleId");
+
+        // The same number asked for again on that link, through either of its two
+        // ends and with a fresh client token each time.
+        for (end, gateway_id) in [
+            ("the responder end", &pair.responder_id),
+            ("the requester end", &pair.requester_id),
+        ] {
+            let answered = fabric
+                .create_rule(
+                    gateway_id,
+                    &pair.link_id,
+                    &format!("token-second-{}", gateway_id),
+                    row.priority,
+                    (row.asked)(),
+                    None,
+                )
+                .await;
+            assert_priority_conflict(
+                &format!("{case}, asked through {end}"),
+                &answered,
+                &held_id,
+                &pair.link_id,
+                row.priority,
+            );
+        }
+
+        // What collided is the number: the very same conditions at a number no rule
+        // of the link holds are stored.
+        let free = if row.priority == 1 {
+            row.priority + 1
+        } else {
+            row.priority - 1
+        };
+        let beside = fabric
+            .create_rule(
+                &pair.responder_id,
+                &pair.link_id,
+                "token-beside",
+                free,
+                (row.asked)(),
+                None,
+            )
+            .await;
+        assert_eq!(
+            beside.status, 200,
+            "case {case:?}: expected priority {free} beside it to be stored, got {} {:?}",
+            beside.status, beside.body
+        );
+        let beside_read = fabric
+            .get_rule(
+                &pair.responder_id,
+                &pair.link_id,
+                &text(&beside.body, "ruleId"),
+            )
+            .await;
+        assert_eq!(
+            beside_read.body["priority"],
+            json!(free),
+            "case {case:?}: expected the second rule to hold priority {free}, got {:?}",
+            beside_read.body["priority"]
+        );
+
+        // Another link's rules are no constraint: the number is unique within one
+        // link.
+        let elsewhere = fabric
+            .create_rule(
+                &other.responder_id,
+                &other.link_id,
+                "token-elsewhere",
+                row.priority,
+                (row.asked)(),
+                None,
+            )
+            .await;
+        assert_eq!(
+            elsewhere.status, 200,
+            "case {case:?}: expected priority {} on another link to be stored, got {} {:?}",
+            row.priority, elsewhere.status, elsewhere.body
+        );
+        let elsewhere_read = fabric
+            .get_rule(
+                &other.responder_id,
+                &other.link_id,
+                &text(&elsewhere.body, "ruleId"),
+            )
+            .await;
+        assert_eq!(
+            elsewhere_read.body["priority"],
+            json!(row.priority),
+            "case {case:?}: expected the other link's rule to hold priority {}, got {:?}",
+            row.priority,
+            elsewhere_read.body["priority"]
+        );
+
+        // A retry of the create that holds the number replays its own rule rather
+        // than conflicting with it.
+        let retry = fabric
+            .create_rule(
+                &pair.responder_id,
+                &pair.link_id,
+                "token-held",
+                row.priority,
+                (row.held)(),
+                None,
+            )
+            .await;
+        assert_eq!(
+            retry.status, 200,
+            "case {case:?}: expected the retry to answer 200, got {} {:?}",
+            retry.status, retry.body
+        );
+        assert_eq!(
+            text(&retry.body, "ruleId"),
+            held_id,
+            "case {case:?}: expected the retry to answer rule {held_id:?}, got {:?}",
+            retry.body["ruleId"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_priority_is_free_again_once_the_rule_holding_it_is_gone() {
+    let case = "the priority a released rule held";
+    let fabric = Fabric::new();
+    let pair = fabric.linked_pair(case, "token").await;
+    let priority = 10;
+
+    let held = fabric
+        .create_rule(
+            &pair.responder_id,
+            &pair.link_id,
+            "token-held",
+            priority,
+            json!({ "pathPrefix": "/bid" }),
+            None,
+        )
+        .await;
+    assert_eq!(
+        held.status, 200,
+        "case {case:?}: expected CreateLinkRoutingRule to answer 200, got {} {:?}",
+        held.status, held.body
+    );
+    let held_id = text(&held.body, "ruleId");
+
+    let deleted = fabric
+        .delete_rule(&pair.responder_id, &pair.link_id, &held_id)
+        .await;
+    assert_eq!(
+        deleted.status, 200,
+        "case {case:?}: expected DeleteLinkRoutingRule to answer 200, got {} {:?}",
+        deleted.status, deleted.body
+    );
+    // The clock finishes the deletion, so no rule of the link holds the number any
+    // more.
+    fabric
+        .gone(case, &pair.responder_id, &pair.link_id, &held_id)
+        .await;
+
+    let reused = fabric
+        .create_rule(
+            &pair.responder_id,
+            &pair.link_id,
+            "token-reused",
+            priority,
+            json!({ "pathExact": "/bid/openrtb" }),
+            None,
+        )
+        .await;
+    assert_eq!(
+        reused.status, 200,
+        "case {case:?}: expected priority {priority} to be free again, got {} {:?}",
+        reused.status, reused.body
+    );
+    let reused_read = fabric
+        .get_rule(
+            &pair.responder_id,
+            &pair.link_id,
+            &text(&reused.body, "ruleId"),
+        )
+        .await;
+    assert_eq!(
+        reused_read.body["priority"],
+        json!(priority),
+        "case {case:?}: expected the fresh rule to hold priority {priority}, got {:?}",
+        reused_read.body["priority"]
+    );
+}
+
+#[tokio::test]
+async fn a_rule_whose_deletion_is_outstanding_still_holds_its_priority() {
+    let case = "a priority held by a rule being deleted";
+    let fabric = Fabric::new();
+    let pair = fabric.linked_pair(case, "token").await;
+    let priority = 500;
+
+    let held = fabric
+        .create_rule(
+            &pair.responder_id,
+            &pair.link_id,
+            "token-held",
+            priority,
+            json!({ "pathPrefix": "/bid" }),
+            None,
+        )
+        .await;
+    assert_eq!(
+        held.status, 200,
+        "case {case:?}: expected CreateLinkRoutingRule to answer 200, got {} {:?}",
+        held.status, held.body
+    );
+    let held_id = text(&held.body, "ruleId");
+
+    let deleted = fabric
+        .delete_rule(&pair.responder_id, &pair.link_id, &held_id)
+        .await;
+    assert_eq!(
+        text(&deleted.body, "status"),
+        RULE_STATUS_DELETION_IN_PROGRESS,
+        "case {case:?}: expected the delete to answer {RULE_STATUS_DELETION_IN_PROGRESS:?}, \
+         got {:?}",
+        deleted.body["status"]
+    );
+
+    // A rule whose deletion is still outstanding has not been deleted, so it holds
+    // its number; the clock may instead have completed that deletion before this
+    // call arrived, and then the number is free and the deleted rule is gone. Both
+    // are the same rule read at two instants, so each answer is checked against the
+    // state it reports.
+    let during = fabric
+        .create_rule(
+            &pair.responder_id,
+            &pair.link_id,
+            "token-during",
+            priority,
+            json!({ "pathExact": "/bid/openrtb" }),
+            None,
+        )
+        .await;
+    if during.status == 200 {
+        let read = fabric
+            .get_rule(&pair.responder_id, &pair.link_id, &held_id)
+            .await;
+        assert_not_found(case, &read, &[&pair.responder_id, &pair.link_id, &held_id]);
+    } else {
+        assert_priority_conflict(case, &during, &held_id, &pair.link_id, priority);
+    }
 }

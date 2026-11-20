@@ -245,6 +245,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A priority orders the link's rules against each other, so the link's
+        // non-deleted rules hold distinct ones: a second rule asking for a number
+        // one of them already holds is refused rather than stored. Checked after
+        // the token, so a retry of THIS create replays its own rule instead of
+        // conflicting with it.
+        if let Some(held) = store.rule_holding_priority(&link_id, input.priority) {
+            return Err(CreateLinkRoutingRuleErrorModeled::ConflictException(
+                ConflictException {
+                    message: crate::state::priority_conflict_message(
+                        &held.rule_id,
+                        &link_id,
+                        input.priority,
+                    ),
+                },
+            )
+            .into());
+        }
+
         // The store's own bounds, checked before the insert.
         if store.routing_rules.len() >= crate::state::ROUTING_RULE_QUOTA {
             return Err(

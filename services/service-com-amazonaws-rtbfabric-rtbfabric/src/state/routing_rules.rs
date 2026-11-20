@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::time::SystemTime;
 
+use super::ComAmazonawsRtbfabricRtbfabricState;
 use crate::ops::types::RuleCondition;
 
 /// `RuleStatus` member: the rule is accepted, it is not routing yet.
@@ -119,4 +120,37 @@ pub fn conditions_stated(conditions: &RuleCondition) -> bool {
         || conditions.path_exact.is_some()
         || conditions.query_string_equals.is_some()
         || conditions.query_string_exists.is_some()
+}
+
+impl ComAmazonawsRtbfabricRtbfabricState {
+    /// The link's rule that already holds `priority`, if one does.
+    ///
+    /// A priority orders the link's rules against each other — lower number
+    /// evaluated first — so two rules of one link holding the same number leave
+    /// that order undecided; the modelled `RulePriority`
+    /// (`smithy_query(query="doc", shape="RulePriority")`) states the number is
+    /// unique per link among the rules that are not deleted. A rule whose
+    /// deletion is still outstanding has not been deleted, so it holds its
+    /// priority until the clock completes that deletion and
+    /// [`settle_all`](Self::settle_all) drops the record; the terminal status is
+    /// excluded here anyway, so a record kept past it constrains nothing.
+    ///
+    /// Another link's rules are no constraint: the scan covers the rules keyed
+    /// to THIS link, and so is bounded by [`ROUTING_RULE_QUOTA`] like every
+    /// other scan this store does under its lock.
+    pub fn rule_holding_priority(&self, link_id: &str, priority: i32) -> Option<&LinkRoutingRule> {
+        self.routing_rules.values().find(|rule| {
+            rule.link_id == link_id
+                && rule.status != RULE_STATUS_DELETED
+                && rule.priority == priority
+        })
+    }
+}
+
+/// What a call asking for a priority another non-deleted rule of the same link
+/// already holds is refused with, beside the modelled `ConflictException` (HTTP
+/// 409): the rule that holds the number, so the caller knows which one to read,
+/// move or delete.
+pub fn priority_conflict_message(rule_id: &str, link_id: &str, priority: i32) -> String {
+    format!("rule {rule_id} on link {link_id} already holds priority {priority}")
 }

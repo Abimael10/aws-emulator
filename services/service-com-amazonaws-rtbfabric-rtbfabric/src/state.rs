@@ -33,9 +33,9 @@ pub use page_tokens::{
     decode_next_token, encode_next_token, TokenRefusal, MAX_TOKEN_LENGTH, TOKEN_LIFETIME,
 };
 pub use routing_rules::{
-    conditions_stated, LinkRoutingRule, ROUTING_RULE_QUOTA, RULE_CONDITIONS_EMPTY_MESSAGE,
-    RULE_STATUS_ACTIVE, RULE_STATUS_CREATION_IN_PROGRESS, RULE_STATUS_DELETED,
-    RULE_STATUS_DELETION_IN_PROGRESS,
+    conditions_stated, priority_conflict_message, LinkRoutingRule, ROUTING_RULE_QUOTA,
+    RULE_CONDITIONS_EMPTY_MESSAGE, RULE_STATUS_ACTIVE, RULE_STATUS_CREATION_IN_PROGRESS,
+    RULE_STATUS_DELETED, RULE_STATUS_DELETION_IN_PROGRESS,
 };
 pub use tagging::{
     resource_tags, resource_tags_mut, tagged_resource, tagging_unresolved, TaggedResource,
