@@ -183,8 +183,10 @@ async fn serve_session(
         break startup_parameters(body.get(4..).unwrap_or_default());
     };
 
-    // 2. The instance this listener belongs to, as the store holds it now.
-    let Some(facts) = context.endpoint_facts() else {
+    // 2. The instance this listener belongs to, as the store holds it now, and the storage
+    //    its statements run on — resolved together, so a session cannot be admitted against
+    //    one database and served from another.
+    let Some(served) = context.endpoint_facts() else {
         return fatal(
             &mut conn,
             "57P03",
@@ -192,6 +194,10 @@ async fn serve_session(
         )
         .await;
     };
+    let wire_session::ServedSession {
+        facts,
+        database: database_handle,
+    } = served;
     let user = startup
         .iter()
         .find(|(key, _)| key == "user")
@@ -229,7 +235,7 @@ async fn serve_session(
     // the database the user would be resolved against, both read from the facts above; the
     // engine is read only inside the decision, and only for a login whose token claims
     // already hold.
-    let iam = context.iam_login(&facts, &user, database.as_deref());
+    let iam = context.iam_login(&facts, &database_handle, &user, database.as_deref());
     let database = match wire_session::admit(
         &facts,
         &user,
@@ -293,7 +299,6 @@ async fn serve_session(
             .await;
         }
     }
-    let database_handle = Arc::clone(&context.database);
     let _session = Session {
         database: Arc::clone(&database_handle),
         sessions: context.sessions.clone(),

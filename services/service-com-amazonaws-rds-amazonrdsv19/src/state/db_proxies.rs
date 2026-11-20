@@ -54,7 +54,19 @@ pub const DEFAULT_DB_PROXY_TARGET_GROUP: &str = "default";
 pub const DEFAULT_IDLE_CLIENT_TIMEOUT: i32 = 1800;
 
 /// The `EngineFamily` whose connection pool defaults differ from every other engine's.
+///
+/// One of the three values that enum takes, declared here with its siblings so the family
+/// vocabulary lives in one module: `super::data_plane::proxy_endpoint` reads them to decide
+/// which database protocol a proxy of each family speaks.
 pub const ENGINE_FAMILY_SQLSERVER: &str = "SQLSERVER";
+
+/// `CreateDBProxy$EngineFamily`'s MySQL value: "For Aurora MySQL, RDS for MariaDB, and RDS
+/// for MySQL databases, specify MYSQL".
+pub const ENGINE_FAMILY_MYSQL: &str = "MYSQL";
+
+/// `CreateDBProxy$EngineFamily`'s PostgreSQL value: "For Aurora PostgreSQL and RDS for
+/// PostgreSQL databases, specify POSTGRESQL".
+pub const ENGINE_FAMILY_POSTGRESQL: &str = "POSTGRESQL";
 
 /// `ConnectionPoolConfiguration$MaxConnectionsPercent`'s documented default for RDS for
 /// Microsoft SQL Server: "Default: 10 for RDS for Microsoft SQL Server, and 100 for all
@@ -554,7 +566,18 @@ pub struct DbProxyRecord {
     /// `TargetConnectionNetworkType`.
     pub target_connection_network_type: String,
     /// The minted DNS label the proxy's endpoint carries.
+    ///
+    /// Minted once, with the proxy, and never changed — `ModifyDBProxy` renames a proxy
+    /// without re-minting it — which is why a session on the proxy's endpoint resolves the
+    /// proxy by this label (`super::data_plane::proxy_endpoint`).
     pub endpoint_host: String,
+    /// The address of the proxy's own LISTENER, for a proxy this emulator serves the wire
+    /// of: what [`Self::endpoint`] publishes, because a client connects to exactly the
+    /// string the control plane hands it.
+    ///
+    /// `None` for a proxy of an engine family whose wire this emulator does not speak, which
+    /// gets no listener and keeps the DNS-form endpoint this service has always reported.
+    pub served_endpoint: Option<super::ServedEndpoint>,
     /// `Status`.
     pub status: String,
     /// The status change the clock owes this record, if any.
@@ -683,7 +706,21 @@ impl DbProxyRecord {
     /// "The endpoint that you can use to connect to the DB proxy", whose published form is
     /// `<proxy name>.proxy-<server-assigned label>.<region>.rds.amazonaws.com` (Amazon RDS
     /// User Guide, "Connecting to a database through RDS Proxy").
+    ///
+    /// A proxy whose engine family's wire this emulator SERVES publishes the address its own
+    /// listener is bound to instead ([`super::data_plane::proxy_endpoint`]): that is the
+    /// address a client connects to, and a name this machine does not resolve would be no
+    /// endpoint at all. The `DBProxy` shape carries no port member of its own, so the
+    /// published address carries the port the listener landed on
+    /// (`service_common::data_plane_addressing::host_port_authority`) — the core owns the
+    /// port range, so a client that reads this string has the whole address it needs.
     pub fn endpoint(&self) -> String {
+        if let Some(served) = &self.served_endpoint {
+            return ::service_common::data_plane_addressing::host_port_authority(
+                &served.host,
+                u16::try_from(served.port).unwrap_or_default(),
+            );
+        }
         format!(
             "{}.proxy-{}.{}.rds.amazonaws.com",
             self.name, self.endpoint_host, self.region

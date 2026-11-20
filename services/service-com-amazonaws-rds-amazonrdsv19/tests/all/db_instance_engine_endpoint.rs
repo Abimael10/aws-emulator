@@ -876,7 +876,12 @@ async fn mysql_write(conn: &mut Client, sequence: u8, payload: &[u8]) {
 }
 
 /// Read one MySQL packet.
-async fn mysql_read(conn: &mut Client) -> (u8, Vec<u8>) {
+///
+/// `pub(crate)` so a sibling suite that reads byte 0 of a MySQL connection WITHOUT logging
+/// in — the DB proxy endpoint suite, where a connection to a proxy with no database behind
+/// it is answered an error packet in place of the greeting — reads the protocol's framing
+/// through this one reading rather than a second copy of it.
+pub(crate) async fn mysql_read(conn: &mut Client) -> (u8, Vec<u8>) {
     let mut header = [0u8; 4];
     conn.read_exact(&mut header)
         .await

@@ -1661,8 +1661,15 @@ async fn proxy_targets_are_registered_reported_and_deregistered() {
         DB_PROXY_STATUS_AVAILABLE,
         "the proxy becomes available on its own: {reported}"
     );
+    // The endpoint is the address a client connects to, and this proxy's engine family is
+    // one whose database protocol this emulator speaks, so what it reports is the `host:port`
+    // its own listener answers on rather than a name nothing here resolves
+    // (`db_proxy_engine_endpoint` pins the host and drives the sessions opened on it).
+    let endpoint = text(&reported, "Endpoint");
     assert!(
-        text(&reported, "Endpoint").starts_with("emu-proxy.proxy-"),
+        endpoint
+            .rsplit_once(':')
+            .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok()),
         "the proxy reports the endpoint a client connects to: {reported}"
     );
 

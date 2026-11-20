@@ -138,6 +138,18 @@ pub enum SessionTarget {
     /// A DB CLUSTER's endpoint — "the connection endpoint for the primary instance of the
     /// DB cluster" — the address of the engine the cluster writes through.
     DbCluster { region: String, resource_id: String },
+    /// A DB PROXY's endpoint — "the endpoint that you can use to connect to the DB proxy" —
+    /// which runs no engine of its own: a session on it is served by the database the
+    /// proxy's target group holds, resolved when the session is opened
+    /// ([`super::proxy_endpoint`]).
+    ///
+    /// The proxy is named by the server-assigned label its endpoint carries rather than by
+    /// `DBProxyName`, because `ModifyDBProxy` can rename a proxy under a live connection
+    /// while that label stays as it was minted.
+    DbProxy {
+        region: String,
+        endpoint_label: String,
+    },
 }
 
 impl SessionTarget {
@@ -145,9 +157,24 @@ impl SessionTarget {
     #[must_use]
     pub fn region(&self) -> &str {
         match self {
-            Self::DbInstance { region, .. } | Self::DbCluster { region, .. } => region,
+            Self::DbInstance { region, .. }
+            | Self::DbCluster { region, .. }
+            | Self::DbProxy { region, .. } => region,
         }
     }
+}
+
+/// What ONE session on an endpoint is served against: the facts its login is admitted
+/// against and the storage its statements run on.
+///
+/// The two are resolved TOGETHER, because an endpoint that runs no engine of its own — a DB
+/// proxy's, whose storage is the database its target group holds — would otherwise be able
+/// to admit a login against one database and run its statements on another.
+pub struct ServedSession {
+    /// The resource a session on this endpoint is admitted against.
+    pub facts: InstanceFacts,
+    /// The databases its statements run on.
+    pub database: Arc<InstanceDatabase>,
 }
 
 /// Which kind of RDS resource an engine endpoint belongs to.
@@ -171,8 +198,15 @@ pub struct SessionContext {
     /// session on it may write ([`EndpointRole`]); the other half is what the resource's own
     /// record says.
     pub role: EndpointRole,
-    /// The databases behind the endpoint.
-    pub database: Arc<InstanceDatabase>,
+    /// The databases behind the endpoint, for an endpoint whose resource runs an engine of
+    /// its own.
+    ///
+    /// `None` for an endpoint that runs none and has no storage of its own — a DB PROXY's,
+    /// which pools connections to the database its target group holds: that database's own
+    /// storage is what a session through the proxy runs on, resolved when the session is
+    /// opened ([`super::proxy_endpoint`]), because a proxy created before any target was
+    /// registered has no database to be opened with.
+    pub database: Option<Arc<InstanceDatabase>>,
     /// The sessions open on this endpoint, which is what `pg_stat_activity` reports and
     /// what `max_connections` is counted against.
     pub sessions: super::pg_sessions::SessionRegistry,
@@ -205,12 +239,13 @@ impl SessionContext {
         self.next_connection_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// The facts this session is admitted against, read once under the state lock.
+    /// What this session is served against — the facts its login is admitted against and
+    /// the storage its statements run on — read once under the state lock.
     ///
     /// `None` when the store holds no such resource any more (it was deleted while the
-    /// listener was still accepting), which the wire answers as an engine that is not
-    /// there.
-    pub fn endpoint_facts(&self) -> Option<InstanceFacts> {
+    /// listener was still accepting), and for a DB proxy's endpoint with no database to pool
+    /// connections to yet, both of which the wire answers as an engine that is not there.
+    pub fn endpoint_facts(&self) -> Option<ServedSession> {
         let mut store = self.state.lock();
         // The transitions the clock has already made due — owed at this instant whether
         // or not anybody called, exactly as every control-plane handler materialises them
@@ -218,68 +253,38 @@ impl SessionContext {
         // that connects without calling the control plane first still finds the resource
         // it would have been told about.
         store.settle_due_transitions(self.target.region());
-        let (region, resource_id) = match &self.target {
+        match &self.target {
             // A cluster's facts come from the CLUSTER record, which is where a cluster's
             // master user, engine version and parameter group live.
             SessionTarget::DbCluster {
                 region,
                 resource_id,
             } => {
-                return super::cluster_endpoint::cluster_facts(
+                let database = self.database.clone()?;
+                let facts = super::cluster_endpoint::cluster_facts(
                     &store,
                     region,
                     resource_id,
-                    &self.database,
+                    &database,
                     self.role.clone(),
-                )
+                )?;
+                Some(ServedSession { facts, database })
             }
             SessionTarget::DbInstance {
                 region,
                 resource_id,
-            } => (region.clone(), resource_id.clone()),
-        };
-        let record = store.instance_by_resource_id(&region, &resource_id)?;
-        let wire = super::engine_wire(&record.engine)?;
-        let endpoint = store.engine_endpoint(&(record.region.clone(), record.identifier.clone()));
-        Some(facts_of(
-            RecordFacts {
-                kind: EndpointKind::DbInstance,
-                identifier: record.identifier.clone(),
-                engine: record.engine.clone(),
-                status: record.status.clone(),
-                wire,
-                engine_version: record.engine_version.clone(),
-                database_name: record.db_name.clone(),
-                master_username: record.master_username.clone(),
-                password: record.master_user_password.clone(),
-                requires_secure_transport: store.requires_secure_transport(record),
-                // The address of the endpoint this session arrived on, read from the ONE
-                // projection the control plane publishes it by
-                // ([`crate::state::DbInstanceRecord::endpoint_address`] and
-                // `published_port`, which `DescribeDBInstances` reports as
-                // `Endpoint{Address,Port}`) rather than from the listener a second time: a
-                // client mints its authentication token for the PUBLISHED pair, so the pair
-                // a describe reports and the pair a token is read against cannot drift. An
-                // instance the store holds no listener for has no address of its own here
-                // (the name it publishes is one this machine does not resolve), which is
-                // what `facts_of` answers a refusal with.
-                served_host: endpoint.map(|_| record.endpoint_address()),
-                served_port: endpoint.and_then(|_| u16::try_from(record.published_port()).ok()),
-                region: record.region.clone(),
-                iam_database_authentication_enabled: record.iam_database_authentication_enabled,
-                // An instance created as a READ REPLICA is replaying its source's writes:
-                // "RDS then uses the asynchronous replication method for the DB engine to
-                // update the read replica", and such a replica serves reads only. The
-                // relationship is what says so, so an instance `PromoteReadReplica` has
-                // promoted — which clears it — serves writes from then on, under the same
-                // session. A database a blue/green deployment pairs serves reads only for the
-                // same reason, on whichever side of the pairing production is not served from
-                // (`ComAmazonawsRdsAmazonrdsv19State::serves_reads_only_in_a_blue_green_deployment`).
-                read_only: serves_reads_only(&store, record),
-                runtime: engine_runtime_of(&store, record),
-            },
-            &self.database,
-        ))
+            } => {
+                let database = self.database.clone()?;
+                let facts = instance_facts(&store, region, resource_id, &database)?;
+                Some(ServedSession { facts, database })
+            }
+            // A proxy's endpoint serves the database its target group holds, whose own
+            // record is where the facts of a login through the proxy come from.
+            SessionTarget::DbProxy {
+                region,
+                endpoint_label,
+            } => super::proxy_endpoint::proxy_session(&store, region, endpoint_label),
+        }
     }
 
     /// The endpoint's engine as it is NOW, re-read for each statement a session runs: the
@@ -295,34 +300,7 @@ impl SessionContext {
     /// session is served under.
     pub fn engine_now(&self) -> Option<(EngineRuntime, bool)> {
         let store = self.state.lock();
-        match &self.target {
-            SessionTarget::DbInstance {
-                region,
-                resource_id,
-            } => {
-                let record = store.instance_by_resource_id(region, resource_id)?;
-                let read_only = serves_reads_only(&store, record);
-                Some((
-                    replaying(engine_runtime_of(&store, record), read_only),
-                    read_only,
-                ))
-            }
-            SessionTarget::DbCluster {
-                region,
-                resource_id,
-            } => {
-                let record = store.cluster_by_resource_id(region, resource_id)?;
-                let read_only =
-                    super::cluster_endpoint::serves_reads_only(&store, record, &self.role);
-                Some((
-                    replaying(
-                        super::cluster_endpoint::cluster_runtime_of(&store, record),
-                        read_only,
-                    ),
-                    read_only,
-                ))
-            }
-        }
+        engine_now_of(&store, &self.target, &self.role)
     }
 
     /// The ASSOCIATIONS the resource this listener serves carries right now, each as its
@@ -338,47 +316,9 @@ impl SessionContext {
     /// capability the association gates cannot be decided from what the login happened to
     /// find.
     #[must_use]
-    fn associations(&self) -> Vec<(Option<String>, Option<String>, Option<String>)> {
+    fn associations(&self) -> Vec<Association> {
         let store = self.state.lock();
-        match &self.target {
-            SessionTarget::DbInstance {
-                region,
-                resource_id,
-            } => store
-                .instance_by_resource_id(region, resource_id)
-                .map(|record| {
-                    record
-                        .associated_roles
-                        .iter()
-                        .map(|role| {
-                            (
-                                role.role_arn.clone(),
-                                role.feature_name.clone(),
-                                role.status.clone(),
-                            )
-                        })
-                        .collect()
-                }),
-            SessionTarget::DbCluster {
-                region,
-                resource_id,
-            } => store
-                .cluster_by_resource_id(region, resource_id)
-                .map(|record| {
-                    record
-                        .associated_roles
-                        .iter()
-                        .map(|role| {
-                            (
-                                role.role_arn.clone(),
-                                role.feature_name.clone(),
-                                role.status.clone(),
-                            )
-                        })
-                        .collect()
-                }),
-        }
-        .unwrap_or_default()
+        associations_of(&store, &self.target).unwrap_or_default()
     }
 
     /// The IAM role ARNs the resource this listener serves has associated with it right
@@ -422,10 +362,15 @@ impl SessionContext {
     /// does not have resolves to none, so a login about to be refused opens nothing and
     /// creates nothing. The engine is read once, later, and only for a login whose token
     /// claims already hold ([`IamLogin::admits`]).
+    ///
+    /// `engine` is the storage this session is served on ([`ServedSession::database`]) rather
+    /// than one read a second time, so the databases a token's user is resolved against are
+    /// the databases the login was admitted against.
     #[must_use]
     pub fn iam_login(
         &self,
         facts: &InstanceFacts,
+        engine: &Arc<InstanceDatabase>,
         user: &str,
         database: Option<&str>,
     ) -> IamLogin {
@@ -438,8 +383,181 @@ impl SessionContext {
             enabled: could_be,
             wire: facts.wire,
             database: could_be.then(|| resolved_database(facts, database)).flatten(),
-            engine: Arc::clone(&self.database),
+            engine: Arc::clone(engine),
         }
+    }
+}
+
+/// The facts a login on the DB INSTANCE `region`/`resource_id`'s own endpoint is admitted
+/// against, read under the state lock the caller holds.
+///
+/// The one reading of a DB instance's own record, so the facts its endpoint admits a login
+/// against and the facts a session through a DB PROXY registered against that instance is
+/// admitted against ([`super::proxy_endpoint`]) cannot drift apart.
+///
+/// `None` when the store holds no such instance any more, or when its engine speaks no wire
+/// this emulator serves.
+pub(super) fn instance_facts(
+    store: &ComAmazonawsRdsAmazonrdsv19State,
+    region: &str,
+    resource_id: &str,
+    database: &Arc<InstanceDatabase>,
+) -> Option<InstanceFacts> {
+    let record = store.instance_by_resource_id(region, resource_id)?;
+    let wire = super::engine_wire(&record.engine)?;
+    let endpoint = store.engine_endpoint(&(record.region.clone(), record.identifier.clone()));
+    Some(facts_of(
+        RecordFacts {
+            kind: EndpointKind::DbInstance,
+            identifier: record.identifier.clone(),
+            engine: record.engine.clone(),
+            status: record.status.clone(),
+            wire,
+            engine_version: record.engine_version.clone(),
+            database_name: record.db_name.clone(),
+            master_username: record.master_username.clone(),
+            password: record.master_user_password.clone(),
+            requires_secure_transport: store.requires_secure_transport(record),
+            // The address of the endpoint this session arrived on, read from the ONE
+            // projection the control plane publishes it by
+            // ([`crate::state::DbInstanceRecord::endpoint_address`] and
+            // `published_port`, which `DescribeDBInstances` reports as
+            // `Endpoint{Address,Port}`) rather than from the listener a second time: a
+            // client mints its authentication token for the PUBLISHED pair, so the pair
+            // a describe reports and the pair a token is read against cannot drift. An
+            // instance the store holds no listener for has no address of its own here
+            // (the name it publishes is one this machine does not resolve), which is
+            // what `facts_of` answers a refusal with.
+            served_host: endpoint.map(|_| record.endpoint_address()),
+            served_port: endpoint.and_then(|_| u16::try_from(record.published_port()).ok()),
+            region: record.region.clone(),
+            iam_database_authentication_enabled: record.iam_database_authentication_enabled,
+            // An instance created as a READ REPLICA is replaying its source's writes:
+            // "RDS then uses the asynchronous replication method for the DB engine to
+            // update the read replica", and such a replica serves reads only. The
+            // relationship is what says so, so an instance `PromoteReadReplica` has
+            // promoted — which clears it — serves writes from then on, under the same
+            // session. A database a blue/green deployment pairs serves reads only for the
+            // same reason, on whichever side of the pairing production is not served from
+            // (`ComAmazonawsRdsAmazonrdsv19State::serves_reads_only_in_a_blue_green_deployment`).
+            read_only: serves_reads_only(store, record),
+            runtime: engine_runtime_of(store, record),
+        },
+        database,
+    ))
+}
+
+/// The engine `target` is served by as it is NOW, and whether that endpoint serves no
+/// writes — the reading [`SessionContext::engine_now`] takes for each statement.
+///
+/// The one place a session's TARGET decides which record the engine is read off: a DB
+/// PROXY's endpoint runs no engine of its own, so what a session through it is served by is
+/// the engine of the database the proxy's target group holds, read here the same way that
+/// database's own endpoint reads it.
+fn engine_now_of(
+    store: &ComAmazonawsRdsAmazonrdsv19State,
+    target: &SessionTarget,
+    role: &EndpointRole,
+) -> Option<(EngineRuntime, bool)> {
+    match target {
+        SessionTarget::DbInstance {
+            region,
+            resource_id,
+        } => {
+            let record = store.instance_by_resource_id(region, resource_id)?;
+            let read_only = serves_reads_only(store, record);
+            Some((
+                replaying(engine_runtime_of(store, record), read_only),
+                read_only,
+            ))
+        }
+        SessionTarget::DbCluster {
+            region,
+            resource_id,
+        } => {
+            let record = store.cluster_by_resource_id(region, resource_id)?;
+            let read_only = super::cluster_endpoint::serves_reads_only(store, record, role);
+            Some((
+                replaying(
+                    super::cluster_endpoint::cluster_runtime_of(store, record),
+                    read_only,
+                ),
+                read_only,
+            ))
+        }
+        SessionTarget::DbProxy {
+            region,
+            endpoint_label,
+        } => engine_now_of(
+            store,
+            &super::proxy_endpoint::proxied_session_target(store, region, endpoint_label)?,
+            // A proxy pools connections to the writer of the database it reaches
+            // (`DBProxyTarget$Role` reports `READ_WRITE` for the target it was registered
+            // against), so the session is served in that database's writing role.
+            &EndpointRole::Writer,
+        ),
+    }
+}
+
+/// ONE association a resource carries, as every reading here carries it: its `RoleArn`, the
+/// `FeatureName` it is for, and its `Status`, each as the record reports it.
+type Association = (Option<String>, Option<String>, Option<String>);
+
+/// The associations the resource `target` names carries right now, each as its
+/// `(RoleArn, FeatureName, Status)` — the reading [`SessionContext::associations`] takes.
+///
+/// As [`engine_now_of`], the one place the target decides which record they are read off, so
+/// a further kind of target is handled here alone.
+fn associations_of(
+    store: &ComAmazonawsRdsAmazonrdsv19State,
+    target: &SessionTarget,
+) -> Option<Vec<Association>> {
+    match target {
+        SessionTarget::DbInstance {
+            region,
+            resource_id,
+        } => store
+            .instance_by_resource_id(region, resource_id)
+            .map(|record| {
+                record
+                    .associated_roles
+                    .iter()
+                    .map(|role| {
+                        (
+                            role.role_arn.clone(),
+                            role.feature_name.clone(),
+                            role.status.clone(),
+                        )
+                    })
+                    .collect()
+            }),
+        SessionTarget::DbCluster {
+            region,
+            resource_id,
+        } => store
+            .cluster_by_resource_id(region, resource_id)
+            .map(|record| {
+                record
+                    .associated_roles
+                    .iter()
+                    .map(|role| {
+                        (
+                            role.role_arn.clone(),
+                            role.feature_name.clone(),
+                            role.status.clone(),
+                        )
+                    })
+                    .collect()
+            }),
+        // An engine capability a session through a proxy uses is the capability of the
+        // database behind it, so the associations it acts under are that database's.
+        SessionTarget::DbProxy {
+            region,
+            endpoint_label,
+        } => associations_of(
+            store,
+            &super::proxy_endpoint::proxied_session_target(store, region, endpoint_label)?,
+        ),
     }
 }
 

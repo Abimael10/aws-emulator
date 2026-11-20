@@ -301,7 +301,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.updated_date = crate::state::now_as_wire_timestamp();
         record.begin_modifying();
         let db_proxy = record.to_wire();
-        store.db_proxies.insert((region, record.name.clone()), record);
+        let moved_to = (region, record.name.clone());
+        // A rename moves the proxy's endpoint with it, so the listener a client is connected
+        // to stays the endpoint the control plane publishes for that proxy.
+        store.move_proxy_endpoint(&key, &moved_to);
+        store.db_proxies.insert(moved_to, record);
         Ok(ModifyDBProxyOutput {
             db_proxy: Some(db_proxy),
         })

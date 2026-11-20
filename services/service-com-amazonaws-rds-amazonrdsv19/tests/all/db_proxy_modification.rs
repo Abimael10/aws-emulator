@@ -384,11 +384,11 @@ async fn renaming_a_proxy_moves_it_and_everything_computed_from_its_name() {
     wait_for_settle();
 
     let before = read_proxy(&router, "the proxy before the rename", "emu-modproxy-from").await;
-    let minted_label = text(&before, "Endpoint")
-        .split('.')
-        .nth(1)
-        .expect("the endpoint carries the server-assigned label as its second label")
-        .to_string();
+    // The endpoint this proxy publishes is the address its own listener answers at, that
+    // engine family's protocol being one this emulator speaks
+    // (`db_proxy_engine_endpoint`): the listener belongs to the PROXY, so a rename moves it
+    // with the proxy and the address a client was handed stays the address it dials.
+    let endpoint_before = text(&before, "Endpoint");
 
     // A rename onto a name the region already holds a proxy under would put two proxies
     // under one name.
@@ -428,10 +428,9 @@ async fn renaming_a_proxy_moves_it_and_everything_computed_from_its_name() {
     );
 
     // The rename moves the proxy: it answers to the new name, the old name resolves to
-    // nothing, and everything computed from the name — the proxy's ARN, the endpoint a
-    // client connects to, and the ARN of the one target group it has — follows it. The
-    // server-assigned label inside the endpoint is NOT recomputed: it belongs to the
-    // proxy, not to its name.
+    // nothing, and everything computed from the name — the proxy's ARN and the ARN of the
+    // one target group it has — follows it. The endpoint does NOT: it is the address the
+    // proxy's own listener answers at, which belongs to the proxy and not to its name.
     let renamed = expect_ok(
         "the rename",
         modify_proxy(
@@ -447,10 +446,7 @@ async fn renaming_a_proxy_moves_it_and_everything_computed_from_its_name() {
             "DBProxyArn",
             format!("arn:aws:rds:{REGION}:{ACCOUNT}:db-proxy:emu-modproxy-to"),
         ),
-        (
-            "Endpoint",
-            format!("emu-modproxy-to.{minted_label}.{REGION}.rds.amazonaws.com"),
-        ),
+        ("Endpoint", endpoint_before.clone()),
     ] {
         let actual = text(&renamed, member);
         assert_eq!(

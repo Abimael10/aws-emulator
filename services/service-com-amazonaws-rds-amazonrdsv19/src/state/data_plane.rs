@@ -25,6 +25,8 @@
 //! * [`cluster_endpoint`] — the same for the endpoints of a DB CLUSTER — its writer
 //!   endpoint, its reader endpoint and the endpoint of each of its member instances —
 //!   whose facts come from the cluster's own record;
+//! * [`proxy_endpoint`] — the same for a DB PROXY's endpoint, which runs no engine of its
+//!   own: a session on it is served by the database the proxy's target group holds;
 //! * [`sql_engine`] — the in-process SQLite database each of an instance's databases runs
 //!   its statements against;
 //! * [`session_transactions`] — the transaction each SESSION has open on it, and the rows
@@ -100,6 +102,9 @@ pub mod pg_numeric;
 pub mod pg_server;
 pub mod pg_sessions;
 pub mod pg_wire;
+/// A DB PROXY's endpoint: the address `DBProxy$Endpoint` publishes, and the sessions a
+/// client opens on it.
+pub mod proxy_endpoint;
 pub mod read_only;
 pub mod replication;
 pub mod row_locks;
@@ -708,7 +713,7 @@ pub async fn open_engine_endpoint<Eng: Send + Sync + 'static>(
             state: state.clone(),
             target: target.clone(),
             role,
-            database: Arc::clone(&database),
+            database: Some(Arc::clone(&database)),
             sessions: sessions.clone(),
             upgrader: listeners.tls_upgrader().map_err(|error| {
                 format!("the engine endpoint's TLS could not be prepared: {error}")
@@ -725,49 +730,11 @@ pub async fn open_engine_endpoint<Eng: Send + Sync + 'static>(
             callback: callback.clone(),
         })
     };
-    // ONE protocol handler per endpoint, served at both of its ends: the listener the core
-    // accepts a client's connections on, and the connections an IN-PROCESS client of this
-    // emulator opens to the address this endpoint publishes
-    // (`service_common::dialable_data_planes`) — a handler running in a Lambda function
-    // attached to this resource's VPC reads `Endpoint` out of the control plane and opens a
-    // connection to exactly that address. Both ends are the same handler over the same
-    // database, so a session is served the same way whichever end it arrived on.
-    let open = |context: wire_session::SessionContext| async {
-        let opened = match wire {
-            EngineWire::Postgres => {
-                let served = Arc::new(pg_wire::PostgresWire::new(context));
-                listeners
-                    .tcp_plaintext(::service_common::dialable_data_planes::SharedHandler(
-                        Arc::clone(&served),
-                    ))
-                    .await
-                    .map(|listener| {
-                        // The wire negotiates its own encryption in band, so the plane is
-                        // handed byte 0 at both ends and upgrades it itself.
-                        let plane =
-                            ::service_common::dialable_data_planes::served_in_process(served, None);
-                        (listener, plane)
-                    })
-            }
-            EngineWire::MySql => {
-                let served = Arc::new(mysql_wire::MySqlWire::new(context));
-                listeners
-                    .tcp_plaintext(::service_common::dialable_data_planes::SharedHandler(
-                        Arc::clone(&served),
-                    ))
-                    .await
-                    .map(|listener| {
-                        let plane =
-                            ::service_common::dialable_data_planes::served_in_process(served, None);
-                        (listener, plane)
-                    })
-            }
-        };
-        opened.map_err(|error| format!("the engine endpoint could not be opened: {error}"))
-    };
-    let (listener, writing) = open(context_for(role)?).await?;
+    let (listener, writing) = open_wire_listener(&listeners, wire, context_for(role)?).await?;
     let reader_endpoint = match reader {
-        true => Some(open(context_for(EndpointRole::Reader)?).await?),
+        true => Some(
+            open_wire_listener(&listeners, wire, context_for(EndpointRole::Reader)?).await?,
+        ),
         false => None,
     };
     let (reader_listener, reading) = match reader_endpoint {
@@ -776,22 +743,14 @@ pub async fn open_engine_endpoint<Eng: Send + Sync + 'static>(
     };
     // The addresses are now ones this emulator SERVES: each is recorded as the address its
     // own plane answers at, and the records are withdrawn with the listeners themselves.
-    let dialable: Vec<::service_common::dialable_data_planes::OpenedPlanes> =
-        match ::service_common::dialable_data_planes::DialablePlanes::of(engine) {
-            Some(planes) => [
-                Some((&listener, &writing)),
-                reader_listener.as_ref().zip(reading.as_ref()),
-            ]
-            .into_iter()
-            .flatten()
-            .map(|(listener, plane)| {
-                let authority =
-                    ::service_common::data_plane_addressing::listener_authority(listener);
-                planes.opening([authority], SIGNING_NAME, plane)
-            })
-            .collect(),
-            None => Vec::new(),
-        };
+    let dialable: Vec<::service_common::dialable_data_planes::OpenedPlanes> = [
+        Some((&listener, &writing)),
+        reader_listener.as_ref().zip(reading.as_ref()),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|(listener, plane)| dialable_plane(engine, listener, plane))
+    .collect();
     Ok(DbEngineEndpoint {
         endpoint: ServedEndpoint {
             host: listener.host(),
@@ -809,6 +768,81 @@ pub async fn open_engine_endpoint<Eng: Send + Sync + 'static>(
         _reader_listener: reader_listener,
         _dialable: dialable,
     })
+}
+
+/// Open ONE plaintext listener speaking `wire`, served by that wire's own protocol handler
+/// over `context`, and answer with the listener and the SAME handler as a plane an
+/// in-process client can open a connection to.
+///
+/// ONE protocol handler per endpoint, served at both of its ends: the listener the core
+/// accepts a client's connections on, and the connections an IN-PROCESS client of this
+/// emulator opens to the address this endpoint publishes
+/// (`service_common::dialable_data_planes`) — a handler running in a Lambda function
+/// attached to this resource's VPC reads the endpoint out of the control plane and opens a
+/// connection to exactly that address. Both ends are the same handler over the same session
+/// context, so a session is served the same way whichever end it arrived on.
+///
+/// The one place either kind of endpoint this module opens — a resource's own engine
+/// endpoint ([`open_engine_endpoint`]) and a DB proxy's ([`proxy_endpoint`]) — binds a
+/// listener, so the two cannot differ in what byte 0 of a connection meets.
+pub(crate) async fn open_wire_listener(
+    listeners: &::emulator_server::Listeners,
+    wire: EngineWire,
+    context: wire_session::SessionContext,
+) -> Result<
+    (
+        ::emulator_server::ResourceListener,
+        Arc<dyn ::service_common::dialable_data_planes::DialablePlane>,
+    ),
+    String,
+> {
+    let opened = match wire {
+        EngineWire::Postgres => {
+            let served = Arc::new(pg_wire::PostgresWire::new(context));
+            listeners
+                .tcp_plaintext(::service_common::dialable_data_planes::SharedHandler(
+                    Arc::clone(&served),
+                ))
+                .await
+                .map(|listener| {
+                    // The wire negotiates its own encryption in band, so the plane is
+                    // handed byte 0 at both ends and upgrades it itself.
+                    let plane =
+                        ::service_common::dialable_data_planes::served_in_process(served, None);
+                    (listener, plane)
+                })
+        }
+        EngineWire::MySql => {
+            let served = Arc::new(mysql_wire::MySqlWire::new(context));
+            listeners
+                .tcp_plaintext(::service_common::dialable_data_planes::SharedHandler(
+                    Arc::clone(&served),
+                ))
+                .await
+                .map(|listener| {
+                    let plane =
+                        ::service_common::dialable_data_planes::served_in_process(served, None);
+                    (listener, plane)
+                })
+        }
+    };
+    opened.map_err(|error| format!("the engine endpoint could not be opened: {error}"))
+}
+
+/// Record the address `listener` landed on as one `plane` answers at, so an in-process
+/// client of this emulator that was handed that address reaches this endpoint.
+///
+/// `None` for an engine that vends no such records, which opens no address; the returned
+/// record is held beside the listener, so dropping it withdraws the address exactly as
+/// dropping the listener closes the port.
+pub(crate) fn dialable_plane<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    listener: &::emulator_server::ResourceListener,
+    plane: &Arc<dyn ::service_common::dialable_data_planes::DialablePlane>,
+) -> Option<::service_common::dialable_data_planes::OpenedPlanes> {
+    let planes = ::service_common::dialable_data_planes::DialablePlanes::of(engine)?;
+    let authority = ::service_common::data_plane_addressing::listener_authority(listener);
+    Some(planes.opening([authority], SIGNING_NAME, plane))
 }
 
 /// The SigV4 signing name of this service, which is what the records above name as the

@@ -245,85 +245,151 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
         };
-        let mut store = state.lock();
-        store.settle_due_transitions(&region);
-
-        // "This name must be unique for all proxies owned by your Amazon Web Services
-        // account in the specified Amazon Web Services Region."
         let key = (region.clone(), input.db_proxy_name.clone());
-        if store.db_proxies.contains_key(&key) {
-            return Err(CreateDBProxyErrorModeled::DBProxyAlreadyExistsFault(
-                DBProxyAlreadyExistsFault {
-                    message: Some(crate::state::db_proxy_already_exists_message(
-                        &input.db_proxy_name,
-                    )),
-                },
-            )
-            .into());
-        }
-        if store.db_proxies_in(&region).len() >= crate::state::DB_PROXY_QUOTA_PER_REGION
-            || !store.has_room_for_region(&region)
-        {
-            return Err(CreateDBProxyErrorModeled::DBProxyQuotaExceededFault(
-                DBProxyQuotaExceededFault {
-                    message: Some(format!(
-                        "Cannot create more than {} DB proxies in {region}",
-                        crate::state::DB_PROXY_QUOTA_PER_REGION
-                    )),
-                },
-            )
-            .into());
-        }
+        let mut record = {
+            let mut store = state.lock();
+            store.settle_due_transitions(&region);
 
-        let mint = store.next_mint();
-        let now = crate::state::now_as_wire_timestamp();
-        let engine_family = input.engine_family;
-        // A new proxy is not ready to handle requests yet: it reports `creating` and
-        // reaches `available` on its own. The due instant is stored on the record — nothing
-        // sleeps.
-        let record = crate::state::DbProxyRecord {
-            name: input.db_proxy_name,
-            region: region.clone(),
-            engine_family: engine_family.clone(),
-            default_auth_scheme: input
-                .default_auth_scheme
-                .unwrap_or_else(|| crate::state::DEFAULT_AUTH_SCHEME_NONE.to_string()),
-            auth: crate::state::user_auth_config_to_info(auth),
-            role_arn: input.role_arn,
-            vpc_subnet_ids: input.vpc_subnet_ids,
-            vpc_id,
-            vpc_security_group_ids: security_groups,
-            // `RequireTLS` / `DebugLogging` each turn something on that the request asks
-            // for, so a proxy created without them has it off.
-            require_tls: input.require_tls.unwrap_or(false),
-            idle_client_timeout: input
-                .idle_client_timeout
-                .unwrap_or(crate::state::DEFAULT_IDLE_CLIENT_TIMEOUT),
-            debug_logging: input.debug_logging.unwrap_or(false),
-            endpoint_network_type: input
-                .endpoint_network_type
-                .unwrap_or_else(|| crate::state::NETWORK_TYPE_IPV4.to_string()),
-            target_connection_network_type: input
-                .target_connection_network_type
-                .unwrap_or_else(|| crate::state::NETWORK_TYPE_IPV4.to_string()),
-            endpoint_host: crate::state::mint_endpoint_host(mint),
-            status: crate::state::DB_PROXY_STATUS_CREATING.to_string(),
-            pending_status: Some(crate::state::PendingStatus::in_a_moment(
-                crate::state::DB_PROXY_STATUS_AVAILABLE,
-            )),
-            created_date: now,
-            updated_date: now,
-            // The proxy's one target group comes up with the proxy, with the connection
-            // pool settings `ConnectionPoolConfiguration` documents as its defaults for
-            // this engine family.
-            target_group: crate::state::DbProxyTargetGroupRecord::new(&engine_family, now),
-            targets: Vec::new(),
-            tags,
+            admits_another_proxy(&store, &region, &input.db_proxy_name)?;
+            let mint = store.next_mint();
+            let now = crate::state::now_as_wire_timestamp();
+            let engine_family = input.engine_family;
+            // A new proxy is not ready to handle requests yet: it reports `creating` and
+            // reaches `available` on its own. The due instant is stored on the record —
+            // nothing sleeps.
+            crate::state::DbProxyRecord {
+                name: input.db_proxy_name,
+                region: region.clone(),
+                engine_family: engine_family.clone(),
+                default_auth_scheme: input
+                    .default_auth_scheme
+                    .unwrap_or_else(|| crate::state::DEFAULT_AUTH_SCHEME_NONE.to_string()),
+                auth: crate::state::user_auth_config_to_info(auth),
+                role_arn: input.role_arn,
+                vpc_subnet_ids: input.vpc_subnet_ids,
+                vpc_id,
+                vpc_security_group_ids: security_groups,
+                // `RequireTLS` / `DebugLogging` each turn something on that the request asks
+                // for, so a proxy created without them has it off.
+                require_tls: input.require_tls.unwrap_or(false),
+                idle_client_timeout: input
+                    .idle_client_timeout
+                    .unwrap_or(crate::state::DEFAULT_IDLE_CLIENT_TIMEOUT),
+                debug_logging: input.debug_logging.unwrap_or(false),
+                endpoint_network_type: input
+                    .endpoint_network_type
+                    .unwrap_or_else(|| crate::state::NETWORK_TYPE_IPV4.to_string()),
+                target_connection_network_type: input
+                    .target_connection_network_type
+                    .unwrap_or_else(|| crate::state::NETWORK_TYPE_IPV4.to_string()),
+                endpoint_host: crate::state::mint_endpoint_host(mint),
+                served_endpoint: None,
+                status: crate::state::DB_PROXY_STATUS_CREATING.to_string(),
+                pending_status: Some(crate::state::PendingStatus::in_a_moment(
+                    crate::state::DB_PROXY_STATUS_AVAILABLE,
+                )),
+                created_date: now,
+                updated_date: now,
+                // The proxy's one target group comes up with the proxy, with the connection
+                // pool settings `ConnectionPoolConfiguration` documents as its defaults for
+                // this engine family.
+                target_group: crate::state::DbProxyTargetGroupRecord::new(&engine_family, now),
+                targets: Vec::new(),
+                tags,
+            }
         };
+
+        // The proxy's own ENDPOINT, opened with the state lock released: binding is
+        // asynchronous and the core owns the socket, the bind interface and the port. It is
+        // opened AFTER every refusal above has been answered — so nothing binds for a create
+        // that was going to fail — and before the record is admitted to the store, so a
+        // proxy this service holds is one whose endpoint is already listening. The proxy
+        // still reports `creating` until the clock makes `available` due, and a session
+        // opened before then is refused exactly as it is against a proxy that is still
+        // coming up.
+        //
+        // A proxy of an engine family whose wire this emulator does not speak gets no
+        // listener and keeps the DNS-form endpoint this service has always reported: a port
+        // that answered nothing would be worse than a name.
+        let endpoint = match crate::state::proxy_engine_wire(&record.engine_family) {
+            Some(wire) => Some(
+                crate::state::open_proxy_endpoint(
+                    &*self.engine,
+                    &state,
+                    crate::state::ProxyEndpointPlan {
+                        region: region.clone(),
+                        endpoint_label: record.endpoint_host.clone(),
+                        wire,
+                        callback: ctx.callback().clone(),
+                    },
+                )
+                .await
+                .map_err(CreateDBProxyError::internal_failure)?,
+            ),
+            None => None,
+        };
+        record.served_endpoint = endpoint.as_ref().map(|endpoint| endpoint.endpoint.clone());
+
+        let mut store = state.lock();
+        // Another request may have stored a proxy while this one was binding, so every
+        // refusal about the STORE is decided again here rather than overwriting a stored
+        // proxy or carrying the region past its quota; the listener this call opened is
+        // dropped with the endpoint it was going to publish, which closes its port.
+        admits_another_proxy(&store, &region, &record.name)?;
         let db_proxy = record.to_wire();
-        store.db_proxies.insert(key, record);
+        store.db_proxies.insert(key.clone(), record);
+        // The endpoint is held in the store, which is what keeps its port open: it is
+        // dropped with the proxy when the clock takes the proxy away.
+        if let Some(endpoint) = endpoint {
+            store.db_proxy_endpoints.insert(key, endpoint);
+        }
         Ok(CreateDBProxyOutput {
             db_proxy: Some(db_proxy),
         })
     }
+}
+
+/// Whether the store admits another proxy named `named` in `region`, or the refusal it
+/// answers one with.
+///
+/// Decided under BOTH of this handler's critical sections, because the proxy's listener is
+/// opened with the state lock released and another request may store a proxy in between: one
+/// reading, so the interleaving cannot admit a second proxy under one name or carry the
+/// region past the number of proxies this emulator keeps.
+///
+/// * "This name must be unique for all proxies owned by your Amazon Web Services account in
+///   the specified Amazon Web Services Region" — the modelled `DBProxyAlreadyExistsFault`.
+/// * "Your Amazon Web Services account already has the maximum number of proxies in the
+///   specified Amazon Web Services Region" — the modelled `DBProxyQuotaExceededFault`, over
+///   the per-region cap this store holds proxies under.
+fn admits_another_proxy(
+    store: &crate::state::ComAmazonawsRdsAmazonrdsv19State,
+    region: &str,
+    named: &str,
+) -> Result<(), CreateDBProxyError> {
+    if store
+        .db_proxies
+        .contains_key(&(region.to_string(), named.to_string()))
+    {
+        return Err(CreateDBProxyErrorModeled::DBProxyAlreadyExistsFault(
+            DBProxyAlreadyExistsFault {
+                message: Some(crate::state::db_proxy_already_exists_message(named)),
+            },
+        )
+        .into());
+    }
+    if store.db_proxies_in(region).len() >= crate::state::DB_PROXY_QUOTA_PER_REGION
+        || !store.has_room_for_region(region)
+    {
+        return Err(CreateDBProxyErrorModeled::DBProxyQuotaExceededFault(
+            DBProxyQuotaExceededFault {
+                message: Some(format!(
+                    "Cannot create more than {} DB proxies in {region}",
+                    crate::state::DB_PROXY_QUOTA_PER_REGION
+                )),
+            },
+        )
+        .into());
+    }
+    Ok(())
 }

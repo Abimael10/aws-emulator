@@ -38,3 +38,28 @@ Cause 2: AssertionError: EventBridge schedule never invoked the Lambda (no messa
 ## Steps to Reproduce
 Cause 1: CreateDBProxy with RequireTLS, wait for it to become available, read DescribeDBProxies' Endpoint and connect to it.
 Cause 2: create a Lambda that writes to an SQS queue, CreateSchedule with that function as the target and a role allowing lambda:InvokeFunction, then poll the queue after the schedule's fire time.
+
+## Resolution
+
+* Cause 1 (FIXED) — a DB proxy of an `EngineFamily` whose database protocol this emulator
+  speaks (`MYSQL`, `POSTGRESQL`) now opens a listener of its own through the core when it is
+  created, and `DBProxy$Endpoint` publishes the address that listener answers on instead of a
+  name under `rds.amazonaws.com`. The listener speaks the family's own wire and a session on
+  it is served against the database the proxy's target group holds — the same storage, the
+  same master user, the same engine version as that database's own endpoint — refused in the
+  clear while `RequireTLS` is on. A proxy of an engine family this emulator speaks no protocol
+  for (`SQLSERVER`) gets no listener and keeps the DNS-form endpoint, because a port that
+  answers nothing would be worse than a name. The address is withdrawn, and its sessions
+  severed, when the proxy is deleted.
+* Cause 1, residual (BLOCKED, vendor) — the published address carries the PORT the core
+  assigned it (`host:port`), because `DBProxy` models no port member and the core owns the
+  socket, the interface and the port: `vendor/server/src/listeners.rs`'s `tcp_plaintext` takes
+  no requested port and `bind_std` / `bind_tokio` take it from the operator's
+  `EMULATOR_LISTENER_PORT_RANGE`. A client that reads the endpoint as a bare host and dials
+  the engine's standard port (3306, 5432) therefore still cannot reach it. Needed in the core:
+  a listener API that accepts a requested port, or a per-resource loopback address. The same
+  constraint is recorded for `LoadBalancer$DNSName` in
+  `issues/things-that-now-work/20261111T030957Z-ec2-elbv2-2-net-new-causes-the-alb.md`.
+* Cause 2 (FIXED) — already served on the mainline this fix was branched from: the scheduler's
+  clock invokes a Lambda target under the schedule's execution role, and both recorded units
+  (the positive one and the one whose invoke permission is granted part-way) replay green.

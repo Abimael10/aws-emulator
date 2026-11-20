@@ -229,7 +229,8 @@ pub use db_proxies::{
     DB_PROXY_ACTIVE_STATE_NAME,
     DB_PROXY_QUOTA_PER_REGION, DB_PROXY_STATUS_AVAILABLE, DB_PROXY_STATUS_CREATING,
     DB_PROXY_STATUS_DELETING, DB_PROXY_STATUS_MODIFYING, DB_PROXY_TARGET_QUOTA_PER_PROXY,
-    ENGINE_FAMILY_SQLSERVER, MAX_SESSION_PINNING_FILTERS,
+    ENGINE_FAMILY_MYSQL, ENGINE_FAMILY_POSTGRESQL, ENGINE_FAMILY_SQLSERVER,
+    MAX_SESSION_PINNING_FILTERS,
     MAX_USER_AUTH_CONFIGS, MISSING_DB_PROXY_TARGETS_MESSAGE,
     MISSING_DB_PROXY_TARGET_IDENTIFIER_MESSAGE, NETWORK_TYPE_IPV4, TARGET_ROLE_READ_ONLY,
     TARGET_HEALTH_REASON_AUTH_FAILURE, TARGET_HEALTH_REASON_UNREACHABLE,
@@ -385,7 +386,9 @@ pub use data_plane::{
     captured_data_bytes, capture_cluster_data, capture_cluster_storage, capture_endpoint_storage,
     capture_instance_storage,
     cluster_endpoint::cluster_engine_wire,
-    engine_wire, open_engine_endpoint, rewind_cluster_storage, wire_session::SessionTarget,
+    engine_wire, open_engine_endpoint,
+    proxy_endpoint::{open_proxy_endpoint, proxy_engine_wire, DbProxyEndpoint, ProxyEndpointPlan},
+    rewind_cluster_storage, wire_session::SessionTarget,
     DbEngineEndpoint, EndpointRole, EngineEndpointPlan, EngineWire, ServedEndpoint,
 };
 pub use ec2_subnets::{invalid_subnets_message, subnet_zones, SubnetZones};
@@ -624,6 +627,16 @@ pub struct ComAmazonawsRdsAmazonrdsv19State {
     /// [`MAX_REGIONS`] bound the map in total — and
     /// [`Self::settle_due_transitions`] drops an endpoint with the cluster it belongs to.
     pub db_cluster_endpoints: BTreeMap<RegionalKey, DbClusterEndpointRecord>,
+    /// The live endpoint of each DB PROXY that has one, by the same
+    /// `(region, DBProxyName)` key as [`Self::db_proxies`].
+    ///
+    /// The proxy's counterpart of [`Self::db_engine_endpoints`], and the same contract: this
+    /// is where the LISTENER lives, so an entry removed from here closes the port and severs
+    /// its sessions (see [`data_plane::proxy_endpoint`]). Bounded by the same per-region
+    /// proxy quota, because an entry exists only for a proxy this store holds —
+    /// `CreateDBProxy` inserts one for every proxy whose `EngineFamily` names a wire this
+    /// emulator speaks, and [`Self::settle_due_transitions`] drops it with the proxy.
+    pub db_proxy_endpoints: BTreeMap<RegionalKey, DbProxyEndpoint>,
 }
 
 impl ComAmazonawsRdsAmazonrdsv19State {
@@ -841,6 +854,10 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         }
         for key in gone.drain(..) {
             self.db_proxies.remove(&key);
+            // The proxy's endpoint goes with it: dropping the record closes the port and
+            // severs every session a client had open on it, so the address the proxy
+            // published answers nothing once the proxy is gone.
+            self.db_proxy_endpoints.remove(&key);
         }
         for (key, export_task) in self
             .export_tasks

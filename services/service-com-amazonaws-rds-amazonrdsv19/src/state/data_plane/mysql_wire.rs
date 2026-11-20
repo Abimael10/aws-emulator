@@ -156,11 +156,15 @@ async fn serve_session(
 ) -> std::io::Result<()> {
     let mut conn = conn;
     let connection_id = context.take_connection_id();
-    let Some(facts) = context.endpoint_facts() else {
-        // No instance behind this listener any more: the protocol's own "server shutting
+    let Some(served) = context.endpoint_facts() else {
+        // No database behind this listener any more: the protocol's own "server shutting
         // down" is the honest answer, sent as the first packet the client reads.
         return write_error(&mut conn, 0, 1053, "08S01", "Server shutdown in progress").await;
     };
+    let wire_session::ServedSession {
+        facts,
+        database: database_handle,
+    } = served;
     let nonce = session_nonce()?;
 
     // 1. The greeting, in the clear.
@@ -214,7 +218,7 @@ async fn serve_session(
     // Guide, IAM database authentication: a connection using an authentication token is an
     // SSL/TLS connection). A login as any other account proves the native password it
     // already presented.
-    let iam = context.iam_login(&facts, &login.user, login.database.as_deref());
+    let iam = context.iam_login(&facts, &database_handle, &login.user, login.database.as_deref());
     let token = match tls.is_some() && iam.expects_a_token(&login.user) {
         true => {
             write_packet(
@@ -294,7 +298,6 @@ async fn serve_session(
             .await;
         }
     }
-    let database_handle = Arc::clone(&context.database);
     let _session = Session {
         database: Arc::clone(&database_handle),
         sessions: context.sessions.clone(),

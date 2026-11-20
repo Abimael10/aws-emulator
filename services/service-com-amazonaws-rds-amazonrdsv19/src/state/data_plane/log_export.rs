@@ -387,6 +387,19 @@ pub fn destination(
                     log_stream: instance.identifier.clone(),
                 })
         }
+        // A line a session through a DB PROXY makes the engine write is written by the
+        // engine of the database behind the proxy, so it is exported where THAT database's
+        // own sessions export it: the proxy runs no engine and publishes no log group of its
+        // own.
+        SessionTarget::DbProxy {
+            region,
+            endpoint_label,
+        } => destination(
+            store,
+            &super::proxy_endpoint::proxied_session_target(store, region, endpoint_label)?,
+            role,
+            wire,
+        ),
     }
 }
 
