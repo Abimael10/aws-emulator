@@ -99,6 +99,83 @@ pub fn to_timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     )
 }
 
+/// A page cursor: the offset into a paginated read's ordered result set at which the next
+/// page starts, behind the prefix the operation that issues it names.
+///
+/// `NextToken` is modelled only as `len 1..1024, pattern ^.+$`, so the shape of the cursor
+/// is this service's own. Every paginated read mints and parses its cursor through
+/// [`page_cursor`] / [`page_start`], so the two cannot drift apart and a third one cannot
+/// grow a third encoding.
+pub fn page_cursor(prefix: &str, offset: usize) -> String {
+    format!("{prefix}{offset:08x}")
+}
+
+/// The `ValidationExceptionReason` a refused cursor carries.
+pub const INVALID_NEXT_TOKEN_REASON: &str = "INVALID_NEXT_TOKEN";
+
+/// The input member a refused cursor names in `ValidationException$Fields`.
+pub const NEXT_TOKEN_FIELD: &str = "NextToken";
+
+/// Why a `NextToken` was refused: the wording a paginated read lifts into its own modelled
+/// `ValidationException`, as the exception's `Message` and as its field entry's message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NextTokenRejection {
+    /// The exception's `Message`.
+    pub message: &'static str,
+    /// The `ValidationExceptionField$Message` for `NextToken`.
+    pub field_message: &'static str,
+}
+
+/// The refusal of a token this service did not issue.
+pub const NEXT_TOKEN_NOT_ISSUED: NextTokenRejection = NextTokenRejection {
+    message: "NextToken is not a cursor this service issued",
+    field_message: "not a cursor this service issued",
+};
+
+/// The refusal of a cursor whose offset is past the end of the result set it is replayed
+/// against.
+pub const NEXT_TOKEN_PAST_END: NextTokenRejection = NextTokenRejection {
+    message: "NextToken points past the end of the result set",
+    field_message: "points past the end of the result set",
+};
+
+/// The offset one page starts at: `0` when the request carries no cursor, the offset a
+/// cursor this operation issued encodes, or a rejection to refuse.
+///
+/// The prefix is what makes a token self-identifying, so a token a client made up is
+/// refused whatever offset it encodes rather than silently driving paging.
+pub fn page_start(
+    prefix: &str,
+    token: Option<&str>,
+    total: usize,
+) -> Result<usize, NextTokenRejection> {
+    let Some(token) = token else {
+        return Ok(0);
+    };
+    let start = token
+        .strip_prefix(prefix)
+        .and_then(|offset| usize::from_str_radix(offset, 16).ok())
+        .ok_or(NEXT_TOKEN_NOT_ISSUED)?;
+    if start > total {
+        return Err(NEXT_TOKEN_PAST_END);
+    }
+    Ok(start)
+}
+
+/// Where one page ends: `MaxResults` records from `start`, or the whole remainder when the
+/// request names no maximum.
+///
+/// A `MaxResults` that is not a usable page size — zero, or a value no page size can hold,
+/// both of which the modelled `range 1..100` already refuses before a handler runs — is read
+/// as "no maximum" rather than as an empty page, so no cursor can be minted for a page that
+/// holds nothing and paging always advances.
+pub fn page_end(start: usize, max_results: Option<i32>, total: usize) -> usize {
+    let page_size = max_results
+        .filter(|max| *max > 0)
+        .map_or(total, |max| usize::try_from(max).unwrap_or(total));
+    start.saturating_add(page_size).min(total)
+}
+
 /// The resource name carried by a `<Thing>NameOrArn` / `<Thing>IdOrArn` member: the
 /// last `/`-separated segment of an ARN, or the value itself when it is a bare name.
 pub fn name_from_name_or_arn(value: &str) -> &str {
@@ -162,6 +239,54 @@ pub struct ConfigurationSet {
     pub default_sender_id: Option<String>,
     pub default_message_feedback_enabled: bool,
     pub event_destinations: Vec<EventDestination>,
+}
+
+impl ConfigurationSet {
+    /// The record's value for one `ConfigurationSetFilterName`, or `None` when the record
+    /// carries no value for that attribute (so no filter value can match it).
+    ///
+    /// The names are exactly the model's `ConfigurationSetFilterName` enum, re-exported as
+    /// [`crate::ops::types::CONFIGURATION_SET_FILTER_NAME_VALUES`];
+    /// `event-destination-name` and `matching-event-types` are multi-valued, because one
+    /// set holds a list of event destinations and each of those a list of event types.
+    pub fn filterable(&self, name: &str) -> Option<Vec<String>> {
+        match name {
+            "event-destination-name" => Some(
+                self.event_destinations
+                    .iter()
+                    .map(|destination| destination.event_destination_name.clone())
+                    .collect(),
+            ),
+            "matching-event-types" => Some(
+                self.event_destinations
+                    .iter()
+                    .flat_map(|destination| destination.matching_event_types.iter().cloned())
+                    .collect(),
+            ),
+            // The record holds the canonical capitalization of the message type
+            // ([`canonical_message_type`]), while a request filters with the spelling the
+            // model's `MessageType` enum declares (`TRANSACTIONAL`), so both forms of the
+            // ONE stored value are offered and either selects this set.
+            "default-message-type" => self.default_message_type.as_ref().map(|value| {
+                let declared = value.to_uppercase();
+                if declared == *value {
+                    vec![declared]
+                } else {
+                    vec![value.clone(), declared]
+                }
+            }),
+            "default-sender-id" => self.default_sender_id.clone().map(|value| vec![value]),
+            "default-message-feedback-enabled" => {
+                Some(vec![self.default_message_feedback_enabled.to_string()])
+            }
+            // Modelled, but no implemented operation associates a protect configuration
+            // with a configuration set, so no stored record carries one and this filter
+            // matches nothing. Named explicitly to keep "modelled but unstored" apart
+            // from the catch-all, which a name outside the modelled enum would reach.
+            "protect-configuration-id" => None,
+            _ => None,
+        }
+    }
 }
 
 /// A stored origination phone number.

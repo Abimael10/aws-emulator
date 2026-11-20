@@ -91,9 +91,9 @@
 use super::types::*;
 
 /// The prefix every `NextToken` this operation issues carries, and which one it accepts
-/// must carry. `NextToken` is modelled only as `len 1..1024, pattern ^.+$`, so the shape
-/// of the cursor is this service's own: the prefix makes it self-identifying, and a token
-/// without it is refused whatever offset it encodes.
+/// must carry, so a cursor another paginated read issued is not one of this one's. The
+/// cursor itself is minted and parsed by [`crate::state::page_cursor`] /
+/// [`crate::state::page_start`].
 const NEXT_TOKEN_PREFIX: &str = "pnlist-";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -232,57 +232,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        // `NextToken` is this emulator's own cursor: the index into the order above at
-        // which the next page starts, behind a prefix only this handler mints. The prefix
-        // is what makes a fabricated token refusable whatever its value, so a client
-        // cannot drive paging with an offset it made up.
-        let start = match input.next_token.as_deref() {
-            None => 0usize,
-            Some(token) => match token
-                .strip_prefix(NEXT_TOKEN_PREFIX)
-                .and_then(|offset| usize::from_str_radix(offset, 16).ok())
-            {
-                Some(offset) => offset,
-                None => {
-                    return Err(DescribePhoneNumbersErrorModeled::ValidationException(
-                        ValidationException {
-                            message: Some("NextToken is not a cursor this service issued".to_string()),
-                            reason: Some("INVALID_NEXT_TOKEN".to_string()),
-                            fields: Some(vec![ValidationExceptionField {
-                                name: "NextToken".to_string(),
-                                message: "not a cursor this service issued".to_string(),
-                            }]),
-                        },
-                    )
-                    .into())
-                }
-            },
+        // `NextToken` is this emulator's own cursor, minted and parsed by the one shared
+        // helper every paginated read of this service uses.
+        let start = match crate::state::page_start(
+            NEXT_TOKEN_PREFIX,
+            input.next_token.as_deref(),
+            matching.len(),
+        ) {
+            Ok(start) => start,
+            Err(rejection) => {
+                return Err(DescribePhoneNumbersErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(rejection.message.to_string()),
+                        reason: Some(crate::state::INVALID_NEXT_TOKEN_REASON.to_string()),
+                        fields: Some(vec![ValidationExceptionField {
+                            name: crate::state::NEXT_TOKEN_FIELD.to_string(),
+                            message: rejection.field_message.to_string(),
+                        }]),
+                    },
+                )
+                .into())
+            }
         };
-        if start > matching.len() {
-            return Err(DescribePhoneNumbersErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some("NextToken points past the end of the result set".to_string()),
-                    reason: Some("INVALID_NEXT_TOKEN".to_string()),
-                    fields: Some(vec![ValidationExceptionField {
-                        name: "NextToken".to_string(),
-                        message: "points past the end of the result set".to_string(),
-                    }]),
-                },
-            )
-            .into());
-        }
 
         // `MaxResults` caps one page; absent, the whole remainder is returned.
-        let page_size = input
-            .max_results
-            .map_or(matching.len(), |max| usize::try_from(max).unwrap_or(0));
-        let end = start.saturating_add(page_size).min(matching.len());
+        let end = crate::state::page_end(start, input.max_results, matching.len());
         let page: Vec<PhoneNumberInformation> = matching[start..end]
             .iter()
             .copied()
             .map(phone_number_information)
             .collect();
-        let next_token = (end < matching.len()).then(|| format!("{NEXT_TOKEN_PREFIX}{end:08x}"));
+        let next_token =
+            (end < matching.len()).then(|| crate::state::page_cursor(NEXT_TOKEN_PREFIX, end));
 
         Ok(DescribePhoneNumbersOutput {
             phone_numbers: Some(page),

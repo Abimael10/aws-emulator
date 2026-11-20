@@ -15,6 +15,9 @@
 //!   and a second delete is not found;
 //! * `DescribePhoneNumbers` narrows by id, by filter and by page, over the store's
 //!   stable order;
+//! * `DescribeConfigurationSets` does the same for configuration sets: it reports every
+//!   stored set from its record, narrows by `ConfigurationSetNames` (name or ARN, each of
+//!   which must name a stored set) and by `Filters`, and pages over the store's order;
 //! * a send resolves every referenced resource against the store and mints a unique
 //!   `MessageId` per accepted send.
 
@@ -22,8 +25,8 @@ use std::sync::Arc;
 
 use service_com_amazonaws_pinpointsmsvoicev2_pinpointsmsvoicev2 as sms_voice;
 use sms_voice::ops::types::{
-    MESSAGE_TYPE_VALUES, NUMBER_CAPABILITY_VALUES, PHONE_NUMBER_FILTER_NAME_VALUES,
-    REQUESTABLE_NUMBER_TYPE_VALUES,
+    CONFIGURATION_SET_FILTER_NAME_VALUES, MESSAGE_TYPE_VALUES, NUMBER_CAPABILITY_VALUES,
+    PHONE_NUMBER_FILTER_NAME_VALUES, REQUESTABLE_NUMBER_TYPE_VALUES,
 };
 use sms_voice::state::{MAX_CONFIGURATION_SETS_PER_ACCOUNT, MAX_RETAINED_MESSAGES};
 use smithy_server_runtime::MultiServiceRouter;
@@ -1560,4 +1563,584 @@ async fn a_conflict_reports_the_message_that_restates_its_own_members() {
             "case {case:?}: expected the structured members the message restates, got {body}"
         );
     }
+}
+
+/// The ARN this emulator stamps into a configuration set's record, for the region these
+/// tests sign for.
+fn configuration_set_arn(name: &str) -> String {
+    format!("arn:aws:sms-voice:{REGION}:{ACCOUNT_ID}:configuration-set/{name}")
+}
+
+/// The `ConfigurationSetName` of every entry a `DescribeConfigurationSets` response
+/// reports, in the order it reports them.
+fn described_set_names(body: &serde_json::Value) -> Vec<String> {
+    body.get("ConfigurationSets")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("expected a ConfigurationSets list in {body}"))
+        .iter()
+        .map(|entry| as_str(entry, "ConfigurationSetName"))
+        .collect()
+}
+
+/// The sender id the rows below configure, so the value under assertion is a chosen one.
+const DESCRIBED_SENDER_ID: &str = "SENDER-01";
+
+#[tokio::test]
+async fn describe_configuration_sets_reports_every_stored_set_from_its_record() {
+    let emulator = Emulator::new();
+
+    // An account with no configuration sets reports an empty list, not an absent member,
+    // and a complete page carries no cursor.
+    let empty = emulator
+        .ok("DescribeConfigurationSets", serde_json::json!({}))
+        .await;
+    assert_eq!(
+        (empty.get("ConfigurationSets"), empty.get("NextToken")),
+        (Some(&serde_json::json!([])), None),
+        "case \"no sets stored\": expected an empty page and no cursor, got {empty}"
+    );
+
+    // One row per shape of set: the name's form and length (`ConfigurationSetName`,
+    // len 1..64, `^[A-Za-z0-9_-]+$`), whether the set carries tags, and whether its
+    // defaults were set. The describe reports each record as it was stored, not one shape.
+    let longest_name = "z".repeat(64);
+    let cases: Vec<(&str, String, bool, bool)> = vec![
+        // (case, ConfigurationSetName, tagged, defaults configured)
+        ("shortest name", "a".to_string(), false, false),
+        ("hyphens and digits", "set-2-demo".to_string(), true, false),
+        ("underscored name", "set_three".to_string(), false, true),
+        ("longest name", longest_name.clone(), true, true),
+        ("digits only", "4242".to_string(), false, false),
+    ];
+
+    // The create response's instant per set, so the describe can be held to the stamp the
+    // record carries rather than to a fresh clock read.
+    let mut created_timestamps: Vec<(String, serde_json::Value)> = Vec::new();
+    for (case, name, tagged, with_defaults) in &cases {
+        let mut request = serde_json::json!({"ConfigurationSetName": name});
+        if *tagged {
+            request["Tags"] = serde_json::json!([{"Key": "team", "Value": case}]);
+        }
+        let created = emulator.ok("CreateConfigurationSet", request).await;
+        created_timestamps.push((
+            name.clone(),
+            created.get("CreatedTimestamp").cloned().unwrap_or_else(|| {
+                panic!("case {case:?}: expected a CreatedTimestamp in {created}")
+            }),
+        ));
+        if *with_defaults {
+            for (operation, member, value) in
+                default_settings(MESSAGE_TYPE_VALUES[0], DESCRIBED_SENDER_ID, true)
+            {
+                emulator
+                    .ok(
+                        operation,
+                        serde_json::json!({"ConfigurationSetName": name, member: value}),
+                    )
+                    .await;
+            }
+        }
+    }
+
+    // With nothing selected, every set in the account is reported, in the store's stable
+    // key order.
+    let described = emulator
+        .ok("DescribeConfigurationSets", serde_json::json!({}))
+        .await;
+    let mut expected_names: Vec<String> =
+        cases.iter().map(|(_, name, _, _)| name.clone()).collect();
+    expected_names.sort();
+    assert_eq!(
+        described_set_names(&described),
+        expected_names,
+        "case \"the whole account\": expected every stored set in key order, got {described}"
+    );
+
+    let entries = described
+        .get("ConfigurationSets")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("expected a ConfigurationSets list in {described}"))
+        .clone();
+    for (case, name, _, with_defaults) in &cases {
+        let entry = entries
+            .iter()
+            .find(|entry| as_str(entry, "ConfigurationSetName") == *name)
+            .unwrap_or_else(|| panic!("case {case:?}: expected {name} in {described}"));
+        let stamped = created_timestamps
+            .iter()
+            .find(|(stored, _)| stored == name)
+            .map(|(_, at)| at.clone())
+            .expect("every created set recorded its instant");
+        assert_eq!(
+            (
+                as_str(entry, "ConfigurationSetArn"),
+                entry.get("CreatedTimestamp").cloned(),
+                entry.get("EventDestinations").cloned(),
+            ),
+            (
+                configuration_set_arn(name),
+                Some(stamped),
+                // No event destination can be created yet, so every stored set reports
+                // the empty list its record holds.
+                Some(serde_json::json!([])),
+            ),
+            "case {case:?}: expected the stored ARN, instant and event destinations, got {entry}"
+        );
+        let defaults = (
+            entry
+                .get("DefaultMessageType")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            entry
+                .get("DefaultSenderId")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            entry
+                .get("DefaultMessageFeedbackEnabled")
+                .and_then(serde_json::Value::as_bool),
+        );
+        let expected_defaults = if *with_defaults {
+            (
+                // A read of the set reports the record's canonical capitalization of the
+                // message type, whichever case the request that set it used.
+                Some(sms_voice::state::canonical_message_type(MESSAGE_TYPE_VALUES[0])),
+                Some(DESCRIBED_SENDER_ID.to_string()),
+                Some(true),
+            )
+        } else {
+            (None, None, Some(false))
+        };
+        assert_eq!(
+            defaults, expected_defaults,
+            "case {case:?}: expected the defaults the record holds, got {entry}"
+        );
+        // `ConfigurationSetInformation` models no `Tags` member and nothing associates a
+        // protect configuration with a set, so neither is reported whatever the create
+        // request carried.
+        assert_eq!(
+            (entry.get("Tags"), entry.get("ProtectConfigurationId")),
+            (None, None),
+            "case {case:?}: expected no Tags and no ProtectConfigurationId, got {entry}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn describe_configuration_sets_selects_the_sets_the_request_names() {
+    let emulator = Emulator::new();
+
+    let names = ["alpha", "bravo", "charlie", "delta", "echo"];
+    for name in names {
+        emulator
+            .ok(
+                "CreateConfigurationSet",
+                serde_json::json!({"ConfigurationSetName": name}),
+            )
+            .await;
+    }
+
+    // `ConfigurationSetNames` entries are `ConfigurationSetNameOrArn`, so the rows differ
+    // in form (bare name, ARN, both), in count (one up to the modelled maximum of five)
+    // and in order: a selection is reported in the order the request named it, not in the
+    // store's.
+    let cases: Vec<(&str, Vec<String>, Vec<&str>)> = vec![
+        ("one bare name", vec![names[0].to_string()], vec![names[0]]),
+        (
+            "one ARN",
+            vec![configuration_set_arn(names[1])],
+            vec![names[1]],
+        ),
+        (
+            "a name and an ARN, out of key order",
+            vec![names[2].to_string(), configuration_set_arn(names[0])],
+            vec![names[2], names[0]],
+        ),
+        (
+            "the five-entry maximum, reversed",
+            names.iter().rev().map(|name| name.to_string()).collect(),
+            names.iter().rev().copied().collect(),
+        ),
+        // One entry is one reported set, so a set named twice is reported twice.
+        (
+            "the same set named twice, by name and by ARN",
+            vec![names[3].to_string(), configuration_set_arn(names[3])],
+            vec![names[3], names[3]],
+        ),
+    ];
+
+    for (case, selection, expected) in &cases {
+        let described = emulator
+            .ok(
+                "DescribeConfigurationSets",
+                serde_json::json!({"ConfigurationSetNames": selection}),
+            )
+            .await;
+        assert_eq!(
+            described_set_names(&described),
+            expected.iter().map(|name| (*name).to_string()).collect::<Vec<String>>(),
+            "case {case:?}: expected exactly the sets the request named, got {described}"
+        );
+    }
+
+    // A name that names no stored set is refused: the doc says a configuration set name
+    // that isn't valid is an error, and the refusal restates its own members.
+    emulator
+        .ok(
+            "DeleteConfigurationSet",
+            serde_json::json!({"ConfigurationSetName": names[4]}),
+        )
+        .await;
+    let gone = configuration_set_arn("never-created");
+    let not_found: Vec<(&str, &str, &str)> = vec![
+        ("a name that was never created", "no-such-set", "no-such-set"),
+        // An ARN resolves to its last segment, so the refusal names the set, not the ARN.
+        ("an ARN of a set that was never created", &gone, "never-created"),
+        ("a set that was deleted", names[4], names[4]),
+    ];
+    for (case, named, resolved) in not_found {
+        let (status, body) = emulator
+            .call(
+                "DescribeConfigurationSets",
+                serde_json::json!({"ConfigurationSetNames": [named]}),
+            )
+            .await;
+        assert_eq!(
+            (
+                status,
+                error_code(&body).as_str(),
+                body.get("Message").and_then(serde_json::Value::as_str),
+                body.get("ResourceId").and_then(serde_json::Value::as_str),
+            ),
+            (
+                400,
+                "ResourceNotFoundException",
+                Some(
+                    sms_voice::state::resource_not_found_message("configuration-set", resolved)
+                        .as_str()
+                ),
+                Some(resolved),
+            ),
+            "case {case:?}: expected the not-found AWS words for it, got {status} with {body}"
+        );
+    }
+
+    // The deleted set is gone from the unselected list too: the describe reads live state.
+    let remaining = emulator
+        .ok("DescribeConfigurationSets", serde_json::json!({}))
+        .await;
+    assert_eq!(
+        described_set_names(&remaining),
+        names[..4].iter().map(|name| (*name).to_string()).collect::<Vec<String>>(),
+        "case \"after a delete\": expected only the sets that remain, got {remaining}"
+    );
+}
+
+/// One configuration set the filter cases run against.
+struct FilterFixture {
+    /// Its `ConfigurationSetName`.
+    name: &'static str,
+    /// The defaults configured on it, or `None` to leave the set with none at all — a
+    /// record with no value for an attribute matches no value of that filter.
+    defaults: Option<FilterDefaults>,
+}
+
+/// The three defaults one [`FilterFixture`] configures.
+struct FilterDefaults {
+    message_type: &'static str,
+    sender_id: &'static str,
+    feedback_enabled: bool,
+}
+
+#[tokio::test]
+async fn describe_configuration_sets_narrows_on_every_modelled_filter_name() {
+    let emulator = Emulator::new();
+
+    // Three sets that differ in every filterable attribute this slice can set: one with
+    // each default configured, one with the other values, and one with no defaults at all
+    // (a record with no value for an attribute matches no value of that filter).
+    let fixtures: Vec<FilterFixture> = vec![
+        FilterFixture {
+            name: "wanted",
+            defaults: Some(FilterDefaults {
+                message_type: MESSAGE_TYPE_VALUES[0],
+                sender_id: "WANTED",
+                feedback_enabled: true,
+            }),
+        },
+        FilterFixture {
+            name: "other",
+            defaults: Some(FilterDefaults {
+                message_type: MESSAGE_TYPE_VALUES[1],
+                sender_id: "OTHER",
+                feedback_enabled: false,
+            }),
+        },
+        FilterFixture {
+            name: "plain",
+            defaults: None,
+        },
+    ];
+    for FilterFixture { name, defaults } in &fixtures {
+        emulator
+            .ok(
+                "CreateConfigurationSet",
+                serde_json::json!({"ConfigurationSetName": name}),
+            )
+            .await;
+        if let Some(FilterDefaults {
+            message_type,
+            sender_id,
+            feedback_enabled,
+        }) = defaults
+        {
+            for (operation, member, value) in
+                default_settings(message_type, sender_id, *feedback_enabled)
+            {
+                emulator
+                    .ok(
+                        operation,
+                        serde_json::json!({"ConfigurationSetName": name, member: value}),
+                    )
+                    .await;
+            }
+        }
+    }
+
+    // One row per `ConfigurationSetFilterName` the model declares: the value under test
+    // and the sets it is expected to select, in key order. `event-destination-name`,
+    // `matching-event-types` and `protect-configuration-id` select nothing, because no
+    // stored set carries an event destination or a protect configuration, and a record
+    // with no value for an attribute matches no filter value.
+    let cases: Vec<(&str, String, Vec<&str>)> = vec![
+        (
+            "default-message-type",
+            sms_voice::state::canonical_message_type(MESSAGE_TYPE_VALUES[0]),
+            vec!["wanted"],
+        ),
+        ("default-sender-id", "OTHER".to_string(), vec!["other"]),
+        (
+            "default-message-feedback-enabled",
+            "false".to_string(),
+            vec!["other", "plain"],
+        ),
+        ("event-destination-name", "any-destination".to_string(), vec![]),
+        ("matching-event-types", "TEXT_DELIVERED".to_string(), vec![]),
+        ("protect-configuration-id", "protect-01".to_string(), vec![]),
+        // One stored value, both of its spellings: the capitalization a read of the record
+        // reports, and the spelling the model's `MessageType` enum declares, which is what
+        // a client filters with.
+        (
+            "default-message-type",
+            MESSAGE_TYPE_VALUES[1].to_string(),
+            vec!["other"],
+        ),
+    ];
+    assert_eq!(
+        cases
+            .iter()
+            .map(|(name, _, _)| *name)
+            .collect::<std::collections::BTreeSet<&str>>(),
+        CONFIGURATION_SET_FILTER_NAME_VALUES
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<&str>>(),
+        "every modelled ConfigurationSetFilterName needs a row, and no row may name a \
+         filter the model does not declare"
+    );
+
+    for (name, value, expected) in &cases {
+        let described = emulator
+            .ok(
+                "DescribeConfigurationSets",
+                serde_json::json!({"Filters": [{"Name": name, "Values": [value]}]}),
+            )
+            .await;
+        assert_eq!(
+            described_set_names(&described),
+            expected.iter().map(|set| (*set).to_string()).collect::<Vec<String>>(),
+            "case {name:?}={value:?}: expected the sets that carry the value, got {described}"
+        );
+    }
+
+    // Values within one filter are OR-ed; separate filters are AND-ed.
+    let either = emulator
+        .ok(
+            "DescribeConfigurationSets",
+            serde_json::json!({"Filters": [
+                {"Name": "default-sender-id", "Values": ["WANTED", "OTHER"]},
+            ]}),
+        )
+        .await;
+    assert_eq!(
+        described_set_names(&either),
+        vec!["other".to_string(), "wanted".to_string()],
+        "case \"OR within one filter\": expected both configured sets, got {either}"
+    );
+    let neither = emulator
+        .ok(
+            "DescribeConfigurationSets",
+            serde_json::json!({"Filters": [
+                {"Name": "default-sender-id", "Values": ["WANTED"]},
+                {"Name": "default-message-feedback-enabled", "Values": ["false"]},
+            ]}),
+        )
+        .await;
+    assert_eq!(
+        neither.get("ConfigurationSets"),
+        Some(&serde_json::json!([])),
+        "case \"AND across filters\": no set is both WANTED and feedback-off, got {neither}"
+    );
+
+    // A filter narrows the selection the names made, rather than replacing it.
+    let selected_and_filtered = emulator
+        .ok(
+            "DescribeConfigurationSets",
+            serde_json::json!({
+                "ConfigurationSetNames": ["plain", "wanted"],
+                "Filters": [{"Name": "default-message-feedback-enabled", "Values": ["true"]}],
+            }),
+        )
+        .await;
+    assert_eq!(
+        described_set_names(&selected_and_filtered),
+        vec!["wanted".to_string()],
+        "case \"names and filters together\": expected the named set that also matches, \
+         got {selected_and_filtered}"
+    );
+}
+
+#[tokio::test]
+async fn describe_configuration_sets_pages_the_whole_account_at_every_page_size() {
+    let emulator = Emulator::new();
+
+    let mut all_names: Vec<String> = Vec::new();
+    for index in 0..7 {
+        let name = format!("paged-{index}");
+        emulator
+            .ok(
+                "CreateConfigurationSet",
+                serde_json::json!({"ConfigurationSetName": name}),
+            )
+            .await;
+        all_names.push(name);
+    }
+    all_names.sort();
+
+    // The whole account is reachable by paging, at every page size from the published
+    // minimum to past the number of records, with no set skipped or repeated.
+    for page_size in [1usize, 2, 3, 6, 7, 8, 100] {
+        let mut seen: Vec<String> = Vec::new();
+        let mut next_token: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let mut request = serde_json::json!({"MaxResults": page_size});
+            if let Some(token) = &next_token {
+                request["NextToken"] = serde_json::Value::String(token.clone());
+            }
+            let page = emulator.ok("DescribeConfigurationSets", request).await;
+            let listed = described_set_names(&page);
+            assert!(
+                listed.len() <= page_size,
+                "case page_size={page_size}: a page must not exceed MaxResults, got {listed:?}"
+            );
+            seen.extend(listed);
+            next_token = page
+                .get("NextToken")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            pages += 1;
+            assert!(
+                pages <= 16,
+                "case page_size={page_size}: paging did not terminate after {pages} pages"
+            );
+            if next_token.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            seen, all_names,
+            "case page_size={page_size}: paging must yield every set exactly once in key \
+             order, got {seen:?}"
+        );
+    }
+
+    // `MaxResults` is modelled `range 1..100`: both published bounds are accepted and a
+    // value past either end is refused before the handler runs.
+    for accepted in [1, 100] {
+        let (status, body) = emulator
+            .call(
+                "DescribeConfigurationSets",
+                serde_json::json!({"MaxResults": accepted}),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case MaxResults={accepted}: a published bound must be accepted, got {status} \
+             with {body}"
+        );
+    }
+    for refused in [0, 101] {
+        let (status, body) = emulator
+            .call(
+                "DescribeConfigurationSets",
+                serde_json::json!({"MaxResults": refused}),
+            )
+            .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "ValidationException"),
+            "case MaxResults={refused}: a value past the modelled range must be refused, \
+             got {status} with {body}"
+        );
+    }
+
+    // A cursor this service did not issue is refused, not silently treated as a page
+    // boundary — including a bare offset, which carries no prefix this handler minted.
+    for forged in ["not-a-cursor", "1", "00000002", "cslist-", "CSLIST-00000001"] {
+        let (status, body) = emulator
+            .call(
+                "DescribeConfigurationSets",
+                serde_json::json!({"NextToken": forged}),
+            )
+            .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "ValidationException"),
+            "case {forged:?}: a forged NextToken must be refused, got {status} with {body}"
+        );
+    }
+
+    // A cursor this service DID issue, replayed after the sets it pointed past were
+    // deleted, points past the end of the result set and is refused too.
+    let first_page = emulator
+        .ok(
+            "DescribeConfigurationSets",
+            serde_json::json!({"MaxResults": 1}),
+        )
+        .await;
+    let issued = first_page
+        .get("NextToken")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("expected a NextToken on a short page, got {first_page}"))
+        .to_string();
+    for name in &all_names {
+        emulator
+            .ok(
+                "DeleteConfigurationSet",
+                serde_json::json!({"ConfigurationSetName": name}),
+            )
+            .await;
+    }
+    let (status, body) = emulator
+        .call(
+            "DescribeConfigurationSets",
+            serde_json::json!({"NextToken": issued}),
+        )
+        .await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (400, "ValidationException"),
+        "case \"a cursor past the end of the result set\": expected a refusal, got {status} \
+         with {body}"
+    );
 }
