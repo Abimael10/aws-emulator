@@ -44,8 +44,21 @@
 //! The REMOVAL half of the same rule is driven by the rows at the end of this file:
 //! `DisassociateResourceSharePermission` takes a managed permission back out of a
 //! share's permission set, and may do so only while the share shares no resources that
-//! permission is the last one governing (its own stub issue:
-//! 20261114T090811Z-ram-disassociateresourcesharepermission-stub.md).
+//! permission is the last one governing. Those rows vary along what the removal rule
+//! generalises over too:
+//!
+//! * WHICH permission is removed: a resource type's default managed permission, an AWS
+//!   managed permission that is not its type's default, and a customer managed one;
+//! * WHICH READ observes the removal: a read of the share's own permissions, and the
+//!   `permissionArn` filter of a read of the shares — both answer which permissions
+//!   govern a share, so both have to stop reporting the one removed;
+//! * WHICH SHARE a removal reaches: the one it names, and no other share governed by the
+//!   same permission;
+//! * WHETHER it is permanent: an attach after a removal governs the share by that
+//!   permission again, and a resource newly shared derives its type's default again;
+//! * WHAT a `clientToken` answers for: a repeat of THAT removal, whether the token was
+//!   the caller's or the one the removal minted for a request that carried none — and
+//!   not for a removal on a share that is gone, nor for a different removal.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_ram_amazonresourcesharing::state::{
@@ -2159,5 +2172,313 @@ async fn a_resource_newly_shared_is_governed_by_its_resource_types_default_permi
         error_message(&refused),
         last_permission_for_resource_type_message(&subnet_default, "ec2:Subnet"),
         "case {case:?}: the refusal names the permission and the resource type, got {refused:?}"
+    );
+}
+
+/// The names of the shares `GetResourceShares` reports for `permissionArn`: the other
+/// read that answers which permissions govern a share, so a removal has to show in it
+/// as well as in a read of the share's own permissions.
+async fn shares_using(
+    router: &MultiServiceRouter,
+    case: &str,
+    permission_arn: &str,
+) -> Vec<String> {
+    let (status, listed) = get_shares(
+        router,
+        &json!({"resourceOwner": "SELF", "permissionArn": permission_arn}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 reading the shares governed by {permission_arn}, got \
+         {status} with {listed:?}"
+    );
+    names_of(case, &listed)
+}
+
+/// One row of the removal-visibility table: the managed permission two shares are both
+/// governed by, one of which the removal is made on.
+struct RemovalVisibilityRow {
+    case: &'static str,
+    permission: String,
+}
+
+impl RemovalVisibilityRow {
+    /// Govern two shares by this row's permission, remove it from one of them, and
+    /// assert that both reads of a share's permission set stop reporting it for THAT
+    /// share only — and that a later attach puts it back in both.
+    async fn run(&self, router: &MultiServiceRouter, suffix: &str) {
+        let case = self.case;
+        let permission = self.permission.clone();
+        let subject_name = format!("removal-visibility-subject-{suffix}");
+        let bystander_name = format!("removal-visibility-bystander-{suffix}");
+        let subject = share_with(
+            router,
+            case,
+            &json!({"name": subject_name, "resourceArns": []}),
+        )
+        .await;
+        let bystander = share_with(
+            router,
+            case,
+            &json!({"name": bystander_name, "resourceArns": []}),
+        )
+        .await;
+        attach_ok(router, case, &subject, &permission).await;
+        attach_ok(router, case, &bystander, &permission).await;
+
+        let mut both = vec![bystander_name.clone(), subject_name.clone()];
+        both.sort();
+        assert_eq!(
+            listed_arns(router, case, &subject).await,
+            vec![permission.clone()],
+            "case {case:?}: the share is governed by the permission attached to it"
+        );
+        assert_eq!(
+            shares_using(router, case, &permission).await,
+            both,
+            "case {case:?}: both shares are reported as governed by {permission}"
+        );
+
+        let (status, answered) = remove(
+            router,
+            &json!({"resourceShareArn": subject, "permissionArn": permission}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 removing {permission}, got {status} with \
+             {answered:?}"
+        );
+        assert_eq!(
+            answered.get("returnValue").and_then(Value::as_bool),
+            Some(true),
+            "case {case:?}: a served removal reports returnValue true, got {answered:?}"
+        );
+
+        assert_eq!(
+            listed_arns(router, case, &subject).await,
+            Vec::<String>::new(),
+            "case {case:?}: the share the removal named is governed by nothing afterwards"
+        );
+        assert_eq!(
+            shares_using(router, case, &permission).await,
+            vec![bystander_name.clone()],
+            "case {case:?}: only the other share is still reported as governed by {permission}"
+        );
+        assert_eq!(
+            listed_arns(router, case, &bystander).await,
+            vec![permission.clone()],
+            "case {case:?}: a removal reaches the share it names and no other"
+        );
+
+        // "Adds or replaces the RAM permission for a resource type included in a
+        // resource share": an attach of a permission a removal took away governs the
+        // share by it again, so the removal is not permanent for the pair.
+        attach_ok(router, case, &subject, &permission).await;
+        assert_eq!(
+            listed_arns(router, case, &subject).await,
+            vec![permission.clone()],
+            "case {case:?}: an attach after the removal governs the share by {permission} again"
+        );
+        assert_eq!(
+            shares_using(router, case, &permission).await,
+            both,
+            "case {case:?}: the re-attached permission is reported by both reads again"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_removal_leaves_every_read_of_that_shares_permission_set_without_it() {
+    let router = emulator();
+    let component_reader = component_permission(&router, "ComponentReaderVisibility").await;
+    // Which permission the removal names: a resource type's default managed permission,
+    // an AWS managed permission that is not its type's default, and a customer managed
+    // one this account minted. None of the shares below shares a resource, so each
+    // permission is held by name only and the removal is served.
+    let rows = [
+        RemovalVisibilityRow {
+            case: "an AWS managed resource-type default",
+            permission: managed("AWSRAMDefaultPermissionSubnet"),
+        },
+        RemovalVisibilityRow {
+            case: "an AWS managed permission that is not its type's default",
+            permission: managed("AWSRAMPermissionGlueDatabaseReadWrite"),
+        },
+        RemovalVisibilityRow {
+            case: "a customer managed permission",
+            permission: component_reader.clone(),
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        row.run(&router, &format!("row-{index}")).await;
+    }
+}
+
+#[tokio::test]
+async fn a_removal_that_carries_no_client_token_mints_the_one_its_repeat_is_made_with() {
+    let router = emulator();
+    let case = "a removal that carries no client token";
+    let component_reader = component_permission(&router, "ComponentReaderMintedToken").await;
+    let other_permission = managed("AWSRAMDefaultPermissionPrefixList");
+    let share_arn = share_with(
+        &router,
+        case,
+        &json!({"name": "minted-token-share", "resourceArns": []}),
+    )
+    .await;
+    attach_ok(&router, case, &share_arn, &component_reader).await;
+    attach_ok(&router, case, &share_arn, &other_permission).await;
+
+    let request = json!({"resourceShareArn": share_arn, "permissionArn": component_reader});
+    let (status, answered) = remove(&router, &request).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 for the removal, got {status} with {answered:?}"
+    );
+    // "If you don't provide this value, then Amazon Web Services generates a random one
+    // for you" (`clientToken`'s own documentation), and the output reports "the
+    // idempotency identifier associated with this request".
+    let minted = answered
+        .get("clientToken")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: the removal reported no clientToken, got {answered:?}")
+        });
+    assert!(
+        !minted.is_empty(),
+        "case {case:?}: the removal reported an empty clientToken, got {answered:?}"
+    );
+
+    // "If you want to repeat the same operation in an idempotent manner then you must
+    // include this value in the clientToken request parameter of that later call": the
+    // minted token answers for the removal that was made.
+    let (status, repeated) = remove(
+        &router,
+        &json!({
+            "resourceShareArn": share_arn,
+            "permissionArn": component_reader,
+            "clientToken": minted,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 repeating the removal under the token it minted, got \
+         {status} with {repeated:?}"
+    );
+    assert_eq!(
+        repeated.get("returnValue").and_then(Value::as_bool),
+        Some(true),
+        "case {case:?}: the repeat reports the removal that was made, got {repeated:?}"
+    );
+    assert_eq!(
+        listed_arns(&router, case, &share_arn).await,
+        vec![other_permission.clone()],
+        "case {case:?}: the repeat took nothing further away"
+    );
+
+    // The token is what makes the repeat idempotent: the same removal sent without one
+    // names a permission the share is no longer governed by.
+    let case = "the same removal again without a token";
+    let (status, refused) = remove(&router, &request).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected HTTP 400, got {status} with {refused:?}"
+    );
+    assert_eq!(
+        error_code(&refused),
+        "InvalidParameterException",
+        "case {case:?}: expected InvalidParameterException, got {refused:?}"
+    );
+    assert_eq!(
+        error_message(&refused),
+        permission_not_attached_message(&share_arn, &component_reader),
+        "case {case:?}: unexpected refusal wording, got {refused:?}"
+    );
+
+    // And the minted token answers for THAT removal only, so another permission under it
+    // is the parameter clash it is.
+    let case = "the minted token naming another permission";
+    let (status, refused) = remove(
+        &router,
+        &json!({
+            "resourceShareArn": share_arn,
+            "permissionArn": other_permission,
+            "clientToken": minted,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected HTTP 400, got {status} with {refused:?}"
+    );
+    assert_eq!(
+        error_code(&refused),
+        "InvalidClientTokenException",
+        "case {case:?}: expected InvalidClientTokenException, got {refused:?}"
+    );
+    assert_eq!(
+        error_message(&refused),
+        IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE,
+        "case {case:?}: the refusal is worded for a token reused for another request, got \
+         {refused:?}"
+    );
+    assert_eq!(
+        listed_arns(&router, case, &share_arn).await,
+        vec![other_permission],
+        "case {case:?}: the refused removal took nothing away"
+    );
+}
+
+#[tokio::test]
+async fn a_removals_token_does_not_answer_for_a_share_that_is_gone() {
+    let router = emulator();
+    let case = "a token whose share was deleted after the removal";
+    let component_reader = component_permission(&router, "ComponentReaderDeletedShare").await;
+    let share_arn = share_with(
+        &router,
+        case,
+        &json!({"name": "token-then-deleted-share", "resourceArns": []}),
+    )
+    .await;
+    attach_ok(&router, case, &share_arn, &component_reader).await;
+
+    let request = json!({
+        "resourceShareArn": share_arn,
+        "permissionArn": component_reader,
+        "clientToken": "ram-removal-token-then-delete",
+    });
+    let (status, answered) = remove(&router, &request).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 for the removal, got {status} with {answered:?}"
+    );
+    let (status, deleted) = delete(&router, &share_arn, None).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 deleting the share, got {status} with {deleted:?}"
+    );
+
+    // A share a delete has removed holds no permission for a call to remove from it, so
+    // the token cannot answer for a removal on it either.
+    let (status, refused) = remove(&router, &request).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected HTTP 400 repeating the removal on a deleted share, got {status} \
+         with {refused:?}"
+    );
+    assert_eq!(
+        error_code(&refused),
+        "UnknownResourceException",
+        "case {case:?}: expected UnknownResourceException, got {refused:?}"
+    );
+    assert_eq!(
+        error_message(&refused),
+        unknown_share_message(&share_arn),
+        "case {case:?}: unexpected refusal wording, got {refused:?}"
     );
 }
