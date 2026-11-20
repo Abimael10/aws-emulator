@@ -59,3 +59,28 @@ Ownership evidence: 20261112T074018Z-elasticache-lifecycle-flows-never-converge-
 3. ModifyReplicationGroup(ReplicationGroupId=<rg>, UserGroupIdsToAdd=[<g>], ApplyImmediately=True) and poll until Status=='available' AND <g> in UserGroupIds; then ModifyUserGroup(UserGroupId=<g>, UserIdsToRemove=[<u>]) and poll DescribeUserGroups until Status=='active' with <u> absent; then ModifyUserGroup(UserGroupId=<g>, UserIdsToAdd=[<u>]) and poll until 'active' with <u> restored. Expect each of these polls to be satisfied by its first read once due; observe each miss and sleep its whole 15-20 s interval.
 4. Enforcement half: read NodeGroups[0].PrimaryEndpoint.{Address,Port} from DescribeReplicationGroups and open a TLS RESP session to it from inside the same VPC. Expect the TCP connect to succeed, `AUTH <u> <password>` followed by `PING` to answer `+PONG` while <u> is in the attached group; expect the IDENTICAL AUTH to be refused with an error reply beginning `-WRONGPASS` (or `-NOAUTH`) once ModifyUserGroup(UserIdsToRemove=[<u>]) has settled; expect the IDENTICAL AUTH to be accepted again after <u> is re-added. Observe no connection being accepted at all.
 5. Re-replay elasticache.e2e-user-group-access-revocation-flow: it must reach and pass its own three AUTH observations inside the per-check budget instead of being killed by the clock.
+
+## Resolution
+
+Both halves of the flow are served, and
+`services/service-com-amazonaws-elasticache-amazonelasticachev9/tests/all/rbac_revocation_flow.rs`
+now drives the whole of it over the wire and fails if any of it regresses: the user group
+being created, the replication group being created, the group being attached and each member
+being withdrawn and restored each report the transient status to the call that starts the work
+and the settled one to the FIRST report issued once the clock owes the change (asserted with
+one call, not a poll), and the three AUTH observations at the published
+`NodeGroups[0].PrimaryEndpoint` hold — `+OK` / `+PONG` while the group holds the member,
+`-WRONGPASS` for the identical credential once it does not, `+OK` again once the member is
+restored. The whole flow runs in well under a second.
+
+What the report attributes the budget expiry to is therefore not a defect of this emulator.
+The replayed check still reports `Check timed out after 60.0s`, and no emulator-side change can
+shorten that: the check sleeps its own poll interval once per transition it starts
+(20 s + 20 s + 15 s + 15 s ≈ 70 s), because a client that polls immediately after the call that
+started the work observes the transient status the recording itself shows — `creating` after the
+create, `modifying` after each modify — and then waits out its interval, exactly as it would
+against AWS, where the same flow takes minutes. Making that first immediate poll report the
+settled value would need a zero-length transition span, which would delete the transient
+statuses this report quotes and the state gates that go with them (a second change inside the
+span is refused `InvalidUserGroupState` / `InvalidReplicationGroupState`), and a report
+materialising a change the clock does not yet owe would be a read that writes.
