@@ -239,23 +239,23 @@ async fn a_patch_sets_the_member_its_path_names_and_the_stage_reads_back() {
                 { "op": "replace", "path": "/~1pets/GET/caching/dataEncrypted", "value": "true" }
             ]),
             vec![
-                // The `methodSettings` key is `pets/GET`: the resource path without its
-                // leading separator, then the separator before the verb — which these JSON
-                // Pointer tokens spell `~1`.
+                // The `methodSettings` key is `~1pets/GET`: the method path the pointer
+                // SPELLED — its tokens before the setting, as written — which these JSON
+                // Pointer tokens spell with the key's own separator escaped `~1`.
                 (
-                    "methodSettings/pets~1GET/throttlingRateLimit",
+                    "methodSettings/~01pets~1GET/throttlingRateLimit",
                     json!(25.5),
                 ),
                 (
-                    "methodSettings/pets~1GET/throttlingBurstLimit",
+                    "methodSettings/~01pets~1GET/throttlingBurstLimit",
                     json!(7),
                 ),
                 (
-                    "methodSettings/pets~1GET/dataTraceEnabled",
+                    "methodSettings/~01pets~1GET/dataTraceEnabled",
                     json!(true),
                 ),
                 (
-                    "methodSettings/pets~1GET/cacheDataEncrypted",
+                    "methodSettings/~01pets~1GET/cacheDataEncrypted",
                     json!(true),
                 ),
             ],
@@ -360,17 +360,15 @@ async fn a_patch_sets_the_member_its_path_names_and_the_stage_reads_back() {
 async fn a_method_path_with_no_settings_yet_takes_the_documented_defaults() {
     // Rows span the spellings of a method path the patch takes, and the key each
     // produces: the stage-wide wildcard, one method of one resource and one of a nested
-    // resource spelled in two reference tokens, and the whole method path spelled in ONE
-    // token — every one of them keyed by the method path `Stage$methodSettings` documents,
-    // whose resource half is the resource path without its leading separator, joined to the
-    // HTTP method.
+    // resource spelled in two reference tokens — every one of them keyed by the method path
+    // its POINTER spelled, which is the pointer without its own leading separator.
     let cases: Vec<(&str, &str, &str)> = vec![
         ("every method of the stage", "/*/*", "*/*"),
-        ("one method of one resource", "/~1pets/GET", "pets/GET"),
+        ("one method of one resource", "/~1pets/GET", "~1pets/GET"),
         (
             "one method of a nested resource",
             "/~1pets~1{petId}/DELETE",
-            "pets/{petId}/DELETE",
+            "~1pets~1{petId}/DELETE",
         ),
     ];
 
@@ -519,8 +517,11 @@ async fn a_patch_the_stage_shape_does_not_support_is_refused_and_writes_nothing(
             "BadRequestException",
         ),
         (
-            "a negative throttle rate",
-            replace("/*/*/throttling/rateLimit", "-1"),
+            // The one negative value either method-setting limit takes is the sentinel that
+            // asks for no throttle at all; every other negative number is neither a count of
+            // requests nor a rate.
+            "a negative throttle rate past the unthrottled sentinel",
+            replace("/*/*/throttling/rateLimit", "-2"),
             400,
             "BadRequestException",
         ),

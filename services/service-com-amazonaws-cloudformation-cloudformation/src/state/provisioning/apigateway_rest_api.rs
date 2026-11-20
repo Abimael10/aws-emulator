@@ -1439,21 +1439,38 @@ fn stage_patches(
 }
 
 /// The method-setting PATH `UpdateStage` addresses one setting by: the method path
-/// `{resource_path}/{http_method}` (`Stage$methodSettings`), with the pointer's own leading
-/// separator standing for the resource path's — the way `MethodSetting$ResourcePath` states
-/// one, which "must include a forward slash" and spells every separator INSIDE the path as the
-/// JSON Pointer escape (`/~1resource~1subresource` for `/resource/subresource`). A declaration
-/// that spells an inner separator plainly is encoded here rather than refused, so either
-/// spelling of one path names one method; API Gateway then keys the setting by that method,
-/// under the one key it documents for it, whichever of these spellings addressed it. The
-/// stage-wide path stands where the entry names neither half.
+/// `{resource_path}/{http_method}` (`Stage$methodSettings`), whose resource half rides in ONE
+/// reference token of the pointer with every separator of it — its initial one included —
+/// spelled as the escape `MethodSetting$ResourcePath` requires of a path name
+/// (`/~1resource~1subresource` for `/resource/subresource`, and "the initial slash must include
+/// a forward slash"). A declaration that spells an inner separator plainly is encoded here
+/// rather than refused, and one that already spelled the whole path that way keeps it, so
+/// either spelling of one path names one method — and API Gateway then reports the setting
+/// under the key that pointer spells, which is that same path name. The stage-wide path stands
+/// where the entry names neither half, and the wildcard resource half names no path at all.
 fn method_setting_path(resource_path: &str, http_method: &str) -> String {
     if resource_path.is_empty() || http_method.is_empty() {
         return EVERY_METHOD.to_string();
     }
-    let resource_path = resource_path.strip_prefix('/').unwrap_or(resource_path);
-    format!("{}/{http_method}", resource_path.replace('/', "~1"))
+    let unprefixed = resource_path.strip_prefix('/').unwrap_or(resource_path);
+    let resource = match unprefixed {
+        EVERY_RESOURCE_PATH => EVERY_RESOURCE_PATH.to_string(),
+        encoded if encoded.starts_with(PATH_NAME_SEPARATOR) => encoded.to_string(),
+        plain => format!(
+            "{PATH_NAME_SEPARATOR}{}",
+            plain.replace('/', PATH_NAME_SEPARATOR)
+        ),
+    };
+    format!("{resource}/{http_method}")
 }
+
+/// The resource half that stands for every resource of the stage, which names no resource path
+/// and so carries no escape: the half of [`EVERY_METHOD`].
+const EVERY_RESOURCE_PATH: &str = "*";
+
+/// How a separator INSIDE a path name is spelled in a JSON Pointer reference token: "Any slash
+/// ("/") character appearing in path names must be escaped with "~1"" (`PatchOperation$path`).
+const PATH_NAME_SEPARATOR: &str = "~1";
 
 /// Apply one patch set to a stage that exists, through the call API Gateway publishes for it.
 async fn patch_stage(
@@ -2050,21 +2067,21 @@ mod tests {
     }
 
     /// A method setting is written on the path `UpdateStage` reads a method by: the resource
-    /// path as the declaration states it, the pointer's own leading separator standing for
-    /// its initial one, and then the verb — or the stage-wide path where the entry names no
-    /// one method.
+    /// path as ONE reference token, every separator of it — its initial one included —
+    /// spelled as the escape a path name carries, and then the verb — or the stage-wide path
+    /// where the entry names no one method.
     #[test]
     fn a_method_setting_is_written_on_the_method_path_it_names() {
         let cases: &[(&str, &str, &str, &str)] = &[
-            ("one method", "/items", "GET", "items/GET"),
-            ("a nested path", "/items/{id}", "PUT", "items~1{id}/PUT"),
+            ("one method", "/items", "GET", "~1items/GET"),
+            ("a nested path", "/items/{id}", "PUT", "~1items~1{id}/PUT"),
             (
                 "a nested path the declaration already encoded",
                 "/~1items~1{id}",
                 "PUT",
                 "~1items~1{id}/PUT",
             ),
-            ("the root resource", "/", "GET", "/GET"),
+            ("the root resource", "/", "GET", "~1/GET"),
             ("every method of a resource", "*", "*", "*/*"),
             ("every method, as the type states it", "/*", "*", "*/*"),
             ("the whole stage", "", "", "*/*"),
@@ -2101,7 +2118,7 @@ mod tests {
             "/clientCertificateId",
             "/accessLogSettings/destinationArn",
             "/accessLogSettings/format",
-            "/items/GET/metrics/enabled",
+            "/~1items/GET/metrics/enabled",
         ] {
             assert!(
                 paths.contains(&expected.to_string()),

@@ -269,13 +269,11 @@ fn traced_line(request_id: &str, line: &str) -> String {
 }
 
 /// The `methodSettings` key the method `verb` of `resource_path` is held under: the method path
-/// `{resource_path}/{http_method}` (`Stage$methodSettings`) — the resource path WITHOUT the leading
-/// separator a resource path is stated with and with every separator inside it literal, joined by a
-/// separator to the verb. The `~1` escape is the patch POINTER's spelling of a path name
-/// ([`method_patch_path`]), not part of the key.
+/// the patch POINTER spelled ([`method_patch_path`]), which is that pointer without the leading
+/// separator a JSON Pointer opens with — so the resource half keeps the `~1` escape
+/// `PatchOperation$path` spells a path name's separators with.
 fn method_key(resource_path: &str, verb: &str) -> String {
-    let unprefixed = resource_path.strip_prefix('/').unwrap_or(resource_path);
-    format!("{unprefixed}/{verb}")
+    method_patch_path(resource_path, verb)
 }
 
 /// The patch path that addresses a setting of that same method, behind the pointer's own leading

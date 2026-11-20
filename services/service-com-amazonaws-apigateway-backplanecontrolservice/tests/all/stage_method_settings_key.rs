@@ -1,34 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end tests for the `methodSettings` KEY one method is held under, whichever of the
-//! spellings an `UpdateStage` patch path may address that method by was used.
+//! End-to-end tests for the `methodSettings` KEY a method's settings are held under, and what
+//! that key DENOTES.
 //!
 //! The RULE under test, one level above any one call:
 //!
 //! > `Stage$methodSettings` is "a map that defines the method settings for a Stage resource.
 //! > Keys (designated as /{method_setting_key) are method paths defined as
 //! > {resource_path}/{http_method} for an individual method override, or /\*/\* for
-//! > overriding all methods in the stage". A key therefore names a METHOD, as the method
-//! > path itself: the resource path WITHOUT the leading separator a resource path is stated
-//! > with and with every separator inside it literal, then a separator, then the HTTP method;
-//! > and `*/*` for the whole-stage path `/*/*`, whose resource half names no resource path.
-//! > The `~1` escape is `PatchOperation$path`'s ("Any slash ("/") character appearing in path
-//! > names must be escaped with "~1"") and belongs to the POINTER, not to the key. A patch
-//! > may spell that method several ways (the resource path's leading separator escaped or left
-//! > to the pointer's own, the separator before the HTTP method escaped too so the whole
-//! > method path rides in one reference token), and every one of them addresses the one
-//! > method, so a stage holds exactly ONE entry per method however many spellings wrote it.
+//! > overriding all methods in the stage". The key API Gateway reports an entry under is the
+//! > method path the patch POINTER spelled: the pointer's reference tokens before the setting
+//! > it writes, each exactly as the request wrote it — so a client reads a setting back under
+//! > the very path it patched. A pointer carrying the whole method path in ONE reference token
+//! > is the exception, because such a token has to be DECODED to be read as a method path at
+//! > all: it is keyed as the documented method path, the resource path without the leading
+//! > separator a resource path is stated with. The method a key denotes (its resource path
+//! > decoded, with that leading separator, and the HTTP method) is what a `remove` names, and
+//! > a stage cannot be updated while two of its keys denote the one method.
 //!
 //! The rows span what the rule generalises over: the DEPTH of the resource path (the root, a
-//! child, a nested one), the wildcard that stands for every method, and each spelling of the
-//! separators — so the setting a client writes under one spelling is the setting it reads
-//! back under the documented key, and a settings-diffing client sees no entry AWS would not
-//! report.
+//! child, a nested one), the wildcard that stands for every method, each spelling of the
+//! separators (escaped, the pointer's own, absent, and the whole method path in one token),
+//! and each spelling of the setting — so the key a client patched is the key it reads back,
+//! and a settings-diffing client sees no key AWS would not report. Each spelling is driven on
+//! a method of its own: two spellings of ONE method are the duplicate-method-settings
+//! refusal, which `method_setting_resource_half_spellings` asserts.
 //!
 //! Every case drives the real wire path through [`Gateway`], this crate's one wire-test
-//! harness, and reuses the stage and patch helpers of the suites beside it. Each spelling is
-//! sent in a request of its OWN: a single request carrying two spellings of one method is the
-//! duplicate-method-settings refusal, which is a rule of its own and not this one.
+//! harness, and reuses the stage and patch helpers of the suites beside it.
 
 use serde_json::{json, Value};
 
@@ -36,67 +35,77 @@ use crate::patch_updates::{op, patch_ok, replace};
 use crate::rest_api_lifecycle::{create_api, Gateway};
 use crate::stage_lifecycle::{create_deployed_stage, get_stage};
 
-/// One row: a method, the single `methodSettings` key it is held under, and the patch paths
-/// that address a setting of it — each paired with the `MethodSetting` member it writes.
+/// One row: a method, and the patch paths that address a setting of it — each paired with the
+/// `methodSettings` key the stage reports it under and the `MethodSetting` member it writes.
 ///
 /// The setting names are the published group-and-name paths and the member names of the
 /// `MethodSetting` shape (`smithy_query(query="shape", shape="MethodSetting")`); a one-token
 /// method path is followed by the member name, which is the only spelling one token can carry.
 struct Row {
     case: &'static str,
-    key: &'static str,
-    /// `(patch path, the member the stage must then report as `true`)`.
-    spellings: &'static [(&'static str, &'static str)],
+    /// `(patch path, the key the setting is reported under, the member it sets to `true`)`.
+    spellings: &'static [(&'static str, &'static str, &'static str)],
 }
 
 const ROWS: &[Row] = &[
     Row {
         case: "a child resource",
-        key: "pets/GET",
         spellings: &[
             // The resource path's leading separator escaped into the first token.
-            ("/~1pets/GET/metrics/enabled", "metricsEnabled"),
+            ("/~1pets/GET/metrics/enabled", "~1pets/GET", "metricsEnabled"),
             // The same resource path with that separator left to the pointer's own, the
-            // spelling `MethodSetting$ResourcePath` states a path in.
-            ("/pets/GET/caching/enabled", "cachingEnabled"),
-            // The whole method path inside ONE reference token.
-            ("/~1pets~1GET/cacheDataEncrypted", "cacheDataEncrypted"),
+            // spelling `MethodSetting$resourcePath` states a path in — on another verb, since
+            // two spellings of ONE method are the refused duplicate.
+            ("//pets/POST/caching/enabled", "/pets/POST", "cachingEnabled"),
+            // The resource path with no leading separator at all.
+            (
+                "/pets/PUT/caching/dataEncrypted",
+                "pets/PUT",
+                "cacheDataEncrypted",
+            ),
+            // The whole method path inside ONE reference token, which is decoded and keyed as
+            // the documented method path.
+            (
+                "/~1pets~1DELETE/metricsEnabled",
+                "pets/DELETE",
+                "metricsEnabled",
+            ),
         ],
     },
     Row {
         case: "a nested resource path",
-        key: "pets/{petId}/DELETE",
         spellings: &[
             (
                 "/~1pets~1{petId}/DELETE/metrics/enabled",
+                "~1pets~1{petId}/DELETE",
                 "metricsEnabled",
             ),
-            ("/pets~1{petId}/DELETE/caching/enabled", "cachingEnabled"),
             (
-                "/~1pets~1{petId}~1DELETE/cacheDataEncrypted",
+                "/pets~1{petId}/PATCH/caching/enabled",
+                "pets~1{petId}/PATCH",
+                "cachingEnabled",
+            ),
+            (
+                "/~1pets~1{petId}~1PUT/cacheDataEncrypted",
+                "pets/{petId}/PUT",
                 "cacheDataEncrypted",
             ),
         ],
     },
     Row {
         case: "the root resource",
-        key: "/GET",
         spellings: &[
-            ("/~1/GET/metrics/enabled", "metricsEnabled"),
-            ("//GET/caching/enabled", "cachingEnabled"),
-            ("/~1~1GET/cacheDataEncrypted", "cacheDataEncrypted"),
+            ("/~1/GET/metrics/enabled", "~1/GET", "metricsEnabled"),
+            ("//HEAD/caching/enabled", "/HEAD", "cachingEnabled"),
         ],
     },
     Row {
         case: "every method of the stage",
-        key: "*/*",
-        // The wildcard names no resource path, so the spellings are its own two tokens, both
-        // of them in one, and the leading separator `MethodSetting$ResourcePath` states a
-        // path with — every one of them the whole-stage key.
+        // The wildcard names no resource path, so the spellings are its own two tokens and
+        // both of them in one — which decodes to the same method path, so it is the same key.
         spellings: &[
-            ("/*/*/metrics/enabled", "metricsEnabled"),
-            ("/*~1*/cachingEnabled", "cachingEnabled"),
-            ("/~1*~1*/cacheDataEncrypted", "cacheDataEncrypted"),
+            ("/*/*/metrics/enabled", "*/*", "metricsEnabled"),
+            ("/*~1*/cachingEnabled", "*/*", "cachingEnabled"),
         ],
     },
 ];
@@ -111,20 +120,8 @@ fn reported_keys(body: &Value) -> Vec<String> {
     keys
 }
 
-/// The `methodSettings` key the method `verb` of `resource_path` is reported under, derived
-/// from the method rather than remembered: the resource path without its leading separator,
-/// then a separator and the verb. The wildcard resource half names no resource path, so it
-/// is carried over as it stands.
-fn method_key(resource_path: &str, verb: &str) -> String {
-    if resource_path.trim_start_matches('/') == "*" {
-        return format!("*/{verb}");
-    }
-    let path = resource_path.strip_prefix('/').unwrap_or(resource_path);
-    format!("{path}/{verb}")
-}
-
 #[tokio::test]
-async fn every_spelling_of_one_method_writes_the_one_documented_key() {
+async fn every_spelling_writes_the_key_it_spelled() {
     let gateway = Gateway::new();
     let (api, _root) = create_api(&gateway, "method-settings-key").await;
     create_deployed_stage(&gateway, &api, "prod").await;
@@ -132,31 +129,25 @@ async fn every_spelling_of_one_method_writes_the_one_documented_key() {
 
     let mut expected_keys: Vec<String> = Vec::new();
     for row in ROWS {
-        expected_keys.push(row.key.to_string());
-        expected_keys.sort();
-        for (path, member) in row.spellings {
+        for (path, key, member) in row.spellings {
             let case = format!("{} as {path:?}", row.case);
             let body = patch_ok(&gateway, &case, &uri, vec![replace(path, "true")]).await;
             assert_eq!(
-                body["methodSettings"][row.key][*member],
+                body["methodSettings"][*key][*member],
                 json!(true),
-                "case {case}: expected {member} under {:?}, got {:?}",
-                row.key,
+                "case {case}: expected {member} under {key:?}, got {:?}",
                 body["methodSettings"]
             );
-            // The whole map: one entry per method named so far and not one more, so a second
-            // spelling of a method is the SAME entry rather than one of its own.
+            // The whole map: the keys every spelling so far wrote and not one more, so a
+            // spelling writes its own entry and rewrites no other.
+            if !expected_keys.contains(&(*key).to_string()) {
+                expected_keys.push((*key).to_string());
+                expected_keys.sort();
+            }
             let keys = reported_keys(&body);
             assert_eq!(
                 keys, expected_keys,
                 "case {case}: expected the keys {expected_keys:?}, got {keys:?}"
-            );
-            // Every key states its method path with literal separators: the `~1` escape is
-            // the patch pointer's spelling of a path name, not part of the key.
-            assert!(
-                keys.iter().all(|key| !key.contains('~')),
-                "case {case}: a key states its method path with literal separators, got \
-                 {keys:?}"
             );
             let read = get_stage(&gateway, &api, "prod").await;
             assert_eq!(
@@ -166,18 +157,16 @@ async fn every_spelling_of_one_method_writes_the_one_documented_key() {
             );
         }
 
-        // Every spelling wrote into the one entry, so each setting they addressed is still
-        // there together with the others.
+        // Every setting each spelling wrote is still there, under the key that spelling named.
         let read = get_stage(&gateway, &api, "prod").await;
-        for (path, member) in row.spellings {
+        for (path, key, member) in row.spellings {
             assert_eq!(
-                read.body["methodSettings"][row.key][*member],
+                read.body["methodSettings"][*key][*member],
                 json!(true),
-                "case {} as {path:?}: the entry under {:?} must keep every setting the \
-                 spellings wrote, got {:?}",
+                "case {} as {path:?}: the entry under {key:?} must keep the setting that \
+                 spelling wrote, got {:?}",
                 row.case,
-                row.key,
-                read.body["methodSettings"][row.key]
+                read.body["methodSettings"][*key]
             );
         }
     }
@@ -190,10 +179,12 @@ async fn a_method_entry_is_removed_by_any_spelling_that_names_it() {
     create_deployed_stage(&gateway, &api, "prod").await;
     let uri = format!("/restapis/{api}/stages/prod");
 
-    // The other side of the same rule: a `remove` naming the method alone takes away the one
-    // entry that method is held under, so a spelling OTHER than the one that wrote the entry
-    // still names it. Rows pair each writing spelling with a different removing one, over the
-    // same resource-path depths and the wildcard.
+    // The other side of the same rule: a `remove` naming the method alone takes away the
+    // entry of the METHOD it names — the sentence API Gateway refuses a `remove` it has
+    // nothing to take away with says "there is no method setting for this method" — so a
+    // spelling OTHER than the one that wrote the entry still names it. Rows pair each writing
+    // spelling with a different removing one, over the same resource-path depths and the
+    // wildcard.
     let rows: [(&str, &str, &str); 6] = [
         (
             "a child resource",
@@ -202,7 +193,7 @@ async fn a_method_entry_is_removed_by_any_spelling_that_names_it() {
         ),
         (
             "a child resource written with the pointer's own separator",
-            "/pets/GET/metrics/enabled",
+            "//pets/GET/metrics/enabled",
             "/~1pets/GET",
         ),
         (
@@ -251,15 +242,13 @@ async fn a_method_entry_is_removed_by_any_spelling_that_names_it() {
     }
 }
 
-/// RULE: the key of a `methodSettings` entry is the METHOD PATH `Stage$methodSettings`
-/// documents — `{resource_path}/{http_method}`, the resource path without its leading
-/// separator and every separator inside it literal — whichever of the spellings the patch
-/// POINTER addressed the entry by.
+/// RULE: the key of a `methodSettings` entry is the method path the pointer SPELLED — the
+/// pointer's reference tokens before the setting, written exactly as the request wrote them.
 ///
-/// The key is DERIVED here from the resource path and the verb of each row, so the row proves
-/// the form rather than one remembered string.
+/// The key is DERIVED here from the pointer of each row, so the row proves the form rather
+/// than one remembered string.
 #[tokio::test]
-async fn a_key_is_the_documented_method_path_derived_from_the_method_it_names() {
+async fn a_key_is_the_method_path_its_pointer_spelled() {
     // Rows differ along what the rule generalises over: the DEPTH of the resource path (the
     // root, a child, a nested one, a deeper one), a path part that is a path parameter, a part
     // carrying a character the pointer leaves alone, the HTTP verb — the verbs are the ones
@@ -274,6 +263,9 @@ async fn a_key_is_the_documented_method_path_derived_from_the_method_it_names() 
         ("every method of the stage", "/*", "*"),
     ];
 
+    /// The setting every row writes, as its published group-and-name path.
+    const SETTING: &str = "metrics/enabled";
+
     let gateway = Gateway::new();
     let (api, _root) = create_api(&gateway, "method-settings-key-form").await;
     create_deployed_stage(&gateway, &api, "prod").await;
@@ -281,16 +273,23 @@ async fn a_key_is_the_documented_method_path_derived_from_the_method_it_names() 
 
     let mut expected_keys: Vec<String> = Vec::new();
     for (case, resource_path, verb) in rows {
-        // The method path as a key: the resource path without its leading separator, every
-        // separator inside it literal.
-        let expected_key = method_key(resource_path, verb);
-        // The pointer that addresses a setting of that same method: a separator INSIDE the
-        // resource path is escaped `~1`, as `PatchOperation$path` requires of a path name.
-        let unprefixed = resource_path.strip_prefix('/').unwrap_or(resource_path);
+        // The pointer that addresses that method's setting: every separator INSIDE the
+        // resource path is escaped `~1`, as `PatchOperation$path` requires of a path name, and
+        // so is its leading one.
         let pointer = format!(
-            "/{}/{verb}/metrics/enabled",
-            unprefixed.replace('/', "~1")
+            "/{}/{verb}/{SETTING}",
+            resource_path
+                .strip_prefix('/')
+                .map_or_else(|| resource_path.to_string(), |rest| format!("/{rest}"))
+                .replace('/', "~1")
         );
+        // The key is that pointer's method path, as written: the pointer without its leading
+        // separator and without the setting it names.
+        let expected_key = pointer
+            .strip_prefix('/')
+            .and_then(|path| path.strip_suffix(&format!("/{SETTING}")))
+            .map(str::to_string)
+            .unwrap_or_default();
 
         let case = format!("{case} as {pointer:?}");
         let body = patch_ok(&gateway, &case, &uri, vec![replace(&pointer, "true")]).await;
@@ -308,11 +307,6 @@ async fn a_key_is_the_documented_method_path_derived_from_the_method_it_names() 
         assert_eq!(
             keys, expected_keys,
             "case {case}: expected the keys {expected_keys:?}, got {keys:?}"
-        );
-        assert!(
-            keys.iter().all(|key| !key.contains('~')),
-            "case {case}: a key states its method path with literal separators, got \
-             {keys:?}"
         );
 
         let read = get_stage(&gateway, &api, "prod").await;

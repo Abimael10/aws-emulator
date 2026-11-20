@@ -166,24 +166,19 @@ fn invalidation_refusal(req: &RtRequest, call: &resource_policy::Call<'_>) -> Ga
 /// `ANY` catch-all serves is `ANY`: a `methodSettings` key names a deployed method, and the
 /// settings a patch wrote about that method are in force for every request it serves.
 ///
-/// A `methodSettings` key is the method path `Stage$methodSettings` documents —
-/// `{resource_path}/{http_method}` with the resource path carried as one reference token, its
-/// separators escaped — or [`EVERY_METHOD_SETTINGS_KEY`]. It is derived HERE from the deployed
-/// resource path and the verb through the one place that derives it
-/// ([`crate::state::method_settings_key`]), which
-/// is also what `UpdateStage` stores by, so whichever spelling a patch addressed the method
-/// in, the setting it wrote is the setting resolved here. The whole-stage key is the
-/// fallback, which is what makes a `/*/*/caching/enabled` patch cache every method.
+/// A `methodSettings` key is the method path `UpdateStage`'s pointer spelled, so the entry is
+/// resolved by the METHOD a key denotes rather than by one spelling of it — the one place that
+/// reads a key apart ([`crate::state::method_settings_in_force`]), which is also what the
+/// control plane compares two patched spellings on, so whichever spelling a patch addressed
+/// the method in, the setting it wrote is the setting resolved here. The whole-stage key is
+/// the fallback, which is what makes a `/*/*/caching/enabled` patch cache every method.
 pub(super) fn method_settings_in_force<'s>(
     stage: &'s StageEntry,
     matched_path: &str,
     verb: &str,
 ) -> Option<&'s MethodSetting> {
     let verb = wire_verb(verb);
-    stage
-        .method_settings
-        .get(&crate::state::method_settings_key(matched_path, &verb))
-        .or_else(|| stage.method_settings.get(EVERY_METHOD_SETTINGS_KEY))
+    crate::state::method_settings_in_force(&stage.method_settings, matched_path, &verb)
 }
 
 /// The key the stage's cache holds this call's response under.

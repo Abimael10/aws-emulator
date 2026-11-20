@@ -16,7 +16,9 @@
 //!   for every value the setting cannot take — a text that is no number as much as a number
 //!   outside the setting's rule — and it carries neither the JSON Pointer the value arrived
 //!   on nor the value itself: a method's throttle limits answer the stage's throttling
-//!   sentence, and a usage plan's answer the one that shape publishes;
+//!   sentence, and a usage plan's answer the one that shape publishes. A method setting's two
+//!   limits take one negative value, the sentinel that asks for NO throttle on the method,
+//!   which the plan's own pair of limits refuses like any other negative number;
 //! * every tag outside the tag key/value contract — an empty key as much as a key or a
 //!   value past its bound — earns the one fixed sentence stating that contract, whichever
 //!   operation the tag rode on;
@@ -120,17 +122,23 @@ fn assert_refusal(answer: &Answer, expected: (u16, &str), message: &str, case: &
 const METHOD_SCOPES: [&str; 2] = ["/*/*", "/~1pets/GET"];
 
 /// The values no throttle limit of either kind can take, each with the case it stands for:
-/// a word, an empty value, a value carrying a unit, one negative, one far negative, and the
-/// two texts that spell a number which is not finite.
+/// a word, an empty value, a value carrying a unit, one far negative, and the two texts that
+/// spell a number which is not finite.
 const UNACCEPTABLE_LIMITS: [(&str, &str); 7] = [
     ("no number at all", "abc"),
     ("an empty value", ""),
     ("a number carrying a unit", "10rps"),
-    ("a negative limit", "-1"),
+    ("one past the unthrottled sentinel", "-2"),
     ("a far negative limit", "-100000"),
     ("an infinity", "Infinity"),
     ("a not-a-number", "NaN"),
 ];
+
+/// The value a METHOD SETTING's throttle takes to mean no throttle at all, and which a usage
+/// plan's throttle — a pair of limits a plan meters by, with no such reading — refuses: the
+/// one negative number either method-setting limit admits, which API Gateway answers with 200
+/// and reports back.
+const UNTHROTTLED_SENTINEL: (&str, &str) = ("the unthrottled sentinel", "-1");
 
 /// The values only an INTEGER limit refuses, beside [`UNACCEPTABLE_LIMITS`]: a count of
 /// requests is a whole number inside the modelled `Integer`, so a fractional text and one
@@ -180,8 +188,13 @@ async fn a_method_throttle_limit_the_setting_cannot_take_earns_one_fixed_sentenc
     // The limits the setting DOES take apply and read back, so every refusal above is about
     // the value and not about the path: the bottom of each limit's range, a limit the
     // account's documented default publishes, the top of the burst's modelled integer, and
-    // a rate spelled in exponent form.
-    for (value, expected) in [("0", 0), ("5000", 5000), ("2147483647", i32::MAX)] {
+    // the sentinel that asks for no throttle on the method at all.
+    for (value, expected) in [
+        ("0", 0),
+        ("5000", 5000),
+        ("2147483647", i32::MAX),
+        (UNTHROTTLED_SENTINEL.1, -1),
+    ] {
         let case = format!("replace /*/*/throttling/burstLimit with {value:?}");
         let answer =
             update_stage(&gateway, &api, replace("/*/*/throttling/burstLimit", value)).await;
@@ -198,7 +211,12 @@ async fn a_method_throttle_limit_the_setting_cannot_take_earns_one_fixed_sentenc
             "case {case}: expected the stage to report {expected}, got {actual:?}"
         );
     }
-    for (value, expected) in [("0", 0.0), ("10000.5", 10_000.5), ("1e3", 1000.0)] {
+    for (value, expected) in [
+        ("0", 0.0),
+        ("10000.5", 10_000.5),
+        ("1e3", 1000.0),
+        (UNTHROTTLED_SENTINEL.1, -1.0),
+    ] {
         let case = format!("replace /*/*/throttling/rateLimit with {value:?}");
         let answer = update_stage(&gateway, &api, replace("/*/*/throttling/rateLimit", value)).await;
         assert_eq!(
@@ -230,17 +248,24 @@ async fn a_usage_plan_throttle_limit_the_plan_cannot_meter_earns_that_shapes_sen
     .await;
     let plan = string_member(&created, "id", "CreateUsagePlan(throttle sentence)");
 
-    // The same table of unacceptable values, on the plan's own throttle: the limits of a
-    // usage plan are the same two members, so the sentence that shape publishes is the
-    // answer for every value either refuses.
+    // The same table of unacceptable values, on the plan's own throttle, plus the sentinel a
+    // method setting takes and a plan does not: the limits of a usage plan are the same two
+    // members, so the sentence that shape publishes is the answer for every value either
+    // refuses.
     let burst: Vec<(&str, &str)> = UNACCEPTABLE_LIMITS
         .iter()
         .chain(UNACCEPTABLE_INTEGER_LIMITS.iter())
+        .chain(::std::iter::once(&UNTHROTTLED_SENTINEL))
+        .copied()
+        .collect();
+    let rates: Vec<(&str, &str)> = UNACCEPTABLE_LIMITS
+        .iter()
+        .chain(::std::iter::once(&UNTHROTTLED_SENTINEL))
         .copied()
         .collect();
     let limits: [(&str, &[(&str, &str)]); 2] = [
         ("/throttle/burstLimit", &burst),
-        ("/throttle/rateLimit", &UNACCEPTABLE_LIMITS),
+        ("/throttle/rateLimit", &rates),
     ];
     for (path, rows) in &limits {
         for (reason, value) in *rows {

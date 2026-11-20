@@ -589,12 +589,11 @@ struct Row {
     resource_path: &'static str,
     /// The body that method answers.
     label: &'static str,
-    /// The `methodSettings` key the level in force is held under: the method path
-    /// `{resource_path}/{http_method}` `Stage$methodSettings` documents, whose resource half
-    /// is the resource path without the leading separator a resource path is stated with and
-    /// with every separator inside it literal — the `~1` escape is `PatchOperation$path`'s
-    /// spelling of a path name, not part of the key — and the whole-stage path `/*/*` keyed
-    /// `*/*`.
+    /// The `methodSettings` key the level in force is held under: the method path the patch
+    /// POINTER the stack's provisioning sends spelled, which states the resource path as the
+    /// path NAME `MethodSetting$ResourcePath` documents ("the initial slash must include a
+    /// forward slash", every separator inside it escaped `~1`) — and the whole-stage path
+    /// `/*/*` keyed `*/*`.
     settings_key: &'static str,
     /// Whether the level in force traces the request at all.
     traced: bool,
@@ -608,7 +607,7 @@ const ROWS: &[Row] = &[
         request_path: "/ping",
         resource_path: PING_PATH,
         label: "ping",
-        settings_key: "ping/GET",
+        settings_key: "~1ping/GET",
         traced: true,
     },
     Row {

@@ -559,22 +559,22 @@ async fn a_stage_refuses_a_pointer_it_has_no_member_for_as_a_method_setting_path
     keys.sort();
     assert_eq!(
         keys,
-        vec!["*/*".to_string(), "pets/GET".to_string()],
+        vec!["*/*".to_string(), "~1pets/GET".to_string()],
         "case UpdateStage(the published grammar): expected one entry per method, got {:?}",
         patched["methodSettings"]
     );
     assert_eq!(
-        patched["methodSettings"]["pets/GET"]["throttlingRateLimit"],
+        patched["methodSettings"]["~1pets/GET"]["throttlingRateLimit"],
         json!(9.0),
         "case UpdateStage(the published grammar): expected the patched rate limit, got {:?}",
-        patched["methodSettings"]["pets/GET"]
+        patched["methodSettings"]["~1pets/GET"]
     );
     assert_eq!(
-        patched["methodSettings"]["pets/GET"]["metricsEnabled"],
+        patched["methodSettings"]["~1pets/GET"]["metricsEnabled"],
         json!(true),
         "case UpdateStage(the published grammar): both spellings of the setting must write \
          the one entry, got {:?}",
-        patched["methodSettings"]["pets/GET"]
+        patched["methodSettings"]["~1pets/GET"]
     );
     let read = get_stage(&gateway, &api, "prod").await;
     assert_eq!(
@@ -584,10 +584,9 @@ async fn a_stage_refuses_a_pointer_it_has_no_member_for_as_a_method_setting_path
     );
 }
 
-/// The `methodSettings` key a patch writes is the method its pointer names — the one key
-/// `Stage$methodSettings` documents for that method, whichever of the spellings a pointer may
-/// address it by was used — so a client reading the stage finds the setting it just wrote
-/// under that key.
+/// The `methodSettings` key a patch writes is the method path its pointer SPELLED — written
+/// exactly as the request wrote it, which is the key API Gateway reports the entry under — so
+/// a client reading the stage finds the setting it just wrote under the path it patched.
 #[tokio::test]
 async fn a_method_settings_key_is_the_method_path_its_pointer_names() {
     let gateway = Gateway::new();
@@ -597,15 +596,15 @@ async fn a_method_settings_key_is_the_method_path_its_pointer_names() {
 
     // Rows span the method paths a client spells: a child resource, a nested one, the root
     // resource, the wildcard form, and the whole method path inside ONE token — which the
-    // service has to decode to read the method out of it, and which is then keyed exactly as
-    // the two-token spelling of that method is.
+    // service has to decode to read the method out of it, so that one is keyed as the method
+    // path `Stage$methodSettings` documents rather than by the token's own spelling.
     let rows: [(&str, &str); 5] = [
-        ("/~1pets/GET/metrics/enabled", "pets/GET"),
+        ("/~1pets/GET/metrics/enabled", "~1pets/GET"),
         (
             "/~1pets~1{petId}/DELETE/metrics/enabled",
-            "pets/{petId}/DELETE",
+            "~1pets~1{petId}/DELETE",
         ),
-        ("/~1/GET/metrics/enabled", "/GET"),
+        ("/~1/GET/metrics/enabled", "~1/GET"),
         ("/*/*/metrics/enabled", "*/*"),
         ("/~1pets~1POST/metricsEnabled", "pets/POST"),
     ];

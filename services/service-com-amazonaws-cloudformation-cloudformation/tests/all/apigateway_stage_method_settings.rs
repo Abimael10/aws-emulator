@@ -5,14 +5,15 @@
 //! METHOD PATH the declaration named it for.
 //!
 //! RULE under test: **a `MethodSettings` entry configures the method its `ResourcePath` and
-//! `HttpMethod` name, and `Stage$methodSettings` keys what it configured by that method path
-//! — "method paths defined as {resource_path}/{http_method} for an individual method
-//! override, or /\*/\* for overriding all methods in the stage" — whose resource half is the
-//! resource path WITHOUT the leading separator a resource path is stated with, every
-//! separator inside it literal, then a separator before the HTTP method. The key is
-//! therefore the one API Gateway reports for that method whichever way the declaration
-//! stated the path: `MethodSetting$ResourcePath` may state it already pointer-encoded, its
-//! initial slash included, or with its separators plain, and both state the one method.**
+//! `HttpMethod` name, and `Stage$methodSettings` keys what it configured by the method path
+//! the patch pointer the stack sends SPELLS — "method paths defined as
+//! {resource_path}/{http_method} for an individual method override, or /\*/\* for overriding
+//! all methods in the stage" with the resource half stated as the path NAME
+//! `MethodSetting$ResourcePath` documents ("the initial slash must include a forward slash",
+//! every separator inside it escaped `~1`). The key is therefore the one API Gateway reports
+//! for that method whichever way the declaration stated the path: `MethodSetting$ResourcePath`
+//! may state it already pointer-encoded, its initial slash included, or with its separators
+//! plain, and both state the one method.**
 //!
 //! Why it matters: a client reading per-method cache or logging settings off a
 //! CloudFormation-provisioned stage looks the method up. A stage that keyed the entry by the
@@ -51,25 +52,25 @@ const ROWS: &[Row] = &[
         case: "a child resource",
         resource_path: "/cached",
         http_method: "GET",
-        key: "cached/GET",
+        key: "~1cached/GET",
     },
     Row {
         case: "a nested resource path, stated plainly",
         resource_path: "/items/{id}",
         http_method: "PUT",
-        key: "items/{id}/PUT",
+        key: "~1items~1{id}/PUT",
     },
     Row {
         case: "a nested resource path, stated encoded as the type documents",
         resource_path: "/~1orders~1{id}",
         http_method: "DELETE",
-        key: "orders/{id}/DELETE",
+        key: "~1orders~1{id}/DELETE",
     },
     Row {
         case: "the root resource",
         resource_path: "/",
         http_method: "HEAD",
-        key: "/HEAD",
+        key: "~1/HEAD",
     },
     Row {
         case: "every method of the stage",

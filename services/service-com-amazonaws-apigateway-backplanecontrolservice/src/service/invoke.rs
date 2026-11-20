@@ -454,11 +454,6 @@ const WARNING_HEADER: &str = "warning";
 const IGNORED_CACHE_CONTROL_WARNING: &str =
     "199 Cache-control headers were ignored because the caller was unauthorized.";
 
-/// The `methodSettings` key that names EVERY method of a stage, which is the fallback for a
-/// method the stage holds no settings of its own for: `UpdateStage` keys a patch of
-/// `/*/*/…` under it.
-const EVERY_METHOD_SETTINGS_KEY: &str = "*/*";
-
 /// The mapping-expression prefix of a request HEADER, which is how both an authorizer's
 /// identity source and a method's request parameter name one.
 ///

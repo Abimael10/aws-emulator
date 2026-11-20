@@ -497,12 +497,8 @@ async fn front(
         // The method path a `methodSettings` entry is addressed by, in the spelling this row
         // uses: a resource path "begins with a '/'" (`Resource$path`), which a patch pointer
         // either escapes inside its own reference token (`~1`) or leaves to the pointer's own
-        // separator. Both name the one method.
-        let method_path = if caching.escaped_method_path {
-            format!("/~1{FRONT_PART}/GET")
-        } else {
-            format!("/{FRONT_PART}/GET")
-        };
+        // separator. Both name the one method, and each is keyed as it is spelled.
+        let method_path = method_patch_path(caching.escaped_method_path);
         apigw(
             router,
             "UpdateStage",
@@ -531,10 +527,14 @@ async fn front(
     let stage = settled_cluster(router, case, &api).await;
     let setting = stage
         .get("methodSettings")
-        // The key is the method path `Stage$methodSettings` documents: the resource path
-        // without the leading separator a resource path is stated with, every separator
-        // inside it literal, then a separator and the HTTP method.
-        .and_then(|settings| settings.get(format!("{FRONT_PART}/GET")))
+        // The key is the method path the patch POINTER spelled: its reference tokens before the
+        // setting, written exactly as the request wrote them, which is the pointer above with
+        // its own leading separator dropped.
+        .and_then(|settings| {
+            settings.get(method_settings_key(
+                caching.is_some_and(|caching| caching.escaped_method_path),
+            ))
+        })
         .cloned()
         .unwrap_or(Value::Null);
     match caching {
@@ -559,6 +559,29 @@ async fn front(
         ),
     }
     api
+}
+
+/// The patch POINTER a row addresses the front resource's `GET` settings by: the method path
+/// `/{resource_path}/{http_method}`, with the resource path's leading separator escaped `~1`
+/// into its own reference token or left to the pointer's own separator.
+fn method_patch_path(escaped: bool) -> String {
+    if escaped {
+        format!("/~1{FRONT_PART}/GET")
+    } else {
+        format!("/{FRONT_PART}/GET")
+    }
+}
+
+/// The `methodSettings` key the stage reports that method's settings under: the method path the
+/// pointer SPELLED, which is the pointer above without the leading separator a JSON Pointer
+/// opens with — so the escaped spelling keys `~1{resource}/GET` and the one that left that
+/// separator to the pointer keys `{resource}/GET`.
+fn method_settings_key(escaped: bool) -> String {
+    let pointer = method_patch_path(escaped);
+    pointer
+        .strip_prefix('/')
+        .map(str::to_string)
+        .unwrap_or(pointer)
 }
 
 /// `FlushStageCache` of the front stage, which "flushes a stage's cache".

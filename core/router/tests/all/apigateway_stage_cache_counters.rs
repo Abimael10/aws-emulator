@@ -650,23 +650,23 @@ async fn deployed_api(router: &MultiServiceRouter, name: &str) -> String {
     settled_cluster(router, name, &api).await;
 
     // The per-method settings, written through paths whose `{resourcePath}/{httpMethod}` tokens
-    // are FILLED IN with this api's own resource path and verb: the first request spells that
-    // resource path with its leading separator left to the pointer's own, the second escapes it
-    // into the first reference token — the two spellings a client writes the same method in,
-    // each in a request of its OWN, because one request carrying two spellings of one method is
-    // the duplicate-method-settings refusal rather than this rule. The method the settings say
-    // nothing about is named by no op at all, and no `/*/*` op is sent, so nothing of the stage
-    // stands in for it.
+    // are FILLED IN with this api's own resource path and verb, over two requests — each
+    // spelling that resource path the one way, with its leading separator escaped into the first
+    // reference token, because the `methodSettings` key is the method path the pointer SPELLED
+    // and a stage carrying one method under two spellings is one the service refuses to update
+    // (both rules pinned by the owning crate's own suites). The method the settings say nothing
+    // about is named by no op at all, and no `/*/*` op is sent, so nothing of the stage stands
+    // in for it.
     let escaped = CACHED_PATH.replace('/', "~1");
     apigw(
         router,
-        "the cached method's caching, unescaped",
+        "the cached method's caching",
         "PATCH",
         &format!("/restapis/{api}/stages/{LIVE}"),
         Some(json!({
             "patchOperations": [{
                 "op": "replace",
-                "path": format!("{CACHED_PATH}/{VERB}/caching/enabled"),
+                "path": format!("/{escaped}/{VERB}/caching/enabled"),
                 "value": "true",
             }],
         })),
@@ -675,7 +675,7 @@ async fn deployed_api(router: &MultiServiceRouter, name: &str) -> String {
     .await;
     let patched = apigw(
         router,
-        "the cached method's TTL and metrics, escaped",
+        "the cached method's TTL and metrics",
         "PATCH",
         &format!("/restapis/{api}/stages/{LIVE}"),
         Some(json!({
@@ -697,8 +697,8 @@ async fn deployed_api(router: &MultiServiceRouter, name: &str) -> String {
     .await;
 
     // What the second update answered, and what a later reader of the stage gets, are the same
-    // record: the one entry carries every setting those ops wrote — whichever spelling wrote it
-    // — and nothing of the method they never named.
+    // record: the one entry carries every setting those ops wrote, and nothing of the method
+    // they never named.
     for (case, stage) in [
         ("the second UpdateStage's own answer", patched),
         (

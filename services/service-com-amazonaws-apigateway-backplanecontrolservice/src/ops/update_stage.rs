@@ -7,7 +7,10 @@
 //!
 //! The whole list is applied to a COPY of the record and written back only once every op
 //! has succeeded, so a list carrying one unsupported op leaves the stored stage as it was
-//! rather than half-patched.
+//! rather than half-patched. The one refusal that is NOT a refusal of the request but of the
+//! stage the request LEAVES — the duplicate method settings [`duplicate_method_settings`]
+//! words — keeps what the list applied, which is how a stage comes to carry the two entries
+//! that sentence asks the caller to remove one of.
 //!
 //! Enabling, resizing or disabling the stage's cache cluster is a transition the CLOCK
 //! owes: the due instant is stored on the record (see [`crate::state::StageEntry`]) and
@@ -27,18 +30,21 @@
 //!
 //! Two paths of this surface are not a plain member of the `Stage` shape:
 //!
-//! * the per-method settings. A method-setting path is the TWO reference tokens naming
-//!   the method followed by the setting it writes (`/~1pets/GET/metrics/enabled`), while the
-//!   KEY the stage holds that method's settings under is the method path
-//!   `{resource_path}/{http_method}` or `*/*` as `Stage$methodSettings` documents, whose
-//!   resource half carries no leading separator and every separator inside it literal
-//!   (`pets/GET`) — the `~1` escape belongs to the POINTER. In the path that leading
-//!   separator is either escaped or left to the pointer's (`/pets/GET/…`, the
-//!   spelling `MethodSetting$ResourcePath` states a path in), and a pointer that escapes the
-//!   separator before the method too names the method in ONE token instead. Every one of
-//!   those spellings addresses the one method, so every one is keyed under the one
-//!   documented key — see [`apply_method_setting_patch`], [`METHOD_PATH_TOKENS`] and
-//!   [`crate::state::method_settings_key`].
+//! * the per-method settings. A method-setting path is the reference tokens naming the method
+//!   followed by the setting it writes (`/~1pets/GET/metrics/enabled`), and the KEY the stage
+//!   holds that method's settings under is the method path those leading tokens SPELL —
+//!   `{resource_path}/{http_method}` or `*/*` as `Stage$methodSettings` documents it, written
+//!   exactly as the request wrote it, so a client reads a setting back under the path it
+//!   patched. The resource half carries its separators escaped `~1` the way
+//!   `PatchOperation$path` requires of a path name (`~1pets/GET`), with its LEADING separator
+//!   either escaped too or left to the pointer's own (`//pets/GET/…`, the spelling
+//!   `MethodSetting$resourcePath` states a path in), and a pointer that escapes the separator
+//!   before the method too names the method in ONE token, which has to be DECODED to be read
+//!   at all and is keyed as the method path it decodes to (`pets/GET`). Two spellings of one
+//!   method are two entries, and a stage carrying both cannot be updated — see
+//!   [`apply_method_setting_patch`], [`method_path_spellings`], [`duplicate_method_settings`]
+//!   and [`crate::state::method_of_settings_key`], which is what a key DENOTES and what the
+//!   data plane resolves a served call's settings by.
 //! * a pointer that is no member of the `Stage` shape is read as such a method path, so
 //!   it is refused as one — see [`STAGE_INVALID_PATCH_PATH`].
 //! * `accessLogSettings` and `canarySettings`, structures whose own members are
@@ -136,10 +142,10 @@ use super::types::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::state::{
-    method_settings_key, patch_enum_string, patch_enum_string_refused_with, patch_f64_checked,
+    patch_enum_string, patch_enum_string_refused_with, patch_f64_checked,
     patch_f64_refused_with, patch_i32_refused_with,
-    patch_optional_string, patch_string_map, Patch, PatchFailure, PatchOpKind, StageEntry,
-    EVERY_RESOURCE, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
+    patch_optional_string, patch_string_map, same_method, Patch, PatchFailure, PatchOpKind,
+    StageEntry, EVERY_RESOURCE, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
 };
 
 // The `path` values `UpdateStage` accepts are the ones `apply_patch` below has an arm
@@ -329,9 +335,11 @@ fn patch_cache_ttl(current: &mut i32, patch: &Patch) -> Result<(), PatchFailure>
 /// Gateway answers every value either limit cannot take with this one sentence: entirely
 /// fixed text, naming neither the limit, nor the method-setting path the value arrived on,
 /// nor the value itself. The limits a stage's method setting takes are the ones
-/// [`crate::state::accepts_throttle_burst`] and [`crate::state::accepts_throttle_rate`]
-/// state: a count and a rate of requests, so neither can be negative and a rate has to be a
-/// finite number. API Gateway publishes DEFAULT account-level throttle limits that an
+/// [`crate::state::accepts_method_throttle_burst`] and
+/// [`crate::state::accepts_method_throttle_rate`] state: a count and a rate of requests, so a
+/// rate has to be a finite number and neither can be negative — except for the one value that
+/// asks for NO throttle on the method ([`crate::state::UNTHROTTLED_LIMIT`]), which API Gateway
+/// takes and reports back. API Gateway publishes DEFAULT account-level throttle limits that an
 /// account can have raised, so no maximum is a contract and only those rules are refusals.
 const INVALID_THROTTLING_SETTING: &str = "Invalid throttling setting";
 
@@ -956,28 +964,53 @@ const METHOD_SETTING_NAMES: &[(&str, &str)] = &[
 /// spells the resource path and the HTTP method separately: "method paths defined as
 /// {resource_path}/{http_method} for an individual method override, or /\*/\* for
 /// overriding all methods in the stage" (`Stage$methodSettings`), with every `/` INSIDE
-/// the resource path escaped `~1` in the POINTER the way a JSON Pointer requires — the KEY
-/// those tokens resolve to carrying no escape at all
-/// ([`crate::state::method_settings_key`]).
+/// the resource path escaped `~1` in the POINTER the way a JSON Pointer requires.
 const METHOD_PATH_TOKENS: usize = 2;
 
-/// The method a patch path names and the setting it writes, or `None` for a path that
-/// names no setting of a method.
+/// How many reference tokens name the method when the resource path's LEADING separator is
+/// the pointer's OWN rather than an escape (`//pets/GET/…` is `/` + `/pets` + `/GET`): that
+/// separator opens an empty first reference token, which belongs to the resource half, so the
+/// method path is one token longer. See [`method_path_spellings`].
+const PREFIXED_METHOD_PATH_TOKENS: usize = METHOD_PATH_TOKENS + 1;
+
+/// How many leading reference tokens of THIS pointer may name the method, in the order they
+/// are read.
+///
+/// A resource path "begins with a '/'" (`Resource$path`), and a pointer may leave that one
+/// leading separator to its own rather than escaping it — the spelling
+/// `MethodSetting$resourcePath` states a path in — which opens an EMPTY first reference token
+/// the resource half carries. The root resource is then named by the method path's two tokens
+/// (`//GET/…`) and every deeper resource path by three (`//pets/GET/…`), so both are read,
+/// the shorter one first. That leading separator is the only unescaped one a resource half may
+/// carry: every separator INSIDE the resource path is escaped `~1`, so no other pointer names
+/// a method in more than [`METHOD_PATH_TOKENS`] tokens.
+fn method_path_spellings(patch: &Patch) -> &'static [usize] {
+    if patch.tokens.first().is_some_and(String::is_empty) {
+        return &[METHOD_PATH_TOKENS, PREFIXED_METHOD_PATH_TOKENS];
+    }
+    &[METHOD_PATH_TOKENS]
+}
+
+/// The `methodSettings` key a patch path names and the setting it writes, or `None` for a
+/// path that names no setting of a method.
 ///
 /// A pointer spells the method in one of the two ways API Gateway reads:
 ///
-/// * as its own two reference tokens, `/{resource_path}/{http_method}/…` — the separator
+/// * as its own reference tokens, `/{resource_path}/{http_method}/…` — the separator
 ///   before the method is a real one and every separator INSIDE the resource path is
 ///   escaped, its leading one either escaped too (`/~1pets/GET/…`) or left to the pointer's
-///   own leading separator (`/pets/GET/…`, the spelling `MethodSetting$ResourcePath` states
-///   a path in) — and then the setting, in either spelling [`METHOD_SETTING_NAMES`] lists;
+///   own leading separator (`//pets/GET/…`, the spelling `MethodSetting$resourcePath` states
+///   a path in; see [`method_path_spellings`]) — and then the setting, in either spelling
+///   [`METHOD_SETTING_NAMES`] lists;
 /// * as ONE token carrying the whole method path, `/{escaped_method_path}/{setting}`, and
 ///   then the setting's own member name. That token has to be decoded for the method to be
-///   read out of it at all.
+///   read out of it at all, and what it decodes to IS the method path.
 ///
-/// Whichever spelling addressed it, the method is keyed under the ONE key
-/// `Stage$methodSettings` documents for it ([`crate::state::method_settings_key`]), so a
-/// stage holds one entry per method rather than one per spelling.
+/// The key is the method path the pointer SPELLED: the tokens before the setting, written
+/// exactly as the request wrote them ([`addressed_method_path`]) — which is the key API
+/// Gateway reports the entry under, so a client reads a setting back under the path it
+/// patched. Two pointers that spell one method differently therefore name two entries, and a
+/// stage cannot be updated while it carries both ([`duplicate_method_settings`]).
 ///
 /// A pointer that is neither — a one-token method path followed by a GROUPED setting name,
 /// a tail that names no setting, a path that stops at the method — names no setting of a
@@ -989,13 +1022,15 @@ const METHOD_PATH_TOKENS: usize = 2;
 /// pushes the verb into the tail, which then names no setting, and is refused by that
 /// question alone.
 fn method_setting(patch: &Patch) -> Option<(String, &'static str)> {
-    if let Some(tail) = patch
-        .tokens
-        .get(METHOD_PATH_TOKENS..)
-        .filter(|tail| !tail.is_empty())
-    {
-        if let Some(setting) = named_setting(&tail.join("/")) {
-            return Some((addressed_method_path(patch)?, setting));
+    for method_tokens in method_path_spellings(patch).iter().copied() {
+        if let Some(tail) = patch
+            .tokens
+            .get(method_tokens..)
+            .filter(|tail| !tail.is_empty())
+        {
+            if let Some(setting) = named_setting(&tail.join("/")) {
+                return Some((addressed_method_path(patch, method_tokens)?, setting));
+            }
         }
     }
     let [method_path, setting] = patch.tokens.as_slice() else {
@@ -1006,13 +1041,15 @@ fn method_setting(patch: &Patch) -> Option<(String, &'static str)> {
     // one token can match. The answer is the published name either way.
     let setting = named_setting(setting)?;
     // Decoded, that one token has to BE a method path: a resource path, and then the HTTP
-    // method after the `/` the escape stood for.
-    let (resource_path, http_method) = method_path.rsplit_once('/')?;
+    // method after the `/` the escape stood for. A token that had to be DECODED to be read at
+    // all is keyed by the method path it decodes to, as `Stage$methodSettings` documents one
+    // ([`crate::state::documented_method_path`]), rather than by the token's own spelling.
+    let (resource_path, _) = method_path.rsplit_once('/')?;
     if !names_a_resource(resource_path) {
         return None;
     }
     Some((
-        method_settings_key(resource_path, http_method),
+        crate::state::documented_method_path(method_path),
         setting,
     ))
 }
@@ -1044,16 +1081,27 @@ fn named_setting(tail: &str) -> Option<&'static str> {
     }
 }
 
-/// The `methodSettings` key the two leading reference TOKENS of this patch's path name: the
-/// resource path they spell and the HTTP method after it, keyed the one documented way
-/// ([`crate::state::method_settings_key`]) — so a resource path whose leading separator the
-/// pointer ate, and one that escaped it, name the same entry. `None` for a path carrying
-/// fewer tokens than a method path needs.
-fn addressed_method_path(patch: &Patch) -> Option<String> {
-    let [resource_path, http_method] = patch.tokens.get(..METHOD_PATH_TOKENS)? else {
-        return None;
-    };
-    Some(method_settings_key(resource_path, http_method))
+/// The `methodSettings` key the leading `method_tokens` reference TOKENS of this patch's path
+/// name: the method path AS THE POINTER SPELLED IT, each token exactly as the request wrote
+/// it. `None` for a path carrying fewer tokens than that.
+///
+/// The tokens are taken from the path itself rather than from `patch.tokens`, which is the
+/// same pointer DECODED: a key is what the pointer SAID (`~1pets/GET`), while the decoded
+/// tokens are what it MEANT (the resource path `/pets`, which is the method the key denotes —
+/// [`crate::state::method_of_settings_key`]).
+fn addressed_method_path(patch: &Patch, method_tokens: usize) -> Option<String> {
+    Some(written_tokens(patch).get(..method_tokens)?.join("/"))
+}
+
+/// This pointer's reference tokens as the REQUEST WROTE them, escapes and all: the path with
+/// its leading separator dropped, split on every separator, which is how a JSON Pointer is
+/// read apart before its tokens are decoded ([`crate::state::Patch`]).
+fn written_tokens(patch: &Patch) -> Vec<&str> {
+    patch
+        .path
+        .strip_prefix('/')
+        .map(|rest| rest.split('/').collect())
+        .unwrap_or_default()
 }
 
 /// The `BadRequestException` message API Gateway refuses a `remove` of a method setting
@@ -1068,6 +1116,26 @@ fn cannot_remove_method_setting(setting: &str) -> String {
         "Cannot remove method setting {setting} because there is no method setting for this \
          method "
     )
+}
+
+/// The key this stage holds the settings of the method `key` denotes under: `key` itself when
+/// the stage carries that entry, else the entry of the SAME method under another spelling.
+///
+/// A `remove` takes the settings of a METHOD away rather than those of a spelling — the
+/// sentence API Gateway refuses one it has nothing to take away with says exactly that
+/// ("there is no method setting for this method", [`cannot_remove_method_setting`]) — so a
+/// pointer that spells the method differently from the one that wrote the entry still names
+/// it. A WRITE keys the entry by its own spelling instead, which is what makes two spellings
+/// two entries.
+fn held_method_key(entry: &StageEntry, key: &str) -> Option<String> {
+    if entry.method_settings.contains_key(key) {
+        return Some(key.to_string());
+    }
+    entry
+        .method_settings
+        .keys()
+        .find(|held| same_method(held, key))
+        .cloned()
 }
 
 /// Take a method's settings away.
@@ -1089,13 +1157,16 @@ fn remove_method_setting(entry: &mut StageEntry, patch: &Patch) -> Result<(), Pa
     };
     let Some((key, setting)) = method_setting(patch) else {
         // The path names the method and nothing beyond it, so the whole entry goes —
-        // whichever spelling it addressed that method by, since every spelling resolves to
-        // the one key the stage holds it under. A path that names neither a setting of a
-        // method nor a method alone takes nothing away.
-        if patch.tokens.len() != METHOD_PATH_TOKENS {
-            return Err(refuse());
-        }
-        let key = addressed_method_path(patch).ok_or_else(refuse)?;
+        // whichever spelling it addressed that method by, since a `remove` names the method
+        // rather than the spelling ([`held_method_key`]). A path that names neither a setting
+        // of a method nor a method alone takes nothing away.
+        let key = method_path_spellings(patch)
+            .iter()
+            .copied()
+            .find(|tokens| *tokens == patch.tokens.len())
+            .and_then(|tokens| addressed_method_path(patch, tokens))
+            .and_then(|key| held_method_key(entry, &key))
+            .ok_or_else(refuse)?;
         return entry
             .method_settings
             .remove(&key)
@@ -1105,6 +1176,7 @@ fn remove_method_setting(entry: &mut StageEntry, patch: &Patch) -> Result<(), Pa
     // The value a setting nobody configured carries, so a setting that was removed reads
     // back exactly as it does on a method the patch never named.
     let unconfigured = default_method_setting();
+    let key = held_method_key(entry, &key).ok_or_else(refuse)?;
     let settings = entry.method_settings.get_mut(&key).ok_or_else(refuse)?;
     match setting {
         "metrics/enabled" => settings.metrics_enabled = unconfigured.metrics_enabled,
@@ -1134,6 +1206,49 @@ fn remove_method_setting(entry: &mut StageEntry, patch: &Patch) -> Result<(), Pa
         _ => return Err(patch.unsupported_path()),
     }
     Ok(())
+}
+
+/// The `BadRequestException` message API Gateway refuses an `UpdateStage` that would leave
+/// the stage with the SAME method configured under two different method-path spellings with.
+///
+/// A stage keys its per-method settings by the method path a pointer WROTE
+/// ([`method_setting`]), so two spellings of one method would be two entries whose settings
+/// contradict each other on that method: API Gateway refuses the whole update instead of
+/// folding them together or picking one, and asks the caller to take one of the two away. The
+/// only variable parts are the colliding method paths, comma-separated — the escaped spelling
+/// first ([`duplicate_method_paths`]) — the account the stage belongs to and the API the
+/// request addressed; the rest is the service's own fixed text.
+fn duplicate_method_settings(method_paths: &[String], rest_api_id: &str) -> String {
+    format!(
+        "Update Stage failed due to different method settings with the same resource path and \
+         http method. Please remove one of the duplicate method settings for method paths: {} \
+         for accountId: {} and restApiId: {rest_api_id}",
+        method_paths.join(", "),
+        ::emulator_server::emulator_account_id(),
+    )
+}
+
+/// The method paths of `entry` that DUPLICATE one another — two spellings naming the one
+/// method ([`crate::state::same_method`]) — and nothing when every method the stage carries
+/// settings for is named one way.
+///
+/// The colliding paths are reported in DESCENDING order, which is the order a recorded
+/// refusal of two spellings of one method prints them in: the resource half of a method path
+/// is a path NAME, whose separators are escaped `~1`, and `~` sorts after every character a
+/// path name carries, so the escaped spelling comes before one that left a separator literal.
+fn duplicate_method_paths(entry: &StageEntry) -> Vec<String> {
+    let keys: Vec<&str> = entry.method_settings.keys().map(String::as_str).collect();
+    let mut duplicates: Vec<String> = Vec::new();
+    for key in &keys {
+        let collides = keys
+            .iter()
+            .any(|other| other != key && same_method(other, key));
+        if collides && !duplicates.iter().any(|held| held == key) {
+            duplicates.push((*key).to_string());
+        }
+    }
+    duplicates.sort_by(|left, right| right.cmp(left));
+    duplicates
 }
 
 /// Apply one patch addressed as a METHOD path:
@@ -1191,13 +1306,13 @@ fn apply_method_setting_patch(
         "throttling/burstLimit" => patch_i32_refused_with(
             &mut settings.throttling_burst_limit,
             &nested,
-            crate::state::accepts_throttle_burst,
+            crate::state::accepts_method_throttle_burst,
             || INVALID_THROTTLING_SETTING.to_string(),
         ),
         "throttling/rateLimit" => patch_f64_refused_with(
             &mut settings.throttling_rate_limit,
             &nested,
-            crate::state::accepts_throttle_rate,
+            crate::state::accepts_method_throttle_rate,
             || INVALID_THROTTLING_SETTING.to_string(),
         ),
         "caching/enabled" => patch_stage_bool(&mut settings.caching_enabled, &nested),
@@ -1312,7 +1427,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // stage.
             //
             // Patched on a COPY: a list whose later op is refused leaves the stored stage
-            // untouched, rather than keeping the ops before it.
+            // untouched, rather than keeping the ops before it. The one refusal that is not
+            // of the REQUEST but of the stage the request leaves — the duplicate method
+            // settings below — keeps what the list applied, which is how a stage comes to
+            // carry two spellings of one method at all.
             let (api, stage) = store
                 .api_and_stage(&input.rest_api_id, &input.stage_name)
                 .map_err(|message| {
@@ -1345,6 +1463,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             for patch in &patches {
                 apply_patch(&mut updated, patch, &context).map_err(patch_failure)?;
+            }
+            // The stage this patch list LEAVES: one method's settings under two spellings of
+            // its method path, which a stage cannot be updated while it carries — see
+            // [`duplicate_method_settings`]. Judged on the whole list's result, so a list
+            // that spells a method twice and then takes one of the two away leaves no
+            // duplicate and is applied; what it leaves STAYS, which is what gives the caller
+            // the two entries the sentence asks it to remove one of, and what makes every
+            // later update of this stage answer the same sentence until one of them is gone.
+            //
+            // A refused update is no successful update: it moves `lastUpdatedDate` no more
+            // than it reports a stage, and it publishes no execution log group — the stage's
+            // own group is published by the update that is ANSWERED with the configuration
+            // ([`provisioned_execution_log_group`]), which is the next one this stage takes.
+            let duplicates = duplicate_method_paths(&updated);
+            if !duplicates.is_empty() {
+                let message = duplicate_method_settings(&duplicates, &input.rest_api_id);
+                let api = store
+                    .rest_apis
+                    .get_mut(&input.rest_api_id)
+                    .ok_or_else(crate::state::state_unavailable)?;
+                api.stages.insert(input.stage_name.clone(), updated);
+                return Err(patch_failure(PatchFailure::BadRequest(message)));
             }
             // A successful patch is when the record last changed. An empty list changes
             // nothing, so it moves nothing.
