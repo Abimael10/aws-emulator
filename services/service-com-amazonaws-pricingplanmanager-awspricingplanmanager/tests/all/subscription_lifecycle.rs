@@ -400,8 +400,6 @@ async fn update_applies_an_upgrade_now_and_schedules_a_downgrade() {
         Case { from: "FREE", to: "PREMIUM", usage_level: Some("LEVEL_3"), downgrade: false },
         // Same tier: no rank change, so it is applied immediately.
         Case { from: "PRO", to: "PRO", usage_level: Some("LEVEL_2"), downgrade: false },
-        // A tier outside the published ladder cannot be ranked, so it is applied now.
-        Case { from: "PRO", to: "CUSTOM", usage_level: None, downgrade: false },
         // Downgrades, including the step down to the bottom of the ladder.
         Case { from: "PREMIUM", to: "BUSINESS", usage_level: None, downgrade: true },
         Case { from: "BUSINESS", to: "PRO", usage_level: Some("DEFAULT"), downgrade: true },
@@ -1602,12 +1600,9 @@ async fn a_resource_the_tier_does_not_cover_is_refused_on_create_and_on_associat
             named: vec![key_value_store("kvs-premium")],
             ineligible: Vec::new(),
         },
-        Case {
-            label: "a KeyValueStore on a tier the service docs do not publish",
-            tier: "ENTERPRISE",
-            named: vec![key_value_store("kvs-unpublished")],
-            ineligible: Vec::new(),
-        },
+        // A tier the plan does not sell gets no further than the plan-catalogue gate
+        // (`subscription_refusal_surface`'s rule 5), so there is no eligibility row for one:
+        // the rows above are every tier this plan offers.
     ];
 
     let router = router();
@@ -2043,23 +2038,94 @@ async fn adding_a_resource_the_subscription_already_covers_is_refused() {
     }
 }
 
-/// The operations this slice does not implement still answer 501, so a client can tell
-/// "not written yet" from an empty success.
+/// Every operation that takes a subscription ARN is SERVED, and each answers its own
+/// modelled outcome rather than the scaffold's 501: an association and a disassociation of
+/// a resource no plan family requires are served 200 and land on the stored set, and a
+/// `CancelSubscriptionChange` against a subscription carrying no change is the modelled
+/// conflict.
+///
+/// Each row runs on its OWN subject with that subject's current tag, so no row's answer
+/// depends on what the row before it left behind.
 #[tokio::test]
-async fn the_operations_outside_this_slice_still_answer_501() {
+async fn the_resource_and_change_operations_are_served() {
+    // (operation, the body it takes beyond the ARN, the status and error code it earns, the
+    // set its subject starts with and the set the subscription must include afterwards)
+    struct Case {
+        operation: &'static str,
+        resources: Option<Vec<String>>,
+        status: u16,
+        code: Option<&'static str>,
+        held: Vec<String>,
+        included: Vec<String>,
+    }
+
+    let pair = vec![distribution("E1EXAMPLE"), web_acl("acl-one")];
+    let with_zone = vec![
+        distribution("E1EXAMPLE"),
+        web_acl("acl-one"),
+        hosted_zone("Z1EXAMPLE"),
+    ];
+    let cases = vec![
+        Case {
+            operation: "AssociateResourcesToSubscription",
+            resources: Some(vec![hosted_zone("Z1EXAMPLE")]),
+            status: 200,
+            code: None,
+            held: pair.clone(),
+            included: with_zone.clone(),
+        },
+        Case {
+            operation: "DisassociateResourcesFromSubscription",
+            resources: Some(vec![hosted_zone("Z1EXAMPLE")]),
+            status: 200,
+            code: None,
+            held: with_zone.clone(),
+            included: pair.clone(),
+        },
+        Case {
+            operation: "CancelSubscriptionChange",
+            resources: None,
+            status: 409,
+            code: Some("ConflictException"),
+            held: with_zone.clone(),
+            included: with_zone.clone(),
+        },
+    ];
+
     let router = router();
-    let created = create(&router, create_body("CloudFront", "PRO", 1, Some("IMMEDIATE"))).await;
-    let arn = created.string("arn");
-    let etag = created.require_etag("stubs");
+    for case in &cases {
+        let operation = case.operation;
+        let created = create(
+            &router,
+            create_body_naming("CloudFront", "PRO", &case.held, Some("IMMEDIATE")),
+        )
+        .await;
+        let arn = created.string("arn");
+        let etag = created.require_etag(operation);
 
-    let cases = [("CancelSubscriptionChange", json!({"arn": arn.clone()}))];
-
-    for (operation, body) in &cases {
-        let answer = call(&router, operation, body.clone(), Some(&etag)).await;
+        let mut body = json!({"arn": arn.clone()});
+        if let Some(resources) = case.resources.as_ref() {
+            body["resourceArns"] = json!(resources);
+        }
+        let answer = call(&router, operation, body, Some(&etag)).await;
         assert_eq!(
-            answer.status, 501,
-            "case {operation}: an unimplemented operation answers 501, got {} {:?}",
-            answer.status, answer.body
+            answer.status, case.status,
+            "case {operation}: expected HTTP {}, got {} {:?}",
+            case.status, answer.status, answer.body
+        );
+        assert_eq!(
+            answer.error_code.as_deref(),
+            case.code,
+            "case {operation}: unexpected error class for {:?}",
+            answer.body
+        );
+
+        let fetched = call(&router, "GetSubscription", json!({"arn": arn}), None).await;
+        assert_eq!(
+            fetched.body["resourceArns"],
+            json!(case.included),
+            "case {operation}: unexpected stored set, got {:?}",
+            fetched.body
         );
     }
 }
@@ -2843,4 +2909,124 @@ async fn a_resource_change_is_refused_while_another_change_is_pending() {
         "case {case:?}: the second removal must take the named resource off, got {:?}",
         admitted.body["resourceArns"]
     );
+}
+
+// ---------------------------------------------------------------------------
+// CancelSubscriptionChange
+// ---------------------------------------------------------------------------
+
+/// `CancelSubscriptionChange` drops the pending change, leaving the subscription in the
+/// state it was in before the change was scheduled; a subscription carrying no change has
+/// nothing to cancel.
+///
+/// The rows differ along which change is pending. The effective instant a row depends on is
+/// WRITTEN into the store the handler reads, so no row depends on when the suite runs.
+#[tokio::test]
+async fn a_pending_change_is_cancelled_and_the_subscription_is_as_it_was() {
+    /// One row: the case, the operation that schedules the change, and the body it takes.
+    type ScheduleRow = (&'static str, &'static str, fn(&str) -> Value);
+
+    let cases: [ScheduleRow; 2] = [
+        (
+            "a pending downgrade",
+            "UpdateSubscription",
+            |arn| json!({"arn": arn, "planTier": "FREE"}),
+        ),
+        (
+            "a pending cancellation",
+            "CancelSubscription",
+            |arn| json!({"arn": arn}),
+        ),
+    ];
+
+    for (label, operation, body) in cases {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let router = router_on(Arc::clone(&engine));
+        let created = create(
+            &router,
+            create_body("CloudFront", "PREMIUM", 1, Some("IMMEDIATE")),
+        )
+        .await;
+        let arn = created.string("arn");
+        let etag = created.require_etag(label);
+
+        // Nothing is pending, so there is nothing to cancel.
+        let nothing = call(
+            &router,
+            "CancelSubscriptionChange",
+            json!({"arn": arn.clone()}),
+            Some(&etag),
+        )
+        .await;
+        assert_eq!(
+            nothing.status, 409,
+            "case {label}: a subscription with no pending change must answer 409, got {} {:?}",
+            nothing.status, nothing.body
+        );
+        assert_eq!(
+            nothing.error_code.as_deref(),
+            Some("ConflictException"),
+            "case {label}: unexpected error code for {:?}",
+            nothing.body
+        );
+
+        let scheduled = call(&router, operation, body(&arn), Some(&etag)).await;
+        assert_eq!(
+            scheduled.status, 200,
+            "case {label}: {operation} must schedule the change, got {} {:?}",
+            scheduled.status, scheduled.body
+        );
+        let scheduled_etag = scheduled.require_etag(label);
+
+        // Well clear of the processing window, so the change is still the caller's to
+        // cancel. The instant is written rather than waited for.
+        {
+            let state = engine.state::<ServiceState>();
+            let mut store = state.lock();
+            let record = store
+                .subscriptions
+                .get_mut(&arn)
+                .expect("the subscription is stored");
+            let change = record
+                .scheduled_change
+                .as_mut()
+                .expect("the pending change is stored");
+            change.effective_date = parse_date_time("2099-01-01T00:00:00Z");
+        }
+
+        let cancelled = call(
+            &router,
+            "CancelSubscriptionChange",
+            json!({"arn": arn.clone()}),
+            Some(&scheduled_etag),
+        )
+        .await;
+        assert_eq!(
+            cancelled.status, 200,
+            "case {label}: the pending change must be cancellable, got {} {:?}",
+            cancelled.status, cancelled.body
+        );
+        assert!(
+            cancelled.body.get("scheduledChange").is_none(),
+            "case {label}: the change must be gone, got {:?}",
+            cancelled.body
+        );
+
+        let fetched = call(&router, "GetSubscription", json!({"arn": arn}), None).await;
+        assert_eq!(
+            fetched.body, cancelled.body,
+            "case {label}: GetSubscription must agree with CancelSubscriptionChange"
+        );
+        assert_eq!(
+            (fetched.string("planTier"), fetched.string("status")),
+            ("PREMIUM".to_string(), "ACTIVE".to_string()),
+            "case {label}: the subscription must be as it was before the change, got {:?}",
+            fetched.body
+        );
+        assert_ne!(
+            fetched.require_etag(label),
+            scheduled_etag,
+            "case {label}: dropping the change is a write, so the ETag moves"
+        );
+    }
 }

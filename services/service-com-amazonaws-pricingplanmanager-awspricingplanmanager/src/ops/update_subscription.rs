@@ -214,6 +214,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        // The tier a subscription moves to has to be one the plan it is on OFFERS: the
+        // new tier is a plain string, so the boundary validator cannot have narrowed it,
+        // and a tier the plan does not sell is the same business rule failure
+        // `CreateSubscription` refuses. The plan comes from the record, because the tier
+        // is a level of the plan the subscription is already on — and a record whose own
+        // family is not on offer is refused here too rather than accepting any tier: no
+        // plan means no tier to resolve within it, and `CreateSubscription` stores no such
+        // record in the first place.
+        if let Err(refusal) = crate::state::resolve_plan(&record.plan_family, &plan_tier) {
+            return Err(UpdateSubscriptionErrorModeled::ValidationException(refusal).into());
+        }
+
         // "You cannot update a subscription while a scheduled change is pending. To make
         // a new change, first cancel the pending change using CancelSubscriptionChange."
         if record.scheduled_change.is_some() {

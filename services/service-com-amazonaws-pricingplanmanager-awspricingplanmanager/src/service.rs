@@ -39,14 +39,22 @@
 //! member of this model declares `@timestampFormat("date-time")`, so the service returns
 //! the shared `date-time` `restJson1` codec from it. See the method's own note.
 //!
+//! `override_operation` is taken too, and NOT to re-route: the three operations whose
+//! input declares a bounded collection member are served through the tree's shared
+//! collection-quoting pass, so a `@length` clause about one states the collection the
+//! request carried rather than a summary of its size. The value that clause needs can only
+//! be read from the request, which `override_refusal` is never handed; which operations pay
+//! for the pass, and the one fact this service states about its clauses, are in
+//! [`constraint_refusal`].
+//!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
-};
+mod constraint_refusal;
+
+use smithy_server_runtime::{http, ErasedOperation, OperationRoutingTable, Refusal, Refused, Service};
 use std::sync::Arc;
 
 /// The `com-amazonaws-pricingplanmanager-awspricingplanmanager` emulated service: the generated [`ServiceDefinition`] plus
@@ -59,6 +67,11 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// This service's wire protocol, built ONCE here because
     /// [`Service::override_protocol`] hands back a borrow of it.
     protocol: service_common::date_time_json::DateTimeRestJson,
+    /// The operations served through the shared collection-quoting pass
+    /// ([`constraint_refusal::routing_table`]), keyed by the routing key the protocol
+    /// resolves — the key the generated table uses — and built from the SAME shared engine,
+    /// so a wrapped operation reads and writes the one store.
+    stated: OperationRoutingTable,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -67,6 +80,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
+            stated: constraint_refusal::routing_table(&engine),
             entry: crate::ServiceDefinition::new(engine),
             protocol: service_common::date_time_json::DateTimeRestJson::new(),
         }
@@ -95,24 +109,30 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // NOT a re-route: the key is the one the generated table's own protocol resolves,
+        // and the operation it names is the one served — through the shared
+        // collection-quoting pass for the operations [`constraint_refusal`] files there. A
+        // key that table does not hold (every operation taking scalars only) resolves to
+        // `None` here and is served by the generated table exactly as before, which is also
+        // what a key the model does not name answers, so the router's routing-error path is
+        // unchanged.
+        let key = self
+            .entry
+            .wire_protocol(req)
+            .protocol()
+            .routing_key(req)
+            .ok()?;
+        self.stated.get(key)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
+        // The centralized walk calls this on a framework-level refusal (an absent required
+        // member, or a value outside a declared bound) to let this service reword it. It is
+        // handed the violations ALONE — no request — so it cannot state the COLLECTION a
+        // `@length` clause quotes; the shared pass [`constraint_refusal`] files the
+        // collection-bearing operations through answers their refusals before this walk is
+        // reached, with the request in hand. A refusal that gets here anyway keeps the
+        // framework's own wording, which states the same envelope, code and requirement.
         let _ = refusal;
         None
     }

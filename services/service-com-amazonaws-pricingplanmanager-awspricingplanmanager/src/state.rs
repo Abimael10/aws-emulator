@@ -24,12 +24,20 @@ use crate::ops::types::{
 /// holds, so it lives on its own.
 pub mod resource_eligibility;
 
+/// Which plans this service offers, and how it refuses a request for one it does not.
+pub mod plan_catalog;
+
 /// Which resource set a stored subscription may hold, and how a change to it is refused —
 /// a rule about this service's own record, shared by every operation that changes the set.
 pub mod subscription_resources;
 
 pub use resource_eligibility::{
     ineligible_resources, ineligible_resources_message, CLOUDFRONT_PLAN_FAMILY,
+};
+
+pub use plan_catalog::{
+    invalid_plan_name, invalid_plan_tier, resolve as resolve_plan, Plan, CLOUDFRONT_PLAN_CODE,
+    PLAN_CATALOG, ROUTE_53_PLAN_CODE, ROUTE_53_PLAN_FAMILY,
 };
 
 pub use subscription_resources::{

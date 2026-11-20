@@ -196,6 +196,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             client_token,
         } = input;
 
+        // What the request asks to subscribe to has to be a plan this service OFFERS:
+        // the family first, then the tier within that family's plan. Both members are
+        // plain strings, so the boundary validator cannot have narrowed them, and a plan
+        // that is not on offer is a business rule failure rather than a resource that is
+        // missing. The gate runs before anything is read or written, so a refused call
+        // leaves no subscription behind.
+        if let Err(refusal) = crate::state::resolve_plan(&plan_family, &plan_tier) {
+            return Err(CreateSubscriptionErrorModeled::ValidationException(refusal).into());
+        }
+
         // `approvalMode` targets an enum shape, so the boundary validator has already
         // refused any value the model does not declare; this arm only guards against a
         // value that got past it.

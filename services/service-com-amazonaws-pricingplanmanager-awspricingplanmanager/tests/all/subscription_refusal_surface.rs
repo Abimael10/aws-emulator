@@ -25,6 +25,11 @@
 //! 4. A `nextToken` this service did not issue is HTTP 400 `ValidationException` with
 //!    `The nextToken provided is invalid.` — a sentence naming no value from the request,
 //!    because the token is opaque — while a token a page did issue is still accepted.
+//! 5. A subscription is only ever to a plan this service OFFERS: a `planFamily` no plan is
+//!    offered for is HTTP 400 `ValidationException` with `Invalid plan name: <planFamily>`,
+//!    and a `planTier` the resolved plan does not sell is
+//!    `Invalid plan tier "<planTier>" for the plan "<plan code>"` — both decided before
+//!    anything is stored, so a refused create leaves no subscription behind.
 //!
 //! The HTTP harness is `subscription_wire_form`'s, so this file adds no second copy of it.
 
@@ -32,7 +37,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_pricingplanmanager_awspricingplanmanager::state::{
-    encode_page_token, LIST_PAGE_SIZE, PLAN_TIERS_ASCENDING,
+    encode_page_token, CLOUDFRONT_PLAN_CODE, LIST_PAGE_SIZE, PLAN_CATALOG, PLAN_TIERS_ASCENDING,
+    ROUTE_53_PLAN_CODE,
 };
 
 use super::subscription_wire_form::{call, create, create_body, router, Answer};
@@ -51,12 +57,13 @@ struct ArnOperation {
     approval: Option<&'static str>,
 }
 
-/// Every implemented operation whose input carries a `SubscriptionArn` and needs nothing
-/// of the subject beyond its ARN and its tag. The two remaining ARN-taking operations are
-/// still 501 scaffolds owned by their own stub issues, so they publish no refusal surface
-/// yet, and `DisassociateResourcesFromSubscription` needs a subject that holds a removable
-/// resource, so it carries these same three rules in the `subscription_lifecycle` suite
-/// beside its own rows.
+/// Every implemented operation whose input carries a `SubscriptionArn` and whose success
+/// path a freshly created subscription satisfies, so one table can carry all four rules.
+/// The two remaining ARN-taking operations need a subject of their own — a pending change
+/// to cancel, a removable resource to drop — so rules 1 and 2 reach them through
+/// [`the_remaining_arn_taking_operations_share_the_gate`] here, and
+/// `DisassociateResourcesFromSubscription` carries the rest beside its own rows in the
+/// `subscription_lifecycle` suite.
 const ARN_OPERATIONS: &[ArnOperation] = &[
     ArnOperation {
         name: "GetSubscription",
@@ -81,6 +88,34 @@ const ARN_OPERATIONS: &[ArnOperation] = &[
         extra: || json!({}),
         if_match: Some("1"),
         approval: Some("MANUAL"),
+    },
+    ArnOperation {
+        name: "AssociateResourcesToSubscription",
+        extra: || json!({"resourceArns": [HOSTED_ZONE]}),
+        if_match: Some("1"),
+        approval: Some("IMMEDIATE"),
+    },
+];
+
+/// A resource of no plan family's required kind, so associating it with a subject of any
+/// family is a change that family allows.
+const HOSTED_ZONE: &str = "arn:aws:route53:::hostedzone/Z1EXAMPLE1EXAMPLE";
+
+/// The ARN-taking operations outside [`ARN_OPERATIONS`]: both mutate something a fresh
+/// subscription does not have, so only the two gates that are decided before the store is
+/// consulted are asserted for them.
+const SUBJECT_BOUND_ARN_OPERATIONS: &[ArnOperation] = &[
+    ArnOperation {
+        name: "CancelSubscriptionChange",
+        extra: || json!({}),
+        if_match: Some("1"),
+        approval: Some("IMMEDIATE"),
+    },
+    ArnOperation {
+        name: "DisassociateResourcesFromSubscription",
+        extra: || json!({"resourceArns": [HOSTED_ZONE]}),
+        if_match: Some("1"),
+        approval: Some("IMMEDIATE"),
     },
 ];
 
@@ -456,4 +491,193 @@ async fn a_token_a_page_issued_is_still_accepted() {
         "case \"issued cursor\": a token a page issued must be accepted, got {} {:?}",
         second.status, second.body
     );
+}
+
+/// Rules 1 and 2 reach the two ARN-taking operations whose success path needs a subject of
+/// its own: both are decided from the ARN alone, before the store is consulted, so they
+/// hold for every operation that takes one and not only for the ones a fresh subscription
+/// satisfies.
+#[tokio::test]
+async fn the_remaining_arn_taking_operations_share_the_gate() {
+    // (case, the ARN, the status and code it must be refused with)
+    let subjects = vec![
+        (
+            "a value that is no ARN",
+            "not-an-arn".to_string(),
+            400,
+            "ValidationException",
+        ),
+        (
+            "an id this service never issues",
+            format!("arn:aws:pricingplanmanager::{ACCOUNT}:subscription/does-not-exist"),
+            400,
+            "ValidationException",
+        ),
+        (
+            "another resource type of this service",
+            format!("arn:aws:pricingplanmanager::{ACCOUNT}:plan:sub_abc123"),
+            400,
+            "ValidationException",
+        ),
+        (
+            "a well-formed ARN naming nothing",
+            format!("arn:aws:pricingplanmanager::{ACCOUNT}:subscription:sub_absent0000000001"),
+            404,
+            "ResourceNotFoundException",
+        ),
+        (
+            "a well-formed ARN of the minted form naming nothing",
+            format!(
+                "arn:aws:pricingplanmanager:us-west-2:{ACCOUNT}:subscription/01234567-89ab-cdef-0123-456789abcdef"
+            ),
+            404,
+            "ResourceNotFoundException",
+        ),
+    ];
+
+    let router = router();
+    for (label, arn, status, code) in &subjects {
+        for operation in SUBJECT_BOUND_ARN_OPERATIONS {
+            let case = format!("{}/{label}", operation.name);
+            let refused = call_with_arn(&router, operation, arn).await;
+            assert_eq!(
+                refused.status, *status,
+                "case {case}: expected HTTP {status}, got {} {:?}",
+                refused.status, refused.body
+            );
+            assert_eq!(
+                refused.error_code.as_deref(),
+                Some(*code),
+                "case {case}: unexpected error code for {:?}",
+                refused.body
+            );
+            if *status == 400 {
+                assert_eq!(
+                    refused.message(&case),
+                    format!("Invalid subscription ARN: {arn}"),
+                    "case {case}: unexpected message for {:?}",
+                    refused.body
+                );
+            }
+        }
+    }
+}
+
+/// Rule 5: a `CreateSubscription` naming a plan this service does not offer is refused with
+/// AWS's sentence for the half that failed, and stores nothing.
+///
+/// The rows differ along which half is wrong, the family (both the catalogue's, in the
+/// published spelling and in another case), the plan the tier refusal names, and the shape
+/// of the rejected value.
+#[tokio::test]
+async fn a_plan_the_service_does_not_offer_is_refused() {
+    // (case, planFamily, planTier, the message the refusal states)
+    let rows = [
+        (
+            "a family no plan is offered for",
+            "NotARealPlanFamily",
+            "PRO",
+            "Invalid plan name: NotARealPlanFamily".to_string(),
+        ),
+        (
+            "another AWS service's name",
+            "DynamoDB",
+            "FREE",
+            "Invalid plan name: DynamoDB".to_string(),
+        ),
+        (
+            "an empty family",
+            "",
+            "PRO",
+            "Invalid plan name: ".to_string(),
+        ),
+        (
+            "a tier the CloudFront plan does not sell",
+            "CloudFront",
+            "NotARealPlanTier",
+            format!("Invalid plan tier \"NotARealPlanTier\" for the plan \"{CLOUDFRONT_PLAN_CODE}\""),
+        ),
+        (
+            "a tier of the wrong case",
+            "CloudFront",
+            "premium",
+            format!("Invalid plan tier \"premium\" for the plan \"{CLOUDFRONT_PLAN_CODE}\""),
+        ),
+        (
+            "the family in lower case, with a tier nothing sells",
+            "cloudfront",
+            "ENTERPRISE",
+            format!("Invalid plan tier \"ENTERPRISE\" for the plan \"{CLOUDFRONT_PLAN_CODE}\""),
+        ),
+        (
+            "a tier the Route 53 plan does not sell",
+            "Route53",
+            "CUSTOM",
+            format!("Invalid plan tier \"CUSTOM\" for the plan \"{ROUTE_53_PLAN_CODE}\""),
+        ),
+        (
+            "an empty tier on the Route 53 plan",
+            "ROUTE53",
+            "",
+            format!("Invalid plan tier \"\" for the plan \"{ROUTE_53_PLAN_CODE}\""),
+        ),
+    ];
+
+    let router = router();
+    for (case, family, tier, expected) in &rows {
+        let refused = call(
+            &router,
+            "CreateSubscription",
+            create_body(family, tier, 1, None, Some("IMMEDIATE")),
+            None,
+        )
+        .await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: a plan not on offer must be refused 400, got {} {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_code.as_deref(),
+            Some("ValidationException"),
+            "case {case:?}: unexpected error code for {:?}",
+            refused.body
+        );
+        assert_eq!(
+            &refused.message(case),
+            expected,
+            "case {case:?}: unexpected message"
+        );
+
+        let listed = call(&router, "ListSubscriptions", json!({}), None).await;
+        assert_eq!(
+            listed.body["subscriptionSummaries"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or_default(),
+            0,
+            "case {case:?}: a refused create must leave no subscription behind, got {:?}",
+            listed.body
+        );
+    }
+
+    // Every plan the catalogue DOES offer, at every tier it sells, is still served: the
+    // rows above refuse what is not on offer and nothing else.
+    for plan in PLAN_CATALOG {
+        for tier in plan.tiers {
+            let case = format!("{}/{tier}", plan.family);
+            let created = call(
+                &router,
+                "CreateSubscription",
+                create_body(plan.family, tier, 1, None, Some("IMMEDIATE")),
+                None,
+            )
+            .await;
+            assert_eq!(
+                created.status, 200,
+                "case {case}: an offered plan must be served, got {} {:?}",
+                created.status, created.body
+            );
+        }
+    }
 }

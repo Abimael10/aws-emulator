@@ -127,9 +127,9 @@ const ROWS: &[Row] = &[
         mutations: 11,
     },
     Row {
-        label: "tier the docs do not publish",
+        label: "the bottom of the published tier ladder",
         family: "CloudFront",
-        tier: "ENTERPRISE",
+        tier: "FREE",
         resources: 1,
         usage_level: None,
         approval: Some("IMMEDIATE"),

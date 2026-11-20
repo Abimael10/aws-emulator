@@ -433,7 +433,16 @@ pub fn quoting_refusal<Op: Operation>(
     req: &RtRequest,
     stated: &StatedClause,
 ) -> Option<RtResponse> {
-    let refusing = refusing_violations_with_mapped_echoes::<Op>(svc.definition().protocol(), req).0;
+    // The codec the request is SERVED in, resolved the way the framework's own dispatch
+    // resolves it: the author's `override_protocol` when the service replaces the
+    // model-derived one, else the definition's (the same resolution
+    // [`crate::front_door`] makes). A pass that read the request with a different codec
+    // from the operation behind it would find a different violation set — or none at all,
+    // for a service whose own codec is what reads its bodies.
+    let protocol = svc
+        .override_protocol()
+        .unwrap_or_else(|| svc.definition().protocol());
+    let refusing = refusing_violations_with_mapped_echoes::<Op>(protocol, req).0;
     let mut restated_a_clause = false;
     // The request's own maps, read at most once per member whatever the clause count.
     let mut submitted = SubmittedMaps::of(req);
@@ -549,7 +558,15 @@ fn map_value_clause<Op: Operation>(
 ///
 /// Two entries of one map earn the SAME clause — it names the member, the whole map and the
 /// whole set — so a renderer stating the clauses once per distinct text states one
-/// validation error for one offending map.
+/// validation error for one offending map. That is also why the clause is BUILT once per
+/// map member here and reused for every further violation under it
+/// ([`member_clause`]): the walk can report one violation per ENTRY of an offending map, so
+/// rendering the whole map inside the per-violation loop would be work one request chooses
+/// twice over — in its body's length and in its entry count. With the clause built per
+/// member, the renderings one refusal performs are bounded by the map members it names (at
+/// most [`MAX_PARSED_PATHS`], the same bound that caps the parses) and the clauses it
+/// returns by [`crate::validation::MAX_VIOLATIONS`], the ceiling the framework's own walk
+/// collects under.
 #[must_use]
 pub fn stated_map_value_clauses(
     violations: &[Violation],
@@ -559,23 +576,87 @@ pub fn stated_map_value_clauses(
     order: MapEntryOrder,
 ) -> HashMap<String, String> {
     let mut submitted = SubmittedMaps::of(req);
-    violations
-        .iter()
-        .filter_map(|violation| {
-            let (_, clause) =
-                stated_map_value_clause(violation, &mut submitted, input_schemas, pattern, order)?;
-            Some((violation.path.clone(), clause))
-        })
-        .collect()
+    // What each map member earns, built the first time a violation names it — the NEGATIVE
+    // answer included, so a member no clause can be stated at is decided once too.
+    let mut stated: HashMap<String, Option<MemberClause>> = HashMap::new();
+    let mut clauses: HashMap<String, String> = HashMap::new();
+    for violation in violations.iter().take(crate::validation::MAX_VIOLATIONS) {
+        // A violation the walk marked `@sensitive` earns none: such a member is one the
+        // service never discloses, so the map it sat in is quoted nowhere — the clause that
+        // states no value at all is the framework's own, which this leaves in place.
+        if violation.sensitive {
+            continue;
+        }
+        let Some((member, key)) = entry_of(&violation.path) else {
+            continue;
+        };
+        if !stated.contains_key(member) {
+            let built = member_clause(member, &mut submitted, input_schemas, pattern, order);
+            stated.insert(member.to_string(), built);
+        }
+        let Some(Some(member_clause)) = stated.get(member) else {
+            continue;
+        };
+        // The key half stays per violation: a clause is stated only for an entry the
+        // REQUEST carried under that member, which is a set lookup rather than a scan of
+        // the map once per violation.
+        if member_clause.keys.contains(key) {
+            clauses.insert(violation.path.clone(), member_clause.clause.clone());
+        }
+    }
+    clauses
+}
+
+/// What one MAP member earns: the clause stated at it, and the keys the request carried
+/// under it — which is what decides whether a violation reported below that member belongs
+/// to an entry the request actually sent.
+struct MemberClause {
+    /// The clause, identical for every violation under this member.
+    clause: String,
+    /// The keys the request's own map carried, as a set.
+    keys: HashSet<String>,
+}
+
+/// The clause stated at the map member `member` and the keys its map carried, or `None`
+/// when no clause can be stated there — the ONE place that clause is built, whichever layer
+/// states it.
+///
+/// THREE facts have to hold together, and each is read rather than assumed: the operation's
+/// input declares that member with a constraint set for its collection's values
+/// ([`element_constraint_set`]), the REQUEST carried that member as a map of strings, and
+/// the service states an order for its entries. The whole map renders ONCE here, so a
+/// refusal renders at most one map per member it names.
+fn member_clause(
+    member: &str,
+    submitted: &mut SubmittedMaps<'_>,
+    input_schemas: &[&'static Schema],
+    pattern: PatternRendering,
+    order: MapEntryOrder,
+) -> Option<MemberClause> {
+    let declared = element_constraint_set(input_schemas, member)?;
+    let entries = submitted.of_path(member)?;
+    let keys: HashSet<String> = entries.iter().map(|(key, _)| key.clone()).collect();
+    let pairs = order(entries)?;
+    let requirements: Vec<String> = declared
+        .into_iter()
+        .map(|kind| stated_requirement(kind, pattern))
+        .collect();
+    Some(MemberClause {
+        clause: format!(
+            "Value '{}' at '{member}' failed to satisfy constraint: {}",
+            quoted_echo(&rendered_map(&pairs)),
+            map_value_set_requirement(&requirements),
+        ),
+        keys,
+    })
 }
 
 /// The MAP member `violation` belongs to and the clause stated at it, or `None` when
-/// `violation` is not a map VALUE's — the ONE place that clause is built, whichever layer
-/// states it.
+/// `violation` is not a map VALUE's.
 ///
-/// A violation the walk marked `@sensitive` earns none: such a member is one the service
-/// never discloses, so the map it sat in is quoted nowhere — the clause that states no value
-/// at all is the framework's own, which this leaves in place.
+/// The clause and every guard around it are [`member_clause`]'s; this is the per-violation
+/// half — the `@sensitive` withholding the walk applied, and whether the entry the
+/// violation names is one the request carried.
 fn stated_map_value_clause(
     violation: &Violation,
     submitted: &mut SubmittedMaps<'_>,
@@ -587,24 +668,11 @@ fn stated_map_value_clause(
         return None;
     }
     let (member, key) = entry_of(&violation.path)?;
-    let declared = element_constraint_set(input_schemas, member)?;
-    let entries = submitted.of_path(member)?;
-    if !entries.iter().any(|(held, _)| held == key) {
-        return None;
-    }
-    let pairs = order(entries)?;
-    let requirements: Vec<String> = declared
-        .into_iter()
-        .map(|kind| stated_requirement(kind, pattern))
-        .collect();
-    Some((
-        member.to_string(),
-        format!(
-            "Value '{}' at '{member}' failed to satisfy constraint: {}",
-            quoted_echo(&rendered_map(&pairs)),
-            map_value_set_requirement(&requirements),
-        ),
-    ))
+    let stated = member_clause(member, submitted, input_schemas, pattern, order)?;
+    stated
+        .keys
+        .contains(key)
+        .then_some((member.to_string(), stated.clause))
 }
 
 /// The member and the entry KEY a path of the form `<member>.<key>` names, or `None` for a
