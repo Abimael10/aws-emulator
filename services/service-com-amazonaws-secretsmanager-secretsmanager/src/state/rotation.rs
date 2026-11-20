@@ -49,12 +49,21 @@
 //!   acting meanwhile. Staging it would mean revisiting that behaviour first.
 //!
 //! Nothing here invents a rotation: every version a rotation produces is one the rotation
-//! function itself wrote through this service's own operations. A rotation whose function did
-//! not complete a step is driven again from the first step — "if rotation fails, Secrets
-//! Manager retries the entire rotation process multiple times"
-//! (`DescribeSecretResponse$NextRotationDate`, this service's Smithy model) — and one whose
-//! function keeps raising is left in the state the real service leaves a failed rotation in:
-//! the current value still readable, `AWSPENDING` still staked, and `LastRotatedDate` unset.
+//! function itself wrote through this service's own operations. The function is invoked ONCE
+//! per step, and a step it RAN and did not complete ends the rotation there: that step's answer
+//! is the customer's own code's, so the steps before it are not run through a second time
+//! behind a client watching the function — what is left is the state the real service leaves a
+//! failed rotation in (the current value still readable, `AWSPENDING` still staked,
+//! `LastRotatedDate` unset), and the reattempt the refusal of the next call speaks of is the
+//! SCHEDULE's: "if rotation fails, Secrets Manager retries the entire rotation process multiple
+//! times. If rotation is unsuccessful, this date may be in the past"
+//! (`DescribeSecretResponse$NextRotationDate`, this service's Smithy model) — a date, not a
+//! span inside the call's own window. An invocation that reached NO function at all is the one
+//! thing attempted again ([`ROTATION_ATTEMPTS`]), because it says nothing about the function.
+//! That one attempt starts at the FIRST step, since "Secrets Manager retries the entire rotation
+//! process": a function that could not be reached at a later step is therefore invoked again for
+//! the steps it had answered — the once-per-step reading above is about a function that ANSWERED,
+//! and an unreachable function has not.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -135,19 +144,20 @@ const ROTATION_START_DELAY: Duration = Duration::from_millis(250);
 /// below a span a developer would call stuck.
 const ROTATION_STEP_BUDGET: Duration = Duration::from_secs(30);
 
-/// How many times a rotation whose function did not complete every step is driven, the first
-/// attempt included.
+/// How many times a rotation whose invocations reached NO function is driven, the first attempt
+/// included.
 ///
-/// "If rotation fails, Secrets Manager retries the entire rotation process multiple times"
-/// (`DescribeSecretResponse$NextRotationDate`, this service's Smithy model) — the ENTIRE
-/// process, so a retry starts again at the first step, which is what makes a rotation whose
-/// function could not be reached at all finish once it can be.
+/// A retry starts again at the first step, which is what makes a rotation whose function could
+/// not be reached at all finish once it can be. It is only for that case: a step the function
+/// RAN and raised is the function's own answer, and re-running the steps it already answered
+/// would invoke it several times per step where the service invokes it once
+/// ([`Invoked::Raised`]).
 ///
 /// AWS publishes neither the number of attempts nor their spacing, so both are this
 /// emulator's own: enough for an obstacle in front of the function that clears by itself — a
 /// function still inside the provisioning window its creation opened, a concurrency limit
-/// momentarily reached — and few enough that a rotation whose function always raises stops
-/// being driven rather than being retried for as long as this process runs.
+/// momentarily reached — and few enough that a rotation whose function cannot be reached at all
+/// stops being driven rather than being retried for as long as this process runs.
 const ROTATION_ATTEMPTS: u32 = 4;
 
 /// How long after an attempt that did not finish the rotation the next one begins. See
@@ -439,13 +449,15 @@ pub struct Rotation {
 }
 
 /// Invoke each step in turn, stopping at the first one the function did not complete, and
-/// drive the whole rotation again when an attempt ended there.
+/// drive the whole rotation again only when the attempt reached no function at all.
 ///
-/// A rotation is retried from its FIRST step ([`ROTATION_ATTEMPTS`]), which is what gets one
-/// past an obstacle in front of the function that clears by itself. A rotation whose function
-/// keeps raising ends where the real service leaves such a rotation — `AWSPENDING` staked,
-/// `AWSCURRENT` where it was and `LastRotatedDate` unset — because the only writes to the
-/// secret are the ones the rotation function itself made through this service's operations.
+/// A rotation whose invocation reached no function is retried from its FIRST step
+/// ([`ROTATION_ATTEMPTS`]), which is what gets one past an obstacle in front of the function
+/// that clears by itself. A rotation whose function RAN and raised is not: that step's answer
+/// is the function's own, so the rotation ends where the real service leaves such a rotation —
+/// `AWSPENDING` staked, `AWSCURRENT` where it was and `LastRotatedDate` unset — because the
+/// only writes to the secret are the ones the rotation function itself made through this
+/// service's operations.
 async fn run<Eng: Send + Sync + 'static>(
     engine: &Arc<Eng>,
     callback: &EmbeddedEmulator,
@@ -465,21 +477,44 @@ async fn run<Eng: Send + Sync + 'static>(
             );
             return;
         }
-        if drive_steps(engine, callback, rotation).await {
+        match drive_steps(engine, callback, rotation).await {
             // Every step returned, so the rotation COMPLETED: "LastRotatedDate — the last
             // date and time that Secrets Manager rotated the secret"
             // (`DescribeSecretResponse`, this service's Smithy model), and the schedule's
             // next due instant is computed from it.
-            stamp_rotated(engine, rotation);
-            return;
-        }
-        if attempt < ROTATION_ATTEMPTS {
-            ::tokio::time::sleep(ROTATION_RETRY_DELAY).await;
+            Attempt::Completed => {
+                stamp_rotated(engine, rotation);
+                return;
+            }
+            // The function ANSWERED a step and did not complete it, or the secret stopped
+            // awaiting this rotation: either way nothing further is this task's to do.
+            Attempt::Answered | Attempt::Abandoned => return,
+            // The invocation reached no function at all, which says nothing about the
+            // function: the whole rotation is driven again.
+            Attempt::Unreached => {
+                if attempt < ROTATION_ATTEMPTS {
+                    ::tokio::time::sleep(ROTATION_RETRY_DELAY).await;
+                }
+            }
         }
     }
 }
 
-/// Invoke the four steps in order, and report whether every one of them completed.
+/// What ONE attempt at driving a rotation came to, which is what decides whether another is
+/// made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Attempt {
+    /// Every step of the protocol returned.
+    Completed,
+    /// A step's invocation reached the function and the function did not complete it.
+    Answered,
+    /// A step's invocation reached no running function at all.
+    Unreached,
+    /// The secret no longer awaits this rotation.
+    Abandoned,
+}
+
+/// Invoke the four steps in order, and report what the attempt came to.
 ///
 /// The secret is asked BEFORE every step whether it still awaits this rotation: "if a rotation
 /// is currently in progress, cancels the rotation" (`CancelRotateSecret`, this service's Smithy
@@ -489,7 +524,7 @@ async fn drive_steps<Eng: Send + Sync + 'static>(
     engine: &Arc<Eng>,
     callback: &EmbeddedEmulator,
     rotation: &Rotation,
-) -> bool {
+) -> Attempt {
     for step in ROTATION_STEPS {
         if !still_awaited(engine, rotation) {
             ::tracing::debug!(
@@ -498,13 +533,15 @@ async fn drive_steps<Eng: Send + Sync + 'static>(
                 step,
                 "this rotation is no longer the one the secret awaits, so this step is not run"
             );
-            return false;
+            return Attempt::Abandoned;
         }
-        if invoke_step(callback, rotation, step).await != Invoked::Completed {
-            return false;
+        match invoke_step(callback, rotation, step).await {
+            Invoked::Completed => {}
+            Invoked::Raised => return Attempt::Answered,
+            Invoked::Unreached => return Attempt::Unreached,
         }
     }
-    true
+    Attempt::Completed
 }
 
 /// Whether the secret is still waiting for THIS rotation: it exists, rotation is on, the
