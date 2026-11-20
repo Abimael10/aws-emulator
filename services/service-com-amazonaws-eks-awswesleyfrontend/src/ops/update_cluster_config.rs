@@ -26,10 +26,15 @@
 //! request carried is reported as an `UpdateParam`, keyed by its `UpdateParamType`.
 //!
 //! Nothing is written until the network the request names RESOLVES: the subnets must
-//! exist in EC2 ([`crate::state::resolve_subnets`]) and the security groups must belong
-//! to the VPC the cluster's cross-account network interfaces sit in
+//! exist in EC2 and sit in ONE VPC ([`crate::state::ResolvedSubnets::list_refusal`],
+//! refused 400 `InvalidParameterException` as the bad parameter it is), and the security
+//! groups must belong to the VPC the cluster's cross-account network interfaces sit in
 //! ([`crate::state::security_group_vpc_refusal`]) — "you can't change which VPC the
-//! subnets are from" — each refused 400 `InvalidParameterException`.
+//! subnets are from". That last comparison is against the network THIS cluster is
+//! already in, a fact about the cluster rather than about the request alone, so it is
+//! refused 400 `InvalidRequestException` ("the request is invalid given the state of the
+//! cluster") where `CreateCluster`, which reads the network out of the request's own
+//! subnets, reports an invalid parameter.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -288,7 +293,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(subnet_ids) => state::resolve_subnets(ctx, &region, subnet_ids).await,
             None => state::ResolvedSubnets::default(),
         };
-        if let Some(why) = resolved_subnets.refusal {
+        // The two rules that reading decides about the LIST
+        // ([`state::ResolvedSubnets::list_refusal`]), the same ones a create is held to:
+        // every id resolves, and the subnets EC2 reported sit in ONE VPC — "you can't
+        // change which VPC the subnets are from", and a list drawn from two names no
+        // single network for the control plane's interfaces to move to.
+        if let Some(why) = resolved_subnets.list_refusal() {
             return Err(invalid_parameter(&cluster_name, why));
         }
         // And the rule those resolved subnets decide, the same one a create is held
@@ -349,7 +359,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(why) =
                 state::security_group_vpc_refusal(ctx, &region, group_ids, vpc_id).await
             {
-                return Err(invalid_parameter(&cluster_name, why));
+                return Err(invalid_request(&cluster_name, why));
             }
         }
 

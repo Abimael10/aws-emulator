@@ -266,6 +266,31 @@ pub fn fewer_than_two_availability_zones(zones: &[String]) -> bool {
     !zones.is_empty() && zones.len() < 2
 }
 
+/// The sentence a subnet list whose subnets do not all sit in ONE VPC is refused
+/// with. Entirely fixed text — it states the rule the list broke, and WHICH subnets
+/// were named is the caller's own request.
+///
+/// Amazon EKS provisions a resource's network in a single VPC: the cross-account
+/// network interfaces of a control plane, the cluster's own security group, a node
+/// group's instances and a Fargate Pod's addresses all live in the one network its
+/// subnets sit in. A subnet belongs to exactly one VPC (`Subnet$VpcId`), so a list
+/// drawn from two VPCs names no network to provision in at all — which is also why
+/// `UpdateClusterConfig` states "you can't change which VPC the subnets are from".
+pub const SUBNETS_IN_ONE_VPC_MESSAGE: &str = "Subnets specified must belong to the same VPC";
+
+/// Whether the VPCs EC2 reported for a request's subnets are MORE THAN ONE network,
+/// which is what [`SUBNETS_IN_ONE_VPC_MESSAGE`] refuses.
+///
+/// `vpc_ids` is the DISTINCT VPCs of the subnets EC2 named
+/// ([`super::ResolvedSubnets::vpc_ids`]), so the question is how many networks the
+/// list reaches rather than how many ids it carries: the same VPC reported for two
+/// subnets is ONE network, and an empty list is EC2 having said nothing — including
+/// this emulator failing to ask it — which grounds no refusal, exactly as an
+/// unresolved subnet read does not.
+pub fn subnets_span_more_than_one_vpc(vpc_ids: &[String]) -> bool {
+    vpc_ids.len() > 1
+}
+
 /// The sentence a request that turns BOTH paths to a cluster's Kubernetes API server
 /// endpoint off is refused with. Entirely fixed text.
 pub const ENDPOINT_ACCESS_BOTH_DISABLED_MESSAGE: &str =

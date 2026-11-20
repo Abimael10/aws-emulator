@@ -415,7 +415,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // also reports the VPC they sit in: the network the capacity below is created in.
         // It runs with no lock held: it is a call out to another service.
         let resolved_subnets = state::resolve_subnets(ctx, &region, &input.subnets).await;
-        if let Some(why) = resolved_subnets.refusal {
+        // The two rules that reading decides about the LIST
+        // ([`state::ResolvedSubnets::list_refusal`]), the same ones a cluster's own
+        // subnets are held to: every id resolves, and the subnets EC2 reported sit in
+        // ONE VPC — the network this node group's instances and their interfaces are
+        // created in, which a list drawn from two VPCs names none of.
+        if let Some(why) = resolved_subnets.list_refusal() {
             return Err(invalid_parameter(
                 &input.cluster_name,
                 &input.nodegroup_name,

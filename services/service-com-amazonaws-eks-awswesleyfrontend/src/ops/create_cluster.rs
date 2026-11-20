@@ -35,10 +35,11 @@
 //! Nothing is written until the request is AUTHORIZED and its inputs RESOLVE: the role
 //! ARNs it asks Amazon EKS to pass must be roles of this account
 //! ([`crate::state::pass_role_refusal`], 403 `AccessDeniedException`), and the subnets it
-//! names must exist in EC2 ([`crate::state::resolve_subnets`], 400
-//! `InvalidParameterException`) — a cluster is never minted against a role the caller
-//! cannot pass or a subnet nothing holds. Those same resolved subnets have to place the
-//! control plane in at least two Availability Zones
+//! names must exist in EC2 and sit in ONE VPC
+//! ([`crate::state::ResolvedSubnets::list_refusal`], 400 `InvalidParameterException`) — a
+//! cluster is never minted against a role the caller cannot pass, a subnet nothing holds,
+//! or a subnet set that names no single network to place the control plane in. Those same
+//! resolved subnets have to place the control plane in at least two Availability Zones
 //! ([`crate::state::fewer_than_two_availability_zones`], 400
 //! `InvalidParameterException`): the zones are EC2's to report, so two subnets of one
 //! zone are refused exactly as one subnet is. The security groups it names must belong to
@@ -562,7 +563,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(subnet_ids) => state::resolve_subnets(ctx, &region, subnet_ids).await,
             None => state::ResolvedSubnets::default(),
         };
-        if let Some(why) = resolved_subnets.refusal {
+        // The two rules that reading decides about the LIST
+        // ([`state::ResolvedSubnets::list_refusal`]): every id resolves, and the
+        // subnets EC2 reported sit in ONE VPC — the network this cluster's
+        // cross-account network interfaces, its own security group and its nodes are
+        // all provisioned in. A list drawn from two VPCs names no such network, so
+        // there is nothing to place a control plane in and nothing is written.
+        if let Some(why) = resolved_subnets.list_refusal() {
             return Err(invalid_parameter(&input.name, why));
         }
 

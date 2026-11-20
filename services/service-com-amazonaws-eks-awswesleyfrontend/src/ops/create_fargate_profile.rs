@@ -493,12 +493,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The Pods of this profile are launched into the subnets the request names, so
-        // those subnets have to exist — resolved against EC2, which owns them, exactly
-        // as `CreateCluster` and `CreateNodegroup` resolve their own
-        // ([`state::unresolved_subnet_refusal`]). It runs with no lock held: it is a
-        // call out to another service.
+        // those subnets have to exist AND sit in one VPC — resolved against EC2, which
+        // owns them, exactly as `CreateCluster` and `CreateNodegroup` resolve their own
+        // ([`state::ResolvedSubnets::list_refusal`]): a Pod's network interface is
+        // created in a single network, which a list drawn from two VPCs names none of.
+        // It runs with no lock held: it is a call out to another service.
         let subnets = input.subnets.clone().unwrap_or_default();
-        if let Some(why) = state::unresolved_subnet_refusal(ctx, &region, &subnets).await {
+        let resolved_subnets = state::resolve_subnets(ctx, &region, &subnets).await;
+        if let Some(why) = resolved_subnets.list_refusal() {
             return Err(invalid_parameter(cluster_name, profile_name, why));
         }
 

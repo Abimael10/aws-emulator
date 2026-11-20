@@ -8,11 +8,14 @@
 //! (`VpcConfigRequest$securityGroupIds`), and a security group belongs to exactly one VPC
 //! (`SecurityGroup$VpcId`), governing only interfaces of that VPC. So a group of another
 //! VPC than the one those subnets sit in could never apply to the cluster, and the call is
-//! refused 400 `InvalidParameterException` naming that group and the cluster's VPC —
-//! before any cluster exists and before any update starts. It holds on both operations
-//! that carry the member: `CreateCluster`, where the VPC is the one the subnets resolve
-//! to, and `UpdateClusterConfig`, where it is the VPC the cluster already reports ("you
-//! can't change which VPC the subnets are from").
+//! refused 400 naming that group and the cluster's VPC — before any cluster exists and
+//! before any update starts. It holds on both operations that carry the member:
+//! `CreateCluster`, where the VPC is the one the subnets resolve to, which reports the
+//! `InvalidParameterException` of a member it read the network out of; and
+//! `UpdateClusterConfig`, where it is the VPC the cluster already reports ("you can't
+//! change which VPC the subnets are from"), which reports `InvalidRequestException` —
+//! the comparison there is against the state of the cluster being changed, not against
+//! the request alone.
 //!
 //! The rule needs EKS and EC2 on one engine, which is why this suite lives here rather
 //! than in the EKS crate: a security group is EC2's resource, so EC2 is the only thing
@@ -477,7 +480,11 @@ fn eks_refuses_a_security_group_outside_the_vpc_the_cluster_sits_in() {
             // ---------------------------------------------------------------
             // The SAME rule on UpdateClusterConfig, where the network is the
             // VPC the cluster already reports: a group of another VPC is
-            // refused and starts no update, one of its own VPC is taken.
+            // refused and starts no update, one of its own VPC is taken. The
+            // refusal is the one a call that the CLUSTER's own network
+            // contradicts earns — `InvalidRequestException`, "the request is
+            // invalid given the state of the cluster" — rather than the
+            // invalid parameter a create reports.
             // ---------------------------------------------------------------
             let cluster = "sg-vpc-update";
             let created = eks(
@@ -510,8 +517,8 @@ fn eks_refuses_a_security_group_outside_the_vpc_the_cluster_sits_in() {
             let case = "an update naming a group of another VPC";
             assert_eq!(
                 (refused.status, refused.error_type.as_deref()),
-                (400, Some("InvalidParameterException")),
-                "case {case:?}: must be refused 400 InvalidParameterException, got {refused:?}"
+                (400, Some("InvalidRequestException")),
+                "case {case:?}: must be refused 400 InvalidRequestException, got {refused:?}"
             );
             let expected = refusal(std::slice::from_ref(&second_group), &first.vpc_id);
             assert_eq!(

@@ -44,7 +44,7 @@ use aws_emulator_router::{build_router, InMemoryEngine};
 use crate::eks_wire::{
     cluster_body, ec2, eks, iam, role_arn, Answer, EC2_NOT_FOUND_CODE, REGION,
 };
-use crate::query_wire::opt_element;
+use crate::query_wire::{elements, opt_element};
 
 /// Keep this at or above `boot_serve.rs`'s stack: the same assembly runs here.
 const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
@@ -115,7 +115,7 @@ fn eks_resolves_its_subnets_against_ec2_and_its_connector_role_against_iam() {
 
             // ---------------------------------------------------------------
             // Setup: a VPC with two subnets the client created, and the
-            // account's own default subnet, all through EC2 itself.
+            // account's own default subnets, all through EC2 itself.
             // ---------------------------------------------------------------
             let created = ec2(&router, &runtime, "CreateVpc", &[("CidrBlock", "10.9.0.0/16")]);
             assert_eq!(
@@ -150,11 +150,12 @@ fn eks_resolves_its_subnets_against_ec2_and_its_connector_role_against_iam() {
                         .unwrap_or_else(|| panic!("setup: no <subnetId> in {}", answer.text)),
                 );
             }
-            // A default subnet of the account's default VPC: a subnet nothing in this
-            // test created, so the rule is shown to hold for a subnet the account simply
-            // HAS as well as for one a client made. It is taken from a THIRD zone, so a
-            // row that pairs it with a created subnet still places a control plane in two
-            // Availability Zones.
+            // Two default subnets of the account's default VPC: subnets nothing in this
+            // test created, so the rule is shown to hold for subnets the account simply
+            // HAS as well as for ones a client made. They come as a PAIR of one network,
+            // because the subnets of one cluster all belong to a single VPC
+            // (`eks_cluster_subnets_belong_to_one_vpc` pins that rule), and from two
+            // zones, because a control plane is placed across at least two of them.
             let defaults = ec2(
                 &router,
                 &runtime,
@@ -162,20 +163,18 @@ fn eks_resolves_its_subnets_against_ec2_and_its_connector_role_against_iam() {
                 &[
                     ("Filter.1.Name", "default-for-az"),
                     ("Filter.1.Value.1", "true"),
-                    ("Filter.2.Name", "availability-zone"),
-                    ("Filter.2.Value.1", &format!("{REGION}c")),
                 ],
             );
             assert_eq!(
                 defaults.status, 200,
                 "setup: DescribeSubnets must succeed, got {defaults:?}"
             );
-            let default_subnet = opt_element(&defaults.text, "subnetId").unwrap_or_else(|| {
-                panic!(
-                    "setup: the account must have a default subnet, got {}",
-                    defaults.text
-                )
-            });
+            let default_subnets = elements(&defaults.text, "subnetId");
+            assert!(
+                default_subnets.len() >= 2,
+                "setup: the account must have at least two default subnets, got {}",
+                defaults.text
+            );
 
             // Two ids no subnet of the account carries, in both of EC2's id forms
             // (`^subnet-[0-9a-f]{8,}$`: 8 and 17 hex digits).
@@ -193,9 +192,9 @@ fn eks_resolves_its_subnets_against_ec2_and_its_connector_role_against_iam() {
                     unresolved: None,
                 },
                 SubnetCase {
-                    case: "a default subnet of the account, beside a created one",
+                    case: "two default subnets of the account, which this test did not create",
                     cluster: "default-subnet",
-                    subnets: vec![default_subnet.clone(), client_subnets[0].clone()],
+                    subnets: vec![default_subnets[0].clone(), default_subnets[1].clone()],
                     unresolved: None,
                 },
                 SubnetCase {

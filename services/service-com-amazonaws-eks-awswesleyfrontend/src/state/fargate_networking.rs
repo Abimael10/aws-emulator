@@ -73,7 +73,7 @@ pub async fn public_subnet_refusal(
     // The subnets as EC2 holds them: a subnet's VPC is what says which main route
     // table governs it when it has no association of its own. A read EC2 refused
     // (an id it holds no subnet for, which the create reports on its own through
-    // [`unresolved_subnet_refusal`]) leaves nothing to ground a refusal in.
+    // [`ResolvedSubnets::list_refusal`]) leaves nothing to ground a refusal in.
     let described = ec2
         .describe_subnets()
         .set_subnet_ids(Some(subnet_ids.to_vec()))
