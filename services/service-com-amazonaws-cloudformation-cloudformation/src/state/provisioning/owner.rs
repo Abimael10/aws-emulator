@@ -264,6 +264,13 @@ impl Owner {
             Self::MediaConvert(kind) => {
                 mediaconvert_resources::create(ctx, region, kind, resource, propagated).await
             }
+            // A patch baseline IS taggable: its `Tags` property is the tag list
+            // `CreatePatchBaseline` takes, so it carries the tags CloudFormation gives the
+            // resource beside its own ([`ssm_patch_baseline::create`], which also registers
+            // the patch groups the declaration asks for).
+            Self::SsmPatchBaseline => {
+                ssm_patch_baseline::create(ctx, region, resource, propagated).await
+            }
         }
     }
 
@@ -326,6 +333,8 @@ impl Owner {
             // declaration asked for.
             Self::LogsResource(_) => Ok(logs_resources::ready()),
             Self::IotAuthorizer => Ok(iot_authorizer::ready()),
+            // A patch baseline exists from the moment its create answers too.
+            Self::SsmPatchBaseline => Ok(ssm_patch_baseline::ready()),
             // A provisioning template and a role alias each EXIST from the moment their
             // create answers ([`iot_provisioning_resources::ready`]).
             Self::IotProvisioningResource(_) => Ok(iot_provisioning_resources::ready()),
@@ -498,6 +507,9 @@ impl Owner {
             // authorizer's `Arn` is the one its create answered with. So there is nothing
             // left to read once any of them is up.
             Self::LogsResource(_) | Self::IotAuthorizer => Ok(BTreeMap::new()),
+            // A patch baseline's `Id` is the id its own create minted, so there is nothing
+            // left to read once it is up.
+            Self::SsmPatchBaseline => Ok(BTreeMap::new()),
             // A provisioning template's `TemplateArn` and a role alias's `RoleAliasArn` are
             // the ones their own creates answered with, so there is nothing left to read once
             // either is up.
@@ -675,6 +687,9 @@ impl Owner {
             // deleted in.
             Self::LogsResource(_) => Ok(logs_resources::removal()),
             Self::IotAuthorizer => Ok(iot_authorizer::removal()),
+            // `DeletePatchBaseline` takes the baseline away as it answers, so there is
+            // nothing to wait for either.
+            Self::SsmPatchBaseline => Ok(ssm_patch_baseline::removal()),
             Self::IotProvisioningResource(_) => Ok(iot_provisioning_resources::removal()),
             // `DeleteTopicRule` takes the rule away as it answers too
             // ([`iot_topic_rule::removal`]).
@@ -869,6 +884,12 @@ impl Owner {
             }
             Self::IotAuthorizer => {
                 iot_authorizer::update(ctx, region, resource, declared).await
+            }
+            // A changed declaration is written to the baseline the stack already has, and the
+            // patch groups it registers are brought into line with what it now asks for
+            // ([`ssm_patch_baseline::update`]).
+            Self::SsmPatchBaseline => {
+                ssm_patch_baseline::update(ctx, region, resource, declared).await
             }
             Self::IotProvisioningResource(kind) => {
                 iot_provisioning_resources::update(ctx, region, kind, resource, declared).await
@@ -1077,6 +1098,9 @@ impl Owner {
             // log group and of an authorizer that already exist are reconciled by no arm here
             // yet ([`Provisioner::retag`]'s own default), so nothing is asked about them.
             Self::LogsResource(_) | Self::IotAuthorizer => Ok(()),
+            // The tags of a patch baseline that already exists are reconciled by no arm here
+            // yet ([`Provisioner::retag`]'s own default), so nothing is asked about them.
+            Self::SsmPatchBaseline => Ok(()),
             // The tags of a provisioning template and of a role alias that already exist are
             // reconciled by no arm here yet either, so nothing is asked about them.
             Self::IotProvisioningResource(_) => Ok(()),
@@ -1235,6 +1259,11 @@ impl Owner {
                 logs_resources::delete(ctx, region, kind, resource).await
             }
             Self::IotAuthorizer => iot_authorizer::delete(ctx, region, resource).await,
+            // Systems Manager takes no snapshot of a patch baseline on the way out either:
+            // there is no such call, so a `Snapshot` deletion policy on this type deletes the
+            // baseline — and the registrations that hold it — with no snapshot invented for
+            // it ([`ssm_patch_baseline::delete`]).
+            Self::SsmPatchBaseline => ssm_patch_baseline::delete(ctx, region, resource).await,
             // Nor of a provisioning template or a role alias, for the same reason.
             Self::IotProvisioningResource(kind) => {
                 iot_provisioning_resources::delete(ctx, region, kind, resource).await
@@ -1450,6 +1479,9 @@ impl Owner {
             Self::IotAuthorizer => {
                 iot_authorizer::actual_configuration(ctx, region, resource).await?
             }
+            Self::SsmPatchBaseline => {
+                ssm_patch_baseline::actual_configuration(ctx, region, resource).await?
+            }
             Self::IotProvisioningResource(kind) => {
                 iot_provisioning_resources::actual_configuration(ctx, region, kind, resource)
                     .await?
@@ -1658,6 +1690,8 @@ impl Owner {
             Self::Athena(_) => message.to_string(),
             // And so does AWS Elemental MediaConvert's.
             Self::MediaConvert(_) => message.to_string(),
+            // And so does AWS Systems Manager's patch-baseline provider.
+            Self::SsmPatchBaseline => message.to_string(),
         }
     }
 

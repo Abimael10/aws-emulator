@@ -311,6 +311,13 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         // node an association was created for cannot be changed on it, so a declaration
         // naming another node asks for a different association.
         SSM_ASSOCIATION => &["InstanceId"],
+        // The operating system a PATCH BASELINE applies to is fixed when Systems Manager makes
+        // it: `OperatingSystem` is a member of `CreatePatchBaseline` and of no member of
+        // `UpdatePatchBaseline`, so a declaration restating it asks for a different baseline —
+        // which CloudFormation replaces rather than updates.
+        crate::state::provisioning::ssm_patch_baseline::SSM_PATCH_BASELINE => {
+            &["OperatingSystem"]
+        }
         // An event bus is created FOR a partner source or for nothing, and EventBridge
         // publishes no call that re-points one: `EventSourceName` is a member of
         // `CreateEventBus` and of no member of `UpdateEventBus`, so a declaration restating it

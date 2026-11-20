@@ -767,6 +767,14 @@ pub(super) const NEPTUNE_GRAPH_ID_PREFIX: &str = "g";
 pub(super) const NEPTUNE_SNAPSHOT_ID_PREFIX: &str = "gs";
 pub(super) const NEPTUNE_GRAPH_ID_DIGITS: usize = 10;
 
+/// The prefix a Systems Manager patch-baseline id carries and how many characters follow it:
+/// the ids that service mints read `pb-` and 17 hexadecimal characters, which is the shortest
+/// value its `BaselineId` pattern admits (`^[a-zA-Z0-9_\-:/]{20,128}$`,
+/// `smithy_query(query="shape", shape="BaselineId")` on that service's model) — so a stand-in
+/// for one is that prefix and exactly seventeen characters.
+pub(super) const SSM_PATCH_BASELINE_ID_PREFIX: &str = "pb";
+pub(super) const SSM_PATCH_BASELINE_ID_DIGITS: usize = 17;
+
 /// The `AWS::<cloudFormationName>::<Resource>` types of the OpenSearch Serverless
 /// resources a stack creates. The middle segment is that service's own
 /// `awsService.cloudFormationName` (`OpenSearchServerless`).

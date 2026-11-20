@@ -215,6 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A baseline the account created here: every reported member is the one its write
         // persisted, projected rather than recomputed.
         if let Some(record) = store.patch_baseline(&region, &baseline_id) {
+            let patch_groups = store.patch_groups_of_patch_baseline(&region, &baseline_id);
             return Ok(GetPatchBaselineOutput {
                 // "The ID of the retrieved patch baseline": the key the record is held
                 // under, which is the id its create minted.
@@ -235,9 +236,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 rejected_patches: Some(record.rejected_patches.clone()),
                 rejected_patches_action: Some(record.rejected_patches_action.clone()),
                 // "Patch groups included in the patch baseline": a patch group is included
-                // in a baseline by registering it there, and this store holds no such
-                // registration, so a baseline it holds includes no patch group.
-                patch_groups: Some(Vec::new()),
+                // in a baseline by registering it there
+                // (`RegisterPatchBaselineForPatchGroup`), so this is the projection of the
+                // registrations that name this baseline
+                // ([`crate::state::patch_groups`]).
+                patch_groups: Some(patch_groups),
                 created_date: Some(::aws_smithy_types::DateTime::from(record.created_date)),
                 // Equal to the created date until a write of this baseline moves it.
                 modified_date: Some(::aws_smithy_types::DateTime::from(record.modified_date)),
@@ -284,6 +287,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
                 rejected_patches: Some(record.rejected_patches.clone()),
                 rejected_patches_action: Some(record.rejected_patches_action.clone()),
+                // The groups registered with this baseline, read the same way as for a
+                // baseline the account created: a group can be registered with one Systems
+                // Manager predefines too.
+                patch_groups: Some(store.patch_groups_of_patch_baseline(&region, &baseline_id)),
                 ..GetPatchBaselineOutput::default()
             });
         }

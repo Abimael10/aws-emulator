@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPatchBaselineForPatchGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPatchBaselineForPatchGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! The patch baseline a patch group's nodes are patched against. This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPatchBaselineForPatchGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Retrieves the patch baseline that should be used for the specified patch group": the
+//! baseline a register recorded for that group and operating system
+//! ([`crate::state::patch_groups`]), and — for a group nothing has registered one for — the
+//! DEFAULT baseline of the operating system asked about, which is what should be used for
+//! such a group and what a patching operation on one of its nodes runs against
+//! ([`crate::state::patch_runs`]). This operation models no not-found error at all, which is
+//! why every group resolves to a baseline rather than to a refusal.
+//!
+//! A read — nothing is written, so a later caller sees the same answer.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +150,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPatchBaselineForPatchGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPatchBaselineForPatchGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPatchBaselineForPatchGroup"))
+        // `PatchGroup` is required and its length and pattern are modelled constraints the
+        // centralized walk has already refused anything outside of, as is `OperatingSystem`'s
+        // own value set.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetPatchBaselineForPatchGroupErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the patch baseline store is unavailable".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        // "Returns the operating system rule specified for patch groups using the patch
+        // baseline. The default value is WINDOWS" (`OperatingSystem`), the same default every
+        // other read of a baseline by operating system takes.
+        let operating_system = input
+            .operating_system
+            .unwrap_or_else(|| crate::state::patch_baselines::DEFAULT_OPERATING_SYSTEM.to_string());
+
+        let resolved = state
+            .lock()
+            .patch_baseline_in_force(&region, &input.patch_group, &operating_system)
+            .ok_or_else(|| {
+                GetPatchBaselineForPatchGroupErrorModeled::InternalServerError(
+                    InternalServerError {
+                        message: Some(format!(
+                            "no patch baseline is held for the operating system \
+                             {operating_system}"
+                        )),
+                    },
+                )
+            })?;
+
+        Ok(GetPatchBaselineForPatchGroupOutput {
+            // "The ID of the patch baseline that should be used for the patch group", named
+            // the way every read of a baseline names it: its own id for one the account
+            // created, and the full ARN for one Systems Manager predefined.
+            baseline_id: Some(resolved.reference),
+            // "The operating system rule specified for patch groups using the patch
+            // baseline", which is the one the baseline this reports applies to.
+            operating_system: Some(resolved.operating_system),
+            // "The name of the patch group" the request asked about.
+            patch_group: Some(input.patch_group),
+        })
     }
 }

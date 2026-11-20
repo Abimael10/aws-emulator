@@ -320,6 +320,10 @@ pub mod ops_item_related_items;
 /// which of them is the default for an operating system.
 pub mod patch_baselines;
 
+/// Which patch baseline a PATCH GROUP is patched against: the registration a register
+/// persists, and the baseline in force for a node of that group.
+pub mod patch_groups;
+
 /// The high-level patch compliance state a patching operation reported for a managed
 /// node, and how a patch-group read narrows, orders and pages those reports.
 pub mod instance_patch_states;
@@ -355,9 +359,17 @@ pub mod custom_inventory;
 /// keys and page a read of it accepts.
 pub mod instance_patches;
 
+/// The compliance items a managed node holds — the projection of the patch rows a patching
+/// operation left, which `ListComplianceItems` reports.
+pub mod compliance_items;
+
 /// The patch-baseline run Patch Manager performs on a managed node when the document it
 /// publishes for that is sent to one, and the compliance that run reports.
 pub mod patch_runs;
+
+/// The patching a State Manager association's run brings back: the compliance the
+/// patch-baseline document reports for a node one run has applied it on.
+pub mod association_patch_runs;
 
 /// The OpsMetadata objects Application Manager holds for this account: what a create
 /// persists, the ARN it is reached by, and the two ways an ARN can name none.
@@ -2247,6 +2259,15 @@ pub struct ComAmazonawsSsmAmazonssmState {
     pub instance_patch_states:
         BTreeMap<(String, String), instance_patch_states::InstancePatchStateRecord>,
 
+    /// Which patch baseline each PATCH GROUP is registered with, keyed by
+    /// `(region, patch group, operating system)`: a group can be patched against a baseline
+    /// of each operating system, which is why `GetPatchBaselineForPatchGroup` takes an
+    /// `OperatingSystem` beside the group. The value is how the registered baseline is NAMED
+    /// (`patch_baselines::ResolvedBaseline::reference`). A group nothing has registered a
+    /// baseline for holds no entry and is patched against the default of its operating
+    /// system instead. See [`patch_groups`].
+    pub patch_group_baselines: BTreeMap<(String, String, String), String>,
+
     /// The default patch baseline of each operating system, keyed by
     /// `(region, operating system)`: "Systems Manager supports creating multiple default
     /// patch baselines. For example, you can create a default patch baseline for each
@@ -2367,6 +2388,7 @@ impl Default for ComAmazonawsSsmAmazonssmState {
             patch_baselines: BTreeMap::new(),
             patch_baseline_sequence: 0,
             default_patch_baselines: BTreeMap::new(),
+            patch_group_baselines: BTreeMap::new(),
             instance_patch_states: BTreeMap::new(),
             resource_data_syncs: BTreeMap::new(),
             access_requests: BTreeMap::new(),

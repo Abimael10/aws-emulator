@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeregisterPatchBaselineForPatchGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeregisterPatchBaselineForPatchGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Taking away the pairing between a patch group and the patch baseline it was registered
+//! with. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeregisterPatchBaselineForPatchGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What it persists is the removal of that registration
+//! ([`crate::state::patch_groups`]): a later read of the group reports the default baseline
+//! of its operating system again, the baseline no longer reports the group among its
+//! `PatchGroups`, and a patching operation on a node of that group runs against that default.
+//!
+//! A `BaselineId` that could never name a baseline of this endpoint — an ARN of another
+//! service, account or Region — is refused (`InvalidResourceId`). Everything else is served:
+//! this operation models no not-found error, so a group that was registered with no such
+//! baseline is already in the state the call asks for and the values it named are reported
+//! back.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +148,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeregisterPatchBaselineForPatchGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeregisterPatchBaselineForPatchGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeregisterPatchBaselineForPatchGroup"))
+        // Both members are required and both carry a modelled length and pattern the
+        // centralized walk has already refused anything outside of.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeregisterPatchBaselineForPatchGroupErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the patch baseline store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // A value that could never name a baseline held at this endpoint is not an id this
+        // service can look anything up by. `InvalidResourceId` carries NO message member at
+        // all, so the error code is the whole of what it reports.
+        let Some(baseline_id) = store.patch_baseline_query(&region, &input.baseline_id) else {
+            return Err(
+                DeregisterPatchBaselineForPatchGroupErrorModeled::InvalidResourceId(
+                    InvalidResourceId {},
+                )
+                .into(),
+            );
+        };
+
+        // The registration is removed by the baseline the request NAMES: a group registered
+        // with another baseline keeps that registration. A group this endpoint holds no such
+        // registration for is already in the state the call asks for, so nothing is removed
+        // and nothing is refused.
+        store.deregister_patch_baseline_for_patch_group(&region, &input.patch_group, &baseline_id);
+
+        Ok(DeregisterPatchBaselineForPatchGroupOutput {
+            // "The ID of the patch baseline the patch group was deregistered from" and "the
+            // name of the patch group deregistered from the patch baseline": the two values
+            // the request named, the baseline under the id this endpoint resolves it by.
+            baseline_id: Some(baseline_id),
+            patch_group: Some(input.patch_group),
+        })
     }
 }

@@ -15,9 +15,11 @@
 //!
 //! # What one does
 //!
-//! A run is performed against the patch baseline the node is patched with — the default
-//! baseline of the node's operating system ([`ComAmazonawsSsmAmazonssmState::default_patch_baseline`]) —
-//! and reports, patch by patch, what it found on the node: the patches that baseline
+//! A run is performed against the patch baseline the node is patched with — the baseline
+//! the node's patch group is registered with
+//! ([`ComAmazonawsSsmAmazonssmState::patch_baseline_in_force`]), and the default baseline of
+//! the node's operating system when its group has none — and reports, patch by patch, what
+//! it found on the node: the patches that baseline
 //! approves and the node does not hold yet are MISSING, an `Install` run installs them,
 //! and a later run of either kind reports them installed. The report is the one the patch
 //! reads of this service project ([`super::instance_patch_states`],
@@ -350,7 +352,13 @@ pub fn perform(
         .find_map(|key| node.tags.get(*key))
         .cloned()
         .unwrap_or_default();
-    let Some(baseline) = store.default_patch_baseline(region, operating_system) else {
+    // The baseline in force for the node: the one its patch group is registered with, and
+    // the default baseline of its operating system when its group has none — the one reading
+    // of "the patch baseline that should be used for the specified patch group"
+    // ([`ComAmazonawsSsmAmazonssmState::patch_baseline_in_force`]), so what a patch-group
+    // read reports and what this run is performed against cannot disagree.
+    let Some(baseline) = store.patch_baseline_in_force(region, &patch_group, operating_system)
+    else {
         return false;
     };
     // What the node already holds, from the report the previous run left: the state each

@@ -3134,6 +3134,9 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::SecretsManager::Secret",
     SSM_ASSOCIATION,
     SSM_PARAMETER,
+    // The patch baseline `provisioning::ssm_patch_baseline` creates, publishing the id
+    // Systems Manager minted for it.
+    crate::state::provisioning::ssm_patch_baseline::SSM_PATCH_BASELINE,
     STEP_FUNCTIONS_ACTIVITY,
     TRANSFER_SERVER,
     "AWS::Transfer::Workflow",

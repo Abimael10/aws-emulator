@@ -934,9 +934,11 @@ pub(super) const DELETE_PARAMETER: &str = "DeleteParameter";
 /// reported under is decided from the code and never from this text.
 ///
 /// Shared by every arm that reports a refusal this way — the `AWS::SSM::Parameter` provider
-/// here and the `AWS::SSM::Association` provider beside it ([`super::ssm_associations`]) — so
-/// the wording cannot drift between two copies of it.
-pub(super) fn handler_refusal(operation: &str, refusal: Refusal) -> Refusal {
+/// here, the `AWS::SSM::Association` provider beside it ([`super::ssm_associations`]) and the
+/// `AWS::SSM::PatchBaseline` provider whose arms live beside the deployment algorithm
+/// ([`crate::state::provisioning::ssm_patch_baseline`]) — so the wording cannot drift between
+/// copies of it.
+pub(in crate::state) fn handler_refusal(operation: &str, refusal: Refusal) -> Refusal {
     let message = if refusal.message.is_empty() {
         format!("Error occurred during operation '{operation}'.")
     } else {

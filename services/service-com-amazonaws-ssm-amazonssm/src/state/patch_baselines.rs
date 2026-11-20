@@ -837,7 +837,10 @@ impl ComAmazonawsSsmAmazonssmState {
     /// A recorded default that NAMED the removed baseline goes with it, in either spelling
     /// a register may have recorded it under: nothing holds that baseline any more, so the
     /// default of its operating system is the one Systems Manager predefines again
-    /// ([`Self::default_patch_baseline`]). Only the Region the delete reached is touched —
+    /// ([`Self::default_patch_baseline`]). So does every PATCH GROUP registration that named
+    /// it ([`Self::drop_patch_group_registrations_of`]), for the same reason: a group whose
+    /// baseline is gone is patched against the default of its operating system again rather
+    /// than against a baseline nothing holds. Only the Region the delete reached is touched —
     /// a baseline is reached through the endpoint of one Region — so a baseline of another
     /// Region, and that Region's defaults, are left exactly as they were.
     pub fn remove_patch_baseline(
@@ -854,6 +857,7 @@ impl ComAmazonawsSsmAmazonssmState {
                 held_region != region
                     || (reference.as_str() != baseline_id && reference.as_str() != arn)
             });
+        self.drop_patch_group_registrations_of(region, baseline_id);
         Some(removed)
     }
 

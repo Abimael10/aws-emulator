@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListComplianceItems
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListComplianceItems`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! The compliance items a managed node holds. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListComplianceItems::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "For a specified resource ID, this API operation returns a list of compliance statuses for
+//! different resource types": what the store holds
+//! ([`crate::state::compliance_items`]) is one item per patch a patching operation reported
+//! for a node — the `Patch` compliance of that node — in ascending `(node id, item id)`
+//! order, narrowed by every filter the request carries and served one page at a time.
+//!
+//! A read: nothing is written beyond the compliance a finished State Manager association run
+//! already owed the nodes it applied the patch-baseline document on, which was due at the same
+//! instant whether or not anybody called ([`crate::state::association_patch_runs`]), so a
+//! later caller sees the same items.
+//!
+//! Four things are refused rather than served:
+//!
+//! * a `Filters` entry whose key names no member of a compliance item, whose comparison is
+//!   none of the modelled ones, or that carries no value to search for (`InvalidFilter`);
+//! * a `ResourceIds` entry that is not shaped like a managed-node id (`InvalidResourceId`);
+//! * a `ResourceTypes` entry other than `ManagedInstance`, "currently the only supported
+//!   resource type" (`InvalidResourceType`);
+//! * a `NextToken` that is not a token this read hands out (`InvalidNextToken`).
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +174,158 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListComplianceItems` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListComplianceItemsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListComplianceItems"))
+        use crate::state::compliance_items::{
+            compliance_filter_rejection, compliance_page_size, RESOURCE_TYPE_MANAGED_INSTANCE,
+        };
+        use crate::state::{managed_node_id_is_well_formed, request_region, INVALID_NEXT_TOKEN};
+
+        // The `ResourceIds` and `ResourceTypes` list lengths and the `MaxResults` range are
+        // MODELLED constraints the centralized walk has already refused anything outside of.
+        // What is decided here is which of the items this endpoint holds the request selects.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListComplianceItemsErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some(
+                        "this service is mounted on an engine that holds no state".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // "The ID for the resources from which to get compliance information": an id that is
+        // not shaped like a managed-node id names no resource this read holds compliance
+        // for. `InvalidResourceId` carries NO message member at all, so the error code is the
+        // whole of what it reports.
+        let resource_ids: Vec<String> = input.resource_ids.clone().unwrap_or_default();
+        if !resource_ids
+            .iter()
+            .all(|id| managed_node_id_is_well_formed(id))
+        {
+            return Err(
+                ListComplianceItemsErrorModeled::InvalidResourceId(InvalidResourceId {}).into(),
+            );
+        }
+        // "Currently, the only supported resource type is ManagedInstance": a request naming
+        // another kind of resource asks about compliance of a kind this service reports none
+        // of. `InvalidResourceType` carries no message member either.
+        if input
+            .resource_types
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|kind| kind != RESOURCE_TYPE_MANAGED_INSTANCE)
+        {
+            return Err(
+                ListComplianceItemsErrorModeled::InvalidResourceType(InvalidResourceType {})
+                    .into(),
+            );
+        }
+
+        // A filter compares one member of a compliance item against the values it carries,
+        // under the comparison it names: a filter that names neither a member nor a value
+        // cannot be served, and the request is refused before a single item is read.
+        let mut filters: Vec<(String, Vec<String>, String)> = Vec::new();
+        for filter in input.filters.as_deref().unwrap_or_default() {
+            let values = filter.values.clone().unwrap_or_default();
+            if let Some(why) = compliance_filter_rejection(
+                filter.key.as_deref(),
+                &values,
+                filter.r#type.as_deref(),
+            ) {
+                return Err(ListComplianceItemsErrorModeled::InvalidFilter(InvalidFilter {
+                    message: Some(why),
+                })
+                .into());
+            }
+            // The key is there: the refusal above is what decides that, so this walk cannot
+            // drift from it.
+            let Some(key) = filter.key.clone().filter(|key| !key.is_empty()) else {
+                continue;
+            };
+            let operator = filter
+                .r#type
+                .clone()
+                .filter(|operator| !operator.is_empty())
+                .unwrap_or_else(|| {
+                    crate::state::compliance_items::OPERATOR_EQUAL.to_string()
+                });
+            filters.push((key, values, operator));
+        }
+
+        let page_size = compliance_page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // The token this read hands out is the item the next page starts at, written as the
+        // node id and the item id it is keyed by — so a token carrying no such pair was never
+        // one of ours.
+        let resume_from = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => match token.split_once(TOKEN_SEPARATOR) {
+                Some((node, id)) if managed_node_id_is_well_formed(node) && !id.is_empty() => {
+                    Some((node.to_string(), id.to_string()))
+                }
+                _ => {
+                    return Err(ListComplianceItemsErrorModeled::InvalidNextToken(
+                        InvalidNextToken {
+                            message: Some(INVALID_NEXT_TOKEN.to_string()),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // Systems Manager is regional: the compliance of a node is reached through the
+        // endpoint of the Region that node is registered with, which is the Region this
+        // request was signed for. The compliance a finished State Manager association run owes
+        // the nodes it applied the patch-baseline document on is materialised first, together
+        // with the managed-node registrations that application is derived from: each write was
+        // owed at the same instant whether or not anybody called. Each is taken with no guard
+        // of this store held.
+        let region = request_region(ctx.parts());
+        crate::state::node_registration::settle_registrations(&*self.engine, &region);
+        crate::state::association_patch_runs::settle_association_patch_runs(
+            &*self.engine,
+            &region,
+        );
+        let store = state.lock();
+        let mut compliance_items = Vec::new();
+        let mut next_token = None;
+        for item in store.compliance_items(&region, &resource_ids) {
+            if resume_from
+                .as_ref()
+                .is_some_and(|(node, id)| (&item.resource_id, &item.id) < (node, id))
+            {
+                continue;
+            }
+            // Two filters narrow together: an item is reported only when EVERY comparison the
+            // request carries holds of it.
+            if !filters
+                .iter()
+                .all(|(key, values, operator)| item.matches_filter(key, values, operator))
+            {
+                continue;
+            }
+            if compliance_items.len() == page_size {
+                // The page is full and an item is still waiting: hand the caller the item it
+                // resumes at, so the next request continues where this one stopped.
+                next_token = Some(format!(
+                    "{}{TOKEN_SEPARATOR}{}",
+                    item.resource_id, item.id
+                ));
+                break;
+            }
+            compliance_items.push(item.to_compliance_item());
+        }
+
+        Ok(ListComplianceItemsOutput {
+            compliance_items: Some(compliance_items),
+            next_token,
+        })
     }
 }
+
+/// What a page token writes between the node id and the item id it resumes at: a managed-node
+/// id carries no `/`, so the two halves of a token this read hands out are always told apart.
+const TOKEN_SEPARATOR: char = '/';

@@ -209,6 +209,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // compliance nobody collected.
         let region = crate::state::request_region(ctx.parts());
         let filters = input.filters.as_deref().unwrap_or_default();
+        // The compliance a finished State Manager association run owes the nodes it applied
+        // the patch-baseline document on is materialised first, together with the
+        // managed-node registrations that application is derived from: each write was owed at
+        // the same instant whether or not anybody called, so this read reports what was due.
+        // Each is taken with no guard of this store held.
+        crate::state::node_registration::settle_registrations(&*self.engine, &region);
+        crate::state::association_patch_runs::settle_association_patch_runs(
+            &*self.engine,
+            &region,
+        );
         let store = state.lock();
         let reported: Vec<PatchComplianceData> = store
             .instance_patch_state(&region, &input.instance_id)

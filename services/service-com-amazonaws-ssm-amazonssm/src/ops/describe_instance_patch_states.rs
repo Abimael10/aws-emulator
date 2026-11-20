@@ -198,6 +198,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request was signed for. The store yields the named nodes' reports for that Region
         // in ascending node-id order, which is what makes the resume cursor total.
         let region = request_region(ctx.parts());
+        // The compliance a finished State Manager association run owes the nodes it applied
+        // the patch-baseline document on is materialised first, together with the
+        // managed-node registrations that application is derived from: each write was owed at
+        // the same instant whether or not anybody called, so this read reports what was due.
+        // Each is taken with no guard of this store held.
+        crate::state::node_registration::settle_registrations(&*self.engine, &region);
+        crate::state::association_patch_runs::settle_association_patch_runs(
+            &*self.engine,
+            &region,
+        );
         let store = state.lock();
         let mut instance_patch_states = Vec::new();
         let mut next_token = None;

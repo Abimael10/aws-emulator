@@ -2343,6 +2343,24 @@ pub(crate) fn return_values(
             attributes.insert(SSM_ASSOCIATION_ID_ATTRIBUTE.to_string(), id.clone());
             (id, attributes)
         }
+        // "Ref returns the patch baseline ID"; Fn::GetAtt: Id. Systems Manager ASSIGNS that id
+        // too — `CreatePatchBaseline` takes the name the baseline is CALLED by and no
+        // identifier — so a declaration reports an identifier of that service's own shape
+        // (`pb-` and 17 hexadecimal characters, which its `BaselineId` pattern admits) rather
+        // than the `Name` the declaration states, which no Systems Manager call on a baseline
+        // would accept. The stand-in is a function of the STACK and the LOGICAL ID for the
+        // same reason the association's is — a declaration need state no name at all, and two
+        // baselines of one stack may be called the same — and `super::provisioning` re-points
+        // it at the id the create really answered.
+        crate::state::provisioning::ssm_patch_baseline::SSM_PATCH_BASELINE => {
+            let id = generated_service_id(
+                SSM_PATCH_BASELINE_ID_PREFIX,
+                &format!("{}/{}", scope.stack.stack_id, declared.logical_id),
+                SSM_PATCH_BASELINE_ID_DIGITS,
+            );
+            attributes.insert(SSM_PATCH_BASELINE_ID_ATTRIBUTE.to_string(), id.clone());
+            (id, attributes)
+        }
         // "Ref returns the alarm name"; Fn::GetAtt: Arn. A CloudWatch alarm's ARN spells
         // its resource with a COLON
         // (`arn:aws:cloudwatch:<region>:<account>:alarm:<alarm name>`), which is why the

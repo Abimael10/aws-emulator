@@ -206,6 +206,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // node at all rather than as a group that does not exist. A READ: nothing is
         // written, so a later caller sees the same reports.
         let region = crate::state::request_region(ctx.parts());
+        // The compliance a finished State Manager association run owes the nodes it applied
+        // the patch-baseline document on is materialised first, together with the
+        // managed-node registrations that application is derived from: each write was owed at
+        // the same instant whether or not anybody called, so this read reports what was due.
+        // Each is taken with no guard of this store held.
+        crate::state::node_registration::settle_registrations(&*self.engine, &region);
+        crate::state::association_patch_runs::settle_association_patch_runs(
+            &*self.engine,
+            &region,
+        );
         let store = state.lock();
         let reports: Vec<&crate::state::instance_patch_states::InstancePatchStateRecord> = store
             .instance_patch_states_in_group(&region, &input.patch_group)

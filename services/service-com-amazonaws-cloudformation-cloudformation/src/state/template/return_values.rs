@@ -196,6 +196,11 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         // resource, so it is read off the resource it created rather than computed here.
         EKS_ADDON | EKS_NODEGROUP => &["Arn"],
         SSM_ASSOCIATION => &[SSM_ASSOCIATION_ID_ATTRIBUTE],
+        // A patch baseline publishes the id Systems Manager minted for it, which is also what
+        // its `Ref` returns.
+        crate::state::provisioning::ssm_patch_baseline::SSM_PATCH_BASELINE => {
+            &[SSM_PATCH_BASELINE_ID_ATTRIBUTE]
+        }
         BATCH_COMPUTE_ENVIRONMENT => &["ComputeEnvironmentArn"],
         BATCH_JOB_QUEUE => &["JobQueueArn"],
         BATCH_JOB_DEFINITION => &["JobDefinitionArn"],
@@ -649,6 +654,12 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         || resource_type == crate::state::provisioner::ssm_maintenance_windows::SSM_MAINTENANCE_WINDOW
         || resource_type
             == crate::state::provisioner::ssm_maintenance_windows::SSM_MAINTENANCE_WINDOW_TARGET
+        // A PATCH BASELINE is one more: `CreatePatchBaseline` takes the `Name` the baseline
+        // is CALLED by and the patches it approves, no identifier at all, and answers the
+        // `pb-…` `BaselineId` Systems Manager minted — the handle `GetPatchBaseline`,
+        // `UpdatePatchBaseline`, `DeletePatchBaseline` and the patch-group registers each
+        // take, and what "Ref returns the patch baseline ID" publishes.
+        || resource_type == crate::state::provisioning::ssm_patch_baseline::SSM_PATCH_BASELINE
         // An IAM access key is one more: "Ref returns the AWS::IAM::AccessKey resource's
         // access key ID", `CreateAccessKey` takes no identifier — the declaration states
         // only the user the key belongs to — and that id is what every IAM operation on a
@@ -1887,6 +1898,14 @@ pub const SSM_ASSOCIATION: &str = "AWS::SSM::Association";
 /// ("Fn::GetAtt … AssociationId: the association ID"), which is also the member Systems
 /// Manager's own `AssociationDescription` reports it as.
 pub const SSM_ASSOCIATION_ID_ATTRIBUTE: &str = "AssociationId";
+
+/// The published return value an `AWS::SSM::PatchBaseline` carries its identifier under
+/// ("Fn::GetAtt … Id: the ID of the patch baseline"), which is also what its `Ref` returns —
+/// the `pb-…` id `CreatePatchBaseline` MINTS, which is why [`identity_is_service_assigned`]
+/// names that type: the call takes no identifier for the baseline (a declaration states the
+/// name it is called and the patches it approves), every Systems Manager call on one takes
+/// that id, and no naming rule here could compute it.
+pub const SSM_PATCH_BASELINE_ID_ATTRIBUTE: &str = "Id";
 
 /// A Resource Groups resource group's resource type (that model:
 /// `cloudFormationName: ResourceGroups`, `arnNamespace: resource-groups`). This is a type

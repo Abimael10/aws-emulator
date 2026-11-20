@@ -170,10 +170,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Error returned if an attempt is made to delete a patch baseline that is
         // registered for a patch group" (`ResourceInUseException`): a patch group is
-        // registered with a baseline by `RegisterPatchBaselineForPatchGroup`, and this
-        // service holds no such registration, so no baseline it holds is in use by one and
-        // nothing is refused for that reason.
+        // registered with a baseline by `RegisterPatchBaselineForPatchGroup`
+        // ([`crate::state::patch_groups`]), so a baseline a group still holds is in use and
+        // the delete is refused, naming the group whose registration has to go first.
         let resolved = store.resolve_patch_baseline(&region, &input.baseline_id);
+        if let Some(resolved) = resolved.as_ref() {
+            let groups = store.patch_groups_of_patch_baseline(&region, &resolved.baseline_id);
+            if let Some(group) = groups.first() {
+                return Err(DeletePatchBaselineErrorModeled::ResourceInUseException(
+                    ResourceInUseException {
+                        message: Some(crate::state::patch_groups::baseline_in_use_message(group)),
+                    },
+                )
+                .into());
+            }
+        }
         let deleted = match resolved {
             // A baseline this endpoint resolves: the record the account created under that
             // id is removed, together with any default registration that named it, so a

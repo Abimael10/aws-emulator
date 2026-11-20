@@ -191,6 +191,11 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         // A State Manager association, identified by the `AssociationId` Systems Manager
         // minted — "Ref returns the association ID", the handle every call on one takes.
         SSM_ASSOCIATION => SSM_ASSOCIATION_ID_ATTRIBUTE,
+        // A patch baseline, identified by the `BaselineId` Systems Manager minted — "Ref
+        // returns the patch baseline ID", which that type publishes as its `Id`.
+        crate::state::provisioning::ssm_patch_baseline::SSM_PATCH_BASELINE => {
+            crate::state::template::SSM_PATCH_BASELINE_ID_ATTRIBUTE
+        }
         BATCH_COMPUTE_ENVIRONMENT => "ComputeEnvironmentArn",
         BATCH_JOB_QUEUE => "JobQueueArn",
         BATCH_JOB_DEFINITION => "JobDefinitionArn",

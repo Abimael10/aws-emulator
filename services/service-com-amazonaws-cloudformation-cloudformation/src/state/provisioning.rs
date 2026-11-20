@@ -338,6 +338,12 @@ mod secretsmanager_rotation_schedule;
 /// `AWS::SecretsManager::Secret`: the secret a stack declares, created in AWS Secrets
 /// Manager itself ([`secretsmanager_secret`]).
 mod secretsmanager_secret;
+/// `AWS::SSM::PatchBaseline`: the patch baseline a stack declares and the patch groups it
+/// registers that baseline for, created in AWS Systems Manager itself
+/// ([`ssm_patch_baseline`]). Visible to the rest of this service's state because the type's
+/// own NAME lives here, beside the arm that provisions it (the return-value rules name the
+/// type whose identity its create answers).
+pub(in crate::state) mod ssm_patch_baseline;
 mod step_functions_state_machine;
 /// The two `AWS::StepFunctions::*` types a stack declares beside a state machine — the
 /// VERSION it publishes of one and the ALIAS that routes traffic to versions: created in AWS
@@ -1289,6 +1295,10 @@ pub(super) enum Owner {
     /// created from, and the preset an output is written with. Which of them it is travels with
     /// the owner, as it does for the types above.
     MediaConvert(mediaconvert_resources::Kind),
+    /// `AWS::SSM::PatchBaseline`, whose arms are [`ssm_patch_baseline`]'s: the patch baseline
+    /// Systems Manager mints for the resource, together with the patch groups the declaration
+    /// registers it for.
+    SsmPatchBaseline,
 }
 
 /// The owner of a template resource type, or `None` for a type this emulator leaves
@@ -1404,6 +1414,9 @@ pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
     }
     if let Some(kind) = mediaconvert_resources::kind_of(resource_type) {
         return Some(Owner::MediaConvert(kind));
+    }
+    if resource_type == ssm_patch_baseline::SSM_PATCH_BASELINE {
+        return Some(Owner::SsmPatchBaseline);
     }
     provisioner_for(resource_type).map(Owner::Builtin)
 }
