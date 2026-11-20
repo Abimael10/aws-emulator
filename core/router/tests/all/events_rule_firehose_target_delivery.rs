@@ -24,10 +24,12 @@
 //! the call, one that may not, one that cannot be assumed) and what the target receives (the
 //! published envelope, or its own constant input).
 //!
-//! The Region and the IAM/wire helpers below are `pub(crate)`, so a suite driving the same
-//! four services over the same wire — `events_rule_fans_out_to_firehose_and_queue_targets.rs`
-//! — calls them rather than restating them: one encoder, one role builder and one Region for
-//! both.
+//! The Region, the emulator and the IAM/wire helpers below are `pub(crate)`, so a suite
+//! driving the same four services over the same wire —
+//! `events_rule_fans_out_to_firehose_and_queue_targets.rs` and
+//! `events_rule_firehose_target_takes_only_the_matching_entries.rs` — calls them rather than
+//! restating them: one encoder, one role builder, one service set and one Region for all of
+//! them.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -346,7 +348,7 @@ async fn delivered(router: &MultiServiceRouter, case: &str, prefix: &str) -> Str
 }
 
 /// The emulator the suite drives: the four services the flow spans, on ONE engine.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
