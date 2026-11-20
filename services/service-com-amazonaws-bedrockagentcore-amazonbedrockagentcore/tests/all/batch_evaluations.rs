@@ -1653,3 +1653,178 @@ async fn a_batch_evaluation_is_started_stopped_and_then_deleted() {
         "expected the deleted job to be gone from the store"
     );
 }
+
+/// Which operation addressed by a `batchEvaluationId` a row sends (source: smithy_query
+/// query="operation" operation="GetBatchEvaluation,StopBatchEvaluation,
+/// DeleteBatchEvaluation" — the three operations whose only input member is that id).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddressedOp {
+    Get,
+    Stop,
+    Delete,
+}
+
+impl AddressedOp {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Get => "GetBatchEvaluation",
+            Self::Stop => "StopBatchEvaluation",
+            Self::Delete => "DeleteBatchEvaluation",
+        }
+    }
+
+    async fn send(self, router: &MultiServiceRouter, id: &str) -> (u16, Value) {
+        match self {
+            Self::Get => get_batch_evaluation(router, id).await,
+            Self::Stop => stop_batch_evaluation(router, id).await,
+            Self::Delete => delete_batch_evaluation(router, id).await,
+        }
+    }
+}
+
+/// The batch-evaluation plane's not-found wording, over every operation a job is addressed
+/// by and every way a well-formed `batchEvaluationId` can address none.
+///
+/// THE RULE: a lookup of a batch evaluation this plane holds no job for is refused 404
+/// `ResourceNotFoundException` (`@httpError 404`, one `message` member — source:
+/// smithy_query query="shape" shape="ResourceNotFoundException") with ONE sentence that is
+/// fixed text end to end: neither the `batchEvaluationId` the request spelled nor the
+/// resource type appears in it, so the refusal is a property of the RESOURCE rather than of
+/// the handler that refuses or of the id that missed.
+///
+/// The rows span what the rule generalises over:
+///
+/// * which OPERATION refuses: the read, the stop and the delete, each addressed by nothing
+///   but the `batchEvaluationId`;
+/// * WHY no job is held: an id nothing ever started, one differing from a held job only in
+///   its discriminator, one differing from it only in the case of its name, and one a
+///   delete removed;
+/// * what the id SPELLS: the shortest and the longest id `BatchEvaluationId`'s pattern
+///   (`^[a-zA-Z][a-zA-Z0-9-_]{0,99}-[a-zA-Z0-9]{10}$`) admits, and one carrying both the
+///   `-` and the `_` that pattern also admits.
+#[tokio::test]
+async fn every_missed_batch_evaluation_lookup_states_one_fixed_sentence() {
+    let span = agentcore::state::BATCH_EVALUATION_TRANSITION_SPAN;
+    let (router, engine) = emulator();
+
+    // One job is held for the whole case — and kept well short of the instant it starts
+    // running, so it stays readable and stays stoppable — which is what makes every refusal
+    // below about the id that was addressed rather than about an empty plane.
+    let (status, held) = start_batch_evaluation(&router, minimal_request("held_job")).await;
+    assert_eq!(
+        status, 202,
+        "the held fixture job must be started, got {status} with {held:?}"
+    );
+    let held_id = text(&held, "batchEvaluationId").to_string();
+    place_short_of_its_run(&engine, &held_id);
+
+    // A second job is carried to the end of its run and deleted, so one row addresses an id
+    // this plane DID hold and holds no longer.
+    let (status, doomed) = start_batch_evaluation(&router, minimal_request("deleted_job")).await;
+    assert_eq!(
+        status, 202,
+        "the fixture job to delete must be started, got {status} with {doomed:?}"
+    );
+    let deleted_id = text(&doomed, "batchEvaluationId").to_string();
+    age_batch_evaluation(&engine, &deleted_id, GENEROUS_MARGIN + span * 2);
+    let (status, removed) = delete_batch_evaluation(&router, &deleted_id).await;
+    assert_eq!(
+        status, 202,
+        "the fixture delete must be accepted, got {status} with {removed:?}"
+    );
+
+    let (held_prefix, held_discriminator) = held_id.rsplit_once('-').expect("a minted id");
+    let unknown: Vec<(&str, String)> = vec![
+        ("never started", "nightly_regression-0a1b2c3d4e".to_string()),
+        // The two bounds of the pattern: one letter before the discriminator, and the 100
+        // characters its `[a-zA-Z][a-zA-Z0-9-_]{0,99}` head admits.
+        ("shortest admissible id", "a-0123456789".to_string()),
+        (
+            "longest admissible id",
+            format!("z{}-0a1b2c3d4e", "y".repeat(99)),
+        ),
+        (
+            "dashes and underscores",
+            "nightly-regression_v2-0A1b2C3d4E".to_string(),
+        ),
+        (
+            "same name, other discriminator",
+            format!("{held_prefix}-ffffffffff"),
+        ),
+        (
+            "the held name in another case",
+            format!(
+                "{}-{held_discriminator}",
+                held_prefix.to_ascii_uppercase()
+            ),
+        ),
+        ("an id a delete removed", deleted_id.clone()),
+    ];
+
+    for (case, id) in &unknown {
+        assert!(
+            is_modelled_batch_evaluation_id(id),
+            "case {case:?}: the row must spell an id the model admits, got {id:?}"
+        );
+        assert_ne!(
+            id, &held_id,
+            "case {case:?}: the row must address no held job, got the held id {id:?}"
+        );
+
+        for op in [AddressedOp::Get, AddressedOp::Stop, AddressedOp::Delete] {
+            let operation = op.name();
+            let (status, body) = op.send(&router, id).await;
+            assert_eq!(
+                status, 404,
+                "case {case:?} on {operation}: expected HTTP 404 for {id:?}, got {status} with {body:?}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "ResourceNotFoundException",
+                "case {case:?} on {operation}: expected ResourceNotFoundException for {id:?}, got {body:?}"
+            );
+            assert_eq!(
+                text(&body, "message"),
+                BATCH_EVALUATION_NOT_FOUND_SENTENCE,
+                "case {case:?} on {operation}: expected the plane's fixed sentence for {id:?}, got {:?}",
+                text(&body, "message")
+            );
+            // The sentence has no variable part, so no part of the request is in it: not
+            // the whole id, not its discriminator, and not the resource type either.
+            let message = text(&body, "message").to_string();
+            for named in [
+                id.as_str(),
+                id.rsplit_once('-').expect("a well-formed id").1,
+            ] {
+                assert!(
+                    !message.contains(named),
+                    "case {case:?} on {operation}: the sentence must not spell {named:?}, got {message:?}"
+                );
+            }
+            for typed in ["batch evaluation", "Batch Evaluation", "batchEvaluationId"] {
+                assert!(
+                    !message.contains(typed),
+                    "case {case:?} on {operation}: the sentence must not name the resource type {typed:?}, got {message:?}"
+                );
+            }
+        }
+    }
+
+    // None of those refusals wrote anything: the held job still reads back in the status it
+    // was in, and it is still the only job this plane holds.
+    let (status, read) = get_batch_evaluation(&router, &held_id).await;
+    assert_eq!(
+        status, 200,
+        "expected the held job to still read back, got {status} with {read:?}"
+    );
+    assert_eq!(
+        text(&read, "status"),
+        "PENDING",
+        "expected the refusals to move no status, got {read:?}"
+    );
+    assert_eq!(
+        batch_evaluation_count(&engine),
+        1,
+        "expected the refusals to have removed nothing but the fixture delete's job"
+    );
+}
