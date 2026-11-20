@@ -41,6 +41,9 @@ vector-tile = { path = "../vector-tile" }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# The one integration-test target's suite list: `tests/all/main.rs` declares one
+# module per `tests/all/<name>.rs`, so a new suite is a new file and nothing else.
+automod = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 # RFC 3986 percent-encoding, so a test can put an ARN in a single-segment

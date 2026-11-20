@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPlace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPlace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPlace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: resolves `PlaceId` against the dataset of the geospatial data
+//! provider the place index named by `IndexName` was created with
+//! ([`crate::state::places`]) and reports that place. An identifier is resolvable
+//! through any index of the PROVIDER that minted it — the identifier's documented
+//! scope is the account, the Region and the provider, not the index — and
+//! `ResourceNotFoundException` answers an index the account does not hold, while
+//! an identifier that provider never minted is not a place this read could not
+//! find but an input this index cannot read, so it is refused with
+//! `ValidationException`. This is the only file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +175,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPlace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPlaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPlace"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetPlaceErrorModeled::InternalServerException(InternalServerException {
+                message: "the Amazon Location state store is unavailable".to_string(),
+            })
+        })?;
+
+        // Which provider minted the identifiers this index can resolve is a
+        // property of the place index resource, so an index the account does not
+        // hold resolves nothing.
+        let data_source = {
+            let store = state.lock();
+            store
+                .place_indexes
+                .get(&input.index_name)
+                .map(|index| index.data_source.clone())
+                .ok_or_else(|| {
+                    GetPlaceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                        message: crate::state::resource_not_found(
+                            crate::state::PLACE_INDEX_RESOURCE,
+                            &input.index_name,
+                        ),
+                    })
+                })?
+        };
+
+        // "A PlaceId is valid only if all of the following are the same in the
+        // original search request and the call to GetPlace: Customer Amazon Web
+        // Services account, Amazon Web Services Region, Data provider specified in
+        // the place index resource." The index itself is not among them: an
+        // identifier minted through one index resolves through every index of the
+        // same provider, and through none of another provider's — where it is not a
+        // place that cannot be found but an input this index cannot read.
+        let record = crate::state::places::record_of_place_id(&input.place_id, &data_source)
+            .ok_or_else(|| {
+                GetPlaceErrorModeled::ValidationException(
+                    crate::state::field_validation_exception(
+                        crate::state::places::PLACE_ID_MEMBER,
+                        crate::state::PLACE_ID_NOT_VALID.to_string(),
+                    ),
+                )
+            })?;
+
+        Ok(GetPlaceOutput {
+            place: crate::state::places::projected_place(
+                record,
+                &data_source,
+                input.language.as_deref(),
+            ),
+        })
     }
 }

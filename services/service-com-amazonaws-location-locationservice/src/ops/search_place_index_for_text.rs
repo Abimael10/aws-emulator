@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchPlaceIndexForText
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SearchPlaceIndexForText`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SearchPlaceIndexForText::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: geocodes the request's free-form `Text` against the dataset of the
+//! geospatial data provider the place index named by `IndexName` was created with
+//! ([`crate::state::places`]), narrows the matches by the request's optional country,
+//! bounding-box and category filters, and answers them in order of highest to lowest
+//! relevance with a summary echoing the request. `ResourceNotFoundException` when the
+//! account holds no such place index. This is the only file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -172,6 +170,15 @@ impl From<SearchPlaceIndexForTextErrorModeled> for SearchPlaceIndexForTextError 
     }
 }
 
+/// This operation's channel for a member the request got wrong: the shape comes from
+/// [`crate::state::field_validation_exception`], which every operation shares; only the
+/// lift into this operation's own error enum is local.
+fn field_validation_failed(member: &str, why: String) -> SearchPlaceIndexForTextErrorModeled {
+    SearchPlaceIndexForTextErrorModeled::ValidationException(
+        crate::state::field_validation_exception(member, why),
+    )
+}
+
 /// The `SearchPlaceIndexForText` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -208,18 +215,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SearchPlaceIndexForText` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchPlaceIndexForTextErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SearchPlaceIndexForText"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SearchPlaceIndexForTextErrorModeled::InternalServerException(InternalServerException {
+                message: "the Amazon Location state store is unavailable".to_string(),
+            })
+        })?;
+
+        // "BiasPosition and FilterBBox are mutually exclusive. Specifying both
+        // options results in an error": two ways to say WHERE to look, so the
+        // request cannot carry both.
+        if input.bias_position.is_some() && input.filter_b_box.is_some() {
+            return Err(field_validation_failed(
+                crate::state::places::BIAS_POSITION_MEMBER,
+                crate::state::places::MUTUALLY_EXCLUSIVE_BIAS_AND_BBOX.to_string(),
+            )
+            .into());
+        }
+        // Both members are `len`-constrained lists of plain doubles, so the request
+        // boundary admits any coordinate: the WGS 84 domain, and a box's corner
+        // order, are this service's own checks.
+        let bias = input
+            .bias_position
+            .as_deref()
+            .map(crate::state::wgs84_position)
+            .transpose()
+            .map_err(|why| {
+                field_validation_failed(crate::state::places::BIAS_POSITION_MEMBER, why)
+            })?;
+        let bounding_box = input
+            .filter_b_box
+            .as_deref()
+            .map(crate::state::places::wgs84_bounding_box)
+            .transpose()
+            .map_err(|why| field_validation_failed(crate::state::places::FILTER_BBOX_MEMBER, why))?;
+
+        // Which provider answers the search is a property of the place index
+        // resource, so an index the account does not hold has no dataset to search.
+        let data_source = {
+            let store = state.lock();
+            store
+                .place_indexes
+                .get(&input.index_name)
+                .map(|index| index.data_source.clone())
+                .ok_or_else(|| {
+                    SearchPlaceIndexForTextErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: crate::state::resource_not_found(
+                                crate::state::PLACE_INDEX_RESOURCE,
+                                &input.index_name,
+                            ),
+                        },
+                    )
+                })?
+        };
+
+        let narrowing = crate::state::places::Narrowing {
+            countries: input.filter_countries.as_deref(),
+            bounding_box,
+            categories: input.filter_categories.as_deref(),
+        };
+        // `MaxResults` is modelled `range 1..50` and the boundary refuses a
+        // violation, so the clamp is defence in depth; an absent member is the
+        // member's documented default.
+        let limit = input
+            .max_results
+            .map_or(crate::state::places::DEFAULT_SEARCH_RESULT_LIMIT, |most| {
+                most.clamp(1, crate::state::places::MAX_SEARCH_RESULT_LIMIT) as usize
+            });
+
+        let matched = crate::state::places::search_text(&input.text, &narrowing, bias);
+        let results: Vec<SearchForTextResult> = matched
+            .iter()
+            .take(limit)
+            .map(|ranked| SearchForTextResult {
+                place: crate::state::places::projected_place(
+                    ranked.record,
+                    &data_source,
+                    input.language.as_deref(),
+                ),
+                // "Distance will be returned only if a bias position was specified
+                // in the query."
+                distance: ranked.distance,
+                relevance: Some(ranked.relevance),
+                // "For SearchPlaceIndexForText operations, the PlaceId is returned
+                // only by place indexes that use HERE or Grab as a data provider."
+                place_id: crate::state::places::text_search_place_id(
+                    ranked.record,
+                    &data_source,
+                ),
+            })
+            .collect();
+        // The box "that fully contains all search results" — the results this
+        // response carries, not every record the query matched.
+        let result_b_box = crate::state::places::enclosing_box(
+            results
+                .iter()
+                .filter_map(|result| result.place.geometry.point.as_ref())
+                .filter_map(|point| <[f64; 2]>::try_from(point.as_slice()).ok()),
+        );
+
+        Ok(SearchPlaceIndexForTextOutput {
+            summary: SearchPlaceIndexForTextSummary {
+                // The summary "echoes the input values for BiasPosition, FilterBBox,
+                // FilterCountries, Language, MaxResults, and Text", so each member
+                // is reported exactly as the request sent it — absent when the
+                // request named it not at all.
+                text: input.text,
+                bias_position: input.bias_position,
+                filter_b_box: input.filter_b_box,
+                filter_countries: input.filter_countries,
+                max_results: input.max_results,
+                result_b_box,
+                // "The geospatial data provider attached to the place index resource
+                // specified in the request."
+                data_source,
+                language: input.language,
+                filter_categories: input.filter_categories,
+            },
+            results,
+        })
     }
 }

@@ -91,6 +91,14 @@ pub mod vector_tile;
 /// same layers.
 pub mod style_document;
 
+/// The place records the Places plane geocodes against, and the one statement of
+/// how a free-form query is matched against them, how a match is ranked and
+/// narrowed, and how a record is reported through the provider a place index was
+/// created with. Beside this module because a place index resource stores a
+/// provider and no places of its own, so every Places operation reaches the same
+/// records.
+pub mod places;
+
 /// Epoch milliseconds. Amazon Location renders every timestamp in ISO 8601
 /// `YYYY-MM-DDThh:mm:ss.sssZ` (see the `CreateTime`/`SampleTime` member docs in the
 /// Smithy model), so millisecond resolution is the precision the wire carries.
@@ -891,6 +899,22 @@ pub const MAP_RESOURCE: &str = "Map";
 
 /// How this service names a place index resource in a refusal about it.
 pub const PLACE_INDEX_RESOURCE: &str = "Place index";
+
+/// The `ValidationException` sentence a place read states for a `PlaceId` the
+/// place index's own data provider never minted.
+///
+/// The `GetPlace` doc states what makes an identifier valid: "A PlaceId is valid
+/// only if all of the following are the same in the original search request and
+/// the call to GetPlace: Customer Amazon Web Services account, Amazon Web Services
+/// Region, Data provider specified in the place index resource." An identifier
+/// that fails that test is not a place this read could not find — it is an input
+/// this index cannot read — so the refusal is about the member rather than about a
+/// missing resource, and the sentence is this API's member-named form: the member
+/// in single quotes, then the rule it broke, as [`pattern_refusal`] and
+/// [`documented_value_set_refusal`] word it for the members they refuse. It
+/// carries no request value: `PlaceId` is `@sensitive`, so the identifier may not
+/// appear in an error string, and it is already the request's own `PlaceId`.
+pub const PLACE_ID_NOT_VALID: &str = "'PlaceId' must be a valid ID.";
 
 /// The `ResourceNotFoundException` sentence stated for a name no resource of that
 /// kind is stored under: the resource's own name as this service writes it, then the
