@@ -22,7 +22,7 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_redshiftdata_redshiftdata::state::{
-    MAX_OPEN_DATABASES, MAX_RESULT_ROWS, MAX_RETAINED_STATEMENTS,
+    caller_database_user, MAX_OPEN_DATABASES, MAX_RESULT_ROWS, MAX_RETAINED_STATEMENTS,
 };
 
 // The harness every suite in this crate drives the emulator through.
@@ -1523,7 +1523,9 @@ async fn execute_statement_refuses_a_request_that_names_no_single_target() {
 }
 
 /// Each authorization combination the documentation names is accepted, and the
-/// statement reports the credentials it was submitted with.
+/// statement reports the credentials it was submitted with — and, for a
+/// submission that names no authorization method of its own, the database user
+/// the caller's IAM identity is mapped to.
 #[tokio::test]
 async fn each_documented_authorization_combination_is_accepted() {
     let emulator = Emulator::new();
@@ -1558,13 +1560,27 @@ async fn each_documented_authorization_combination_is_accepted() {
             .ok("DescribeStatement", &json!({"Id": id_of(&submitted)}))
             .await;
 
-        for member in ["ClusterIdentifier", "WorkgroupName", "DbUser", "SecretArn"] {
+        for member in ["ClusterIdentifier", "WorkgroupName", "SecretArn"] {
             assert_eq!(
                 described.get(member).cloned().unwrap_or(Value::Null),
                 connection.get(member).cloned().unwrap_or(Value::Null),
                 "case {label}: {member} must be reported as submitted, got {described}"
             );
         }
+        // A submission that names a database user runs as that user; one that
+        // names neither a user nor a secret authenticates with the temporary
+        // credentials of the identity it was signed with, and runs as the
+        // database user that identity maps to.
+        let expected_user = match (connection.get("DbUser"), connection.get("SecretArn")) {
+            (Some(named), _) => named.clone(),
+            (None, Some(_secret)) => Value::Null,
+            (None, None) => json!(caller_database_user()),
+        };
+        assert_eq!(
+            described.get("DbUser").cloned().unwrap_or(Value::Null),
+            expected_user,
+            "case {label}: expected DbUser {expected_user}, got {described}"
+        );
         assert_eq!(
             described["ExecutionMode"], "AUTO_COMMIT",
             "case {label}: a single statement is committed on its own, got {described}"

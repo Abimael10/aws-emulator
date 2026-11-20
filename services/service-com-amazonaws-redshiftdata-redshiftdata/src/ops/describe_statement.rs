@@ -251,7 +251,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             query_string: statement.query_string(),
             result_rows: statement.result_rows(),
             result_size: statement.result_size(),
-            redshift_query_id: statement.redshift_query_id,
+            redshift_query_id: statement.redshift_query_id(),
             redshift_query_uuid: statement.query_uuid.clone(),
             // `SqlParametersList` is modelled with a minimum length of 1, so a
             // statement submitted without parameters reports the member absent
@@ -310,7 +310,7 @@ fn sub_statement_data(sub_statement: &Statement) -> SubStatementData {
         query_string: sub_statement.query_string(),
         result_rows: sub_statement.result_rows(),
         result_size: sub_statement.result_size(),
-        redshift_query_id: sub_statement.redshift_query_id,
+        redshift_query_id: sub_statement.redshift_query_id(),
         redshift_query_uuid: sub_statement.query_uuid.clone(),
         has_result_set: sub_statement.has_result_set(),
     }

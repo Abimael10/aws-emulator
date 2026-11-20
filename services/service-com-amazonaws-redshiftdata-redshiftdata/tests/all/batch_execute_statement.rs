@@ -231,9 +231,9 @@ async fn a_batch_reports_each_statement_it_ran_in_order() {
                 case.label
             );
             assert!(
-                number(sub, "RedshiftQueryId") > 0 && sub["RedshiftQueryUuid"].is_string(),
-                "case {}: statement {position} is a query the cluster ran, so it carries its own \
-                 identifiers: {sub}",
+                number(sub, "RedshiftQueryId") == 0 && sub["RedshiftQueryUuid"].is_string(),
+                "case {}: statement {position} carries its own query identifier, and no \
+                 warehouse query id is reported for a statement of a batch: {sub}",
                 case.label
             );
 

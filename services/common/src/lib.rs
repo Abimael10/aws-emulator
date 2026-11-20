@@ -269,6 +269,10 @@
 //! epoch-seconds number.
 
 pub mod rds_cluster_parameters;
+/// The ONE mapping from an IAM identity to the database user an Amazon Redshift warehouse
+/// runs that identity's work as, for the control plane that mints its credentials and the
+/// Data API that reports the user a statement ran as.
+pub mod redshift_database_users;
 /// The Amazon DocumentDB engine catalog the one `rds` front door publishes — its engine
 /// versions, their upgrade targets and the capabilities a version and an orderable option of
 /// it report — shared by the two views of that door which answer for this engine.

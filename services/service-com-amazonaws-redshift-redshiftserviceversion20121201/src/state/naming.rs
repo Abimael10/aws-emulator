@@ -432,9 +432,17 @@ pub fn credential_duration_out_of_range_message() -> String {
 /// `False` or `IAMA:` if `AutoCreate` is `True`" — so the prefix is decided by
 /// the request's own `AutoCreate` and by nothing else.
 pub fn credential_db_user(db_user: &str, auto_create: bool) -> String {
-    let prefix = if auto_create { "IAMA:" } else { "IAM:" };
+    let prefix = if auto_create {
+        AUTO_CREATED_DB_USER_PREFIX
+    } else {
+        ::service_common::redshift_database_users::IAM_IDENTITY_DB_USER_PREFIX
+    };
     format!("{prefix}{db_user}")
 }
+
+/// The prefix the database user of an identity `AutoCreate` creates on the way in
+/// carries. See [`credential_db_user`].
+const AUTO_CREATED_DB_USER_PREFIX: &str = "IAMA:";
 
 /// The prefix the database user of an IAM ROLE identity carries, beside the
 /// `IAM:` prefix [`credential_db_user`] states for every other IAM identity.
@@ -443,13 +451,10 @@ pub fn credential_db_user(db_user: &str, auto_create: bool) -> String {
 /// the `IAM:`/`IAMA:` prefixes an identity logs on under, and the Amazon Redshift
 /// identity-to-database-user mapping gives a ROLE its own prefix — so the prefix
 /// says which KIND of IAM identity the database user stands for, and the name
-/// after it is that identity's own name.
-pub const IAM_ROLE_DB_USER_PREFIX: &str = "IAMR:";
-
-/// The resource type an assumed-role identity's ARN carries
-/// (`arn:aws:sts::<account>:assumed-role/<role>/<session>`), which is what makes
-/// it a ROLE identity rather than a user.
-const ASSUMED_ROLE_RESOURCE_TYPE: &str = "assumed-role";
+/// after it is that identity's own name. Stated through the ONE definition of that
+/// mapping, which the Data API reports the user a statement ran as from.
+pub const IAM_ROLE_DB_USER_PREFIX: &str =
+    ::service_common::redshift_database_users::IAM_ROLE_DB_USER_PREFIX;
 
 /// The `DbUser` a `GetClusterCredentialsWithIAM` response reports for the IAM
 /// identity the request was signed with, given that identity's ARN.
@@ -474,27 +479,13 @@ const ASSUMED_ROLE_RESOURCE_TYPE: &str = "assumed-role";
 /// credentials of ONE identity map to one database user, which is what makes the
 /// mapping 1:1 — and a value that is not a well-formed ARN is read as the name it
 /// stands for rather than replaced.
+///
+/// Stated through the ONE definition of that mapping
+/// ([`service_common::redshift_database_users::iam_identity_db_user`]) rather than
+/// built here, so the user this service mints a credential for is the user the
+/// Data API reports a statement of the same identity as having run as.
 pub fn iam_identity_db_user(caller_identity_arn: &str) -> String {
-    let resource =
-        ::service_common::arn::resource(caller_identity_arn).unwrap_or(caller_identity_arn);
-    let (resource_type, rest) = resource.split_once('/').unwrap_or(("", resource));
-    if resource_type == ASSUMED_ROLE_RESOURCE_TYPE {
-        // `assumed-role/<role>/<session>`: the identity is the ROLE, so the
-        // session name the caller chose per session names no database user.
-        let role_name = rest.split('/').find(|segment| !segment.is_empty());
-        return format!(
-            "{IAM_ROLE_DB_USER_PREFIX}{}",
-            role_name.unwrap_or(rest)
-        );
-    }
-    // Every other identity's name is the LAST segment of its resource field: an
-    // IAM user's path (`user/team/airflow/analyst`) belongs to where the identity
-    // sits, not to its name.
-    let name = rest
-        .rsplit('/')
-        .find(|segment| !segment.is_empty())
-        .unwrap_or(rest);
-    credential_db_user(name, false)
+    ::service_common::redshift_database_users::iam_identity_db_user(caller_identity_arn)
 }
 
 // The clusters a token request may scope its token to are documented on the

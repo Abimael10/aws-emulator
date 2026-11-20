@@ -266,7 +266,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 ///
 /// The text is written by the `csv` crate, so the separator, the quoting of a
 /// value carrying a comma, a quote or a newline, and the line terminator are a
-/// CSV writer's and not this service's own rendering. The terminator is the
+/// CSV writer's and not this service's own rendering; the TEXT of each value is
+/// the one the statement's own `ResultSize` is measured over
+/// ([`crate::state::value_text`]). The terminator is the
 /// CRLF the CSV format itself specifies (RFC 4180 §2: "Each record is located
 /// on a separate line, delimited by a line break (CRLF)"), so a record's own
 /// embedded newline stays distinguishable from the end of a record.
@@ -286,7 +288,7 @@ fn csv_records(
         writer.write_record(&header).map_err(|e| e.to_string())?;
     }
     for row in rows {
-        let cells: Vec<String> = row.iter().map(csv_cell).collect();
+        let cells: Vec<String> = row.iter().map(crate::state::value_text).collect();
         writer.write_record(&cells).map_err(|e| e.to_string())?;
     }
     let rendered = writer
@@ -294,20 +296,6 @@ fn csv_records(
         .map_err(|error| error.error().to_string())?;
     let rendered = String::from_utf8(rendered).map_err(|error| error.to_string())?;
     Ok(vec![QueryRecords::CSVRecords(rendered)])
-}
-
-/// One value as its CSV cell: the text the value IS. A SQL NULL carries no
-/// text at all, which is the empty cell; binary carries its bytes as
-/// hexadecimal, the text form Amazon Redshift prints a `VARBYTE` value in.
-fn csv_cell(field: &Field) -> String {
-    match field {
-        Field::isNull(_) => String::new(),
-        Field::booleanValue(value) => value.to_string(),
-        Field::longValue(value) => value.to_string(),
-        Field::doubleValue(value) => value.to_string(),
-        Field::stringValue(value) => value.clone(),
-        Field::blobValue(value) => hex::encode(value),
-    }
 }
 
 /// Refuse the request as invalid, with the `ValidationException` this operation
