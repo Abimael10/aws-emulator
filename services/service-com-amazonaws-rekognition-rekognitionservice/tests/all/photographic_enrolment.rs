@@ -27,7 +27,13 @@
 //! face turned to the camera, clothing), how large the subject is in the frame (a
 //! head-and-shoulders portrait, a close crop, a small figure in a wide frame), the tones it
 //! is lit in, and the format it is encoded in.
+//!
+//! The last table takes ONE photograph and submits it transformed — re-encoded, rescaled,
+//! mirrored, cropped — so the bytes differ in every row while the people the picture shows
+//! do not: a count read off the pixels is the same one each time, and a count synthesised
+//! from the request is not.
 
+use image::imageops::{self, FilterType};
 use image::{GrayImage, ImageFormat, Luma};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -649,5 +655,213 @@ async fn the_same_photograph_enrols_the_same_faces_every_time() {
              {found:?}",
             boxes[0]
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// One photograph, submitted transformed
+// ---------------------------------------------------------------------------
+
+/// The window the cropping transform below submits, in the drawn frame's own pixels: a
+/// window that holds the whole of the drawn head and less of the frame around it, so the
+/// face sits at other fractions of the submitted image than it does of the frame as drawn.
+const CROP_LEFT: u32 = 32;
+const CROP_TOP: u32 = 16;
+const CROP_SIDE: u32 = 256;
+
+/// One way of submitting the same photograph: what is done to its pixels, the format the
+/// result is encoded in, and where a point of the drawn frame lands in what was submitted.
+struct Submission {
+    case: &'static str,
+    format: ImageFormat,
+    /// The pixels the request carries, from the photograph as drawn.
+    apply: fn(&GrayImage) -> GrayImage,
+    /// Where a point of the drawn frame, in that frame's own pixels, sits in the submitted
+    /// image — as the fractions of width and height a `BoundingBox` is expressed in.
+    locate: fn(&Photograph, (f32, f32)) -> (f64, f64),
+}
+
+/// The photograph as drawn, encoded as it stands.
+fn as_drawn(pixels: &GrayImage) -> GrayImage {
+    pixels.clone()
+}
+
+/// The same photograph in a smaller frame: every distance in it three quarters of what it
+/// was, so each face covers as much of the picture as before over fewer pixels.
+fn scaled_down(pixels: &GrayImage) -> GrayImage {
+    imageops::resize(
+        pixels,
+        pixels.width() * 3 / 4,
+        pixels.height() * 3 / 4,
+        FilterType::Triangle,
+    )
+}
+
+/// The same photograph in a larger frame.
+fn scaled_up(pixels: &GrayImage) -> GrayImage {
+    imageops::resize(
+        pixels,
+        pixels.width() * 3 / 2,
+        pixels.height() * 3 / 2,
+        FilterType::Triangle,
+    )
+}
+
+/// The same photograph flipped left for right, which moves the subject across the frame
+/// without changing what the picture shows.
+fn mirrored(pixels: &GrayImage) -> GrayImage {
+    imageops::flip_horizontal(pixels)
+}
+
+/// A window of the same photograph, holding the whole subject and less of the surroundings.
+fn cropped(pixels: &GrayImage) -> GrayImage {
+    imageops::crop_imm(pixels, CROP_LEFT, CROP_TOP, CROP_SIDE, CROP_SIDE).to_image()
+}
+
+/// A point at the same fractions of the frame it was drawn at: what rescaling and
+/// re-encoding leave alone, since a `BoundingBox` is expressed in fractions.
+fn same_fractions(photograph: &Photograph, point: (f32, f32)) -> (f64, f64) {
+    (
+        f64::from(point.0) / f64::from(photograph.width),
+        f64::from(point.1) / f64::from(photograph.height),
+    )
+}
+
+/// A point mirrored with the frame: as far from the right edge as it was from the left.
+fn mirrored_fractions(photograph: &Photograph, point: (f32, f32)) -> (f64, f64) {
+    let (across, down) = same_fractions(photograph, point);
+    (1.0 - across, down)
+}
+
+/// A point of the drawn frame, as a fraction of the cropped window that was submitted.
+fn cropped_fractions(_photograph: &Photograph, point: (f32, f32)) -> (f64, f64) {
+    (
+        (f64::from(point.0) - f64::from(CROP_LEFT)) / f64::from(CROP_SIDE),
+        (f64::from(point.1) - f64::from(CROP_TOP)) / f64::from(CROP_SIDE),
+    )
+}
+
+/// Assert that `record`'s box covers the region of the SUBMITTED image that the drawn
+/// subject's own features landed in, and is a region of it rather than the whole of it.
+fn assert_box_covers(
+    case: &str,
+    record: &Value,
+    subject: &Subject,
+    photograph: &Photograph,
+    locate: fn(&Photograph, (f32, f32)) -> (f64, f64),
+) {
+    let (left, top, box_width, box_height) = face_box(case, record);
+    let (right, bottom) = (left + box_width, top + box_height);
+    for (name, point) in [
+        ("the left eye", subject.left_eye()),
+        ("the right eye", subject.right_eye()),
+        ("the mouth", subject.mouth_centre()),
+    ] {
+        let (x, y) = locate(photograph, point);
+        assert!(
+            x >= left && x <= right && y >= top && y <= bottom,
+            "case {case:?}: the enrolled box must hold {name}, which the submitted image \
+             carries at ({x:.3}, {y:.3}), got ({left:.3}, {top:.3}) {box_width:.3}x\
+             {box_height:.3}"
+        );
+    }
+    assert!(
+        box_width * box_height < 0.95,
+        "case {case:?}: a face's box is a region of the submitted image, not the whole of \
+         it, got ({left:.3}, {top:.3}) {box_width:.3}x{box_height:.3}"
+    );
+}
+
+/// What is enrolled is read off the PIXELS: one photograph submitted re-encoded, rescaled,
+/// mirrored and cropped enrols the same one face every time — each box over the subject
+/// where that submission put them — and the same photograph with the subject turned away
+/// from the camera enrols none through any of those submissions. The bytes differ in every
+/// row, so a count taken from the request rather than from its content cannot hold.
+#[tokio::test]
+async fn the_faces_enrolled_follow_the_pixels_through_transforms_of_the_picture() {
+    let router = harness();
+    // Off centre, so flipping the frame moves the subject rather than leaving them where
+    // they were.
+    let facing = Photograph::portrait().with_subjects(vec![Subject::new(112.0, 128.0, 60.0)]);
+    let turned_away = Photograph::portrait()
+        .with_subjects(vec![Subject::new(112.0, 128.0, 60.0).turned_away()]);
+    let submissions = [
+        Submission {
+            case: "as drawn, as a JPEG",
+            format: ImageFormat::Jpeg,
+            apply: as_drawn,
+            locate: same_fractions,
+        },
+        Submission {
+            case: "the same pixels re-encoded as a PNG",
+            format: ImageFormat::Png,
+            apply: as_drawn,
+            locate: same_fractions,
+        },
+        Submission {
+            case: "scaled down to three quarters",
+            format: ImageFormat::Jpeg,
+            apply: scaled_down,
+            locate: same_fractions,
+        },
+        Submission {
+            case: "scaled up by half",
+            format: ImageFormat::Png,
+            apply: scaled_up,
+            locate: same_fractions,
+        },
+        Submission {
+            case: "mirrored left for right",
+            format: ImageFormat::Jpeg,
+            apply: mirrored,
+            locate: mirrored_fractions,
+        },
+        Submission {
+            case: "cropped to a window around the subject",
+            format: ImageFormat::Png,
+            apply: cropped,
+            locate: cropped_fractions,
+        },
+    ];
+
+    for (subjects_case, photograph, expected) in [
+        ("one person facing the camera", &facing, 1_usize),
+        ("the same person photographed from behind", &turned_away, 0_usize),
+    ] {
+        let drawn = photograph.render();
+        for (at, submission) in submissions.iter().enumerate() {
+            let case = format!("{subjects_case}, {}", submission.case);
+            let collection_id = format!("submitted-{}-{at}", expected);
+            create_collection(&router, &collection_id).await;
+            let bytes = encode(&(submission.apply)(&drawn), submission.format);
+            let reply = index(&router, &collection_id, &bytes, Some("one-upload")).await;
+            let found = records(&case, &reply);
+            assert_eq!(
+                found.len(),
+                expected,
+                "case {case:?}: the picture shows {expected} face(s) however it is \
+                 submitted, got {} with boxes {:?}",
+                found.len(),
+                found
+                    .iter()
+                    .map(|record| face_box(&case, record))
+                    .collect::<Vec<_>>()
+            );
+            for (record, subject) in found.iter().zip(photograph.subjects.iter()) {
+                assert_box_covers(&case, record, subject, photograph, submission.locate);
+            }
+            let described = call(
+                &router,
+                "DescribeCollection",
+                json!({ "CollectionId": collection_id }),
+            )
+            .await;
+            assert_eq!(
+                described.field("FaceCount").and_then(Value::as_i64),
+                Some(expected as i64),
+                "case {case:?}: the collection holds exactly what was enrolled, got {:?}",
+                described.body
+            );
+        }
     }
 }
