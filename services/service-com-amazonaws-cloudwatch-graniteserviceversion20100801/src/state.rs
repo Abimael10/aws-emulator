@@ -1370,6 +1370,19 @@ pub struct StoredAlarm {
     /// takes it back FORWARD of that instant — not an arriving datapoint of the series the
     /// alarm watches, which would otherwise leave the forced state visible to nobody at all.
     pub forced_state_until_secs: f64,
+    /// The instant, in epoch seconds, at which this alarm's WARM-UP window ends; `None` for an
+    /// alarm configured with no `WarmUpConfiguration`.
+    ///
+    /// "Use these settings to delay alarm evaluation after you create or update the alarm […]
+    /// During the warm-up period, the alarm stays in `INSUFFICIENT_DATA` and does not perform
+    /// alarm actions." (`WarmUpConfiguration`) — so the window is an instant this store holds
+    /// rather than a span it sleeps: the evaluation that is due while it stands is WITHHELD, and
+    /// the alarm reports the warm-up evaluation state meanwhile
+    /// ([`alarm_evaluation::warm_up`]). Stored rather than derived from the configuration's own
+    /// time stamp, because a window can also end EARLY, once the series hold enough data to
+    /// fill the alarm's evaluation window, and because a later write never brings back one that
+    /// has already passed.
+    pub warm_up_ends_secs: Option<f64>,
     /// What this alarm's CONTRIBUTORS stood at when its evaluation last graded them, in the
     /// order the query that returns them ranked them; empty for an alarm that is graded on one
     /// series and so has no contributors at all.

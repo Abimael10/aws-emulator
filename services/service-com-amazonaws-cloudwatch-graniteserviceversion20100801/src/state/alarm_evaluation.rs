@@ -118,6 +118,10 @@ pub mod evaluation_window;
 
 pub use evaluation_window::{AlignmentZone, EvaluationGrid};
 
+/// The WARM-UP window an alarm is created or updated with: when it ends, and what it withholds
+/// while it is in force.
+pub mod warm_up;
+
 /// How long after the write that configured an alarm its FIRST evaluation is owed, and how
 /// long after an evaluation the NEXT one is owed.
 ///
@@ -1069,6 +1073,15 @@ impl State {
         // that came due since.
         if let Some(stored) = self.alarms.get_mut(name) {
             stored.evaluation_due_secs = now_secs + EVALUATION_DELAY_SECS;
+        }
+        // An alarm inside its WARM-UP window is not graded at all: "During the warm-up period,
+        // the alarm stays in INSUFFICIENT_DATA and does not perform alarm actions."
+        // (`WarmUpConfiguration`) — so this evaluation is withheld, whichever form the alarm's
+        // configuration is graded in, and the one that finds the window over hands the alarm
+        // back to its own grading ([`warm_up`]).
+        if self.warm_up_withholds_evaluation(name, now_secs, budget) {
+            budget.settled_one();
+            return;
         }
         // An alarm whose query returns a VECTOR of series is decided by its CONTRIBUTORS: each
         // entry of that vector is graded on its own ([`Self::graded_contributors`]) and the

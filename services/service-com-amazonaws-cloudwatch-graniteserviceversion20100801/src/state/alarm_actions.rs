@@ -1173,10 +1173,19 @@ fn metric_trigger_document(alarm: &MetricAlarm) -> Value {
         alarm.namespace.as_deref().map(Value::from),
     );
     // "StatisticType" says which of the two statistic members the alarm carries, the way the
-    // model names them (`MetricAlarm$Statistic` / `MetricAlarm$ExtendedStatistic`).
+    // model names them (`MetricAlarm$Statistic` / `MetricAlarm$ExtendedStatistic`). The VALUE
+    // of a basic statistic travels in the notification's own spelling — the upper-case token —
+    // where the API spells it in title case (`Statistic` enum: SampleCount/Average/Sum/
+    // Minimum/Maximum), so a consumer matching the payload's field as an enum matches the token
+    // CloudWatch puts on the wire. A percentile travels as the alarm names it: an
+    // `ExtendedStatistic` is a value of its own family ("p95", "tm99"), not a member of that
+    // enum, so there is no other spelling of it.
     if let Some(statistic) = alarm.statistic.as_deref() {
         trigger.insert("StatisticType".to_string(), Value::from("Statistic"));
-        trigger.insert("Statistic".to_string(), Value::from(statistic));
+        trigger.insert(
+            "Statistic".to_string(),
+            Value::from(notification_statistic(statistic)),
+        );
     } else if let Some(extended) = alarm.extended_statistic.as_deref() {
         trigger.insert(
             "StatisticType".to_string(),
@@ -1233,6 +1242,19 @@ fn metric_trigger_document(alarm: &MetricAlarm) -> Value {
             .map(Value::from),
     );
     Value::Object(trigger)
+}
+
+/// A basic statistic as the NOTIFICATION spells it: the upper-case token.
+///
+/// The API spells a statistic in title case — the `Statistic` enum's own values, which is what
+/// `PutMetricAlarm` accepts and `DescribeAlarms` reports
+/// (`smithy_query(query="shape",shape="Statistic")`) — while the state-change document
+/// CloudWatch publishes to an alarm's actions carries the same statistic upper-cased. Both
+/// spellings are of the one configured value, so the alarm stores the API's and only this
+/// document re-spells it; a name of any other statistic family is not a value of that enum and
+/// is carried as the alarm names it.
+fn notification_statistic(statistic: &str) -> String {
+    statistic.to_ascii_uppercase()
 }
 
 /// One query of a `Metrics` alarm as the notification's `Trigger` carries it: the members the

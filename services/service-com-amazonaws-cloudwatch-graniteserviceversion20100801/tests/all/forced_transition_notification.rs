@@ -131,15 +131,18 @@ async fn notifications(emulator: &Emulator, url: &str) -> Vec<(String, Value)> {
 }
 
 /// The members of a metric alarm's configuration the notification's `Trigger` reports under the
-/// SAME names the model gives them (`MetricAlarm$Namespace`, `$MetricName`, `$Statistic`,
-/// `$ExtendedStatistic`, `$Unit`, `$Period`, `$EvaluationPeriods`, `$DatapointsToAlarm`,
-/// `$ComparisonOperator`, `$Threshold`, `$TreatMissingData`,
-/// `smithy_query(query="shape",shape="MetricAlarm")`). Each is asserted on the rows that carry it,
-/// which is what makes the trigger the alarm's OWN configuration rather than a fixed document.
+/// SAME names the model gives them, in the SAME spelling the configuration carries
+/// (`MetricAlarm$Namespace`, `$MetricName`, `$ExtendedStatistic`, `$Unit`, `$Period`,
+/// `$EvaluationPeriods`, `$DatapointsToAlarm`, `$ComparisonOperator`, `$Threshold`,
+/// `$TreatMissingData`, `smithy_query(query="shape",shape="MetricAlarm")`). Each is asserted on
+/// the rows that carry it, which is what makes the trigger the alarm's OWN configuration rather
+/// than a fixed document.
+///
+/// `Statistic` is not among them: a basic statistic is the one member the notification spells
+/// differently from the API, and it is asserted on its own below.
 const TRIGGER_MEMBERS: &[&str] = &[
     "Namespace",
     "MetricName",
-    "Statistic",
     "ExtendedStatistic",
     "Unit",
     "Period",
@@ -332,6 +335,17 @@ async fn a_forced_transition_publishes_the_request_and_the_alarms_own_configurat
                 Some(asked),
                 "case {case:?}: the trigger must report the alarm's own {member}, expected \
                  {asked}, got {trigger}"
+            );
+        }
+        // A basic statistic travels in the notification's own spelling — the upper-case token —
+        // where the alarm's configuration carries the API's title case.
+        if let Some(asked) = configuration["Statistic"].as_str() {
+            assert_eq!(
+                trigger["Statistic"].as_str(),
+                Some(asked.to_ascii_uppercase().as_str()),
+                "case {case:?}: the trigger must report the alarm's statistic as the \
+                 notification's upper-case token, expected {:?}, got {trigger}",
+                asked.to_ascii_uppercase()
             );
         }
         // A dimension is spelled in the trigger the way a notification spells it — lower case —

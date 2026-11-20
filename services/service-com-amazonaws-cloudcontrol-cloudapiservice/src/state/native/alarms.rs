@@ -461,6 +461,14 @@ fn write(
     replacing: bool,
 ) {
     let previous = store.alarms.get(identifier).map(|stored| stored.alarm.clone());
+    // The WARM-UP window the alarm is standing in, which this write leaves exactly where it is:
+    // the warm-up configuration itself is one this path carries over rather than applies, so the
+    // window it opened is the same one — and an alarm still inside it goes on reporting that
+    // (`cw::alarm_evaluation::warm_up`).
+    let warm_up_ends_secs = store
+        .alarms
+        .get(identifier)
+        .and_then(|stored| stored.warm_up_ends_secs);
     let state = previous.as_ref().map(|alarm| {
         (
             alarm.state_value.clone(),
@@ -517,8 +525,12 @@ fn write(
         metrics: previous.as_ref().and_then(|alarm| alarm.metrics.clone()),
         threshold_metric_id: desired.threshold_metric_id,
         // No evaluation has run against this configuration yet: the alarm's state is the one
-        // this write left it in until the first evaluation becomes due.
-        evaluation_state: None,
+        // this write left it in until the first evaluation becomes due — and an alarm inside a
+        // warm-up window says so, that evaluation being withheld until the window passes.
+        evaluation_state: cw::alarm_evaluation::warm_up::evaluation_state(
+            warm_up_ends_secs,
+            now,
+        ),
         state_transitioned_timestamp: state_transitioned,
         evaluation_window: previous
             .as_ref()
@@ -560,6 +572,7 @@ fn write(
             // Nothing a caller FORCED is standing: a configuration write hands the alarm
             // back to its own evaluation.
             forced_state_until_secs: 0.0,
+            warm_up_ends_secs,
             // Nothing is recorded per contributor by a write: the entries of a query that
             // returns a vector of series are what the alarm's own evaluation grades
             // (`cw::StoredAlarmContributor`).

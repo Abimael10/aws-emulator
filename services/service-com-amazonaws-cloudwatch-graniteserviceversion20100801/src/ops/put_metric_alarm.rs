@@ -1136,6 +1136,15 @@ fn write_alarm(
         .get(&input.alarm_name)
         .map(|stored| stored.tags.clone())
         .unwrap_or_default();
+    // The WARM-UP window this write leaves the alarm in: "After you create or update the alarm,
+    // the alarm stays in INSUFFICIENT_DATA for this duration"
+    // (`WarmUpConfiguration$WarmUpPeriodDurationInMinutes`), measured against the window the
+    // alarm is already standing in ([`crate::state::alarm_evaluation::warm_up::window_end_secs`]).
+    let warm_up_ends_secs = crate::state::alarm_evaluation::warm_up::window_end_secs(
+        store.alarms.get(&input.alarm_name),
+        input.warm_up_configuration.as_ref(),
+        now,
+    );
     let existing = previous.as_ref().map(|alarm| {
         (
             alarm.state_value.clone(),
@@ -1244,8 +1253,13 @@ fn write_alarm(
         metrics: crate::state::configured_queries(input.metrics.as_deref()),
         threshold_metric_id: input.threshold_metric_id.clone(),
         // No evaluation has run for this alarm yet: its state is the one this write left
-        // it in until the first evaluation becomes due.
-        evaluation_state: None,
+        // it in until the first evaluation becomes due — and an alarm inside a warm-up window
+        // says so, that evaluation being WITHHELD until the window passes
+        // ([`crate::state::alarm_evaluation::warm_up`]).
+        evaluation_state: crate::state::alarm_evaluation::warm_up::evaluation_state(
+            warm_up_ends_secs,
+            now,
+        ),
         state_transitioned_timestamp: state_transitioned,
         evaluation_window: input.evaluation_window.clone(),
         warm_up_configuration: input.warm_up_configuration.clone(),
@@ -1316,6 +1330,7 @@ fn write_alarm(
             // a caller FORCED: a configuration write hands the alarm back to its own
             // evaluation, so nothing is standing that the evaluation must not cut short.
             forced_state_until_secs: 0.0,
+            warm_up_ends_secs,
             // The entries of the query this alarm watches are what its own evaluation grades,
             // so this write records none of them: the first evaluation that is due for the
             // alarm reads them out of the series the store holds.
