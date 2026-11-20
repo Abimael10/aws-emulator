@@ -36,5 +36,29 @@ Traces: emr__glue__s3.cli-emr-cluster-terminate-s3-logs-persist-positive, emr__g
 Cause 1 — replay detail, verbatim: 'botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the CreateVpcEndpoint operation: operation CreateVpcEndpoint with route table associations is scaffolded but not implemented in this emulator'. Expected: HTTP 200 CreateVpcEndpointResult with the prefix-list route installed in the named route table. Actual: NotImplemented.
 Cause 2 — replay detail: 'Error: Check timed out after 60.0s' on all three checks. Expected: the step reaching COMPLETED and log objects under <LogUri>/<cluster-id>/ within the polling budget. Actual: nothing written, condition never reached.
 
+## Resolution
+Cause 1: EC2 `CreateVpcEndpoint` serves `RouteTableIds` — the association set is stored on the
+endpoint and the service's prefix-list route is installed in each named route table
+(`services/service-com-amazonaws-ec2-amazonec2/src/ops/create_vpc_endpoint.rs`, suites
+`create_vpc_endpoint_route_table_associations.rs`, `vpc_endpoint_prefix_list_route_conflict.rs`).
+Replay key `emr__glue__s3|CreateVpcEndpoint|NotImplemented`: fixed.
+
+Cause 2: a submitted step runs and ends in the state its work's exit status decides, a kept-alive
+cluster rests in `WAITING` once its queue has run, and the log files written under the launch's
+`LogUri` outlive the cluster. Replay keys
+`…cli-emr-create-cluster-submit-step-s3-workflow|_poll_until#15` and
+`…emr-cluster-logs-uploaded-to-s3-log-uri-positive|_poll_cluster_state#10`: fixed. The whole
+sequence is pinned over the wire by
+`services/service-com-amazonaws-emr-elasticmapreduce/tests/all/cluster_log_persistence_after_termination.rs`,
+which drives it in about ten seconds.
+
+Hand-off: this report's remaining key
+`…cli-emr-cluster-terminate-s3-logs-persist-positive|_poll_until#11` no longer stops in that poll
+helper — the same unit now runs out of the environment's per-check budget inside the check's own
+fixed-duration re-read loop, which is the key
+`emr__glue__s3.cli-emr-cluster-terminate-s3-logs-persist-positive|run#23|Timeout|time.sleep(2)`
+carried by the open report
+`issues/things-that-do-not-work/20261116T201047Z-emr-glue-s3-2-net-new-causes-an.md`.
+
 ## Steps to Reproduce
 1. Clone the repo and run the behavioral suite. 2. Replay the emr__glue__s3 checks in trace_ids. 3. Cause 1: call ec2 CreateVpcEndpoint with VpcEndpointType=Gateway, ServiceName=com.amazonaws.<region>.s3 and RouteTableIds=[<rtb-id>]. 4. Cause 2: RunJobFlow with a LogUri and one step, poll DescribeStep/ListSteps for COMPLETED and list <LogUri>/<cluster-id>/ in S3, then TerminateJobFlows and list again.
