@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeProtectConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeProtectConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeProtectConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the account's stored protect configurations from
+//! [`crate::state`], narrowed by `ProtectConfigurationIds` and `Filters` and paged over
+//! the store's stable key order. A pure read: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +82,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The prefix every `NextToken` this operation issues carries, and the one it requires a
+/// cursor to carry, so a cursor another paginated read issued is not one of this one's.
+/// The cursor itself is minted and parsed by [`crate::state::page_cursor`] /
+/// [`crate::state::page_start`].
+const NEXT_TOKEN_PREFIX: &str = "pclist-";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -159,18 +160,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeProtectConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeProtectConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeProtectConfigurations"))
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeProtectConfigurationsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the protect-configuration store is unavailable".to_string(),
+                        ),
+                        request_id: None,
+                    },
+                )
+                .into(),
+            );
+        };
+        // A describe reports; it never writes. The guard is taken read-only.
+        let state = store.lock();
+
+        // `ProtectConfigurationIds` SELECTS: each entry is a `ProtectConfigurationIdOrArn`,
+        // so it may name the configuration by ARN, and each one must name a stored
+        // configuration. One entry is one reported configuration, in the order the request
+        // named them. Absent (or empty), the whole account is reported in the store's
+        // stable key order.
+        let selected: Vec<&crate::state::ProtectConfiguration> =
+            match input.protect_configuration_ids {
+                Some(ref identifiers) if !identifiers.is_empty() => {
+                    let mut records = Vec::with_capacity(identifiers.len());
+                    for named in identifiers {
+                        let id = crate::state::name_from_name_or_arn(named);
+                        let Some(record) = state.protect_configurations.get(id) else {
+                            return Err(
+                                DescribeProtectConfigurationsErrorModeled::ResourceNotFoundException(
+                                    ResourceNotFoundException {
+                                        message: Some(crate::state::resource_not_found_message(
+                                            "protect-configuration",
+                                            id,
+                                        )),
+                                        resource_type: Some("protect-configuration".to_string()),
+                                        resource_id: Some(id.to_string()),
+                                    },
+                                )
+                                .into(),
+                            );
+                        };
+                        records.push(record);
+                    }
+                    records
+                }
+                _ => state.protect_configurations.values().collect(),
+            };
+
+        // Every filter must match (AND); within one filter any value matches (OR).
+        let filters = input.filters.unwrap_or_default();
+        let matching: Vec<&crate::state::ProtectConfiguration> = selected
+            .into_iter()
+            .filter(|record| {
+                filters.iter().all(|filter| {
+                    record.filterable(&filter.name).is_some_and(|actual| {
+                        actual.iter().any(|value| filter.values.contains(value))
+                    })
+                })
+            })
+            .collect();
+
+        // `NextToken` is this emulator's own cursor, minted and parsed by the one shared
+        // helper every paginated read of this service uses.
+        let start = match crate::state::page_start(
+            NEXT_TOKEN_PREFIX,
+            input.next_token.as_deref(),
+            matching.len(),
+        ) {
+            Ok(start) => start,
+            Err(rejection) => {
+                return Err(
+                    DescribeProtectConfigurationsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(rejection.message.to_string()),
+                            reason: Some(crate::state::INVALID_NEXT_TOKEN_REASON.to_string()),
+                            fields: Some(vec![ValidationExceptionField {
+                                name: crate::state::NEXT_TOKEN_FIELD.to_string(),
+                                message: rejection.field_message.to_string(),
+                            }]),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        };
+
+        // `MaxResults` caps one page; absent, the whole remainder is returned.
+        let end = crate::state::page_end(start, input.max_results, matching.len());
+        let page: Vec<ProtectConfigurationInformation> = matching[start..end]
+            .iter()
+            .copied()
+            .map(protect_configuration_information)
+            .collect();
+        let next_token =
+            (end < matching.len()).then(|| crate::state::page_cursor(NEXT_TOKEN_PREFIX, end));
+
+        Ok(DescribeProtectConfigurationsOutput {
+            // `ProtectConfigurationInformationList` is modelled `len 1..100`, so a result
+            // set with nothing in it is reported as an absent list rather than an empty
+            // one, which the list's own minimum forbids.
+            protect_configurations: (!page.is_empty()).then_some(page),
+            next_token,
+        })
+    }
+}
+
+/// One stored protect configuration as the modelled `ProtectConfigurationInformation`,
+/// every member read from the record.
+fn protect_configuration_information(
+    record: &crate::state::ProtectConfiguration,
+) -> ProtectConfigurationInformation {
+    ProtectConfigurationInformation {
+        protect_configuration_arn: record.arn.clone(),
+        protect_configuration_id: record.id.clone(),
+        created_timestamp: crate::state::to_timestamp(record.created_timestamp),
+        account_default: record.account_default,
+        deletion_protection_enabled: record.deletion_protection_enabled,
     }
 }

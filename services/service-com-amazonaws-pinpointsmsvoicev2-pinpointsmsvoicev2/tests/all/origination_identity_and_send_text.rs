@@ -19,7 +19,10 @@
 //!   stored set from its record, narrows by `ConfigurationSetNames` (name or ARN, each of
 //!   which must name a stored set) and by `Filters`, and pages over the store's order;
 //! * a send resolves every referenced resource against the store and mints a unique
-//!   `MessageId` per accepted send.
+//!   `MessageId` per accepted send;
+//! * `CreateProtectConfiguration` mints and persists a configuration whose every
+//!   reported member comes from the stored record, and `DescribeProtectConfigurations`
+//!   reports it back, narrowed by id, by filter and by page.
 
 use std::sync::Arc;
 
@@ -2355,4 +2358,447 @@ async fn describe_configuration_sets_pages_the_whole_account_at_every_page_size(
         "case \"a cursor past the end of the result set\": expected a refusal, got {status} \
          with {body}"
     );
+}
+
+/// The ARN this emulator stamps into a protect configuration's record, for the region
+/// these tests sign for.
+fn protect_configuration_arn(id: &str) -> String {
+    format!("arn:aws:sms-voice:{REGION}:{ACCOUNT_ID}:protect-configuration/{id}")
+}
+
+/// The `ProtectConfigurationId` of every entry a `DescribeProtectConfigurations`
+/// response reports, in the order it reports them.
+///
+/// A response that matched nothing carries no `ProtectConfigurations` member at all
+/// (`ProtectConfigurationInformationList` is modelled `len 1..100`), which reads as the
+/// empty selection it is.
+fn described_protect_configuration_ids(body: &serde_json::Value) -> Vec<String> {
+    body.get("ProtectConfigurations")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|entry| as_str(entry, "ProtectConfigurationId"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether a value satisfies `ProtectConfigurationId` (len 1..64, `^[A-Za-z0-9_-]+$`).
+fn is_protect_configuration_id(value: &str) -> bool {
+    (1..=64).contains(&value.len())
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_' || character == '-')
+}
+
+/// One create request body, from the members that shape the resource.
+fn protect_configuration_request(
+    deletion_protection: Option<bool>,
+    tags: &[(&str, &str)],
+) -> serde_json::Value {
+    let mut request = serde_json::json!({});
+    if let Some(enabled) = deletion_protection {
+        request["DeletionProtectionEnabled"] = serde_json::json!(enabled);
+    }
+    if !tags.is_empty() {
+        request["Tags"] = serde_json::Value::Array(
+            tags.iter()
+                .map(|(key, value)| serde_json::json!({"Key": key, "Value": value}))
+                .collect(),
+        );
+    }
+    request
+}
+
+/// One row of the create-request table: a case name, the `DeletionProtectionEnabled` the
+/// request carries (absent on one row) and the tags it carries.
+type CreateProtectConfigurationCase<'a> = (&'a str, Option<bool>, Vec<(&'a str, &'a str)>);
+
+#[tokio::test]
+async fn creating_a_protect_configuration_persists_it_and_the_describe_reports_the_record() {
+    let emulator = Emulator::new();
+
+    // One row per shape of the create request — the only members that shape the resource
+    // are `DeletionProtectionEnabled` (absent, so the modelled default applies, false and
+    // true) and `Tags` (none, one, several, the `Name` tag the service documents as where
+    // a configuration's name lives among them).
+    let cases: Vec<CreateProtectConfigurationCase<'_>> = vec![
+        ("every member absent", None, vec![]),
+        (
+            "deletion protection off, one tag",
+            Some(false),
+            vec![("Name", "campaign-guard")],
+        ),
+        ("deletion protection on, no tags", Some(true), vec![]),
+        (
+            "deletion protection on, three tags",
+            Some(true),
+            vec![
+                ("Name", "fraud-guard"),
+                ("team", "trust-and-safety"),
+                ("env", "test"),
+            ],
+        ),
+    ];
+
+    let mut created_ids: Vec<String> = Vec::new();
+    for (case, deletion_protection, tags) in &cases {
+        let created = emulator
+            .ok(
+                "CreateProtectConfiguration",
+                protect_configuration_request(*deletion_protection, tags),
+            )
+            .await;
+        let id = as_str(&created, "ProtectConfigurationId");
+        assert!(
+            is_protect_configuration_id(&id),
+            "case {case:?}: expected a minted ProtectConfigurationId, got {id:?}"
+        );
+        let expected_tags = (!tags.is_empty()).then(|| {
+            serde_json::Value::Array(
+                tags.iter()
+                    .map(|(key, value)| serde_json::json!({"Key": key, "Value": value}))
+                    .collect(),
+            )
+        });
+        assert_eq!(
+            (
+                as_str(&created, "ProtectConfigurationArn"),
+                created.get("AccountDefault").and_then(serde_json::Value::as_bool),
+                created
+                    .get("DeletionProtectionEnabled")
+                    .and_then(serde_json::Value::as_bool),
+                created.get("Tags").cloned(),
+            ),
+            (
+                protect_configuration_arn(&id),
+                // A fresh configuration is never the account default one.
+                Some(false),
+                Some(deletion_protection.unwrap_or(false)),
+                expected_tags.clone(),
+            ),
+            "case {case:?}: expected the record that was persisted, got {created}"
+        );
+        let stamped = timestamp_member(&created, "/CreatedTimestamp");
+        assert!(
+            stamped.as_u64().is_some_and(|seconds| seconds > EPOCH_SECONDS_FLOOR),
+            "case {case:?}: expected an epoch-seconds CreatedTimestamp, got {stamped}"
+        );
+
+        // The round trip, by id and by ARN: `ProtectConfigurationIds` holds a
+        // `ProtectConfigurationIdOrArn`, and either form selects the one stored record.
+        for (named_by, identifier) in [
+            ("by id", id.clone()),
+            ("by ARN", protect_configuration_arn(&id)),
+        ] {
+            let described = emulator
+                .ok(
+                    "DescribeProtectConfigurations",
+                    serde_json::json!({"ProtectConfigurationIds": [identifier]}),
+                )
+                .await;
+            let entries = described
+                .get("ProtectConfigurations")
+                .and_then(serde_json::Value::as_array)
+                .unwrap_or_else(|| {
+                    panic!("case {case:?} {named_by}: expected a selection in {described}")
+                });
+            assert_eq!(
+                entries.len(),
+                1,
+                "case {case:?} {named_by}: one identifier selects one record, got {described}"
+            );
+            assert_eq!(
+                (
+                    as_str(&entries[0], "ProtectConfigurationId"),
+                    as_str(&entries[0], "ProtectConfigurationArn"),
+                    entries[0].get("CreatedTimestamp").cloned(),
+                    entries[0].get("AccountDefault").and_then(serde_json::Value::as_bool),
+                    entries[0]
+                        .get("DeletionProtectionEnabled")
+                        .and_then(serde_json::Value::as_bool),
+                ),
+                (
+                    id.clone(),
+                    protect_configuration_arn(&id),
+                    Some(stamped.clone()),
+                    Some(false),
+                    Some(deletion_protection.unwrap_or(false)),
+                ),
+                "case {case:?} {named_by}: the describe must report the created record, \
+                 got {described}"
+            );
+        }
+
+        created_ids.push(id);
+    }
+
+    // Every create minted its own identifier, and the whole account is reported in the
+    // store's stable key order.
+    assert_eq!(
+        created_ids
+            .iter()
+            .collect::<std::collections::BTreeSet<&String>>()
+            .len(),
+        cases.len(),
+        "each create must mint its own ProtectConfigurationId, got {created_ids:?}"
+    );
+    let mut in_key_order = created_ids.clone();
+    in_key_order.sort();
+    let described = emulator
+        .ok("DescribeProtectConfigurations", serde_json::json!({}))
+        .await;
+    assert_eq!(
+        described_protect_configuration_ids(&described),
+        in_key_order,
+        "case \"no selection\": every stored configuration is reported once, got {described}"
+    );
+}
+
+#[tokio::test]
+async fn a_repeated_client_token_creates_one_protect_configuration() {
+    let emulator = Emulator::new();
+
+    let body = protect_configuration_request(Some(true), &[("Name", "guard")]);
+    let first = emulator
+        .ok("CreateProtectConfiguration", body.clone())
+        .await;
+    let mut tokened = body.clone();
+    tokened["ClientToken"] = serde_json::json!("protect-token-1");
+    let created = emulator
+        .ok("CreateProtectConfiguration", tokened.clone())
+        .await;
+    let again = emulator.ok("CreateProtectConfiguration", tokened).await;
+    assert_eq!(
+        (
+            as_str(&again, "ProtectConfigurationId"),
+            again.get("CreatedTimestamp").cloned(),
+        ),
+        (
+            as_str(&created, "ProtectConfigurationId"),
+            created.get("CreatedTimestamp").cloned(),
+        ),
+        "case \"repeated ClientToken\": expected the record the token already created, \
+         got {again}"
+    );
+
+    // The same token on a DIFFERENT request is a different request, which is refused
+    // rather than answered with the record the token first created.
+    for (case, changed) in [
+        (
+            "deletion protection flipped",
+            protect_configuration_request(Some(false), &[("Name", "guard")]),
+        ),
+        (
+            "a tag changed",
+            protect_configuration_request(Some(true), &[("Name", "other-guard")]),
+        ),
+        (
+            "a tag added",
+            protect_configuration_request(Some(true), &[("Name", "guard"), ("env", "test")]),
+        ),
+    ] {
+        let mut request = changed;
+        request["ClientToken"] = serde_json::json!("protect-token-1");
+        let (status, refused) = emulator.call("CreateProtectConfiguration", request).await;
+        assert_eq!(
+            (
+                status,
+                error_code(&refused).as_str(),
+                refused.get("Message").and_then(serde_json::Value::as_str),
+            ),
+            (
+                400,
+                "ConflictException",
+                Some("Token used for different request"),
+            ),
+            "case {case:?}: a replayed token on a different request must conflict, got \
+             {status} with {refused}"
+        );
+    }
+
+    // A DIFFERENT token for the same request is a second create: the resource carries no
+    // caller-supplied name, so there is nothing for it to collide with.
+    let mut other = body;
+    other["ClientToken"] = serde_json::json!("protect-token-2");
+    let third = emulator.ok("CreateProtectConfiguration", other).await;
+    let described = emulator
+        .ok("DescribeProtectConfigurations", serde_json::json!({}))
+        .await;
+    let mut expected = vec![
+        as_str(&first, "ProtectConfigurationId"),
+        as_str(&created, "ProtectConfigurationId"),
+        as_str(&third, "ProtectConfigurationId"),
+    ];
+    expected.sort();
+    assert_eq!(
+        described_protect_configuration_ids(&described),
+        expected,
+        "case \"three creates, one of them a replay\": expected three stored \
+         configurations, got {described}"
+    );
+}
+
+#[tokio::test]
+async fn describe_protect_configurations_narrows_by_filter_id_and_page() {
+    let emulator = Emulator::new();
+
+    // Three stored configurations, differing in the one attribute a create can set.
+    let mut ids: Vec<String> = Vec::new();
+    for deletion_protection in [true, true, false] {
+        let created = emulator
+            .ok(
+                "CreateProtectConfiguration",
+                protect_configuration_request(Some(deletion_protection), &[]),
+            )
+            .await;
+        ids.push(as_str(&created, "ProtectConfigurationId"));
+    }
+    let mut in_key_order = ids.clone();
+    in_key_order.sort();
+
+    // One row per `ProtectConfigurationFilterName` value and per value of that attribute:
+    // every filter the model declares is exercised, and none it does not.
+    let cases: Vec<(&str, &str, usize)> = vec![
+        ("deletion-protection-enabled", "true", 2),
+        ("deletion-protection-enabled", "false", 1),
+        // No implemented operation makes a configuration the account default one, so
+        // every stored record reports `false` for it.
+        ("account-default", "false", 3),
+        ("account-default", "true", 0),
+    ];
+    assert_eq!(
+        cases
+            .iter()
+            .map(|(name, _, _)| *name)
+            .collect::<std::collections::BTreeSet<&str>>(),
+        sms_voice::ops::types::PROTECT_CONFIGURATION_FILTER_NAME_VALUES
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<&str>>(),
+        "every modelled ProtectConfigurationFilterName needs a row, and no row may name a \
+         filter the model does not declare"
+    );
+    for (name, value, expected) in &cases {
+        let described = emulator
+            .ok(
+                "DescribeProtectConfigurations",
+                serde_json::json!({"Filters": [{"Name": name, "Values": [value]}]}),
+            )
+            .await;
+        assert_eq!(
+            described_protect_configuration_ids(&described).len(),
+            *expected,
+            "case {name:?}={value:?}: expected {expected} configurations, got {described}"
+        );
+    }
+
+    // Two filters are an AND, and the values within one filter an OR.
+    let both = emulator
+        .ok(
+            "DescribeProtectConfigurations",
+            serde_json::json!({"Filters": [
+                {"Name": "deletion-protection-enabled", "Values": ["true", "false"]},
+                {"Name": "account-default", "Values": ["false"]},
+            ]}),
+        )
+        .await;
+    assert_eq!(
+        described_protect_configuration_ids(&both),
+        in_key_order,
+        "case \"an OR within a filter and an AND across two\": expected every stored \
+         configuration, got {both}"
+    );
+
+    // An id that names no stored configuration is not found, whichever form it takes, and
+    // the refusal restates the exception's own structured members.
+    let unknown_arn = protect_configuration_arn("protect-configuration-absent");
+    for (case, identifier) in [
+        ("an id nothing minted", "protect-configuration-absent".to_string()),
+        ("an ARN nothing minted", unknown_arn),
+    ] {
+        let (status, body) = emulator
+            .call(
+                "DescribeProtectConfigurations",
+                serde_json::json!({"ProtectConfigurationIds": [identifier]}),
+            )
+            .await;
+        assert_eq!(
+            (
+                status,
+                error_code(&body).as_str(),
+                body.get("Message").and_then(serde_json::Value::as_str),
+                body.get("ResourceType").and_then(serde_json::Value::as_str),
+                body.get("ResourceId").and_then(serde_json::Value::as_str),
+            ),
+            (
+                400,
+                "ResourceNotFoundException",
+                Some(
+                    "Resource Not Found - ResourceType=\"protect-configuration\" \
+                     ResourceId=\"protect-configuration-absent\""
+                ),
+                Some("protect-configuration"),
+                Some("protect-configuration-absent"),
+            ),
+            "case {case:?}: expected a not-found naming the resource, got {status} with {body}"
+        );
+    }
+
+    // Paging walks the store's key order once, whatever the page size.
+    for page_size in [1, 2, 3] {
+        let mut seen: Vec<String> = Vec::new();
+        let mut next_token: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let mut request = serde_json::json!({"MaxResults": page_size});
+            if let Some(token) = &next_token {
+                request["NextToken"] = serde_json::json!(token);
+            }
+            let described = emulator
+                .ok("DescribeProtectConfigurations", request)
+                .await;
+            let page = described_protect_configuration_ids(&described);
+            assert!(
+                page.len() <= page_size,
+                "case page_size={page_size}: a page must hold at most MaxResults entries, \
+                 got {described}"
+            );
+            seen.extend(page);
+            next_token = described
+                .get("NextToken")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            pages += 1;
+            assert!(
+                pages <= 8,
+                "case page_size={page_size}: paging did not terminate after {pages} pages"
+            );
+            if next_token.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            seen, in_key_order,
+            "case page_size={page_size}: paging must yield every configuration exactly \
+             once in key order, got {seen:?}"
+        );
+    }
+
+    // A cursor this read did not issue is refused rather than silently driving paging —
+    // including one another paginated read of this service minted.
+    for forged in ["not-a-cursor", "1", "00000002", "pclist-", "cslist-00000001"] {
+        let (status, body) = emulator
+            .call(
+                "DescribeProtectConfigurations",
+                serde_json::json!({"NextToken": forged}),
+            )
+            .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "ValidationException"),
+            "case {forged:?}: a forged NextToken must be refused, got {status} with {body}"
+        );
+    }
 }

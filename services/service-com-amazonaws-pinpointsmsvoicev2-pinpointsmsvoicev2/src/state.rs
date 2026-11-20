@@ -3,10 +3,10 @@
 //! Engine state for the com-amazonaws-pinpointsmsvoicev2-pinpointsmsvoicev2 service.
 //!
 //! The origination-identity + send-text slice of AWS End User Messaging SMS
-//! (`sms-voice`) is persisted here: configuration sets, requested phone numbers and
-//! the messages that were actually sent. Every implemented handler computes its whole
-//! response from these records, so a create is observable through the matching
-//! describe/release and a release is observable as an absence.
+//! (`sms-voice`) is persisted here: configuration sets, requested phone numbers, protect
+//! configurations and the messages that were actually sent. Every implemented handler
+//! computes its whole response from these records, so a create is observable through the
+//! matching describe/release and a release is observable as an absence.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::SystemTime;
@@ -56,6 +56,12 @@ pub const REQUEST_PHONE_NUMBER: &str = "RequestPhoneNumber";
 /// quota the model names for this resource. The number itself is this emulator's
 /// choice: AWS publishes an adjustable per-account quota, not a fixed one.
 pub const MAX_CONFIGURATION_SETS_PER_ACCOUNT: usize = 1_000;
+
+/// The most protect configurations one account may hold. Reaching it is answered with
+/// `ServiceQuotaExceededException` / `reason = PROTECT_CONFIGURATIONS_PER_ACCOUNT`, the
+/// quota the model names for this resource. Chosen for the same reason as
+/// [`MAX_CONFIGURATION_SETS_PER_ACCOUNT`].
+pub const MAX_PROTECT_CONFIGURATIONS_PER_ACCOUNT: usize = 1_000;
 
 /// The most phone numbers one account may lease, answered with
 /// `ServiceQuotaExceededException` / `reason = PHONE_NUMBERS_PER_ACCOUNT`. Chosen for
@@ -340,6 +346,41 @@ impl PhoneNumberRecord {
     }
 }
 
+/// A stored protect configuration.
+///
+/// The resource carries no name of its own: a caller labels it with a `Name` tag, so the
+/// only identity a record has is its minted `ProtectConfigurationId` and the ARN built
+/// from it.
+#[derive(Debug, Clone)]
+pub struct ProtectConfiguration {
+    pub id: String,
+    pub arn: String,
+    pub created_timestamp: SystemTime,
+    /// True while this configuration is the account default one.
+    pub account_default: bool,
+    pub deletion_protection_enabled: bool,
+    pub tags: Vec<Tag>,
+}
+
+impl ProtectConfiguration {
+    /// The record's value for one `ProtectConfigurationFilterName`, or `None` when the
+    /// record carries no value for that attribute (so no filter value can match it).
+    ///
+    /// The names are exactly the model's `ProtectConfigurationFilterName` enum,
+    /// re-exported as
+    /// [`crate::ops::types::PROTECT_CONFIGURATION_FILTER_NAME_VALUES`]; both are
+    /// single-valued booleans, which a request filters for as `"true"` / `"false"`.
+    pub fn filterable(&self, name: &str) -> Option<Vec<String>> {
+        match name {
+            "account-default" => Some(vec![self.account_default.to_string()]),
+            "deletion-protection-enabled" => {
+                Some(vec![self.deletion_protection_enabled.to_string()])
+            }
+            _ => None,
+        }
+    }
+}
+
 /// A message this emulator accepted for sending.
 #[derive(Debug, Clone)]
 pub struct SentMessage {
@@ -372,6 +413,10 @@ pub struct ComAmazonawsPinpointsmsvoicev2Pinpointsmsvoicev2State {
     /// Keyed by `PhoneNumberId`. Bounded by [`MAX_PHONE_NUMBERS_PER_ACCOUNT`], enforced
     /// by `RequestPhoneNumber`.
     pub phone_numbers: BTreeMap<String, PhoneNumberRecord>,
+    /// Keyed by `ProtectConfigurationId`. Bounded by
+    /// [`MAX_PROTECT_CONFIGURATIONS_PER_ACCOUNT`], enforced by
+    /// `CreateProtectConfiguration`.
+    pub protect_configurations: BTreeMap<String, ProtectConfiguration>,
     /// The most recent accepted sends, oldest first, dry runs included (`dry_run` tells
     /// them apart). A ring bounded by [`MAX_RETAINED_MESSAGES`].
     messages: VecDeque<SentMessage>,

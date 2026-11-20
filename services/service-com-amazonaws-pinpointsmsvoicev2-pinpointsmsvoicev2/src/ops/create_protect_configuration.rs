@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateProtectConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateProtectConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateProtectConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a protect configuration, stores it in [`crate::state`] and answers
+//! from the stored record, so `DescribeProtectConfigurations` reports the same values. A
+//! repeat of the same `ClientToken` returns the configuration that token already created.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +168,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateProtectConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateProtectConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateProtectConfiguration"))
+        let region = crate::state::request_region(ctx);
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateProtectConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the protect-configuration store is unavailable".to_string(),
+                        ),
+                        request_id: None,
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = store.lock();
+
+        // The request this `ClientToken` is scoped to: every member that shapes the
+        // configuration.
+        let deletion_protection_enabled = input.deletion_protection_enabled.unwrap_or(false);
+        let mut fingerprinted: Vec<String> = vec![deletion_protection_enabled.to_string()];
+        for tag in input.tags.iter().flatten() {
+            fingerprinted.push(format!("{}={}", tag.key, tag.value));
+        }
+        let fingerprint = crate::state::request_fingerprint(
+            &fingerprinted.iter().map(String::as_str).collect::<Vec<&str>>(),
+        );
+
+        // Idempotency: the same `ClientToken` must not create a second configuration.
+        // Answer from the record that token already created, so a retried request is a
+        // read. A token replayed with a DIFFERENT request is a different request, which
+        // AWS does not answer idempotently, so it is refused.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(seen) = state.client_token_record(Self::NAME, token).cloned() {
+                if seen.fingerprint != fingerprint {
+                    return Err(CreateProtectConfigurationErrorModeled::ConflictException(
+                        ConflictException {
+                            message: Some(
+                                crate::state::CLIENT_TOKEN_CONFLICT_MESSAGE.to_string(),
+                            ),
+                            reason: None,
+                            resource_type: None,
+                            resource_id: None,
+                        },
+                    )
+                    .into());
+                }
+                if let Some(existing) = state.protect_configurations.get(&seen.resource) {
+                    return Ok(protect_configuration_output(existing));
+                }
+            }
+        }
+
+        // The per-account quota bounds this store: past it the create is refused, so a
+        // loop of creates cannot grow the emulator's memory without limit.
+        if state.protect_configurations.len()
+            >= crate::state::MAX_PROTECT_CONFIGURATIONS_PER_ACCOUNT
+        {
+            return Err(
+                CreateProtectConfigurationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "the account already holds {} protect configurations",
+                            crate::state::MAX_PROTECT_CONFIGURATIONS_PER_ACCOUNT
+                        )),
+                        reason: Some("PROTECT_CONFIGURATIONS_PER_ACCOUNT".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The resource carries no caller-supplied name, so the service mints its
+        // identifier: from the store's monotonic sequence, so no two configurations
+        // collide, and within `ProtectConfigurationId` (len 1..64, `^[A-Za-z0-9_-]+$`).
+        let sequence = state.next_sequence();
+        let id = format!("protect-configuration-{sequence:032x}");
+        let record = crate::state::ProtectConfiguration {
+            arn: ::emulator_server::emulator_arn(
+                crate::state::SIGNING_NAME,
+                &region,
+                &format!("protect-configuration/{id}"),
+            ),
+            id: id.clone(),
+            created_timestamp: ::std::time::SystemTime::now(),
+            // A fresh configuration is not the account default one: only
+            // `SetAccountDefaultProtectConfiguration` makes one the default.
+            account_default: false,
+            deletion_protection_enabled,
+            tags: input.tags.unwrap_or_default(),
+        };
+        state.protect_configurations.insert(id.clone(), record);
+        if let Some(token) = input.client_token.as_deref() {
+            state.remember_client_token(Self::NAME, token, &id, fingerprint);
+        }
+
+        // Read the response back out of the store: what the caller sees is what was
+        // persisted, not what was passed in.
+        let stored = state
+            .protect_configurations
+            .get(&id)
+            .expect("the protect configuration just inserted is present");
+        Ok(protect_configuration_output(stored))
     }
 }
+
+/// The response for one stored protect configuration, every member read from the record.
+fn protect_configuration_output(
+    record: &crate::state::ProtectConfiguration,
+) -> CreateProtectConfigurationOutput {
+    CreateProtectConfigurationOutput {
+        protect_configuration_arn: record.arn.clone(),
+        protect_configuration_id: record.id.clone(),
+        created_timestamp: crate::state::to_timestamp(record.created_timestamp),
+        account_default: record.account_default,
+        deletion_protection_enabled: record.deletion_protection_enabled,
+        // `Tags` is optional and AWS omits it when the resource carries none.
+        tags: (!record.tags.is_empty()).then(|| record.tags.clone()),
+    }
+}
+
