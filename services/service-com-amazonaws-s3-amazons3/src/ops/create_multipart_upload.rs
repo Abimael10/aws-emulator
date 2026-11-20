@@ -341,6 +341,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::invalid_canned_acl(value));
         }
 
+        // The storage class it asks the finished object to be stored under has to be one the
+        // `StorageClass` member publishes, judged HERE for the same reason and through the
+        // same reading ([`crate::service::object_write::rejected_storage_class`]). A
+        // PUBLISHED class the addressed bucket cannot host is the same refusal, taken below
+        // once the bucket is known.
+        if let Some(refusal) = crate::service::object_write::rejected_storage_class(
+            ctx.parts(),
+            super::types::CREATE_MULTIPART_UPLOAD_INPUT_SCHEMA,
+        ) {
+            return Err(refusal);
+        }
+
         // What this emulator cannot carry out faithfully, refused rather than answered
         // with an upload id that would claim it. Each member decides something about the
         // object the upload completes into that nothing here performs:
@@ -383,12 +395,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is recorded: a name S3 cannot store names no object this upload could become
         // ([`crate::service::object_write::key_refusal`] holds both published rules, and the
         // store's own ceiling answers the same code below).
-        if let Some((code, message)) = crate::service::object_write::key_refusal(&input.key) {
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                code,
-                crate::service::object_write::KEY_REFUSAL_STATUS,
-                message,
-            ));
+        if let Some(refusal) = crate::service::object_write::key_refusal(&input.key) {
+            return Err(refusal.scaffolded());
         }
 
         // `ServerSideEncryption` is an enum member, so the boundary refuses a value
@@ -875,12 +883,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // is `KeyTooLongError` with HTTP 400 (Amazon S3 "Error responses", list of
             // error codes); the model declares no shape for it, so it goes out through the
             // unmodelled channel with the code and status S3 sends.
-            crate::state::MultipartUploadCreation::KeyTooLong { .. } => {
-                return Err(crate::scaffolded::Scaffolded::unmodeled(
-                    crate::service::object_write::KEY_TOO_LONG_CODE,
-                    crate::service::object_write::KEY_REFUSAL_STATUS,
-                    crate::service::object_write::KEY_TOO_LONG_MESSAGE,
-                ));
+            crate::state::MultipartUploadCreation::KeyTooLong { bytes } => {
+                return Err(
+                    crate::service::object_write::KeyRefusal::TooLong { bytes }.scaffolded()
+                );
             }
             // "Within the PUT request header, the user-defined metadata is limited to 2
             // KB in size" (Amazon S3 User Guide). Past it S3 answers `MetadataTooLarge`

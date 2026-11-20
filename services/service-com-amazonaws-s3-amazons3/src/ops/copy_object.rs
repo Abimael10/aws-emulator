@@ -475,12 +475,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         // The DESTINATION key this copy writes, judged on its bytes alone before anything
         // else: a name S3 cannot store is refused whatever the source is
         // ([`crate::service::object_write::key_refusal`] holds both published rules).
-        if let Some((code, message)) = crate::service::object_write::key_refusal(&input.key) {
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                code,
-                crate::service::object_write::KEY_REFUSAL_STATUS,
-                message,
-            ));
+        if let Some(refusal) = crate::service::object_write::key_refusal(&input.key) {
+            return Err(refusal.scaffolded());
         }
 
         // The canned ACL this copy asks the destination object to be stored with has to be
@@ -495,6 +491,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
             super::types::COPY_OBJECT_INPUT_SCHEMA,
         ) {
             return Err(crate::scaffolded::Scaffolded::invalid_canned_acl(value));
+        }
+
+        // The storage class it asks the destination object to be stored under has to be one
+        // the `StorageClass` member publishes, judged HERE for the same reason and through
+        // the same reading ([`crate::service::object_write::rejected_storage_class`]). A
+        // PUBLISHED class the destination bucket cannot host is the same refusal, taken below
+        // once that bucket is known.
+        if let Some(refusal) = crate::service::object_write::rejected_storage_class(
+            ctx.parts(),
+            super::types::COPY_OBJECT_INPUT_SCHEMA,
+        ) {
+            return Err(refusal);
         }
 
         // An ACL arrives in ONE of the two header forms: "you can specify a canned ACL … or
@@ -1253,12 +1261,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
             // metadata past the published 2 KB is refused with the code S3 publishes for
             // exactly that condition, naming the request's own total and the ceiling
             // ([`crate::scaffolded::Scaffolded::metadata_too_large`]).
-            crate::state::ObjectWrite::KeyTooLong { .. } => {
-                return Err(crate::scaffolded::Scaffolded::unmodeled(
-                    crate::service::object_write::KEY_TOO_LONG_CODE,
-                    crate::service::object_write::KEY_REFUSAL_STATUS,
-                    crate::service::object_write::KEY_TOO_LONG_MESSAGE,
-                ));
+            crate::state::ObjectWrite::KeyTooLong { bytes } => {
+                return Err(
+                    crate::service::object_write::KeyRefusal::TooLong { bytes }.scaffolded()
+                );
             }
             crate::state::ObjectWrite::MetadataTooLarge { bytes } => {
                 return Err(crate::scaffolded::Scaffolded::metadata_too_large(bytes));

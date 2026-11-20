@@ -356,12 +356,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::ObjectWrite::Created | crate::state::ObjectWrite::Replaced => {}
             // The destination key is longer than S3 stores a key under, which is the refusal
             // the write of such a key earns ([`crate::service::object_write`]).
-            crate::state::ObjectWrite::KeyTooLong { .. } => {
-                return Err(crate::scaffolded::Scaffolded::unmodeled(
-                    crate::service::object_write::KEY_TOO_LONG_CODE,
-                    crate::service::object_write::KEY_REFUSAL_STATUS,
-                    crate::service::object_write::KEY_TOO_LONG_MESSAGE,
-                ));
+            crate::state::ObjectWrite::KeyTooLong { bytes } => {
+                return Err(
+                    crate::service::object_write::KeyRefusal::TooLong { bytes }.scaffolded()
+                );
             }
             crate::state::ObjectWrite::MetadataTooLarge { bytes } => {
                 return Err(crate::scaffolded::Scaffolded::metadata_too_large(bytes));

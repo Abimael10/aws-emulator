@@ -23,7 +23,9 @@
 //!   Unicode characters whose UTF-8 encoding is at most 1,024 bytes long" (Amazon S3 User
 //!   Guide, *Creating object key names*), so a key of exactly 1,024 bytes is stored and a
 //!   longer one is refused `KeyTooLongError` (400) — the code a client branching on the limit
-//!   reads; and a key carrying a NUL (0x00) byte, which no request URI can convey, is not a
+//!   reads — whose document also carries the `<Size>` / `<MaxSizeAllowed>` pair, the key's own
+//!   byte count and the ceiling it was judged against, because the sentence names neither
+//!   number; and a key carrying a NUL (0x00) byte, which no request URI can convey, is not a
 //!   request the API gets to refuse at all — it is answered with the bare HTTP 400 that
 //!   carries no error document, which is what an SDK reports the status itself as the code
 //!   for. Both hold for every operation that names a key: the one-shot write, the destination
@@ -592,6 +594,25 @@ async fn a_key_is_refused_for_the_bytes_it_carries() {
                 "case {case:?}/{operation}: expected the published sentence for a key of \
                  {key_bytes} bytes, got {:?}",
                 answer.error_message()
+            );
+            // Which is why the document carries the two numbers instead: the key's own byte
+            // count and the ceiling it was judged against, so a caller reads by how much the
+            // name has to be shortened.
+            let size = answer.element("Size");
+            assert_eq!(
+                size,
+                Some(key_bytes.to_string()),
+                "case {case:?}/{operation}: expected <Size> {key_bytes}, got {size:?} with \
+                 body {:?}",
+                text(&answer)
+            );
+            let allowed = answer.element("MaxSizeAllowed");
+            assert_eq!(
+                allowed,
+                Some(MAX_OBJECT_KEY_BYTES.to_string()),
+                "case {case:?}/{operation}: expected <MaxSizeAllowed> \
+                 {MAX_OBJECT_KEY_BYTES}, got {allowed:?} with body {:?}",
+                text(&answer)
             );
         }
     }

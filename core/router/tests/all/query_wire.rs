@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The two things every awsQuery suite in this test crate needs: the percent-encoder that
-//! builds a form body, and the readers that pull one element's text — or every occurrence
-//! of a repeated one — out of the XML answer.
+//! What a suite in this test crate needs to write a request's text and to read an XML
+//! answer's: the percent-encoders that build a form body ([`form_encode`]) and a URI path
+//! ([`path_encode`], which a REST suite addressing a resource by name needs), and the readers
+//! that pull one element's text — or every occurrence of a repeated one — out of the XML
+//! answer.
 //!
 //! They live here, ONCE, because a suite that writes its own drifts from the others: an
 //! encoder that leaves one more byte literal, or a reader that stops at a different tag,
@@ -40,6 +42,29 @@ pub(crate) fn form_encode(value: &str) -> String {
     for byte in value.bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(char::from(byte));
+            }
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    encoded
+}
+
+/// Percent-encode one URI PATH, leaving RFC 3986's unreserved characters and the `/` that
+/// separates segments literal.
+///
+/// The path counterpart of [`form_encode`] — which escapes `/` too, because that is the
+/// FORM-BODY encoding, and a path encoded with it would address one key named with literal
+/// slashes. Here for the same reason the rest of this module is: a suite addressing a resource
+/// whose name carries a byte no URI conveys literally — a non-ASCII object key, a space — has
+/// to escape it, and one that writes its own escaping drifts from the others. Byte-wise, so a
+/// multi-byte character is escaped byte by byte, which is what an AWS SDK sends and what a
+/// greedy `{Key+}` label decodes back.
+pub(crate) fn path_encode(path: &str) -> String {
+    let mut encoded = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
                 encoded.push(char::from(byte));
             }
             other => encoded.push_str(&format!("%{other:02X}")),
@@ -356,6 +381,29 @@ mod tests {
 
         for (case, value, expected) in rows {
             let encoded = form_encode(value);
+            assert_eq!(
+                encoded, expected,
+                "case {case:?}: expected {expected:?}, got {encoded:?}"
+            );
+        }
+    }
+
+    /// The PATH encoder keeps the segment separator literal and escapes everything else
+    /// outside the unreserved set, over the classes a resource name in a path runs into.
+    #[test]
+    fn a_path_keeps_its_separators_and_escapes_the_rest() {
+        // (case, the path, its encoding)
+        let rows: [(&str, &str, &str); 6] = [
+            ("the unreserved set", "/bucket/aZ09-._~", "/bucket/aZ09-._~"),
+            ("a space in a segment", "/bucket/a b", "/bucket/a%20b"),
+            ("a non-ASCII character", "/bucket/é", "/bucket/%C3%A9"),
+            ("a query separator in a name", "/bucket/a?b", "/bucket/a%3Fb"),
+            ("an already-escaped escape", "/bucket/a%20b", "/bucket/a%2520b"),
+            ("every separator kept", "/a/b/c", "/a/b/c"),
+        ];
+
+        for (case, path, expected) in rows {
+            let encoded = path_encode(path);
             assert_eq!(
                 encoded, expected,
                 "case {case:?}: expected {expected:?}, got {encoded:?}"

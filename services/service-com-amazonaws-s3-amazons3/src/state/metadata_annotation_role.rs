@@ -36,20 +36,22 @@ pub const ANNOTATION_ROLE_PERMISSIONS_CODE: &str = "InsufficientAnnotationRolePe
 
 /// See [`ANNOTATION_ROLE_PERMISSIONS_CODE`] — the sentence that code carries.
 ///
-/// Worded as the published V2 provisioning failures of the other tables are
-/// (`smithy_query(query="doc",shape="ErrorDetails",member="ErrorCode")`, which lists no entry
-/// for the annotation table): what is wrong, then "make sure that" the requirement — which is
-/// the one the create states for this role, "the role must have a trust policy that allows
-/// the Amazon S3 metadata service to assume it, and a permissions policy that grants the
-/// actions needed to read annotations from your bucket" — and then what every entry in that
-/// list closes with, because a table that failed is replaced by re-creating the
-/// configuration.
+/// Recorded behaviour: the whole string is this error class's FIXED diagnostic, interpolating
+/// nothing from the request or from state. It states what the role has to grant on the bucket,
+/// which service principal its trust policy has to admit, what a KMS-encrypted bucket needs
+/// beside that, and — as every published V2 table-provisioning failure closes
+/// (`smithy_query(query="doc",shape="ErrorDetails",member="ErrorCode")`) — that a new table
+/// takes deleting the configuration and creating it again.
 pub const ANNOTATION_ROLE_PERMISSIONS_MESSAGE: &str =
-    "The IAM role for the annotation table doesn't have sufficient permissions. Make sure \
-     that the role has a trust policy that allows the Amazon S3 metadata service to assume \
-     it, and a permissions policy that grants the actions needed to read annotations from \
-     your bucket. To create a new metadata table, you must delete the metadata configuration \
-     for this bucket, and then create a new metadata configuration.";
+    "The annotation role does not have sufficient permissions. Ensure the role grants \
+     s3:GetObjectAnnotation, s3:GetObjectVersionAnnotation, s3:ListBucket, and \
+     s3:ListBucketVersions on the bucket, and that the role's trust policy allows \
+     metadata.s3.amazonaws.com to assume it. If the bucket or its objects/annotations are \
+     encrypted with a KMS key, ensure the role also has kms:Decrypt permission. Additionally, \
+     ensure that the KMS key used to encrypt the bucket still exists, is active and has a \
+     resource policy granting access to the S3 service principals. To create a new S3 \
+     Metadata table, you must delete the S3 Metadata configuration for this bucket, and then \
+     create a new S3 Metadata configuration.";
 
 /// Why an annotation table provisioned NOW under `role` could not be created, or `None` when
 /// nothing IAM answered stops it.

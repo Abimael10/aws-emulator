@@ -950,11 +950,9 @@ fn refused_write(
         // service words it ([`crate::service::object_write`]); user-defined metadata past the
         // published 2 KB is answered with the code S3 publishes for that condition, naming
         // the total and the ceiling ([`crate::scaffolded::Scaffolded::metadata_too_large`]).
-        crate::state::ObjectWrite::KeyTooLong { .. } => crate::scaffolded::Scaffolded::unmodeled(
-            crate::service::object_write::KEY_TOO_LONG_CODE,
-            crate::service::object_write::KEY_REFUSAL_STATUS,
-            crate::service::object_write::KEY_TOO_LONG_MESSAGE,
-        ),
+        crate::state::ObjectWrite::KeyTooLong { bytes } => {
+            crate::service::object_write::KeyRefusal::TooLong { bytes }.scaffolded()
+        }
         crate::state::ObjectWrite::MetadataTooLarge { bytes } => {
             crate::scaffolded::Scaffolded::metadata_too_large(bytes)
         }

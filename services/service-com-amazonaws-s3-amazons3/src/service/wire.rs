@@ -1776,23 +1776,27 @@ fn as_bound_timestamp(value: &str, format: ::aws_smithy_types::date_time::Format
 /// The request headers whose value the OPERATION judges rather than the boundary, each
 /// WITHHELD from the codec when it is outside the value set the model publishes for it.
 ///
-/// `x-amz-acl` and `x-amz-object-ownership` are the two. A value outside the published set
-/// is refused by S3 with its own `InvalidArgument` envelope — the `<ArgumentName>` /
+/// `x-amz-acl`, `x-amz-object-ownership` and `x-amz-storage-class` are the three. A value
+/// outside the published set is refused by S3 with its own envelope — the `<ArgumentName>` /
 /// `<ArgumentValue>` pair naming the header and the value as sent, beside a sentence that is
-/// empty for the one ([`crate::scaffolded::Scaffolded::invalid_canned_acl`]) and names the
-/// header for the other ([`crate::state::invalid_object_ownership_message`]) — and an
-/// envelope with members of its own is something only a handler can answer: the boundary's
-/// refusal carries the constraint clause the validating walk wrote, which names the Smithy
-/// member path and the model's value list instead.
+/// empty for the first ([`crate::scaffolded::Scaffolded::invalid_canned_acl`]) and names the
+/// header for the second ([`crate::state::invalid_object_ownership_message`]), and the
+/// `InvalidStorageClass` document naming the class asked for for the third
+/// ([`crate::service::object_write::invalid_storage_class`]) — and an envelope with members of
+/// its own is something only a handler can answer: the boundary's refusal carries the
+/// constraint clause the validating walk wrote, which names the Smithy member path and the
+/// model's value list instead.
 ///
 /// So the value is kept from the codec, exactly as a website document the owning operation
 /// is the one to refuse is ([`crate::state::website_document_rejection`]), and every
 /// operation that binds the header answers the refusal itself from the request's own
-/// headers ([`rejected_canned_acl`], [`rejected_object_ownership`]). The set is still
-/// enforced, in that one place: nothing outside it is ever stored.
-const HEADERS_JUDGED_BY_THE_HANDLER: [&str; 2] = [
+/// headers ([`rejected_canned_acl`], [`rejected_object_ownership`],
+/// [`rejected_storage_class`]). The set is still enforced, in that one place: nothing outside
+/// it is ever stored.
+const HEADERS_JUDGED_BY_THE_HANDLER: [&str; 3] = [
     crate::state::CANNED_ACL_ARGUMENT,
     crate::state::OBJECT_OWNERSHIP_ARGUMENT,
+    crate::service::object_write::STORAGE_CLASS_HEADER,
 ];
 
 /// The `x-amz-acl` value `parts` carried that is outside the set `input_schema`'s own `ACL`
@@ -1837,6 +1841,30 @@ pub(crate) fn rejected_object_ownership<'p>(
     let permitted = permitted_values(header_member(
         input_schema,
         crate::state::OBJECT_OWNERSHIP_ARGUMENT,
+    )?)?;
+    (!permitted.contains(&value)).then_some(value)
+}
+
+/// The `x-amz-storage-class` value `parts` carried that is outside the set `input_schema`'s
+/// own `StorageClass` member publishes, or `None` for a request carrying a published value or
+/// no such header at all.
+///
+/// The judgement the boundary would have made, made where the refusal can carry S3's own
+/// envelope — see [`HEADERS_JUDGED_BY_THE_HANDLER`], which is what withholds the value from
+/// the codec, and [`rejected_canned_acl`], the same reading for another header judged that
+/// way. The envelope itself is the object-write path's
+/// ([`crate::service::object_write::rejected_storage_class`], which is what a handler calls).
+pub(crate) fn rejected_storage_class<'p>(
+    parts: &'p ::http::request::Parts,
+    input_schema: &Schema,
+) -> Option<&'p str> {
+    let value = parts
+        .headers
+        .get(crate::service::object_write::STORAGE_CLASS_HEADER)
+        .and_then(|value| value.to_str().ok())?;
+    let permitted = permitted_values(header_member(
+        input_schema,
+        crate::service::object_write::STORAGE_CLASS_HEADER,
     )?)?;
     (!permitted.contains(&value)).then_some(value)
 }

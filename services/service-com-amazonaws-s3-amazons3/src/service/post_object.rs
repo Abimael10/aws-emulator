@@ -193,6 +193,11 @@ struct Refusal {
     code: &'static str,
     status: u16,
     message: String,
+    /// What the refusal is ABOUT, for an error class whose document carries members beside
+    /// the sentence — the same members the object-write path's own channel writes for that
+    /// class ([`crate::scaffolded::ErrorDetail`]), so one class of refusal reads the same
+    /// whether it was asked for by a form upload or by a REST write.
+    detail: Option<crate::scaffolded::ErrorDetail>,
 }
 
 impl Refusal {
@@ -202,6 +207,30 @@ impl Refusal {
             code,
             status,
             message: message.into(),
+            detail: None,
+        }
+    }
+
+    /// This refusal, with the members its error class's document carries beside the sentence.
+    fn naming(mut self, detail: crate::scaffolded::ErrorDetail) -> Self {
+        self.detail = Some(detail);
+        self
+    }
+}
+
+/// A KEY this form upload cannot be stored under, as a refusal of the upload: the code, the
+/// status, the sentence and the document members that key's own rule answers with, taken whole
+/// from the one place every object write is judged by it.
+impl From<crate::service::object_write::KeyRefusal> for Refusal {
+    fn from(refusal: crate::service::object_write::KeyRefusal) -> Self {
+        let rendered = Self::new(
+            refusal.code(),
+            crate::service::object_write::KEY_REFUSAL_STATUS,
+            refusal.message(),
+        );
+        match refusal.detail() {
+            Some(detail) => rendered.naming(detail),
+            None => rendered,
         }
     }
 }
@@ -919,25 +948,34 @@ fn refused(svc: &dyn Service, refusal: &Refusal) -> RtResponse {
     let protocol = svc
         .override_protocol()
         .unwrap_or_else(|| svc.definition().protocol());
-    let document = crate::scaffolded::UnmodeledMessage {
-        message: refusal.message.clone(),
-    };
-    protocol
-        .serialize_error(
-            &document,
+    let rendered = |document: &dyn ::aws_smithy_schema::serde::SerializableStruct| {
+        protocol.serialize_error(
+            document,
             &crate::scaffolded::UNMODELED_SCHEMA,
             refusal.code,
             refusal.status,
         )
-        .unwrap_or_else(|error| {
-            ::tracing::warn!(
-                code = refusal.code,
-                %error,
-                "this refusal of a form upload could not be rendered in this service's \
-                 envelope"
-            );
-            response_with(refusal.status, SdkBody::empty())
-        })
+    };
+    // A class whose document carries members beside the sentence is written by the renderer
+    // that can write them; every other refusal carries the `<Message>` alone.
+    match &refusal.detail {
+        Some(detail) => rendered(&crate::scaffolded::UnmodeledWithDetail {
+            message: refusal.message.clone(),
+            detail: detail.clone(),
+        }),
+        None => rendered(&crate::scaffolded::UnmodeledMessage {
+            message: refusal.message.clone(),
+        }),
+    }
+    .unwrap_or_else(|error| {
+        ::tracing::warn!(
+            code = refusal.code,
+            %error,
+            "this refusal of a form upload could not be rendered in this service's \
+             envelope"
+        );
+        response_with(refusal.status, SdkBody::empty())
+    })
 }
 
 /// The refusal a write this service already decided answers with, rendered through that
@@ -1076,12 +1114,8 @@ impl<Eng: Send + Sync + 'static> PostObject<Eng> {
         // ([`crate::service::object_write::key_refusal`] holds that rule, and is the same
         // one the write itself judges the finished key by).
         for named in [stated_key, file_name.as_str()] {
-            if let Some((code, message)) = crate::service::object_write::key_refusal(named) {
-                return Err(Refusal::new(
-                    code,
-                    crate::service::object_write::KEY_REFUSAL_STATUS,
-                    message,
-                ));
+            if let Some(refusal) = crate::service::object_write::key_refusal(named) {
+                return Err(refusal.into());
             }
         }
         let key = stated_key.replace(FILENAME_PLACEHOLDER, file_name);

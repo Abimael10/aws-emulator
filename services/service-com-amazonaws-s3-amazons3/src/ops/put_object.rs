@@ -393,12 +393,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObject<Eng> {
         // The KEY this write names, judged on its bytes alone before anything else about the
         // request: a name S3 cannot store is refused whatever the bucket or the payload is
         // ([`crate::service::object_write::key_refusal`] holds both published rules).
-        if let Some((code, message)) = crate::service::object_write::key_refusal(&input.key) {
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                code,
-                crate::service::object_write::KEY_REFUSAL_STATUS,
-                message,
-            ));
+        if let Some(refusal) = crate::service::object_write::key_refusal(&input.key) {
+            return Err(refusal.scaffolded());
         }
 
         // The canned ACL this write asks the object to be stored with has to be one the
@@ -412,6 +408,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObject<Eng> {
             super::types::PUT_OBJECT_INPUT_SCHEMA,
         ) {
             return Err(crate::scaffolded::Scaffolded::invalid_canned_acl(value));
+        }
+
+        // The storage class it asks the object to be stored under has to be one the
+        // `StorageClass` member publishes, judged HERE for the same reason and through the
+        // same reading ([`crate::service::object_write::rejected_storage_class`]). A
+        // PUBLISHED class the addressed bucket cannot host is the same refusal, taken below
+        // once the bucket is known.
+        if let Some(refusal) = crate::service::object_write::rejected_storage_class(
+            ctx.parts(),
+            super::types::PUT_OBJECT_INPUT_SCHEMA,
+        ) {
+            return Err(refusal);
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -1156,12 +1164,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObject<Eng> {
             // on the key's bytes alone, with the `KeyTooLongError` S3 answers it with. The
             // store's own ceiling is the same one, so this arm is the one that cannot be
             // reached from here; it carries the same answer rather than a different code.
-            crate::state::ObjectWrite::KeyTooLong { .. } => {
-                return Err(crate::scaffolded::Scaffolded::unmodeled(
-                    crate::service::object_write::KEY_TOO_LONG_CODE,
-                    crate::service::object_write::KEY_REFUSAL_STATUS,
-                    crate::service::object_write::KEY_TOO_LONG_MESSAGE,
-                ));
+            crate::state::ObjectWrite::KeyTooLong { bytes } => {
+                return Err(
+                    crate::service::object_write::KeyRefusal::TooLong { bytes }.scaffolded()
+                );
             }
             // "Within the PUT request header, the user-defined metadata is limited to 2 KB
             // in size" (Amazon S3 User Guide). Past it S3 answers the code it publishes for

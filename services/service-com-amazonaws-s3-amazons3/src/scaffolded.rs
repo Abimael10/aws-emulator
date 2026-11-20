@@ -1033,6 +1033,22 @@ static LOCATION_CONSTRAINT: Schema = Schema::new_member(
 )
 .with_xml_name("LocationConstraint");
 
+/// The `<StorageClassRequested>` of an S3 error document: the storage class the refused
+/// request's `x-amz-storage-class` named, as it spelled it — the only place a storage-class
+/// refusal says WHICH class was rejected, since its sentence names none. See
+/// [`LOCATION_CONSTRAINT`], the same role for the location a create asked for.
+static STORAGE_CLASS_REQUESTED: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#RefusedResource$storageClassRequested",
+        "smithy.framework",
+        "storageClassRequested",
+    ),
+    ShapeType::String,
+    "storageClassRequested",
+    26,
+)
+.with_xml_name("StorageClassRequested");
+
 /// The `<Message>` S3 sends with [`crate::state::NOT_IMPLEMENTED_CODE`] when it is a QUERY
 /// PARAMETER that asked for functionality the service does not implement for the resource
 /// addressed: "NotImplemented — A query parameter you provided implies functionality that is
@@ -1225,6 +1241,10 @@ pub enum ErrorDetail {
     /// value the request's own `CreateBucketConfiguration` carried, which is what says which
     /// location was rejected — the sentence of that class names none.
     LocationConstraint(String),
+    /// A refusal about the STORAGE CLASS a write asked for, named by
+    /// `<StorageClassRequested>`: the value the request's own `x-amz-storage-class` carried,
+    /// which is what says which class was rejected — the sentence of that class names none.
+    StorageClassRequested(String),
     /// A request asking for functionality the service does not implement for the resource it
     /// addressed, named by the `<Header>` or the `<QueryParameter>` that asked for it: the
     /// sentence of that class names only the KIND of thing that implied it, so the member is
@@ -1343,6 +1363,9 @@ impl ErrorDetail {
             }
             Self::Condition(condition) => s.write_string(&UNMET_CONDITION, condition),
             Self::LocationConstraint(location) => s.write_string(&LOCATION_CONSTRAINT, location),
+            Self::StorageClassRequested(requested) => {
+                s.write_string(&STORAGE_CLASS_REQUESTED, requested)
+            }
             Self::Size {
                 size,
                 max_size_allowed,
@@ -1372,7 +1395,8 @@ impl ErrorDetail {
             | Self::Argument { name, .. }
             | Self::Upload(name)
             | Self::Condition(name)
-            | Self::LocationConstraint(name) => name.clone(),
+            | Self::LocationConstraint(name)
+            | Self::StorageClassRequested(name) => name.clone(),
             Self::Unimplemented(by) => by.name().to_string(),
             // The first of the series, which is the one such a refusal is reported by.
             Self::Arguments(arguments) => arguments

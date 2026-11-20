@@ -125,7 +125,8 @@ pub const STORAGE_CLASS_NOT_ALLOWED: &str = " is not allowed.";
 ///   and `OUTPOSTS` against a general purpose bucket, and everything but a directory bucket's
 ///   two against one of those — would store the object under a class the bucket cannot host,
 ///   which every later read, lifecycle transition and restore of it would then report. That
-///   value is not valid for the request, which is what `InvalidStorageClass` reports.
+///   value is not valid for the request, which is what `InvalidStorageClass` reports
+///   ([`invalid_storage_class`], the one envelope that class is answered with).
 pub fn storage_class_refusal<E>(
     bucket: &Bucket,
     storage_class: Option<&str>,
@@ -138,16 +139,54 @@ pub fn storage_class_refusal<E>(
             format!("{named}{STORAGE_CLASS_NOT_ALLOWED}"),
         ));
     }
-    (!hosted_storage_classes(bucket).contains(&named)).then(|| {
-        crate::scaffolded::Scaffolded::unmodeled(
-            INVALID_STORAGE_CLASS_CODE,
-            INVALID_STORAGE_CLASS_STATUS,
-            INVALID_STORAGE_CLASS_MESSAGE,
-        )
-    })
+    (!hosted_storage_classes(bucket).contains(&named)).then(|| invalid_storage_class(named))
 }
 
-/// Why the object key `key` is refused, as `(code, message)`, or `None` for a key S3 stores.
+/// The refusal S3 answers a write whose `x-amz-storage-class` names a class the request cannot
+/// be served under with: [`INVALID_STORAGE_CLASS_CODE`] at [`INVALID_STORAGE_CLASS_STATUS`]
+/// with that code's fixed sentence, plus `<StorageClassRequested>` echoing the class the
+/// request asked for.
+///
+/// The member is the only place this class of refusal says WHICH class was rejected, since the
+/// sentence names none (recorded response), so it travels with every such refusal: a value
+/// outside the set the model publishes for the member ([`rejected_storage_class`] reads it
+/// straight from the request's header, because such a value never reaches a deserialized
+/// input) and a published value the addressed bucket cannot host are the same answer to the
+/// caller — the class it named is not one this request can be served under.
+///
+/// The ONE place that envelope is built, so every write that names a class refuses it
+/// identically.
+pub fn invalid_storage_class<E>(requested: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::unmodeled(
+        INVALID_STORAGE_CLASS_CODE,
+        INVALID_STORAGE_CLASS_STATUS,
+        INVALID_STORAGE_CLASS_MESSAGE,
+    )
+    .naming(crate::scaffolded::ErrorDetail::StorageClassRequested(
+        requested.to_string(),
+    ))
+}
+
+/// The refusal a write whose `x-amz-storage-class` is outside the set the model publishes for
+/// the member it binds earns, or `None` for a request carrying a published value or no such
+/// header at all.
+///
+/// The judgement the BOUNDARY would otherwise make, made where the refusal can carry S3's own
+/// envelope: the boundary's refusal words the constraint the validating walk checked, naming
+/// the Smithy member path and the model's value list, where S3 answers its own
+/// `InvalidStorageClass` ([`invalid_storage_class`]) naming the class the request asked for —
+/// so the value is withheld from the codec and read here from the request's own headers,
+/// exactly as the two canned-ACL-shaped headers judged that way are
+/// (`crate::service::wire::rejected_canned_acl`). The set comes from the OPERATION's own
+/// member, so nothing outside it is ever stored.
+pub fn rejected_storage_class<E>(
+    parts: &::http::request::Parts,
+    input_schema: &::aws_smithy_schema::Schema,
+) -> Option<crate::scaffolded::Scaffolded<E>> {
+    crate::service::wire::rejected_storage_class(parts, input_schema).map(invalid_storage_class)
+}
+
+/// Why the object key `key` is refused, or `None` for a key S3 stores.
 ///
 /// Two published rules about the NAME, both of them about the bytes it is made of:
 ///
@@ -160,12 +199,81 @@ pub fn storage_class_refusal<E>(
 ///
 /// Judged before anything is stored, so a refused write leaves whatever the key held exactly
 /// as it was.
-pub fn key_refusal(key: &str) -> Option<(&'static str, String)> {
+pub fn key_refusal(key: &str) -> Option<KeyRefusal> {
     if key.contains('\0') {
-        return Some((ERRORLESS_REFUSAL_CODE, String::new()));
+        return Some(KeyRefusal::Unconveyable);
     }
-    (key.len() > state::MAX_OBJECT_KEY_BYTES)
-        .then(|| (KEY_TOO_LONG_CODE, KEY_TOO_LONG_MESSAGE.to_string()))
+    (key.len() > state::MAX_OBJECT_KEY_BYTES).then_some(KeyRefusal::TooLong { bytes: key.len() })
+}
+
+/// Why a key is refused — and therefore the whole envelope S3 answers it with, since what the
+/// document carries differs by the class the refusal belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyRefusal {
+    /// A key no request URI can convey, which is refused before the API layer and so carries
+    /// no error document at all ([`ERRORLESS_REFUSAL_CODE`]).
+    Unconveyable,
+    /// A key past the published ceiling: [`KEY_TOO_LONG_CODE`], whose document also states the
+    /// two numbers its sentence does not — see [`KeyRefusal::detail`].
+    TooLong {
+        /// How many bytes the key the request named is made of.
+        bytes: usize,
+    },
+}
+
+impl KeyRefusal {
+    /// The wire `<Code>` this refusal carries.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Unconveyable => ERRORLESS_REFUSAL_CODE,
+            Self::TooLong { .. } => KEY_TOO_LONG_CODE,
+        }
+    }
+
+    /// Its `<Message>`.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Unconveyable => "",
+            Self::TooLong { .. } => KEY_TOO_LONG_MESSAGE,
+        }
+    }
+
+    /// The members this class's error document carries BESIDE the sentence, or `None` for a
+    /// class whose document carries none.
+    ///
+    /// A key past the ceiling is refused on its SIZE, and S3's document for that class carries
+    /// the `<Size>` / `<MaxSizeAllowed>` pair — the key's own byte count and the ceiling it was
+    /// judged against — because the sentence names neither, so the pair is the only place the
+    /// refusal says by how much the caller has to shorten the name (recorded response; the same
+    /// pair every size-refused value of this service carries,
+    /// [`crate::scaffolded::ErrorDetail::Size`]).
+    pub fn detail(self) -> Option<crate::scaffolded::ErrorDetail> {
+        match self {
+            Self::Unconveyable => None,
+            Self::TooLong { bytes } => Some(crate::scaffolded::ErrorDetail::Size {
+                size: i64::try_from(bytes).unwrap_or(i64::MAX),
+                max_size_allowed: i64::try_from(state::MAX_OBJECT_KEY_BYTES).unwrap_or(i64::MAX),
+            }),
+        }
+    }
+
+    /// This refusal on the error channel every object write answers on, whole: the code, the
+    /// status and the sentence, plus the members its document carries.
+    ///
+    /// The ONE place that envelope is built, so every write that names a key — the put, the
+    /// copy, the upload initiation and completion, the rename and the browser form — refuses an
+    /// unstorable name identically.
+    pub fn scaffolded<E>(self) -> crate::scaffolded::Scaffolded<E> {
+        let refusal = crate::scaffolded::Scaffolded::unmodeled(
+            self.code(),
+            KEY_REFUSAL_STATUS,
+            self.message(),
+        );
+        match self.detail() {
+            Some(detail) => refusal.naming(detail),
+            None => refusal,
+        }
+    }
 }
 
 /// The sentence S3 answers a key past the published ceiling with: fixed text, naming neither
@@ -383,7 +491,7 @@ mod tests {
     }
 
     /// The key rules, at the ceiling and one byte past it, and over a key carrying the one
-    /// byte no URI conveys.
+    /// byte no URI conveys — with the members each class's error document carries.
     #[test]
     fn a_key_is_refused_for_its_bytes_alone() {
         let rows: [(&str, String, Option<&'static str>); 6] = [
@@ -413,9 +521,29 @@ mod tests {
         for (case, key, expected) in rows {
             let refusal = key_refusal(&key);
             assert_eq!(
-                refusal.as_ref().map(|(code, _)| *code),
+                refusal.map(KeyRefusal::code),
                 expected,
                 "case {case:?}: expected {expected:?}, got {refusal:?}"
+            );
+            // A key refused for its LENGTH states the two numbers its sentence does not: its
+            // own byte count and the published ceiling. Nothing else carries them.
+            let stated = refusal.and_then(KeyRefusal::detail).map(|detail| match detail {
+                crate::scaffolded::ErrorDetail::Size {
+                    size,
+                    max_size_allowed,
+                } => (size, max_size_allowed),
+                other => panic!("case {case:?}: a key refusal states a size, got {other:?}"),
+            });
+            let owed = (expected == Some(KEY_TOO_LONG_CODE)).then(|| {
+                (
+                    i64::try_from(key.len()).expect("a test key fits an i64"),
+                    i64::try_from(state::MAX_OBJECT_KEY_BYTES).expect("the ceiling fits an i64"),
+                )
+            });
+            assert_eq!(
+                stated, owed,
+                "case {case:?}: expected the <Size>/<MaxSizeAllowed> pair {owed:?}, got \
+                 {stated:?}"
             );
         }
     }

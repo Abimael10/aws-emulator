@@ -16,8 +16,11 @@
 //! > `CreateMultipartUpload`: the request is refused HTTP 400 `InvalidArgument` whose message
 //! > is that class followed by " is not allowed.", naming the `x-amz-storage-class` header
 //! > and echoing the value, and nothing is written. A class that belongs to another KIND of
-//! > bucket than the one addressed is refused `InvalidStorageClass`. Every other published
-//! > class is stored as asked and reported back by a read.
+//! > bucket than the one addressed is refused `InvalidStorageClass`, as is a value that is no
+//! > published class at all — either way the class the caller named is not one the request can
+//! > be served under, and the document names it in `<StorageClassRequested>`, the only place
+//! > that refusal says WHICH class was rejected since its sentence names none. Every other
+//! > published class is stored as asked and reported back by a read.
 //!
 //! Its sources: the catalog is the model's own
 //! (`smithy_query(query="shape",shape="StorageClass")` reports `STANDARD`,
@@ -127,6 +130,14 @@ fn assert_refused(case: &str, class: &str, outcome: Outcome, answer: &Answer) {
                 "The storage class you specified is not valid",
                 "case {case:?}: expected the published sentence, got {:?}",
                 answer.error_message()
+            );
+            // The sentence names no class, so the document does: the one the request asked
+            // for, as it spelled it.
+            assert_eq!(
+                answer.element("StorageClassRequested"),
+                Some(class.to_string()),
+                "case {case:?}: the refusal names the class asked for, got {:?}",
+                answer.element("StorageClassRequested")
             );
         }
         Outcome::Stored => unreachable!("case {case:?}: a stored class is no refusal"),
@@ -251,5 +262,77 @@ async fn a_write_may_name_only_a_storage_class_the_addressed_bucket_accepts_from
                 );
             }
         }
+    }
+}
+
+/// The values that are no published `StorageClass` at all, spanning the ways a header can
+/// fail to name one: a word no value spells, a published value in another case (the enum's
+/// values are the model's spelling), a published value with a suffix, and a value that is a
+/// number. None is a row of [`CATALOG`], whose every entry IS published.
+const UNPUBLISHED: &[&str] = &["BOGUS", "standard", "STANDARD_IAX", "1"];
+
+#[tokio::test]
+async fn a_class_that_is_no_published_value_is_refused_as_the_service_refuses_a_class() {
+    for class in UNPUBLISHED {
+        assert!(
+            !CATALOG.iter().any(|(published, _)| published == class),
+            "case {class:?}: this row must name no published class, got {CATALOG:?}"
+        );
+        // A fresh store per row, so one row's object cannot decide another row's emptiness.
+        let router = router();
+        let name = "storage-class-unpublished";
+        bucket(&router, name).await;
+        let source = put_object(&router, name, "source.bin", BODY, &[]).await;
+        assert_eq!(
+            source.status, 200,
+            "case {class:?}: the source write must be accepted, got {} with body {:?}",
+            source.status,
+            text(&source)
+        );
+
+        // The same value, named by each of the three writes that take one: the rule is the
+        // header's rather than one operation's.
+        let key = "unpublished.bin";
+        let written = put_object(&router, name, key, BODY, &[(HEADER, class)]).await;
+        let copied = copy_object(
+            &router,
+            name,
+            &format!("copy-{key}"),
+            &format!("{name}/source.bin"),
+            &[(HEADER, class)],
+        )
+        .await;
+        let initiated =
+            create_multipart_upload(&router, name, &format!("mpu-{key}"), &[(HEADER, class)]).await;
+        for (operation, answer) in [
+            ("PutObject", &written),
+            ("CopyObject", &copied),
+            ("CreateMultipartUpload", &initiated),
+        ] {
+            // The service's own refusal of a class, not the constraint clause a validating
+            // walk would word: same code, same sentence and same member as a published class
+            // the bucket cannot host.
+            assert_refused(
+                &format!("{class}/{operation}"),
+                class,
+                Outcome::NotHosted,
+                answer,
+            );
+        }
+
+        // Nothing was stored under either key the refused writes named.
+        let read = head_object(&router, name, key, "").await;
+        assert_eq!(
+            read.status, 404,
+            "case {class:?}: a refused write stores nothing, got {} with body {:?}",
+            read.status,
+            text(&read)
+        );
+        let copied_read = head_object(&router, name, &format!("copy-{key}"), "").await;
+        assert_eq!(
+            copied_read.status, 404,
+            "case {class:?}: a refused copy stores nothing, got {}",
+            copied_read.status
+        );
     }
 }

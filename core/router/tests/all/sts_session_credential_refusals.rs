@@ -44,7 +44,7 @@ use smithy_server_runtime::MultiServiceRouter;
 // The percent-encoder every awsQuery suite of this crate shares, and the readers that pull
 // one element's text — or every occurrence of a repeated one, with the serializer's escaping
 // undone — out of an XML answer: written ONCE in `query_wire`.
-use crate::query_wire::{element, elements, form_encode};
+use crate::query_wire::{element, elements, form_encode, path_encode};
 
 /// The region every request here is signed for.
 const REGION: &str = "us-east-1";
@@ -183,24 +183,6 @@ pub(crate) async fn s3(
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
     (status, String::from_utf8_lossy(response.body()).to_string())
-}
-
-/// One object key as a request URI path component: every byte outside RFC 3986's unreserved
-/// set percent-encoded, the `/` separators kept — the encoding an SDK addresses a key by.
-///
-/// Not `query_wire::form_encode`, which escapes `/` too: that is the form-body encoding, and
-/// a path encoded with it would address one key named with literal slashes.
-fn path_encode(key: &str) -> String {
-    let mut encoded = String::with_capacity(key.len());
-    for byte in key.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
-                encoded.push(char::from(byte));
-            }
-            other => encoded.push_str(&format!("%{other:02X}")),
-        }
-    }
-    encoded
 }
 
 /// `text` with every character outside ASCII written as the JSON `\uXXXX` escape that names
