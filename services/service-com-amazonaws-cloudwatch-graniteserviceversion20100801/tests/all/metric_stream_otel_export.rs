@@ -74,7 +74,10 @@ const DIMENSIONS_KEY: &str = "Dimensions";
 /// from, its namespace and its metric name, joined by `/`. That is the name an OpenTelemetry
 /// consumer keys and routes a series by; the unqualified halves are read back off the data point's
 /// identifying pairs.
-fn qualified_name(namespace: &str, metric_name: &str) -> String {
+///
+/// Shared with `metric_stream_otel_names`, so one spelling of the expectation serves every suite
+/// that reads an exported record's metric.
+pub(crate) fn qualified_name(namespace: &str, metric_name: &str) -> String {
     format!("amazonaws.com/{namespace}/{metric_name}")
 }
 
