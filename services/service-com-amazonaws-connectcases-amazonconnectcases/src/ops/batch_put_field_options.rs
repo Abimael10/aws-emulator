@@ -247,17 +247,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(BatchPutFieldOptionsErrorModeled::ResourceNotFoundException)?;
 
         // Field options belong to a single-select field, so a field of any
-        // other type has none to set.
+        // other type has none to set. The refusal names that field's stored
+        // type.
         if field.field_type != crate::state::FIELD_TYPE_SINGLE_SELECT {
             return Err(BatchPutFieldOptionsErrorModeled::ValidationException(
-                ValidationException {
-                    message: format!(
-                        "field {} is a {} field; field options can only be set on a {} field",
-                        input.field_id,
-                        field.field_type,
-                        crate::state::FIELD_TYPE_SINGLE_SELECT
-                    ),
-                },
+                crate::state::field_options_unsupported(&field.field_type),
             )
             .into());
         }

@@ -1195,14 +1195,57 @@ pub fn list_too_long(member: &str, len: usize, cap: usize) -> Option<String> {
 /// The modelled 400 for a request that references field ids the domain's schema
 /// does not define, as [`Domain::unknown_field_ids`] reports them.
 ///
-/// One wording for one rule: whichever member carried the references, the
-/// service names the ids it could not resolve after its own fixed text, so every
-/// operation that resolves a field id against a domain refuses in the same
-/// words. The ids come from the REQUEST, verbatim, and are rendered by
-/// [`name_ids`] so one request cannot make the refusal grow without bound.
+/// The sentence a call that names field ids to READ, WRITE or FILTER a case's
+/// values is refused with: the service names the ids it could not resolve after
+/// its own fixed text and attributes them to no member, since the ids are the
+/// request's field selection or field values rather than a configuration of a
+/// resource — a member-attributed reference is
+/// [`unknown_fields_in`]. The ids come from the REQUEST, verbatim, and are
+/// rendered by [`name_ids`] so one request cannot make the refusal grow without
+/// bound.
 pub fn unknown_fields(ids: &[String]) -> ValidationException {
     ValidationException {
         message: format!("Unknown field Ids: {}", name_ids(ids)),
+    }
+}
+
+/// The modelled 400 for a request whose `member` CONFIGURES a resource with
+/// references to the domain's fields — a layout's `content`, a template's
+/// `requiredFields` — and names ids the schema does not define.
+///
+/// This frame is PARAMETERISED BY THE INPUT MEMBER the references rode in: such
+/// a payload nests field references inside a structure the caller composed, so
+/// the service attributes the unresolvable ids to the top-level member that
+/// carried them and the caller can tell which part of the payload was rejected.
+/// `member` is therefore the member name as the model spells it (`content`,
+/// `requiredFields`), never a sentence of the raising site's own. The ids come
+/// from the REQUEST, verbatim, and are rendered by [`name_ids`] so one request
+/// cannot make the refusal grow without bound.
+pub fn unknown_fields_in(member: &str, ids: &[String]) -> ValidationException {
+    ValidationException {
+        message: format!(
+            "The following field IDs provided in {member} do not exist: {}",
+            name_ids(ids)
+        ),
+    }
+}
+
+/// The modelled 400 for a request that would set field options on a field whose
+/// stored [`Field::field_type`] is not [`FIELD_TYPE_SINGLE_SELECT`].
+///
+/// Field options belong to a single select field — `BatchPutFieldOptions`
+/// "Creates and updates a set of field options for a single select field in a
+/// Cases domain" (`smithy_query(query="doc",shape="BatchPutFieldOptions")`) — so
+/// a field of any other type has none to set. The one variable part is the
+/// target field's type AS STORED, which is what tells the caller why the call
+/// cannot be repaired by resending; the field is addressed by the request's own
+/// path labels, so its id is not interpolated into the sentence.
+pub fn field_options_unsupported(field_type: &str) -> ValidationException {
+    ValidationException {
+        message: format!(
+            "Field type ({field_type}) does not support field options. Only \
+             {FIELD_TYPE_SINGLE_SELECT} field types are supported"
+        ),
     }
 }
 

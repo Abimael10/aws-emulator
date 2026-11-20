@@ -267,7 +267,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 domain.unknown_field_ids(required_fields.iter().map(|f| f.field_id.as_str()));
             if !unknown.is_empty() {
                 return Err(UpdateTemplateErrorModeled::ValidationException(
-                    crate::state::unknown_fields(&unknown),
+                    // `requiredFields` is the input member the references rode
+                    // in, which the refusal attributes them to.
+                    crate::state::unknown_fields_in("requiredFields", &unknown),
                 )
                 .into());
             }

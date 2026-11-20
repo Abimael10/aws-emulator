@@ -14,8 +14,13 @@
 //!    empty value", a value a caller writes — is reported like any other value.
 //!    That is what keeps "cleared" distinguishable from "never set".
 //! 2. A request that references a field id the domain's schema does not define is
-//!    refused with `ValidationException` (400) naming the unresolvable ids after
-//!    the service's fixed text, whichever member carried them.
+//!    refused with `ValidationException` (400). A member that CONFIGURES a
+//!    resource with field references (a layout's `content`, a template's
+//!    `requiredFields`) is ATTRIBUTED in the sentence, so a caller can tell which
+//!    part of its payload was rejected; a call that names field ids to read,
+//!    write or filter a case's values carries the service's bare sentence, which
+//!    attributes them to no member. Either way the ids are the ones the request
+//!    spelled, in its own order.
 //! 3. `ResourceNotFoundException` (404) carries the sentence this service sends
 //!    for the KIND of resource that could not be resolved (its generic one for
 //!    the kinds that have none of their own); the resource that could not be
@@ -33,6 +38,10 @@
 //! 7. A listing of layouts reports the layouts the domain still holds, computed
 //!    from the stored records: the reader `UpdateLayout`'s refusal above is
 //!    checked against, which was a scaffolded 501 before this change.
+//! 8. A put of field options against a field whose stored `FieldType` is not
+//!    `SingleSelect` is refused with `ValidationException` (400) naming that
+//!    STORED type, and no field id — the field is already addressed by the
+//!    request's own path labels.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcases_amazonconnectcases::state::{
@@ -292,13 +301,13 @@ async fn a_field_id_outside_the_domains_schema_is_refused_in_the_services_words(
     let long_id = "x".repeat(500);
     let minted_looking = "00000000-0000-4000-8000-000000000000";
 
-    // (case, method, path, body, the unknown ids the message must name in order)
-    let rows: Vec<(&str, &str, String, Value, Vec<&str>)> = vec![
+    let rows: Vec<UnknownFieldRow> = vec![
         (
             "GetCase names one id the schema does not define",
             "POST",
             format!("/domains/{domain_id}/cases/{case_id}"),
             json!({ "fields": [{ "id": "no-such-field" }] }),
+            None,
             vec!["no-such-field"],
         ),
         (
@@ -306,6 +315,7 @@ async fn a_field_id_outside_the_domains_schema_is_refused_in_the_services_words(
             "POST",
             format!("/domains/{domain_id}/cases/{case_id}"),
             json!({ "fields": [{ "id": text }, { "id": "a" }, { "id": minted_looking }] }),
+            None,
             vec!["a", minted_looking],
         ),
         (
@@ -313,6 +323,7 @@ async fn a_field_id_outside_the_domains_schema_is_refused_in_the_services_words(
             "POST",
             format!("/domains/{domain_id}/cases/{case_id}"),
             json!({ "fields": [{ "id": long_id }] }),
+            None,
             vec![long_id.as_str()],
         ),
         (
@@ -323,6 +334,7 @@ async fn a_field_id_outside_the_domains_schema_is_refused_in_the_services_words(
                 "templateId": template_id,
                 "fields": [{ "id": "no-such-field", "value": { "stringValue": "x" } }],
             }),
+            None,
             vec!["no-such-field"],
         ),
         (
@@ -330,6 +342,7 @@ async fn a_field_id_outside_the_domains_schema_is_refused_in_the_services_words(
             "PUT",
             format!("/domains/{domain_id}/cases/{case_id}"),
             json!({ "fields": [{ "id": "no-such-field", "value": { "stringValue": "x" } }] }),
+            None,
             vec!["no-such-field"],
         ),
         (
@@ -337,13 +350,30 @@ async fn a_field_id_outside_the_domains_schema_is_refused_in_the_services_words(
             "POST",
             format!("/domains/{domain_id}/templates"),
             json!({ "name": "requires-a-dangling-field", "requiredFields": [{ "fieldId": "no-such-field" }] }),
+            Some("requiredFields"),
             vec!["no-such-field"],
+        ),
+        (
+            "CreateTemplate requires two of them",
+            "POST",
+            format!("/domains/{domain_id}/templates"),
+            json!({
+                "name": "requires-two-dangling-fields",
+                "requiredFields": [
+                    { "fieldId": "a" },
+                    { "fieldId": text },
+                    { "fieldId": minted_looking },
+                ],
+            }),
+            Some("requiredFields"),
+            vec!["a", minted_looking],
         ),
         (
             "UpdateTemplate requires one",
             "PUT",
             format!("/domains/{domain_id}/templates/{template_id}"),
             json!({ "requiredFields": [{ "fieldId": "no-such-field" }] }),
+            Some("requiredFields"),
             vec!["no-such-field"],
         ),
         (
@@ -351,13 +381,26 @@ async fn a_field_id_outside_the_domains_schema_is_refused_in_the_services_words(
             "POST",
             format!("/domains/{domain_id}/layouts"),
             json!({ "name": "places-a-dangling-field", "content": layout_content(&["no-such-field"]) }),
+            Some("content"),
             vec!["no-such-field"],
+        ),
+        (
+            "CreateLayout places two of them",
+            "POST",
+            format!("/domains/{domain_id}/layouts"),
+            json!({
+                "name": "places-two-dangling-fields",
+                "content": layout_content(&["a", text.as_str(), minted_looking]),
+            }),
+            Some("content"),
+            vec!["a", minted_looking],
         ),
         (
             "UpdateLayout places one",
             "PUT",
             format!("/domains/{domain_id}/layouts/{layout_id}"),
             json!({ "content": layout_content(&["no-such-field"]) }),
+            Some("content"),
             vec!["no-such-field"],
         ),
         (
@@ -365,6 +408,7 @@ async fn a_field_id_outside_the_domains_schema_is_refused_in_the_services_words(
             "POST",
             format!("/domains/{domain_id}/cases-search"),
             json!({ "fields": [{ "id": "no-such-field" }] }),
+            None,
             vec!["no-such-field"],
         ),
         (
@@ -372,6 +416,7 @@ async fn a_field_id_outside_the_domains_schema_is_refused_in_the_services_words(
             "POST",
             format!("/domains/{domain_id}/cases-search"),
             json!({ "sorts": [{ "fieldId": "no-such-field", "sortOrder": "Asc" }] }),
+            None,
             vec!["no-such-field"],
         ),
         (
@@ -384,6 +429,20 @@ async fn a_field_id_outside_the_domains_schema_is_refused_in_the_services_words(
                     "value": { "stringValue": "x" },
                 } } },
             }),
+            None,
+            vec!["no-such-field"],
+        ),
+        (
+            "SearchAllRelatedItems filters a custom item on one",
+            "POST",
+            format!("/domains/{domain_id}/related-items-search"),
+            json!({
+                "filters": [{ "custom": { "fields": { "field": { "equalTo": {
+                    "id": "no-such-field",
+                    "value": { "stringValue": "x" },
+                } } } } }],
+            }),
+            None,
             vec!["no-such-field"],
         ),
         (
@@ -396,6 +455,7 @@ async fn a_field_id_outside_the_domains_schema_is_refused_in_the_services_words(
                     { "id": "no-such-field", "value": { "stringValue": "x" } },
                 ] } },
             }),
+            None,
             vec!["no-such-field"],
         ),
         (
@@ -411,11 +471,32 @@ async fn a_field_id_outside_the_domains_schema_is_refused_in_the_services_words(
                     "targetSlaMinutes": 60,
                 } } },
             }),
+            None,
             vec!["no-such-field"],
         ),
     ];
 
-    for (case, method, path, body, unknown) in rows {
+    // Both halves of the rule are driven: every configuration member that
+    // references the domain's fields, and the case paths that name field ids to
+    // read, write or filter values.
+    let mut attributed: Vec<&str> = rows
+        .iter()
+        .filter_map(|(_, _, _, _, member, _)| *member)
+        .collect();
+    attributed.sort_unstable();
+    attributed.dedup();
+    assert_eq!(
+        attributed,
+        vec!["content", "requiredFields"],
+        "the table must span every input member that configures a resource with field \
+         references, got {attributed:?}"
+    );
+    assert!(
+        rows.iter().any(|(_, _, _, _, member, _)| member.is_none()),
+        "the table must also drive the case paths, which attribute their ids to no member"
+    );
+
+    for (case, method, path, body, member, unknown) in rows {
         let (status, code, message) = emulator
             .failure_detail(case, method, &path, Some(body))
             .await;
@@ -424,7 +505,7 @@ async fn a_field_id_outside_the_domains_schema_is_refused_in_the_services_words(
             (400, "ValidationException"),
             "case {case:?}: expected 400 ValidationException, got {status} {code}: {message}"
         );
-        let expected = format!("Unknown field Ids: {}", unknown.join(", "));
+        let expected = unknown_field_sentence(member, &unknown);
         assert_eq!(
             message, expected,
             "case {case:?}: expected {expected:?}, got {message:?}"
@@ -432,6 +513,112 @@ async fn a_field_id_outside_the_domains_schema_is_refused_in_the_services_words(
         assert!(
             !message.contains(domain_id.as_str()),
             "case {case:?}: the refusal must carry no domain id, got {message:?}"
+        );
+    }
+}
+
+/// One row of the unknown-field-reference table: the case, the call to make
+/// (method, path, body), the input member the refusal must attribute the ids to
+/// (`None` where the refusal attributes them to no member), and the unknown ids
+/// the message must name, in order.
+type UnknownFieldRow<'a> = (
+    &'a str,
+    &'a str,
+    String,
+    Value,
+    Option<&'a str>,
+    Vec<&'a str>,
+);
+
+/// The sentence a request that references field ids the domain's schema does not
+/// define earns.
+///
+/// A member that CONFIGURES a resource with field references (a layout's
+/// `content`, a template's `requiredFields`) is named in the sentence, so the
+/// caller can tell which part of the payload was rejected; a call that names
+/// field ids to read, write or filter a case's VALUES is refused with the
+/// service's bare sentence instead, which attributes them to no member. Both
+/// carry the ids in the order the request spelled them.
+fn unknown_field_sentence(member: Option<&str>, ids: &[&str]) -> String {
+    match member {
+        Some(member) => format!(
+            "The following field IDs provided in {member} do not exist: {}",
+            ids.join(", ")
+        ),
+        None => format!("Unknown field Ids: {}", ids.join(", ")),
+    }
+}
+
+#[tokio::test]
+async fn field_options_on_a_field_of_another_type_are_refused_by_that_fields_type() {
+    let emulator = Emulator::new();
+    let domain_id = domain(&emulator, "field-option-type-wording-domain").await;
+    let fields = fields_of_every_type(&emulator, &domain_id).await;
+    let option = json!({ "name": "an option", "value": "an-option", "active": true });
+
+    // One row per `FieldType` the model declares (`FIELD_TYPE_VALUES`, the
+    // catalog `fields_of_every_type` creates from): the single select field takes
+    // options, and every other type is refused by the type the field is STORED
+    // with — the sentence's one variable part.
+    for (field_type, field_id) in &fields {
+        let case = format!("BatchPutFieldOptions on a {field_type} field");
+        let path = format!("/domains/{domain_id}/fields/{field_id}/options");
+        let body = json!({ "options": [option.clone()] });
+        if *field_type == "SingleSelect" {
+            emulator.ok(&case, "PUT", &path, body).await;
+            continue;
+        }
+        let (status, code, message) = emulator
+            .failure_detail(&case, "PUT", &path, Some(body))
+            .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: expected 400 ValidationException, got {status} {code}: {message}"
+        );
+        assert_eq!(
+            message,
+            format!(
+                "Field type ({field_type}) does not support field options. Only SingleSelect \
+                 field types are supported"
+            ),
+            "case {case:?}: expected the stored-type sentence, got {message:?}"
+        );
+        // The field's type is the ONLY variable part: the field the request
+        // addressed by its path labels is not named in the sentence.
+        assert!(
+            !message.contains(field_id.as_str()),
+            "case {case:?}: the sentence must carry no field id, got {message:?}"
+        );
+    }
+
+    // The refusals wrote nothing, and the one field that takes options holds the
+    // option that was accepted.
+    for (field_type, field_id) in &fields {
+        let case = format!("ListFieldOptions on a {field_type} field");
+        let listed = emulator
+            .ok(
+                &case,
+                "POST",
+                &format!("/domains/{domain_id}/fields/{field_id}/options-list"),
+                json!({}),
+            )
+            .await;
+        let values: Vec<&str> = listed
+            .get("options")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("case {case:?}: no options list in {listed:?}"))
+            .iter()
+            .filter_map(|held| held.get("value").and_then(Value::as_str))
+            .collect();
+        let expected: Vec<&str> = if *field_type == "SingleSelect" {
+            vec!["an-option"]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            values, expected,
+            "case {case:?}: expected {expected:?} held, got {values:?}"
         );
     }
 }

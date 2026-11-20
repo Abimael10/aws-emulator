@@ -251,7 +251,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let unknown = domain.unknown_field_ids(referenced.iter().map(String::as_str));
             if !unknown.is_empty() {
                 return Err(UpdateLayoutErrorModeled::ValidationException(
-                    crate::state::unknown_fields(&unknown),
+                    // `content` is the input member the references rode in,
+                    // which the refusal attributes them to.
+                    crate::state::unknown_fields_in("content", &unknown),
                 )
                 .into());
             }
