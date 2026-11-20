@@ -364,6 +364,15 @@ async fn a_stack_provisions_the_guardduty_ip_set_its_template_declares() {
         let region = row.region;
         let stack_name = format!("guardduty-ipset-stack-{index}");
         let template = (row.template)();
+        // The row states the `Location` its template declares and the read must report, so
+        // the two must not drift: a template edit that left the row's expectation behind
+        // would make it wrong and still passing.
+        assert!(
+            template.contains(row.expected_location),
+            "case {case:?}: the row expects the location {:?}, which its own template does \
+             not carry: {template}",
+            row.expected_location
+        );
 
         let (status, body) = cloudformation(
             &router,
