@@ -422,11 +422,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // what persists them.
             connect_settings: None,
             // `NetworkType`'s own documentation: "The default value is IPv4 or IPv6
-            // based on the provided subnet capabilities" — a choice made by the VPC
-            // data plane this emulator does not have, so an unspecified network type
-            // stays absent rather than being invented. Every value of the modelled
-            // enum is admitted: unlike Simple AD, Managed Microsoft AD's documentation
-            // narrows none of them.
+            // based on the provided subnet capabilities" — so where the request names
+            // none, the directory reports the default read from the capabilities of the
+            // subnets the owner of subnets resolved above
+            // (`crate::state::Directory::reported_network_type`) rather than one invented
+            // here. Every value of the modelled enum is admitted: unlike Simple AD,
+            // Managed Microsoft AD's documentation narrows none of them.
             network_type: input.network_type,
             // `EnableSso` (still scaffolded) is what turns this on.
             sso_enabled: false,

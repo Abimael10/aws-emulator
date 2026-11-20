@@ -28,7 +28,11 @@
 //!   `RemoveRegion` signed for it can stop the replication again (after which the same add
 //!   is accepted once more), the directory's own primary Region is refused with
 //!   `UnsupportedOperationException`, and so is a directory whose type or edition does not
-//!   replicate across Regions.
+//!   replicate across Regions;
+//! * a directory DESCRIBES the Regions it lives in from that same record:
+//!   `DirectoryDescription$RegionsInfo` reports the Region the create was issued in as the
+//!   primary one and every replication an add recorded as an additional one, so the
+//!   description and the inventory cannot disagree.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -261,6 +265,215 @@ async fn active_directory(emulator: &Emulator, name: &str, edition: Option<&str>
     // The stage chain the create owes falls due on its own.
     tokio::time::sleep(crate::directory_lifecycle::PAST_ONE_SPAN).await;
     id
+}
+
+/// A `CreateDirectory` body for a Simple AD directory of the smallest size the modelled
+/// `DirectorySize` enum declares.
+fn simple_ad(name: &str) -> Value {
+    json!({
+        "Name": name,
+        "Password": PASSWORD,
+        "Size": "Small",
+        "VpcSettings": {
+            "VpcId": "vpc-0a1b2c3d",
+            "SubnetIds": ["subnet-0a1b2c3d", "subnet-1a2b3c4d"]
+        }
+    })
+}
+
+/// The one `DirectoryDescription` `DescribeDirectories` reports for `directory_id`, read in
+/// `region`.
+async fn described_in(
+    emulator: &Emulator,
+    region: &str,
+    directory_id: &str,
+    case: &str,
+) -> Value {
+    let (status, parsed) = call_as(
+        emulator,
+        ACCOUNT_ACCESS_KEY_ID,
+        region,
+        "DescribeDirectories",
+        json!({ "DirectoryIds": [directory_id] }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected the read to answer 200, got {status} with {parsed}"
+    );
+    let page = parsed["DirectoryDescriptions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        page.len(),
+        1,
+        "case {case:?}: expected exactly one description of {directory_id}, got {page:?}"
+    );
+    page[0].clone()
+}
+
+/// The `AdditionalRegions` a description reports, or `None` where the member is absent —
+/// which is what a directory replicated nowhere reports.
+fn additional_regions(described: &Value) -> Option<Vec<String>> {
+    described["RegionsInfo"]["AdditionalRegions"]
+        .as_array()
+        .map(|regions| {
+            regions
+                .iter()
+                .map(|region| region.as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+}
+
+/// RULE: a directory describes the Regions it lives in from its own record —
+/// `DirectoryDescription$RegionsInfo` reports the Region the directory was CREATED in as
+/// `PrimaryRegion` ("the Region where the ... directory was originally created") and the
+/// Regions a replication was added for as `AdditionalRegions` ("the Regions where the
+/// directory has been replicated, excluding the primary Region"), which stays absent until
+/// an add records one.
+///
+/// The rows differ along what the rule generalises over: the Region the create was issued
+/// in, the create operation, the directory type and the edition — and every description is
+/// read in ANOTHER Region than the one the create was issued in, so what the member reports
+/// is the record rather than the request that reads it.
+#[tokio::test]
+async fn a_directory_describes_the_region_it_was_created_in_and_the_ones_it_replicates_to() {
+    let emulator = emulator();
+
+    // (case, the Region the create is issued in, the create operation, its body)
+    let rows: Vec<(&str, &str, &str, Value)> = vec![
+        (
+            "an Enterprise Managed Microsoft AD created in the home Region",
+            HOME_REGION,
+            "CreateMicrosoftAD",
+            microsoft_ad("home-enterprise.example.com", None),
+        ),
+        (
+            "a Standard Managed Microsoft AD created in another Region",
+            OTHER_REGION,
+            "CreateMicrosoftAD",
+            microsoft_ad("west-standard.example.com", Some("Standard")),
+        ),
+        (
+            "a Simple AD created in a third Region",
+            "eu-central-1",
+            "CreateDirectory",
+            simple_ad("central-simple.example.com"),
+        ),
+    ];
+
+    for (case, created_in, operation, body) in &rows {
+        let (status, parsed) = call_as(
+            &emulator,
+            ACCOUNT_ACCESS_KEY_ID,
+            created_in,
+            operation,
+            body.clone(),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the create to answer 200, got {status} with {parsed}"
+        );
+        let directory = parsed["DirectoryId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a DirectoryId, got {parsed}"))
+            .to_string();
+
+        // Read in the home Region whatever the create was issued in — and for the row
+        // created there, read in another one — so the Region the ANSWER names can only have
+        // come from the stored record.
+        let read_in = if *created_in == HOME_REGION {
+            OTHER_REGION
+        } else {
+            HOME_REGION
+        };
+        let described = described_in(&emulator, read_in, &directory, case).await;
+        assert_eq!(
+            described["RegionsInfo"]["PrimaryRegion"],
+            json!(created_in),
+            "case {case:?}: expected the Region the create was issued in as the primary one, \
+             got {described}"
+        );
+        assert_eq!(
+            additional_regions(&described),
+            None,
+            "case {case:?}: expected no additional Region before any add, got {described}"
+        );
+        // The Region inventory reads the same record, so the two cannot disagree about
+        // which Region is the primary one.
+        let (_, inventory) = call_as(
+            &emulator,
+            ACCOUNT_ACCESS_KEY_ID,
+            read_in,
+            "DescribeRegions",
+            json!({ "DirectoryId": &directory }),
+        )
+        .await;
+        let primary = inventory["RegionsDescription"]
+            .as_array()
+            .and_then(|described| described.first().cloned())
+            .unwrap_or_default();
+        assert_eq!(
+            primary["RegionName"], described["RegionsInfo"]["PrimaryRegion"],
+            "case {case:?}: expected the inventory and the description to name one primary \
+             Region, got {inventory}"
+        );
+    }
+
+    // A replication is what fills `AdditionalRegions`: the Enterprise directory above is
+    // the one type that replicates, so the adds are made against it.
+    let replicated = active_directory(&emulator, "replicated.example.com", None).await;
+    let case = "a replicated directory";
+    let described = described_in(&emulator, HOME_REGION, &replicated, case).await;
+    assert_eq!(
+        additional_regions(&described),
+        None,
+        "case {case:?}: expected no additional Region before any add, got {described}"
+    );
+
+    for region in ["eu-west-1", OTHER_REGION] {
+        ok(
+            &emulator,
+            "AddRegion",
+            add_region(&replicated, region),
+            case,
+        )
+        .await;
+    }
+    let described = described_in(&emulator, HOME_REGION, &replicated, case).await;
+    assert_eq!(
+        additional_regions(&described),
+        Some(vec!["eu-west-1".to_string(), OTHER_REGION.to_string()]),
+        "case {case:?}: expected both added Regions, got {described}"
+    );
+    assert_eq!(
+        described["RegionsInfo"]["PrimaryRegion"],
+        json!(HOME_REGION),
+        "case {case:?}: expected the add to leave the primary Region where it was, got \
+         {described}"
+    );
+
+    // And stopping a replication takes that Region back out of the member.
+    let (status, parsed) = call_as(
+        &emulator,
+        ACCOUNT_ACCESS_KEY_ID,
+        OTHER_REGION,
+        "RemoveRegion",
+        json!({ "DirectoryId": &replicated }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected the removal to answer 200, got {status} with {parsed}"
+    );
+    let described = described_in(&emulator, HOME_REGION, &replicated, case).await;
+    assert_eq!(
+        additional_regions(&described),
+        Some(vec!["eu-west-1".to_string()]),
+        "case {case:?}: expected the removed Region to be gone, got {described}"
+    );
 }
 
 /// RULE: a request is authorized before the directory it names is resolved, so the

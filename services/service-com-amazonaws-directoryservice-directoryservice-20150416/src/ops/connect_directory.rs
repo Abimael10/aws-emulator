@@ -384,9 +384,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // (`DirectoryConnectSettings$CustomerDnsIps`) and `DnsIpAddrs` reports.
             customer_dns_ips: input.connect_settings.customer_dns_ips.unwrap_or_default(),
             // `NetworkType`'s own documentation: "The default value is IPv4 or IPv6 based
-            // on the provided subnet capabilities" — a choice made by the VPC data plane
-            // this emulator does not have, so an unspecified network type stays absent
-            // rather than being invented.
+            // on the provided subnet capabilities" — so where the request names none, the
+            // directory reports the default read from the capabilities of the subnets the
+            // owner of subnets resolved above
+            // (`crate::state::Directory::reported_network_type`).
             network_type: input.network_type,
             // `EnableSso` (still scaffolded) is what turns this on.
             sso_enabled: false,

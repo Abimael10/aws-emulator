@@ -147,8 +147,8 @@ use crate::ops::types::{
     ClientCertAuthSettings, Computer, ConditionalForwarder, DirectoryConnectSettingsDescription,
     DirectoryDescription, DirectoryLimits, DirectoryVpcSettings,
     DirectoryVpcSettingsDescription, DomainController, EventTopic, IpRouteInfo, LDAPSSettingInfo,
-    LogSubscription, RegionDescription, SchemaExtensionInfo, SettingEntry, SharedDirectory,
-    Snapshot, SnapshotLimits, Tag, Trust, UpdateInfoEntry, UpdateValue,
+    LogSubscription, RegionDescription, RegionsInfo, SchemaExtensionInfo, SettingEntry,
+    SharedDirectory, Snapshot, SnapshotLimits, Tag, Trust, UpdateInfoEntry, UpdateValue,
 };
 
 /// How long a status transition a create owes takes to fall due.
@@ -481,12 +481,25 @@ pub const TYPE_AD_CONNECTOR: &str = "ADConnector";
 /// is the bare host it is built on, which is what [`Directory::access_url`] composes.
 const ACCESS_URL_SUFFIX: &str = ".awsapps.com";
 
+/// The `NetworkType` value of a directory whose subnets carry IPv4 blocks alone: the
+/// `IPv4` value of the modelled `NetworkType` enum
+/// (`smithy_query(query="shape",shape="NetworkType")`).
+pub const NETWORK_TYPE_IPV4: &str = "IPv4";
+
+/// The `NetworkType` value of a directory whose subnets carry IPv6 blocks alone: the
+/// `IPv6` value of that same modelled enum.
+pub const NETWORK_TYPE_IPV6: &str = "IPv6";
+
+/// The `NetworkType` value of a directory whose subnets carry blocks of both families: the
+/// `Dual-stack` value of that same modelled enum.
+pub const NETWORK_TYPE_DUAL_STACK: &str = "Dual-stack";
+
 /// The network types a Simple AD directory may be created with.
 ///
 /// From `CreateDirectoryRequest$NetworkType`'s own documentation: "The network type for
 /// your directory. Simple AD supports IPv4 and Dual-stack only." The third value of the
 /// modelled `NetworkType` enum, `IPv6`, is therefore refused for this directory type.
-pub const SIMPLE_AD_NETWORK_TYPES: [&str; 2] = ["IPv4", "Dual-stack"];
+pub const SIMPLE_AD_NETWORK_TYPES: [&str; 2] = [NETWORK_TYPE_IPV4, NETWORK_TYPE_DUAL_STACK];
 
 /// Directory Service's default quota of Simple AD directories per account per Region,
 /// which `CreateDirectory` draws on.
@@ -2950,12 +2963,15 @@ impl Directory {
 
     /// This directory as the modelled `DirectoryDescription`.
     ///
-    /// The members this slice has no record behind — RADIUS, sharing, regions, the owner
+    /// The members this slice has no record behind — RADIUS, sharing, the owner
     /// description — are left absent rather than invented: the operations that would
     /// populate them are still scaffolded. The placement members are REPORTED rather than
     /// echoed: the DNS addresses ([`Self::dns_ip_addrs`]) and the Availability Zones
     /// ([`Self::availability_zones`]) come from the subnets the create resolved against the
     /// service that owns them, so the directory reports the network it was really placed in.
+    /// The Regions are reported from the same record the Region inventory is
+    /// ([`Self::regions_info`]), so one directory's Regions read the same whichever
+    /// operation is asked.
     pub fn to_description(&self) -> DirectoryDescription {
         DirectoryDescription {
             directory_id: Some(self.directory_id.clone()),
@@ -2976,8 +2992,65 @@ impl Directory {
             connect_settings: self.described_connect_settings(),
             sso_enabled: self.sso_enabled,
             desired_number_of_domain_controllers: self.desired_number_of_domain_controllers,
-            network_type: self.network_type.clone(),
+            network_type: self.reported_network_type(),
+            regions_info: Some(self.regions_info()),
             ..DirectoryDescription::default()
+        }
+    }
+
+    /// The `NetworkType` this directory reports: the network type its create was called
+    /// with, or — where the create named none — the default that member's own documentation
+    /// states, "IPv4 or IPv6 based on the provided subnet capabilities".
+    ///
+    /// A subnet's capability is which address families its blocks are of, which is a fact of
+    /// the account's network rather than of the request: the create read it off the service
+    /// that owns subnets and kept it with the placement ([`SubnetNetwork::carries_ipv6`]),
+    /// so the default is reported from the network the directory was really placed in —
+    /// [`NETWORK_TYPE_DUAL_STACK`] where those subnets carry both families,
+    /// [`NETWORK_TYPE_IPV6`] where they carry IPv6 alone and [`NETWORK_TYPE_IPV4`] where
+    /// they carry IPv4 alone. A directory whose placement resolved to no subnet at all
+    /// reports none: there is no capability to read, and nothing is invented for it.
+    fn reported_network_type(&self) -> Option<String> {
+        if let Some(requested) = self.network_type.clone() {
+            return Some(requested);
+        }
+        let carries_ipv6 = self
+            .subnet_networks
+            .values()
+            .any(|network| network.carries_ipv6);
+        let carries_ipv4 = self
+            .subnet_networks
+            .values()
+            .any(|network| network.cidr_block.is_some());
+        match (carries_ipv4, carries_ipv6) {
+            (true, true) => Some(NETWORK_TYPE_DUAL_STACK.to_string()),
+            (false, true) => Some(NETWORK_TYPE_IPV6.to_string()),
+            (true, false) => Some(NETWORK_TYPE_IPV4.to_string()),
+            (false, false) => None,
+        }
+    }
+
+    /// This directory's Regions as the modelled `RegionsInfo`.
+    ///
+    /// `PrimaryRegion` is the Region the directory was created in — "The Region where the
+    /// Managed Microsoft AD directory was originally created" — which every create persists
+    /// ([`Self::primary_region`]), and `AdditionalRegions` "lists the Regions where the
+    /// directory has been replicated, excluding the primary Region": the Regions `AddRegion`
+    /// recorded, in Region-name order, absent until one is added and absent again once
+    /// `RemoveRegion` has stopped the last replication.
+    ///
+    /// Read from the SAME record [`Self::region_list`] reports, so the Regions a directory
+    /// describes itself with and the ones its Region inventory lists cannot disagree.
+    fn regions_info(&self) -> RegionsInfo {
+        RegionsInfo {
+            primary_region: Some(self.primary_region.clone()),
+            additional_regions: optional_list(
+                &self
+                    .additional_regions
+                    .values()
+                    .map(|replication| replication.region_name.clone())
+                    .collect::<Vec<String>>(),
+            ),
         }
     }
 
@@ -3648,6 +3721,20 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// [`Self::deleted_directories`].
     pub fn was_deleted(&self, directory_id: &str) -> bool {
         self.deleted_directories.contains_key(directory_id)
+    }
+
+    /// Whether `directory_id` names a directory this account has NEVER held: neither one
+    /// stored now nor one it had and has since deleted.
+    ///
+    /// The companion of [`Self::was_deleted`] for a reporting call whose answer is the
+    /// RECORDS a directory held rather than the directory itself: such a read resolves to
+    /// nothing twice over — for an id whose directory holds no such record, and for an id
+    /// whose directory is gone, because the records went away with it
+    /// ([`directory_deletion`]) — and only an id this account never held names nothing to
+    /// read at all, which is what the not-found refusal is reserved for. One predicate, so
+    /// the reads that take that view cannot disagree about which ids they refuse.
+    pub fn never_held_directory(&self, directory_id: &str) -> bool {
+        !self.directories.contains_key(directory_id) && !self.was_deleted(directory_id)
     }
 
     /// Place `count` domain controllers in the directory `directory_id`, as of `now`.

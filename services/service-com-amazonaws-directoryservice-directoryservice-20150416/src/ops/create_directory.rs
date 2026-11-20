@@ -393,6 +393,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A Simple AD directory serves DNS from its own directory servers, not from a
             // self-managed directory's.
             customer_dns_ips: Vec::new(),
+            // The network type the request named, if any: where it named none, the
+            // directory reports the default `NetworkType`'s own documentation states, read
+            // from the capabilities of the subnets above
+            // (`crate::state::Directory::reported_network_type`).
             network_type: input.network_type,
             // `EnableSso` (still scaffolded) is what turns this on.
             sso_enabled: false,

@@ -34,7 +34,8 @@ use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
 
 use crate::ad_connector::connect_directory;
 use crate::directory_lifecycle::{
-    call, create_directory, descriptions, ok, string, PASSWORD, REGION, STAGE_ACTIVE,
+    call, create_directory, descriptions, minimal_create, ok, string, PASSWORD, REGION,
+    STAGE_ACTIVE,
 };
 use crate::microsoft_ad::create_microsoft_ad;
 
@@ -778,4 +779,177 @@ async fn a_directory_is_not_placed_in_subnets_the_account_does_not_have() {
         "case \"after every refused placement\": expected no directory to have been stored, \
          got {held:?}"
     );
+}
+
+/// Give the subnet `subnet_id` an IPv6 CIDR block through EC2's own API, so the subnet the
+/// account holds really carries one, and answer the block EC2 reports for it.
+///
+/// Written through the owner of subnets rather than into any store: which address families a
+/// subnet carries is EC2's fact, and it is the one a directory's default network type is
+/// read from.
+async fn associate_ipv6(ec2: &::aws_sdk_ec2::Client, vpc: &str, subnet_id: &str) -> String {
+    let vpc_block = ec2
+        .associate_vpc_cidr_block()
+        .vpc_id(vpc)
+        .amazon_provided_ipv6_cidr_block(true)
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("EC2 must give {vpc} an IPv6 block: {error:?}"))
+        .ipv6_cidr_block_association()
+        .and_then(|association| association.ipv6_cidr_block())
+        .unwrap_or_else(|| panic!("AssociateVpcCidrBlock must report the IPv6 block it minted"))
+        .to_string();
+    // A subnet's IPv6 block is a /64 of one of its VPC's blocks; the VPC's is a /56 whose
+    // host bits are clear, so its FIRST /64 is that same base.
+    let subnet_block = vpc_block.replace("/56", "/64");
+    ec2.associate_subnet_cidr_block()
+        .subnet_id(subnet_id)
+        .ipv6_cidr_block(&subnet_block)
+        .send()
+        .await
+        .unwrap_or_else(|error| {
+            panic!("EC2 must give {subnet_id} the block {subnet_block}: {error:?}")
+        })
+        .ipv6_cidr_block_association()
+        .and_then(|association| association.ipv6_cidr_block())
+        .unwrap_or_else(|| panic!("AssociateSubnetCidrBlock must report the block it associated"))
+        .to_string()
+}
+
+/// RULE: a directory reports the `NetworkType` its create was called with, and where the
+/// create named none it reports the default that member's own documentation states — "the
+/// default value is IPv4 or IPv6 based on the provided subnet capabilities" — read from the
+/// address families the subnets its servers were placed in really carry, as the owner of
+/// subnets reports them. A directory placed in no subnet at all reports none.
+///
+/// The rows differ along what the rule generalises over: the create operation and directory
+/// type, whether the request names a network type itself, and what the chosen subnets carry
+/// (IPv4 alone, both families, or no subnet at all).
+#[tokio::test]
+async fn the_network_type_a_directory_reports_follows_the_subnets_it_was_placed_in() {
+    let network = network().await;
+    let router = &network.router;
+    let ipv4_only = [network.client[0].clone(), network.client[1].clone()];
+    let subnet_ids = |subnets: &[AccountSubnet]| {
+        subnets
+            .iter()
+            .map(|subnet| subnet.id.clone())
+            .collect::<Vec<String>>()
+    };
+
+    // Every row below is created while the chosen subnets carry IPv4 blocks alone.
+    let ipv4_rows: Vec<(&str, &str, Value, Option<&str>)> = vec![
+        (
+            "a Managed Microsoft AD in subnets carrying IPv4 alone",
+            "CreateMicrosoftAD",
+            microsoft_ad_in("net-microsoft.example.com", &network.vpc, &ipv4_only),
+            Some("IPv4"),
+        ),
+        (
+            "a Simple AD in the same subnets",
+            "CreateDirectory",
+            json!({
+                "Name": "net-simple.example.com",
+                "Password": PASSWORD,
+                "Size": "Small",
+                "VpcSettings": { "VpcId": &network.vpc, "SubnetIds": subnet_ids(&ipv4_only) }
+            }),
+            Some("IPv4"),
+        ),
+        (
+            "an AD Connector in the same subnets",
+            "ConnectDirectory",
+            json!({
+                "Name": "net-connected.example.com",
+                "Password": "Sim2Real-Connect-Pw1!",
+                "Size": "Small",
+                "ConnectSettings": {
+                    "VpcId": &network.vpc,
+                    "SubnetIds": subnet_ids(&ipv4_only),
+                    "CustomerDnsIps": CUSTOMER_DNS_IPS,
+                    "CustomerUserName": "ad-connector-svc",
+                }
+            }),
+            Some("IPv4"),
+        ),
+        (
+            "a create that names a network type of its own",
+            "CreateMicrosoftAD",
+            {
+                let mut body =
+                    microsoft_ad_in("net-named.example.com", &network.vpc, &ipv4_only);
+                body["NetworkType"] = json!("Dual-stack");
+                body
+            },
+            Some("Dual-stack"),
+        ),
+        (
+            "a Simple AD placed in no subnet at all",
+            "CreateDirectory",
+            minimal_create("net-placeless.example.com"),
+            None,
+        ),
+    ];
+
+    for (case, operation, body, expected) in &ipv4_rows {
+        let directory_id = match *operation {
+            "CreateMicrosoftAD" => create_microsoft_ad(router, body.clone(), case).await,
+            "ConnectDirectory" => connect_directory(router, body.clone(), case).await,
+            _ => create_directory(router, body.clone(), case).await,
+        };
+        in_service(router, &directory_id, case).await;
+        let described = describe_one(router, &directory_id, case).await;
+        let reported = described["NetworkType"].as_str();
+        assert_eq!(
+            reported, *expected,
+            "case {case:?}: expected NetworkType {expected:?}, got {reported:?} in {described}"
+        );
+    }
+
+    // The account now gives ONE of those subnets an IPv6 block too, through EC2 itself, so
+    // the pair carries both families.
+    let ec2 = ec2_client(&EmbeddedEmulator::from_router(router.clone()));
+    let case = "a Managed Microsoft AD in subnets carrying both families";
+    let ipv6_block = associate_ipv6(&ec2, &network.vpc, &ipv4_only[0].id).await;
+    assert!(
+        ipv6_block.ends_with("/64"),
+        "case {case:?}: expected EC2 to report the subnet's IPv6 block, got {ipv6_block:?}"
+    );
+
+    let directory_id = create_microsoft_ad(
+        router,
+        microsoft_ad_in("net-dual.example.com", &network.vpc, &ipv4_only),
+        case,
+    )
+    .await;
+    in_service(router, &directory_id, case).await;
+    let described = describe_one(router, &directory_id, case).await;
+    assert_eq!(
+        described["NetworkType"].as_str(),
+        Some("Dual-stack"),
+        "case {case:?}: expected the default to follow the subnets' capabilities, got \
+         {described}"
+    );
+    // And the directory created in the same subnets BEFORE the association still reports
+    // what they carried then: the capability is read off the owner of subnets when the
+    // placement is made and kept with it, not re-read on every description.
+    let first = describe_one(router, &ipv4_only_first(router).await, "the earlier directory").await;
+    assert_eq!(
+        first["NetworkType"].as_str(),
+        Some("IPv4"),
+        "case \"the earlier directory\": expected the placement it was created with, got \
+         {first}"
+    );
+}
+
+/// The id of the FIRST directory the account holds — the one the network-type rows above
+/// created while the chosen subnets carried IPv4 alone.
+async fn ipv4_only_first(router: &MultiServiceRouter) -> String {
+    let case = "the earlier directory";
+    let listed = ok(router, "DescribeDirectories", json!({}), case).await;
+    let held = descriptions(&listed, case);
+    let first = held
+        .first()
+        .unwrap_or_else(|| panic!("case {case:?}: expected the account to hold a directory"));
+    string(first, "DirectoryId", case)
 }

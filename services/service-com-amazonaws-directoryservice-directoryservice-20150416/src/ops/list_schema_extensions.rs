@@ -3,7 +3,9 @@
 //! @op ListSchemaExtensions
 //!
 //! Reports the schema extensions `StartSchemaExtension` persisted for one directory in
-//! [`crate::state`], a page at a time, in the order they were started. A reporting
+//! [`crate::state`], a page at a time, in the order they were started. A directory id this
+//! account HAD and has since deleted answers an empty page — its extension records went
+//! away with the directory — and only an id this account never held is refused. A reporting
 //! operation: the only write is
 //! [`crate::state::ComAmazonawsDirectoryserviceDirectoryservice20150416State::advance_clock`],
 //! which materialises the status transitions the clock has already made due.
@@ -175,25 +177,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.advance_clock(::std::time::SystemTime::now());
 
-        // The listing is of ONE directory's extensions, and an id naming no stored
-        // directory is reported rather than served as an empty page.
-        let directory = store
-            .directories
-            .get(&input.directory_id)
-            .ok_or_else(|| {
+        // The listing is of ONE directory's extensions, and an extension record is what it
+        // reads: a directory this account HAD and has since deleted took its extensions
+        // with it, so that id resolves to no records and the page is served empty (HTTP
+        // 200) — which is what lets a client confirm the teardown removed them. Only an id
+        // this account never held names nothing to list at all, and that is what the
+        // not-found refusal is reserved for.
+        if store.never_held_directory(&input.directory_id) {
+            return Err(
                 ListSchemaExtensionsErrorModeled::EntityDoesNotExistException(
                     crate::state::refusal(crate::state::no_such_directory(&input.directory_id)),
                 )
-            })?;
+                .into(),
+            );
+        }
+        let directory = store.directories.get(&input.directory_id);
 
         // Every extension of that directory, in the order they were started, from the
-        // cursor on. A directory that has been through none contributes nothing.
+        // cursor on. A directory that has been through none contributes nothing, and so
+        // does an id whose directory is gone.
         let mut selected: Vec<(u64, SchemaExtensionInfo)> = directory
-            .schema_extensions_in_creation_order()
-            .into_iter()
-            .filter(|extension| extension.seq > after_seq)
-            .map(|extension| (extension.seq, extension.to_info(&directory.directory_id)))
-            .collect();
+            .map(|directory| {
+                directory
+                    .schema_extensions_in_creation_order()
+                    .into_iter()
+                    .filter(|extension| extension.seq > after_seq)
+                    .map(|extension| (extension.seq, extension.to_info(&directory.directory_id)))
+                    .collect()
+            })
+            .unwrap_or_default();
         drop(store);
 
         let truncated = selected.len() > page_size;

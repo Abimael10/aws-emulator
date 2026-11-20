@@ -47,6 +47,14 @@ pub struct SubnetNetwork {
     /// The subnet's IPv4 CIDR block, as EC2 reports it; `None` for a subnet it reports none
     /// for, whose servers then hold no IPv4 address.
     pub cidr_block: Option<String>,
+    /// Whether the subnet carries an IPv6 CIDR block, as EC2 reports it.
+    ///
+    /// What it is for: the `NetworkType` a create that named none reports is "IPv4 or IPv6
+    /// based on the provided subnet capabilities" (that member's own documentation), and a
+    /// subnet's capability IS which address families its blocks are of — a fact of the
+    /// account's network, read off the owner of subnets rather than decided here
+    /// ([`Directory::reported_network_type`]).
+    pub carries_ipv6: bool,
     /// The Availability Zone the subnet sits in, as EC2 reports it.
     pub availability_zone: Option<String>,
     /// The VPC the subnet belongs to, as EC2 reports it — the network the directory's

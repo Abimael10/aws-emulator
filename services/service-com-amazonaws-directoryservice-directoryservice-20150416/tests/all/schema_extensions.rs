@@ -652,6 +652,14 @@ async fn a_snapshot_first_extension_is_bound_by_the_manual_snapshot_quota() {
     );
 }
 
+/// RULE: the schema-extension inventory of ONE directory is read from the extension
+/// records themselves — a directory id this account HAD and has since deleted took its
+/// extensions with it, so the listing of that id is an empty page (HTTP 200), and only an
+/// id this account never held is refused with the not-found error the model declares.
+///
+/// The rows differ along what the rule generalises over: how many extensions the deleted
+/// directory had been through (none, one, several), and the forms a well-formed id the
+/// account never held takes.
 #[tokio::test]
 async fn a_schema_extension_does_not_outlive_its_directory() {
     let router = service();
@@ -674,22 +682,104 @@ async fn a_schema_extension_does_not_outlive_its_directory() {
 
     crate::harness::delete_directory_and_wait(&router, &first, "delete").await;
 
-    // An extension is an extension OF a directory, so it does not outlive it, and the
-    // other directory's extension is untouched.
-    refused(
-        &router,
-        "ListSchemaExtensions",
-        json!({ "DirectoryId": &first }),
-        "EntityDoesNotExistException",
-        "the deleted directory",
-    )
-    .await;
+    // An extension is an extension OF a directory, so it does not outlive it: the id the
+    // account HAD now resolves to no extension record at all, which is an empty page rather
+    // than a refusal — what lets a client confirm the teardown took them. The other
+    // directory's extension is untouched.
+    let found = list(&router, &first, "the deleted directory").await;
+    assert!(
+        found.is_empty(),
+        "case \"the deleted directory\": expected its extensions to have gone with it, got \
+         {found:?}"
+    );
     let found = list(&router, &second, "the surviving directory").await;
     assert_eq!(
         reported_ids(&found, "the surviving directory"),
         vec![kept],
         "expected only the surviving directory's extension, got {found:?}"
     );
+
+    // The same reading, over the counts a deleted directory can have been through: none,
+    // one and several. Each row is deleted and then read back.
+    for (case, extensions_started) in [
+        ("a deleted directory that had been through none", 0),
+        ("a deleted directory that had been through one", 1),
+        ("a deleted directory that had been through three", 3),
+    ] {
+        let doomed = directory_in_service(
+            &router,
+            &format!("gone{extensions_started}.example.com"),
+            case,
+        )
+        .await;
+        for index in 0..extensions_started {
+            start(
+                &router,
+                start_body(&doomed, &format!("gone-{index}"), ldif, false),
+                case,
+            )
+            .await;
+        }
+        let before = list(&router, &doomed, case).await;
+        assert_eq!(
+            before.len(),
+            extensions_started,
+            "case {case:?}: expected the extensions the starts persisted, got {before:?}"
+        );
+
+        crate::harness::delete_directory_and_wait(&router, &doomed, case).await;
+
+        let answer = ok(
+            &router,
+            "ListSchemaExtensions",
+            json!({ "DirectoryId": &doomed }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            extensions(&answer, case),
+            Vec::<Value>::new(),
+            "case {case:?}: expected an empty page for the id the account no longer holds, \
+             got {answer}"
+        );
+        assert!(
+            answer["NextToken"].is_null(),
+            "case {case:?}: expected a final page to carry no token, got {answer}"
+        );
+        // The same empty answer however the page was asked for: the reading is of the id,
+        // not of the page size.
+        let narrowed = ok(
+            &router,
+            "ListSchemaExtensions",
+            json!({ "DirectoryId": &doomed, "Limit": 1 }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            extensions(&narrowed, case),
+            Vec::<Value>::new(),
+            "case {case:?}: expected an empty page under a Limit too, got {narrowed}"
+        );
+    }
+
+    // An id this account NEVER held is still refused: there is nothing to list for it. The
+    // rows span the forms the modelled `DirectoryId` pattern `^d-[0-9a-f]{10}$` admits.
+    for absent in [
+        ABSENT_DIRECTORY_ID,
+        "d-0000000000",
+        "d-ffffffffff",
+        "d-abcdef0123",
+    ] {
+        let case = format!("ListSchemaExtensions against {absent}");
+        refused(
+            &router,
+            "ListSchemaExtensions",
+            json!({ "DirectoryId": absent }),
+            "EntityDoesNotExistException",
+            &case,
+        )
+        .await;
+    }
 
     // A directory that has been through none reports an empty list rather than a
     // refusal.

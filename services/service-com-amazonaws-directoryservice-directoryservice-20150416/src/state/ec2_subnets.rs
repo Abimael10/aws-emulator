@@ -198,6 +198,14 @@ pub async fn resolve_subnet_networks(
                     SubnetNetwork {
                         subnet_id: subnet_id.to_string(),
                         cidr_block: subnet.cidr_block().map(str::to_string),
+                        // Which address families the subnet carries is what a directory's
+                        // default `NetworkType` is read from, so the IPv6 side of the
+                        // placement comes off the owner of subnets too: EC2 reports a
+                        // subnet's IPv6 blocks as the association set of that subnet.
+                        carries_ipv6: subnet
+                            .ipv6_cidr_block_association_set()
+                            .iter()
+                            .any(|association| association.ipv6_cidr_block().is_some()),
                         availability_zone: subnet.availability_zone().map(str::to_string),
                         vpc_id: subnet.vpc_id().map(str::to_string),
                     },
