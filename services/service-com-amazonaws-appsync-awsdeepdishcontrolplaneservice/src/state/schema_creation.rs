@@ -187,6 +187,10 @@ impl GraphqlApiRecord {
                 // rather than a sentence that holds for every one.
                 let detail = schema_success_detail(types.len());
                 self.types = types;
+                // The document is the WHOLE type system of this API, so nothing a merge
+                // installed on it is held any longer either: a Merged API's contributions
+                // are composed back in when the next merge of each is performed.
+                self.merged_type_names.clear();
                 // The document itself is kept too: it declares what the type map cannot
                 // hold — the root operation types a `schema` definition binds and the
                 // directives the schema defines — which the introspection schema reports.
@@ -234,15 +238,45 @@ impl super::ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
     /// schema — and the same types — to every caller whether or not another call touched
     /// it first.
     ///
-    /// The merges the clock owes are performed straight after, because a merge carries
-    /// the types the creations above install and is scheduled to come due only once the
-    /// source API's creation is (`super::merge_due_instant`): the two dues are one schema
-    /// transition of the APIs they touch, so every caller that materialises one
-    /// materialises both and no two reads can disagree about a merged type.
+    /// The association transitions the clock owes are applied with them, because all
+    /// three are one transition of the type systems they touch: an association whose
+    /// DELETION came due contributes no types any more
+    /// (`super::ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState::settle_due_disassociations`),
+    /// while a merge carries the types the creations above install and is scheduled to
+    /// come due only once the source API's creation is (`super::merge_due_instant`). So
+    /// every caller that materialises one materialises all of them, and no two reads can
+    /// disagree about a merged type.
     pub fn settle_schema_creations(&mut self, now: SystemTime) {
+        // Withdrawals first: an association that is gone has no schema to merge, and a
+        // record that is gone has no status to settle.
+        self.settle_due_disassociations(now);
+        // The APIs whose own creation this call materialises. A creation replaces the
+        // WHOLE type system of the API it ran for, so a Merged API among them is composed
+        // again below from the associations it holds — its merged types are not a creation's
+        // to drop.
+        let created: Vec<String> = self
+            .graphql_apis
+            .values()
+            .filter(|api| {
+                api.schema
+                    .as_ref()
+                    .and_then(|schema| schema.due_at)
+                    .is_some_and(|due| now >= due)
+            })
+            .map(|api| api.api_id.clone())
+            .collect();
         for api in self.graphql_apis.values_mut() {
             api.settle_schema_creation(now);
         }
         self.settle_due_merges(now);
+        for api_id in created {
+            if self
+                .source_api_associations
+                .values()
+                .any(|association| association.merged_api_id == api_id)
+            {
+                self.settle_composition(&api_id);
+            }
+        }
     }
 }

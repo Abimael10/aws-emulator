@@ -356,6 +356,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             data_sources: std::collections::BTreeMap::new(),
             functions: std::collections::BTreeMap::new(),
             types: std::collections::BTreeMap::new(),
+            // No merge has installed a type on it either: a Merged API's merged types are
+            // composed from the associations it holds, and a fresh API holds none.
+            merged_type_names: std::collections::BTreeSet::new(),
             resolvers: std::collections::BTreeMap::new(),
             // No schema creation has run for a fresh API either:
             // `StartSchemaCreation` is what schedules one, and a fresh API holds no

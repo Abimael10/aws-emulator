@@ -308,7 +308,11 @@ impl TypeRecord {
 ///
 /// Only the members the kind can hold are filled, so a projection reads them by kind
 /// rather than guessing from what is empty.
-#[derive(Debug, Clone, Default)]
+///
+/// Compared member by member where two source APIs declare one type name: two
+/// declarations of a member that are EQUAL say the same thing and compose to one
+/// (`super::combine_type_definitions`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TypeDefinition {
     /// The `__TypeKind` the SDL keyword declares ([`OBJECT_KIND`] and the rest).
     pub kind: &'static str,
@@ -331,7 +335,7 @@ pub struct TypeDefinition {
 }
 
 /// One field of a parsed object or interface type.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldDefinition {
     pub name: String,
     pub description: Option<String>,
@@ -346,7 +350,7 @@ pub struct FieldDefinition {
 
 /// One argument of a field, or one field of an input object type: the two are the same
 /// shape in GraphQL (`__InputValue`) and in SDL.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputValueDefinition {
     pub name: String,
     pub description: Option<String>,
@@ -360,7 +364,7 @@ pub struct InputValueDefinition {
 }
 
 /// One value of a parsed enum type.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnumValueDefinition {
     pub name: String,
     pub description: Option<String>,
@@ -376,7 +380,7 @@ pub struct EnumValueDefinition {
 /// AppSync's own authorization directives are what a schema states ABOUT a type — so a
 /// stored definition keeps every one of them and every report of the type writes them
 /// back, rather than reporting a definition the caller never stated.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectiveUse {
     /// The directive's name, without the leading `@`.
     pub name: String,
@@ -394,7 +398,7 @@ pub struct DirectiveUse {
 /// `@aws_auth` guard names, the mutations an `@aws_subscribe` link names — and they are the
 /// parser's own `StringValue`s, so GraphQL's escaping is applied by `apollo-parser` rather
 /// than by a second reading of its string syntax.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectiveArgument {
     pub name: String,
     pub value: String,
@@ -404,7 +408,7 @@ pub struct DirectiveArgument {
 }
 
 /// Whether a field or enum value is deprecated, and why.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Deprecation {
     pub is_deprecated: bool,
     pub reason: Option<String>,
@@ -412,7 +416,7 @@ pub struct Deprecation {
 
 /// A reference to a type from a field or an argument: a name, a list of them, or a
 /// non-null one.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeRef {
     Named(String),
     List(Box<TypeRef>),

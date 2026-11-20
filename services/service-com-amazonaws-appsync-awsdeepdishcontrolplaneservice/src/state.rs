@@ -7,7 +7,7 @@
 //! between two of them. A handler reaches it through [`service_state`] and answers from what is
 //! stored here — nothing is recomputed from the request.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The Event API DATA plane's records: the sockets each `Api` is served on, the realtime
@@ -49,8 +49,13 @@ pub use schema_creation::*;
 mod introspection_schema;
 pub use introspection_schema::*;
 
-/// The merge of a source API's schema into the Merged API it is associated with.
+/// The merge of a source API's schema into the Merged API it is associated with, and the
+/// withdrawal of it when the association is deleted.
 mod schema_merge;
+
+/// How the type systems of several source APIs COMBINE into the one a Merged API holds.
+mod type_composition;
+pub use type_composition::*;
 
 /// The resolvers attached to a GraphQL API's fields, and how one is kept, addressed and
 /// reported.
@@ -211,6 +216,17 @@ pub struct GraphqlApiRecord {
     /// Bounded: `CreateType` refuses a create once the API holds the AppSync per-API
     /// quota of types, so this map cannot grow without limit.
     pub types: BTreeMap<String, TypeRecord>,
+    /// Which of the names in [`Self::types`] a MERGE installed, i.e. which of them this
+    /// (Merged) API holds because a source API associated with it contributed the name
+    /// rather than because the API declared it in its own right.
+    ///
+    /// What tells the two apart when the Merged API's type system is recomposed
+    /// ([`ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState::recompose_merged_types`]):
+    /// the contributed names are the ones that live and die with the associations that
+    /// contributed them, so an association's types leave the Merged API with it, while a
+    /// name the API holds in its own right is kept — including one a merge also
+    /// contributed to, which is composed into the API's own declaration and stays with it.
+    pub merged_type_names: BTreeSet<String>,
     /// The resolvers attached to the fields of this API's types, keyed by the
     /// `typeName`/`fieldName` pair that addresses one ([`ResolverKey`]) — a field
     /// carries at most one resolver, so the pair identifies it within its API and no
@@ -1642,6 +1658,33 @@ pub struct SourceApiAssociationRecord {
     /// The instant the deletion this association scheduled comes due, or `None` while
     /// no deletion was asked for. Stored rather than slept on: see [`DELETION_SPAN`].
     pub deletion_due_at: Option<SystemTime>,
+    /// The types this association's last PERFORMED merge carried into the Merged API: the
+    /// source API's own type system as it stood when that merge came due, keyed by type
+    /// name. Empty while no merge of this association has been performed, and for one
+    /// whose merge could not be combined into the Merged API's schema.
+    ///
+    /// A snapshot rather than a reference to the source API's current types, because a
+    /// merge is what carries a source API's schema into the Merged API: a schema the
+    /// source API creates afterwards reaches the Merged API through the NEXT merge, not
+    /// before. It is also this association's whole contribution to the Merged API's
+    /// schema, so it is withdrawn with the association
+    /// ([`ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState::recompose_merged_types`]).
+    ///
+    /// Bounded: a snapshot holds at most the per-API quota of types ([`TYPES_PER_API`]),
+    /// a source API takes part in at most one association ([`create_source_api_association`]
+    /// refuses a second one) and an account holds at most the per-Region quota of GraphQL
+    /// APIs, so the snapshots this store keeps cannot grow without limit.
+    pub merged_types: BTreeMap<String, TypeRecord>,
+    /// When this association's contribution was recorded, relative to the other
+    /// associations of the same Merged API: drawn from the state's own counter by the
+    /// merge that recorded it, so a later merge always carries a higher value. Zero while
+    /// no merge of this association has been performed.
+    ///
+    /// The Merged API's schema is composed in this order, so a declaration that cannot be
+    /// composed is the one the LATEST merge carried — the merge that arrives at a schema
+    /// it cannot be combined with is the one that is not performed — rather than whichever
+    /// association a map happens to be walked in the order of.
+    pub merge_order: u64,
 }
 
 impl SourceApiAssociationRecord {
@@ -1681,23 +1724,28 @@ impl SourceApiAssociationRecord {
         self.deletion_due_at.is_some_and(|due| now >= due)
     }
 
-    /// Materialise the merge the CLOCK already made due at `now`.
+    /// Record that the merge the clock made due at `due` HAS been performed.
     ///
-    /// Owed by the clock alone: the due instant was recorded by the call that
-    /// scheduled the merge, so the same transition is applied whether or not anybody
-    /// read the association in between, and the merge date is the due instant itself
-    /// rather than the moment of the read — so every later read reports the same one.
-    pub fn settle(&mut self, now: SystemTime) {
-        let Some(due) = self.merge_due_at else {
-            return;
-        };
-        if now < due {
-            return;
-        }
+    /// The merge date is the due instant itself rather than the moment of the read that
+    /// materialised it, so every later read reports the same one.
+    pub fn merge_performed(&mut self, due: SystemTime) {
         self.merge_due_at = None;
         self.status = MERGE_SUCCESS.to_string();
         self.status_detail = merge_success_detail(&self.source_api_id, &self.association_id);
         self.last_successful_merge_date = Some(due);
+    }
+
+    /// Record that the merge the clock made due COULD NOT be performed, because `conflict`
+    /// states what the source API's schema and the Merged API's cannot both hold.
+    ///
+    /// A merge that failed is not a merge that happened: the merge date stays what the
+    /// last SUCCESSFUL merge left behind ([`MERGE_FAILED`] is a terminal status of its
+    /// own, so the association stops owing the clock anything either).
+    pub fn merge_failed(&mut self, conflict: &str) {
+        self.merge_due_at = None;
+        self.status = MERGE_FAILED.to_string();
+        self.status_detail =
+            merge_failed_detail(&self.source_api_id, &self.association_id, conflict);
     }
 
     /// Initiate a merge of the source API's schema into the Merged API, and report the
@@ -2041,6 +2089,10 @@ pub fn create_source_api_association(
         last_successful_merge_date: None,
         merge_due_at: Some(merge_due_instant(now, source_schema_due)),
         deletion_due_at: None,
+        // Nothing has been merged yet, so the association contributes no type to the
+        // Merged API's schema until the merge it scheduled is performed.
+        merged_types: BTreeMap::new(),
+        merge_order: 0,
     };
     let association = record.to_source_api_association();
     state
@@ -2196,15 +2248,15 @@ pub struct ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
 }
 
 impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
-    /// Apply every merge the clock owes at `now`, so an association reports the same
-    /// state to every caller whether or not another call touched it first.
+    /// Apply every transition the clock owes an association at `now`, so an association —
+    /// and the Merged API's schema it contributes to — reports the same state to every
+    /// caller whether or not another call touched it first.
+    ///
+    /// Every one of them: a deletion the clock has made due, the schema creations a merge
+    /// depends on and the merges themselves are one transition of the association and
+    /// schema state, applied in that order by
+    /// [`Self::settle_schema_creations`], so no caller can see half of it.
     pub fn settle_associations(&mut self, now: SystemTime) {
-        // A deletion the clock has made due leaves no association behind, so it is
-        // applied before the merges: a record that is gone has no status to settle.
-        self.source_api_associations
-            .retain(|_, association| !association.deletion_due(now));
-        // The merges the clock owes are performed with the schema creations they depend
-        // on, in that order (`settle_schema_creations`).
         self.settle_schema_creations(now);
     }
 
@@ -2348,11 +2400,24 @@ impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
     /// Drop every association the API `api_id` takes part in, on either side.
     ///
     /// An association names two APIs, so it cannot outlive either of them: deleting
-    /// an API deletes the links it was a side of.
+    /// an API deletes the links it was a side of. An association that is gone contributes
+    /// nothing to the Merged API's schema, so every Merged API that held one of these
+    /// links is recomposed from the associations it has LEFT ([`Self::recompose_merged_types`]).
     pub fn remove_api_associations(&mut self, api_id: &str) {
+        let merged_apis: BTreeSet<String> = self
+            .source_api_associations
+            .values()
+            .filter(|association| {
+                association.source_api_id == api_id || association.merged_api_id == api_id
+            })
+            .map(|association| association.merged_api_id.clone())
+            .collect();
         self.source_api_associations.retain(|_, association| {
             association.source_api_id != api_id && association.merged_api_id != api_id
         });
+        for merged_api_id in merged_apis {
+            self.settle_composition(&merged_api_id);
+        }
     }
 
     /// The API keys the API `api_id` holds, or `None` when no stored API has that id.
@@ -2978,6 +3043,11 @@ pub const MERGE_SCHEDULED: &str = "MERGE_SCHEDULED";
 /// has been performed.
 pub const MERGE_SUCCESS: &str = "MERGE_SUCCESS";
 
+/// The `SourceApiAssociationStatus` an association reaches when the merge it scheduled
+/// could not be performed, because the source API's schema cannot be combined with the
+/// one the Merged API holds ([`combine_type_definitions`] states when it cannot).
+pub const MERGE_FAILED: &str = "MERGE_FAILED";
+
 /// The `sourceApiAssociationStatusDetail` that goes with [`MERGE_SCHEDULED`].
 pub const MERGE_SCHEDULED_DETAIL: &str =
     "The source API merge is scheduled and has not been performed yet.";
@@ -2994,6 +3064,21 @@ pub fn merge_success_detail(source_api_id: &str, association_id: &str) -> String
     format!(
         "Successfully merged source GraphQL API (API Id: {source_api_id}, Association Id: \
          {association_id})"
+    )
+}
+
+/// The `sourceApiAssociationStatusDetail` that goes with [`MERGE_FAILED`], for the merge
+/// of the source API `source_api_id` under the association `association_id` that
+/// `conflict` could not be performed because of.
+///
+/// Worded after the sentence a merge that succeeded carries ([`merge_success_detail`]):
+/// the same two correlation handles identify WHICH merge is being detailed, and the
+/// conflict says what the caller has to reconcile before the merge can be performed —
+/// both read from the stored association and from the two schemas, never from the request.
+pub fn merge_failed_detail(source_api_id: &str, association_id: &str, conflict: &str) -> String {
+    format!(
+        "Failed to merge source GraphQL API (API Id: {source_api_id}, Association Id: \
+         {association_id}): {conflict}"
     )
 }
 
@@ -3016,7 +3101,8 @@ pub const ASSOCIATION_OPERATION_IN_PROGRESS_MESSAGE: &str =
 /// ([`ASSOCIATION_OPERATION_IN_PROGRESS_MESSAGE`]). A merge that DEPENDS on a schema
 /// creation the source API still owes takes one such span after that creation comes due
 /// ([`merge_due_instant`]). Nothing sleeps for it — the due instant is stored on the
-/// record and [`SourceApiAssociationRecord::settle`] applies it.
+/// record and [`ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState::settle_associations`]
+/// applies it.
 pub const MERGE_SPAN: Duration = Duration::from_millis(500);
 
 /// When a merge scheduled at `now` comes due, given the instant `source_schema_due` the
