@@ -413,17 +413,43 @@ pub fn is_valid_custom_type_name(type_name: &str) -> bool {
     (3..=93).contains(&name.len()) && name.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
+/// The rules a type name has to satisfy, as this service states them in every refusal of
+/// one: the published names are matched case-sensitively, every name belongs to one of the
+/// two namespaces, and a name of the caller's own namespace matches
+/// [`CUSTOM_TYPE_NAME_PATTERN`].
+///
+/// Fixed text, and the whole of it is shared by the refusals below: what differs between them
+/// is only which value they say is invalid.
+fn type_name_rules() -> String {
+    format!(
+        "Type name is case sensitive, such as AWS:APpLICation is invalid; Type name must start \
+         with either AWS: or Custom:;  Custom inventory type name must satisfy regular \
+         expression pattern: {CUSTOM_TYPE_NAME_PATTERN}"
+    )
+}
+
 /// How this service refuses a type name that names no inventory type: the name the caller
-/// submitted, and the three rules a name has to satisfy — the published names are matched
-/// case-sensitively, every name belongs to one of the two namespaces, and a name of the
-/// caller's own namespace matches [`CUSTOM_TYPE_NAME_PATTERN`].
+/// submitted, and the rules a name has to satisfy ([`type_name_rules`]).
 ///
 /// Fixed text apart from the bracketed name, which is echoed from the request.
 #[must_use]
 pub fn invalid_type_name_message(type_name: &str) -> String {
     format!(
-        "Inventory type name [{type_name}] is invalid. Type name is case sensitive, such as \
-         AWS:APpLICation is invalid; Type name must start with either AWS: or Custom:;  Custom \
-         inventory type name must satisfy regular expression pattern: {CUSTOM_TYPE_NAME_PATTERN}"
+        "Inventory type name [{type_name}] is invalid. {}",
+        type_name_rules()
+    )
+}
+
+/// How this service refuses a FILTER KEY whose type-name part names no inventory type: the
+/// type name and the whole key the caller submitted, and the same rules a name has to satisfy
+/// ([`type_name_rules`]) — the fault is the type name, so a key carrying one is refused as the
+/// type-name fault it is, naming the key it was read from.
+///
+/// Fixed text apart from the two bracketed values, both echoed from the request.
+#[must_use]
+pub fn invalid_filter_key_type_name_message(type_name: &str, key: &str) -> String {
+    format!(
+        "Type name [{type_name}] of filter key [{key}] is invalid.{}",
+        type_name_rules()
     )
 }

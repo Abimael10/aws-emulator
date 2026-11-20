@@ -157,7 +157,49 @@ async fn query(router: &MultiServiceRouter, case: &str, body: &Value) -> Value {
     parsed
 }
 
-/// The node ids a query reported, in the order it reported them.
+/// The inventory type an aggregation that counted NOTHING reports, or `None` when the answer
+/// is not that one.
+///
+/// An aggregation whose fleet reports no value of the attribute it counts over still reports
+/// the type it is about, holding an empty row set — one entity, belonging to no node, whose
+/// `Data` carries that type with an empty `Content` — so this also asserts that shape.
+fn no_row_type(parsed: &Value, case: &str) -> Option<String> {
+    let reported = entities(parsed);
+    let [entity] = reported.as_slice() else {
+        return None;
+    };
+    if !entity["Id"].is_null() {
+        return None;
+    }
+    let data = entity["Data"]
+        .as_object()
+        .unwrap_or_else(|| panic!("case {case:?}: the entity carries Data, got {parsed}"));
+    assert_eq!(
+        data.len(),
+        1,
+        "case {case:?}: the queried type alone is reported, got {parsed}"
+    );
+    let (type_name, item) = data
+        .iter()
+        .next()
+        .unwrap_or_else(|| panic!("case {case:?}: Data holds the queried type, got {parsed}"));
+    assert_eq!(
+        item["TypeName"].as_str(),
+        Some(type_name.as_str()),
+        "case {case:?}: the item names the type it is keyed by, got {parsed}"
+    );
+    let content = item["Content"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case:?}: the item carries Content, got {parsed}"));
+    assert!(
+        content.is_empty(),
+        "case {case:?}: a no-row answer carries an empty Content, got {parsed}"
+    );
+    Some(type_name.clone())
+}
+
+/// The node ids a query reported, in the order it reported them — none for a query that
+/// selected no node, which reports no entity at all.
 async fn reported_ids(router: &MultiServiceRouter, case: &str, body: &Value) -> Vec<String> {
     let parsed = query(router, case, body).await;
     entities(&parsed)
@@ -239,6 +281,72 @@ fn sorted(ids: &[&str]) -> Vec<String> {
     let mut ids: Vec<String> = ids.iter().map(|id| (*id).to_string()).collect();
     ids.sort();
     ids
+}
+
+/// How the service states an expression naming an attribute its inventory type supports no
+/// aggregation on: fixed text apart from the attribute and the type, both echoed from the
+/// aggregator's own expression.
+fn not_aggregatable(type_name: &str, attribute: &str) -> String {
+    format!("Attribute {attribute} of type {type_name} does not support count aggregator.")
+}
+
+/// How the service states a value that is not a filter key at all: fixed text apart from the
+/// key, echoed from the request.
+fn invalid_filter_key(key: &str) -> String {
+    format!(
+        "Invalid filter key {key}. The key format must be TypeName.AttributeName, such as \
+         AWS:Application.Name."
+    )
+}
+
+/// How the service states a filter key naming an attribute its type does not define: fixed
+/// text apart from the quoted attribute, echoed from the key.
+fn undefined_attribute(attribute: &str) -> String {
+    format!("Attribute name '{attribute}' is not defined for the given type")
+}
+
+/// How the service states a filter key whose type-name part names no inventory type: the type
+/// name and the whole key, then the same rules every type-name refusal states.
+fn invalid_filter_key_type_name(type_name: &str, key: &str) -> String {
+    format!(
+        "Type name [{type_name}] of filter key [{key}] is invalid.{}",
+        type_name_rules()
+    )
+}
+
+/// How the service states a value that is not an aggregator expression at all: fixed text
+/// apart from the expression, echoed from the request.
+fn invalid_expression(expression: &str) -> String {
+    format!("Invalid aggregator expression: {expression}.")
+}
+
+/// The rules every type-name refusal of this service states: fixed text, shared by the
+/// refusals that differ only in which value they say is invalid.
+fn type_name_rules() -> String {
+    "Type name is case sensitive, such as AWS:APpLICation is invalid; Type name must start \
+     with either AWS: or Custom:;  Custom inventory type name must satisfy regular expression \
+     pattern: ^(Custom:)([a-zA-Z0-9]{3,93})$"
+        .to_string()
+}
+
+/// How the service states a value that names no inventory type: fixed text apart from the
+/// bracketed name, echoed from the request. The pattern it quotes is the one a name of the
+/// caller's own namespace has to satisfy.
+fn invalid_type_name(type_name: &str) -> String {
+    format!(
+        "Inventory type name [{type_name}] is invalid. {}",
+        type_name_rules()
+    )
+}
+
+/// How the service states a `ResultAttributes` type name it cannot project: fixed text —
+/// the supported names and the default one — apart from the name echoed from the request.
+fn unsupported_result_type(type_name: &str) -> String {
+    format!(
+        "Result type name {type_name} is not supported. Supported type names are: \
+         AWS:InstanceInformation, AWS:PatchSummary. Default result type name is \
+         AWS:InstanceInformation."
+    )
 }
 
 /// An `Aggregators` list of `levels` nested aggregators, each carrying `groups` groups: the
@@ -389,16 +497,6 @@ async fn a_filter_selects_the_nodes_whose_attribute_satisfies_it() {
             sorted(&[EC2_LONG]),
         ),
         (
-            "Exists asks only whether the attribute is reported",
-            json!([filter("AgentVersion", &["ignored"], "Exists")]),
-            sorted(&[EC2_SHORT, EC2_LONG]),
-        ),
-        (
-            "Exists on an attribute no node reports",
-            json!([filter("AgentType", &["amazon-ssm-agent"], "Exists")]),
-            Vec::new(),
-        ),
-        (
             "two values union",
             json!([filter("PlatformType", &["Linux", "Windows"], "Equal")]),
             sorted(&[EC2_SHORT, EC2_LONG, HYBRID]),
@@ -462,36 +560,127 @@ async fn a_filter_selects_the_nodes_whose_attribute_satisfies_it() {
 }
 
 #[tokio::test]
-async fn a_filter_key_that_names_no_attribute_of_an_inventory_type_is_invalid_filter() {
+async fn a_filter_key_that_names_no_attribute_of_an_inventory_type_is_refused_by_its_fault() {
     let (router, engine) = service();
     seed_fleet(&engine);
 
-    /// `InvalidFilter`'s own documentation, which is how the service states the refusal.
-    const STATED: &str =
-        "The filter name isn't valid. Verify that you entered the correct name and try again.";
-
-    // (case, the Filters key)
-    let cases: Vec<(&str, &str)> = vec![
-        ("an attribute name naming no type", "PlatformType"),
-        ("a type naming no attribute", TYPE),
-        ("a type with an empty attribute", "AWS:InstanceInformation."),
+    // (case, the Filters key, the error class, the message). Three faults, three refusals:
+    // a value that is not a key at all is quoted back with the form a key takes; a key whose
+    // type-name part names no inventory type is the type-name refusal, naming both; and an
+    // attribute the type does not define is named as the attribute it is.
+    let cases: Vec<(&str, String, &str, String)> = vec![
+        (
+            "an attribute name naming no type",
+            "PlatformType".to_string(),
+            "InvalidFilter",
+            invalid_filter_key("PlatformType"),
+        ),
+        (
+            "a type naming no attribute",
+            TYPE.to_string(),
+            "InvalidFilter",
+            invalid_filter_key(TYPE),
+        ),
+        (
+            "a type with an empty attribute",
+            format!("{TYPE}."),
+            "InvalidFilter",
+            invalid_filter_key(&format!("{TYPE}.")),
+        ),
         (
             "an attribute outside the schema of the type",
-            "AWS:InstanceInformation.NotAnAttribute",
+            key("NotAnAttribute"),
+            "InvalidFilter",
+            undefined_attribute("NotAnAttribute"),
         ),
-        ("a type neither Amazon's nor a caller's", "Fleet.Owner"),
+        (
+            "another attribute outside it",
+            key("OSName"),
+            "InvalidFilter",
+            undefined_attribute("OSName"),
+        ),
+        (
+            "a type neither Amazon's nor a caller's",
+            "Fleet.Owner".to_string(),
+            "InvalidTypeNameException",
+            invalid_filter_key_type_name("Fleet", "Fleet.Owner"),
+        ),
         (
             "an Amazon type this service does not publish",
-            "AWS:NotAnInventoryType.Name",
+            "AWS:NotAnInventoryType.Name".to_string(),
+            "InvalidTypeNameException",
+            invalid_filter_key_type_name("AWS:NotAnInventoryType", "AWS:NotAnInventoryType.Name"),
+        ),
+        (
+            "a published name in another case, which is another name",
+            "AWS:InstanceInfo.PlatformName".to_string(),
+            "InvalidTypeNameException",
+            invalid_filter_key_type_name("AWS:InstanceInfo", "AWS:InstanceInfo.PlatformName"),
+        ),
+        (
+            "a caller's own name the pattern does not admit",
+            "Custom:My-Fleet.Owner".to_string(),
+            "InvalidTypeNameException",
+            invalid_filter_key_type_name("Custom:My-Fleet", "Custom:My-Fleet.Owner"),
         ),
     ];
 
-    for (case, bad_key) in cases {
+    for (case, bad_key, expected_code, expected_message) in cases {
         let body = json!({ "Filters": [{ "Key": bad_key, "Values": ["x"], "Type": "Equal" }] });
         let (status, parsed) = call(&router, OPERATION, &body).await;
         assert_eq!(
             status, 400,
             "case {case:?}: the key is refused, got {status} with {parsed}"
+        );
+        let code = error_code(&parsed);
+        assert_eq!(
+            code, expected_code,
+            "case {case:?}: expected {expected_code}, got {code:?} with {parsed}"
+        );
+        let stated = error_message(&parsed);
+        assert_eq!(
+            stated, expected_message,
+            "case {case:?}: expected {expected_message:?}, got {stated:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_exists_operator_belongs_to_an_aggregator_group_and_not_to_a_query_filter() {
+    let (router, engine) = service();
+    seed_fleet(&engine);
+
+    /// How the service states the `Exists` operator in a query's own filters, which
+    /// `InventoryFilter$Type` documents as belonging to aggregators ("The `Exists` filter
+    /// must be used with aggregators").
+    const STATED: &str = "Exists operator can only be used in Aggregator filters.";
+
+    // (case, the Filters list). Whichever attribute it asks about, and wherever in the list
+    // the entry sits, a query's own filter may not ask whether an attribute is reported.
+    let cases: Vec<(&str, Value)> = vec![
+        (
+            "an attribute every node reports",
+            json!([filter("PlatformType", &["ignored"], "Exists")]),
+        ),
+        (
+            "an attribute no node reports",
+            json!([filter("AgentType", &["ignored"], "Exists")]),
+        ),
+        (
+            "the second entry of a list whose first is served",
+            json!([
+                filter("PlatformType", &["Linux"], "Equal"),
+                filter("AgentVersion", &["ignored"], "Exists"),
+            ]),
+        ),
+    ];
+
+    for (case, filters) in cases {
+        let body = json!({ "Filters": filters });
+        let (status, parsed) = call(&router, OPERATION, &body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: the operator is refused, got {status} with {parsed}"
         );
         let code = error_code(&parsed);
         assert_eq!(
@@ -504,6 +693,24 @@ async fn a_filter_key_that_names_no_attribute_of_an_inventory_type_is_invalid_fi
             "case {case:?}: expected {STATED:?}, got {stated:?}"
         );
     }
+
+    // The same operator in an aggregator's group criteria is served: that is where asking
+    // whether an attribute is reported belongs.
+    let body = json!({
+        "Aggregators": [{
+            "Groups": [{
+                "Name": "Reporting",
+                "Filters": [filter("AgentVersion", &["ignored"], "Exists")],
+            }],
+        }],
+    });
+    let content = aggregated_content(&router, "a group defined by Exists", &body, TYPE).await;
+    let expected = vec![row(&[("Reporting", "2"), ("NotReporting", "1")])];
+    assert_eq!(
+        content, expected,
+        "a group counts the nodes reporting the attribute beside the ones that do not: \
+         expected {expected:?}, got {content:?}"
+    );
 }
 
 #[tokio::test]
@@ -711,38 +918,9 @@ async fn an_aggregator_the_service_cannot_count_over_is_invalid_aggregator() {
     const STATED: &str = "The specified aggregator isn't valid for the group type. Verify that \
                           the aggregator you provided is supported.";
 
-    // (case, the Aggregators list). Every attribute of this type outside the three
-    // `GetInventorySchemaRequest$Aggregator` documents it as aggregating on is refused,
-    // whichever of them it is and however deeply nested the aggregator sits.
+    // (case, the Aggregators list). An aggregator naming no ONE aggregation at all is
+    // stated by the error class's own sentence: there is no expression to quote in it.
     let cases: Vec<(&str, Value)> = vec![
-        (
-            "the node status, which the type supports no aggregation on",
-            json!([{ "Expression": key("InstanceStatus") }]),
-        ),
-        (
-            "the node id, the same",
-            json!([{ "Expression": key("InstanceId") }]),
-        ),
-        (
-            "the agent version, the same",
-            json!([{ "Expression": key("AgentVersion") }]),
-        ),
-        (
-            "an attribute outside the schema of the type",
-            json!([{ "Expression": key("NotAnAttribute") }]),
-        ),
-        (
-            "an attribute name naming no type",
-            json!([{ "Expression": "PlatformType" }]),
-        ),
-        (
-            "a type naming no attribute",
-            json!([{ "Expression": TYPE }]),
-        ),
-        (
-            "an Amazon type this service does not publish",
-            json!([{ "Expression": "AWS:NotAnInventoryType.Name" }]),
-        ),
         (
             "an aggregator naming neither an expression nor groups",
             json!([{}]),
@@ -756,20 +934,6 @@ async fn an_aggregator_the_service_cannot_count_over_is_invalid_aggregator() {
                     "Filters": [filter("PlatformType", &["Linux"], "Equal")],
                 }],
             }]),
-        ),
-        (
-            "a nested aggregator over an attribute the type supports no aggregation on",
-            json!([{
-                "Expression": key("PlatformType"),
-                "Aggregators": [{ "Expression": key("InstanceStatus") }],
-            }]),
-        ),
-        (
-            "a second aggregator of the list, where the first is countable",
-            json!([
-                { "Expression": key("PlatformName") },
-                { "Expression": key("ComputerName") },
-            ]),
         ),
         (
             "a nesting deeper than this service walks",
@@ -826,63 +990,303 @@ async fn an_aggregator_the_service_cannot_count_over_is_invalid_aggregator() {
 }
 
 #[tokio::test]
+async fn an_expression_that_is_not_a_type_and_an_attribute_is_quoted_back() {
+    let (router, engine) = service();
+    seed_fleet(&engine);
+
+    // (case, the expression). An expression is a type name and an attribute of it, so a
+    // value missing either half names no aggregation to look up and is quoted back as the
+    // expression it is \u2014 whichever half is missing.
+    let cases: Vec<(&str, String)> = vec![
+        (
+            "an attribute name alone",
+            "PlatformType".to_string(),
+        ),
+        ("a type naming no attribute", TYPE.to_string()),
+        (
+            "a type with an empty attribute",
+            format!("{TYPE}."),
+        ),
+        (
+            "an attribute with no type before it",
+            ".PlatformType".to_string(),
+        ),
+        (
+            "a name of neither namespace and no attribute",
+            "Fleet".to_string(),
+        ),
+    ];
+
+    for (case, expression) in cases {
+        let body = json!({ "Aggregators": [{ "Expression": expression }] });
+        let (status, parsed) = call(&router, OPERATION, &body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: the expression is refused, got {status} with {parsed}"
+        );
+        let code = error_code(&parsed);
+        assert_eq!(
+            code, "InvalidAggregatorException",
+            "case {case:?}: expected InvalidAggregatorException, got {code:?} with {parsed}"
+        );
+        let expected = invalid_expression(&expression);
+        let stated = error_message(&parsed);
+        assert_eq!(
+            stated, expected,
+            "case {case:?}: expected {expected:?}, got {stated:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_expression_naming_a_non_aggregatable_attribute_names_the_attribute_and_type() {
+    let (router, engine) = service();
+    seed_fleet(&engine);
+
+    // (case, the Aggregators list, the type and the attribute the refusal names). Every
+    // attribute of this type outside the three `GetInventorySchemaRequest$Aggregator`
+    // documents it as aggregating on is refused, whichever of them it is and however deeply
+    // nested the aggregator sits — and so is any attribute of a type this service reports no
+    // aggregatable schema for at all.
+    let cases: Vec<(&str, Value, &str, &str)> = vec![
+        (
+            "the node status, which the type supports no aggregation on",
+            json!([{ "Expression": key("InstanceStatus") }]),
+            TYPE,
+            "InstanceStatus",
+        ),
+        (
+            "the node id, the same",
+            json!([{ "Expression": key("InstanceId") }]),
+            TYPE,
+            "InstanceId",
+        ),
+        (
+            "the agent version, the same",
+            json!([{ "Expression": key("AgentVersion") }]),
+            TYPE,
+            "AgentVersion",
+        ),
+        (
+            "an attribute outside the schema of the type",
+            json!([{ "Expression": key("NotAnAttribute") }]),
+            TYPE,
+            "NotAnAttribute",
+        ),
+        (
+            // A published type this service reports no aggregatable schema for: an
+            // aggregation read of the catalog reports this type's attributes for none.
+            "an attribute of a published type that supports no aggregation",
+            json!([{ "Expression": "AWS:Application.Name" }]),
+            "AWS:Application",
+            "Name",
+        ),
+        (
+            "an attribute of a caller's own type",
+            json!([{ "Expression": "Custom:Fleet.Owner" }]),
+            "Custom:Fleet",
+            "Owner",
+        ),
+        (
+            "a nested aggregator over an attribute the type supports no aggregation on",
+            json!([{
+                "Expression": key("PlatformType"),
+                "Aggregators": [{ "Expression": key("InstanceStatus") }],
+            }]),
+            TYPE,
+            "InstanceStatus",
+        ),
+        (
+            "a second aggregator of the list, where the first is countable",
+            json!([
+                { "Expression": key("PlatformName") },
+                { "Expression": key("ComputerName") },
+            ]),
+            TYPE,
+            "ComputerName",
+        ),
+    ];
+
+    for (case, aggregators, type_name, attribute) in cases {
+        let body = json!({ "Aggregators": aggregators });
+        let (status, parsed) = call(&router, OPERATION, &body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: the aggregator is refused, got {status} with {parsed}"
+        );
+        let code = error_code(&parsed);
+        assert_eq!(
+            code, "InvalidAggregatorException",
+            "case {case:?}: expected InvalidAggregatorException, got {code:?} with {parsed}"
+        );
+        let expected = not_aggregatable(type_name, attribute);
+        let stated = error_message(&parsed);
+        assert_eq!(
+            stated, expected,
+            "case {case:?}: expected {expected:?}, got {stated:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_expression_naming_no_inventory_type_is_invalid_type_name() {
+    let (router, engine) = service();
+    seed_fleet(&engine);
+
+    // (case, the expression, the type name the refusal echoes). The type name an aggregator
+    // carries is validated as a type name — separately from the aggregation it asks for —
+    // so every way of naming no inventory type is reported as the type-name fault it is.
+    let cases: Vec<(&str, String, String)> = vec![
+        (
+            "an Amazon type this service does not publish",
+            "AWS:NotAnInventoryType.Name".to_string(),
+            "AWS:NotAnInventoryType".to_string(),
+        ),
+        (
+            "a published name in another case, which is another name",
+            "AWS:instanceinformation.PlatformType".to_string(),
+            "AWS:instanceinformation".to_string(),
+        ),
+        (
+            "a namespace in another case",
+            "aws:InstanceInformation.PlatformType".to_string(),
+            "aws:InstanceInformation".to_string(),
+        ),
+        (
+            "a type of neither namespace",
+            "Fleet.Owner".to_string(),
+            "Fleet".to_string(),
+        ),
+        (
+            // One character short of the 3..=93 the custom-name pattern admits.
+            "a caller's own name shorter than the pattern admits",
+            "Custom:ab.Owner".to_string(),
+            "Custom:ab".to_string(),
+        ),
+        (
+            // 93 is the longest the pattern admits, so 94 is one past it.
+            "a caller's own name longer than the pattern admits",
+            format!("Custom:{}.Owner", "a".repeat(94)),
+            format!("Custom:{}", "a".repeat(94)),
+        ),
+        (
+            "a caller's own name carrying a separator the pattern admits none of",
+            "Custom:My-Fleet.Owner".to_string(),
+            "Custom:My-Fleet".to_string(),
+        ),
+    ];
+
+    for (case, expression, named) in cases {
+        let body = json!({ "Aggregators": [{ "Expression": expression }] });
+        let (status, parsed) = call(&router, OPERATION, &body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: the type name is refused, got {status} with {parsed}"
+        );
+        let code = error_code(&parsed);
+        assert_eq!(
+            code, "InvalidTypeNameException",
+            "case {case:?}: expected InvalidTypeNameException, got {code:?} with {parsed}"
+        );
+        let expected = invalid_type_name(&named);
+        let stated = error_message(&parsed);
+        assert_eq!(
+            stated, expected,
+            "case {case:?}: expected {expected:?}, got {stated:?}"
+        );
+    }
+
+    // A caller's own name the pattern DOES admit, over an attribute no type of that
+    // namespace publishes an aggregation on: the type name is accepted and the aggregation
+    // is what is refused, which is the other side of the same split.
+    let body = json!({ "Aggregators": [{ "Expression": "Custom:Fleet.Owner" }] });
+    let (status, parsed) = call(&router, OPERATION, &body).await;
+    assert_eq!(
+        status, 400,
+        "a caller's own type is refused on its attribute, got {status} with {parsed}"
+    );
+    let code = error_code(&parsed);
+    assert_eq!(
+        code, "InvalidAggregatorException",
+        "a name the pattern admits is no type-name fault: got {code:?} with {parsed}"
+    );
+}
+
+#[tokio::test]
 async fn the_reported_type_is_the_one_the_result_attributes_name() {
     let (router, engine) = service();
     seed_fleet(&engine);
 
-    // (case, ResultAttributes, how many entities the query reports)
-    let cases: Vec<(&str, Value, usize)> = vec![
+    // (case, ResultAttributes, the node ids the query reports). The types a cross-node query
+    // PROJECTS are the two its own refusal lists; the one every managed node has carries the
+    // fleet, and the other has had nothing collected for it here.
+    let cases: Vec<(&str, Value, Vec<String>)> = vec![
         (
             "the default type, named explicitly",
             json!([{ "TypeName": TYPE }]),
-            3,
+            sorted(&[EC2_SHORT, EC2_LONG, HYBRID]),
         ),
         (
-            // A type this service knows and holds no item of: `PutInventory`, the
-            // operation a caller writes an item with, is still a scaffold.
-            "a default Amazon type nothing has been collected for",
-            json!([{ "TypeName": "AWS:Network" }]),
-            0,
-        ),
-        (
-            "a caller's own type nothing has been collected for",
-            json!([{ "TypeName": "Custom:Fleet" }]),
-            0,
+            "the other projected type, nothing has been collected for",
+            json!([{ "TypeName": "AWS:PatchSummary" }]),
+            Vec::new(),
         ),
     ];
 
     for (case, result_attributes, expected) in cases {
-        let parsed = query(
-            &router,
-            case,
-            &json!({ "ResultAttributes": result_attributes }),
-        )
-        .await;
-        let reported = entities(&parsed).len();
+        let body = json!({ "ResultAttributes": result_attributes });
+        let ids = reported_ids(&router, case, &body).await;
         assert_eq!(
-            reported, expected,
-            "case {case:?}: expected {expected} entities, got {reported} in {parsed}"
+            ids, expected,
+            "case {case:?}: expected {expected:?}, got {ids:?}"
         );
     }
 
-    // A type name that names no inventory type at all is the modelled refusal of that
-    // member.
-    let body = json!({ "ResultAttributes": [{ "TypeName": "AWS:NotAnInventoryType" }] });
-    let (status, parsed) = call(&router, OPERATION, &body).await;
+    // The type an AGGREGATION reports an empty row set under is the type it counted over,
+    // which is the type its expression names rather than the one the result attributes do.
+    let body = json!({
+        "Filters": [filter("PlatformType", &["MacOS"], "Equal")],
+        "Aggregators": [{ "Expression": key("PlatformName") }],
+        "ResultAttributes": [{ "TypeName": "AWS:PatchSummary" }],
+    });
+    let parsed = query(&router, "an aggregation over the default type", &body).await;
     assert_eq!(
-        status, 400,
-        "a type name naming no inventory type is refused, got {status} with {parsed}"
+        no_row_type(&parsed, "an aggregation over the default type").as_deref(),
+        Some(TYPE),
+        "the empty row set is reported under the aggregated type, got {parsed}"
     );
-    let code = error_code(&parsed);
-    assert_eq!(
-        code, "InvalidResultAttributeException",
-        "expected InvalidResultAttributeException, got {code:?} with {parsed}"
-    );
-    let stated = error_message(&parsed);
-    assert_eq!(
-        stated, "The specified inventory item result attribute isn't valid.",
-        "the refusal is stated as the modelled error documents it, got {stated:?}"
-    );
+
+    // (case, the type name). A type name outside the projected set is refused whether it
+    // names a real inventory type a read of one node's entries reports, or no type at all.
+    let cases: Vec<(&str, &str)> = vec![
+        ("a published type this query does not project", "AWS:Network"),
+        (
+            "another published type, the same",
+            "AWS:WindowsUpdate",
+        ),
+        ("a caller's own type", "Custom:Fleet"),
+        ("an Amazon name naming no type", "AWS:NotAnInventoryType"),
+    ];
+
+    for (case, type_name) in cases {
+        let body = json!({ "ResultAttributes": [{ "TypeName": type_name }] });
+        let (status, parsed) = call(&router, OPERATION, &body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: the type name is refused, got {status} with {parsed}"
+        );
+        let code = error_code(&parsed);
+        assert_eq!(
+            code, "InvalidResultAttributeException",
+            "case {case:?}: expected InvalidResultAttributeException, got {code:?} with {parsed}"
+        );
+        let expected = unsupported_result_type(type_name);
+        let stated = error_message(&parsed);
+        assert_eq!(
+            stated, expected,
+            "case {case:?}: expected {expected:?}, got {stated:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -959,18 +1363,129 @@ async fn a_page_holds_max_results_entities_and_resumes_at_the_node_it_stopped_at
 async fn an_account_that_has_registered_no_node_holds_no_inventory() {
     let (router, _engine) = service();
 
-    // Nothing is seeded: a query invents no node and no item, and an aggregation over an
-    // empty fleet counts nothing at all.
+    // Nothing is seeded: a query invents no node and no item, so it reports no entity.
     let parsed = query(&router, "an empty store", &json!({})).await;
     assert!(
         entities(&parsed).is_empty(),
         "an account with no registered node holds no inventory, got {parsed}"
     );
 
+    // An aggregation that counted nothing is the same no-row answer, under the type the
+    // aggregation is about: a fleet that reports no value of the counted attribute has no
+    // count to report, not no answer.
     let body = json!({ "Aggregators": [{ "Expression": key("PlatformType") }] });
     let parsed = query(&router, "an aggregation over an empty fleet", &body).await;
-    assert!(
-        entities(&parsed).is_empty(),
+    assert_eq!(
+        no_row_type(&parsed, "an aggregation over an empty fleet").as_deref(),
+        Some(TYPE),
         "a fleet that reports no value of the attribute is counted as nothing, got {parsed}"
+    );
+}
+
+#[tokio::test]
+async fn an_aggregation_that_counted_nothing_reports_its_type_holding_no_row() {
+    let (router, engine) = service();
+    seed_fleet(&engine);
+
+    // (case, the request body, the type the answer reports an empty row set for). One row per
+    // WAY an aggregation can count nothing — a filter selecting no node, an attribute no
+    // selected node reports, a group whose own nested aggregation has nothing left to refine —
+    // because the answer is about the aggregation having been served, not about which of them
+    // it was.
+    let cases: Vec<(&str, Value, &str)> = vec![
+        (
+            "a filter that selects no node",
+            json!({
+                "Filters": [filter("PlatformType", &["MacOS"], "Equal")],
+                "Aggregators": [{ "Expression": key("PlatformName") }],
+            }),
+            TYPE,
+        ),
+        (
+            "two filters no node satisfies together",
+            json!({
+                "Filters": [
+                    filter("PlatformType", &["Windows"], "Equal"),
+                    filter("InstanceStatus", &["Stopped"], "Equal"),
+                ],
+                "Aggregators": [{ "Expression": key("PlatformType") }],
+            }),
+            TYPE,
+        ),
+        (
+            "a well-formed node id nothing registered under",
+            json!({
+                "Filters": [filter("InstanceId", &[UNREGISTERED], "Equal")],
+                "Aggregators": [{ "Expression": key("PlatformVersion") }],
+            }),
+            TYPE,
+        ),
+        (
+            // A second aggregator counts nothing either, so the whole answer is the empty
+            // one: the entity reports the type, not one aggregator's luck.
+            "two aggregators over a fleet that reports neither attribute",
+            json!({
+                "Filters": [filter("PlatformType", &["MacOS"], "Equal")],
+                "Aggregators": [
+                    { "Expression": key("PlatformName") },
+                    { "Expression": key("PlatformVersion") },
+                ],
+            }),
+            TYPE,
+        ),
+    ];
+
+    for (case, body, type_name) in cases {
+        let parsed = query(&router, case, &body).await;
+        let reported = entities(&parsed);
+        assert_eq!(
+            reported.len(),
+            1,
+            "case {case:?}: an aggregation reports the type it counted over, got {parsed}"
+        );
+        assert_eq!(
+            no_row_type(&parsed, case).as_deref(),
+            Some(type_name),
+            "case {case:?}: expected an empty row set for {type_name}, got {parsed}"
+        );
+        assert!(
+            parsed["NextToken"].is_null(),
+            "case {case:?}: an aggregated answer is served whole, got {parsed}"
+        );
+    }
+
+    // (case, the request body). A ROW query that selected no node is the other answer: there
+    // is no node's inventory to report, so no entity is.
+    let cases: Vec<(&str, Value)> = vec![
+        (
+            "a filter no node satisfies",
+            json!({ "Filters": [filter("PlatformType", &["MacOS"], "Equal")] }),
+        ),
+        (
+            "a projected type nothing has been collected for",
+            json!({ "ResultAttributes": [{ "TypeName": "AWS:PatchSummary" }] }),
+        ),
+        (
+            // A cursor every seeded node is before, so the page it resumes starts past the
+            // last of them (the modelled `mi-` form, 17 characters).
+            "a page past the last node the cursor could resume at",
+            json!({ "MaxResults": 1, "NextToken": "mi-99999999999999999" }),
+        ),
+    ];
+
+    for (case, body) in cases {
+        let parsed = query(&router, case, &body).await;
+        assert!(
+            entities(&parsed).is_empty(),
+            "case {case:?}: a row query that selected no node reports no entity, got {parsed}"
+        );
+    }
+
+    // The fleet is still reported when the query selects nodes.
+    let ids = reported_ids(&router, "the whole fleet", &json!({})).await;
+    assert_eq!(
+        ids,
+        sorted(&[EC2_SHORT, EC2_LONG, HYBRID]),
+        "a query that selects nodes reports them alone"
     );
 }

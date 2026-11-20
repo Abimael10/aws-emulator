@@ -269,6 +269,96 @@ fn filter(key: &str, values: &[&str]) -> Value {
     json!({ "Key": key, "Values": values })
 }
 
+/// A listing reports the description a baseline CURRENTLY carries, whatever write last set
+/// it: the description is read from the baseline's own state, so an update that adds,
+/// replaces or clears it is what the next listing reports.
+#[tokio::test]
+async fn a_listing_reports_the_description_the_last_write_left_on_the_baseline() {
+    let router = router();
+
+    // The baseline every row writes: created without a description, so the first row proves
+    // the member is reported from state rather than from the create alone.
+    let baseline_id = create_ok(
+        &router,
+        "the baseline the updates write",
+        REGION,
+        "Listing.Described",
+        Some("AMAZON_LINUX_2"),
+        None,
+    )
+    .await;
+
+    // (case, the update body members — `Null` for the row that updates nothing — and the
+    // description the listing then reports)
+    let cases: &[(&str, Value, Option<&str>)] = &[
+        (
+            "before any update, a create that named none",
+            Value::Null,
+            None,
+        ),
+        (
+            "an update that adds a description",
+            json!({ "Description": "the described baseline" }),
+            Some("the described baseline"),
+        ),
+        (
+            "an update that replaces it with another",
+            json!({ "Description": "the redescribed baseline" }),
+            Some("the redescribed baseline"),
+        ),
+        (
+            // "Fields not specified in the request are left unchanged": an update naming
+            // another member alone leaves the description where it is.
+            "an update that names another member alone",
+            json!({ "RejectedPatches": ["KB2124262"] }),
+            Some("the redescribed baseline"),
+        ),
+        (
+            // "If True, then all fields that are required by the CreatePatchBaseline
+            // operation are also required for this API request": a replacing update that
+            // names no description clears it to what a create naming none would hold.
+            "a replacing update that names no description",
+            json!({
+                "Replace": true,
+                "Name": "Listing.Described",
+                "ApprovedPatches": ["KB2124261"],
+            }),
+            None,
+        ),
+        (
+            "an update that describes it again",
+            json!({ "Description": "the described baseline again" }),
+            Some("the described baseline again"),
+        ),
+    ];
+
+    for (case, update, expected) in cases {
+        if let Some(members) = update.as_object() {
+            let mut body = members.clone();
+            body.insert("BaselineId".to_string(), json!(baseline_id));
+            let (status, response) =
+                call_in_region(&router, REGION, "UpdatePatchBaseline", &Value::Object(body)).await;
+            assert_eq!(
+                status, 200,
+                "case {case}: UpdatePatchBaseline {update} must succeed, got {status} {response}"
+            );
+            assert_eq!(
+                response["Description"].as_str(),
+                *expected,
+                "case {case}: the update reports the description it left, got {response}"
+            );
+        }
+        let listed = list_all(&router, case, REGION, None, None).await;
+        let identity = identity_of(&listed, &baseline_id)
+            .unwrap_or_else(|| panic!("case {case}: the listing reports {baseline_id:?}"));
+        assert_eq!(
+            identity["BaselineDescription"].as_str(),
+            *expected,
+            "case {case}: expected the description {expected:?}, got {identity:?}"
+        );
+    }
+}
+
 /// A listing reports every baseline the account created at the endpoint, as the basic
 /// information its create persisted.
 #[tokio::test]

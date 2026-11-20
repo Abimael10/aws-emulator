@@ -17,35 +17,55 @@
 //!
 //! ## Which requests are refused, and with which modelled error
 //!
-//! * A `Filters` key that names no attribute of an inventory type — not the dotted
-//!   `<TypeName>.<AttributeName>` form, a type this service does not know, or an attribute
-//!   outside the schema of the one type whose schema it holds — is `InvalidFilter`
+//! * A `Filters` key that is not the `<TypeName>.<AttributeName>` form is not a key at all
+//!   and is `InvalidFilter` quoting the key and the form one takes; a key of that form whose
+//!   type-name part names no inventory type is a TYPE-NAME fault, so it is
+//!   `InvalidTypeNameException` naming the type name and the key it was read from; and a key
+//!   naming an attribute outside the schema of the one type whose schema this service holds
+//!   is `InvalidFilter` naming that attribute
 //!   ([`crate::state::inventory::filter_key_rejection`]). A key naming a type this service
 //!   knows and holds no item of is NOT refused: it selects nothing, which is what has been
 //!   collected for it.
-//! * An `Aggregators` expression that is not that same dotted form, or that names an
-//!   attribute its type supports no aggregation on, is `InvalidAggregatorException`
-//!   ([`crate::state::inventory::aggregator_expression_rejection`]) — "this call returns
-//!   the AWS:InstanceInformation type, because it supports aggregation based on the
+//! * A `Filters` entry naming the `Exists` operator is `InvalidFilter`
+//!   ([`crate::state::inventory::EXISTS_ONLY_IN_AGGREGATOR_FILTERS`]): "the `Exists` filter
+//!   must be used with aggregators" (`InventoryFilter$Type`), so asking whether an attribute
+//!   is reported at all is a criterion an aggregator's groups are defined by, not a way of
+//!   selecting the nodes a query reports.
+//! * An `Aggregators` expression that is not the `<TypeName>.<AttributeName>` form at all
+//!   names no aggregation to look up, and is `InvalidAggregatorException` quoting the
+//!   expression ([`crate::state::inventory::invalid_expression_message`]).
+//! * An `Aggregators` expression whose type-name part names no inventory type is
+//!   `InvalidTypeNameException` naming it — the type name a request carries is validated as
+//!   a type name, separately from and ahead of the aggregation it asks for, so a mistyped
+//!   or unsupported type is reported as the type-name fault it is rather than as an
+//!   aggregator fault ([`crate::state::inventory::aggregator_expression_rejection`]).
+//! * An `Aggregators` expression naming an attribute its type supports no aggregation on is
+//!   `InvalidAggregatorException` stating WHICH attribute of WHICH type was rejected
+//!   ([`crate::state::inventory::not_aggregatable_message`]) — "this call returns the
+//!   AWS:InstanceInformation type, because it supports aggregation based on the
 //!   PlatformName, PlatformType, and PlatformVersion attributes"
 //!   (`GetInventorySchemaRequest$Aggregator`), so an aggregator over another attribute of
-//!   that type is one the service does not support.
+//!   that type, or over any attribute of a type this service reports no aggregatable schema
+//!   for, is one the service does not support.
 //! * An aggregator that names neither an expression nor groups has nothing to count over,
 //!   and one that names both names two aggregations where its result holds one: both are
-//!   `InvalidAggregatorException`. So is a nesting deeper than
-//!   [`MAX_AGGREGATOR_NESTING`], the emulator's own bound on how far a request may nest
-//!   aggregators.
-//! * A `ResultAttributes` type name that names no inventory type — neither a default type
-//!   this service publishes nor a caller's own `Custom:` type — is
-//!   `InvalidResultAttributeException`. A known type this store holds no item of is not
-//!   refused: the query reports the nothing collected for it.
+//!   `InvalidAggregatorException` stated by that class's own sentence. So is a nesting
+//!   deeper than [`MAX_AGGREGATOR_NESTING`], the emulator's own bound on how far a request
+//!   may nest aggregators.
+//! * A `ResultAttributes` type name outside the types this query PROJECTS
+//!   ([`crate::state::inventory::SUPPORTED_RESULT_TYPE_NAMES`]) is
+//!   `InvalidResultAttributeException` naming it beside the names it may name — that set is
+//!   narrower than the inventory types that exist, so a real inventory type a read of one
+//!   node's entries reports is refused here too. A projected type this store holds no item
+//!   of is not refused: the query reports the nothing collected for it.
 //! * A `NextToken` this service did not issue is `InvalidNextToken`.
 //!
 //! ## Filtering, aggregating and paging
 //!
 //! Filters intersect and each filter's values union, under the operator the filter names
-//! (`Equal` when it names none, and `Exists` asking only whether the attribute is reported
-//! at all — [`crate::state::inventory::matches_filter`]). An aggregator counts the selected
+//! (`Equal` when it names none — [`crate::state::inventory::matches_filter`]; `Exists`, which
+//! asks only whether the attribute is reported at all, is a group's criterion rather than a
+//! query's filter). An aggregator counts the selected
 //! nodes per distinct value of the attribute its expression names, a nested aggregator
 //! refines each of those counts into the counts of its own attribute within them, and a
 //! group counts the selected nodes its filters match beside the ones they do not ("Groups
@@ -57,6 +77,12 @@
 //! the `NextToken` is the id of the node the next page starts at — the cursor every node
 //! report of this service hands out — which is total because the node store is keyed by
 //! `(region, node id)` and therefore walked in ascending node-id order.
+//!
+//! An AGGREGATION that counted nothing — a fleet reporting no value of the attribute it
+//! counts over — still reports the type it is about, holding an empty content list
+//! ([`empty_result_entity`]): the aggregated entity is the answer to the question the
+//! aggregation asked, and "nothing was counted" is an answer to it. A ROW query that selected
+//! no node reports no entity: there is no node's inventory to report.
 //!
 //! ## Shape of an operation
 //!
@@ -138,6 +164,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::inventory::{AggregatorRejection, FilterKeyRejection};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -213,8 +241,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::inventory::{
-            filter_key_rejection, inventory_page_size, is_known_inventory_type, matches_filter,
-            INVENTORY_TYPE_INSTANCE_INFORMATION,
+            filter_key_rejection, inventory_page_size, is_supported_result_type, matches_filter,
+            unsupported_result_type_message, EXISTS_ONLY_IN_AGGREGATOR_FILTERS,
+            INVENTORY_TYPE_INSTANCE_INFORMATION, OPERATOR_EXISTS,
         };
         use crate::state::{managed_node_id_is_well_formed, request_region, INVALID_NEXT_TOKEN};
 
@@ -230,8 +259,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // about the nodes.
         let filters = input.filters.as_deref().unwrap_or_default();
         for filter in filters {
-            if let Some(why) = filter_key_rejection(&filter.key) {
-                return Err(invalid_filter(why));
+            if let Some(rejection) = filter_key_rejection(&filter.key) {
+                return Err(filter_key_rejected(rejection));
+            }
+            // "The `Exists` filter must be used with aggregators" (`InventoryFilter$Type`):
+            // asking whether an attribute is reported at all is a criterion an aggregator's
+            // groups are defined by rather than a way of selecting the nodes a query
+            // reports, so a query's own filters may not name it.
+            if filter.r#type.as_deref() == Some(OPERATOR_EXISTS) {
+                return Err(invalid_filter(EXISTS_ONLY_IN_AGGREGATOR_FILTERS));
             }
         }
 
@@ -250,12 +286,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_or(INVENTORY_TYPE_INSTANCE_INFORMATION, |attribute| {
                 attribute.type_name.as_str()
             });
-        if !is_known_inventory_type(reported_type) {
+        if !is_supported_result_type(reported_type) {
             return Err(GetInventoryErrorModeled::InvalidResultAttributeException(
                 InvalidResultAttributeException {
-                    message: Some(
-                        "The specified inventory item result attribute isn't valid.".to_string(),
-                    ),
+                    message: Some(unsupported_result_type_message(reported_type)),
                 },
             )
             .into());
@@ -310,9 +344,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if !aggregators.is_empty() {
             // An aggregated count is about the fleet rather than about one node, so the
-            // counts of every aggregator the request named are reported together.
+            // counts of every aggregator the request named are reported together — and a
+            // fleet that reports no value of the counted attribute counts nothing, which is
+            // the same no-row answer a row query that selected nothing gives, for the type
+            // the aggregation is about.
+            let mut entities = aggregated_entities(&selected, aggregators)?;
+            if entities.is_empty() {
+                entities.push(empty_result_entity(aggregated_type(aggregators)));
+            }
             return Ok(GetInventoryOutput {
-                entities: Some(aggregated_entities(&selected, aggregators)?),
+                entities: Some(entities),
                 next_token: None,
             });
         }
@@ -320,7 +361,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut entities = Vec::new();
         let mut next_token = None;
         // Only the node's own information is collected for a node here; another type this
-        // service knows has had nothing reported for it, so it is reported as holding
+        // query projects has had nothing reported for it, so it is reported as holding
         // nothing rather than refused.
         if reported_type == INVENTORY_TYPE_INSTANCE_INFORMATION {
             for (id, node) in selected {
@@ -366,6 +407,114 @@ fn invalid_aggregator(why: &str) -> GetInventoryError {
     .into()
 }
 
+/// The modelled refusal of a filter key this operation cannot serve, which is one of two
+/// error classes: a key whose type-name part names no inventory type is a TYPE-NAME fault
+/// (the modelled type-name refusal, naming the type name and the key it was read from), while
+/// a key that is not a key at all, or that names an attribute outside the schema of the type
+/// it names, is the filter refusal.
+fn filter_key_rejected(rejection: FilterKeyRejection) -> GetInventoryError {
+    use crate::state::inventory::{invalid_filter_key_message, undefined_attribute_message};
+    use crate::state::inventory_catalog::invalid_filter_key_type_name_message;
+
+    match rejection {
+        FilterKeyRejection::NotAKey(key) => invalid_filter(&invalid_filter_key_message(&key)),
+        FilterKeyRejection::UnknownTypeName { type_name, key } => {
+            GetInventoryErrorModeled::InvalidTypeNameException(InvalidTypeNameException {
+                message: Some(invalid_filter_key_type_name_message(&type_name, &key)),
+            })
+            .into()
+        }
+        FilterKeyRejection::UnknownAttribute(attribute) => {
+            invalid_filter(&undefined_attribute_message(&attribute))
+        }
+    }
+}
+
+/// The modelled refusal of an aggregator expression this operation cannot count over, which
+/// is one of three distinct refusals: the type name an expression carries and the attribute
+/// it names are two different things to get wrong, so a name that names no inventory type is
+/// the modelled type-name refusal (naming it, and the rules a name has to satisfy) while an
+/// attribute its type supports no aggregation on is the aggregator refusal naming that
+/// attribute and type.
+fn aggregator_rejection(rejection: AggregatorRejection) -> GetInventoryError {
+    use crate::state::inventory::{invalid_expression_message, not_aggregatable_message};
+    use crate::state::inventory_catalog::invalid_type_name_message;
+
+    match rejection {
+        AggregatorRejection::UnknownTypeName(type_name) => {
+            GetInventoryErrorModeled::InvalidTypeNameException(InvalidTypeNameException {
+                message: Some(invalid_type_name_message(&type_name)),
+            })
+            .into()
+        }
+        AggregatorRejection::AttributeNotAggregatable {
+            type_name,
+            attribute,
+        } => invalid_aggregator(&not_aggregatable_message(&type_name, &attribute)),
+        AggregatorRejection::NotAnExpression(expression) => {
+            invalid_aggregator(&invalid_expression_message(&expression))
+        }
+    }
+}
+
+/// The inventory type an aggregation is ABOUT: the type its first aggregator names, which is
+/// the type the entries it counts are reported under — the expression's type name, or the type
+/// the first group's criteria are about, and the default type when it names neither (the same
+/// type the aggregation walk counts a group under).
+fn aggregated_type(aggregators: &[InventoryAggregator]) -> &str {
+    use crate::state::inventory::{split_qualified_attribute, INVENTORY_TYPE_INSTANCE_INFORMATION};
+
+    aggregators
+        .first()
+        .and_then(|aggregator| {
+            let expression = crate::state::non_empty(aggregator.expression.as_deref());
+            let group_key = aggregator
+                .groups
+                .as_deref()
+                .unwrap_or_default()
+                .first()
+                .and_then(|group| group.filters.first())
+                .map(|filter| filter.key.as_str());
+            expression.or(group_key)
+        })
+        .and_then(split_qualified_attribute)
+        .map_or(INVENTORY_TYPE_INSTANCE_INFORMATION, |(type_name, _)| {
+            type_name
+        })
+}
+
+/// The one entity a valid query that selected no row of the type it asked for reports: the
+/// queried type carrying an empty content list.
+///
+/// It belongs to no node — "for managed node inventory the result will be the managed node
+/// ID" (`InventoryResultEntity$Id`), and an empty row set is the inventory of no node — so it
+/// carries no `Id`, and the schema version is the one the type publishes
+/// ([`crate::state::inventory_catalog`]) since no content of it was collected to report the
+/// version of.
+fn empty_result_entity(type_name: &str) -> InventoryResultEntity {
+    use crate::state::inventory::INSTANCE_INFORMATION_SCHEMA_VERSION;
+    use crate::state::inventory_catalog::published_type;
+
+    let schema_version = published_type(type_name)
+        .map_or(INSTANCE_INFORMATION_SCHEMA_VERSION, |published| {
+            published.version
+        });
+    let item = InventoryResultItem {
+        type_name: type_name.to_string(),
+        schema_version: schema_version.to_string(),
+        capture_time: None,
+        content_hash: None,
+        content: Vec::new(),
+    };
+    InventoryResultEntity {
+        id: None,
+        data: Some(std::collections::HashMap::from([(
+            type_name.to_string(),
+            item,
+        )])),
+    }
+}
+
 /// Refuse every aggregator of `aggregators`, and of the aggregators nested inside them,
 /// that this service cannot count over, answering how many aggregated entries the list
 /// asks for. `depth` is the nesting level the list sits at, counted from one.
@@ -392,6 +541,7 @@ fn check_aggregators(
         MAX_AGGREGATED_ENTRIES,
     };
 
+
     if depth > MAX_AGGREGATOR_NESTING {
         return Err(invalid_aggregator(INVALID_AGGREGATOR));
     }
@@ -401,15 +551,15 @@ fn check_aggregators(
         let groups = aggregator.groups.as_deref().unwrap_or_default();
         match (expression, groups.is_empty()) {
             (Some(expression), true) => {
-                if let Some(why) = aggregator_expression_rejection(expression) {
-                    return Err(invalid_aggregator(why));
+                if let Some(rejection) = aggregator_expression_rejection(expression) {
+                    return Err(aggregator_rejection(rejection));
                 }
             }
             (None, false) => {
                 for group in groups {
                     for filter in &group.filters {
-                        if let Some(why) = filter_key_rejection(&filter.key) {
-                            return Err(invalid_filter(why));
+                        if let Some(rejection) = filter_key_rejection(&filter.key) {
+                            return Err(filter_key_rejected(rejection));
                         }
                     }
                 }

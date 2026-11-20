@@ -202,7 +202,17 @@ pub const GATHER_SOFTWARE_INVENTORY: &str = r#"{
 /// The inventory query operator that asks whether the attribute is reported at all, rather
 /// than comparing its value (the modelled `InventoryQueryOperatorType` value `Exists`, the
 /// one operator the node describes' `InstancePropertyFilterOperator` does not carry).
+///
+/// It is the criterion an AGGREGATOR's groups may be defined by, and not a way of SELECTING
+/// the nodes a query reports: "The `Exists` filter must be used with aggregators"
+/// (`InventoryFilter$Type`), so a query's own filters are refused for naming it
+/// ([`EXISTS_ONLY_IN_AGGREGATOR_FILTERS`]).
 pub const OPERATOR_EXISTS: &str = "Exists";
+
+/// How this service states the [`OPERATOR_EXISTS`] operator in a query's own filters, where
+/// it belongs to an aggregator's group criteria alone.
+pub const EXISTS_ONLY_IN_AGGREGATOR_FILTERS: &str =
+    "Exists operator can only be used in Aggregator filters.";
 
 /// The key an aggregated entry carries its count under, beside the attribute value it
 /// counted: an aggregator "returns counts of inventory types based on one or more
@@ -228,11 +238,16 @@ pub const AGGREGATED_ENTITY_ID: &str = "";
 pub const INVALID_FILTER: &str =
     "The filter name isn't valid. Verify that you entered the correct name and try again.";
 
-/// How this service states an aggregator it cannot count over: an expression it supports no
-/// aggregation on, or an aggregator naming no one aggregation at all — neither an expression
-/// nor groups, or both at once. `InvalidAggregatorException`'s own documentation: "The
-/// specified aggregator isn't valid for the group type. Verify that the aggregator you
+/// How this service states an aggregator naming no one aggregation at all — neither an
+/// expression nor groups, or both at once. `InvalidAggregatorException`'s own documentation:
+/// "The specified aggregator isn't valid for the group type. Verify that the aggregator you
 /// provided is supported."
+///
+/// An expression that is not an expression, or that names an attribute its type supports no
+/// aggregation on, is a different refusal of the same class, stated by
+/// [`invalid_expression_message`] and [`not_aggregatable_message`]: those name the value or
+/// the attribute and type, which is what tells a caller WHICH of up to ten aggregators was
+/// rejected.
 pub const INVALID_AGGREGATOR: &str = "The specified aggregator isn't valid for the group type. \
                                       Verify that the aggregator you provided is supported.";
 
@@ -302,42 +317,187 @@ pub fn is_known_inventory_type(type_name: &str) -> bool {
         || super::inventory_catalog::is_valid_custom_type_name(type_name)
 }
 
+/// Why an inventory filter key cannot be served: the key's FORM, the type it names and the
+/// attribute it names are three different things to get wrong, and the type-name fault is the
+/// modelled type-name refusal rather than a filter one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilterKeyRejection {
+    /// The key is not the `<TypeName>.<AttributeName>` form at all, so it names no attribute
+    /// of any type; stated by [`invalid_filter_key_message`].
+    NotAKey(String),
+    /// The key's type-name part names no inventory type ([`is_known_inventory_type`]), which
+    /// is a type-name fault; stated by
+    /// [`super::inventory_catalog::invalid_filter_key_type_name_message`].
+    UnknownTypeName {
+        /// The type name the key carries.
+        type_name: String,
+        /// The whole key it was read from.
+        key: String,
+    },
+    /// The key names an attribute outside the schema of a type whose schema this service
+    /// holds; stated by [`undefined_attribute_message`].
+    UnknownAttribute(String),
+}
+
+/// How this service states a filter key that is not the `<TypeName>.<AttributeName>` form:
+/// the key the request submitted, the form a key has to take, and an example of one.
+///
+/// Fixed text apart from the key, which is echoed from the request.
+#[must_use]
+pub fn invalid_filter_key_message(key: &str) -> String {
+    format!(
+        "Invalid filter key {key}. The key format must be TypeName.AttributeName, such as \
+         AWS:Application.Name."
+    )
+}
+
+/// How this service states a filter key naming an attribute the inventory type it names does
+/// not define: the attribute, quoted, and that the type defines no such attribute.
+///
+/// Fixed text apart from the quoted attribute, which is echoed from the key.
+#[must_use]
+pub fn undefined_attribute_message(attribute: &str) -> String {
+    format!("Attribute name '{attribute}' is not defined for the given type")
+}
+
 /// Why an inventory filter key cannot be served, or `None` when it can.
 ///
-/// A key has to name an attribute of an inventory type: the dotted form above, over a type
-/// this service knows. For the one type whose schema this service holds, the attribute has
-/// to be one of that schema's attributes; for a type it knows and holds no schema of, any
-/// attribute name is a name that type may publish, so the filter is served — against the
-/// nothing that type has collected — rather than refused.
-pub fn filter_key_rejection(key: &str) -> Option<&'static str> {
-    let Some((type_name, attribute)) = split_qualified_attribute(key) else {
-        return Some(INVALID_FILTER);
-    };
+/// A key has to name an attribute of an inventory type: the inventory type up to the first
+/// `.` and the attribute of it after that, so a value missing either half is not a key at all
+/// and is quoted back as one. A key that IS that form has to name a type this service knows;
+/// for the one type whose schema this service holds, the attribute has to be one of that
+/// schema's attributes; for a type it knows and holds no schema of, any attribute name is a
+/// name that type may publish, so the filter is served — against the nothing that type has
+/// collected — rather than refused.
+pub fn filter_key_rejection(key: &str) -> Option<FilterKeyRejection> {
+    let (type_name, attribute) = key.split_once('.').unwrap_or((key, ""));
+    if type_name.is_empty() || attribute.is_empty() {
+        return Some(FilterKeyRejection::NotAKey(key.to_string()));
+    }
     if !is_known_inventory_type(type_name) {
-        return Some(INVALID_FILTER);
+        return Some(FilterKeyRejection::UnknownTypeName {
+            type_name: type_name.to_string(),
+            key: key.to_string(),
+        });
     }
     let unknown_attribute = type_name == INVENTORY_TYPE_INSTANCE_INFORMATION
         && !INSTANCE_INFORMATION_ATTRIBUTES.contains(&attribute);
-    unknown_attribute.then_some(INVALID_FILTER)
+    unknown_attribute.then(|| FilterKeyRejection::UnknownAttribute(attribute.to_string()))
+}
+
+/// The attributes an aggregator may count over for `type_name`: the published aggregatable
+/// attributes of the one type Systems Manager documents as supporting aggregation
+/// ([`INSTANCE_INFORMATION_AGGREGATABLE_ATTRIBUTES`]), and none for every other type — a
+/// type this service reports no aggregatable schema for ([`reported_schemas`] with
+/// `aggregatable_only`) supports no aggregation an expression could name.
+#[must_use]
+pub fn aggregatable_attributes(type_name: &str) -> &'static [&'static str] {
+    if type_name == INVENTORY_TYPE_INSTANCE_INFORMATION {
+        INSTANCE_INFORMATION_AGGREGATABLE_ATTRIBUTES
+    } else {
+        &[]
+    }
+}
+
+/// Why an aggregator expression cannot be counted over: the three faults are three distinct
+/// refusals, because the type name an expression carries and the attribute it names are two
+/// different things to get wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AggregatorRejection {
+    /// The type-name part of the expression names no inventory type at all
+    /// ([`is_known_inventory_type`]), which is a type-name fault rather than an aggregation
+    /// one: it is stated by [`super::inventory_catalog::invalid_type_name_message`].
+    UnknownTypeName(String),
+    /// The expression names an attribute its type supports no aggregation on
+    /// ([`aggregatable_attributes`]), stated by [`not_aggregatable_message`].
+    AttributeNotAggregatable {
+        /// The inventory type the expression names.
+        type_name: String,
+        /// The attribute of it the expression asks to count over.
+        attribute: String,
+    },
+    /// The expression is not the `<TypeName>.<AttributeName>` form at all, so it names no
+    /// aggregation this service could look up; stated by [`invalid_expression_message`].
+    NotAnExpression(String),
+}
+
+/// How this service states a value that is not an aggregator expression: the expression the
+/// request submitted, which is the only variable part.
+#[must_use]
+pub fn invalid_expression_message(expression: &str) -> String {
+    format!("Invalid aggregator expression: {expression}.")
+}
+
+/// How this service states an expression naming an attribute its inventory type supports no
+/// aggregation on: the attribute and the type the request named, and the aggregation that is
+/// not supported for them.
+///
+/// Fixed text apart from the two names, which are echoed from the aggregator's own
+/// expression.
+#[must_use]
+pub fn not_aggregatable_message(type_name: &str, attribute: &str) -> String {
+    format!("Attribute {attribute} of type {type_name} does not support count aggregator.")
 }
 
 /// Why an aggregator expression cannot be counted over, or `None` when it can.
 ///
 /// The expression is "the inventory type and attribute name for aggregation"
-/// (`InventoryAggregator$Expression`), so it carries the same dotted form a filter key
-/// does — and the attribute has to be one the type supports aggregation ON, which for the
-/// one type whose aggregatable attributes this service knows is
-/// [`INSTANCE_INFORMATION_AGGREGATABLE_ATTRIBUTES`].
-pub fn aggregator_expression_rejection(expression: &str) -> Option<&'static str> {
-    let Some((type_name, attribute)) = split_qualified_attribute(expression) else {
-        return Some(INVALID_AGGREGATOR);
-    };
-    if !is_known_inventory_type(type_name) {
-        return Some(INVALID_AGGREGATOR);
+/// (`InventoryAggregator$Expression`): the inventory type up to the first `.` and the
+/// attribute of it after that, so a value that is not that form names no aggregation to look
+/// up at all. A value that IS that form carries a type name, held to the rule every inventory
+/// type name of a request is held to ([`is_known_inventory_type`]), and an attribute, held to
+/// the aggregatable attributes that type publishes ([`aggregatable_attributes`]) — three
+/// faults, reported as three refusals.
+pub fn aggregator_expression_rejection(expression: &str) -> Option<AggregatorRejection> {
+    // A type name carries no `.` (a published name has none and a caller's own name is
+    // alphanumeric past its prefix), so the first one separates the two parts.
+    let (type_name, attribute) = expression.split_once('.').unwrap_or((expression, ""));
+    if type_name.is_empty() || attribute.is_empty() {
+        return Some(AggregatorRejection::NotAnExpression(expression.to_string()));
     }
-    let not_aggregatable = type_name == INVENTORY_TYPE_INSTANCE_INFORMATION
-        && !INSTANCE_INFORMATION_AGGREGATABLE_ATTRIBUTES.contains(&attribute);
-    not_aggregatable.then_some(INVALID_AGGREGATOR)
+    if !is_known_inventory_type(type_name) {
+        return Some(AggregatorRejection::UnknownTypeName(type_name.to_string()));
+    }
+    if aggregatable_attributes(type_name).contains(&attribute) {
+        return None;
+    }
+    Some(AggregatorRejection::AttributeNotAggregatable {
+        type_name: type_name.to_string(),
+        attribute: attribute.to_string(),
+    })
+}
+
+/// The inventory types a cross-node inventory query can PROJECT, which is what a
+/// `ResultAttributes` type name may name: the default type every managed node has
+/// ("Valid value: `AWS:InstanceInformation`. Default Value: `AWS:InstanceInformation`" —
+/// `ResultAttribute$TypeName`) and the patch summary of its last patch operation, the two
+/// names the service's own refusal below lists.
+///
+/// It is NARROWER than the inventory types that EXIST ([`is_known_inventory_type`]): a type
+/// outside this set is a real inventory type a read of one node's entries reports
+/// (`ListInventoryEntries`) and no type this query projects, which is what
+/// `InvalidResultAttributeException` reports ([`unsupported_result_type_message`]).
+pub const SUPPORTED_RESULT_TYPE_NAMES: &[&str] =
+    &[INVENTORY_TYPE_INSTANCE_INFORMATION, "AWS:PatchSummary"];
+
+/// Whether `type_name` names a type this query projects ([`SUPPORTED_RESULT_TYPE_NAMES`]).
+#[must_use]
+pub fn is_supported_result_type(type_name: &str) -> bool {
+    SUPPORTED_RESULT_TYPE_NAMES.contains(&type_name)
+}
+
+/// How this service states a `ResultAttributes` type name it cannot project: the name the
+/// caller submitted, the names it may name instead, and the one it is served when it names
+/// none.
+///
+/// Fixed text apart from the submitted name, which is echoed from the request.
+#[must_use]
+pub fn unsupported_result_type_message(type_name: &str) -> String {
+    format!(
+        "Result type name {type_name} is not supported. Supported type names are: {}. Default \
+         result type name is {INVENTORY_TYPE_INSTANCE_INFORMATION}.",
+        SUPPORTED_RESULT_TYPE_NAMES.join(", ")
+    )
 }
 
 /// The published bounds of a schema read's page (`GetInventorySchemaMaxResults`, range
@@ -389,8 +549,8 @@ pub fn reported_schemas(
         // The attributes an aggregator may count over, for the one type whose aggregatable
         // attributes this service knows; a type it knows none of supports no aggregation it
         // could report, so an aggregation read leaves that type out.
-        let aggregatable = (published.type_name == INVENTORY_TYPE_INSTANCE_INFORMATION)
-            .then_some(INSTANCE_INFORMATION_AGGREGATABLE_ATTRIBUTES);
+        let aggregatable =
+            Some(aggregatable_attributes(published.type_name)).filter(|set| !set.is_empty());
         let attributes = if aggregatable_only {
             match aggregatable {
                 None => continue,

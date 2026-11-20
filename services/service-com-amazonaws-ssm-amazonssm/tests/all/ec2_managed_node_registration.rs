@@ -383,7 +383,8 @@ pub(crate) async fn node_when_registered(
 }
 
 /// The `AWS:InstanceInformation` content `GetInventory` reports for `instance_id`, or `None`
-/// when it reports no entity for it.
+/// when it reports no row for it — a query that selects no node reports the queried type
+/// holding an empty row set, which is no inventory of that instance.
 async fn inventory(router: &MultiServiceRouter, region: &str, instance_id: &str) -> Option<Value> {
     let (status, body) = call_in_region(
         router,
@@ -403,8 +404,9 @@ async fn inventory(router: &MultiServiceRouter, region: &str, instance_id: &str)
     );
     body["Entities"]
         .as_array()
-        .and_then(|entities| entities.first().cloned())
-        .map(|entity| entity["Data"][INVENTORY_TYPE]["Content"][0].clone())
+        .and_then(|entities| entities.first())
+        .and_then(|entity| entity["Data"][INVENTORY_TYPE]["Content"].as_array())
+        .and_then(|content| content.first().cloned())
 }
 
 /// One row of the registration table: an instance launched a given way, and whether it
