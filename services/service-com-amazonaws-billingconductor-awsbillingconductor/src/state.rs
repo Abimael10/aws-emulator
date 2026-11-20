@@ -3132,6 +3132,25 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
         }
     }
 
+    /// Forget every `ClientToken` entry that named `arn`, so a retry cannot replay into
+    /// the ARN of a resource that no longer exists.
+    ///
+    /// The removal half of the pair [`Self::record_idempotent_arn`] writes: every entry
+    /// whose value is the removed ARN goes, and `idempotency_order` is pruned back to the
+    /// keys the map still holds, which is what keeps that deque exactly "the keys of
+    /// `idempotency_tokens` in insertion order" — otherwise a key whose entry is gone
+    /// would make the cap evict a token that is still live. Written ONCE, for the same
+    /// reason the insert half is: every removal of this store
+    /// ([`Self::remove_billing_group`], [`Self::remove_custom_line_item`],
+    /// [`Self::remove_pricing_rule`], [`Self::remove_pricing_plan`], and any removal added
+    /// later) reclaims its tokens through here, so the two statements cannot drift apart.
+    fn release_idempotent_arns(&mut self, arn: &str) {
+        self.idempotency_tokens.retain(|_, held| held != arn);
+        let remaining = &self.idempotency_tokens;
+        self.idempotency_order
+            .retain(|key| remaining.contains_key(key));
+    }
+
     /// The preference recorded for the billing transfer `arn` names, or `None` when no
     /// call ever set one — the case `GetBillingTransferPreference` reports the
     /// documented default and an empty `LastModifiedTime` for.
@@ -3578,10 +3597,7 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
         // ([`Self::remove_custom_line_item`]); an item still applying in an earlier
         // period is still a record a replay may resolve to, so it keeps its token. What
         // is left to reclaim here is the group's own.
-        self.idempotency_tokens.retain(|_, arn| arn != group_arn);
-        let remaining = &self.idempotency_tokens;
-        self.idempotency_order
-            .retain(|key| remaining.contains_key(key));
+        self.release_idempotent_arns(group_arn);
 
         Some(removed)
     }
@@ -3649,10 +3665,7 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
                 .retain(|association| association.arn != item_arn);
         }
 
-        self.idempotency_tokens.retain(|_, arn| arn != item_arn);
-        let remaining = &self.idempotency_tokens;
-        self.idempotency_order
-            .retain(|key| remaining.contains_key(key));
+        self.release_idempotent_arns(item_arn);
 
         Some(removed)
     }
@@ -3858,10 +3871,7 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
         let removed = self.pricing_rules.remove(rule_arn)?;
         self.pricing_rule_names.remove(&removed.name);
 
-        self.idempotency_tokens.retain(|_, arn| arn != rule_arn);
-        let remaining = &self.idempotency_tokens;
-        self.idempotency_order
-            .retain(|key| remaining.contains_key(key));
+        self.release_idempotent_arns(rule_arn);
 
         Some(removed)
     }
@@ -3877,10 +3887,7 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
         let removed = self.pricing_plans.remove(plan_arn)?;
         self.pricing_plan_names.remove(&removed.name);
 
-        self.idempotency_tokens.retain(|_, arn| arn != plan_arn);
-        let remaining = &self.idempotency_tokens;
-        self.idempotency_order
-            .retain(|key| remaining.contains_key(key));
+        self.release_idempotent_arns(plan_arn);
 
         Some(removed)
     }
