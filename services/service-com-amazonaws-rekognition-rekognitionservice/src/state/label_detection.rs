@@ -22,12 +22,13 @@
 //!
 //! * [`FACE_LABEL`] — one per face the detector measured, carrying an `Instance` with the
 //!   box it measured for that face and the agreement score it measured for it.
-//! * [`PERSON_LABEL`] — the ancestor of that label. The operation documents that
-//!   "DetectLabels returns a hierarchical taxonomy of detected labels … The response
-//!   includes the all ancestors for a label, where every ancestor is a unique label", so a
-//!   measured face is reported together with the entity it is part of. It carries NO
-//!   `Instance`: where the person extends in the image is not something the face detector
-//!   measured, and a box the size of the face would not be that person's box.
+//! * [`HEAD_LABEL`] and [`PERSON_LABEL`] — the ancestors the published taxonomy puts above
+//!   that label. The operation documents that "DetectLabels returns a hierarchical taxonomy
+//!   of detected labels … The response includes the all ancestors for a label, where every
+//!   ancestor is a unique label", so a measured face is reported together with the entities
+//!   it is part of. Neither carries an `Instance`: where a head or a person extends in the
+//!   image is not something the face detector measured, and a box the size of the face would
+//!   not be either one's box.
 //! * A COLOUR the frame carries, which is the one other thing about an image's content that
 //!   is measured rather than classified. Its name is the simplified colour name this
 //!   model's own `DominantColor.SimplifiedColor` member is defined over — "one of 12
@@ -35,17 +36,19 @@
 //!   Every pixel is classified into one of those twelve families, and a family covering at
 //!   least [`MIN_COLOR_SHARE`] of the frame is reported, with the confidence
 //!   [`color_confidence`] gives for how much of the frame it covers. A colour is not one of
-//!   the "common object labels" a box is returned for, so no `Instance` locates one.
-//! * [`MONOCHROME_LABEL`] — a frame essentially ONE colour: a composition the pixels
-//!   measure directly, reported when a single colour family covers at least
-//!   [`MONOCHROME_SHARE`] of them, with the share it covers as its confidence.
+//!   the "common object labels" a box is returned for, so no `Instance` locates one. How
+//!   much of the frame ONE colour covers is already what that label's own confidence
+//!   reports, so a frame of essentially one colour is not reported a SECOND time under a
+//!   composition name: `Labels` carries one label per thing measured, not one per way of
+//!   restating a measurement.
 //!
 //! An image carrying no measured entity and no measurable colour is answered with an EMPTY
 //! label list — the answer for an image in which nothing was found — and never with a
 //! refusal: a refusal here is reserved for an image that could not be read at all. Every
-//! label's `Categories` and `Aliases` stay absent: both come from the taxonomy a trained
-//! model is published with, which this process does not hold, and a category or an alias
-//! invented for a label would be a value nothing established.
+//! label reported carries all six members `Label` models, built in one place
+//! ([`super::label_taxonomy`]): the category the published taxonomy puts it in, its
+//! ancestors, the instances located for it, and the EMPTY `Aliases` list this emulator has
+//! nothing to report in.
 //!
 //! ## What the pixels themselves measure
 //!
@@ -82,10 +85,11 @@ use ::image::DynamicImage;
 
 use super::face_detection;
 use super::image_source::{self, UnreadableImage};
+use super::label_taxonomy::{self, COLORS_CATEGORY, PERSON_DESCRIPTION_CATEGORY};
 use crate::ops::types::{
     BoundingBox, DetectLabelsImageBackground, DetectLabelsImageForeground,
     DetectLabelsImageProperties, DetectLabelsImageQuality, DominantColor, FaceDetail,
-    GeneralLabelsSettings, Image, Instance, Label, Parent,
+    GeneralLabelsSettings, Image, Instance, Label,
 };
 
 /// The confidence floor `DetectLabels` narrows to when the request names none: "if
@@ -109,15 +113,11 @@ pub const DEFAULT_MAX_DOMINANT_COLORS: usize = 10;
 pub const GENERAL_LABELS_FEATURE: &str = "GENERAL_LABELS";
 pub const IMAGE_PROPERTIES_FEATURE: &str = "IMAGE_PROPERTIES";
 
-/// The entity label a measured face is reported as, and its one ancestor in the taxonomy.
+/// The entity label a measured face is reported as, and the ancestors the published
+/// taxonomy puts above it: a face is part of a head, which is part of a person.
 pub const FACE_LABEL: &str = "Face";
+pub const HEAD_LABEL: &str = "Head";
 pub const PERSON_LABEL: &str = "Person";
-
-/// The label a frame of essentially one colour carries.
-pub const MONOCHROME_LABEL: &str = "Monochrome";
-
-/// How much of a frame one colour family must cover for the frame to be of that one colour.
-pub const MONOCHROME_SHARE: f64 = 0.95;
 
 /// The version of the label detection model that produced an answer, which `DetectLabels`
 /// reports in `LabelModelVersion`. It is an opaque string on the wire; this detector is one
@@ -294,6 +294,13 @@ pub fn analysed_image(
 /// "The service returns the specified number of highest confidence labels", so the cap is
 /// applied to labels ordered by descending confidence; labels of equal confidence keep
 /// detection order, which puts a measured label before the ancestor it brought with it.
+///
+/// A `MaxLabels` of zero asks for no cap rather than for no label: "the default and upper
+/// limit is 1000 labels", and zero is how this operation's own settings spell a cap the
+/// request did not name — the sibling cap `Settings.ImageProperties.MaxDominantColors`
+/// carries `default: 0` beside its own documented default of ten. The recorded answer for a
+/// request this emulator reported no label at all for carries a label, so zero is not a cap
+/// of none.
 pub fn narrowed(
     labels: Vec<Label>,
     settings: Option<&GeneralLabelsSettings>,
@@ -315,6 +322,7 @@ pub fn narrowed(
     });
     let most = max_labels
         .and_then(|requested| usize::try_from(requested).ok())
+        .filter(|requested| *requested > 0)
         .unwrap_or(MAX_LABELS)
         .min(MAX_LABELS);
     kept.truncate(most);
@@ -326,9 +334,7 @@ pub fn narrowed(
 /// "The exact label names or label categories must be supplied", so a filter is compared
 /// against the label's own name and categories as supplied. An inclusion filter list that
 /// names anything narrows the answer to what it names; an exclusion filter list removes what
-/// it names. No label this detector reports carries a category (see this module's docs), so
-/// a category inclusion filter admits none of them and a category exclusion filter removes
-/// none of them.
+/// it names.
 fn admitted(label: &Label, settings: Option<&GeneralLabelsSettings>) -> bool {
     let Some(settings) = settings else {
         return true;
@@ -373,8 +379,9 @@ fn excluded(filters: &Option<Vec<String>>, values: &[&str], inclusive: bool) -> 
 }
 
 /// The labels of the entities measured in one frame: one [`FACE_LABEL`] carrying an instance
-/// per measured face, and the [`PERSON_LABEL`] ancestor it brings with it. An empty list
-/// when nothing was measured.
+/// per measured face, and the ancestor labels it brings with it — "the response includes all
+/// ancestor labels", "where every ancestor is a unique label". An empty list when nothing
+/// was measured.
 ///
 /// `colors`, when the request asked for image properties, is the frame and the colour cap
 /// each instance's own `DominantColors` are measured over.
@@ -401,32 +408,35 @@ fn detected_labels(faces: &[FaceDetail], colors: Option<(&Plane, usize)>) -> Vec
         .filter_map(|face| face.confidence)
         .fold(0.0_f32, f32::max);
     vec![
-        Label {
-            name: Some(FACE_LABEL.to_string()),
-            confidence: Some(confidence),
-            instances: Some(instances),
-            parents: Some(vec![Parent {
-                name: Some(PERSON_LABEL.to_string()),
-            }]),
-            // A category or an alias comes from a published taxonomy this process does not
-            // hold: see this module's docs.
-            ..Label::default()
-        },
-        Label {
-            name: Some(PERSON_LABEL.to_string()),
-            confidence: Some(confidence),
-            // Where the person extends is not what the face detector measured, so this
-            // label locates no instance; its ancestors are none, being the root of the two.
-            instances: None,
-            parents: Some(Vec::new()),
-            ..Label::default()
-        },
+        label_taxonomy::reported_label(
+            FACE_LABEL,
+            confidence,
+            PERSON_DESCRIPTION_CATEGORY,
+            &[HEAD_LABEL, PERSON_LABEL],
+            instances,
+        ),
+        // Each ancestor of the measured label is reported as a label of its own, and where
+        // a head or a person extends is not what the face detector measured, so neither
+        // locates an instance.
+        label_taxonomy::reported_label(
+            HEAD_LABEL,
+            confidence,
+            PERSON_DESCRIPTION_CATEGORY,
+            &[PERSON_LABEL],
+            Vec::new(),
+        ),
+        label_taxonomy::reported_label(
+            PERSON_LABEL,
+            confidence,
+            PERSON_DESCRIPTION_CATEGORY,
+            &[],
+            Vec::new(),
+        ),
     ]
 }
 
 /// The colours one frame carries, as labels of it: one per simplified colour family
-/// covering at least [`MIN_COLOR_SHARE`] of the pixels, most covered first, and the
-/// composition they add up to where the frame is essentially one colour.
+/// covering at least [`MIN_COLOR_SHARE`] of the pixels, most covered first.
 fn color_labels(plane: &Plane) -> Vec<Label> {
     let pixels = plane.pixels();
     if pixels == 0 {
@@ -446,33 +456,20 @@ fn color_labels(plane: &Plane) -> Vec<Label> {
     // Most covered first; two families covering equally much are ordered by the family, so
     // one frame's answer is one answer.
     families.sort_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
-    let monochrome = families
-        .first()
-        .map(|(_, share)| *share)
-        .filter(|share| *share >= MONOCHROME_SHARE);
-    let mut labels: Vec<Label> = families
+    families
         .into_iter()
-        .map(|(family, share)| Label {
-            name: Some(color_label_name(family)),
-            confidence: Some(color_confidence(share)),
+        .map(|(family, share)| {
             // A colour is not one of the "common object labels" a bounding box is returned
             // for, and it has no ancestor in the colour vocabulary.
-            instances: None,
-            parents: Some(Vec::new()),
-            ..Label::default()
+            label_taxonomy::reported_label(
+                &color_label_name(family),
+                color_confidence(share),
+                COLORS_CATEGORY,
+                &[],
+                Vec::new(),
+            )
         })
-        .collect();
-    // What the frame LOOKS like as a whole comes after the colours it is made of.
-    if let Some(share) = monochrome {
-        labels.push(Label {
-            name: Some(MONOCHROME_LABEL.to_string()),
-            confidence: Some((share * 100.0).clamp(0.0, 100.0) as f32),
-            instances: None,
-            parents: Some(Vec::new()),
-            ..Label::default()
-        });
-    }
-    labels
+        .collect()
 }
 
 /// The label name of a colour family: its simplified colour name, capitalised the way a

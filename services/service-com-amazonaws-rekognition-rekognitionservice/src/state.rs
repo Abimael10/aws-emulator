@@ -42,7 +42,8 @@
 //!
 //! The same rule governs the LABELS of a submitted image in [`label_detection`]: no
 //! classifier over a label taxonomy runs here, so the entities it reports are the ones the
-//! same geometric detector measured — a face, and the person it is part of — while the
+//! same geometric detector measured — a face, and the head and the person it is part of —
+//! while the
 //! properties of the image itself (its quality, its dominant colours and the two sides of
 //! its foreground/background split) are measured off the decoded pixels and reported in
 //! full.
@@ -82,6 +83,7 @@ pub mod face_detection;
 pub mod idempotency;
 pub mod image_source;
 pub mod label_detection;
+pub mod label_taxonomy;
 pub mod modeled_error;
 pub mod project_policies;
 pub mod video_analysis;

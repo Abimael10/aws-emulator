@@ -3,8 +3,11 @@
 //! Where the BYTES of a submitted `Image` come from, and why one cannot be read.
 //!
 //! An `Image` carries its content "either as base64-encoded image bytes or as a reference
-//! to an image in an Amazon S3 bucket" (`DetectFaces`' own documentation), so half of this
-//! service's image surface is an object of the object store — and this emulator holds an
+//! to an image in an Amazon S3 bucket" (`DetectFaces`' own documentation) — EITHER, so the
+//! two members are ALTERNATIVES: an `Image` naming both, like one naming neither, identifies
+//! no single image to analyse and is refused for the parameter it violated before a byte is
+//! read. Half of this service's image surface is therefore an object of the object store —
+//! and this emulator holds an
 //! Amazon S3 of its own, reached the way any emulated service reaches another: through the
 //! operation callback ([`smithy_server_runtime::OperationContext::callback`]), which routes
 //! IN PROCESS, with no socket, no outbound request and no host resolution. An image a
@@ -45,6 +48,15 @@ pub const UNREADABLE_OBJECT_MESSAGE: &str =
 pub const MISSING_IMAGE_CONTENT_MESSAGE: &str =
     "Requested image should either contain bytes or s3 object.";
 
+/// The message an `Image` carrying BOTH forms is refused with, as AWS words it for that
+/// error class: fixed text that interpolates nothing — neither a request value nor a member
+/// name — so it is the same for every image operation. The shape "provides the input image
+/// either as bytes or an S3 object" (`smithy_query(query="shape",shape="Image")`), so a
+/// request naming both violates the constraint on the parameter; the model marks both
+/// members optional, so such a request reaches the handler and is refused there.
+pub const CONFLICTING_IMAGE_CONTENT_MESSAGE: &str =
+    "Cannot provide both S3 Location and Image Bytes.";
+
 /// The message `InvalidImageFormatException` is stated with — the error AWS answers for
 /// bytes that are not an image in a format it reads.
 pub const INVALID_IMAGE_FORMAT_MESSAGE: &str = "Request has invalid image format";
@@ -80,8 +92,8 @@ pub enum UnreadableImage {
     /// The image is an S3 object whose bytes this emulator cannot obtain.
     /// Answered with `InvalidS3ObjectException`.
     S3Unreadable(String),
-    /// The request does not identify an image at all.
-    /// Answered with `InvalidParameterException`.
+    /// The request does not identify exactly one image: it named neither content member, or
+    /// it named both. Answered with `InvalidParameterException`.
     InvalidParameter(String),
     /// The analysis did not complete — a panic or a cancellation on the blocking pool. This
     /// says nothing about the image, so it is answered as the server fault it is, with
@@ -118,6 +130,15 @@ pub async fn image_bytes(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     image: &Image,
 ) -> Result<Vec<u8>, UnreadableImage> {
+    // The two content members are ALTERNATIVES, not a pair: an `Image` provides its content
+    // "either as bytes or an S3 object". A request naming both identifies no single image to
+    // analyse, so it is refused for the parameter it violated before a byte is read — the
+    // mirror image of the request that named neither, below.
+    if image.bytes.is_some() && image.s3_object.is_some() {
+        return Err(UnreadableImage::InvalidParameter(
+            CONFLICTING_IMAGE_CONTENT_MESSAGE.to_string(),
+        ));
+    }
     if let Some(bytes) = image.bytes.as_ref() {
         if !bytes.is_empty() {
             return Ok(bytes.clone());
@@ -125,11 +146,8 @@ pub async fn image_bytes(
         // `Bytes` present and empty IS inline content, and none of it is an image — a
         // different thing from a request that identified no content at all. The model's own
         // `ImageBlob` length constraint refuses it at the boundary, so this is the answer
-        // for a request that somehow gets past that; an S3 object named beside it is still
-        // read.
-        if image.s3_object.is_none() {
-            return Err(UnreadableImage::invalid_format());
-        }
+        // for a request that somehow gets past that.
+        return Err(UnreadableImage::invalid_format());
     }
     let Some(object) = image.s3_object.as_ref() else {
         return Err(UnreadableImage::InvalidParameter(

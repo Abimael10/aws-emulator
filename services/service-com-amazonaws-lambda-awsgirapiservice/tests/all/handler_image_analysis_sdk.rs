@@ -98,9 +98,6 @@ const BLUE: [u8; 3] = [0, 0, 255];
 const RED_LABEL: &str = "Red";
 const BLUE_LABEL: &str = "Blue";
 
-/// The composition label a frame that is essentially ONE colour also carries.
-const MONOCHROME_LABEL: &str = "Monochrome";
-
 /// The version of the label detection model the service answers with, which is the member's
 /// own documentation: "version number of the label detection model that was used to detect
 /// labels".
@@ -769,7 +766,8 @@ async fn a_node_handler_analyses_an_image_through_the_sdk_the_runtime_supplies()
         );
     }
 
-    // The frame drawn in ONE colour: that colour, and the composition one colour adds up to.
+    // The frame drawn in ONE colour: that colour, and nothing else — one label per thing
+    // measured in the frame.
     for case in [
         "one colour, staged as PNG",
         "the same frame staged in the other format the service reads",
@@ -777,9 +775,8 @@ async fn a_node_handler_analyses_an_image_through_the_sdk_the_runtime_supplies()
         let answer = report[case]["answer"].clone();
         assert_eq!(
             label_names(&answer),
-            vec![RED_LABEL.to_string(), MONOCHROME_LABEL.to_string()],
-            "case {case:?}: expected the colour drawn and the composition it adds up to, got \
-             {answer}"
+            vec![RED_LABEL.to_string()],
+            "case {case:?}: expected the one colour drawn and nothing else, got {answer}"
         );
         assert_eq!(
             answer["LabelModelVersion"].as_str(),
@@ -788,8 +785,8 @@ async fn a_node_handler_analyses_an_image_through_the_sdk_the_runtime_supplies()
         );
     }
 
-    // Two colours, half the frame each: both, and no composition, because neither is the whole
-    // frame — and what the handler read back is what this service answers a CLIENT for the same
+    // Two colours, half the frame each: both of them, one label per colour measured — and what
+    // the handler read back is what this service answers a CLIENT for the same
     // image.
     let case_two = "two colours, neither of them the whole frame";
     let two = report[case_two]["answer"].clone();
@@ -981,8 +978,8 @@ async fn a_python_handler_analyses_an_image_through_the_sdk_the_runtime_supplies
     );
     assert_eq!(
         payload["recorded"],
-        json!([RED_LABEL, MONOCHROME_LABEL]),
-        "case {case:?}: expected the colour drawn and the composition it adds up to, got {payload}"
+        json!([RED_LABEL]),
+        "case {case:?}: expected the one colour drawn and nothing else, got {payload}"
     );
     assert_eq!(
         payload["model_version"].as_str(),
@@ -1023,7 +1020,7 @@ async fn a_python_handler_analyses_an_image_through_the_sdk_the_runtime_supplies
     .await;
     assert_eq!(
         held["Item"]["labels"]["SS"],
-        json!([RED_LABEL, MONOCHROME_LABEL]),
+        json!([RED_LABEL]),
         "case {case:?}: expected the measured labels recorded under the object's key, got {held}"
     );
 }
@@ -1132,7 +1129,7 @@ const UPLOADS: &[Upload] = &[
         key: FLAT_PNG_KEY,
         run: "run-1",
         stored_run: "run-1",
-        labels: &[RED_LABEL, MONOCHROME_LABEL],
+        labels: &[RED_LABEL],
         caught: None,
     },
     Upload {
@@ -1140,7 +1137,7 @@ const UPLOADS: &[Upload] = &[
         key: FLAT_PNG_KEY,
         run: "run-2",
         stored_run: "run-1",
-        labels: &[RED_LABEL, MONOCHROME_LABEL],
+        labels: &[RED_LABEL],
         caught: Some(CONDITION_FAILED),
     },
     Upload {
