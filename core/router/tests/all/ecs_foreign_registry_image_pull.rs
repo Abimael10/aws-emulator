@@ -312,7 +312,17 @@ async fn run(
 ) -> String {
     let mut definition = json!({
         "family": family,
-        "containerDefinitions": [{ "name": CONTAINER, "image": image, "memory": 128 }],
+        // A program that ENDS: a task is stopped as one whose essential container exited
+        // only once that container really exits (`Container$exitCode` is "the exit code
+        // returned from the container"), so a row that reads the stop of a task that RAN
+        // gives its container something to run to the end. What the program does is beside
+        // the point here — every row is about the image fetch that precedes it.
+        "containerDefinitions": [{
+            "name": CONTAINER,
+            "image": image,
+            "memory": 128,
+            "command": ["sh", "-c", "exit 0"],
+        }],
     });
     if let Some(role) = execution_role {
         definition["executionRoleArn"] = json!(role);

@@ -550,7 +550,11 @@ const ROWS: &[Row] = &[
         family: "fargatepair",
         launch_type: "FARGATE",
         network_mode: "awsvpc",
-        command: None,
+        // A task reaches `STOPPED` when an essential container of it EXITS — that exit is
+        // what the stop states (`Container$exitCode` is "the exit code returned from the
+        // container") — so every row of a WHOLE run gives its container something to run to
+        // the end. What this row is about is the COUNT one call placed.
+        command: Some(&["sh", "-c", "exit 0"]),
         count: 2,
     },
     Row {

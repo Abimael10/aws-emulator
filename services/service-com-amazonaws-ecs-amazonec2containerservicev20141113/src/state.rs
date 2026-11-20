@@ -1339,9 +1339,9 @@ pub const STOP_CODE_ESSENTIAL_CONTAINER_EXITED: &str = "EssentialContainerExited
 /// ECS's own words for a task whose essential container has exited.
 pub const ESSENTIAL_CONTAINER_EXITED_REASON: &str = "Essential container in task exited";
 
-/// How long after it starts a STANDALONE task's containers have finished the work they
-/// were placed to do, after which Amazon ECS stops the task
-/// ([`TaskRecord::finish_work`]).
+/// How long after it starts a STANDALONE task may be reported as having finished the work
+/// it was placed to do, once an essential container of it has exited — after which Amazon
+/// ECS stops the task ([`TaskRecord::finish_work`]).
 ///
 /// A task placed on its own is one run of a workload — nothing replaces it when it ends,
 /// which is why "if you have an application that runs on a schedule or that runs to
@@ -1350,6 +1350,13 @@ pub const ESSENTIAL_CONTAINER_EXITED_REASON: &str = "Essential container in task
 /// its containers' work finishes and the task reaches the terminal `STOPPED` status. A
 /// task a service's scheduler placed takes no such instant: that scheduler keeps the
 /// service's desired count in place, so the service always holds a task that is running.
+///
+/// What this span is NOT is a reason to stop a task: the stop belongs to the EXIT of an
+/// essential container ([`TaskRecord::essential_container_exited`]), and a task none of
+/// whose containers produced an exit status goes on running — exactly as a service's task
+/// whose program nothing performed does. Within the span a container that exits at once
+/// still leaves the task `RUNNING` for the rest of it, and past the span an exit stops the
+/// task at the instant it happens.
 ///
 /// How long the work takes is the workload's own business and AWS publishes no duration
 /// for it, so the span is CHOSEN: this emulator's own transient spans are three seconds, which
@@ -4311,10 +4318,13 @@ pub struct TaskRecord {
     /// registration of another revision does not change what the pull of an already
     /// launched task was decided against.
     pub execution_role_arn: Option<String>,
-    /// When the work this task's containers were placed to do is finished, after which the
-    /// task stops ([`Self::finish_work`]) — set when the task STARTS, and `None` for a
-    /// task that has not started, for one that is already on its way out, and for a task a
-    /// service's scheduler placed (see [`CONTAINER_WORK_SPAN`]).
+    /// The earliest instant at which the work this task's containers were placed to do can
+    /// be reported finished, after which a task whose essential container has EXITED stops
+    /// ([`Self::finish_work`]) — set when the task STARTS, and `None` for a task that has
+    /// not started, for one that is already on its way out, for a task a service's
+    /// scheduler placed, and for one whose instant has passed with no essential container
+    /// having exited, whose stop is then earned by the exit itself whenever it happens (see
+    /// [`CONTAINER_WORK_SPAN`]).
     pub work_done_due_at: Option<SystemTime>,
     /// What this task's containers PRESENT on the AWS calls their programs make: the session
     /// of the task role this task runs under ([`settle_task_role_credentials`]), and `None`
@@ -4564,6 +4574,23 @@ impl TaskRecord {
         self.last_status == STATUS_RUNNING && self.desired_status == STATUS_RUNNING
     }
 
+    /// Whether an ESSENTIAL container of this task has EXITED: one that reports an
+    /// `exitCode`, which is "the exit code returned from the container"
+    /// (`Container$exitCode`) and is therefore recorded only for a container process that
+    /// really ended — by the run this emulator performed for it
+    /// ([`container_runtime`]) or by the agent's own report of it
+    /// (`SubmitContainerStateChange`).
+    ///
+    /// What the stop [`STOP_CODE_ESSENTIAL_CONTAINER_EXITED`] states ("The task stopped
+    /// because an essential container exited"), so it is what that stop WAITS for: a task no
+    /// container of which produced an exit status has had no container exit, whatever of its
+    /// containers' programs this emulator was unable to perform.
+    pub fn essential_container_exited(&self) -> bool {
+        self.containers
+            .iter()
+            .any(|container| container.essential && container.exit_code.is_some())
+    }
+
     /// Whether an ESSENTIAL container of this task is still performing its program, given
     /// the container ARNs whose runs are still going (`running`).
     ///
@@ -4580,8 +4607,12 @@ impl TaskRecord {
             .any(|container| running.contains(&container.container_arn))
     }
 
-    /// Stop this task because the work its containers were placed to do is finished, as of
-    /// `at`.
+    /// Stop this task because an ESSENTIAL container of it has exited, as of `at`, which is
+    /// how the work a standalone task was placed to do ends.
+    ///
+    /// Only ever reached for a task an essential container of which really exited
+    /// ([`Self::essential_container_exited`]): that exit is what the stop recorded here
+    /// states, so a task whose containers produced no exit status is never stopped by it.
     ///
     /// The stop a task that RAN earns, as against the one a task that could not be launched
     /// at all earns ([`TaskRecord::fail_launch`]): the task keeps the `startedAt` it
@@ -4591,10 +4622,9 @@ impl TaskRecord {
     /// tasks reports it under — and `STOPPED` itself falls due one [`TRANSITION_SPAN`]
     /// later, the same two-step stop every other stop of a task is recorded as.
     ///
-    /// No container is given an `exitCode`: `Container$exitCode` is "the exit code returned
-    /// from the container", and this emulator starts no container process, so nothing
-    /// observed an exit status to report. The agent's own report
-    /// (`SubmitContainerStateChange`) stays the only writer of one.
+    /// The exit statuses the containers reported are left as they are: each is the status
+    /// its own process ended with, written where that end was observed, and this stop claims
+    /// none of its own.
     pub fn finish_work(&mut self, at: SystemTime) {
         self.work_done_due_at = None;
         self.desired_status = STATUS_STOPPED.to_string();

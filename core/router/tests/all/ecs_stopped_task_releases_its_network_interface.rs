@@ -314,6 +314,9 @@ struct Row {
     /// Whether the caller stops the task with `StopTask`; a row that does not is left to
     /// finish the work it was placed to do.
     stopped_by_the_caller: bool,
+    /// The argument vector its container runs: a program that ends for the row whose task
+    /// finishes its own work, and none for the row the caller stops.
+    program: &'static [&'static str],
 }
 
 const ROWS: [Row; 2] = [
@@ -321,11 +324,13 @@ const ROWS: [Row; 2] = [
         case: "a task the caller stopped",
         family: "releasestopped",
         stopped_by_the_caller: true,
+        program: &[],
     },
     Row {
         case: "a task whose own work finished",
         family: "releasefinished",
         stopped_by_the_caller: false,
+        program: &["sh", "-c", "exit 0"],
     },
 ];
 
@@ -380,6 +385,15 @@ async fn a_stopped_awsvpc_tasks_interface_is_gone_from_the_service_that_owns_it(
     // than one after another.
     let mut placed: Vec<(&Row, String)> = Vec::new();
     for row in &ROWS {
+        let mut app = json!({ "name": "app", "image": IMAGE, "memory": 128 });
+        if !row.program.is_empty() {
+            // The row whose task ends ON ITS OWN gives its container a program that EXITS,
+            // because that exit is what ends such a task: a task is stopped as one whose
+            // essential container exited only once that container really exits
+            // (`Container$exitCode` is "the exit code returned from the container"). The row
+            // the CALLER stops needs none.
+            app["command"] = json!(row.program);
+        }
         ecs(
             &router,
             "RegisterTaskDefinition",
@@ -389,7 +403,7 @@ async fn a_stopped_awsvpc_tasks_interface_is_gone_from_the_service_that_owns_it(
                 "requiresCompatibilities": ["FARGATE"],
                 "cpu": "256",
                 "memory": "512",
-                "containerDefinitions": [{ "name": "app", "image": IMAGE, "memory": 128 }],
+                "containerDefinitions": [app],
             }),
         )
         .await;

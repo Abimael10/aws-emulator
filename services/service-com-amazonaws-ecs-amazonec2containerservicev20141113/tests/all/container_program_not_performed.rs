@@ -11,8 +11,12 @@
 //! > perform has run nothing of the image's own program, so the container reports NO exit
 //! > code — exactly as a container whose launch names no argument vector at all reports none
 //! > — and the task it belongs to is therefore not stopped as a task whose essential
-//! > container exited. A program that ends with a status of its own still reports that
-//! > status.
+//! > container exited: `Task$stopCode` `EssentialContainerExited` states that an essential
+//! > container EXITED, so a task no container of which produced an exit status keeps the
+//! > `RUNNING` status Amazon ECS reports for a task whose containers are running, with no
+//! > `stopCode` and no `stoppedReason` at all, until something stops it. A program that ends
+//! > with a status of its own still reports that status, and its task is then stopped with
+//! > that stop code.
 //!
 //! Which matters beyond the one container, and is the second rule here: a SERVICE's task
 //! whose program is one of those is not stopped and replaced over and over, so the
@@ -61,6 +65,12 @@ const POLL_BUDGET: Duration = Duration::from_secs(240);
 /// `Task$stopCode` of a task whose essential container exited, spelled out here rather than
 /// imported so a wrong constant in the implementation cannot make a test pass.
 const ESSENTIAL_CONTAINER_EXITED: &str = "EssentialContainerExited";
+
+/// How long a row watches a task whose program nothing performed: past the span after which
+/// a standalone task whose essential container HAS exited is stopped (three seconds in
+/// `state::CONTAINER_WORK_SPAN`), so a task that is stopped without any container of it
+/// having exited is observed being stopped rather than read once before it is.
+const WATCH_WINDOW: Duration = Duration::from_secs(6);
 
 /// One row of the exit-status table.
 struct Row {
@@ -192,10 +202,10 @@ async fn describe(router: &MultiServiceRouter, cluster: &str, arn: &str, case: &
 
 /// Read one task again until its `lastStatus` is `STOPPED`, and answer it.
 ///
-/// Waiting for the CONDITION rather than for a span: a standalone task is stopped once the
-/// work its containers were placed to do is over, which is what makes its container's run
-/// certainly finished — so what is asserted afterwards is what the run left behind rather
-/// than a reading taken too early.
+/// Waiting for the CONDITION rather than for a span: a standalone task is stopped once an
+/// essential container of it has exited, which is what makes that container's run certainly
+/// finished — so what is asserted afterwards is what the run left behind rather than a
+/// reading taken too early.
 async fn stopped_task(router: &MultiServiceRouter, cluster: &str, arn: &str, case: &str) -> Value {
     let deadline = Instant::now() + POLL_BUDGET;
     loop {
@@ -211,7 +221,53 @@ async fn stopped_task(router: &MultiServiceRouter, cluster: &str, arn: &str, cas
     }
 }
 
-/// RULE: a container reports an `exitCode` only for a program that ran and ended.
+/// Read one task again until its `lastStatus` is `RUNNING`, and answer it.
+async fn running_task(router: &MultiServiceRouter, cluster: &str, arn: &str, case: &str) -> Value {
+    let deadline = Instant::now() + POLL_BUDGET;
+    loop {
+        let task = describe(router, cluster, arn, case).await;
+        if string(&task, "lastStatus", case) == "RUNNING" {
+            return task;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the task to reach RUNNING within the poll budget, got \
+             {task}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Assert of one described task that it claims no exit status and no stop: every container
+/// of it reports no `exitCode`, and the task itself carries no `stopCode` and no
+/// `stoppedReason` and is both running and wanted running.
+fn claims_nothing(task: &Value, case: &str) {
+    let containers = list(task, "containers", case);
+    assert!(
+        containers
+            .iter()
+            .all(|held| present_count(held, "exitCode", case).is_none()),
+        "case {case:?}: no container of this task reports a status, got {task}"
+    );
+    for member in ["stopCode", "stoppedReason"] {
+        assert_eq!(
+            task.get(member).and_then(Value::as_str),
+            None,
+            "case {case:?}: a task no container of which exited carries no {member}, got {task}"
+        );
+    }
+    for member in ["lastStatus", "desiredStatus"] {
+        assert_eq!(
+            string(task, member, case),
+            "RUNNING",
+            "case {case:?}: a task no container of which exited goes on running, its {member} \
+             too, got {task}"
+        );
+    }
+}
+
+/// RULE: a container reports an `exitCode` only for a program that ran and ended, and only
+/// such an exit stops its task as one whose essential container exited.
 #[tokio::test]
 async fn a_program_this_container_does_not_perform_claims_no_exit_status() {
     let router = crate::ecs_wire::service();
@@ -229,7 +285,12 @@ async fn a_program_this_container_does_not_perform_claims_no_exit_status() {
         launched.push((row, arn));
     }
 
+    // The rows whose program really ends: the task stops, the container reports the status
+    // it ended with, and the stop names the exit that caused it.
     for (row, arn) in &launched {
+        let Some(wanted) = row.exit_code else {
+            continue;
+        };
         let case = row.case;
         let task = stopped_task(&router, cluster, arn, case).await;
         let containers = list(&task, "containers", case);
@@ -238,27 +299,37 @@ async fn a_program_this_container_does_not_perform_claims_no_exit_status() {
             .unwrap_or_else(|| panic!("case {case:?}: expected a container, got {task}"));
         let reported = present_count(container, "exitCode", case);
         assert_eq!(
-            reported, row.exit_code,
-            "case {case:?}: expected exitCode {:?}, got {reported:?} in {task}",
-            row.exit_code
+            reported,
+            Some(wanted),
+            "case {case:?}: expected exitCode {wanted:?}, got {reported:?} in {task}"
         );
-        if row.exit_code.is_none() {
-            // Nothing ran, so nothing exited: the stop such a task earns is the end of the
-            // work a standalone task was placed to do, and no container of it claims a
-            // status.
-            assert!(
-                containers
-                    .iter()
-                    .all(|held| present_count(held, "exitCode", case).is_none()),
-                "case {case:?}: no container of this task reports a status, got {task}"
-            );
-        } else {
-            assert_eq!(
-                string(&task, "stopCode", case),
-                ESSENTIAL_CONTAINER_EXITED,
-                "case {case:?}: a task whose essential container really exited carries the \
-                 stop code for it, got {task}"
-            );
+        assert_eq!(
+            string(&task, "stopCode", case),
+            ESSENTIAL_CONTAINER_EXITED,
+            "case {case:?}: a task whose essential container really exited carries the stop \
+             code for it, got {task}"
+        );
+    }
+
+    // The rows whose program nothing performed: each task reaches `RUNNING` and STAYS there,
+    // claiming no exit status and no stop, for a window far past the span in which a
+    // standalone task whose essential container exited is stopped. Watched in ONE loop over
+    // every such row, so the window is spent once rather than once per row.
+    let unperformed: Vec<(&Row, &String)> = launched
+        .iter()
+        .filter(|(row, _)| row.exit_code.is_none())
+        .map(|(row, arn)| (*row, arn))
+        .collect();
+    for (row, arn) in &unperformed {
+        let task = running_task(&router, cluster, arn, row.case).await;
+        claims_nothing(&task, row.case);
+    }
+    let until = Instant::now() + WATCH_WINDOW;
+    while Instant::now() < until {
+        tokio::time::sleep(POLL_INTERVAL).await;
+        for (row, arn) in &unperformed {
+            let task = describe(&router, cluster, arn, row.case).await;
+            claims_nothing(&task, row.case);
         }
     }
 }

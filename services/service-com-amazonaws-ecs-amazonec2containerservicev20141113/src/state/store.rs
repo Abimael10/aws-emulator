@@ -158,20 +158,37 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     }
                 }
             }
-            // The work a STANDALONE task was placed to do, finished at the instant it was
-            // owed at whether or not anybody called to look: its essential containers have
-            // exited, so Amazon ECS stops the task ([`TaskRecord::finish_work`]). Only a
-            // task whose work is still going takes that stop — one already on its way out
-            // is being stopped for the reason that put it there
-            // ([`TaskRecord::work_is_running`]) — and only one whose essential containers
-            // really have exited: a container still performing its program has not, so the
-            // task runs on for as long as that program does.
+            // The work a STANDALONE task was placed to do is finished when an ESSENTIAL
+            // container of it has EXITED: that exit is what the stop such a task takes
+            // states ([`STOP_CODE_ESSENTIAL_CONTAINER_EXITED`], "The task stopped because an
+            // essential container exited"), and `Container$exitCode` — "the exit code
+            // returned from the container" — is the record of one
+            // ([`TaskRecord::essential_container_exited`]). So the span decides only WHEN
+            // such a stop may be reported, never THAT one is: a task no container of which
+            // produced an exit status has had no container exit, and goes on running until
+            // something stops it.
+            //
+            // Only a task whose work is still going takes that stop — one already on its way
+            // out is being stopped for the reason that put it there
+            // ([`TaskRecord::work_is_running`]) — and only one none of whose essential
+            // containers is still performing its program, because such a container has not
+            // exited however long ago the span fell due.
+            //
+            // The instant is CONSUMED either way: once it has passed, the exit of an
+            // essential container stops the task at the instant it happens instead
+            // ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::record_container_outcome`]),
+            // so nothing is left waiting on an elapsed instant the clock would be woken by
+            // over and over.
             if let Some(due) = task.work_done_due_at {
-                if due <= now
-                    && task.work_is_running()
-                    && !task.essential_programs_running(&performing)
-                {
-                    task.finish_work(due);
+                if due <= now {
+                    if task.work_is_running()
+                        && task.essential_container_exited()
+                        && !task.essential_programs_running(&performing)
+                    {
+                        task.finish_work(due);
+                    } else {
+                        task.work_done_due_at = None;
+                    }
                 }
             }
             // The elastic network interface Amazon ECS created for the task is torn down WITH

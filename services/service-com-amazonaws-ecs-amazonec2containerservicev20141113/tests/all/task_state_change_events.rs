@@ -354,10 +354,31 @@ async fn register(
     fargate: bool,
     case: &str,
 ) {
+    register_running(router, family, network_mode, fargate, None, case).await;
+}
+
+/// The same, with `program` as the container's own command — a program run through a shell,
+/// and none at all for `None`.
+///
+/// A row that reads a task stopping ON ITS OWN needs a container that EXITS: a task is
+/// stopped as one whose essential container exited only once that container really exits
+/// (`Container$exitCode` is "the exit code returned from the container").
+async fn register_running(
+    router: &MultiServiceRouter,
+    family: &str,
+    network_mode: &str,
+    fargate: bool,
+    program: Option<&str>,
+    case: &str,
+) {
+    let mut web = container("web", IMAGE);
+    if let Some(program) = program {
+        web["command"] = json!(["sh", "-c", program]);
+    }
     let mut body = json!({
         "family": family,
         "networkMode": network_mode,
-        "containerDefinitions": [container("web", IMAGE)],
+        "containerDefinitions": [web],
     });
     if fargate {
         body["requiresCompatibilities"] = json!(["FARGATE"]);
@@ -782,7 +803,9 @@ async fn a_transition_is_published_once_however_often_the_task_is_read() {
     )
     .await;
     register_capacity(&router, CLUSTER, case).await;
-    register(&router, "polled", "bridge", false, case).await;
+    // The task of this row ends ON ITS OWN, which is what makes its run four moves: its
+    // container runs a program that exits, and that exit is what stops the task.
+    register_running(&router, "polled", "bridge", false, Some("exit 0"), case).await;
 
     let placed = ok(
         &router,
@@ -798,8 +821,22 @@ async fn a_transition_is_published_once_however_often_the_task_is_read() {
     .await;
     let task_arn = string(&list(&placed, "tasks", case)[0], "taskArn", case);
 
-    // Past the start, then read the settled task through three doors.
-    tokio::time::sleep(AWSVPC_START).await;
+    // Up and running — waiting for the CONDITION rather than for a span — and then read
+    // through three doors. The reads are what this rule is about: none of them may announce
+    // a move again.
+    let deadline = Instant::now() + POLL_BUDGET;
+    loop {
+        let task = describe(&router, &task_arn, case).await;
+        let status = string(&task, "lastStatus", case);
+        if status == "RUNNING" || status == "DEACTIVATING" || status == "STOPPED" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the task to start within the poll budget, got {task}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
     for operation in ["DescribeTasks", "DescribeTasks", "ListTasks"] {
         let body = if operation == "ListTasks" {
             json!({ "cluster": CLUSTER })
@@ -809,11 +846,11 @@ async fn a_transition_is_published_once_however_often_the_task_is_read() {
         ok(&router, operation, body, case).await;
     }
 
-    // A task placed on its own ends the work it was placed for
-    // (`state::CONTAINER_WORK_SPAN`), so its WHOLE run is four moves: it comes up PENDING
-    // then RUNNING, and stops DEACTIVATING then STOPPED. Collecting until the last of them
-    // arrives is what makes the exact sequence assertable — the rule being that each move is
-    // published once, however often the task was READ in between.
+    // A task placed on its own ends when the essential container it was placed to run has
+    // exited, so its WHOLE run is four moves: it comes up PENDING then RUNNING, and stops
+    // DEACTIVATING then STOPPED. Collecting until the last of them arrives is what makes the
+    // exact sequence assertable — the rule being that each move is published once, however
+    // often the task was READ in between.
     let delivered = collect_events(
         &router,
         case,
@@ -822,13 +859,19 @@ async fn a_transition_is_published_once_however_often_the_task_is_read() {
         &["PENDING", "RUNNING", "DEACTIVATING", "STOPPED"],
     )
     .await;
-    // One more quiet stretch, in case a read queued a second announcement of a move.
-    tokio::time::sleep(QUIET_BUDGET).await;
-    let late: Vec<Value> = drain(&router, case, &url)
-        .await
-        .into_iter()
-        .filter(|event| event["detail"]["taskArn"] == json!(task_arn))
-        .collect();
+    // One more quiet stretch, LOOKED at over and over rather than slept through: a read that
+    // queued a second announcement of a move would be found by one of these drains.
+    let quiet_until = Instant::now() + QUIET_BUDGET;
+    let mut late: Vec<Value> = Vec::new();
+    while Instant::now() < quiet_until {
+        tokio::time::sleep(POLL_INTERVAL).await;
+        late.extend(
+            drain(&router, case, &url)
+                .await
+                .into_iter()
+                .filter(|event| event["detail"]["taskArn"] == json!(task_arn)),
+        );
+    }
     let observed = statuses_of(&delivered);
     let late_observed = statuses_of(&late);
     assert_eq!(

@@ -127,13 +127,33 @@ const CONNECTED: &str = "CONNECTED";
 
 /// Register one revision of `family` in `network_mode` with a single container.
 async fn register(router: &MultiServiceRouter, family: &str, network_mode: &str, case: &str) {
+    register_running(router, family, network_mode, None, case).await;
+}
+
+/// Register one revision of `family` in `network_mode` whose single container runs
+/// `program` through a shell — and none at all for `None`.
+///
+/// A row that reads a task stopping ON ITS OWN needs a container that EXITS: a task is
+/// stopped as one whose essential container exited only once that container really exits
+/// (`Container$exitCode` is "the exit code returned from the container").
+async fn register_running(
+    router: &MultiServiceRouter,
+    family: &str,
+    network_mode: &str,
+    program: Option<&str>,
+    case: &str,
+) {
+    let mut web = container("web", IMAGE);
+    if let Some(program) = program {
+        web["command"] = json!(["sh", "-c", program]);
+    }
     ok(
         router,
         "RegisterTaskDefinition",
         json!({
             "family": family,
             "networkMode": network_mode,
-            "containerDefinitions": [container("web", IMAGE)],
+            "containerDefinitions": [web],
         }),
         case,
     )
@@ -748,7 +768,10 @@ async fn a_stopped_awsvpc_tasks_interface_is_released_one_documented_step_at_a_t
         let router = service();
         cluster_with_capacity(&router, CLUSTER, case).await;
         let family = format!("ifacerelease{index}");
-        register(&router, &family, "awsvpc", case).await;
+        // The row whose task ends ON ITS OWN gives its container a program that exits,
+        // because that exit is what ends such a task; the row the CALLER stops needs none.
+        let program = (!stopped_by_the_caller).then_some("exit 0");
+        register_running(&router, &family, "awsvpc", program, case).await;
         let task_arn = launch(&router, Launch::RunTask, &family, case).await;
         let identity = running_interface(&router, &task_arn, case).await;
 

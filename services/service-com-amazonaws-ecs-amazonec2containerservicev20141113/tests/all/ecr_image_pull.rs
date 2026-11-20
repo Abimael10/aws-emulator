@@ -112,6 +112,10 @@ const TASK_FAILED_TO_START: &str = "TaskFailedToStart";
 /// ran.
 const ESSENTIAL_CONTAINER_EXITED: &str = "EssentialContainerExited";
 
+/// The argument vector a standalone row's container runs: a program that ends at once, so
+/// the container really exits and the task is stopped for that exit.
+const PROGRAM_THAT_ENDS: [&str; 3] = ["sh", "-c", "exit 0"];
+
 /// The error class a container runtime reports a failed image fetch under, which is the
 /// fixed part of such a `stoppedReason`.
 const CANNOT_PULL: &str = "CannotPullContainerError";
@@ -172,6 +176,12 @@ async fn cluster(router: &MultiServiceRouter) {
 
 /// Register one revision of `family` running `image` as `execution_role`, and run one task
 /// of it — answering the task's ARN.
+///
+/// The container runs a program that ENDS: a task is stopped as one whose essential
+/// container exited only once that container really exits
+/// (`Container$exitCode` is "the exit code returned from the container"), so a row that
+/// reads the stop of a task that RAN gives its container something to run to the end. What
+/// the program does is beside the point here — every row is about the PULL that precedes it.
 async fn run(
     router: &MultiServiceRouter,
     family: &str,
@@ -179,9 +189,11 @@ async fn run(
     execution_role: Option<&str>,
     case: &str,
 ) -> String {
+    let mut app = container("app", image);
+    app["command"] = json!(PROGRAM_THAT_ENDS);
     let mut definition = json!({
         "family": family,
-        "containerDefinitions": [container("app", image)],
+        "containerDefinitions": [app],
     });
     if let Some(role) = execution_role {
         definition["executionRoleArn"] = json!(role);
@@ -649,14 +661,19 @@ async fn a_task_pulls_its_ecr_image_as_its_execution_role_and_then_settles() {
                 );
             }
         }
-        // Whichever way the task ended, no container reports an `exitCode`: this emulator
-        // starts no container process, so nothing observed an exit status — only the
-        // agent's own report carries one.
+        // What each container reports follows from whether it RAN: the one of a task that
+        // ran performed the program its launch named and reports the status that program
+        // ended with ([`PROGRAM_THAT_ENDS`] exits zero), while a task that never started a
+        // container has none to report an exit status for.
+        let expected_exit = match expected {
+            Outcome::Ran => Some(0),
+            Outcome::FailedToStart | Outcome::RegistryAuthWithheld => None,
+        };
         for container in task["containers"].as_array().cloned().unwrap_or_default() {
-            assert!(
-                container["exitCode"].is_null(),
-                "case {case:?}: expected no exitCode on a container nothing ran, got \
-                 {container}"
+            assert_eq!(
+                container["exitCode"].as_i64(),
+                expected_exit,
+                "case {case:?}: expected exitCode {expected_exit:?}, got {container}"
             );
         }
     }

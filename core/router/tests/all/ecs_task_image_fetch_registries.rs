@@ -363,7 +363,17 @@ async fn run(
         &json!({
             "family": family,
             "executionRoleArn": execution_role,
-            "containerDefinitions": [{"name": "app", "image": image, "memory": 128}],
+            // A program that ENDS: a task is stopped as one whose essential container
+            // exited only once that container really exits (`Container$exitCode` is "the
+            // exit code returned from the container"), so a row that reads the stop of a
+            // task that RAN gives its container something to run to the end. What the
+            // program does is beside the point here — every row is about the image fetch.
+            "containerDefinitions": [{
+                "name": "app",
+                "image": image,
+                "memory": 128,
+                "command": ["sh", "-c", "exit 0"],
+            }],
         }),
     )
     .await;

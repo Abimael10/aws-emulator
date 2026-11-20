@@ -14,7 +14,17 @@
 //!    exited"), whatever status that container exited with; and a task whose NON-essential
 //!    container ends keeps running, because "if the `essential` parameter of a container is
 //!    marked as `false`, its failure doesn't affect the rest of the containers in a task".
-//! 2. `Deployment$failedTasks`: "The number of consecutively failed tasks in the
+//! 2. The same rule for a STANDALONE task, which is the one the clock stops rather than a
+//!    scheduler: `Container$exitCode` is "the exit code returned from the container", so a
+//!    task is stopped with `EssentialContainerExited` — and with the sentence Amazon ECS
+//!    words for it — exactly when an ESSENTIAL container of it has EXITED. A task no
+//!    essential container of which produced an exit status has had no essential container
+//!    exit, so it keeps the `RUNNING` status Amazon ECS reports for a task whose containers
+//!    are running and carries no `stopCode` and no `stoppedReason` at all — however long it
+//!    has been running, and whatever of its containers' programs this emulator was able to
+//!    perform — while every container of it still runs its own program to the end and
+//!    reports the status that program ended with.
+//! 3. `Deployment$failedTasks`: "The number of consecutively failed tasks in the
 //!    deployment. A task is considered a failure if the service scheduler can't launch the
 //!    task, the task doesn't transition to a `RUNNING` state, or if it fails any of its
 //!    defined health checks and is stopped" — with the note that "once a service deployment
@@ -36,7 +46,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::ecs_wire::{cluster_with_capacity, count, list, ok, service, string};
+use crate::ecs_wire::{cluster_with_capacity, count, list, ok, present_count, service, string};
 
 /// The cluster every service below runs in.
 const CLUSTER: &str = "exiting";
@@ -429,4 +439,454 @@ async fn the_circuit_breaker_fails_and_rolls_back_a_rollout_whose_tasks_keep_end
         "case {case:?}: expected the service back on the revision that completed, got \
          {rolled_back}"
     );
+}
+
+// --- rule 2: the STANDALONE task, whose stop the clock materialises ----------------------
+
+/// The `stoppedReason` that goes with [`ESSENTIAL_CONTAINER_EXITED`], spelled out here for
+/// the reason that constant is.
+const ESSENTIAL_CONTAINER_EXITED_REASON: &str = "Essential container in task exited";
+
+/// How long a row watches a standalone task that must go on running: past the span in which
+/// a standalone task whose essential container HAS exited is stopped (three seconds in
+/// `state::CONTAINER_WORK_SPAN`), so a task stopped without any essential container of it
+/// having exited is observed being stopped rather than read once before it is.
+const WATCH_WINDOW: Duration = Duration::from_secs(6);
+
+/// How long the slow program of the second standalone test runs for: longer than that same
+/// span, so the container is still performing its program at the instant a stop would have
+/// fallen due and the status it reports was produced after it.
+const SLOW_PROGRAM_SECONDS: u64 = 4;
+
+/// How long the two tests below keep looking for a condition before they give up. Generous:
+/// the slow program above runs for several seconds inside a session of this process, and
+/// these tests run beside every other test of the workspace, which can slow every span down.
+/// The deadline is only here so a failure is a failure rather than a hang.
+const STANDALONE_POLL_BUDGET: Duration = Duration::from_secs(240);
+
+/// One container of a standalone row: what it runs, whether it is essential, and the status
+/// it must report once the task has settled.
+struct StandaloneContainer {
+    name: &'static str,
+    /// The argument vector the container's image is handed, and `None` for a launch that
+    /// names none at all — whose program is the image's own entry point, which this emulator
+    /// does not hold.
+    command: Option<&'static [&'static str]>,
+    /// `ContainerDefinition$essential`.
+    essential: bool,
+    /// `Container$exitCode`, and `None` for a container that produces no exit status.
+    exit_code: Option<i64>,
+}
+
+/// What a standalone row expects of the task once it has settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ends {
+    /// An essential container exited with this status, so the task is stopped for it.
+    EssentialExit(i64),
+    /// No essential container exited, so the task goes on running.
+    RunsOn,
+}
+
+/// One row of the standalone stop table.
+struct StandaloneRow {
+    case: &'static str,
+    containers: &'static [StandaloneContainer],
+    ends: Ends,
+}
+
+/// The rows differ along what the rule generalises over — WHY no essential container has
+/// exited: its program runs on, its program needs an interpreter this emulator has none of,
+/// its launch names no program at all, and the container that did exit was not essential —
+/// against the contrast rows where an essential container really does exit.
+const STANDALONE_ROWS: &[StandaloneRow] = &[
+    StandaloneRow {
+        case: "a program that runs until the container is stopped",
+        containers: &[StandaloneContainer {
+            name: "app",
+            command: Some(&["sh", "-c", "echo up; sleep 600"]),
+            essential: true,
+            exit_code: None,
+        }],
+        ends: Ends::RunsOn,
+    },
+    StandaloneRow {
+        // The shape the recorded workloads take: an interpreter handed an inline program,
+        // and one that does not return — a server in the foreground, which AWS reports
+        // RUNNING for as long as it serves. This emulator holds no interpreter, so nothing
+        // of that program runs and nothing is claimed about it.
+        case: "an interpreter running an inline program, which this emulator has none of",
+        containers: &[StandaloneContainer {
+            name: "guest",
+            command: Some(&[
+                "python3",
+                "-c",
+                "import http.server, socketserver\n\
+                 socketserver.TCPServer(('', 8080), http.server.SimpleHTTPRequestHandler)\
+                 .serve_forever()",
+            ]),
+            essential: true,
+            exit_code: None,
+        }],
+        ends: Ends::RunsOn,
+    },
+    StandaloneRow {
+        case: "a launch that names no argument vector at all",
+        containers: &[StandaloneContainer {
+            name: "imageentrypoint",
+            command: None,
+            essential: true,
+            exit_code: None,
+        }],
+        ends: Ends::RunsOn,
+    },
+    StandaloneRow {
+        // "If the `essential` parameter of a container is marked as `false`, its failure
+        // doesn't affect the rest of the containers in a task": the exit is REPORTED and the
+        // task runs on.
+        case: "a container that exits while it is not essential, beside one that runs on",
+        containers: &[
+            StandaloneContainer {
+                name: "sidecar",
+                command: Some(&["sh", "-c", "exit 0"]),
+                essential: false,
+                exit_code: Some(0),
+            },
+            StandaloneContainer {
+                name: "app",
+                command: Some(&STAYS_UP),
+                essential: true,
+                exit_code: None,
+            },
+        ],
+        ends: Ends::RunsOn,
+    },
+    StandaloneRow {
+        // Two containers that exit while NEITHER of them is essential, beside the essential
+        // one every task has ("all tasks must have at least one essential container"): each
+        // reports the status its own program produced, and no exit of theirs stops the task.
+        case: "two containers that exit while neither is essential",
+        containers: &[
+            StandaloneContainer {
+                name: "first",
+                command: Some(&["sh", "-c", "exit 0"]),
+                essential: false,
+                exit_code: Some(0),
+            },
+            StandaloneContainer {
+                name: "second",
+                command: Some(&["sh", "-c", "exit 6"]),
+                essential: false,
+                exit_code: Some(6),
+            },
+            StandaloneContainer {
+                name: "app",
+                command: Some(&STAYS_UP),
+                essential: true,
+                exit_code: None,
+            },
+        ],
+        ends: Ends::RunsOn,
+    },
+    StandaloneRow {
+        case: "a program that ends successfully",
+        containers: &[StandaloneContainer {
+            name: "app",
+            command: Some(&["sh", "-c", "echo done"]),
+            essential: true,
+            exit_code: Some(0),
+        }],
+        ends: Ends::EssentialExit(0),
+    },
+    StandaloneRow {
+        case: "a program that ends with a status of its own",
+        containers: &[StandaloneContainer {
+            name: "app",
+            command: Some(&["sh", "-c", "echo leaving; exit 9"]),
+            essential: true,
+            exit_code: Some(9),
+        }],
+        ends: Ends::EssentialExit(9),
+    },
+    StandaloneRow {
+        case: "the essential one of two containers exits",
+        containers: &[
+            StandaloneContainer {
+                name: "app",
+                command: Some(&["sh", "-c", "exit 4"]),
+                essential: true,
+                exit_code: Some(4),
+            },
+            StandaloneContainer {
+                name: "sidecar",
+                command: Some(&STAYS_UP),
+                essential: false,
+                exit_code: None,
+            },
+        ],
+        ends: Ends::EssentialExit(4),
+    },
+];
+
+/// The container definition one standalone row's container is registered as.
+fn standalone_definition(held: &StandaloneContainer) -> Value {
+    let mut definition = json!({
+        "name": held.name,
+        "image": IMAGE,
+        "memory": 128,
+        "essential": held.essential,
+    });
+    if let Some(command) = held.command {
+        definition["command"] = json!(command);
+    }
+    definition
+}
+
+/// `RunTask` one standalone task of `family` in [`CLUSTER`], and answer its ARN.
+async fn run_standalone(router: &MultiServiceRouter, family: &str, case: &str) -> String {
+    let body = ok(
+        router,
+        "RunTask",
+        json!({ "cluster": CLUSTER, "taskDefinition": family }),
+        case,
+    )
+    .await;
+    let tasks = list(&body, "tasks", case);
+    let task = tasks
+        .first()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a task back, got {body}"));
+    string(task, "taskArn", case)
+}
+
+/// Read one task again until its `lastStatus` is `status`, and answer it.
+async fn task_at(router: &MultiServiceRouter, arn: &str, status: &str, case: &str) -> Value {
+    let deadline = Instant::now() + STANDALONE_POLL_BUDGET;
+    loop {
+        let task = describe_task(router, arn, case).await;
+        if string(&task, "lastStatus", case) == status {
+            return task;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the task to reach {status} within the poll budget, got \
+             {task}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// The exit status one named container of a described task reports, and `None` for a
+/// container that reported none.
+fn exit_code_of(task: &Value, name: &str, case: &str) -> Option<i64> {
+    let containers = list(task, "containers", case);
+    let container = containers
+        .iter()
+        .find(|held| string(held, "name", case) == name)
+        .unwrap_or_else(|| panic!("case {case:?}: expected a container named {name}, got {task}"));
+    present_count(container, "exitCode", case)
+}
+
+/// Assert of one described task that it claims NO stop: no `stopCode` and no `stoppedReason`
+/// reach the wire, and it is both running and wanted running.
+fn claims_no_stop(task: &Value, case: &str) {
+    for member in ["stopCode", "stoppedReason"] {
+        assert_eq!(
+            task.get(member).and_then(Value::as_str),
+            None,
+            "case {case:?}: a task no essential container of which exited carries no \
+             {member}, got {task}"
+        );
+    }
+    for member in ["lastStatus", "desiredStatus"] {
+        assert_eq!(
+            string(task, member, case),
+            "RUNNING",
+            "case {case:?}: a task no essential container of which exited goes on running, \
+             its {member} too, got {task}"
+        );
+    }
+}
+
+/// RULE 2: a standalone task is stopped as one whose essential container exited exactly
+/// when an essential container of it really exited.
+#[tokio::test]
+async fn a_standalone_task_is_stopped_only_when_an_essential_container_exits() {
+    let router = service();
+    cluster_with_capacity(&router, CLUSTER, "stops that need an exit").await;
+
+    // Every row's task is launched FIRST and read afterwards: the runs happen in parallel in
+    // the one emulator, so the test waits for the longest of them rather than for their sum.
+    let mut launched: Vec<(&StandaloneRow, String)> = Vec::new();
+    for (index, row) in STANDALONE_ROWS.iter().enumerate() {
+        let family = format!("standalonestop{index}");
+        let definitions: Vec<Value> = row.containers.iter().map(standalone_definition).collect();
+        ok(
+            &router,
+            "RegisterTaskDefinition",
+            json!({ "family": &family, "containerDefinitions": definitions }),
+            row.case,
+        )
+        .await;
+        let arn = run_standalone(&router, &family, row.case).await;
+        launched.push((row, arn));
+    }
+
+    for (row, arn) in &launched {
+        let case = row.case;
+        let Ends::EssentialExit(status) = row.ends else {
+            continue;
+        };
+        let task = task_at(&router, arn, "STOPPED", case).await;
+        assert_eq!(
+            string(&task, "stopCode", case),
+            ESSENTIAL_CONTAINER_EXITED,
+            "case {case:?}: expected the stop code of an essential container's exit, got {task}"
+        );
+        assert_eq!(
+            string(&task, "stoppedReason", case),
+            ESSENTIAL_CONTAINER_EXITED_REASON,
+            "case {case:?}: expected the reason Amazon ECS words for that code, got {task}"
+        );
+        let essential = row
+            .containers
+            .iter()
+            .find(|held| held.essential)
+            .unwrap_or_else(|| panic!("case {case:?}: this row has an essential container"));
+        let reported = exit_code_of(&task, essential.name, case);
+        assert_eq!(
+            reported,
+            Some(status),
+            "case {case:?}: expected the exiting container to report {status}, got \
+             {reported:?} in {task}"
+        );
+    }
+
+    // The rows that go on running: each task reaches `RUNNING` and STAYS there, claiming no
+    // stop. Watched in ONE loop over every such row, so the window is spent once rather than
+    // once per row.
+    let running: Vec<(&StandaloneRow, &String)> = launched
+        .iter()
+        .filter(|(row, _)| row.ends == Ends::RunsOn)
+        .map(|(row, arn)| (*row, arn))
+        .collect();
+    for (row, arn) in &running {
+        task_at(&router, arn, "RUNNING", row.case).await;
+    }
+    let until = Instant::now() + WATCH_WINDOW;
+    while Instant::now() < until {
+        tokio::time::sleep(POLL_INTERVAL).await;
+        for (row, arn) in &running {
+            let task = describe_task(&router, arn, row.case).await;
+            claims_no_stop(&task, row.case);
+        }
+    }
+    // And what each container of such a task reports, read once the window is over: the
+    // status its own program ended with, and nothing for a program that is still going or
+    // that was never performed.
+    for (row, arn) in &running {
+        let task = describe_task(&router, arn, row.case).await;
+        for held in row.containers {
+            let reported = exit_code_of(&task, held.name, row.case);
+            assert_eq!(
+                reported, held.exit_code,
+                "case {:?}: expected container {} to report exitCode {:?}, got {reported:?} \
+                 in {task}",
+                row.case, held.name, held.exit_code
+            );
+        }
+    }
+}
+
+/// RULE 2 (the other half): every container of such a task runs its own program to the end
+/// and reports the status it ended with — including a container whose program is still going
+/// long after the span a stop would have fallen in, and a sibling that only reads what
+/// another container has written.
+#[tokio::test]
+async fn a_container_still_running_past_the_stop_span_reports_its_own_exit_status() {
+    let router = service();
+    let case = "a slow writer and the sibling that waits for it";
+    cluster_with_capacity(&router, CLUSTER, case).await;
+
+    let family = "slowexits";
+    ok(
+        &router,
+        "RegisterTaskDefinition",
+        json!({
+            "family": family,
+            "volumes": [{ "name": "shared", "host": {} }],
+            "containerDefinitions": [
+                {
+                    // The essential container every task has ("all tasks must have at least
+                    // one essential container"), and it runs on: no essential container of
+                    // this task exits, so nothing stops the task while the two below take
+                    // their time.
+                    "name": "app",
+                    "image": IMAGE,
+                    "memory": 128,
+                    "essential": true,
+                    "command": STAYS_UP,
+                },
+                {
+                    "name": "writer",
+                    "image": IMAGE,
+                    "memory": 128,
+                    // Neither of these two is essential, so no exit of theirs stops the
+                    // task: what each reports is its own program's status alone.
+                    "essential": false,
+                    "command": ["sh", "-c",
+                        format!("sleep {SLOW_PROGRAM_SECONDS}; echo payload > /shared/payload")],
+                    "mountPoints": [
+                        { "sourceVolume": "shared", "containerPath": "/shared", "readOnly": false },
+                    ],
+                },
+                {
+                    "name": "reader",
+                    "image": IMAGE,
+                    "memory": 128,
+                    "essential": false,
+                    // Waits for the CONDITION — the file the writer writes — rather than for
+                    // a span of its own, so what it reads is what the writer wrote.
+                    "command": ["sh", "-c",
+                        "while [ ! -f /shared/payload ]; do sleep 1; done; cat /shared/payload"],
+                    "mountPoints": [
+                        { "sourceVolume": "shared", "containerPath": "/shared", "readOnly": true },
+                    ],
+                },
+            ],
+        }),
+        case,
+    )
+    .await;
+    let arn = run_standalone(&router, family, case).await;
+
+    // Both programs end, however long after the stop span that is, and each reports the
+    // status it ended with.
+    let deadline = Instant::now() + STANDALONE_POLL_BUDGET;
+    let settled = loop {
+        let task = describe_task(&router, &arn, case).await;
+        let codes: Vec<Option<i64>> = ["writer", "reader"]
+            .iter()
+            .map(|name| exit_code_of(&task, name, case))
+            .collect();
+        if codes.iter().all(Option::is_some) {
+            break task;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected both containers to report an exit status, got {codes:?} \
+             in {task}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    };
+    for name in ["writer", "reader"] {
+        let reported = exit_code_of(&settled, name, case);
+        assert_eq!(
+            reported,
+            Some(0),
+            "case {case:?}: expected container {name} to report exitCode 0, got {reported:?} \
+             in {settled}"
+        );
+    }
+    // And the task itself claims no stop: neither of those two was essential, and the
+    // essential container of the task has not exited.
+    claims_no_stop(&settled, case);
 }

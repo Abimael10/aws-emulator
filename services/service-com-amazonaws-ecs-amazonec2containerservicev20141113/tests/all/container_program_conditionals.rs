@@ -56,6 +56,12 @@ const POLL_BUDGET: Duration = Duration::from_secs(240);
 /// imported so a wrong constant in the implementation cannot make a test pass.
 const ESSENTIAL_CONTAINER_EXITED: &str = "EssentialContainerExited";
 
+/// How long the rows whose program is not performed are watched: past the span in which a
+/// standalone task whose essential container HAS exited is stopped (three seconds in
+/// `state::CONTAINER_WORK_SPAN`), so a task stopped without any container of it having
+/// exited is observed being stopped rather than read once before it is.
+const WATCH_WINDOW: Duration = Duration::from_secs(6);
+
 /// One row: a shell program, and the status it ends with.
 struct Row {
     case: &'static str,
@@ -267,28 +273,50 @@ async fn run_task(router: &MultiServiceRouter, cluster: &str, family: &str, case
 /// Read one task again until its `lastStatus` is `STOPPED`, and answer it.
 ///
 /// Waiting for the CONDITION rather than for a span: a standalone task is stopped once the
-/// work its containers were placed to do is over, which is what makes its container's run
-/// certainly finished.
+/// essential container it was placed to run has exited, which is what makes that container's
+/// run certainly finished.
 async fn stopped_task(router: &MultiServiceRouter, cluster: &str, arn: &str, case: &str) -> Value {
     let deadline = Instant::now() + POLL_BUDGET;
     loop {
-        let body = ok(
-            router,
-            "DescribeTasks",
-            json!({ "cluster": cluster, "tasks": [arn] }),
-            case,
-        )
-        .await;
-        let task = list(&body, "tasks", case)
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| panic!("case {case:?}: expected the task back, got {body}"));
+        let task = describe(router, cluster, arn, case).await;
         if string(&task, "lastStatus", case) == "STOPPED" {
             return task;
         }
         assert!(
             Instant::now() < deadline,
             "case {case:?}: expected the task to stop within the poll budget, got {task}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// One task, as `DescribeTasks` reports it.
+async fn describe(router: &MultiServiceRouter, cluster: &str, arn: &str, case: &str) -> Value {
+    let body = ok(
+        router,
+        "DescribeTasks",
+        json!({ "cluster": cluster, "tasks": [arn] }),
+        case,
+    )
+    .await;
+    list(&body, "tasks", case)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("case {case:?}: expected the task back, got {body}"))
+}
+
+/// Read one task again until its `lastStatus` is `RUNNING`, and answer it.
+async fn running_task(router: &MultiServiceRouter, cluster: &str, arn: &str, case: &str) -> Value {
+    let deadline = Instant::now() + POLL_BUDGET;
+    loop {
+        let task = describe(router, cluster, arn, case).await;
+        if string(&task, "lastStatus", case) == "RUNNING" {
+            return task;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the task to reach RUNNING within the poll budget, got \
+             {task}"
         );
         tokio::time::sleep(POLL_INTERVAL).await;
     }
@@ -341,7 +369,9 @@ async fn a_conditional_program_reports_the_status_it_chose() {
 }
 
 /// RULE, the other side: a program that reaches a form or a utility this container performs
-/// nothing of ran none of the program its image holds, so it claims no status at all.
+/// nothing of ran none of the program its image holds, so it claims no status at all — and
+/// its task, no container of which exited, is not stopped as one whose essential container
+/// did.
 #[tokio::test]
 async fn a_program_reaching_an_unperformed_form_still_claims_no_status() {
     let router = crate::ecs_wire::service();
@@ -358,11 +388,42 @@ async fn a_program_reaching_an_unperformed_form_still_claims_no_status() {
 
     for (row, arn) in &launched {
         let case = row.case;
-        let task = stopped_task(&router, cluster, arn, case).await;
+        let task = running_task(&router, cluster, arn, case).await;
         let reported = present_count(&container_of(&task, case), "exitCode", case);
         assert_eq!(
             reported, None,
             "case {case:?}: expected no exitCode at all, got {reported:?} in {task}"
         );
+    }
+    // And they STAY that way, over a window far past the span in which a standalone task
+    // whose essential container HAS exited is stopped (three seconds in
+    // `state::CONTAINER_WORK_SPAN`): nothing of these programs ran, so no container of them
+    // exited and no stop is earned. Watched in ONE loop over every row, so the window is
+    // spent once rather than once per row.
+    let until = Instant::now() + WATCH_WINDOW;
+    while Instant::now() < until {
+        tokio::time::sleep(POLL_INTERVAL).await;
+        for (row, arn) in &launched {
+            let case = row.case;
+            let task = describe(&router, cluster, arn, case).await;
+            let reported = present_count(&container_of(&task, case), "exitCode", case);
+            assert_eq!(
+                reported, None,
+                "case {case:?}: expected no exitCode at all, got {reported:?} in {task}"
+            );
+            for member in ["stopCode", "stoppedReason"] {
+                assert_eq!(
+                    task.get(member).and_then(Value::as_str),
+                    None,
+                    "case {case:?}: a task no container of which exited carries no {member}, \
+                     got {task}"
+                );
+            }
+            assert_eq!(
+                string(&task, "lastStatus", case),
+                "RUNNING",
+                "case {case:?}: a task no container of which exited goes on running, got {task}"
+            );
+        }
     }
 }

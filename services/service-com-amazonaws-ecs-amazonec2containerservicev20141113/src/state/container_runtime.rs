@@ -551,9 +551,11 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// container exited"). Only a task something else has not already stopped takes it
     /// ([`TaskRecord::work_is_running`]), and only one whose end the clock does not already
     /// owe at an instant of its own: a STANDALONE task was placed to do a piece of work and
-    /// ends when that work is done ([`CONTAINER_WORK_SPAN`], which waits for these same
-    /// programs), while a task a service's or a daemon's scheduler placed is kept in place
-    /// by that scheduler and so ends here, at the instant its essential container exited.
+    /// is reported running for the span that work takes ([`CONTAINER_WORK_SPAN`], which the
+    /// clock materialises once an essential container HAS exited), while a task a service's
+    /// or a daemon's scheduler placed is kept in place by that scheduler and so ends here,
+    /// at the instant its essential container exited — as does a standalone task whose span
+    /// has already passed.
     pub(super) fn record_container_outcome(
         &mut self,
         container_arn: &str,
