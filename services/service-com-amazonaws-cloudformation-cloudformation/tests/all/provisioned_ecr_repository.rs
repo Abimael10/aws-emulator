@@ -768,3 +768,144 @@ async fn deleting_the_stack_deletes_the_repository_it_created() {
         "the repository must be gone with the stack that created it"
     );
 }
+
+/// Deploy `template` on the stack `name` as an UPDATE and answer the status it SETTLES on,
+/// through the suite-wide waiter — the companion of [`deploy_until_settled`] for the second
+/// deployment of one stack.
+async fn update_until_settled(
+    case: &str,
+    router: &MultiServiceRouter,
+    name: &str,
+    template: &str,
+) -> (String, Option<String>) {
+    let (status, body) = call(
+        router,
+        "UpdateStack",
+        &[member("StackName", name), member("TemplateBody", template)],
+    )
+    .await;
+    assert_eq!(status, 200, "UpdateStack({name}) answered {status}: {body}");
+    let settled = settled_stack_status(case, router, REGION, name).await;
+    let (_, body) = describe_stack(router, name).await;
+    (settled, xml_text(&body, "StackStatusReason"))
+}
+
+/// RULE: the same settings document that reaches the owning service's own call on the CREATE
+/// reaches it again when a LATER deployment states it differently — for a repository's
+/// `LifecyclePolicy`, through `PutLifecyclePolicy` for the document the new declaration
+/// carries and `DeleteLifecyclePolicy` for a declaration that stops carrying one — so the
+/// repository the stack already has ends up with the policy the template now declares rather
+/// than the deployment reporting a change it did not apply.
+#[tokio::test]
+async fn a_changed_lifecycle_policy_is_applied_to_the_repository_the_stack_already_has() {
+    let untagged = lifecycle_rule(
+        1,
+        "Expire untagged images after 14 days",
+        json!({
+            "tagStatus": "untagged",
+            "countType": "sinceImagePushed",
+            "countUnit": "days",
+            "countNumber": 14,
+        }),
+    );
+    let released = lifecycle_rule(
+        2,
+        "Keep the last 10 release images",
+        json!({
+            "tagStatus": "tagged",
+            "tagPrefixList": ["release"],
+            "countType": "imageCountMoreThan",
+            "countNumber": 10,
+        }),
+    );
+    let one_rule = json!({"rules": [untagged.clone()]});
+    let two_rules = json!({"rules": [untagged, released]});
+
+    // The rows differ along WHAT the second deployment does to the declared policy: replaces
+    // the document, adds one to a repository created without any, and drops the one the
+    // repository carries.
+    let declaration = |name: &str, policy: Option<&Value>| {
+        let mut properties = json!({"RepositoryName": name});
+        if let Some(policy) = policy {
+            properties["LifecyclePolicy"] = json!({"LifecyclePolicyText": policy.clone()});
+        }
+        json!({
+            "Resources": {"Registry": {
+                "Type": "AWS::ECR::Repository",
+                "Properties": properties,
+            }},
+        })
+        .to_string()
+    };
+    // (case, the repository's name, the policy the create declares, the policy the update
+    // declares, the policy the repository must hold afterwards)
+    type LifecycleUpdateRow = (
+        &'static str,
+        &'static str,
+        Option<Value>,
+        Option<Value>,
+        Option<Value>,
+    );
+    let rows: Vec<LifecycleUpdateRow> = vec![
+        (
+            "the document replaced by the update",
+            "cfn-updated-lifecycle",
+            Some(one_rule.clone()),
+            Some(two_rules.clone()),
+            Some(two_rules.clone()),
+        ),
+        (
+            "a policy added by the update to a repository created without one",
+            "cfn-late-lifecycle",
+            None,
+            Some(one_rule.clone()),
+            Some(one_rule.clone()),
+        ),
+        (
+            "the policy dropped by the update",
+            "cfn-unpoliced-again",
+            Some(two_rules),
+            None,
+            None,
+        ),
+    ];
+
+    for (index, (case, name, created, updated, expected)) in rows.iter().enumerate() {
+        let router = router();
+        let stack = format!("ecr-lifecycle-update-stack-{index}");
+        let (status, reason) =
+            deploy_until_settled(case, &router, &stack, &declaration(name, created.as_ref())).await;
+        assert_eq!(
+            status, "CREATE_COMPLETE",
+            "case {case:?}: expected the create to complete, got {status:?} ({reason:?})"
+        );
+        let (status, reason) =
+            update_until_settled(case, &router, &stack, &declaration(name, updated.as_ref())).await;
+        assert_eq!(
+            status, "UPDATE_COMPLETE",
+            "case {case:?}: expected the update to complete, got {status:?} ({reason:?})"
+        );
+        // An in-place change keeps the repository's identity: the policy is read back under
+        // the name the create published.
+        let reported = physical_id(&router, &stack, "Registry").await;
+        assert_eq!(
+            reported, *name,
+            "case {case:?}: expected the update to keep the repository {name:?}, got {reported:?}"
+        );
+        let held = lifecycle_policy(&router, &reported).await;
+        match expected {
+            Some(policy) => assert_eq!(
+                held.as_ref().ok(),
+                Some(policy),
+                "case {case:?}: expected the policy the update declares on {reported}, got \
+                 {held:?}"
+            ),
+            None => assert_eq!(
+                held.as_ref().err().map(String::as_str),
+                Some("LifecyclePolicyNotFoundException"),
+                "case {case:?}: expected the update to take the policy off {reported}, got \
+                 {held:?}"
+            ),
+        }
+    }
+}
