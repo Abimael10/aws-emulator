@@ -217,7 +217,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // returned, so the next page resumes strictly after it. A token this listing
         // never handed out — one of another listing's making, or one naming a position
         // in a different suppression list than the request selects — is the modelled
-        // `InvalidNextTokenException`, never read as "start from the beginning". A
+        // `InvalidNextTokenException`, never read as "start from the beginning", worded
+        // as THIS listing words that class ([`invalid_next_token_message`]). A
         // position whose entry has since been deleted stays valid: it is a point in the
         // order, not a record.
         let resume_after = match input.next_token.as_deref() {
@@ -233,7 +234,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .ok_or_else(|| {
                     ListSuppressedDestinationsErrorModeled::InvalidNextTokenException(
                         InvalidNextTokenException {
-                            message: Some(crate::state::invalid_next_token()),
+                            message: Some(invalid_next_token_message()),
                         },
                     )
                 })?,
@@ -307,4 +308,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_token,
         })
     }
+}
+
+/// How THIS listing words the refusal of a `NextToken` that is not a position in it.
+///
+/// AWS's own sentence for this operation's bad-cursor class, which is wholly FIXED text:
+/// the token is refused for being something this listing never handed out, and the
+/// rejected token is never echoed back. The wording belongs to the operation that refuses
+/// the cursor, not to the service: the listings whose refusal AWS renders as
+/// `BadRequestException` state the same condition in their own words
+/// ([`crate::state::invalid_next_token`]), and `ListEmailIdentities` in its own again, so
+/// these are deliberately not one string.
+fn invalid_next_token_message() -> String {
+    "Token is invalid.".to_string()
 }

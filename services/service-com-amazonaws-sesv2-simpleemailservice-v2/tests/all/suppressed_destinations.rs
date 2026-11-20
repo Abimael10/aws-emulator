@@ -1239,6 +1239,11 @@ async fn a_page_walk_reports_every_entry_once_and_terminates() {
     );
 }
 
+/// AWS's sentence for a `NextToken` this listing never minted, which the
+/// `InvalidNextTokenException` this operation models carries: wholly fixed text that
+/// never echoes the rejected cursor.
+const TOKEN_IS_INVALID: &str = "Token is invalid.";
+
 #[tokio::test]
 async fn a_next_token_this_listing_never_minted_is_refused() {
     let (ses, _base) = seeded().await;
@@ -1294,8 +1299,8 @@ async fn a_next_token_this_listing_never_minted_is_refused() {
         );
         assert_eq!(
             reply.message(),
-            "Invalid next token.",
-            "case {case:?}: expected the refusal to read \"Invalid next token.\", got {:?}",
+            TOKEN_IS_INVALID,
+            "case {case:?}: expected the refusal to read {TOKEN_IS_INVALID:?}, got {:?}",
             reply.message()
         );
     }
@@ -1333,6 +1338,112 @@ async fn a_next_token_this_listing_never_minted_is_refused() {
         resumed_tenant.status,
         resumed_tenant.body
     );
+}
+
+#[tokio::test]
+async fn the_cursor_refusal_reads_one_fixed_sentence_whatever_else_the_request_carries() {
+    let (ses, base) = seeded().await;
+
+    // The rows span what the rule generalises over: WHICH list the request selects (the
+    // account-level one, a tenant list holding entries, a tenant list holding none) and
+    // WHAT the request carries beside the cursor (nothing, a page size, a reason filter,
+    // a date window, and all of them at once).
+    let selections: [(&str, Option<&str>); 3] = [
+        ("the account-level list", None),
+        ("a tenant list holding entries", Some("tenant_one")),
+        ("a tenant list holding nothing", Some("tenant_empty")),
+    ];
+    let window_start = before(base, 10_000);
+    let alongside: Vec<(&str, Vec<(&'static str, String)>)> = vec![
+        ("the cursor on its own", Vec::new()),
+        ("a page size", vec![("PageSize", "1".to_string())]),
+        ("a reason filter", vec![("Reason", "BOUNCE".to_string())]),
+        (
+            "a date window",
+            vec![("StartDate", date_time(window_start))],
+        ),
+        (
+            "a page size, a reason filter and a window",
+            vec![
+                ("PageSize", "2".to_string()),
+                ("Reason", "COMPLAINT".to_string()),
+                ("StartDate", date_time(window_start)),
+            ],
+        ),
+    ];
+    // The forms a cursor this listing never minted arrives in: text that is not base64,
+    // base64 of a value no listing minted, another listing's cursor, and nothing at all.
+    let forged: [(&str, String); 4] = [
+        ("text that is not base64", "***not base64***".to_string()),
+        (
+            "base64 of a value no listing minted",
+            aws_smithy_types::base64::encode("alpha@example.com"),
+        ),
+        (
+            "another listing's cursor",
+            encode_tagged_page_token(CONTACTS_PAGE_TOKEN_TAG, "alpha@example.com"),
+        ),
+        ("the empty string", String::new()),
+    ];
+
+    for (selection_name, tenant) in selections {
+        // The positive control: the same selection with no cursor at all is served, and
+        // every refusal below must leave that answer exactly as it is.
+        let served = ses.list_suppressed(&selection(tenant)).await;
+        assert_eq!(
+            served.status,
+            200,
+            "case {selection_name:?} with no cursor: expected the listing to be served, \
+             got {} {:?}",
+            served.status,
+            served.body
+        );
+        let page = served.body.clone();
+
+        for (extras_name, extras) in &alongside {
+            for (form, token) in &forged {
+                let case = format!("{selection_name} with {form} and {extras_name}");
+                let mut query = selection(tenant);
+                query.extend(extras.iter().cloned());
+                query.push(("NextToken", token.clone()));
+                let refused = ses.list_suppressed(&query).await;
+                assert_eq!(
+                    (refused.status, refused.error_code().as_str()),
+                    (400, "InvalidNextTokenException"),
+                    "case {case:?}: expected 400 InvalidNextTokenException, got {} {} {:?}",
+                    refused.status,
+                    refused.error_code(),
+                    refused.body
+                );
+                assert_eq!(
+                    refused.message(),
+                    TOKEN_IS_INVALID,
+                    "case {case:?}: expected the refusal to read {TOKEN_IS_INVALID:?}, got {:?}",
+                    refused.message()
+                );
+                assert!(
+                    token.is_empty() || !refused.message().contains(token.as_str()),
+                    "case {case:?}: the refusal must not echo the rejected cursor, got {:?}",
+                    refused.message()
+                );
+                assert!(
+                    tenant.is_none_or(|tenant| !refused.message().contains(tenant)),
+                    "case {case:?}: the refusal must not name the list it selected, got {:?}",
+                    refused.message()
+                );
+            }
+        }
+
+        // The refusals read, so the selection still answers exactly what it answered
+        // before them.
+        let again = ses.list_suppressed(&selection(tenant)).await;
+        assert_eq!(
+            again.body, page,
+            "case {selection_name:?}: expected the refusals to leave the listing \
+             unchanged, got {:?}",
+            again.body
+        );
+    }
 }
 
 #[tokio::test]

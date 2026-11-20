@@ -3750,15 +3750,21 @@ fn boundary_clause(violation: &Violation) -> String {
 }
 
 /// How this service words the refusal of a `NextToken` that is not a position in the
-/// listing being read.
+/// listing being read, for the listings that render that refusal as
+/// `BadRequestException`.
 ///
-/// AWS's own sentence for the bad-cursor class, which is wholly FIXED text: a token is
-/// refused for being something this listing never handed out, and there is nothing else
-/// to say about it — in particular the rejected token is never echoed back. ONE wording
-/// for every listing of this service, whichever error shape carries it (the page-cursor
-/// refusals this service renders as `BadRequestException`, and the listings that model
-/// `InvalidNextTokenException`), because it is one condition: a second sentence for it
-/// would be exactly the drift this function exists to prevent.
+/// AWS's own sentence for the bad-cursor class on those listings, which is wholly FIXED
+/// text: a token is refused for being something this listing never handed out, and there
+/// is nothing else to say about it — in particular the rejected token is never echoed
+/// back. ONE wording for all of them, whatever form the bad cursor takes, because it is
+/// one condition; a second sentence for THOSE listings would be exactly the drift this
+/// function exists to prevent.
+///
+/// The wording belongs to the operation that refuses the cursor, so a listing AWS words
+/// differently states the condition in its own words beside its own handler and does not
+/// reach this function: `ListSuppressedDestinations`, whose model binds
+/// `InvalidNextTokenException` for it, and `ListEmailIdentities`, which echoes the cursor
+/// it rejected.
 pub fn invalid_next_token() -> String {
     "Invalid next token.".to_string()
 }
