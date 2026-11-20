@@ -1,21 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! WHICH phases a build reports once a phase failure has ABORTED it.
+//! WHICH phases a build reports once a phase failure has ENDED it.
 //!
-//! RULE: `on-failure` decides what a failing phase does to the build, and its default is
-//! `ABORT`: "the build stops" at the phase that failed, so every phase that would have come
-//! after it — the later buildspec phases AND the upload of the build's artifacts — is work
-//! the build never attempted, and `BatchGetBuilds` reports none of them. Not reported as
-//! failed, not reported as succeeded: absent. The build's own finishing work still ran, so
-//! `FINALIZING` and the terminal `COMPLETED` marker are reported, the build is
-//! `buildComplete` and its `buildStatus` is `FAILED`. `on-failure: CONTINUE` is the other
-//! arm: the phases after the failure DID run, so each of them is reported with its own
-//! outcome and the upload among them.
+//! RULE: `on-failure` decides what a failing phase does to the phases after it, and its
+//! default is `ABORT`: "the build stops" at a phase that PREPARES the build (`install`,
+//! `pre_build`), so every phase that would have come after it — the later buildspec phases
+//! AND the upload of the build's artifacts — is work the build never attempted, and
+//! `BatchGetBuilds` reports none of them. Not reported as failed, not reported as
+//! succeeded: absent. From the BUILD phase on, a failure stops none of that work: the
+//! commands of that phase ran and whatever they wrote is in the build's working tree, so
+//! CodeBuild still runs the phases it runs after the build phase and still packages what the
+//! build produced. Either way the build's own finishing work ran, so `FINALIZING` and the
+//! terminal `COMPLETED` marker are reported, the build is `buildComplete` and its
+//! `buildStatus` is `FAILED`. `on-failure: CONTINUE` is the other arm of the first half: the
+//! phases after a failure it continues past DID run, so each of them is reported with its
+//! own outcome and the upload among them.
 //!
-//! The rows span what the rule generalises over: WHICH phase aborts the build (each of the
-//! four a buildspec declares commands for), and whether the project names an artifacts
-//! DESTINATION at all — the upload phase is absent either way, since the abort is what
-//! decides it rather than there being nothing to upload.
+//! The rows span what the rule generalises over: WHICH phase fails (each of the four a
+//! buildspec declares commands for), the FORM its failing command takes, and whether the
+//! project names an artifacts DESTINATION at all — what decides the upload is where the
+//! failure fell rather than there being something to upload.
 //!
 //! Every call goes over the wire through the harness `project_build_lifecycle.rs` keeps.
 
@@ -23,9 +27,17 @@ use serde_json::{json, Value};
 
 use super::project_build_lifecycle::{create_project, emulator, merged, phase_pairs, settled_build};
 
-/// The phases a build reports ONLY when it got past its buildspec's phases: the later
-/// phases of the buildspec, and the upload of what they produced.
-const PHASES_AFTER_A_FAILURE: [&str; 4] = ["PRE_BUILD", "BUILD", "POST_BUILD", "UPLOAD_ARTIFACTS"];
+/// The phases a build goes through after its specification was read, in order: the four
+/// phases a buildspec declares commands for and then the upload of what they produced. The
+/// ones a build reports are decided by where its failure fell, so a row reads the phases
+/// AFTER its own failing phase out of this sequence.
+const PHASE_SEQUENCE: [&str; 5] = [
+    "INSTALL",
+    "PRE_BUILD",
+    "BUILD",
+    "POST_BUILD",
+    "UPLOAD_ARTIFACTS",
+];
 
 /// The phases every build that ran its commands reports, however they answered.
 const FINISHING_PHASES: [&str; 2] = ["FINALIZING", "COMPLETED"];
@@ -48,14 +60,14 @@ fn buildspec(phases: &[(&str, &str)]) -> String {
 }
 
 #[tokio::test]
-async fn an_aborted_build_reports_none_of_the_phases_it_never_attempted() {
+async fn a_build_a_preparing_phase_ended_reports_none_of_the_phases_it_never_attempted() {
     let router = emulator();
 
     // (case, the phase whose command fails, the whole buildspec, the artifacts destination)
     let destination = json!({"artifacts": {"type": "S3", "location": "artifact-destination"}});
     let rows: Vec<(&str, &str, String, Value)> = vec![
         (
-            "the install phase aborts the build",
+            "the install phase ends the build",
             "INSTALL",
             buildspec(&[
                 ("install", "false"),
@@ -66,7 +78,7 @@ async fn an_aborted_build_reports_none_of_the_phases_it_never_attempted() {
             json!({}),
         ),
         (
-            "the pre_build phase aborts the build",
+            "the pre_build phase ends the build",
             "PRE_BUILD",
             buildspec(&[
                 ("install", "echo installing"),
@@ -77,21 +89,23 @@ async fn an_aborted_build_reports_none_of_the_phases_it_never_attempted() {
             json!({}),
         ),
         (
-            "the pre_build phase aborts a build whose artifacts name a destination",
+            "the pre_build phase ends a build whose artifacts name a destination",
             "PRE_BUILD",
             buildspec(&[("pre_build", "false"), ("build", "echo never")]),
             destination.clone(),
         ),
         (
-            "the build phase aborts the build",
-            "BUILD",
-            buildspec(&[("build", "exit 7"), ("post_build", "echo never")]),
+            "an install phase ended by an explicit non-zero exit",
+            "INSTALL",
+            buildspec(&[("install", "exit 7"), ("build", "echo never")]),
             json!({}),
         ),
         (
-            "the post_build phase aborts the build",
-            "POST_BUILD",
-            buildspec(&[("build", "echo building"), ("post_build", "false")]),
+            "a pre_build phase whose own finally block is what failed",
+            "PRE_BUILD",
+            "version: 0.2\nphases:\n  pre_build:\n    commands:\n      - echo preparing\n    \
+             finally:\n      - false\n  build:\n    commands:\n      - echo never\n"
+                .to_string(),
             destination.clone(),
         ),
     ];
@@ -111,12 +125,12 @@ async fn an_aborted_build_reports_none_of_the_phases_it_never_attempted() {
         assert_eq!(
             build["buildStatus"],
             json!("FAILED"),
-            "case {case:?}: expected the aborted build to be FAILED, got {build}"
+            "case {case:?}: expected the ended build to be FAILED, got {build}"
         );
         assert_eq!(
             build["buildComplete"],
             json!(true),
-            "case {case:?}: an aborted build is complete, got {build}"
+            "case {case:?}: a build a failure ended is complete, got {build}"
         );
         // The phase that failed is reported, and it is the only one that failed.
         let failures: Vec<&String> = pairs
@@ -132,7 +146,7 @@ async fn an_aborted_build_reports_none_of_the_phases_it_never_attempted() {
         // Every phase the build would have reached after it is absent — neither failed nor
         // succeeded, but never attempted. The phases BEFORE the failure are not in scope
         // here, so the list is cut at the failing phase.
-        let after = PHASES_AFTER_A_FAILURE
+        let after = PHASE_SEQUENCE
             .iter()
             .skip_while(|phase| *phase != failing)
             .skip(1);
@@ -153,10 +167,115 @@ async fn an_aborted_build_reports_none_of_the_phases_it_never_attempted() {
     }
 }
 
-/// RULE: whether the build runs the phase AFTER one that failed is decided by that phase's
-/// own `on-failure` and by nothing else — `CONTINUE` runs the later phases, each reported
-/// with its own outcome and the upload among them, however the failing command came to fail
-/// — while the failed phase keeps its `FAILED` status and the build is `FAILED` either way.
+/// RULE: a failure from the BUILD phase on ends none of the work CodeBuild does after that
+/// phase — the commands of that phase ran and what they wrote is in the build's working
+/// tree, so the later buildspec phases still run and the build still ATTEMPTS the upload of
+/// its artifacts, which it reports as an `UPLOAD_ARTIFACTS` phase — while the failing phase
+/// keeps its `FAILED` status and the build is `FAILED`.
+///
+/// The rows differ along what the rule generalises over: WHICH phase from the build phase on
+/// fails, the FORM its failing command takes (a utility that answers failure, an explicit
+/// non-zero `exit`, a command of the phase's own `finally` block), and whether the project
+/// names an artifacts destination at all. WHERE the upload's bytes land, and the status that
+/// upload then reports, is the object store's half of the run, covered where a store is
+/// mounted (`core/router/tests/all/codebuild_s3_build_output.rs`).
+#[tokio::test]
+async fn a_failure_from_the_build_phase_on_still_reaches_the_upload() {
+    let router = emulator();
+
+    // (case, the phase whose command fails, the whole buildspec, the artifacts destination,
+    //  the phases that must be reported SUCCEEDED after it)
+    let destination = json!({"artifacts": {"type": "S3", "location": "artifact-destination"}});
+    let rows: Vec<(&str, &str, String, Value, Vec<&str>)> = vec![
+        (
+            "the build phase fails with an explicit non-zero exit",
+            "BUILD",
+            buildspec(&[("build", "exit 7"), ("post_build", "echo after")]),
+            json!({}),
+            vec!["POST_BUILD"],
+        ),
+        (
+            "the build phase fails with the utility that answers failure",
+            "BUILD",
+            buildspec(&[("build", "false"), ("post_build", "echo after")]),
+            json!({}),
+            vec!["POST_BUILD"],
+        ),
+        (
+            "a build phase whose own finally block is what failed",
+            "BUILD",
+            "version: 0.2\nphases:\n  build:\n    commands:\n      - echo building\n    \
+             finally:\n      - false\n  post_build:\n    commands:\n      - echo after\n"
+                .to_string(),
+            json!({}),
+            vec!["POST_BUILD"],
+        ),
+        (
+            "the post_build phase fails, and nothing of the buildspec is left to run",
+            "POST_BUILD",
+            buildspec(&[("build", "echo building"), ("post_build", "false")]),
+            json!({}),
+            vec![],
+        ),
+        (
+            "the build phase fails on a project whose artifacts name a destination",
+            "BUILD",
+            buildspec(&[("build", "exit 3"), ("post_build", "echo after")]),
+            destination.clone(),
+            vec!["POST_BUILD"],
+        ),
+    ];
+
+    for (index, (case, failing, spec, artifacts, succeeding)) in rows.iter().enumerate() {
+        let project = format!("build-failure-proj-{index}");
+        create_project(
+            &router,
+            &project,
+            merged(source_with(spec), artifacts.clone()),
+        )
+        .await;
+        let build = settled_build(&router, &project, json!({})).await;
+        let pairs = phase_pairs(&build);
+        let reported: Vec<String> = pairs.iter().map(|(phase, _)| phase.clone()).collect();
+
+        assert_eq!(
+            build["buildStatus"],
+            json!("FAILED"),
+            "case {case:?}: a phase that failed fails the build, got {build}"
+        );
+        assert_eq!(
+            pairs
+                .iter()
+                .find(|(phase, _)| phase == failing)
+                .and_then(|(_, status)| status.clone()),
+            Some("FAILED".to_string()),
+            "case {case:?}: expected {failing} to be reported FAILED, got {pairs:?}"
+        );
+        // The phases CodeBuild runs after it ran, and so did the build's own upload: the
+        // phase is REPORTED, whatever that upload then answered.
+        for phase in succeeding {
+            assert_eq!(
+                pairs
+                    .iter()
+                    .find(|(reported, _)| reported == phase)
+                    .and_then(|(_, status)| status.clone()),
+                Some("SUCCEEDED".to_string()),
+                "case {case:?}: expected {phase} to have run after the failure, got {pairs:?}"
+            );
+        }
+        for phase in ["UPLOAD_ARTIFACTS", "FINALIZING", "COMPLETED"] {
+            assert!(
+                reported.contains(&phase.to_string()),
+                "case {case:?}: expected {phase} to be reported, got {pairs:?}"
+            );
+        }
+    }
+}
+
+/// RULE: a phase whose `on-failure` is `CONTINUE` runs the phases after it however the
+/// failing command came to fail — each of them reported with its own outcome and the upload
+/// among them — while the failed phase keeps its `FAILED` status and the build is `FAILED`
+/// either way.
 ///
 /// The rows differ along what the rule generalises over: WHICH phase fails and continues, and
 /// the FORM its failing command takes — a command that exits non-zero of its own accord, and

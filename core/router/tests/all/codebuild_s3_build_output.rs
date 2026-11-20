@@ -11,9 +11,10 @@
 //! artifact is stored in MyArtifacts/<build-ID>/MyArtifact.zip") — and reports the S3 ARN
 //! of what it put there; a build whose buildspec declares no artifact file, or whose
 //! declared paths match nothing it produced, uploads nothing and ends FAILED with the
-//! client error CodeBuild states for it; a build a phase failure ABORTED uploads nothing at
-//! all, since the upload is work it never attempted; a project whose cache is held in the
-//! store carries
+//! client error CodeBuild states for it; a build whose own commands FAILED from the build
+//! phase on still uploads what they produced, while one a failure in the phases that only
+//! prepare it ended uploads nothing at all, since the upload is work it never attempted; a
+//! project whose cache is held in the store carries
 //! its declared cached paths from one build into the next, until `InvalidateProjectCache`
 //! resets it; and a build whose source is an object of the store runs on the files that
 //! archive holds.
@@ -538,57 +539,163 @@ async fn zipped_artifacts_land_as_one_object_with_its_checksums() {
     }
 }
 
-/// RULE: a build a phase failure ABORTED uploads nothing — the upload of its artifacts is
-/// work it never attempted, so the destination holds no object and the build reports no
-/// `UPLOAD_ARTIFACTS` phase — while the phase's own `finally` block still ran, which is what
-/// the failing phase's context reports.
+/// One row of the failed-build upload table: a build whose own commands failed, and what its
+/// destination must hold afterwards.
+struct FailedRow {
+    case: &'static str,
+    /// The phase whose command fails, as the build reports it.
+    failing: &'static str,
+    /// The context that phase reports: the command as written and the status it produced.
+    context: &'static str,
+    /// The buildspec the build runs.
+    buildspec: &'static str,
+    /// The keys the destination must hold once the build has settled.
+    keys: Vec<&'static str>,
+    /// The markers the one uploaded object must carry, in the order the commands wrote them
+    /// — empty for a row that uploads nothing.
+    markers: Vec<&'static str>,
+    /// Whether the build reports an `UPLOAD_ARTIFACTS` phase at all.
+    upload_reported: bool,
+}
+
+/// The rows of that table, spanning what the rule generalises over: WHICH phase failed
+/// (the build phase, and the phase after it), the FORM of the failure (an explicit non-zero
+/// `exit`, a utility that answers failure), WHICH block of the failing phase wrote the
+/// declared file (its `commands`, its `finally`), and the control arm — a failure in the
+/// phases that only PREPARE the build, which the build does not get past.
+fn failed_rows() -> Vec<FailedRow> {
+    vec![
+        FailedRow {
+            case: "the build phase exits non-zero and its finally block appends to the file \
+                   its commands wrote",
+            failing: "BUILD",
+            context: "Error while executing command: exit 7. Reason: exit status 7",
+            buildspec: "version: 0.2\nphases:\n  build:\n    commands:\n      \
+                        - \"echo pre-marker >> out.txt\"\n      - \"exit 7\"\n    finally:\n      \
+                        - \"echo finally-marker >> out.txt\"\nartifacts:\n  files:\n    \
+                        - out.txt\n",
+            keys: vec!["build/out.txt"],
+            markers: vec!["pre-marker", "finally-marker"],
+            upload_reported: true,
+        },
+        FailedRow {
+            case: "the declared file is written only by the finally block of the failing phase",
+            failing: "BUILD",
+            context: "Error while executing command: false. Reason: exit status 1",
+            buildspec: "version: 0.2\nphases:\n  build:\n    commands:\n      - \"false\"\n    \
+                        finally:\n      - \"echo finally-only >> out.txt\"\nartifacts:\n  \
+                        files:\n    - out.txt\n",
+            keys: vec!["build/out.txt"],
+            markers: vec!["finally-only"],
+            upload_reported: true,
+        },
+        FailedRow {
+            case: "the phase after the build phase is the one that failed",
+            failing: "POST_BUILD",
+            context: "Error while executing command: exit 3. Reason: exit status 3",
+            buildspec: "version: 0.2\nphases:\n  build:\n    commands:\n      \
+                        - \"echo built-marker >> out.txt\"\n  post_build:\n    commands:\n      \
+                        - \"exit 3\"\nartifacts:\n  files:\n    - out.txt\n",
+            keys: vec!["build/out.txt"],
+            markers: vec!["built-marker"],
+            upload_reported: true,
+        },
+        FailedRow {
+            case: "a failure in the phases that only prepare the build never reaches the upload",
+            failing: "PRE_BUILD",
+            context: "Error while executing command: false. Reason: exit status 1",
+            buildspec: "version: 0.2\nphases:\n  pre_build:\n    commands:\n      \
+                        - \"false\"\n    finally:\n      \
+                        - \"echo finally-marker >> out.txt\"\n  build:\n    commands:\n      \
+                        - \"echo never >> out.txt\"\nartifacts:\n  files:\n    - out.txt\n",
+            keys: vec![],
+            markers: vec![],
+            upload_reported: false,
+        },
+    ]
+}
+
+/// RULE: the upload of a build's artifacts is the build's OWN finishing work rather than a
+/// phase of its buildspec, and a failure from the BUILD phase on stops none of the work
+/// CodeBuild does after that phase, so a build whose commands FAILED there still packages
+/// the files they produced — what a failing phase's `finally` block wrote among them — to
+/// the destination its artifacts name, and still reports an `UPLOAD_ARTIFACTS` phase, while
+/// the failing phase keeps its `FAILED` status and the build is `FAILED`. A build a failure
+/// in the phases that only PREPARE it (`install`, `pre_build`) ended produced nothing and
+/// never attempted that upload: its destination holds no object and it reports no upload
+/// phase.
 #[tokio::test]
-async fn an_aborted_builds_output_is_not_uploaded() {
+async fn a_failed_builds_declared_artifact_is_still_uploaded() {
     let router = emulator();
     let role = codebuild_role(&router, "codebuild-failed-role").await;
-    let bucket = "codebuild-failed-output";
-    create_bucket(&router, bucket).await;
-    let buildspec = "version: 0.2\nphases:\n  build:\n    commands:\n      \
-         - \"echo pre-marker >> out.txt\"\n      - \"exit 7\"\n    finally:\n      \
-         - \"echo finally-marker >> out.txt\"\nartifacts:\n  files:\n    - out.txt\n";
-    create_project(
-        &router,
-        "codebuild-failed-proj",
-        &role,
-        buildspec,
-        json!({"artifacts": {"type": "S3", "location": bucket, "name": "build"}}),
-    )
-    .await;
 
-    let build = settled_build(&router, "codebuild-failed-proj").await;
-    assert_eq!(
-        build["buildStatus"],
-        json!("FAILED"),
-        "a command exiting non-zero fails the build, got {build}"
-    );
-    assert_eq!(
-        phase_message(&build, "BUILD"),
-        "Error while executing command: exit 7. Reason: exit status 7",
-        "expected the command and the status it exited with, got {build}"
-    );
-    // The phases after the failing one were never attempted, the upload among them.
-    let phases: Vec<String> = build["phases"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|phase| phase["phaseType"].as_str().map(str::to_string))
-        .collect();
-    assert!(
-        !phases.contains(&"UPLOAD_ARTIFACTS".to_string()),
-        "an aborted build never attempted its upload, so it reports no upload phase, got \
-         {phases:?}"
-    );
-    let keys = object_keys(&router, bucket).await;
-    assert!(
-        keys.is_empty(),
-        "an aborted build uploads nothing, got {keys:?}"
-    );
+    for (index, row) in failed_rows().into_iter().enumerate() {
+        // One bucket per row, so the keys asserted below are this row's whole output.
+        let bucket = format!("codebuild-failed-output-{index}");
+        create_bucket(&router, &bucket).await;
+        let project = format!("codebuild-failed-proj-{index}");
+        create_project(
+            &router,
+            &project,
+            &role,
+            row.buildspec,
+            json!({"artifacts": {"type": "S3", "location": bucket, "name": "build"}}),
+        )
+        .await;
+
+        let build = settled_build(&router, &project).await;
+        assert_eq!(
+            build["buildStatus"],
+            json!("FAILED"),
+            "case {:?}: a command exiting non-zero fails the build, got {build}",
+            row.case
+        );
+        let reported = phase_message(&build, row.failing);
+        assert_eq!(
+            reported, row.context,
+            "case {:?}: expected the failing phase to report {:?}, got {reported:?}",
+            row.case, row.context
+        );
+        let phases: Vec<String> = build["phases"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|phase| phase["phaseType"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            phases.contains(&"UPLOAD_ARTIFACTS".to_string()),
+            row.upload_reported,
+            "case {:?}: expected the upload phase to be reported: {}, got {phases:?}",
+            row.case,
+            row.upload_reported
+        );
+        let keys = object_keys(&router, &bucket).await;
+        assert_eq!(
+            keys, row.keys,
+            "case {:?}: expected the destination to hold {:?}, got {keys:?}",
+            row.case, row.keys
+        );
+        for key in &row.keys {
+            let bytes = object_bytes(&router, &bucket, key)
+                .await
+                .unwrap_or_else(|| panic!("case {:?}: the store must hold {key}", row.case));
+            let held = String::from_utf8_lossy(&bytes).to_string();
+            // The markers appear in the order the commands wrote them: the file the build
+            // uploaded is the one its commands built up, block by block.
+            let mut rest = held.as_str();
+            for marker in &row.markers {
+                let found = rest.find(marker).unwrap_or_else(|| {
+                    panic!(
+                        "case {:?}: expected {key} to carry {marker:?} after what came before \
+                         it, got {held:?}",
+                        row.case
+                    )
+                });
+                rest = &rest[found + marker.len()..];
+            }
+        }
+    }
 }
 
 /// RULE: a project whose cache is held in the object store carries its declared cached

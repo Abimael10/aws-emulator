@@ -296,9 +296,10 @@ async fn a_phases_finally_block_runs_after_its_commands() {
             "case {case:?}: expected the exported STATE {expected_state:?}, got {state:?}"
         );
         // Whatever the commands answered, the build did its own finishing work, which is
-        // the phase every build that ran its commands reports. The phase that puts its
-        // output where its artifacts say is reported only by a build no phase failure
-        // ABORTED: a build that ended at a failing phase never attempted that upload.
+        // the phase every build that ran its commands reports. Every row here fails (or
+        // succeeds) in the BUILD phase, and a failure from that phase on stops neither the
+        // phases after it nor the build's own upload, so the phase that puts its output
+        // where its artifacts say is reported for every row.
         let phases: Vec<String> = build["phases"]
             .as_array()
             .cloned()
@@ -310,13 +311,9 @@ async fn a_phases_finally_block_runs_after_its_commands() {
             phases.contains(&"FINALIZING".to_string()),
             "case {case:?}: expected the build's finishing phase to be reported, got {phases:?}"
         );
-        // Every FAILED row here fails a phase whose `on-failure` is the default, ABORT.
-        let aborted = *expected_status == "FAILED";
-        assert_eq!(
+        assert!(
             phases.contains(&"UPLOAD_ARTIFACTS".to_string()),
-            !aborted,
-            "case {case:?}: expected the upload phase to be reported only for a build no \
-             failure aborted, got {phases:?}"
+            "case {case:?}: expected the upload phase to be reported, got {phases:?}"
         );
     }
 }

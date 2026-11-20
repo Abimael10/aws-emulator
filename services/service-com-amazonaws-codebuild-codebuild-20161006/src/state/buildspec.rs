@@ -8,20 +8,25 @@
 //! `buildStatus` is what those commands answered: `SUCCEEDED` when every command of
 //! every phase exited zero, and `FAILED` when one did not. `FAULT` is CodeBuild's
 //! build-SYSTEM failure, so it is not what a build whose own commands failed reports.
-//! Each phase's `phaseStatus` is the same answer for that phase's commands, and a phase
-//! whose failure aborts the build is the last COMMAND phase the build reports — the phases
-//! after it never ran, so none is reported. WHICH of the two a failing phase does is the
-//! `on-failure` of that phase and nothing else: `CONTINUE` goes on to the next phase,
-//! however the failure came about and however many phases have already failed, while the
-//! failed phase keeps its own `FAILED` status and the build is `FAILED` either way. A
-//! phase's `finally` block runs after its commands whatever they answered, and an `exit`
-//! ends the command BLOCK it was performed in — CodeBuild runs each block in its own shell
-//! instance — so it ends neither the `finally` block after it nor the phases after that.
+//! Each phase's `phaseStatus` is the same answer for that phase's commands, and the failed
+//! phase keeps its own `FAILED` status however the build goes on. WHAT a failure does to
+//! the phases after it is decided by `on-failure` and by WHERE in the sequence the failing
+//! phase sits: `CONTINUE` goes on to the next phase, however the failure came about and
+//! however many phases have already failed, while `ABORT` — the default — ends the build at
+//! a phase that PREPARES it ([`PREPARING_PHASES`]), so the phases after that one never ran
+//! and the build reports none of them. From the BUILD phase on, a failure stops none of the
+//! work CodeBuild does after that phase: the build's commands have run and what they wrote
+//! is in its working tree, so the later command phases still run and the build still
+//! packages what it produced. A phase's `finally` block runs after its commands whatever
+//! they answered, and an `exit` ends the command BLOCK it was performed in — CodeBuild runs
+//! each block in its own shell instance — so it ends neither the `finally` block after it
+//! nor the phases after that.
 //!
 //! A build that ran its commands then does its own finishing work whether they succeeded
 //! or failed: what it produced is put where its artifacts say and the build reports an
-//! `UPLOAD_ARTIFACTS` phase for it, so a FAILED build uploads what it did produce exactly
-//! as a successful one does. That transfer is the object store's half of the run and is
+//! `UPLOAD_ARTIFACTS` phase for it, so a build its own build phase FAILED uploads what it
+//! did produce — a `finally` block's output among it — exactly as a successful one does.
+//! That transfer is the object store's half of the run and is
 //! performed by [`super::build_run`], which calls [`run_commands`] and then
 //! [`finish_build`] with what the transfer answered: this module decides nothing about
 //! where an artifact went. Nor does it decide what the build's `reports` sections came to:
@@ -99,6 +104,26 @@ const COMMAND_PHASES: [(&str, &str); 4] = [
     ("build", "BUILD"),
     ("post_build", "POST_BUILD"),
 ];
+
+/// The command phases that run BEFORE the build phase, as the `BuildPhaseType` each is
+/// reported by: the ones whose failure under `on-failure: ABORT` ENDS the build.
+///
+/// `on-failure: ABORT` "aborts the build", and what a build has left to do depends on where
+/// it is: `install` and `pre_build` only PREPARE it, so a build that failed to install what
+/// it needs or to get ready has nothing left to run and nothing it produced, and CodeBuild
+/// stops there. Once the build phase has run, the commands have produced whatever they
+/// produced, and the work CodeBuild does after that phase still happens: `post_build` runs
+/// after a failing build phase — which is what the build environment's documented
+/// `CODEBUILD_BUILD_SUCCEEDING` ("whether the current build is succeeding") is there for a
+/// command of that phase to read — and the build's own artifact upload packages what the
+/// commands wrote.
+const PREPARING_PHASES: [&str; 2] = ["INSTALL", "PRE_BUILD"];
+
+/// Whether a FAILING phase reported as `phase_type` ends the build under `on-failure:
+/// ABORT` ([`PREPARING_PHASES`]).
+fn failure_ends_the_build(phase_type: &str) -> bool {
+    PREPARING_PHASES.contains(&phase_type)
+}
 
 /// The `PhaseContext$statusCode` CodeBuild reports when the buildspec itself could not
 /// be read, and the two readings that carry it.
@@ -544,15 +569,16 @@ pub struct CommandRun {
     /// Whether the build got far enough to have output to put anywhere. A build whose
     /// specification could not be read, or whose runtimes could not be installed, never
     /// reached its own finishing work, so it reports no upload phase at all — and neither
-    /// does one a phase failure ABORTED ([`Self::aborted`]), since the phases after that
-    /// failure were never attempted.
+    /// does one that was ENDED before it ran its build phase ([`Self::aborted`]), since the
+    /// work after that point was never attempted.
     pub reached_output: bool,
-    /// Whether a phase failure, or the build's execution timeout, ENDED the build:
-    /// `on-failure: ABORT` (the default) stops the build at the phase that failed, and a
-    /// build whose execution timeout fell due is ended at the phase that was running then,
-    /// so every phase after it — the later buildspec phases and the upload of the build's
-    /// artifacts — is one the build never attempted, and the build reports none of them. The
-    /// build's own finishing work still runs, so [`finish_build`] still reports that.
+    /// Whether a failure in a phase that PREPARES the build ([`PREPARING_PHASES`]), or the
+    /// build's execution timeout, ENDED the build: `on-failure: ABORT` (the default) stops
+    /// the build at such a phase, and a build whose execution timeout fell due is ended at
+    /// the phase that was running then, so every phase after it — the later buildspec phases
+    /// and the upload of the build's artifacts — is one the build never attempted, and the
+    /// build reports none of them. The build's own finishing work still runs, so
+    /// [`finish_build`] still reports that.
     pub aborted: bool,
     /// The buildspec it ran, which is what declares WHICH files its artifacts and its
     /// cache are made of — `None` for a build that never got one.
@@ -851,10 +877,13 @@ pub fn run_commands(
             clock.at_millis,
             phase_contexts(reported),
         ));
-        // A phase whose failure aborts the build is the last phase that ran, so the build
+        // A phase whose failure ENDS the build is the last phase that ran, so the build
         // reports none of the ones after it; `on-failure: CONTINUE` goes on to the next
-        // phase, however many phases have already failed.
-        if phase_failed && declared.abort_on_failure {
+        // phase, however many phases have already failed, and a failure from the build
+        // phase on stops neither the phases after it nor the build's own upload
+        // ([`PREPARING_PHASES`]).
+        if phase_failed && declared.abort_on_failure && failure_ends_the_build(declared.phase_type)
+        {
             aborted = true;
             break;
         }
@@ -869,12 +898,12 @@ pub fn run_commands(
     CommandRun {
         failed,
         phases,
-        // A build that ran its commands through has output to put where its artifacts say,
-        // whether those commands succeeded or not: CodeBuild uploads what a build whose
-        // phases all ran produced for a FAILED build exactly as for one that succeeded.
+        // A build that ran its commands has output to put where its artifacts say, whether
+        // those commands succeeded or not: CodeBuild uploads what a build produced for a
+        // FAILED build exactly as for one that succeeded.
         //
-        // A build a phase failure ABORTED is the other case: the build ended at that phase,
-        // so putting its output anywhere is work it never attempted, and it reports no
+        // A build that was ENDED before its build phase ran is the other case: it produced
+        // nothing, so putting output anywhere is work it never attempted, and it reports no
         // upload phase at all ([`CommandRun::aborted`]).
         reached_output: !aborted,
         aborted,
@@ -899,9 +928,10 @@ pub fn run_commands(
 /// where it belongs (which includes a build with nothing to put anywhere), and the context
 /// CodeBuild reports for one that could not.
 ///
-/// A build a phase failure ABORTED, or its execution timeout ENDED, attempted no upload at
-/// all, so it reports no `UPLOAD_ARTIFACTS` phase — its own finishing work still ran, which
-/// is the phase it does report before the terminal marker.
+/// A build that a failure in one of the phases that PREPARE it ENDED, or that its execution
+/// timeout ended, attempted no upload at all, so it reports no `UPLOAD_ARTIFACTS` phase —
+/// its own finishing work still ran, which is the phase it does report before the terminal
+/// marker.
 ///
 /// The finishing phases are stamped where the build's clock stands
 /// ([`CommandRun::ended_millis`]): they come after every phase that ran, so the windows the
