@@ -44,7 +44,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The name Athena reaches the account's AWS Glue Data Catalog by.
-const GLUE_CATALOG: &str = "AwsDataCatalog";
+pub(crate) const GLUE_CATALOG: &str = "AwsDataCatalog";
 
 /// A SigV4 `Authorization` header whose credential scope names `service`, which is the
 /// routing key the router claims a request by. The key id and signature are not
@@ -58,7 +58,10 @@ fn authorization(service: &str) -> String {
 
 /// Athena and Glue mounted on ONE shared engine, the way the router mounts every
 /// service: the catalog Glue writes is the catalog Athena reports.
-fn emulator() -> MultiServiceRouter {
+///
+/// `pub(crate)` because `tests/all` is ONE crate: a sibling suite over these same two
+/// services mounts them through this one function rather than copying it.
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -99,12 +102,20 @@ async fn call(
 }
 
 /// One Athena call, as a client makes it.
-async fn athena(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn athena(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     call(router, "athena", "AmazonAthena", operation, body).await
 }
 
 /// One Athena call that must succeed, and its body.
-async fn athena_ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+pub(crate) async fn athena_ok(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> Value {
     let (status, parsed) = athena(router, operation, body).await;
     assert_eq!(
         status, 200,
@@ -114,7 +125,11 @@ async fn athena_ok(router: &MultiServiceRouter, operation: &str, body: &Value) -
 }
 
 /// One Glue call that must succeed, and its body.
-async fn glue_ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+pub(crate) async fn glue_ok(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> Value {
     let (status, parsed) = call(router, "glue", "AWSGlue", operation, body).await;
     assert_eq!(
         status, 200,
@@ -809,8 +824,8 @@ async fn refusals_name_what_was_asked_for() {
             }),
             "MetadataException",
             // The metastore's own answer for a table it does not hold, which names no
-            // entity of the request.
-            service_com_amazonaws_athena_amazonathena::state::table_not_found(),
+            // entity of the request — carried through into Athena's relayed refusal.
+            ::service_com_amazonaws_glue_awsglue::state::messages::TABLE_ENTITY_NOT_FOUND,
         ),
     ];
 

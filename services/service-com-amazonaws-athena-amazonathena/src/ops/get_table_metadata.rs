@@ -17,7 +17,11 @@
 //! through an external Hive metastore or a connector function this emulator does not
 //! host, and a `CatalogName` nothing registered is refused with
 //! `InvalidRequestException`. A database or a table the catalog does not hold is the
-//! METASTORE's answer, so it is refused with `MetadataException`.
+//! METASTORE's answer, so it is refused with `MetadataException` — and because that answer
+//! came back from a CALL to the Data Catalog, the message is the catalog's own sentence
+//! inside the clause the relaying SDK layer states around a caught service exception
+//! ([`crate::state::relayed_catalog_entity_not_found`]), which is what tells a client that
+//! the entity is the thing that is missing.
 //!
 //! The reported table carries its STORAGE DESCRIPTOR in `Parameters`: Athena presents a
 //! Data Catalog table as the Hive table it is, one flat property set, and

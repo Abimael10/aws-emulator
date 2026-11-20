@@ -622,17 +622,71 @@ pub fn delete_catalog_only_unsupported(catalog_name: &str, catalog_type: &str) -
 /// The miss is the METASTORE's answer, which is why it is reported as `MetadataException`
 /// rather than as a bad request — and the sentence is therefore the metastore's own, taken
 /// from the Data Catalog this read resolved against rather than composed here, so a
-/// database miss reads the same whether a client asked Athena or asked the catalog.
+/// database miss reads the same whether a client asked Athena or asked the catalog. It is
+/// reported as the RELAYED answer it is ([`relayed_catalog_entity_not_found`]): the
+/// catalog's own sentence inside the clause naming the call it came back from.
 pub fn database_not_found(database_name: &str) -> String {
-    glue_state::messages::database_not_found(database_name)
+    relayed_catalog_entity_not_found(&glue_state::messages::database_not_found(database_name))
 }
 
 /// The refusal message for a metadata read whose `TableName` names no table the
 /// addressed database holds. The per-kind counterpart of [`database_not_found`]: the same
 /// metastore answers it, so the sentence is that metastore's own wording for a table its
-/// store does not hold, which names no entity of the request.
-pub fn table_not_found() -> &'static str {
-    glue_state::messages::TABLE_ENTITY_NOT_FOUND
+/// store does not hold — which names no entity of the request — relayed in the same
+/// clause ([`relayed_catalog_entity_not_found`]).
+pub fn table_not_found() -> String {
+    relayed_catalog_entity_not_found(glue_state::messages::TABLE_ENTITY_NOT_FOUND)
+}
+
+/// The service the SDK layer that relayed a metadata read names for the component that
+/// answered it: Athena's metadata plane resolves a database or a table by CALLING the
+/// Data Catalog, which that layer addresses as its own component rather than as the Glue
+/// API ([`RELAYED_CATALOG_SERVICE`] is what a relayed clause of this service states, the
+/// same name the catalog's refusals carry where another service surfaces them).
+const RELAYED_CATALOG_SERVICE: &str = "AmazonDataCatalog";
+
+/// The error code the Data Catalog answers a reference that resolved to nothing under,
+/// and so the simple name of the exception class the relaying SDK layer caught for it.
+const RELAYED_CATALOG_ENTITY_NOT_FOUND: &str = "EntityNotFoundException";
+
+/// The HTTP status the Data Catalog RAISED such a miss with — the client-error status its
+/// own awsJson surface answers a missing entity with, which is not necessarily the status
+/// this service answers the relaying call with.
+const RELAYED_CATALOG_CLIENT_STATUS: u16 = 400;
+
+/// `reason`, the sentence the DATA CATALOG itself answered a metadata read with, as this
+/// service reports it to its caller: that sentence verbatim, then the clause the SDK layer
+/// that relayed the call states around a caught service exception — the component that
+/// answered, the status it raised the refusal with, the error code it answered under, that
+/// call's own request id and the proxy it came through.
+///
+/// Athena registers no databases and no tables of its own, so a metadata read of
+/// `AwsDataCatalog` (or of a registered `GLUE` catalog naming the same catalog id) is a
+/// CALL to the Data Catalog, and a miss it comes back with belongs to that call. The
+/// relayed sentence is therefore not re-worded here, and the clause is what tells a client
+/// WHICH component refused and under which code — the detail `MetadataException` carries
+/// nowhere else, and the only thing that distinguishes an absent entity from any other
+/// metastore failure.
+///
+/// The request id belongs to the relayed CALL, so one is minted per call rather than
+/// derived from the request, and the whole clause comes from the workspace's one rendering
+/// of it (`service_common::relayed_refusal`) so a client parses one form whichever
+/// emulated service relayed a call.
+pub fn relayed_catalog_entity_not_found(reason: &str) -> String {
+    ::service_common::relayed_refusal::caught_exception_message(
+        // The relaying service states no opening of its own here and the relayed answer
+        // names no exception class, so the message is the catalog's sentence and the
+        // clause alone.
+        "",
+        "",
+        reason,
+        ::service_common::relayed_refusal::CaughtCall {
+            service: RELAYED_CATALOG_SERVICE,
+            status: RELAYED_CATALOG_CLIENT_STATUS,
+            code: RELAYED_CATALOG_ENTITY_NOT_FOUND,
+            request_id: &::service_common::query_error_envelope::new_request_id(),
+        },
+    )
 }
 
 /// The refusal message for a listing whose `Expression` is no pattern the catalog can

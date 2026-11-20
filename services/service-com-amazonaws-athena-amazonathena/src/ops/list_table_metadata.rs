@@ -17,7 +17,9 @@
 //! registered catalog of any other type reads through an external Hive metastore or a
 //! connector function this emulator does not host, which is the METASTORE's answer and so
 //! `MetadataException`; a `CatalogName` nothing registered is refused with
-//! `InvalidRequestException`.
+//! `InvalidRequestException`. A `DatabaseName` the catalog does not hold is the CATALOG's
+//! answer to the call this listing made to it, so it is reported as the relayed refusal it
+//! is ([`crate::state::relayed_catalog_entity_not_found`]).
 //!
 //! `Expression` selects the tables whose WHOLE name matches the pattern, in the one
 //! pattern language the catalog serving these tables implements
