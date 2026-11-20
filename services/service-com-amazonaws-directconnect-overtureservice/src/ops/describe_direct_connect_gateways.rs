@@ -168,28 +168,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Lists all your Direct Connect gateways or only the specified Direct
         // Connect gateway. Deleted Direct Connect gateways are not returned."
-        let selected: Vec<&crate::state::DirectConnectGateway> = match &input
-            .direct_connect_gateway_id
-        {
-            Some(gateway_id) => match store
-                .gateways
-                .get(gateway_id)
-                .filter(|gateway| gateway.direct_connect_gateway_state != "deleted")
-            {
-                Some(gateway) => vec![gateway],
-                // An id that names nothing is a bad parameter, not an empty page.
-                None => {
-                    return Err(client_error(format!(
-                        "Direct Connect gateway ID {gateway_id} does not exist"
-                    )))
-                }
-            },
-            None => store
-                .gateways_in_order()
-                .into_iter()
-                .filter(|gateway| gateway.direct_connect_gateway_state != "deleted")
-                .collect(),
-        };
+        //
+        // `directConnectGatewayId` NARROWS that listing, so it SELECTS and is not a
+        // lookup that has to resolve: the same sentence has a gateway that was
+        // deleted simply absent from the answer rather than reported as a bad
+        // parameter, and a listing states "nothing matched" the one way a listing
+        // can — an empty page. A well-formed id selecting no gateway therefore falls
+        // through to the normal 200 path, exactly as the association, attachment and
+        // proposal listings of this same family already do.
+        let selected: Vec<&crate::state::DirectConnectGateway> = store
+            .gateways_in_order()
+            .into_iter()
+            .filter(|gateway| {
+                gateway.direct_connect_gateway_state != "deleted"
+                    && input
+                        .direct_connect_gateway_id
+                        .as_deref()
+                        .is_none_or(|id| gateway.direct_connect_gateway_id == id)
+            })
+            .collect();
 
         let Some(page) = crate::state::paginate(
             selected,

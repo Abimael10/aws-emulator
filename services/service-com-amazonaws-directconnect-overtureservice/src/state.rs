@@ -73,6 +73,32 @@ pub fn amazon_side_asn_is_private(asn: i64) -> bool {
         .any(|(low, high)| (*low..=*high).contains(&asn))
 }
 
+/// How this service STATES a refusal of a listing of associations that selects by nothing.
+///
+/// `DescribeDirectConnectGatewayAssociations` publishes its listing in forms that each name at
+/// least one of the Direct Connect gateway, the gateway associated with it, or the association
+/// itself ("You must specify one of the following: A Direct Connect gateway … A virtual private
+/// gateway … A transit gateway …"), so a request carrying none of those members asks for no
+/// listing at all. FIXED text: nothing of the request varies it. Stated here beside this
+/// service's other refusal wording.
+pub const ASSOCIATION_SELECTOR_REQUIRED_MESSAGE: &str =
+    "Either Direct Connect Gateway ID or Associated Gateway ID or Association ID must be set";
+
+/// How this service STATES a refusal of an Amazon-side ASN outside the ranges
+/// [`PRIVATE_AMAZON_SIDE_ASN_RANGES`] holds.
+///
+/// `amazonSideAsn` carries no `@range` in the model
+/// (`smithy_query(query="operation",operation="CreateDirectConnectGateway")`), so the
+/// bound is the documented one and the sentence reporting it is this service's own: the
+/// VALUE the request submitted, then fixed text. The member is not named and the ranges
+/// are not restated — a client branches on this sentence to tell a bad ASN from any
+/// other client fault, since every one of them shares the one error shape and the one
+/// 400 status. Stated here once, so every caller that refuses such a value words it
+/// alike.
+pub fn amazon_side_asn_not_valid_message(asn: i64) -> String {
+    format!("{asn} is not a valid value for Amazon Side ASN")
+}
+
 /// The largest page a `maxResults` of `MaxResultSetSize` can ask for: "If
 /// MaxResults is given a value larger than 100, only 100 results are returned."
 pub const MAX_RESULT_SET_SIZE: i32 = 100;

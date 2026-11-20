@@ -178,6 +178,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into()
         };
 
+        // "You must specify one of the following: A Direct Connect gateway … A virtual
+        // private gateway … A transit gateway … A Direct Connect gateway and a virtual
+        // private gateway …" — every form this listing is published in names at least
+        // one of the Direct Connect gateway, the gateway associated with it, or the
+        // association itself, so a request that carries NONE of those members asks for
+        // no listing this operation publishes and is refused rather than answered with
+        // every association the account holds. What a member that IS carried holds is
+        // not judged here: a selector is a filter, so a value naming no association —
+        // the empty string included — selects nothing and is answered with an empty
+        // page.
+        if input.direct_connect_gateway_id.is_none()
+            && input.associated_gateway_id.is_none()
+            && input.virtual_gateway_id.is_none()
+            && input.association_id.is_none()
+        {
+            return Err(client_error(
+                crate::state::ASSOCIATION_SELECTOR_REQUIRED_MESSAGE.to_string(),
+            ));
+        }
+
         // The page is taken as a SNAPSHOT under the lock, so the store is not held
         // while the owner of gateways is asked what each associated gateway attaches.
         let (page_items, next_token) = {

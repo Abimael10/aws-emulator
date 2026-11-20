@@ -240,26 +240,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The Direct Connect gateway the association is made ON. Checked before the
-        // owner of gateways is asked anything, and the guard is dropped before that
-        // hop: no store lock is held across a call into another service.
-        {
-            let mut store = state.lock();
-            store.settle_due_transitions();
-            if !store
-                .gateways
-                .get(&input.direct_connect_gateway_id)
-                .is_some_and(|gateway| gateway.direct_connect_gateway_state != "deleted")
-            {
-                return Err(client_error(format!(
-                    "Direct Connect gateway ID {} does not exist",
-                    input.direct_connect_gateway_id
-                )));
-            }
-        }
-
         // ASKED, never assumed: the gateway, its owner, its Region and the VPCs it
-        // attaches come from the service that owns them.
+        // attaches come from the service that owns them. It is asked BEFORE this
+        // service looks for the Direct Connect gateway the association would be made
+        // on, because a request that names neither an existing gateway to associate
+        // nor an existing Direct Connect gateway is refused about the GATEWAY TO
+        // ASSOCIATE: that is the resource whose owner is resolved first. No store
+        // lock is taken before this hop, so none is held across a call into another
+        // service.
         let Some(gateway) =
             crate::state::ec2_network::resolve_gateway(ctx, &region, &gateway_id, kind).await
         else {
@@ -295,8 +283,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle_due_transitions();
 
-        // The Direct Connect gateway is re-read after the hop: it may have been torn
-        // down while the owner of gateways was being asked.
+        // The Direct Connect gateway the association is made ON, read once the owner
+        // of the gateway to associate has answered: a gateway torn down while that
+        // owner was being asked is gone here too.
         if !store
             .gateways
             .get(&input.direct_connect_gateway_id)

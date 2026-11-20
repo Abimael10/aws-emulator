@@ -24,8 +24,9 @@
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   before any handler ran. Edited here: an enumerated type's value set is stated
+//!   in the order THIS service states it in, which is not the order the set reaches
+//!   the seam in; every other refusal keeps the framework's own wording.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -40,10 +41,44 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
-};
+use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service, Violation};
 use std::sync::Arc;
+
+/// The enumerated value sets this service states in an order of its OWN: one row per
+/// enumerated type, holding the values as the MODEL declares them and the same values in
+/// the order this service's own refusals state them.
+///
+/// The model half is matched as a SET, so an enum is recognised by the values a member
+/// admits and not by the order a schema presents them in: one type is stated alike for
+/// every member targeting it, in any operation and at any depth, and a model revision
+/// that reordered its own declaration would not move the stated set. A set no row names
+/// keeps the order it reached the seam in, because this service has shown no other order
+/// for it.
+const STATED_ENUM_VALUE_SETS: &service_common::validation_message::StatedEnumValueSets<'static> =
+    &[(
+        // `ResiliencyModel`, declared `maximum-resiliency, high-resiliency,
+        // basic-resiliency` (`smithy_query(query="shape",shape="ResiliencyModel")`) and
+        // stated by this service's own refusals in ascending order — the values the
+        // model declares, reordered and nothing else. The model half is the generated
+        // slice, so a model revision that ADDED a value to this enum would no longer
+        // match this row (the match is on the whole set) and the refusal would fall
+        // back to stating the set in the order the schema carries it, which is the
+        // framework's own behaviour rather than a wrong order of this service's.
+        crate::ops::types::RESILIENCY_MODEL_VALUES,
+        &["basic-resiliency", "high-resiliency", "maximum-resiliency"],
+    )];
+
+/// `violation` with an enumerated type's value set stated in the order THIS service
+/// states that type's values in ([`STATED_ENUM_VALUE_SETS`]); every other violation, and
+/// every value set this service pins no order of, is returned unchanged.
+///
+/// The CLAUSE stays the framework's: only what goes inside the brackets moves, so the
+/// envelope, the member path, the echoed value and the requirement's wording keep coming
+/// from the one place that writes them, and the ordering itself is `service_common`'s one
+/// statement of it.
+fn in_stated_enum_order(violation: &Violation) -> Violation {
+    service_common::validation_message::in_stated_enum_order(violation, STATED_ENUM_VALUE_SETS)
+}
 
 /// The `com-amazonaws-directconnect-overtureservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -97,16 +132,35 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound or an enumerated
+        // set) before any handler runs.
+        //
+        // ONE thing this service states differently: an enumerated type's value
+        // set is listed in the order this service states that type in
+        // ([`in_stated_enum_order`]) rather than the order the set reaches this
+        // seam in, which is the order the model happens to declare that type's
+        // members in. The code, the status, the envelope, the member paths, the
+        // echoed value and every other requirement stay the framework's, so
+        // nothing else can drift — and a refusal this service states exactly as the
+        // framework already does keeps the framework's own rendering rather than
+        // being re-rendered here.
+        let Refusal::Invalid(violations) = refusal else {
+            return None;
+        };
+        let restated: Vec<Violation> = violations.iter().map(in_stated_enum_order).collect();
+        if restated == *violations {
+            return None;
+        }
+        Some(Refused {
+            // The code a constraint refusal carries on this service's awsJson1_1
+            // envelope — the same one the framework's default picks, supplied here
+            // because a chosen message must travel with its matching code.
+            code: "ValidationException".to_string(),
+            // The same envelope the framework renders (`N validation error(s)
+            // detected: …`), built from the restated violations so the clause
+            // wording stays in the one place that owns it.
+            message: aws_smithy_schema_server::constraints::envelope(&restated)?,
+        })
     }
 
     fn override_routing_error(

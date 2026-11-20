@@ -377,7 +377,7 @@ async fn a_virtual_private_gateway_association_advertises_its_attached_vpc_block
         ),
     ];
 
-    let mut minted: Vec<String> = Vec::new();
+    let mut minted: Vec<(String, String)> = Vec::new();
     for (index, (case, cidr, extra)) in rows.iter().enumerate() {
         let vpc = network(&router, cidr, extra).await;
         let virtual_gateway_id = attached_virtual_gateway(&router, &vpc.vpc_id).await;
@@ -511,25 +511,48 @@ async fn a_virtual_private_gateway_association_advertises_its_attached_vpc_block
             );
         }
 
-        minted.push(association_id);
+        minted.push((gateway_id.clone(), association_id));
     }
 
-    // Every association is still held, each exactly once, in creation order.
-    let all = described(&router, "every association", json!({})).await;
-    let listed: Vec<String> = all
+    // Every association is still held, each exactly once, read back on the Direct
+    // Connect gateway it was made on — this listing publishes no "every association"
+    // form, so each is selected by one of the selectors it does publish.
+    let listed: Vec<String> = {
+        let mut found_ids = Vec::new();
+        for (gateway_id, association_id) in &minted {
+            let found = described(
+                &router,
+                "every association",
+                json!({ "directConnectGatewayId": gateway_id }),
+            )
+            .await;
+            let ids: Vec<String> = found
+                .iter()
+                .map(|association| {
+                    association
+                        .get("associationId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect();
+            assert_eq!(
+                ids,
+                vec![association_id.clone()],
+                "case \"every association\": the gateway {gateway_id} must hold exactly its own \
+                 association, got {ids:?}"
+            );
+            found_ids.extend(ids);
+        }
+        found_ids
+    };
+    let expected: Vec<String> = minted
         .iter()
-        .map(|association| {
-            association
-                .get("associationId")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string()
-        })
+        .map(|(_, association_id)| association_id.clone())
         .collect();
     assert_eq!(
-        listed, minted,
-        "case \"every association\": expected each stored association once in creation order, \
-         got {listed:?}"
+        listed, expected,
+        "case \"every association\": expected each stored association once, got {listed:?}"
     );
 }
 
@@ -682,8 +705,15 @@ async fn a_held_gateway_is_refused_until_its_association_has_disassociated() {
             "case {case:?}: the refusal must name the gateway that is already held, got {}",
             refused.body
         );
-        // Nothing was stored: the account still holds exactly the one association.
-        let held = described(&router, case, json!({})).await;
+        // Nothing was stored: the gateway still holds exactly the one association.
+        // This listing publishes no "every association" form, so the probe selects on
+        // the gateway the attempts name.
+        let held = described(
+            &router,
+            case,
+            json!({ "associatedGatewayId": virtual_gateway_id }),
+        )
+        .await;
         assert_eq!(
             held.len(),
             1,
@@ -920,6 +950,9 @@ async fn a_transit_gateway_association_advertises_the_prefixes_the_request_names
 // neither kind of gateway; EC2 holds no gateway of that id (each kind, in both of
 // EC2's published id forms); EC2 holds the gateway but it attaches no VPC (never
 // attached, detached again, or deleted); and the request names no gateway at all.
+// One row names NEITHER an existing Direct Connect gateway nor a gateway EC2 holds,
+// which pins WHICH of the two refusals is reported: the gateway to associate is
+// resolved first, so that is the one the message names.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -963,12 +996,24 @@ async fn a_gateway_the_account_cannot_associate_is_refused_and_stores_nothing() 
     // (case, the request body, the text the refusal must name)
     let rows: Vec<(String, Value, String)> = vec![
         (
-            "a Direct Connect gateway id naming nothing".to_string(),
+            "a Direct Connect gateway id naming nothing, with a gateway that IS \
+             associable"
+                .to_string(),
+            json!({
+                "directConnectGatewayId": "00000000-0000-4000-8000-000000000000",
+                "gatewayId": attached.clone(),
+            }),
+            "00000000-0000-4000-8000-000000000000".to_string(),
+        ),
+        (
+            "a Direct Connect gateway id naming nothing, beside a gateway EC2 does not \
+             hold: the gateway to associate is resolved first"
+                .to_string(),
             json!({
                 "directConnectGatewayId": "00000000-0000-4000-8000-000000000000",
                 "gatewayId": "vgw-0123456789abcdef0",
             }),
-            "00000000-0000-4000-8000-000000000000".to_string(),
+            "vgw-0123456789abcdef0".to_string(),
         ),
         (
             "an identifier that names neither kind of gateway".to_string(),
@@ -1054,8 +1099,15 @@ async fn a_gateway_the_account_cannot_associate_is_refused_and_stores_nothing() 
             "case {case:?}: expected the refusal to name {named:?}, got {}",
             refused.body
         );
-        // A refused create leaves the account exactly as it was.
-        let held = described(&router, case, json!({})).await;
+        // A refused create leaves the account exactly as it was. This listing
+        // publishes no "every association" form, so the probe selects on the Direct
+        // Connect gateway the rows name.
+        let held = described(
+            &router,
+            case,
+            json!({ "directConnectGatewayId": gateway_id }),
+        )
+        .await;
         assert!(
             held.is_empty(),
             "case {case:?}: a refused create must store no association, got {held:?}"

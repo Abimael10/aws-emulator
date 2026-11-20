@@ -181,10 +181,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .amazon_side_asn
             .unwrap_or(crate::state::DEFAULT_AMAZON_SIDE_ASN);
         if !crate::state::amazon_side_asn_is_private(amazon_side_asn) {
-            return Err(client_error(format!(
-                "amazonSideAsn {amazon_side_asn} is not valid; the ASN must be in the private \
-                 range of 64,512 to 65,534 or 4,200,000,000 to 4,294,967,294"
-            )));
+            return Err(client_error(
+                crate::state::amazon_side_asn_not_valid_message(amazon_side_asn),
+            ));
         }
 
         let tags = input.tags.unwrap_or_default();
