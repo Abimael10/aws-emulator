@@ -104,9 +104,9 @@ impl NotebookRecord {
             notebook_id: Some(self.id.clone()),
             name: Some(self.name.clone()),
             work_group: Some(self.work_group.clone()),
-            creation_time: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            creation_time: Some(reported_time(self.created_at)),
             r#type: Some(self.notebook_type.clone()),
-            last_modified_time: Some(::aws_smithy_types::DateTime::from(self.last_modified_at)),
+            last_modified_time: Some(reported_time(self.last_modified_at)),
         }
     }
 }

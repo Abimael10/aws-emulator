@@ -364,16 +364,14 @@ impl SessionRecord {
     pub fn to_session_status(&self, now: SystemTime) -> SessionStatus {
         let state = self.state_at(now);
         SessionStatus {
-            start_date_time: Some(::aws_smithy_types::DateTime::from(self.created_at)),
-            last_modified_date_time: Some(::aws_smithy_types::DateTime::from(
-                self.state_changed_at(now),
-            )),
+            start_date_time: Some(reported_time(self.created_at)),
+            last_modified_date_time: Some(reported_time(self.state_changed_at(now))),
             // Reported only once the shutdown is complete: a session still shutting down
             // has not ended yet, and one nobody asked to shut down has no end.
             end_date_time: (state == SESSION_STATE_TERMINATED)
-                .then(|| self.ended_at().map(::aws_smithy_types::DateTime::from))
+                .then(|| self.ended_at().map(reported_time))
                 .flatten(),
-            idle_since_date_time: self.idle_since(now).map(::aws_smithy_types::DateTime::from),
+            idle_since_date_time: self.idle_since(now).map(reported_time),
             state: Some(state.to_string()),
             // "The reason for the session state change": Athena states one for a state it
             // moved the session to on its own, and every state this service derives is one
@@ -441,7 +439,7 @@ impl SessionRecord {
     pub fn to_notebook_session_summary(&self) -> NotebookSessionSummary {
         NotebookSessionSummary {
             session_id: Some(self.id.clone()),
-            creation_time: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            creation_time: Some(reported_time(self.created_at)),
         }
     }
 

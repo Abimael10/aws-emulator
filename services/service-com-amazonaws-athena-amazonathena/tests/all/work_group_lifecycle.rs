@@ -102,6 +102,11 @@ fn now_epoch_seconds() -> f64 {
         .as_secs_f64()
 }
 
+/// One millisecond, in the epoch seconds a timestamp renders as: the resolution Athena
+/// reports an instant at, so an instant taken inside a window is reported no more than this
+/// far before the window's floor.
+const MILLISECOND: f64 = 0.001;
+
 /// A valid workgroup name of `length` characters, all of them inside the modelled
 /// `WorkGroupName` pattern `^[a-zA-Z0-9._-]{1,128}$`.
 fn name_of_length(length: usize) -> String {
@@ -248,8 +253,9 @@ async fn a_created_work_group_is_read_back_by_get_work_group() {
 
         let creation_time = group["CreationTime"].as_f64();
         assert!(
-            creation_time.is_some_and(|at| at >= before && at <= after),
-            "case {:?}: expected CreationTime inside [{before}, {after}], got {:?}",
+            creation_time.is_some_and(|at| at > before - MILLISECOND && at <= after),
+            "case {:?}: expected CreationTime inside [{before}, {after}] to the millisecond, \
+             got {:?}",
             case.case,
             group["CreationTime"]
         );

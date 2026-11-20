@@ -264,7 +264,18 @@ pub struct ResourceNotFoundException {
     pub resource_name: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.athena#WorkGroupConfiguration")]
+/// The configuration of one workgroup: where its queries put their results, which settings
+/// it overrides for its clients, and what it reports about itself.
+///
+/// Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="WorkGroupConfiguration")`, plus two members that are
+/// RECORDED BEHAVIOUR rather than modelled, which a read of a workgroup serves beside them:
+/// `SystemTableStatuses`, one entry per system table Athena publishes with whether this
+/// workgroup has it enabled, and `QuerySchedulingType`, how the workgroup schedules the
+/// queries submitted to it. Both are REPORTED and never read off the wire (`out`) — no
+/// modelled member sets either, so they are the service's own projection of the workgroup
+/// ([`crate::state::effective_work_group_configuration`]) — and
+/// `types::recorded_member_wire` says why this shape is hand-written.
 #[derive(Debug, Clone, Default)]
 pub struct WorkGroupConfiguration {
     pub result_configuration: Option<ResultConfiguration>,
@@ -282,7 +293,224 @@ pub struct WorkGroupConfiguration {
     pub enable_minimum_encryption_configuration: Option<bool>,
     pub identity_center_configuration: Option<IdentityCenterConfiguration>,
     pub query_results_s3_access_grants_configuration: Option<QueryResultsS3AccessGrantsConfiguration>,
+    pub system_table_statuses: Option<Vec<SystemTableStatus>>,
+    pub query_scheduling_type: Option<String>,
 }
+
+/// The `@range` of `WorkGroupConfiguration$BytesScannedCutoffPerQuery`, whose target
+/// `BytesScannedCutoffValue` declares `min: 10000000` and no maximum
+/// (`smithy_query(query="shape", shape="WorkGroupConfiguration")`). Carried on the member
+/// schema so the framework measures a configuration a request sends against it; see
+/// `types::recorded_member_wire`.
+static M_BYTES_SCANNED_CUTOFF_PER_QUERY_TRAITS: ::std::sync::LazyLock<
+    ::aws_smithy_schema::TraitMap,
+> = ::std::sync::LazyLock::new(|| {
+    let mut traits = ::aws_smithy_schema::TraitMap::new();
+    traits.insert(::std::boxed::Box::new(
+        ::aws_smithy_schema_server::constraints::RangeTrait::new(Some(10_000_000.0), None),
+    ));
+    traits
+});
+
+/// The `@length` of `WorkGroupConfiguration$AdditionalConfiguration`, whose target
+/// `NameString` declares `min: 1, max: 128`. See
+/// [`M_BYTES_SCANNED_CUTOFF_PER_QUERY_TRAITS`].
+static M_ADDITIONAL_CONFIGURATION_TRAITS: ::std::sync::LazyLock<::aws_smithy_schema::TraitMap> =
+    ::std::sync::LazyLock::new(|| {
+        let mut traits = ::aws_smithy_schema::TraitMap::new();
+        traits.insert(::std::boxed::Box::new(
+            ::aws_smithy_schema_server::constraints::LengthTrait::new(Some(1), Some(128)),
+        ));
+        traits
+    });
+
+/// The `@length` and `@pattern` of `WorkGroupConfiguration$ExecutionRole`, whose target
+/// `RoleArn` declares `min: 20, max: 2048` and the IAM role ARN pattern. See
+/// [`M_BYTES_SCANNED_CUTOFF_PER_QUERY_TRAITS`].
+static M_EXECUTION_ROLE_TRAITS: ::std::sync::LazyLock<::aws_smithy_schema::TraitMap> =
+    ::std::sync::LazyLock::new(|| {
+        let mut traits = ::aws_smithy_schema::TraitMap::new();
+        traits.insert(::std::boxed::Box::new(
+            ::aws_smithy_schema_server::constraints::LengthTrait::new(Some(20), Some(2048)),
+        ));
+        traits.insert(::std::boxed::Box::new(
+            ::aws_smithy_schema_server::constraints::PatternTrait::new(
+                r"^arn:aws[a-z\-]*:iam::\d{12}:role/?[a-zA-Z_0-9+=,.@\-_/]+$",
+            ),
+        ));
+        traits
+    });
+
+ath_schema_and_codec!(
+    WorkGroupConfiguration,
+    WORK_GROUP_CONFIGURATION_SCHEMA,
+    "com.amazonaws.athena#WorkGroupConfiguration",
+    "com.amazonaws.athena",
+    "WorkGroupConfiguration",
+    (
+        M_RESULT_CONFIGURATION,
+        result_configuration,
+        "ResultConfiguration",
+        0,
+        opt,
+        struct_of(ResultConfiguration)
+    ),
+    (
+        M_MANAGED_QUERY_RESULTS_CONFIGURATION,
+        managed_query_results_configuration,
+        "ManagedQueryResultsConfiguration",
+        1,
+        opt,
+        struct_of(ManagedQueryResultsConfiguration)
+    ),
+    (
+        M_ENFORCE_WORK_GROUP_CONFIGURATION,
+        enforce_work_group_configuration,
+        "EnforceWorkGroupConfiguration",
+        2,
+        opt,
+        boolean
+    ),
+    (
+        M_PUBLISH_CLOUD_WATCH_METRICS_ENABLED,
+        publish_cloud_watch_metrics_enabled,
+        "PublishCloudWatchMetricsEnabled",
+        3,
+        opt,
+        boolean
+    ),
+    (
+        M_BYTES_SCANNED_CUTOFF_PER_QUERY,
+        bytes_scanned_cutoff_per_query,
+        "BytesScannedCutoffPerQuery",
+        4,
+        opt,
+        traits(M_BYTES_SCANNED_CUTOFF_PER_QUERY_TRAITS),
+        long
+    ),
+    (
+        M_REQUESTER_PAYS_ENABLED,
+        requester_pays_enabled,
+        "RequesterPaysEnabled",
+        5,
+        opt,
+        boolean
+    ),
+    (
+        M_ENGINE_VERSION,
+        engine_version,
+        "EngineVersion",
+        6,
+        opt,
+        struct_of(EngineVersion)
+    ),
+    (
+        M_ADDITIONAL_CONFIGURATION,
+        additional_configuration,
+        "AdditionalConfiguration",
+        7,
+        opt,
+        traits(M_ADDITIONAL_CONFIGURATION_TRAITS),
+        string
+    ),
+    (
+        M_EXECUTION_ROLE,
+        execution_role,
+        "ExecutionRole",
+        8,
+        opt,
+        traits(M_EXECUTION_ROLE_TRAITS),
+        string
+    ),
+    (
+        M_MONITORING_CONFIGURATION,
+        monitoring_configuration,
+        "MonitoringConfiguration",
+        9,
+        opt,
+        struct_of(MonitoringConfiguration)
+    ),
+    (
+        M_ENGINE_CONFIGURATION,
+        engine_configuration,
+        "EngineConfiguration",
+        10,
+        opt,
+        struct_of(EngineConfiguration)
+    ),
+    (
+        M_CUSTOMER_CONTENT_ENCRYPTION_CONFIGURATION,
+        customer_content_encryption_configuration,
+        "CustomerContentEncryptionConfiguration",
+        11,
+        opt,
+        struct_of(CustomerContentEncryptionConfiguration)
+    ),
+    (
+        M_ENABLE_MINIMUM_ENCRYPTION_CONFIGURATION,
+        enable_minimum_encryption_configuration,
+        "EnableMinimumEncryptionConfiguration",
+        12,
+        opt,
+        boolean
+    ),
+    (
+        M_IDENTITY_CENTER_CONFIGURATION,
+        identity_center_configuration,
+        "IdentityCenterConfiguration",
+        13,
+        opt,
+        struct_of(IdentityCenterConfiguration)
+    ),
+    (
+        M_QUERY_RESULTS_S3_ACCESS_GRANTS_CONFIGURATION,
+        query_results_s3_access_grants_configuration,
+        "QueryResultsS3AccessGrantsConfiguration",
+        14,
+        opt,
+        struct_of(QueryResultsS3AccessGrantsConfiguration)
+    ),
+    (
+        M_SYSTEM_TABLE_STATUSES,
+        system_table_statuses,
+        "SystemTableStatuses",
+        15,
+        out,
+        recorded(list_of_struct(SystemTableStatus))
+    ),
+    (
+        M_QUERY_SCHEDULING_TYPE,
+        query_scheduling_type,
+        "QuerySchedulingType",
+        16,
+        out,
+        recorded(string)
+    ),
+);
+
+/// Whether one of Athena's system tables is enabled for a workgroup: the table, and its
+/// state.
+///
+/// Wholly RECORDED behaviour — the on-disk model declares no such shape — so it and both of
+/// its members sit in the recorded namespace; see `types::recorded_member_wire`. A read of a
+/// workgroup reports one of these per system table Athena publishes
+/// ([`crate::state::SYSTEM_TABLES`]), so a client can tell a system table that is off from
+/// one that does not exist.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SystemTableStatus {
+    pub table_name: String,
+    pub enabled: bool,
+}
+
+ath_schema_and_codec!(
+    SystemTableStatus,
+    SYSTEM_TABLE_STATUS_SCHEMA,
+    "com.amazonaws.athena.recorded#SystemTableStatus",
+    "com.amazonaws.athena.recorded",
+    "SystemTableStatus",
+    (M_TABLE_NAME, table_name, "TableName", 0, req, string),
+    (M_ENABLED, enabled, "Enabled", 1, req, boolean),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.athena#MonitoringConfiguration")]
 #[derive(Debug, Clone, Default, PartialEq)]

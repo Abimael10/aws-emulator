@@ -2,8 +2,9 @@
 
 //! End-to-end tests for the boolean switches a workgroup's configuration carries:
 //! `GetWorkGroup` reports each one with the value it has in effect — the value a create
-//! or an update set, and off for one no write ever set — rather than leaving the member
-//! out. Driven over the wire (awsJson1_1, `x-amz-target: AmazonAthena.<Operation>`)
+//! or an update set, Athena's own default for a create that carried no configuration at
+//! all, and off for one no write ever set — rather than leaving the member out. Driven
+//! over the wire (awsJson1_1, `x-amz-target: AmazonAthena.<Operation>`)
 //! through the same router the emulator boots, so every assertion is about what an SDK
 //! client observes.
 //!
@@ -31,6 +32,15 @@ const CONFIGURATION_SWITCHES: [&str; 4] = [
     "EnableMinimumEncryptionConfiguration",
 ];
 
+/// The switches a workgroup Athena configured ITSELF comes up with — a create that carried
+/// no `Configuration` at all: the workgroup's settings override the client's and query
+/// metrics are published. Spelled out here rather than taken from the service, so the
+/// expectation does not move with the code under test.
+const DEFAULTED_SWITCHES: [(&str, bool); 2] = [
+    ("EnforceWorkGroupConfiguration", true),
+    ("PublishCloudWatchMetricsEnabled", true),
+];
+
 /// The `Configuration` `GetWorkGroup` reports for `name`.
 async fn configuration(router: &MultiServiceRouter, name: &str) -> Value {
     let (status, body) = call(router, "GetWorkGroup", &json!({ "WorkGroup": name })).await;
@@ -53,6 +63,13 @@ fn expected_switches(named: &[(&'static str, bool)]) -> BTreeMap<&'static str, b
         expected.insert(switch, *value);
     }
     expected
+}
+
+/// The value every switch must read as for a workgroup created with NO `Configuration` at
+/// all: Athena's own defaults ([`DEFAULTED_SWITCHES`]) over the same off baseline.
+fn expected_default_switches() -> BTreeMap<&'static str, bool> {
+    let defaulted: Vec<(&'static str, bool)> = DEFAULTED_SWITCHES.to_vec();
+    expected_switches(&defaulted)
 }
 
 /// Assert every switch of `configuration` reads as `expected` says, naming `case`.
@@ -146,7 +163,15 @@ async fn get_work_group_reports_every_configuration_switch_a_create_left_unset()
         );
 
         let read = configuration(&router, &name).await;
-        assert_switches(case.case, &read, &expected_switches(&case.named));
+        // A create that carried no `Configuration` at all is given Athena's own default
+        // configuration; one that carried a configuration is stored as it was sent, so
+        // every switch it left unset is off.
+        let expected = if case.configuration.is_null() {
+            expected_default_switches()
+        } else {
+            expected_switches(&case.named)
+        };
+        assert_switches(case.case, &read, &expected);
 
         // The switches are reported beside, not instead of, the configuration the create
         // carried: a member it named still reads back as it was sent.
@@ -258,6 +283,6 @@ async fn two_reads_of_one_work_group_report_the_same_switches() {
     assert_switches(
         "a workgroup created with no configuration",
         &second,
-        &expected_switches(&[]),
+        &expected_default_switches(),
     );
 }

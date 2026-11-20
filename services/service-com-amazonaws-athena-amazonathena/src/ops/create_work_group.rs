@@ -2,7 +2,8 @@
 
 //! @op CreateWorkGroup
 //! IMPLEMENTED: registers a workgroup under its name in this service's state, with the
-//! engine version resolved, and refuses a name the registry already holds.
+//! engine version resolved and, for a create that carried no configuration at all, with
+//! Athena's own default configuration; refuses a name the registry already holds.
 //!
 //! ## Shape of an operation
 //!
@@ -161,8 +162,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Stored as the caller gave it, except for the engine version: that member is
         // documented read-only on this operation, so it is resolved here rather than
-        // echoed, and every later read reports this one resolution.
-        let mut configuration = input.configuration.unwrap_or_default();
+        // echoed, and every later read reports this one resolution. A request that carried
+        // no configuration AT ALL does not create a workgroup with nothing configured: it
+        // gets Athena's own default configuration
+        // (`crate::state::default_work_group_configuration`), which is then this
+        // workgroup's configuration like any other.
+        let mut configuration = input
+            .configuration
+            .unwrap_or_else(crate::state::default_work_group_configuration);
         configuration.engine_version = Some(crate::state::resolved_engine_version(
             configuration.engine_version.as_ref(),
         ));

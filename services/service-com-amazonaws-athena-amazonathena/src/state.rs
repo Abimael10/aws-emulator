@@ -181,6 +181,14 @@ pub use work_group_deletion::*;
 mod engine_versions;
 pub use engine_versions::*;
 
+/// What a workgroup's configuration holds when nobody said, and what a read reports for it.
+mod work_group_configuration;
+pub use work_group_configuration::*;
+
+/// The resolution the instants in this service's responses are reported at.
+mod reported_timestamps;
+pub use reported_timestamps::*;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
@@ -205,13 +213,6 @@ use crate::ops::types::{
 pub const WORK_GROUP_STATE_ENABLED: &str = "ENABLED";
 /// The other `WorkGroupState`; see [`WORK_GROUP_STATE_ENABLED`].
 pub const WORK_GROUP_STATE_DISABLED: &str = "DISABLED";
-
-/// What one of the boolean switches of a `WorkGroupConfiguration` means when no create or
-/// update ever set it: off. `WorkGroupConfiguration$RequesterPaysEnabled` states it for
-/// its own member — "The default is `false`" — and it is the reading every one of them
-/// documents, each describing a workgroup that does less when the switch is not set. See
-/// [`effective_work_group_configuration`].
-pub const WORK_GROUP_SWITCH_UNSET: bool = false;
 
 /// The engine version that asks Athena to choose one.
 ///
@@ -260,9 +261,10 @@ pub const MAX_WORK_GROUPS: usize = 1000;
 
 /// One workgroup, as this service persists it.
 ///
-/// The configuration is held already normalised (see
-/// [`resolved_engine_version`]), so the create path decides the engine version once
-/// and every later read reports that same decision.
+/// The configuration is held already normalised (see [`resolved_engine_version`] and
+/// [`default_work_group_configuration`]), so the create path decides the engine version and
+/// the settings the request named nothing about once, and every later read reports those same
+/// decisions.
 #[derive(Debug, Clone)]
 pub struct WorkGroupRecord {
     /// The workgroup name, which is also its key in the registry.
@@ -297,7 +299,7 @@ impl WorkGroupRecord {
             name: Some(self.name.clone()),
             state: Some(self.state.clone()),
             description: Some(self.description.clone().unwrap_or_default()),
-            creation_time: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            creation_time: Some(reported_time(self.created_at)),
             engine_version: self.configuration.engine_version.clone(),
             // Filled only for an IAM Identity Center enabled workgroup, whose Identity
             // Center application this emulator does not create.
@@ -315,54 +317,11 @@ impl WorkGroupRecord {
             state: Some(self.state.clone()),
             configuration: Some(effective_work_group_configuration(&self.configuration)),
             description: self.description.clone(),
-            creation_time: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            creation_time: Some(reported_time(self.created_at)),
             // Athena fills this only for an IAM Identity Center enabled workgroup,
             // whose Identity Center application this emulator does not create.
             identity_center_application_arn: None,
         }
-    }
-}
-
-/// The configuration a read reports for a workgroup that holds `stored`: every switch the
-/// shape carries as a boolean, reported with the value it has in effect.
-///
-/// `WorkGroupConfiguration` carries four of them — `EnforceWorkGroupConfiguration`,
-/// `PublishCloudWatchMetricsEnabled`, `RequesterPaysEnabled` and
-/// `EnableMinimumEncryptionConfiguration` — and each is documented by what the workgroup
-/// does when it is set and when it is not, `RequesterPaysEnabled` stating "The default is
-/// `false`" outright. So a workgroup whose create named none of them is not one whose
-/// settings are unknown but one with every switch off, and that is what a read of its
-/// configuration reports: an OFF switch, not an absent member.
-///
-/// DERIVED at read time and never written: the record keeps exactly what the create or
-/// update put in it, which is what makes the switch a later update leaves alone the one
-/// that write set. Every other member of the stored configuration is reported as it
-/// stands.
-pub fn effective_work_group_configuration(
-    stored: &WorkGroupConfiguration,
-) -> WorkGroupConfiguration {
-    WorkGroupConfiguration {
-        enforce_work_group_configuration: Some(
-            stored
-                .enforce_work_group_configuration
-                .unwrap_or(WORK_GROUP_SWITCH_UNSET),
-        ),
-        publish_cloud_watch_metrics_enabled: Some(
-            stored
-                .publish_cloud_watch_metrics_enabled
-                .unwrap_or(WORK_GROUP_SWITCH_UNSET),
-        ),
-        requester_pays_enabled: Some(
-            stored
-                .requester_pays_enabled
-                .unwrap_or(WORK_GROUP_SWITCH_UNSET),
-        ),
-        enable_minimum_encryption_configuration: Some(
-            stored
-                .enable_minimum_encryption_configuration
-                .unwrap_or(WORK_GROUP_SWITCH_UNSET),
-        ),
-        ..stored.clone()
     }
 }
 
@@ -376,7 +335,11 @@ pub fn effective_work_group_configuration(
 /// registries were opened, held once on the store so every read reports the same one.
 ///
 /// Enabled (it is the workgroup queries run in by default), with no description of its
-/// own and the engine version Athena resolves for a workgroup that selected none.
+/// own and the engine version Athena resolves for a workgroup that selected none. Its
+/// switches are the ones each of them documents for a workgroup that does not set it
+/// ([`WORK_GROUP_SWITCH_UNSET`]) rather than the defaults a CREATE is given
+/// ([`default_work_group_configuration`]): those are what AWS writes for a create that
+/// carried no configuration, and no create ever wrote this record.
 pub fn default_work_group_record(created_at: SystemTime) -> WorkGroupRecord {
     WorkGroupRecord {
         name: DEFAULT_WORK_GROUP.to_string(),
@@ -699,7 +662,7 @@ pub fn malformed_pattern(pattern: &str, reason: &impl ::std::fmt::Display) -> St
 pub fn to_table_metadata(table: &glue_state::TableEntry) -> TableMetadata {
     TableMetadata {
         name: table.name.clone(),
-        create_time: Some(::aws_smithy_types::DateTime::from(table.create_time)),
+        create_time: Some(reported_time(table.create_time)),
         last_access_time: table.last_access_time,
         table_type: table.table_type.clone(),
         columns: table
@@ -1752,10 +1715,8 @@ impl QueryExecutionRecord {
             status: Some(QueryExecutionStatus {
                 state: Some(state.to_string()),
                 state_change_reason,
-                submission_date_time: Some(::aws_smithy_types::DateTime::from(self.submitted_at)),
-                completion_date_time: self
-                    .completion_at(now)
-                    .map(::aws_smithy_types::DateTime::from),
+                submission_date_time: Some(reported_time(self.submitted_at)),
+                completion_date_time: self.completion_at(now).map(reported_time),
                 athena_error,
             }),
             statistics: Some(self.statistics_at(now)),

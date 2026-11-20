@@ -259,9 +259,8 @@ impl CapacityReservationRecord {
             // `CapacityAllocation$StatusMessage` is "the status message of the capacity
             // allocation"; no allocation here fails, so there is nothing to report.
             status_message: None,
-            request_time: ::aws_smithy_types::DateTime::from(self.allocation_requested_at),
-            request_completion_time: (!pending)
-                .then(|| ::aws_smithy_types::DateTime::from(self.allocation_complete_at)),
+            request_time: reported_time(self.allocation_requested_at),
+            request_completion_time: (!pending).then(|| reported_time(self.allocation_complete_at)),
         }
     }
 
@@ -276,8 +275,8 @@ impl CapacityReservationRecord {
             last_allocation: Some(self.last_allocation_at(now)),
             last_successful_allocation_time: self
                 .last_successful_allocation_at(now)
-                .map(::aws_smithy_types::DateTime::from),
-            creation_time: ::aws_smithy_types::DateTime::from(self.creation_time),
+                .map(reported_time),
+            creation_time: reported_time(self.creation_time),
         }
     }
 

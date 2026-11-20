@@ -20,10 +20,12 @@
 //! later model refresh only has to move it into place and put the derive back.
 //!
 //! WHAT IS DELIBERATELY ABSENT, for the same reason the derive's own output would be inert
-//! here: the constraint traits (the validating walk runs on operation INPUTS only, and no
-//! member below carries a bound of its own), the `@http` chain (baked on only for an
-//! operation's input) and `@jsonName` (no member below declares one: each one's wire name IS
-//! its Smithy member name).
+//! here: the `@http` chain (baked on only for an operation's input) and `@jsonName` (no member
+//! below declares one: each one's wire name IS its Smithy member name). The constraint traits
+//! are NOT absent — a shape declared here may also be an operation INPUT, whose values the
+//! framework's validating walk measures against the trait map on each member schema — so a
+//! member carrying a bound of its own names its trait map through `traits(<static>)`; see
+//! `ath_member_schema!`.
 //!
 //! The structures that need them live in this service's per-operation `types/` modules, where
 //! each shape is declared exactly once, so `types/mod.rs` pulls this module in with
@@ -92,7 +94,22 @@ macro_rules! ath_shape_type {
 /// `struct_of(T)`, `list_of_struct(T)`, `list_of_string` — or `recorded(<kind>)` for a member
 /// the model does not declare at all,
 /// whose shape id then sits in [`RECORDED_NAMESPACE`] rather than in the service's own.
+///
+/// A member whose own shape carries a CONSTRAINT trait — `@length`, `@range`, `@pattern` —
+/// names the [`::aws_smithy_schema::TraitMap`] holding them first, as `traits(<static>),`
+/// ahead of the kind. That is the one thing the derive emits that a bare member schema would
+/// drop: the framework's validating walk enforces an input constraint out of the member
+/// schema's trait map, so a hand-written member that carries one must carry its traits too or
+/// a value the model refuses would be accepted. The map is a `static LazyLock<TraitMap>` at
+/// module scope — it cannot live in the `impl` block these member schemas are declared in —
+/// built exactly as the vendored codegen builds its own.
 macro_rules! ath_member_schema {
+    (
+        $ns:literal, $local:literal, $wire:literal, $idx:literal,
+        traits($traits:path), $($kind:tt)+
+    ) => {
+        ath_member_schema!($ns, $local, $wire, $idx, $($kind)+).with_traits(&$traits)
+    };
     ($ns:literal, $local:literal, $wire:literal, $idx:literal, recorded($kind:tt $(($inner:ty))?)) => {
         ::aws_smithy_schema::Schema::new_member(
             ::aws_smithy_schema::ShapeId::from_static(
@@ -121,6 +138,11 @@ macro_rules! ath_member_schema {
 
 /// Write one member, as the vendored codegen's `codegen::emit_write` does for that kind.
 macro_rules! ath_write_member {
+    // The member's constraint traits are read by the VALIDATING walk off its schema; what is
+    // written, and how, is decided by the kind alone.
+    ($s:ident, $m:expr, $v:expr, traits($traits:path), $($kind:tt)+) => {
+        ath_write_member!($s, $m, $v, $($kind)+);
+    };
     // A member the model does not declare writes exactly like the kind it wraps; only its
     // shape id differs (see `ath_member_schema!`).
     ($s:ident, $m:expr, $v:expr, recorded($($kind:tt)+)) => {
@@ -170,6 +192,9 @@ macro_rules! ath_write_member {
 /// Nesting DEPTH is bounded by the codec itself, which refuses a document nesting deeper
 /// than its own maximum.
 macro_rules! ath_read_member {
+    ($d:ident, $m:expr, traits($traits:path), $($kind:tt)+) => {
+        ath_read_member!($d, $m, $($kind)+)
+    };
     ($d:ident, $m:expr, recorded($($kind:tt)+)) => {
         ath_read_member!($d, $m, $($kind)+)
     };
@@ -256,9 +281,11 @@ macro_rules! ath_member_value {
 /// Each member entry is `(CONST, field, "WireName", index, req|opt|out, kind)`; `req` is a
 /// `@required` member (a bare Rust field, refused when absent on the wire), `opt` an `Option`
 /// one, and `out` an `Option` one the service only REPORTS — never read off the wire, so a
-/// request cannot set what the service itself computes. The entries must be given in the
-/// model's member order — the order `smithy_query(query="shape", shape=...)` lists them in
-/// and the order the struct declares its fields in — with an unmodelled member last.
+/// request cannot set what the service itself computes. A member whose shape carries a
+/// constraint trait names its trait map ahead of the kind, as `traits(<static>), kind`. The
+/// entries must be given in the model's member order — the order
+/// `smithy_query(query="shape", shape=...)` lists them in and the order the struct declares
+/// its fields in — with an unmodelled member last.
 macro_rules! ath_schema_and_codec {
     (
         $ty:ident, $schema_static:ident, $shape:literal, $ns:literal, $local:literal,

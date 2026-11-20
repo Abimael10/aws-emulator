@@ -24,6 +24,7 @@
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
+use super::reported_time;
 use crate::ops::types::{PreparedStatement, PreparedStatementSummary};
 
 /// How many prepared statements one workgroup holds in this emulator.
@@ -128,7 +129,7 @@ impl PreparedStatementRecord {
             query_statement: Some(self.query_statement.clone()),
             work_group_name: Some(self.work_group_name.clone()),
             description: self.description.clone(),
-            last_modified_time: Some(::aws_smithy_types::DateTime::from(self.last_modified_time)),
+            last_modified_time: Some(reported_time(self.last_modified_time)),
         }
     }
 
@@ -138,7 +139,7 @@ impl PreparedStatementRecord {
     pub fn to_summary(&self) -> PreparedStatementSummary {
         PreparedStatementSummary {
             statement_name: Some(self.statement_name.clone()),
-            last_modified_time: Some(::aws_smithy_types::DateTime::from(self.last_modified_time)),
+            last_modified_time: Some(reported_time(self.last_modified_time)),
         }
     }
 
