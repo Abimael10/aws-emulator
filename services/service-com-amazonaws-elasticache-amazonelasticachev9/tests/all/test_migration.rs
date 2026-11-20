@@ -63,7 +63,7 @@ fn hold_group_status(emulator: &Emulator, id: &str, status: &str) {
 /// a wrapped list's elements from 1 beneath the member segment, which for
 /// `CustomerNodeEndpointList` is the Smithy default `member` (the list declares no
 /// `xmlName`).
-fn endpoint_params(endpoints: &[(&str, i32)]) -> Vec<(String, String)> {
+pub(crate) fn endpoint_params(endpoints: &[(&str, i32)]) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
     for (index, (address, port)) in endpoints.iter().enumerate() {
         let position = index + 1;
@@ -81,7 +81,7 @@ fn endpoint_params(endpoints: &[(&str, i32)]) -> Vec<(String, String)> {
 
 /// Wait until the replication group `id` reports the status the clock owes it after a
 /// create or a change: `available`.
-async fn await_available_group(emulator: &Emulator, case: &str, id: &str) -> Reply {
+pub(crate) async fn await_available_group(emulator: &Emulator, case: &str, id: &str) -> Reply {
     poll_until(
         emulator,
         REGION,
@@ -96,7 +96,7 @@ async fn await_available_group(emulator: &Emulator, case: &str, id: &str) -> Rep
 
 /// Create one replication group with `shards` shards and let the clock settle it at
 /// `available`.
-async fn create_settled_group(emulator: &Emulator, case: &str, id: &str, shards: i32) {
+pub(crate) async fn create_settled_group(emulator: &Emulator, case: &str, id: &str, shards: i32) {
     let created = emulator
         .call(
             "CreateReplicationGroup",
@@ -119,7 +119,11 @@ async fn create_settled_group(emulator: &Emulator, case: &str, id: &str, shards:
 }
 
 /// `TestMigration` of `endpoints` into the replication group `id`.
-async fn test_migration(emulator: &Emulator, id: &str, endpoints: &[(&str, i32)]) -> Reply {
+pub(crate) async fn test_migration(
+    emulator: &Emulator,
+    id: &str,
+    endpoints: &[(&str, i32)],
+) -> Reply {
     let mut pairs = params(&[("ReplicationGroupId", id)]);
     pairs.extend(endpoint_params(endpoints));
     emulator.call("TestMigration", &pairs).await
@@ -133,7 +137,7 @@ async fn start_migration(emulator: &Emulator, id: &str) -> Reply {
 }
 
 /// `DescribeReplicationGroups` for one group by id.
-async fn describe_group(emulator: &Emulator, id: &str) -> Reply {
+pub(crate) async fn describe_group(emulator: &Emulator, id: &str) -> Reply {
     emulator
         .call(
             "DescribeReplicationGroups",

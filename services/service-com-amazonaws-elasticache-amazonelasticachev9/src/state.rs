@@ -123,11 +123,11 @@
 //! ([`UserGroupRecord::settle`]) — so the membership still has ONE copy, the
 //! group's `user_ids`, and `User$UserGroupIds` stays derived from it.
 //!
-//! Everything else in this service (`DeleteUserGroup`, the migration
-//! operations other than `StartMigration`, and the parameter-group operations
-//! that would change a parameter's value) is still a scaffolded 501 and owns its
-//! own gap issue; where a member of an implemented operation belongs to one of
-//! those resources, the comment beside it says so.
+//! The operations of this service that are still a scaffolded 501, each owning
+//! its own gap issue, are exactly four: `CopyServerlessCacheSnapshot`,
+//! `DeleteServerlessCacheSnapshot`, `PrepareMigration` and `StopMigration`.
+//! Where a member of an implemented operation belongs to one of those, the
+//! comment beside it says so.
 //!
 //! A data migration is the work that moves a customer-run cache into one this
 //! account runs: `StartMigration` starts the data sync into the target the
@@ -136,17 +136,20 @@
 //! ([`ServerlessCacheRecord::migration`] /
 //! [`ReplicationGroupRecord::migration`], both a [`MigrationRecord`]). That one
 //! copy is what refuses a second start on the same target and what
-//! `ServerlessCache$Migration` reports; `PrepareMigration`, `StopMigration`,
-//! `CompleteMigration` and `TestMigration` are still scaffolded 501s with their
-//! own gap issues and read and write the same record rather than a copy beside
-//! it.
+//! `ServerlessCache$Migration` reports; `CompleteMigration` retires that record
+//! and `TestMigration` reads it to decide whether there is a migration to test
+//! at all, while `PrepareMigration` and `StopMigration` are still scaffolded
+//! 501s with their own gap issues — every one of them reads and writes the same
+//! record rather than a copy beside it.
 //!
 //! The serverless cache is another customer-created resource this store holds:
 //! `CreateServerlessCache` mints one, `ModifyServerlessCache` changes it,
 //! `DescribeServerlessCaches` reports it and `DeleteServerlessCache` removes it.
-//! The serverless snapshot operations are still scaffolded 501s with their own
-//! gap issues, and every one of them reads and writes the SAME record rather
-//! than a copy beside it.
+//! `CreateServerlessCacheSnapshot`, `DescribeServerlessCacheSnapshots` and
+//! `ExportServerlessCacheSnapshot` do the same for a snapshot of one, while
+//! copying and deleting a serverless snapshot are still scaffolded 501s with
+//! their own gap issues; every one of them reads and writes the SAME record
+//! rather than a copy beside it.
 //!
 //! A replication group is the other resource this state holds:
 //! `CreateReplicationGroup` mints one together with the member cache clusters it
