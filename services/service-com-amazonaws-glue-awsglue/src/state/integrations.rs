@@ -111,9 +111,10 @@ pub struct IntegrationResourcePropertyEntry {
     pub target_processing_properties: Option<TargetProcessingProperties>,
     /// The create's `Tags`, which the `IntegrationResourceProperty` shape has no member for.
     ///
-    /// Kept so the create does not discard what the client sent, but NOT yet reachable
-    /// through the tagging operations, for the reason [`CustomEntityTypeEntry::tags`] gives:
-    /// [`TaggedResourceKind`] carries no integration resource property variant.
+    /// Kept so the create does not discard what the client sent, but NOT reachable through
+    /// the tagging operations: these belong to a processing-properties RECORD rather than to
+    /// a Glue resource of its own, so [`TaggedResourceKind`] carries no variant for one and
+    /// no `ResourceArn` resolves here.
     pub tags: Vec<Tag>,
 }
 

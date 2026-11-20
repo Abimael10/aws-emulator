@@ -592,6 +592,24 @@ pub fn dashboard_url_not_supported(resource_type: &str) -> String {
 /// may be re-worded without the other.
 pub const DASHBOARD_URL_RESOURCE_NOT_FOUND: &str = "Entity not found";
 
+/// The miss of the TAGGING surface: a `ResourceArn` that is the ARN of a taggable Glue
+/// resource but names none this endpoint holds — `GetTags`, `TagResource` and
+/// `UntagResource` alike.
+///
+/// RECORDED constant, and the whole message: the tagging surface resolves the ARN and, when
+/// nothing is there, answers its modelled `EntityNotFoundException` with this fixed, generic
+/// sentence — it names neither the ARN it was handed, nor the kind of resource it was looked
+/// for as, nor the name inside it, and carries no trailing period. So the tag read of an
+/// absent workflow and of an absent database read the same, which is what distinguishes
+/// "this resource is not here" from "this is not a resource I tag" (the latter being the
+/// operation's `InvalidInputException`, which carries no prose at all —
+/// [`crate::state::INVALID_RESOURCE_ARN_MESSAGE`]).
+///
+/// It reads the same as other surfaces' generic misses ([`WORKFLOW_NOT_FOUND`],
+/// [`DASHBOARD_URL_RESOURCE_NOT_FOUND`]) and is a separate constant all the same, for the
+/// reason those two are: each surface is recorded independently.
+pub const TAGGED_RESOURCE_NOT_FOUND: &str = "Entity not found";
+
 /// A session lookup addressed by `Id` for an id this account holds no session under —
 /// `GetSession`'s miss, and the miss of every operation that resolves a session the same
 /// way and words it the same.

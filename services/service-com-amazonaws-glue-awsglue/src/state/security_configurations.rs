@@ -77,9 +77,9 @@ pub struct UsageProfileEntry {
     pub last_modified_on: SystemTime,
     /// The create's `Tags`, which the `GetUsageProfile` response has no member for.
     ///
-    /// Kept so the create does not discard what the client sent, but NOT yet reachable
-    /// through the tagging operations, for the reason [`CustomEntityTypeEntry::tags`]
-    /// gives: [`TaggedResourceKind`] carries no usage profile variant.
+    /// This is the record the TAGGING operations resolve a usage profile's ARN to, for the
+    /// reason [`CustomEntityTypeEntry::tags`] gives:
+    /// [`TaggedResourceKind::UsageProfile`] names it.
     pub tags: HashMap<String, String>,
 }
 

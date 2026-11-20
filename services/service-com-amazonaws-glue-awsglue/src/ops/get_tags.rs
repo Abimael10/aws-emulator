@@ -10,17 +10,16 @@
 //! tags this read reports. The ARN is resolved through
 //! [`crate::state::parse_tagged_resource`] plus
 //! [`crate::state::ComAmazonawsGlueAwsglueState::resource_tags`], the one resolution
-//! every tag read in this emulator goes through.
-//!
-//! An interactive SESSION is resolved beside that catalog resolution
-//! ([`SESSION_ARN_SEGMENT`]): `CreateSession` takes a `Tags` map and the session record
-//! keeps it, and a session lives beside the catalog tree keyed by the Region its create was
-//! served in and its own id, which is what its ARN names.
+//! every tag read in this emulator goes through — and that resolution covers every kind of
+//! Glue resource whose record carries a tag set, a registry, a schema set, a session, a
+//! workflow and the rest among them, because the modelled `ResourceArn` places no
+//! restriction on which kind of Glue resource the ARN names.
 //!
 //! An ARN that names no taggable Glue resource at all earns the modelled client-input
 //! refusal; one of a known kind this store holds no resource for earns the modelled
-//! `EntityNotFoundException`, as does one naming another Region's or another account's
-//! estate.
+//! `EntityNotFoundException` carrying the tagging surface's recorded sentence
+//! ([`crate::state::messages::TAGGED_RESOURCE_NOT_FOUND`]), as does one naming another
+//! Region's or another account's estate.
 //!
 //! That client-input refusal is this handler's, not the framework boundary's
 //! (`skip_validation` on `GetTagsRequest` in `src/ops/types/`): a `ResourceArn` outside
@@ -89,14 +88,6 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-
-/// The ARN resource-type segment an interactive session carries: `session/<session-id>`.
-///
-/// Source: the resource portion of a Glue session's ARN, which names the session by the
-/// `Id` its create chose. The model states only the prefix every Glue ARN shares
-/// (`GetTags$ResourceArn`'s `GlueResourceArn` pattern), so the segment is named here, in
-/// the one operation that resolves it.
-const SESSION_ARN_SEGMENT: &str = "session";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -180,40 +171,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
 
-        // A Glue interactive session carries a tag set of its own — `CreateSession` takes
-        // "The map of key value pairs (tags) belonging to the session" and the session
-        // record keeps it — so the tags this read reports for a session ARN are the ones
-        // its create recorded. A session is not a resource of the catalog tree: it lives
-        // beside it, keyed by the Region its create was served in and by its id, so the
-        // ARN is resolved against this endpoint's own estate and then against that
-        // Region's session namespace rather than through the catalog's resource table.
-        if let Some(arn) = crate::state::parse_glue_arn(&input.resource_arn) {
-            if let Some(session_id) = arn.resource_of_type(SESSION_ARN_SEGMENT) {
-                let tags = arn
-                    .is_local(&region)
-                    .then(|| {
-                        state
-                            .lock()
-                            .session(&region, session_id)
-                            .map(|session| session.tags.clone())
-                    })
-                    .flatten();
-                // An ARN naming a session this endpoint holds none of — including one of
-                // another account or another Region — names no entity here, which is the
-                // same answer every other kind's miss earns.
-                let Some(tags) = tags else {
-                    return Err(GetTagsErrorModeled::EntityNotFoundException(
-                        EntityNotFoundException {
-                            message: Some(crate::state::messages::session_not_found(session_id)),
-                            from_federation_source: None,
-                        },
-                    )
-                    .into());
-                };
-                return Ok(GetTagsOutput { tags: Some(tags) });
-            }
-        }
-
         // A `ResourceArn` this service tags NO resource of is a bad parameter, not a
         // miss: the modelled constraint admits any Glue ARN, so the resource type it
         // carries is what is checked here.
@@ -226,10 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let not_found = || {
             GetTagsErrorModeled::EntityNotFoundException(EntityNotFoundException {
-                message: Some(crate::state::tagged_resource_not_found_message(
-                    &resource,
-                    &input.resource_arn,
-                )),
+                message: Some(crate::state::messages::TAGGED_RESOURCE_NOT_FOUND.to_string()),
                 from_federation_source: None,
             })
         };

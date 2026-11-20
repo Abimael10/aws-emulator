@@ -33,7 +33,7 @@ use service_com_amazonaws_glue_awsglue::state::MAX_TAGS_PER_RESOURCE;
 
 use crate::resource_tagging::{
     create_request, glue_arn, map_of, read_tags, resource_arn, tags_of, ARN_WRONG_REGION,
-    OTHER_REGIONS,
+    OTHER_REGIONS, TAGGING_ENTITY_NOT_FOUND,
 };
 use crate::wire::{call, call_in_region, emulator, error_code, error_message, ok, ACCOUNT_ID, REGION};
 
@@ -470,12 +470,11 @@ fn refusal_rows() -> Vec<RefusalRow> {
 
     // A Glue ARN whose resource portion names no kind that carries a tag set. Everything
     // outside the kinds a tagging call accepts is a bad parameter, and that refusal states
-    // NO prose at all — the code alone.
+    // NO prose at all — the code alone. Which kinds those are is pinned per kind by
+    // [`crate::tagging_resource_kinds`].
     for resource in [
         "table/untag_refusal_db/orders",
-        "schema/registry-1/schema-1",
         "devEndpoint/dev-1",
-        "trigger/nightly",
         "userDefinedFunction/untag_refusal_db/to_upper",
         "catalog",
         "database/",
@@ -490,30 +489,15 @@ fn refusal_rows() -> Vec<RefusalRow> {
         });
     }
 
-    // An ARN of a taggable kind that resolves to no stored resource: a miss, worded as this
-    // crate words that kind's miss wherever it fails to resolve.
-    rows.push(RefusalRow {
-        case: "a database name this catalog holds nothing under".to_string(),
-        region: REGION,
-        arn: resource_arn("database", "never_created"),
-        code: "EntityNotFoundException",
-        message: Some("Database never_created not found.".to_string()),
-    });
-    rows.push(RefusalRow {
-        case: "a crawler name this account holds nothing under".to_string(),
-        region: REGION,
-        arn: resource_arn("crawler", "never-created"),
-        code: "EntityNotFoundException",
-        message: Some("Crawler entry with name never-created does not exist".to_string()),
-    });
-    for segment in ["connection", "job"] {
-        let arn = resource_arn(segment, "never-created");
+    // An ARN of a taggable kind that resolves to no stored resource: a miss, worded with the
+    // fixed sentence the tagging surface answers one with whatever the kind is.
+    for segment in ["database", "crawler", "connection", "job"] {
         rows.push(RefusalRow {
             case: format!("a {segment} name this account holds nothing under"),
             region: REGION,
-            message: Some(format!("Entity not found for resource {arn}")),
-            arn,
+            arn: resource_arn(segment, "never-created"),
             code: "EntityNotFoundException",
+            message: Some(TAGGING_ENTITY_NOT_FOUND.to_string()),
         });
     }
 

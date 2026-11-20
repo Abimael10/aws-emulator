@@ -209,9 +209,9 @@ pub struct SessionEntry {
     /// carry.
     ///
     /// Kept because `ListSessions` takes "the tags" to narrow its answer by, so they decide
-    /// which sessions a filtered listing reports. NOT yet reachable through the tagging
-    /// operations, for the reason [`BlueprintEntry::tags`] gives: [`TaggedResourceKind`]
-    /// carries no session variant yet.
+    /// which sessions a filtered listing reports, and reachable through the tagging
+    /// operations for the reason [`BlueprintEntry::tags`] gives:
+    /// [`TaggedResourceKind::Session`] resolves a session's ARN to this record.
     pub tags: HashMap<String, String>,
     /// The statements run on this session, oldest first — which is submission order,
     /// because a statement is appended here by the run that recorded it.

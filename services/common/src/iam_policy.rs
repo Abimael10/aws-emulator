@@ -719,7 +719,23 @@ const MAX_CANONICAL_NESTING: usize = 128;
 /// [`MAX_CANONICAL_NESTING`]: this is a rendering, not a validation, and the policy grammar
 /// ([`resource_policy_defect`]) is what refuses an unusable document.
 pub fn canonical_document(text: &str) -> String {
-    render_canonically(text, false)
+    render_canonically(text, false, true)
+}
+
+/// [`canonical_document`] for a service that reports a VALUE LIST as it was written: a list
+/// holding exactly one value keeps its brackets (`"Action" : [ "svc:DoThing" ]`).
+///
+/// The collapse [`canonical_document`] performs is what the services whose recorded reads
+/// show it do — their policy engine re-serializes a one-value list of `Action`, `Resource`,
+/// `Principal` or a condition key through the string form the policy language gives it. A
+/// service whose recorded reads show the list instead takes this flavour, and gets the SAME
+/// walk otherwise: the same separator, the same indentation per enclosing object, inline
+/// arrays, `{ }` and `[ ]`, each token copied out of the submitted text byte for byte, and
+/// the same fixed point.
+///
+/// Taken by the Glue resource-policy surface (`GetResourcePolicy`, `GetResourcePolicies`).
+pub fn canonical_document_keeping_value_lists(text: &str) -> String {
+    render_canonically(text, false, false)
 }
 
 /// [`canonical_document`], plus the one thing a policy ENGINE settles that re-indenting does
@@ -741,17 +757,22 @@ pub fn canonical_document(text: &str) -> String {
 /// Taken by a service whose recorded reads show that coercion; a service whose reads report
 /// the caller's own JSON types takes [`canonical_document`].
 pub fn canonical_document_with_condition_values_as_strings(text: &str) -> String {
-    render_canonically(text, true)
+    render_canonically(text, true, true)
 }
 
-/// The rendering both entry points above share: the one walk, with or without the condition
-/// coercion.
-fn render_canonically(text: &str, condition_values_as_strings: bool) -> String {
+/// The rendering every entry point above shares: the one walk, with or without the condition
+/// coercion, and with or without the one-value list collapse.
+fn render_canonically(
+    text: &str,
+    condition_values_as_strings: bool,
+    collapse_value_lists: bool,
+) -> String {
     let mut renderer = PolicyRenderer {
         source: text,
         at: 0,
         nesting: 0,
         condition_values_as_strings,
+        collapse_value_lists,
         rendered: String::with_capacity(text.len() + text.len() / 2),
     };
     if renderer.render() {
@@ -782,6 +803,10 @@ struct PolicyRenderer<'a> {
     /// Whether a condition's values are rendered as strings
     /// ([`canonical_document_with_condition_values_as_strings`]).
     condition_values_as_strings: bool,
+    /// Whether a value list holding exactly one value is written as that value alone, without
+    /// its brackets ([`canonical_document`]), or as the list it was written as
+    /// ([`canonical_document_keeping_value_lists`]).
+    collapse_value_lists: bool,
     /// What has been rendered so far.
     rendered: String,
 }
@@ -909,11 +934,13 @@ impl<'a> PolicyRenderer<'a> {
         self.skip_space();
         // A VALUE list is one whose element is a string \u2014 as written, or as a condition's
         // own value was coerced to ([`canonical_document_with_condition_values_as_strings`]),
-        // which is what makes a one-value list of them collapse like any other.
-        let holds_values = opened_with == b'"'
-            || (self.condition_values_as_strings
-                && in_condition
-                && self.rendered.as_bytes().get(opens_at) == Some(&b'"'));
+        // which is what makes a one-value list of them collapse like any other. A caller that
+        // reports its lists as written collapses none of them.
+        let holds_values = self.collapse_value_lists
+            && (opened_with == b'"'
+                || (self.condition_values_as_strings
+                    && in_condition
+                    && self.rendered.as_bytes().get(opens_at) == Some(&b'"')));
         if holds_values && self.peek()? == b']' {
             self.at += 1;
             return Some(());
@@ -1689,6 +1716,74 @@ mod tests {
                 "case {case:?}: expected re-rendering to change nothing, got {again:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_value_list_keeps_its_brackets_for_a_caller_that_reports_its_lists_as_written() {
+        // The rows differ along what the flavour generalises over: the arity of a value list
+        // (one, several), which element carries it, a value written as a bare string rather
+        // than as a list, a list of objects, and a condition key's own one-value list.
+        let rows: [(&str, &str, &str); 5] = [
+            (
+                "a one-value Action list",
+                "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":[\"svc:A\"]}}",
+                "\"Action\" : [ \"svc:A\" ]",
+            ),
+            (
+                "a list of several values, as the collapse-free rendering too",
+                "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":[\"svc:A\",\"svc:B\"]}}",
+                "\"Action\" : [ \"svc:A\", \"svc:B\" ]",
+            ),
+            (
+                "a value written as a string, which is no list at all",
+                "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"svc:A\"}}",
+                "\"Action\" : \"svc:A\"",
+            ),
+            (
+                "a one-value Resource list inside a one-statement list",
+                "{\"Statement\":[{\"Effect\":\"Allow\",\"Resource\":[\"arn:aws:svc:::thing\"]}]}",
+                "\"Resource\" : [ \"arn:aws:svc:::thing\" ]",
+            ),
+            (
+                "a condition key's one-value list",
+                "{\"Statement\":{\"Effect\":\"Allow\",\
+                 \"Condition\":{\"StringEquals\":{\"k\":[\"v\"]}}}}",
+                "\"k\" : [ \"v\" ]",
+            ),
+        ];
+
+        for (case, submitted, expected) in rows {
+            let actual = canonical_document_keeping_value_lists(submitted);
+            assert!(
+                actual.contains(expected),
+                "case {case:?}: expected a rendering carrying {expected:?}, got {actual:?}"
+            );
+            // The same walk, so the rendering is a fixed point here too.
+            let again = canonical_document_keeping_value_lists(&actual);
+            assert_eq!(
+                again, actual,
+                "case {case:?}: expected re-rendering to change nothing, got {again:?}"
+            );
+        }
+
+        // Everything but the brackets of a one-value list is the canonical layout: a
+        // document carrying no one-value list renders the same under both entry points.
+        let without_value_lists = "{\"Version\":\"2012-10-17\",\"Statement\":[{\
+                                   \"Effect\":\"Allow\",\"Principal\":\"*\",\
+                                   \"Action\":[\"svc:A\",\"svc:B\"],\"Resource\":[]}]}";
+        assert_eq!(
+            canonical_document_keeping_value_lists(without_value_lists),
+            canonical_document(without_value_lists),
+            "a document with no one-value list renders alike under both flavours"
+        );
+        // And the one-value list is the only difference where there is one.
+        let with_value_list = "{\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"svc:A\"]}]}";
+        assert_eq!(
+            canonical_document(with_value_list)
+                .replace("\"Action\" : \"svc:A\"", "\"Action\" : [ \"svc:A\" ]"),
+            canonical_document_keeping_value_lists(with_value_list),
+            "the brackets of a one-value list are the only difference between the flavours"
+        );
     }
 
     #[test]

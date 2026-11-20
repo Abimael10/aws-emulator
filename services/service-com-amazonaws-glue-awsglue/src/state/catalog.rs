@@ -240,9 +240,9 @@ pub struct CatalogDefinition {
     pub update_time: SystemTime,
     /// The create's `Tags`, which the `Catalog` shape does not carry.
     ///
-    /// Kept so the create does not discard what the client sent, but not yet reachable
-    /// through the tagging operations: [`TaggedResourceKind`] carries no catalog variant,
-    /// and that table is what every tag lookup resolves an ARN against.
+    /// This is the record the TAGGING operations resolve a catalog resource's ARN to
+    /// ([`TaggedResourceKind::Catalog`]), so the tags a create recorded are the ones
+    /// `GetTags` reports for it.
     pub tags: HashMap<String, String>,
 }
 
@@ -442,10 +442,12 @@ pub fn to_catalog_properties_output(
 /// answered and the one a later read reports are the same string.
 #[derive(Debug, Clone)]
 pub struct ResourcePolicyEntry {
-    /// `PolicyInJson`: "the requested policy document, in JSON format", exactly as the
-    /// write carried it \u2014 a policy is reported as stored, never re-serialised.
+    /// `PolicyInJson`: "the requested policy document, in JSON format" — the document the
+    /// write carried, in the layout the service reports it in
+    /// ([`render_policy_document`]), so every read of this attachment reports one text.
     pub policy_in_json: String,
-    /// `PolicyHash`: the hash of [`Self::policy_in_json`], from [`policy_hash`].
+    /// `PolicyHash`: the token minted for the write that stored this document, from
+    /// [`new_policy_hash`].
     pub policy_hash: String,
     /// `CreateTime`: "the date and time at which the policy was created" \u2014 the instant the
     /// FIRST write attached a policy to this resource, kept across later writes.
@@ -459,7 +461,7 @@ impl ResourcePolicyEntry {
     /// same.
     pub fn new(policy_in_json: String, now: SystemTime) -> Self {
         Self {
-            policy_hash: policy_hash(&policy_in_json),
+            policy_hash: new_policy_hash(),
             policy_in_json,
             create_time: now,
             update_time: now,
@@ -468,33 +470,47 @@ impl ResourcePolicyEntry {
 
     /// Replace this record's document with the one a later write carried, at `now`.
     ///
-    /// The document is replaced whole and the hash recomputed from it, while
+    /// The document is replaced whole and a new `PolicyHash` minted for the write, while
     /// [`Self::create_time`] stays where the first write put it: the policy is the same
     /// attachment, rewritten.
     pub fn replace_document(&mut self, policy_in_json: String, now: SystemTime) {
-        self.policy_hash = policy_hash(&policy_in_json);
+        self.policy_hash = new_policy_hash();
         self.policy_in_json = policy_in_json;
         self.update_time = now;
     }
 }
 
-/// The `PolicyHash` of a policy document: the SHA-256 of the document, lowercase
-/// hexadecimal.
-///
-/// Derived from the document's CONTENT, which is what the member is for: it is "the hash
-/// value returned when the previous policy was set using `PutResourcePolicy`", whose
-/// "purpose is to prevent concurrent modifications of a policy"
-/// (`PutResourcePolicyRequest$PolicyHashCondition`) \u2014 so the same document always hashes
-/// to the same value, and a document changed in any way hashes to a different one. Glue
-/// publishes no digest for it, so the algorithm is this emulator's; the 64 hexadecimal
-/// characters are inside `HashString`'s `length 1..255` and match its pattern.
-///
-/// This is not a per-run value and not a credential: it is computed from the request's
-/// own document, so two runs that attach the same policy report the same hash.
-pub fn policy_hash(policy_in_json: &str) -> String {
-    use ::sha2::Digest;
+/// How many `PolicyHash` tokens this process has minted. A nonce source for
+/// [`new_policy_hash`], exactly as the counters beside it are for the other ids this crate
+/// mints.
+static MINTED_POLICY_HASHES: ::std::sync::atomic::AtomicU64 =
+    ::std::sync::atomic::AtomicU64::new(0);
 
-    ::hex::encode(::sha2::Sha256::digest(policy_in_json.as_bytes()))
+/// How many 64-bit words a `PolicyHash` carries: two, i.e. 128 bits.
+const POLICY_HASH_WORDS: usize = 2;
+
+/// A fresh `PolicyHash`: the OPAQUE token identifying the policy a write has just attached.
+///
+/// It is what the member is for — "the hash value returned when the previous policy was set
+/// using `PutResourcePolicy`", whose "purpose is to prevent concurrent modifications of a
+/// policy" (`PutResourcePolicyRequest$PolicyHashCondition`) — so what it has to satisfy is
+/// that a client holding it can tell whether the policy has been written since: it is minted
+/// per WRITE, stored on the attachment, reported unchanged by every read of that attachment
+/// until the next write, and never minted twice. Glue publishes no algorithm behind the
+/// member, and a token the service mints is not something a client can compute, so nothing
+/// here is derived from the document; the value is the 128 bits [`super::mint_hex_id`] draws,
+/// base64-encoded the way this service's own token is spelled, which is inside
+/// `HashString`'s `length 1..255` and matches its pattern.
+///
+/// This names a RESOURCE's version, not a credential: a credential would come from the
+/// credential store, never from here.
+pub fn new_policy_hash() -> String {
+    let drawn = super::mint_hex_id(&MINTED_POLICY_HASHES, POLICY_HASH_WORDS);
+    // The draw is rendered hexadecimal, so its bytes are read back before they are spelled
+    // again; a draw this crate made is always valid hexadecimal, and the fallback keeps a
+    // request path alive rather than panicking on something unreachable.
+    let bytes = ::hex::decode(&drawn).unwrap_or_else(|_| drawn.clone().into_bytes());
+    ::base64::Engine::encode(&::base64::engine::general_purpose::STANDARD, bytes)
 }
 
 /// The resource whose policy a resource-policy request addresses: the `ResourceArn` it

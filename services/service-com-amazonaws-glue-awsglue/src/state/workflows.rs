@@ -34,10 +34,8 @@ pub struct WorkflowEntry {
     pub last_modified_on: SystemTime,
     /// The create's `Tags`, which are not part of the `Workflow` shape.
     ///
-    /// Kept so the create does not discard what the client sent, but NOT yet reachable
-    /// through the tagging operations, for the reason [`CustomEntityTypeEntry::tags`]
-    /// gives: [`TaggedResourceKind`] carries no workflow variant yet, and resolving one
-    /// belongs to the tagging operations' own issues.
+    /// This is the record the TAGGING operations resolve a workflow's ARN to, for the reason
+    /// [`CustomEntityTypeEntry::tags`] gives: [`TaggedResourceKind::Workflow`] names it.
     pub tags: HashMap<String, String>,
     /// The runs `StartWorkflowRun` started of this workflow, oldest first and bounded by
     /// [`MAX_RUNS_PER_WORKFLOW`].

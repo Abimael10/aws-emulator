@@ -5,12 +5,15 @@
 //!
 //! The rule under test: a resource policy is ONE record per Glue resource, addressed by
 //! `ResourceArn` alone — this account's Data Catalog when the request names none — which a
-//! put stores whole and re-hashes from the document it carries, a read reports with that
-//! hash and the instants the attachment was created and last written, and a delete
-//! removes. A resource carrying no policy is a miss for the read and the delete alike
-//! (400 `EntityNotFoundException`, "Policy not found"), each condition a request carries
-//! is checked BEFORE anything is stored, and `GetResourcePolicies` enumerates the
-//! policies of individual resources without the account-level catalog policy among them.
+//! put stores whole, a read reports with the hash the put answered and the instants the
+//! attachment was created and last written, and a delete removes. The DOCUMENT a read
+//! reports is the one the put carried, re-emitted in the service's own layout rather than
+//! echoed back byte for byte, and the `PolicyHash` is an opaque token minted for each write.
+//! A resource carrying no policy is a miss for the read and the delete alike (400
+//! `EntityNotFoundException`, "Policy not found"), each condition a request carries is
+//! checked BEFORE anything is stored, and `GetResourcePolicies` enumerates the policies of
+//! individual resources without the account-level catalog policy among them, answering a
+//! continuation token for every first page.
 //!
 //! Each suite is a TABLE whose rows differ along what the rule generalises over: which
 //! resource the policy is attached to, which document it carries (size, statement count,
@@ -149,8 +152,8 @@ async fn assert_no_policy(router: &MultiServiceRouter, case: &str, arn: Option<&
     }
 }
 
-/// The `GetResourcePoliciesResponseList` of one page, as a list of documents.
-fn listed_documents(page: &Value, case: &str) -> Vec<String> {
+/// The `GetResourcePoliciesResponseList` of one page, as the documents it carries.
+fn listed_documents(page: &Value, case: &str) -> Vec<Value> {
     page["GetResourcePoliciesResponseList"]
         .as_array()
         .unwrap_or_else(|| {
@@ -158,14 +161,51 @@ fn listed_documents(page: &Value, case: &str) -> Vec<String> {
         })
         .iter()
         .map(|policy| {
-            policy["PolicyInJson"]
-                .as_str()
-                .unwrap_or_else(|| {
-                    panic!("case {case}: every listed policy carries its document, got {page}")
-                })
-                .to_string()
+            let text = policy["PolicyInJson"].as_str().unwrap_or_else(|| {
+                panic!("case {case}: every listed policy carries its document, got {page}")
+            });
+            parsed(text, case)
         })
         .collect()
+}
+
+/// `document` as a JSON value, so two spellings of one policy compare equal.
+fn parsed(document: &str, case: &str) -> Value {
+    serde_json::from_str(document).unwrap_or_else(|error| {
+        panic!("case {case}: {document:?} must be a JSON document, got {error}")
+    })
+}
+
+/// Whether `hash` is shaped the way a `PolicyHash` is: the base64 of 128 bits, i.e. 24
+/// characters of the base64 alphabet ending in the two padding characters that 16 bytes
+/// leave.
+///
+/// The SHAPE is what the recorded member pins — the token itself is opaque, minted per write
+/// — so this is what a client validating the form of the hash it stores sees.
+fn is_policy_hash_shaped(hash: &str) -> bool {
+    hash.len() == 24
+        && hash.ends_with("==")
+        && hash[..22]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/')
+}
+
+/// Assert that `reported` carries the policy `submitted`: the SAME JSON document, member for
+/// member and value for value.
+///
+/// The two are compared as JSON values rather than as text, because what a read reports is
+/// the document and not the client's bytes — the service re-emits it in its own layout, which
+/// [`a_policy_document_is_reported_in_the_services_own_layout`] pins against literal text.
+fn assert_reports_document(reported: &Value, submitted: &str, case: &str) {
+    let text = reported["PolicyInJson"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case}: the read reports a PolicyInJson, got {reported}"));
+    assert_eq!(
+        parsed(text, case),
+        parsed(submitted, case),
+        "case {case}: the reported document must be the one submitted; expected {submitted}, \
+         got {text}"
+    );
 }
 
 /// A resource that carries no policy is a miss for the read and the delete, whichever
@@ -199,8 +239,8 @@ async fn a_resource_with_no_policy_is_a_miss_for_the_read_and_the_delete() {
     );
 }
 
-/// Every policy document a put carries is reported back exactly as sent, with a hash of
-/// its own and the two instants of the attachment — and two reads with no write between
+/// Every policy document a put carries is reported back as the document it is, with a hash
+/// of its own and the two instants of the attachment — and two reads with no write between
 /// them answer the same.
 #[tokio::test]
 async fn every_policy_document_round_trips_with_a_hash_of_its_own() {
@@ -294,13 +334,14 @@ async fn every_policy_document_round_trips_with_a_hash_of_its_own() {
             !put_hash.is_empty() && put_hash.chars().count() <= 255,
             "case {case}: a PolicyHash is a HashString of 1..255 characters, got {put_hash:?}"
         );
+        assert!(
+            is_policy_hash_shaped(&put_hash),
+            "case {case}: a PolicyHash is the recorded shape — 128 bits, base64 — got \
+             {put_hash:?}"
+        );
 
         let reported = attached(&router, case, None).await;
-        assert_eq!(
-            reported["PolicyInJson"],
-            json!(document),
-            "case {case}: the document is reported as stored; expected {document}, got {reported}"
-        );
+        assert_reports_document(&reported, document, case);
         assert_eq!(
             reported["PolicyHash"],
             json!(put_hash),
@@ -328,60 +369,68 @@ async fn every_policy_document_round_trips_with_a_hash_of_its_own() {
         hashes.push((case.to_string(), put_hash));
     }
 
-    // The hash is derived from the document: these rows carry documents that all differ,
-    // so no two of them may share a hash.
+    // The hash identifies the WRITE that attached the policy, so no two of these
+    // attachments — each in a store of its own — may share one.
     let distinct: BTreeSet<&String> = hashes.iter().map(|(_, hash)| hash).collect();
     assert_eq!(
         distinct.len(),
         hashes.len(),
-        "documents that differ must hash differently, got {hashes:?}"
+        "two attachments must not share a PolicyHash, got {hashes:?}"
     );
 
-    // ...and the same document always hashes the same, in a store that never saw it
-    // before.
+    // ...and a second write of the SAME document mints another one, because what the hash
+    // tells a client is whether the policy has been written since it last read it.
     let (case, document) = &cases[0];
     let elsewhere = emulator();
-    let repeated = attach(&elsewhere, case, document, Some(TABLE_ARN)).await;
+    let first = attach(&elsewhere, case, document, Some(TABLE_ARN)).await;
+    let again = attach(&elsewhere, case, document, Some(TABLE_ARN)).await;
+    assert_ne!(
+        again, first,
+        "case {case}: a second write of one document must mint a new PolicyHash, got {first} \
+         twice"
+    );
+    let reported = ok(
+        &elsewhere,
+        "GetResourcePolicy",
+        &arn_request(Some(TABLE_ARN)),
+    )
+    .await;
     assert_eq!(
-        repeated, hashes[0].1,
-        "case {case}: one document has one hash wherever it is attached, got {repeated} and {}",
-        hashes[0].1
+        reported["PolicyHash"],
+        json!(again),
+        "case {case}: the read reports the hash the last write answered, got {reported}"
     );
 }
 
-/// A second put replaces the document whole, keeps the attachment's `CreateTime` and
-/// re-hashes from what it carried.
+/// A second put replaces the document whole, keeps the attachment's `CreateTime` and mints
+/// a new `PolicyHash` for the write.
 #[tokio::test]
 async fn a_second_put_replaces_the_document_and_keeps_the_create_time() {
-    // (case, the first document, the second, whether the two hash alike)
-    let cases: Vec<(&str, String, String, bool)> = vec![
+    // (case, the first document, the second)
+    let cases: Vec<(&str, String, String)> = vec![
         (
             "a narrower grant",
             policy_document(&["glue:GetDatabase", "glue:GetTable"], CATALOG_ARN),
             policy_document(&["glue:GetDatabase"], CATALOG_ARN),
-            false,
         ),
         (
             "a wider grant",
             policy_document(&["glue:GetDatabase"], CATALOG_ARN),
             policy_document(&["glue:GetDatabase", "glue:GetPartitions"], CATALOG_ARN),
-            false,
         ),
         (
             "an emptied statement list",
             policy_document(&["glue:GetDatabase"], CATALOG_ARN),
             json!({ "Version": "2012-10-17", "Statement": [] }).to_string(),
-            false,
         ),
         (
             "the very same document again",
             policy_document(&["glue:GetTable"], TABLE_ARN),
             policy_document(&["glue:GetTable"], TABLE_ARN),
-            true,
         ),
     ];
 
-    for (case, first, second, same_hash) in &cases {
+    for (case, first, second) in &cases {
         let router = emulator();
         let first_hash = attach(&router, case, first, None).await;
         let before = attached(&router, case, None).await;
@@ -389,20 +438,15 @@ async fn a_second_put_replaces_the_document_and_keeps_the_create_time() {
         let second_hash = attach(&router, case, second, None).await;
         let after = attached(&router, case, None).await;
 
-        assert_eq!(
-            after["PolicyInJson"],
-            json!(second),
-            "case {case}: the second document replaces the first; expected {second}, got {after}"
-        );
+        assert_reports_document(&after, second, case);
         assert_eq!(
             after["PolicyHash"],
             json!(second_hash),
             "case {case}: the read reports the hash the second put answered, got {after}"
         );
-        assert_eq!(
-            second_hash == first_hash,
-            *same_hash,
-            "case {case}: the hash follows the document; got {first_hash} then {second_hash}"
+        assert_ne!(
+            second_hash, first_hash,
+            "case {case}: every write mints its own hash; got {first_hash} twice"
         );
         assert_eq!(
             after["CreateTime"], before["CreateTime"],
@@ -436,11 +480,7 @@ async fn the_default_resource_arn_and_the_catalog_arn_name_one_record() {
         let hash = attach(&router, case, &document, *put_arn).await;
 
         let reported = attached(&router, case, *read_arn).await;
-        assert_eq!(
-            reported["PolicyInJson"],
-            json!(document),
-            "case {case}: both spellings address one record; expected {document}, got {reported}"
-        );
+        assert_reports_document(&reported, &document, case);
         assert_eq!(
             reported["PolicyHash"],
             json!(hash),
@@ -492,12 +532,7 @@ async fn each_resource_keeps_its_own_policy() {
     }
     for (case, arn, document) in &attachments {
         let reported = attached(&router, case, *arn).await;
-        assert_eq!(
-            reported["PolicyInJson"],
-            json!(document),
-            "case {case}: each resource reports its own document; expected {document}, got \
-             {reported}"
-        );
+        assert_reports_document(&reported, document, case);
     }
 
     // Detaching one leaves every other attachment readable.
@@ -513,12 +548,7 @@ async fn each_resource_keeps_its_own_policy() {
             continue;
         }
         let reported = attached(&router, case, *arn).await;
-        assert_eq!(
-            reported["PolicyInJson"],
-            json!(document),
-            "case {case}: another resource's delete must leave this attachment alone, got \
-             {reported}"
-        );
+        assert_reports_document(&reported, document, case);
     }
 }
 
@@ -574,12 +604,7 @@ async fn the_exists_condition_decides_whether_the_put_is_served() {
                 // before, which for an empty store is no policy at all.
                 if *attach_first {
                     let reported = attached(&router, case, None).await;
-                    assert_eq!(
-                        reported["PolicyInJson"],
-                        json!(attached_document),
-                        "case {case}: a refused put must leave the attachment alone, got \
-                         {reported}"
-                    );
+                    assert_reports_document(&reported, &attached_document, case);
                 } else {
                     assert_no_policy(&router, case, None).await;
                 }
@@ -590,11 +615,7 @@ async fn the_exists_condition_decides_whether_the_put_is_served() {
                     "case {case}: a satisfied condition must be served, got {status} with {body}"
                 );
                 let reported = attached(&router, case, None).await;
-                assert_eq!(
-                    reported["PolicyInJson"],
-                    json!(new_document),
-                    "case {case}: the served put stores its own document, got {reported}"
-                );
+                assert_reports_document(&reported, &new_document, case);
             }
         }
     }
@@ -692,11 +713,7 @@ async fn the_hash_condition_admits_only_the_attached_policys_hash() {
 
         // Neither refused call touched the attachment.
         let reported = attached(&router, case, None).await;
-        assert_eq!(
-            reported["PolicyInJson"],
-            json!(second_document),
-            "case {case}: a refused call must leave the attachment alone, got {reported}"
-        );
+        assert_reports_document(&reported, &second_document, case);
         assert_eq!(
             reported["PolicyHash"],
             json!(second_hash),
@@ -745,14 +762,14 @@ async fn get_resource_policies_lists_individual_resources_without_the_catalog_po
     let page = ok(&router, "GetResourcePolicies", &json!({})).await;
     assert_eq!(
         listed_documents(&page, "the catalog policy alone"),
-        Vec::<String>::new(),
+        Vec::<Value>::new(),
         "case the catalog policy alone: the account-level catalog policy is not listed, got \
          {page}"
     );
-    assert_eq!(
-        page.get("NextToken"),
-        None,
-        "case the catalog policy alone: a last page carries no NextToken, got {page}"
+    assert!(
+        page.get("NextToken").and_then(Value::as_str).is_some(),
+        "case the catalog policy alone: a first listing answers a continuation token even \
+         with nothing to report, got {page}"
     );
 
     // Attach one policy per individual resource. The expected order is the ARNs' own.
@@ -778,9 +795,9 @@ async fn get_resource_policies_lists_individual_resources_without_the_catalog_po
         attach(&router, arn, document, Some(arn)).await;
     }
     individual.sort_by(|left, right| left.0.cmp(right.0));
-    let expected: Vec<String> = individual
+    let expected: Vec<Value> = individual
         .iter()
-        .map(|(_, document)| document.clone())
+        .map(|(arn, document)| parsed(document, arn))
         .collect();
 
     let page = ok(&router, "GetResourcePolicies", &json!({})).await;
@@ -790,28 +807,35 @@ async fn get_resource_policies_lists_individual_resources_without_the_catalog_po
         "case every individual resource: expected the four documents in ARN order, got {page}"
     );
     assert!(
-        !listed_documents(&page, "every individual resource").contains(&catalog_document),
+        !listed_documents(&page, "every individual resource")
+            .contains(&parsed(&catalog_document, "the catalog policy")),
         "case every individual resource: the catalog's own policy must not be listed, got {page}"
     );
     let catalog = attached(&router, "every individual resource", None).await;
-    assert_eq!(
-        catalog["PolicyInJson"],
-        json!(catalog_document),
-        "case every individual resource: the catalog policy stays readable, got {catalog}"
-    );
+    assert_reports_document(&catalog, &catalog_document, "every individual resource");
 
     // Paged, one entry at a time: the pages concatenate to the whole set, in the same
-    // order, and only the last page carries no token.
+    // order, and the walk terminates — the page a continuation reaches past the last entry
+    // carries no token of its own.
     for page_size in [1_i64, 2, 3, MAX_PAGE_SIZE] {
         let case = format!("MaxResults {page_size}");
-        let mut walked: Vec<String> = Vec::new();
+        let mut walked: Vec<Value> = Vec::new();
         let mut token: Option<String> = None;
+        // One page per entry, plus the first page and the one that reports the tail of the
+        // set: a walk that asks for more than that is not terminating.
+        let mut pages = 0usize;
+        let allowed = expected.len() + 2;
         loop {
             let mut request = json!({ "MaxResults": page_size });
             if let Some(cursor) = &token {
                 request["NextToken"] = json!(cursor);
             }
             let page = ok(&router, "GetResourcePolicies", &request).await;
+            pages += 1;
+            assert!(
+                pages <= allowed,
+                "case {case}: the walk must terminate within {allowed} pages, got {pages}"
+            );
             let documents = listed_documents(&page, &case);
             assert!(
                 documents.len() as i64 <= page_size,
@@ -827,6 +851,22 @@ async fn get_resource_policies_lists_individual_resources_without_the_catalog_po
             walked, expected,
             "case {case}: the pages must concatenate to the whole set in ARN order, got \
              {walked:?}"
+        );
+    }
+
+    // A token this store did not mint names no position and is refused rather than
+    // resolved against an ARN that happens to sort somewhere.
+    for forged in ["arn:aws:glue:us-east-1:000000000000:crawler/nightly", "zz"] {
+        let (status, body) = call(
+            &router,
+            "GetResourcePolicies",
+            &json!({ "NextToken": forged }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {forged:?}: a continuation token this store did not mint must be refused \
+             with 400, got {status} with {body}"
         );
     }
 
@@ -921,12 +961,7 @@ async fn a_resource_arn_of_another_estate_is_refused_by_every_operation() {
 
         // The refused calls left this account's own attachment alone.
         let reported = attached(&router, foreign, None).await;
-        assert_eq!(
-            reported["PolicyInJson"],
-            json!(own_document),
-            "case {foreign:?}: a refused call must leave this account's policy alone, got \
-             {reported}"
-        );
+        assert_reports_document(&reported, &own_document, foreign);
     }
 
     // A value that is no Glue ARN at all is refused before the handler, by the member's
@@ -993,9 +1028,163 @@ async fn a_policy_document_that_is_not_a_json_object_is_refused() {
     let document = json!({ "Version": "2012-10-17", "Statement": [] }).to_string();
     attach(&router, "an object", &document, None).await;
     let reported = attached(&router, "an object", None).await;
-    assert_eq!(
-        reported["PolicyInJson"],
-        json!(document),
-        "case an object: a JSON object is a policy document and must be stored, got {reported}"
-    );
+    assert_reports_document(&reported, &document, "an object");
+}
+
+/// A `PolicyInJson` that is not JSON at all is refused with the service's parser's own
+/// complaint: the word it stopped on, quoted, what a value may begin with, and the position
+/// that word starts at in the submitted document.
+#[tokio::test]
+async fn a_policy_that_is_not_json_is_refused_with_the_parsers_complaint() {
+    // (case, the value sent as PolicyInJson, the word named, the line and column reported).
+    // The recorded case is the first: a document that begins with a bare word.
+    let cases = [
+        ("a bare word", "not a policy".to_string(), "not", 1, 1),
+        ("a single word", "nope".to_string(), "nope", 1, 1),
+        (
+            "a word where a member's value belongs",
+            "{\"Version\": allow}".to_string(),
+            "allow",
+            1,
+            13,
+        ),
+        (
+            "a word on the third line",
+            "{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": nothing\n}".to_string(),
+            "nothing",
+            3,
+            16,
+        ),
+        (
+            "a word after a long prefix of whitespace",
+            format!("{}maybe", " ".repeat(40)),
+            "maybe",
+            1,
+            41,
+        ),
+    ];
+
+    for (case, document, token, line, column) in cases {
+        let router = emulator();
+        let (status, body) = call(&router, "PutResourcePolicy", &put_request(&document, None)).await;
+        assert_eq!(
+            status, 400,
+            "case {case}: {document:?} is no policy document, so it must be refused with 400, \
+             got {status} with {body}"
+        );
+        assert!(
+            error_code(&body).contains("InvalidInputException"),
+            "case {case}: expected InvalidInputException, got {body}"
+        );
+        let expected = format!(
+            "Invalid input policy: Unexpected IOException: Unrecognized token '{token}': was \
+             expecting (JSON String, Number, Array, Object or token 'null', 'true' or \
+             'false')\n at [Source: REDACTED \
+             (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled); line: {line}, \
+             column: {column}]"
+        );
+        assert_eq!(
+            error_message(&body),
+            expected,
+            "case {case}: unexpected wording for a document that is not JSON"
+        );
+        assert_no_policy(&router, case, None).await;
+    }
+}
+
+/// The document a read reports is the one the write carried, re-emitted in the service's
+/// OWN layout: one member per line, two spaces of indent per nesting level, `" : "` between
+/// a member's name and its value, and a list on one line between single spaces.
+///
+/// The rows differ along what the layout generalises over: nesting depth, a member's value
+/// type, an empty object and an empty list, a list of scalars and a list of objects — and
+/// the document a client already submits in that layout, which is reported unchanged.
+#[tokio::test]
+async fn a_policy_document_is_reported_in_the_services_own_layout() {
+    // (case, the document submitted, the text every read of it reports)
+    let cases: Vec<(&str, String, String)> = vec![
+        (
+            "an object with no member",
+            "{}".to_string(),
+            "{ }".to_string(),
+        ),
+        (
+            "one member",
+            r#"{"Version":"2012-10-17"}"#.to_string(),
+            "{\n  \"Version\" : \"2012-10-17\"\n}".to_string(),
+        ),
+        (
+            "an empty statement list",
+            r#"{"Version":"2012-10-17","Statement":[]}"#.to_string(),
+            "{\n  \"Version\" : \"2012-10-17\",\n  \"Statement\" : [ ]\n}".to_string(),
+        ),
+        (
+            "a list of scalars",
+            r#"{"Action":["glue:GetTable","glue:GetDatabase"]}"#.to_string(),
+            "{\n  \"Action\" : [ \"glue:GetTable\", \"glue:GetDatabase\" ]\n}".to_string(),
+        ),
+        (
+            // The recorded shape of a Glue resource policy: one statement, nested objects
+            // and lists inside it.
+            "a statement with a principal and a list of actions",
+            policy_document(&["glue:GetDatabase"], CATALOG_ARN),
+            [
+                "{",
+                "  \"Version\" : \"2012-10-17\",",
+                "  \"Statement\" : [ {",
+                "    \"Effect\" : \"Allow\",",
+                "    \"Principal\" : {",
+                &format!("      \"AWS\" : \"arn:aws:iam::{ACCOUNT_ID}:root\""),
+                "    },",
+                "    \"Action\" : [ \"glue:GetDatabase\" ],",
+                &format!("    \"Resource\" : [ \"{CATALOG_ARN}\" ]"),
+                "  } ]",
+                "}",
+            ]
+            .join("\n"),
+        ),
+        (
+            "values that are not strings",
+            r#"{"Version":"2012-10-17","Count":2,"Enabled":true,"Unset":null}"#.to_string(),
+            [
+                "{",
+                "  \"Version\" : \"2012-10-17\",",
+                "  \"Count\" : 2,",
+                "  \"Enabled\" : true,",
+                "  \"Unset\" : null",
+                "}",
+            ]
+            .join("\n"),
+        ),
+        (
+            // A document already in that layout is reported as it stands, so a client that
+            // reads a policy and writes it back sees no difference.
+            "a document already in the service's layout",
+            "{\n  \"Version\" : \"2012-10-17\",\n  \"Statement\" : [ ]\n}".to_string(),
+            "{\n  \"Version\" : \"2012-10-17\",\n  \"Statement\" : [ ]\n}".to_string(),
+        ),
+    ];
+
+    for (case, document, reported_text) in &cases {
+        let router = emulator();
+        attach(&router, case, document, None).await;
+
+        let reported = attached(&router, case, None).await;
+        assert_eq!(
+            reported["PolicyInJson"],
+            json!(reported_text),
+            "case {case}: the read must report the service's own layout of {document}"
+        );
+
+        // The listing reports the same text for the same attachment, so no reader renders
+        // a document of its own.
+        attach(&router, case, document, Some(DATABASE_ARN)).await;
+        let page = ok(&router, "GetResourcePolicies", &json!({})).await;
+        let listed = page["GetResourcePoliciesResponseList"][0]["PolicyInJson"].clone();
+        assert_eq!(
+            listed,
+            json!(reported_text),
+            "case {case}: the listing must report the same text as the read, got {page}"
+        );
+    }
 }

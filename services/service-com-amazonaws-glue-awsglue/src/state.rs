@@ -298,6 +298,7 @@ mod materialized_views;
 mod ml_transforms;
 mod pagination;
 mod partition_predicate;
+mod policy_documents;
 mod schema_compatibility;
 mod schema_definition_json;
 mod schema_registry;
@@ -305,6 +306,7 @@ mod security_configurations;
 mod sessions;
 mod statement_execution;
 mod table_rows;
+mod tagged_resources;
 mod triggers;
 mod workflow_runs;
 mod workflows;
@@ -345,6 +347,7 @@ pub use materialized_views::*;
 pub use ml_transforms::*;
 pub use pagination::*;
 pub use partition_predicate::*;
+pub use policy_documents::*;
 pub use schema_compatibility::*;
 pub use schema_definition_json::*;
 pub use schema_registry::*;
@@ -352,6 +355,7 @@ pub use security_configurations::*;
 pub use sessions::*;
 pub use statement_execution::*;
 pub use table_rows::*;
+pub use tagged_resources::*;
 pub use triggers::*;
 pub use workflow_runs::*;
 pub use workflows::*;
@@ -3795,131 +3799,9 @@ impl ComAmazonawsGlueAwsglueState {
             .find(|term| term.glossary_id == glossary_id && term.name == name)
     }
 
-    /// The tag set of the resource `resource` names, or `None` when this store holds no
-    /// such resource.
-    ///
-    /// The ONE resolution every tag READ goes through, so an ARN names the same record
-    /// whichever operation — this service's own `GetTags`, or the account-wide tagging
-    /// API that projects this store — resolved it.
-    pub fn resource_tags(&self, resource: &TaggedResource) -> Option<&HashMap<String, String>> {
-        match resource.kind {
-            // A database and a connection live INSIDE a catalog, so the ARN's account
-            // segment is the `CatalogId` they are looked for under.
-            TaggedResourceKind::Database => self
-                .catalogs
-                .get(&resource.account_id)
-                .and_then(|catalog| catalog.databases.get(&resource.name))
-                .map(|database| &database.tags),
-            TaggedResourceKind::Connection => self
-                .catalogs
-                .get(&resource.account_id)
-                .and_then(|catalog| catalog.connections.get(&resource.name))
-                .map(|connection| &connection.tags),
-            // A crawler and a job definition live BESIDE the catalog tree in one
-            // per-account namespace, so the account segment is what decides whether this
-            // emulator could hold them at all.
-            TaggedResourceKind::Crawler => is_served_account(&resource.account_id)
-                .then(|| self.crawlers.get(&resource.name).map(|crawler| &crawler.tags))
-                .flatten(),
-            TaggedResourceKind::Job => is_served_account(&resource.account_id)
-                .then(|| {
-                    self.job(&resource.region, &resource.name)
-                        .map(|job| &job.tags)
-                })
-                .flatten(),
-        }
-    }
-
-    /// [`Self::resource_tags`] mutably: the ONE record every tag WRITE lands in, so a tag
-    /// written through this service's own `TagResource` and one written through the
-    /// account-wide tagging API are the same tag.
-    pub fn resource_tags_mut(
-        &mut self,
-        resource: &TaggedResource,
-    ) -> Option<&mut HashMap<String, String>> {
-        match resource.kind {
-            TaggedResourceKind::Database => self
-                .catalogs
-                .get_mut(&resource.account_id)
-                .and_then(|catalog| catalog.databases.get_mut(&resource.name))
-                .map(|database| &mut database.tags),
-            TaggedResourceKind::Connection => self
-                .catalogs
-                .get_mut(&resource.account_id)
-                .and_then(|catalog| catalog.connections.get_mut(&resource.name))
-                .map(|connection| &mut connection.tags),
-            TaggedResourceKind::Crawler => {
-                if !is_served_account(&resource.account_id) {
-                    return None;
-                }
-                self.crawlers
-                    .get_mut(&resource.name)
-                    .map(|crawler| &mut crawler.tags)
-            }
-            TaggedResourceKind::Job => {
-                if !is_served_account(&resource.account_id) {
-                    return None;
-                }
-                let region = resource.region.clone();
-                let name = resource.name.clone();
-                self.job_mut(&region, &name).map(|job| &mut job.tags)
-            }
-        }
-    }
-
-    /// Every resource of the account `account_id` this store holds a tag set for, as
-    /// `(ARN, tags)`.
-    ///
-    /// This is ONE account's tag-store rows for this service: the tags a create recorded
-    /// are the resource's own, so the account-wide tagging API projects THESE records
-    /// rather than keeping a second copy that a create would have to be taught to write.
-    /// Resources carrying NO tag are included — the caller decides what to do with an
-    /// untagged resource — and `region` is the Region the ARNs are minted for, for the
-    /// reason [`request_region`] gives.
-    ///
-    /// The account is the boundary the single-resource accessors enforce, so it bounds this
-    /// projection too: a database and a connection are reached through the catalog of
-    /// `account_id` alone, exactly as [`Self::resource_tags`] reaches them, and the crawlers
-    /// and job definitions that live beside the catalog tree in one per-account namespace are
-    /// projected only for an account this emulator serves ([`is_served_account`]), exactly as
-    /// that accessor decides it. So no account's rows are ever reported to another's.
-    pub fn tagged_resources(
-        &self,
-        account_id: &str,
-        region: &str,
-    ) -> Vec<(String, HashMap<String, String>)> {
-        let mut found: Vec<(String, HashMap<String, String>)> = Vec::new();
-        if let Some(catalog) = self.catalogs.get(account_id) {
-            for database in catalog.databases.values() {
-                found.push((
-                    TaggedResourceKind::Database.arn(region, &database.name),
-                    database.tags.clone(),
-                ));
-            }
-            for connection in catalog.connections.values() {
-                found.push((
-                    TaggedResourceKind::Connection.arn(region, &connection.name),
-                    connection.tags.clone(),
-                ));
-            }
-        }
-        if !is_served_account(account_id) {
-            return found;
-        }
-        for crawler in self.crawlers.values() {
-            found.push((
-                TaggedResourceKind::Crawler.arn(region, &crawler.name),
-                crawler.tags.clone(),
-            ));
-        }
-        for job in self.jobs_in(region) {
-            found.push((
-                TaggedResourceKind::Job.arn(region, &job.name),
-                job.tags.clone(),
-            ));
-        }
-        found
-    }
+    // The tag set of the resource an ARN names, the resolution of such an ARN and the
+    // projection of this store the account-wide tagging API reads are all in
+    // `state::tagged_resources`, beside the table of kinds they share.
 }
 
 // The shapes a machine learning TASK RUN is made of, declared beside the records and the

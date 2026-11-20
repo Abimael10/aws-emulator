@@ -15,6 +15,14 @@
 //! `GetResourcePolicy`, and then requires that no policy this operation lists carries
 //! that catalog's ARN in its document. The recording is followed over the prose.
 //!
+//! A FIRST listing — a request carrying no `NextToken` — always answers a continuation
+//! token, which is also what the recorded traffic shows: the token is the position a client
+//! resumes the enumeration from, and its presence states nothing about whether more
+//! policies exist (an account with no individual policy at all still gets one). A page
+//! reached WITH a token carries one only while the set holds entries past it, so a client
+//! walking the pages terminates. The token itself is opaque and minted by this store
+//! ([`crate::state::pagination`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -176,16 +184,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or(1)
             .clamp(1, MAX_PAGE_SIZE as usize);
 
-        // Reporting only. The records are already in ARN order, and the token is the ARN
-        // of the previous page's last entry, so a page resumes at the first policy whose
-        // resource sorts strictly after it — which stays correct across policies attached
-        // or detached between two calls. The account-level Data Catalog policy is left out
-        // of the set: this list reports "the resource policies set on individual
-        // resources", and the catalog's own is what `GetResourcePolicy` answers.
+        // Reporting only. The records are already in ARN order, and the token names the
+        // resource the next page resumes AFTER, so a page resumes at the first policy whose
+        // resource sorts strictly after it — which stays correct across policies attached or
+        // detached between two calls. The token is opaque and bound to THIS listing
+        // ([`crate::state::pagination`]), so a value this store did not mint for it names no
+        // position and is refused rather than resolved against an ARN that happens to sort
+        // somewhere; it also keeps the ARNs of this account's resources out of a value
+        // clients log and pass around. The account-level Data Catalog policy is left out of
+        // the set: this list reports "the resource policies set on individual resources",
+        // and the catalog's own is what `GetResourcePolicy` answers.
         let store = state.lock();
+        let token_scope = crate::state::listing_scope(Self::NAME, &[]);
+        let resumed = input.next_token.is_some();
         let attached = store.individual_resource_policies();
         let start = match input.next_token.as_deref() {
-            Some(cursor) => attached.partition_point(|(arn, _)| arn.as_str() <= cursor),
+            Some(token) => {
+                let Some(cursor) =
+                    crate::state::decode_page_token(&store.page_token_key, &token_scope, token)
+                else {
+                    return Err(GetResourcePoliciesErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(
+                                crate::state::messages::INVALID_PAGINATION_TOKEN.to_string(),
+                            ),
+                            from_federation_source: None,
+                        },
+                    )
+                    .into());
+                };
+                attached.partition_point(|(arn, _)| arn.as_str() <= cursor.as_str())
+            }
             None => 0,
         };
         // Taken with `skip`/`take` rather than by slicing, so a cursor the request chose
@@ -193,13 +222,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page: Vec<(&String, &crate::state::ResourcePolicyEntry)> =
             attached.iter().skip(start).take(page_size).copied().collect();
         let end = start.saturating_add(page.len());
-        // The token names the last entry of the page, taken from the page itself so there
-        // is no index arithmetic to underflow on an empty page.
-        let next_token = if end < attached.len() {
-            page.last().map(|(arn, _)| (*arn).clone())
-        } else {
-            None
-        };
+        // The cursor is the last entry of the page, taken from the page itself so there is
+        // no index arithmetic to underflow on an empty page; for a page that reported
+        // nothing it is the position the listing started from, which is the whole set.
+        let cursor = page
+            .last()
+            .map_or_else(String::new, |(arn, _)| (*arn).clone());
+        // A FIRST listing always hands back a continuation token, even when the page it
+        // reported was the whole set and even when there was nothing to report: the token
+        // is what a client resumes the enumeration from, and whether more policies exist is
+        // not what its presence states. A page reached WITH a token carries one only while
+        // the set holds entries past it, so a continuation terminates rather than handing
+        // out tokens for ever.
+        let next_token = (end < attached.len() || !resumed).then(|| {
+            crate::state::encode_page_token(&store.page_token_key, &token_scope, &cursor)
+        });
 
         Ok(GetResourcePoliciesOutput {
             get_resource_policies_response_list: Some(

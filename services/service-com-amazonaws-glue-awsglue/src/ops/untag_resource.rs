@@ -16,11 +16,14 @@
 //! [`crate::state::ComAmazonawsGlueAwsglueState::resource_tags_mut`], the mutable half of
 //! the one resolution every tag read in this emulator goes through, exactly as the tag
 //! write beside it does, so a write, a removal and a read of one ARN reach the same tag
-//! set. An ARN that names no taggable Glue resource at all earns the modelled client-input
-//! refusal, as does one naming another Region than the endpoint serving the request; one
-//! of a known kind this store holds no resource for earns the modelled
-//! `EntityNotFoundException`, as does one naming another account's estate. A refused
-//! removal changes nothing.
+//! set — and that resolution covers every kind of Glue resource whose record carries a tag
+//! set, because the modelled `ResourceArn` places no restriction on which kind of Glue
+//! resource the ARN names. An ARN that names no taggable Glue resource at all earns the
+//! modelled client-input refusal, as does one naming another Region than the endpoint
+//! serving the request; one of a known kind this store holds no resource for earns the
+//! modelled `EntityNotFoundException` carrying the tagging surface's recorded sentence
+//! ([`crate::state::messages::TAGGED_RESOURCE_NOT_FOUND`]), as does one naming another
+//! account's estate. A refused removal changes nothing.
 //!
 //! That client-input refusal is this handler's, not the framework boundary's
 //! (`skip_validation` on `UntagResourceRequest` in `src/ops/types/`): a `ResourceArn`
@@ -203,10 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(tags) = store.resource_tags_mut(&resource) else {
             return Err(UntagResourceErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(crate::state::tagged_resource_not_found_message(
-                        &resource,
-                        &input.resource_arn,
-                    )),
+                    message: Some(crate::state::messages::TAGGED_RESOURCE_NOT_FOUND.to_string()),
                     from_federation_source: None,
                 },
             )

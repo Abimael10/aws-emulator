@@ -21,7 +21,9 @@
 //! those keys are new or already held, the form of the key and the value — including both
 //! published bounds of `TagKey` (len 1..128) and of `TagValue` (len 0..256) — how full the
 //! resource's tag set already is, and which part of the ARN does not address a resource
-//! this endpoint serves.
+//! this endpoint serves. The KINDS a tagging call accepts are enumerated per kind by
+//! [`crate::tagging_resource_kinds`]; the rows here are the catalog resources and the two
+//! that live beside the catalog tree.
 //!
 //! The fixtures a tagging suite needs - the create of each taggable kind, the tag-set
 //! helpers and the read that reports one - are `pub` here and shared with the removal suite
@@ -520,6 +522,11 @@ async fn a_write_past_the_tag_bound_is_refused_and_stores_nothing() {
 /// modelled `Message` member absent from the body.
 const NO_PROSE: &str = "<no Message>";
 
+/// The `Message` the tagging surface answers for an ARN of a taggable kind that names no
+/// resource this endpoint holds. Recorded wording: the fixed, generic sentence, which names
+/// neither the ARN, nor the kind, nor the name inside it.
+pub const TAGGING_ENTITY_NOT_FOUND: &str = "Entity not found";
+
 /// One refused tag write: the Region the request is served in, the ARN it names, and the
 /// refusal it earns.
 struct RefusalRow {
@@ -574,14 +581,13 @@ fn refusal_rows() -> Vec<RefusalRow> {
         });
     }
 
-    // A Glue ARN whose resource portion names no kind that carries a tag set. Everything
-    // outside the kinds a tag write accepts is a bad parameter, and that refusal states NO
-    // prose at all — the code alone.
+    // A Glue ARN whose resource portion names no kind that carries a tag set, or names a
+    // taggable kind but no one resource of it. Everything outside the kinds a tag write
+    // accepts is a bad parameter, and that refusal states NO prose at all — the code alone.
+    // Which kinds those are is pinned per kind by [`crate::tagging_resource_kinds`].
     for resource in [
         "table/refusal_db/orders",
-        "schema/registry-1/schema-1",
         "devEndpoint/dev-1",
-        "trigger/nightly",
         "userDefinedFunction/refusal_db/to_upper",
         "catalog",
         "database/",
@@ -596,30 +602,15 @@ fn refusal_rows() -> Vec<RefusalRow> {
         });
     }
 
-    // An ARN of a taggable kind that resolves to no stored resource: a miss, worded as
-    // this crate words that kind's miss wherever it fails to resolve.
-    rows.push(RefusalRow {
-        case: "a database name this catalog holds nothing under".to_string(),
-        region: REGION,
-        arn: resource_arn("database", "never_created"),
-        code: "EntityNotFoundException",
-        message: Some("Database never_created not found.".to_string()),
-    });
-    rows.push(RefusalRow {
-        case: "a crawler name this account holds nothing under".to_string(),
-        region: REGION,
-        arn: resource_arn("crawler", "never-created"),
-        code: "EntityNotFoundException",
-        message: Some("Crawler entry with name never-created does not exist".to_string()),
-    });
-    for segment in ["connection", "job"] {
-        let arn = resource_arn(segment, "never-created");
+    // An ARN of a taggable kind that resolves to no stored resource: a miss, worded with
+    // the fixed sentence the tagging surface answers one with whatever the kind is.
+    for segment in ["database", "crawler", "connection", "job"] {
         rows.push(RefusalRow {
             case: format!("a {segment} name this account holds nothing under"),
             region: REGION,
-            message: Some(format!("Entity not found for resource {arn}")),
-            arn,
+            arn: resource_arn(segment, "never-created"),
             code: "EntityNotFoundException",
+            message: Some(TAGGING_ENTITY_NOT_FOUND.to_string()),
         });
     }
 

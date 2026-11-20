@@ -216,15 +216,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
 
         // "Contains the policy document to set, in JSON format": a value that is no JSON
-        // document at all is a bad parameter, not a policy. Only the document's FORM is
-        // checked here — what a statement grants is the caller's to decide.
-        if !serde_json::from_str::<serde_json::Value>(&input.policy_in_json)
-            .is_ok_and(|document| document.is_object())
-        {
-            return Err(invalid_input(
-                crate::state::messages::POLICY_MUST_BE_JSON.to_string(),
-            ));
-        }
+        // document at all is a bad parameter, not a policy, and the refusal surfaces the
+        // parser's own failure. Only the document's FORM is read here — what a statement
+        // grants is the caller's to decide — and what is stored is the document in the
+        // layout every read of it reports ([`crate::state::render_policy_document`]), so a
+        // client that submits a compact document reads back the service's own rendering of
+        // it rather than its own bytes.
+        let policy_in_json = match crate::state::render_policy_document(&input.policy_in_json) {
+            Ok(rendered) => rendered,
+            Err(refusal) => return Err(invalid_input(refusal)),
+        };
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
@@ -264,8 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let Some(policy_hash) =
-            store.set_resource_policy(&resource_arn, input.policy_in_json, now)
+        let Some(policy_hash) = store.set_resource_policy(&resource_arn, policy_in_json, now)
         else {
             return Err(invalid_input(
                 crate::state::messages::too_many_resource_policies(

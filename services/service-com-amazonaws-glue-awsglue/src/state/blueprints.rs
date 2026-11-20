@@ -135,9 +135,9 @@ pub struct BlueprintEntry {
     /// does not carry.
     ///
     /// Kept because `ListBlueprints` "filters the list by an Amazon Web Services resource
-    /// tag", so they decide which blueprints a filtered listing reports. NOT yet reachable
-    /// through the tagging operations, for the reason [`CustomEntityTypeEntry::tags`]
-    /// gives: [`TaggedResourceKind`] carries no blueprint variant yet.
+    /// tag", so they decide which blueprints a filtered listing reports, and reachable
+    /// through the tagging operations for the reason [`CustomEntityTypeEntry::tags`] gives:
+    /// [`TaggedResourceKind::Blueprint`] resolves a blueprint's ARN to this record.
     pub tags: HashMap<String, String>,
     /// The runs `StartBlueprintRun` started of this blueprint, oldest first and bounded by
     /// [`MAX_RUNS_PER_BLUEPRINT`].

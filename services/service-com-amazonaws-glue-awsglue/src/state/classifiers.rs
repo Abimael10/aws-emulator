@@ -448,12 +448,10 @@ pub struct CustomEntityTypeEntry {
     pub context_words: Option<Vec<String>>,
     /// The create's `Tags`, which are not part of the `CustomEntityType` shape.
     ///
-    /// Kept so the create does not discard what the client sent, but NOT yet reachable
-    /// through the tagging operations: [`TaggedResourceKind`] carries no custom entity
-    /// type variant, because the model states no ARN resource-type segment for this kind
-    /// (nothing in it spells one), and the segment is what every tag lookup resolves an
-    /// ARN against. So a tagging call naming a custom entity type still resolves to
-    /// nothing, and these tags are stored rather than served.
+    /// This is the record the TAGGING operations resolve a custom entity type's ARN to
+    /// ([`TaggedResourceKind::CustomEntityType`]), so the tags a create recorded are the
+    /// ones `GetTags` reports and a `TagResource` of that ARN lands here: one tag set per
+    /// resource, whichever operation reaches it.
     pub tags: HashMap<String, String>,
 }
 

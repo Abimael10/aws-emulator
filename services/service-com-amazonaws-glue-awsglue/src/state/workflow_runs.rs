@@ -1573,10 +1573,9 @@ pub struct DataQualityRulesetEntry {
     pub client_token: Option<String>,
     /// The create's `Tags`, which no reader of a ruleset models.
     ///
-    /// Kept so the create does not discard what the client sent, but NOT yet reachable
-    /// through the tagging operations, exactly as a custom entity type's are
-    /// ([`CustomEntityTypeEntry::tags`]): [`TaggedResourceKind`] carries no data quality
-    /// ruleset variant, because the model states no ARN resource-type segment for this kind.
+    /// This is the record the TAGGING operations resolve a ruleset's ARN to, exactly as for
+    /// a custom entity type ([`CustomEntityTypeEntry::tags`]):
+    /// [`TaggedResourceKind::DataQualityRuleset`] names it.
     pub tags: HashMap<String, String>,
 }
 

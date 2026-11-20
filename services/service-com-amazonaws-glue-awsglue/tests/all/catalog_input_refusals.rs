@@ -655,7 +655,7 @@ async fn a_resource_arn_that_is_no_glue_arn_is_the_catalogs_own_input_error() {
         ),
         (
             "a Glue ARN of a resource kind the catalog tags none of",
-            format!("arn:aws:glue:{REGION}:{ACCOUNT_ID}:catalog/default"),
+            format!("arn:aws:glue:{REGION}:{ACCOUNT_ID}:table/tagged_db/orders"),
         ),
     ];
 
