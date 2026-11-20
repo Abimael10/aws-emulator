@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DetachTrafficSources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DetachTrafficSources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DetachTrafficSources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Detaches traffic sources from one Auto Scaling group, as a WHOLE: every identifier the
+//! request names must be one the group currently holds, so a request naming one it does not
+//! hold detaches NONE of them and the group's attachments are either exactly what the request
+//! asked to be left or exactly what they were.
+//!
+//! What the group HOLDS is the collection [`crate::ops::attach_traffic_sources`] writes and
+//! [`crate::ops::describe_traffic_sources`] reports
+//! ([`crate::state::StoredGroup::traffic_sources`]): "when all instances are deregistered,
+//! then you can no longer describe the traffic source using the DescribeTrafficSources API
+//! call", so a detached traffic source leaves that collection and the ones the call did not
+//! name keep the order the group came to hold them in. So what this call can remove is
+//! exactly what that read reports — a client detaches the attachments it can see, and sees
+//! afterwards exactly the ones it left.
+//!
+//! The instances themselves do deregister: "the instances continue to run", and the group's
+//! load-balancing registrations are brought in line with what it is still attached to
+//! ([`crate::state::settle_group_load_balancers`]), so a detached traffic source drains the
+//! group's instances out of the target group or Classic Load Balancer it named exactly as
+//! `DeregisterTargets` takes a target out.
+//!
+//! Whether the CALLER may change the group's attachments at all is decided first, against the
+//! group's own ARN ([`crate::service::authorization`]): a request IAM does not permit detaches
+//! nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +154,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DetachTrafficSources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DetachTrafficSourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DetachTrafficSources"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DetachTrafficSourcesErrorModeled::ResourceContentionFault(
+                ResourceContentionFault {
+                    message: Some(
+                        "the Auto Scaling store is not mounted on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let name = input.auto_scaling_group_name;
+        let requested = input.traffic_sources;
+        // Whether IAM lets this caller change THIS group's attachments, decided against the
+        // group's own ARN before anything is read or written
+        // ([`crate::service::authorization`]).
+        if let Some(refusal) = crate::service::authorization::group_action_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &name,
+        ) {
+            crate::state::audit(ctx.parts(), Self::NAME, &name, "refused: not authorized");
+            return Err(refusal);
+        }
+        // The member's own documented bound — "you can specify up to 10 traffic sources" —
+        // which the model does not express as a length, so it is checked here rather than at
+        // the boundary, and refused with the sentence this service words a request updating
+        // too many associations at once in (the same bound the attach of traffic sources and
+        // both halves of the legacy target-group pair are held to).
+        if requested.len() > crate::state::MAX_TARGET_GROUPS_PER_CALL {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::too_many_target_groups_message(),
+            ));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        {
+            let mut state = state.lock();
+            state.materialize_due(&*self.engine, now);
+
+            let Some(group) = state.groups.get_mut(&name) else {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::absent_group_message(&name),
+                ));
+            };
+
+            // The identifier is what the association IS — the same reading the attach holds
+            // two entries to be one traffic source by — so a request names a held attachment
+            // when it names its identifier, whatever type it states for it.
+            let held = group.traffic_sources.clone().unwrap_or_default();
+            // Checked for EVERY named traffic source before any of them is removed: the
+            // request is one unit of work, so one identifier this group does not hold refuses
+            // the whole call and leaves the attachments it does hold in place.
+            let unattached: Vec<String> = requested
+                .iter()
+                .filter(|source| {
+                    !held
+                        .iter()
+                        .any(|attached| attached.identifier == source.identifier)
+                })
+                .map(|source| source.identifier.clone())
+                .collect();
+            if !unattached.is_empty() {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::unattached_target_groups_message(&unattached),
+                ));
+            }
+
+            let remaining: Vec<TrafficSourceIdentifier> = held
+                .into_iter()
+                .filter(|attached| {
+                    !requested
+                        .iter()
+                        .any(|source| source.identifier == attached.identifier)
+                })
+                .collect();
+            group.traffic_sources = Some(remaining);
+        }
+
+        crate::state::audit(ctx.parts(), Self::NAME, &name, "traffic sources detached");
+        // A traffic source the group is no longer attached to deregisters the group's
+        // instances — "when you detach a traffic source, it enters the Removing state while
+        // deregistering the instances in the group". The store's lock is released above: the
+        // reconcile takes it itself.
+        crate::state::settle_group_load_balancers(&*self.engine, &name);
+        Ok(DetachTrafficSourcesOutput {})
     }
 }
