@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end cover for the link routing-rule surface: `CreateLinkRoutingRule` and
-//! `GetLinkRoutingRule`, driven over the wire through the router the production
-//! emulator uses.
+//! End-to-end cover for the link routing-rule surface: `CreateLinkRoutingRule`,
+//! `GetLinkRoutingRule` and `DeleteLinkRoutingRule`, driven over the wire through the
+//! router the production emulator uses.
 //!
 //! The rules under test are about state, not about one recorded request:
 //!
@@ -10,6 +10,9 @@
 //!   either of its two ends, so the read reports exactly what the create stored and a
 //!   rule is never readable through another link;
 //! * a rule is created `CREATION_IN_PROGRESS` and the clock settles it to `ACTIVE`;
+//! * deleting a rule is accepted whatever live status it holds, answers
+//!   `DELETION_IN_PROGRESS`, and the clock then releases that ONE rule, so no later
+//!   read reports it while its link and the link's other rules stay;
 //! * a rule cannot outlive the link it routes for, so deleting the link takes its
 //!   rules with it;
 //! * a client-token record is released with the resource it minted, so once a rule is
@@ -33,6 +36,7 @@ use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde_json::{json, Value};
 use service_com_amazonaws_rtbfabric_rtbfabric::state::{
     RESOURCE_NOT_FOUND_MESSAGE, RULE_STATUS_ACTIVE, RULE_STATUS_CREATION_IN_PROGRESS,
+    RULE_STATUS_DELETION_IN_PROGRESS,
 };
 use service_com_amazonaws_rtbfabric_rtbfabric::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -233,6 +237,43 @@ impl Fabric {
             None,
         )
         .await
+    }
+
+    async fn delete_rule(&self, gateway_id: &str, link_id: &str, rule_id: &str) -> Answer {
+        self.send(
+            "DELETE",
+            &format!("/responder-gateway/{gateway_id}/link/{link_id}/routing-rule/{rule_id}"),
+            None,
+        )
+        .await
+    }
+
+    /// Read the rule until it is gone, or a generous deadline passes: the deletion
+    /// is one the clock completes, so the test waits for the CONDITION rather than
+    /// for a span of time. Every answer before that reports the rule as deleting —
+    /// nothing else — and the refusal that ends the wait is the service's one
+    /// not-found.
+    async fn gone(&self, case: &str, gateway_id: &str, link_id: &str, rule_id: &str) {
+        let give_up_at = Instant::now() + SETTLE_DEADLINE;
+        loop {
+            let answered = self.get_rule(gateway_id, link_id, rule_id).await;
+            if answered.status != 200 {
+                assert_not_found(case, &answered, &[gateway_id, link_id, rule_id]);
+                return;
+            }
+            assert_eq!(
+                text(&answered.body, "status"),
+                RULE_STATUS_DELETION_IN_PROGRESS,
+                "case {case:?}: expected a rule still being deleted to report {RULE_STATUS_DELETION_IN_PROGRESS:?}, got {:?}",
+                answered.body["status"]
+            );
+            assert!(
+                Instant::now() < give_up_at,
+                "case {case:?}: expected the rule to be gone, got {:?}",
+                answered.body
+            );
+            tokio::time::sleep(POLL_PAUSE).await;
+        }
     }
 
     /// Read the rule until it reports `expected`, or a generous deadline passes: the
@@ -998,5 +1039,283 @@ async fn a_client_token_whose_resource_is_still_stored_keeps_replaying_it() {
         "case {case:?}: expected the replay to answer the stored gateway {:?}, got {:?}",
         kept.requester_id,
         gateway_replay.body["gatewayId"]
+    );
+}
+
+/// One row of the deletion table: the live status the rule holds when the delete
+/// arrives, which of the link's two ends addresses it, and the rule's own facts (a
+/// `RuleCondition` member and a priority inside the published bounds of
+/// `RulePriority`).
+struct DeleteRow {
+    name: &'static str,
+    conditions: fn() -> Value,
+    priority: i64,
+    /// Whether the clock has settled the rule to `ACTIVE` before the delete
+    /// arrives, rather than the delete reaching a rule that is still creating.
+    settle_first: bool,
+    /// Whether the delete is addressed from the requester end of the link rather
+    /// than from the responder end.
+    from_requester: bool,
+}
+
+/// Both live statuses a rule can hold when a delete arrives, each addressed from
+/// both of the link's two ends, carrying a different condition member and priority.
+const DELETE_ROWS: &[DeleteRow] = &[
+    DeleteRow {
+        name: "a creating rule deleted from the responder end",
+        conditions: || json!({ "hostHeader": "bids.example.com" }),
+        priority: 1,
+        settle_first: false,
+        from_requester: false,
+    },
+    DeleteRow {
+        name: "an active rule deleted from the responder end",
+        conditions: || json!({ "pathPrefix": "/bid" }),
+        priority: 500,
+        settle_first: true,
+        from_requester: false,
+    },
+    DeleteRow {
+        name: "a creating rule deleted from the requester end",
+        conditions: || json!({ "queryStringExists": "debug" }),
+        priority: 999,
+        settle_first: false,
+        from_requester: true,
+    },
+    DeleteRow {
+        name: "an active rule deleted from the requester end",
+        conditions: || json!({ "hostHeaderWildcard": "*.example.com" }),
+        priority: 7,
+        settle_first: true,
+        from_requester: true,
+    },
+];
+
+#[tokio::test]
+async fn deleting_a_rule_releases_that_one_rule_whatever_live_status_it_holds() {
+    for row in DELETE_ROWS {
+        let case = row.name;
+        let fabric = Fabric::new();
+        let pair = fabric.linked_pair(case, "token").await;
+
+        let created = fabric
+            .create_rule(
+                &pair.responder_id,
+                &pair.link_id,
+                "token-rule",
+                row.priority,
+                (row.conditions)(),
+                None,
+            )
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: expected CreateLinkRoutingRule to answer 200, got {} {:?}",
+            created.status, created.body
+        );
+        let rule_id = text(&created.body, "ruleId");
+
+        // A second rule on the same link, so the test tells releasing ONE rule from
+        // releasing the link's rules.
+        let bystander = fabric
+            .create_rule(
+                &pair.responder_id,
+                &pair.link_id,
+                "token-bystander",
+                1000,
+                json!({ "pathExact": "/health" }),
+                None,
+            )
+            .await;
+        assert_eq!(
+            bystander.status, 200,
+            "case {case:?}: expected the second CreateLinkRoutingRule to answer 200, got {} {:?}",
+            bystander.status, bystander.body
+        );
+        let bystander_id = text(&bystander.body, "ruleId");
+
+        if row.settle_first {
+            fabric
+                .settled(
+                    case,
+                    &pair.responder_id,
+                    &pair.link_id,
+                    &rule_id,
+                    RULE_STATUS_ACTIVE,
+                )
+                .await;
+        }
+
+        let addressed = if row.from_requester {
+            pair.requester_id.as_str()
+        } else {
+            pair.responder_id.as_str()
+        };
+        let deleted = fabric.delete_rule(addressed, &pair.link_id, &rule_id).await;
+        assert_eq!(
+            deleted.status, 200,
+            "case {case:?}: expected DeleteLinkRoutingRule to answer 200, got {} {:?}",
+            deleted.status, deleted.body
+        );
+        assert_eq!(
+            text(&deleted.body, "ruleId"),
+            rule_id,
+            "case {case:?}: expected the delete to answer the addressed rule {rule_id:?}, got {:?}",
+            deleted.body["ruleId"]
+        );
+        assert_eq!(
+            text(&deleted.body, "status"),
+            RULE_STATUS_DELETION_IN_PROGRESS,
+            "case {case:?}: expected the delete to answer {RULE_STATUS_DELETION_IN_PROGRESS:?}, \
+             got {:?}",
+            deleted.body["status"]
+        );
+
+        // A repeat asks for the state the rule is already in: it is answered with
+        // the deleting record, or with the one not-found once the clock has
+        // finished, and never with another refusal.
+        let repeat = fabric.delete_rule(addressed, &pair.link_id, &rule_id).await;
+        if repeat.status == 200 {
+            assert_eq!(
+                text(&repeat.body, "ruleId"),
+                rule_id,
+                "case {case:?}: expected the repeat to answer rule {rule_id:?}, got {:?}",
+                repeat.body["ruleId"]
+            );
+            assert_eq!(
+                text(&repeat.body, "status"),
+                RULE_STATUS_DELETION_IN_PROGRESS,
+                "case {case:?}: expected the repeat to answer \
+                 {RULE_STATUS_DELETION_IN_PROGRESS:?}, got {:?}",
+                repeat.body["status"]
+            );
+        } else {
+            assert_not_found(case, &repeat, &[addressed, &pair.link_id, &rule_id]);
+        }
+
+        // The clock finishes the deletion, and the rule is then gone from both ends
+        // of its link.
+        fabric
+            .gone(case, &pair.responder_id, &pair.link_id, &rule_id)
+            .await;
+        let from_the_other_end = fabric
+            .get_rule(&pair.requester_id, &pair.link_id, &rule_id)
+            .await;
+        assert_not_found(
+            case,
+            &from_the_other_end,
+            &[&pair.requester_id, &pair.link_id, &rule_id],
+        );
+
+        // Only that rule went: the link's other rule is still readable, and a delete
+        // of the rule that is gone is the service's one not-found.
+        let other = fabric
+            .get_rule(&pair.responder_id, &pair.link_id, &bystander_id)
+            .await;
+        assert_eq!(
+            other.status, 200,
+            "case {case:?}: expected the link's other rule to stay readable, got {} {:?}",
+            other.status, other.body
+        );
+        let again = fabric.delete_rule(addressed, &pair.link_id, &rule_id).await;
+        assert_not_found(case, &again, &[addressed, &pair.link_id, &rule_id]);
+
+        // The rule's client-token record went with it, as on every other release
+        // path: the token is free, so a create presenting it with OTHER parameters
+        // mints a second rule instead of being refused over a rule the store no
+        // longer holds.
+        let reused = fabric
+            .create_rule(
+                &pair.responder_id,
+                &pair.link_id,
+                "token-rule",
+                row.priority,
+                json!({ "pathExact": "/replayed" }),
+                None,
+            )
+            .await;
+        assert_eq!(
+            reused.status, 200,
+            "case {case:?}: expected the freed token to mint a rule, got {} {:?}",
+            reused.status, reused.body
+        );
+        let minted_rule_id = text(&reused.body, "ruleId");
+        assert_ne!(
+            minted_rule_id, rule_id,
+            "case {case:?}: expected a newly minted ruleId, got the released {rule_id:?}"
+        );
+        let read_back = fabric
+            .get_rule(&pair.responder_id, &pair.link_id, &minted_rule_id)
+            .await;
+        assert_eq!(
+            read_back.status, 200,
+            "case {case:?}: expected the new rule to read back, got {} {:?}",
+            read_back.status, read_back.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn deleting_a_rule_the_store_does_not_hold_is_the_one_not_found() {
+    let fabric = Fabric::new();
+    let pair = fabric.linked_pair("the stored pair", "token-a").await;
+    // A second pair, so there is a link that carries no rule of the first link's id
+    // and a gateway that is no end of the first link.
+    let other = fabric.linked_pair("the other pair", "token-b").await;
+    let created = fabric
+        .create_rule(
+            &pair.responder_id,
+            &pair.link_id,
+            "token-rule",
+            1,
+            json!({ "pathPrefix": "/bid" }),
+            None,
+        )
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "case {:?}: expected CreateLinkRoutingRule to answer 200, got {} {:?}",
+        "the stored rule", created.status, created.body
+    );
+    let rule_id = text(&created.body, "ruleId");
+
+    for (case, gateway_id, link_id, addressed_rule) in [
+        (
+            "nothing of the three exists",
+            "rtb-gw-0123456789abcdef",
+            "link-0123456789abcdef",
+            "rule-0123456789abcdef",
+        ),
+        (
+            "a stored link and a rule id nothing minted",
+            pair.responder_id.as_str(),
+            pair.link_id.as_str(),
+            "rule-0123456789abcdef",
+        ),
+        (
+            "a stored rule addressed through another link",
+            other.responder_id.as_str(),
+            other.link_id.as_str(),
+            rule_id.as_str(),
+        ),
+        (
+            "a stored rule addressed from a gateway that is no end of its link",
+            other.requester_id.as_str(),
+            pair.link_id.as_str(),
+            rule_id.as_str(),
+        ),
+    ] {
+        let answered = fabric.delete_rule(gateway_id, link_id, addressed_rule).await;
+        assert_not_found(case, &answered, &[gateway_id, link_id, addressed_rule]);
+    }
+
+    // None of those refusals touched the stored rule.
+    let read = fabric
+        .get_rule(&pair.responder_id, &pair.link_id, &rule_id)
+        .await;
+    assert_eq!(
+        read.status, 200,
+        "case {:?}: expected the stored rule to survive the refusals, got {} {:?}",
+        "the stored rule", read.status, read.body
     );
 }

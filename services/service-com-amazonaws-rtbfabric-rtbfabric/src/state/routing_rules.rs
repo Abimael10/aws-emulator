@@ -6,6 +6,12 @@
 //! A rule belongs to one link, so it is keyed by (`linkId`, `ruleId`) and released
 //! with that link ([`release_link`](super::ComAmazonawsRtbfabricRtbfabricState::release_link)):
 //! no read can report a rule whose link is gone.
+//!
+//! A rule of its own is released by `DeleteLinkRoutingRule`, which the service
+//! answers before the rule is gone: the record holds `DELETION_IN_PROGRESS` until
+//! the clock makes the deletion due, and
+//! [`settle_all`](super::ComAmazonawsRtbfabricRtbfabricState::settle_all) then drops
+//! it, so no later read reports it.
 
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -16,6 +22,10 @@ use crate::ops::types::RuleCondition;
 pub const RULE_STATUS_CREATION_IN_PROGRESS: &str = "CREATION_IN_PROGRESS";
 /// `RuleStatus` member: the rule routes traffic.
 pub const RULE_STATUS_ACTIVE: &str = "ACTIVE";
+/// `RuleStatus` member: the rule's deletion is accepted, it is not gone yet.
+pub const RULE_STATUS_DELETION_IN_PROGRESS: &str = "DELETION_IN_PROGRESS";
+/// `RuleStatus` member: terminal, the rule is gone.
+pub const RULE_STATUS_DELETED: &str = "DELETED";
 
 /// What a `conditions` structure carrying no condition at all is refused with.
 ///
@@ -44,8 +54,9 @@ pub struct LinkRoutingRule {
     pub priority: i32,
     pub conditions: RuleCondition,
     pub status: String,
-    /// The instant the clock makes `CREATION_IN_PROGRESS` -> `ACTIVE` due; `None`
-    /// once the record has settled.
+    /// The instant the clock makes this rule's outstanding transition due — the
+    /// one [`settles_to`](LinkRoutingRule::settles_to) names; `None` once the
+    /// record has settled.
     pub settles_at: Option<SystemTime>,
     pub tags: HashMap<String, String>,
     pub created_at: SystemTime,
@@ -53,14 +64,46 @@ pub struct LinkRoutingRule {
 }
 
 impl LinkRoutingRule {
-    /// Materialise the `CREATION_IN_PROGRESS` -> `ACTIVE` transition the clock has
-    /// already made due, dated at the instant it was owed rather than now.
-    pub fn settle(&mut self, now: SystemTime) {
-        if let Some(due) = self.settles_at.filter(|due| *due <= now) {
-            self.status = RULE_STATUS_ACTIVE.to_string();
-            self.settles_at = None;
-            self.updated_at = due;
+    /// The status the clock owes this rule next: a rule whose creation was
+    /// accepted routes traffic, and one whose deletion was accepted is gone.
+    /// `None` once the rule holds a status nothing moves it out of.
+    pub fn settles_to(&self) -> Option<&'static str> {
+        match self.status.as_str() {
+            RULE_STATUS_CREATION_IN_PROGRESS => Some(RULE_STATUS_ACTIVE),
+            RULE_STATUS_DELETION_IN_PROGRESS => Some(RULE_STATUS_DELETED),
+            _ => None,
         }
+    }
+
+    /// Whether this rule's deletion is already outstanding, so a repeat of the
+    /// delete asks for the state the rule is in rather than for a new one.
+    pub fn deleting(&self) -> bool {
+        self.status == RULE_STATUS_DELETION_IN_PROGRESS
+    }
+
+    /// Take the deletion the caller asked for: the rule stops routing once the
+    /// clock makes `DELETED` due, so a caller reading straight after the call
+    /// still observes the transient status.
+    pub fn begin_deletion(&mut self, now: SystemTime) {
+        self.status = RULE_STATUS_DELETION_IN_PROGRESS.to_string();
+        self.settles_at = Some(now + super::PROVISIONING_DELAY);
+        self.updated_at = now;
+    }
+
+    /// Materialise the transition the clock has already made due, dated at the
+    /// instant it was owed rather than now.
+    pub fn settle(&mut self, now: SystemTime) {
+        let Some(due) = self.settles_at.filter(|due| *due <= now) else {
+            return;
+        };
+        // Cleared whatever the status is, so the field's invariant — a due instant
+        // only while one is owed — holds for a record in any status.
+        self.settles_at = None;
+        let Some(next) = self.settles_to() else {
+            return;
+        };
+        self.status = next.to_string();
+        self.updated_at = due;
     }
 }
 

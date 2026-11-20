@@ -34,7 +34,8 @@ pub use page_tokens::{
 };
 pub use routing_rules::{
     conditions_stated, LinkRoutingRule, ROUTING_RULE_QUOTA, RULE_CONDITIONS_EMPTY_MESSAGE,
-    RULE_STATUS_ACTIVE, RULE_STATUS_CREATION_IN_PROGRESS,
+    RULE_STATUS_ACTIVE, RULE_STATUS_CREATION_IN_PROGRESS, RULE_STATUS_DELETED,
+    RULE_STATUS_DELETION_IN_PROGRESS,
 };
 pub use tagging::{
     resource_tags, resource_tags_mut, tagged_resource, tagging_unresolved, TaggedResource,
@@ -450,6 +451,16 @@ impl ComAmazonawsRtbfabricRtbfabricState {
         }
         for rule in self.routing_rules.values_mut() {
             rule.settle(now);
+        }
+        // A rule whose deletion the clock has now completed is gone, exactly as
+        // the record a synchronous delete removes is: nothing reports a rule that
+        // reached the terminal status, and the store does not grow with them. Its
+        // client-token record goes with it, as on every other release path.
+        let held_before = self.routing_rules.len();
+        self.routing_rules
+            .retain(|_, rule| rule.status != RULE_STATUS_DELETED);
+        if self.routing_rules.len() != held_before {
+            self.forget_released_client_tokens();
         }
         for association in self.certificate_associations.values_mut() {
             association.settle(now);
