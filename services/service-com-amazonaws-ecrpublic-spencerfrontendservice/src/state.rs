@@ -155,15 +155,14 @@ pub fn unsupported_in_region(
 }
 
 /// The host AWS serves the public gallery at — the fixed labels every public-registry
-/// authority leads with ([`registry_address::GALLERY_HOST_LABELS`]) over AWS's own zone,
-/// which is what a container reference a client WRITES BY HAND names this gallery by and how
-/// such a reference is read as addressing this registry
+/// authority AWS publishes leads with ([`registry_address::GALLERY_HOST_LABELS`]) over AWS's
+/// own zone, which is what a container reference a client WRITES BY HAND names this gallery
+/// by and how such a reference is read as addressing this registry
 /// ([`gallery_pull::parse_gallery_reference`]).
 ///
-/// It is not the authority this service PUBLISHES: a URI this registry hands out carries the
-/// same fixed labels, over the zone this emulator answers in rather than AWS's — this name
-/// resolves to the real public registry rather than to this process
-/// ([`registry_address::gallery_authority`]).
+/// It is not an authority this service PUBLISHES: this name resolves to the real public
+/// registry rather than to this process, so a URI this registry hands out carries the
+/// endpoint this emulator answers at instead ([`registry_address::announced_gallery_authority`]).
 pub const GALLERY_HOST: &str = "public.ecr.aws";
 
 /// The registry alias this emulator's single public registry is assigned.
@@ -868,11 +867,11 @@ impl ComAmazonawsEcrpublicSpencerfrontendserviceState {
         ::engine::emulator_arn(ARN_NAMESPACE, "", &format!("registry/{}", self.registry_id))
     }
 
-    /// The URI of the registry, on the authority this emulator publishes it at
-    /// (`gallery_authority`, read with [`announced_gallery_authority`]):
-    /// `Registry$registryUri` documents it as "a universal prefix and the registry alias",
-    /// so it is that authority scoped by this registry's own alias — which is the
-    /// `repositoryUri` form without the trailing repository segment.
+    /// The URI of the registry, on the endpoint this emulator answers the reader at (read
+    /// with [`announced_gallery_authority`]): `Registry$registryUri` documents it as "a
+    /// universal prefix and the registry alias", so it is that endpoint scoped by this
+    /// registry's own alias — which is the `repositoryUri` form without the trailing
+    /// repository segment.
     pub fn registry_uri(&self, gallery_authority: &str) -> String {
         registry_address::registry_uri(gallery_authority, &self.registry_alias)
     }

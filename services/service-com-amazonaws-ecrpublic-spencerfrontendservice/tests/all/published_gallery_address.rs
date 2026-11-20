@@ -6,26 +6,27 @@
 //! ONE rule is under test, because the model states one kind of value twice:
 //! `Registry$registryUri` ("The URI of a public registry. The URI contains a universal
 //! prefix and the registry alias") and `Repository$repositoryUri` ("The URI for the
-//! repository. You can use this URI for container image `push` and `pull` operations") both
-//! carry a public-registry AUTHORITY — the fixed `public`.`ecr` labels over the DNS name the
-//! registry is served under — scoped by the account's primary registry alias
-//! (`RegistryAlias$primaryRegistryAlias`, "displayed in both the repository URL and the
-//! image URI used in the docker pull commands"), and nothing else: the owning account is
-//! reported in `registryId`, and a public registry is global, so no Region appears either.
-//! Both are also addresses a container client DIALS, so that DNS name is in the zone THIS
-//! emulator answers in: the zone of the endpoint the CALLER reached the emulator at when a
-//! registry client can use it, and of the address the emulator is served at otherwise. The
-//! zone AWS serves its own gallery in resolves to AWS's public registry rather than to this
-//! emulator, so a URI naming it sends a push or a pull out of the emulator entirely.
+//! repository. You can use this URI for container image `push` and `pull` operations") are
+//! both the address a container client DIALS, so each is published on an endpoint THIS
+//! emulator answers at — the endpoint the CALLER reached it on when a registry client can
+//! use it, and the address the emulator is served at otherwise — scoped by the account's
+//! primary registry alias (`RegistryAlias$primaryRegistryAlias`, "displayed in both the
+//! repository URL and the image URI used in the docker pull commands"), with the repository's
+//! own name appended for a repository's URI. Nothing else belongs in either: the owning
+//! account is reported in `registryId`, and a public registry is global, so no Region appears
+//! either. The name AWS serves its gallery at resolves to AWS's public registry rather than
+//! to this emulator, and a name invented under that gallery's `public`.`ecr` prefix resolves
+//! nowhere at all, so a URI naming either sends a push or a pull out of the emulator
+//! entirely.
 //!
 //! The class the rule generalises over is the endpoint a call arrived on crossed with the
 //! repository name and the operation reporting the URI, so the rows span the endpoint forms
 //! a caller reaches this emulator by — the emulator's own socket, a loopback name with
 //! another port, a bracketed IPv6 literal, an endpoint carried only on the request URI, this
-//! service's own endpoint host (which names a service, so no registry client can use it), a
-//! `Host` that is no endpoint at all, and no `Host` at all — crossed with the
-//! repository-name forms the modelled `RepositoryName` pattern admits. No row is the
-//! recorded request.
+//! service's own endpoint host (which AWS publishes, so no registry client can use it), the
+//! published endpoint dialled back, a `Host` that is no endpoint at all, and no `Host` at all
+//! — crossed with the repository-name forms the modelled `RepositoryName` pattern admits. No
+//! row is the recorded request.
 //!
 //! The composition AWS documents is preserved throughout: a repository's URI is the
 //! registry's URI followed by the repository's name, and the four operations that publish
@@ -38,14 +39,16 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_ecrpublic_spencerfrontendservice::state::registry_address::GALLERY_HOST_LABELS;
+use service_com_amazonaws_ecrpublic_spencerfrontendservice::state::registry_address;
 use service_com_amazonaws_ecrpublic_spencerfrontendservice::state::{
     gallery_pull, DEFAULT_REGISTRY_ALIAS, GALLERY_HOST,
 };
 use service_com_amazonaws_ecrpublic_spencerfrontendservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::repository_image_lifecycle::{call_addressed, ARN_PREFIX, REGISTRY_ID};
+use crate::repository_image_lifecycle::{
+    call_addressed, ARN_PREFIX, PUBLIC_REGISTRY_LABELS, REGISTRY_ID,
+};
 
 /// The address this emulator is SERVED at in this suite: the base a call that reached it on
 /// no usable endpoint of its own is told to come back to.
@@ -59,8 +62,8 @@ const SERVED_ENDPOINT: &str = "127.0.0.1:9297";
 const SIGNED_REGION: &str = "us-east-1";
 
 /// One endpoint a caller reaches this emulator on: where the endpoint travels (the `Host`
-/// header, the request URI's authority, or neither) and the public-registry authority every
-/// URI published to that call is built on.
+/// header, the request URI's authority, or neither) and the authority every URI published to
+/// that call is built on.
 struct Endpoint {
     case: &'static str,
     host: Option<&'static str>,
@@ -70,58 +73,57 @@ struct Endpoint {
 
 /// The endpoints the table drives, spanning the forms a caller reaches this emulator by.
 ///
-/// An endpoint that names an ADDRESS names no DNS zone, so the authority published on it
-/// sits in the loopback zone RFC 6761 reserves for that interface, carrying the port the
-/// call arrived on.
+/// An endpoint a registry client can dial is published as it arrived, host and port together;
+/// every other form falls back to the address this emulator is served at.
 fn endpoints() -> Vec<Endpoint> {
     vec![
         Endpoint {
             case: "the emulator's own socket",
             host: Some(SERVED_ENDPOINT),
             uri_authority: None,
-            published: "public.ecr.localhost:9297",
+            published: SERVED_ENDPOINT,
         },
         Endpoint {
             case: "a loopback name with another port",
             host: Some("localhost:39355"),
             uri_authority: None,
-            published: "public.ecr.localhost:39355",
+            published: "localhost:39355",
         },
         Endpoint {
             case: "a bracketed IPv6 loopback literal",
             host: Some("[::1]:38001"),
             uri_authority: None,
-            published: "public.ecr.localhost:38001",
+            published: "[::1]:38001",
         },
         Endpoint {
             case: "an endpoint carried only on the request URI",
             host: None,
             uri_authority: Some("127.0.0.1:8443"),
-            published: "public.ecr.localhost:8443",
+            published: "127.0.0.1:8443",
         },
         Endpoint {
-            case: "this service's endpoint host, which names a service",
+            case: "this service's endpoint host, which AWS publishes",
             host: Some("api.ecr-public.us-east-1.amazonaws.com"),
             uri_authority: None,
-            published: "public.ecr.localhost:9297",
+            published: SERVED_ENDPOINT,
         },
         Endpoint {
-            case: "the published authority dialled back",
-            host: Some("public.ecr.localhost:9297"),
+            case: "the published endpoint dialled back",
+            host: Some(SERVED_ENDPOINT),
             uri_authority: None,
-            published: "public.ecr.localhost:9297",
+            published: SERVED_ENDPOINT,
         },
         Endpoint {
             case: "a Host that is no endpoint at all",
             host: Some("elsewhere.example.com/gallery"),
             uri_authority: None,
-            published: "public.ecr.localhost:9297",
+            published: SERVED_ENDPOINT,
         },
         Endpoint {
             case: "no endpoint on the request at all",
             host: None,
             uri_authority: None,
-            published: "public.ecr.localhost:9297",
+            published: SERVED_ENDPOINT,
         },
     ]
 }
@@ -189,7 +191,7 @@ fn string_at(case: &str, value: &Value, label: &str) -> String {
 }
 
 /// The registry URI `DescribeRegistries` publishes to a call that arrived at `endpoint`,
-/// asserted to be the published authority scoped by the registry's PRIMARY alias — the one
+/// asserted to be the published endpoint scoped by the registry's PRIMARY alias — the one
 /// flagged `RegistryAlias$primaryRegistryAlias` on that very answer, which is the alias a
 /// pull URL shows — and to carry neither the owning account nor a Region.
 async fn published_registry_uri(router: &MultiServiceRouter, endpoint: &Endpoint) -> String {
@@ -216,8 +218,8 @@ async fn published_registry_uri(router: &MultiServiceRouter, endpoint: &Endpoint
     assert_eq!(
         uri,
         format!("{}/{primary}", endpoint.published),
-        "case {:?}: expected the registry URI on the public-registry authority this \
-         emulator answers at, scoped by the primary alias, got {uri:?}",
+        "case {:?}: expected the registry URI on the endpoint this emulator answers at, \
+         scoped by the primary alias, got {uri:?}",
         endpoint.case
     );
     assert!(
@@ -238,25 +240,25 @@ fn dialled(case: &str, uri: &str) -> (String, String) {
     let (authority, path) = uri
         .split_once('/')
         .unwrap_or_else(|| panic!("case {case:?}: {uri:?} names no path"));
-    // What makes the authority a public registry's: the two fixed labels, then a domain of
-    // at least one non-empty label — which is what a client reads to tell a public registry
-    // URI apart from a private `<account>.dkr.ecr.<region>` one.
-    let [public, ecr] = GALLERY_HOST_LABELS;
-    let zone = authority
-        .strip_prefix(&format!("{public}.{ecr}."))
-        .unwrap_or_else(|| {
-            panic!("case {case:?}: expected {uri:?} on a {public}.{ecr}.<domain> authority")
-        });
+    // What makes the authority publishable at all: this emulator answers on it, by the one
+    // reading of that question this service states.
     assert!(
-        !zone.is_empty() && zone.split('.').all(|label| !label.is_empty()),
-        "case {case:?}: expected a domain after the universal prefix, got {authority:?}"
+        registry_address::names_this_emulator(authority),
+        "case {case:?}: expected {uri:?} on an address this emulator answers on"
     );
-    // The one thing a published address may never be: a host AWS serves and this emulator
-    // does not.
+    // The addresses a published URI may never name: a host AWS serves and this emulator does
+    // not — the gallery's own name, any name invented under the gallery's universal prefix
+    // (nothing resolves one to this process), and an AWS endpoint host.
     assert_ne!(
         authority, GALLERY_HOST,
         "case {case:?}: {uri:?} names the real gallery host, which this emulator does not \
          answer on"
+    );
+    let [public, ecr] = PUBLIC_REGISTRY_LABELS;
+    assert!(
+        !authority.starts_with(&format!("{public}.{ecr}.")),
+        "case {case:?}: {uri:?} names a host under the gallery's universal prefix, which \
+         nothing resolves to this emulator"
     );
     assert!(
         !authority.ends_with(".amazonaws.com"),
@@ -297,8 +299,8 @@ async fn every_published_repository_uri_names_an_endpoint_this_emulator_answers_
             let (authority, path) = dialled(&case, &created_uri);
             assert_eq!(
                 authority, endpoint.published,
-                "case {case:?}: expected the dialled authority to be the public-registry \
-                 authority this emulator answers at, got {authority:?}"
+                "case {case:?}: expected the dialled authority to be the endpoint this \
+                 emulator answers at, got {authority:?}"
             );
             assert_eq!(
                 path,
@@ -365,8 +367,8 @@ async fn every_published_repository_uri_names_an_endpoint_this_emulator_answers_
                 let (listed_authority, _) = dialled(&case, uri);
                 assert_eq!(
                     listed_authority, endpoint.published,
-                    "case {case:?}: every discovered push target is on the public-registry \
-                     authority this emulator answers at, got {uri:?}"
+                    "case {case:?}: every discovered push target is on the endpoint this \
+                     emulator answers at, got {uri:?}"
                 );
             }
 
@@ -518,7 +520,8 @@ async fn a_reference_composed_on_a_published_uri_pulls_the_image_pushed_to_it() 
     // and a container runtime pulls the reference it composed on that URI — so the address
     // this registry publishes and the address it answers for are the same one. The rows span
     // the reference forms a runtime writes (a tag, the implicit tag, and a digest) over a
-    // namespaced repository name.
+    // namespaced repository name, and the reference a container definition spells by hand on
+    // the gallery AWS serves, which names this registry by its alias.
     let (router, engine) = emulator_with_engine();
     let endpoints = endpoints();
     let endpoint = &endpoints[0];
@@ -557,6 +560,7 @@ async fn a_reference_composed_on_a_published_uri_pulls_the_image_pushed_to_it() 
         format!("{published}:latest"),
         published.clone(),
         format!("{published}@{digest}"),
+        format!("{GALLERY_HOST}/{DEFAULT_REGISTRY_ALIAS}/{name}:latest"),
     ] {
         let parsed = gallery_pull::parse_gallery_reference(&reference).unwrap_or_else(|| {
             panic!("case {reference:?}: expected a reference into this gallery")

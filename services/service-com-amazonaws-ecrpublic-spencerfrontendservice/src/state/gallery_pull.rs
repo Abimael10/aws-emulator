@@ -13,14 +13,16 @@
 //! rather than by whoever is starting the container.
 //!
 //! TWO kinds of host address this gallery, and both have to be read, because a client
-//! composes a reference on whichever of them it was given: an authority that NAMES a public
-//! registry ([`registry_address::names_the_public_gallery`]) — the fixed `public`.`ecr`
-//! labels over a zone, which covers both the name AWS serves the gallery at
-//! ([`GALLERY_HOST`]), as a reference written by hand carries it, and the authority this
-//! registry PUBLISHES, over the zone this emulator answers in — and a bare address this
-//! emulator answers on ([`registry_address::names_this_emulator`]), which is the endpoint a
-//! client pointed straight at this emulator reaches it by. So the reference a client builds
-//! from the URI the API handed it resolves to the very repository that URI names.
+//! composes a reference on whichever of them it was given: an address this emulator answers
+//! on ([`registry_address::names_this_emulator`]), which is the authority every URI this
+//! registry PUBLISHES is built on ([`registry_address::announced_gallery_authority`]) and the
+//! endpoint a client pointed straight at this emulator reaches it by; and an authority that
+//! names a public registry of the gallery AWS serves
+//! ([`registry_address::names_the_public_gallery`]) — the fixed `public`.`ecr` labels over a
+//! zone, which covers the name AWS serves the gallery at ([`GALLERY_HOST`]) as a reference
+//! written BY HAND carries it. So the reference a client builds from the URI the API handed
+//! it resolves to the very repository that URI names, and so does one a container definition
+//! spells in AWS's own form.
 //!
 //! Only this registry's own alias is answered: an alias this registry was not assigned names
 //! some other public registry ([`ComAmazonawsEcrpublicSpencerfrontendserviceState::is_this_registry`]
@@ -117,9 +119,9 @@ pub fn parse_gallery_reference(image: &str) -> Option<GalleryReference> {
     })
 }
 
-/// Whether the host of a container reference addresses THIS gallery: an authority that names
-/// a public registry — AWS's own gallery name and the authority this registry publishes alike
-/// — or a bare address this emulator answers on (see the module docs).
+/// Whether the host of a container reference addresses THIS gallery: an address this emulator
+/// answers on — which is what every URI this registry publishes is built on — or an authority
+/// that names a public registry of the gallery AWS serves (see the module docs).
 ///
 /// Which public registry such a reference names is decided by the alias segment that follows,
 /// against the one alias this registry was assigned ([`serves_registry_alias`]).
@@ -225,8 +227,9 @@ mod tests {
     }
 
     /// RULE: a reference is read as this gallery's only when its host addresses this gallery —
-    /// an authority that names a public registry, or an address this emulator answers on — and
-    /// the alias, repository and tag or digest are read out of the reference itself.
+    /// an address this emulator answers on, or an authority that names a public registry of
+    /// the gallery AWS serves — and the alias, repository and tag or digest are read out of
+    /// the reference itself.
     #[test]
     fn a_gallery_reference_is_read_out_of_the_path() {
         let rows = [
@@ -237,16 +240,11 @@ mod tests {
             Row {
                 // The authority a `repositoryUri` this registry published carries: a client
                 // that appends a tag to the URI it was handed names this registry by it.
-                image: "public.ecr.localhost:9297/alias/app:1.2",
-                expected: Some(names("alias", "app", Some("1.2"), None)),
-            },
-            Row {
-                // The endpoint a client pointed straight at this emulator reaches it by.
                 image: "127.0.0.1:9297/alias/app:1.2",
                 expected: Some(names("alias", "app", Some("1.2"), None)),
             },
             Row {
-                image: "public.ecr.emulator.invalid/alias/team/app@sha256:abc",
+                image: "emulator.invalid/alias/team/app@sha256:abc",
                 expected: Some(names("alias", "team/app", None, Some("sha256:abc"))),
             },
             Row {
