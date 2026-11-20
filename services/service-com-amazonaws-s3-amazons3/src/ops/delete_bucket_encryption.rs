@@ -188,9 +188,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Everything this delete needs is in its deserialized input: the bucket travels as
-        // an @httpLabel and the expected owner as a bound header.
-        let _ = ctx;
+        // Everything this delete needs beyond the credential it presented is in its
+        // deserialized input: the bucket travels as an @httpLabel and the expected owner as a
+        // bound header.
 
         // "The account ID of the expected bucket owner. If the account ID that you provide
         // does not match the actual owner of the bucket, the request fails with the HTTP
@@ -220,8 +220,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        // WHO is asking, resolved BEFORE the store is locked, so the STS and IAM stores this
+        // service reads the calling principal and its policies from are never reached while
+        // this service's own guard is held.
+        let caller = crate::service::request_authorization::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(DeleteBucketEncryptionErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+
+        // "The `s3:PutEncryptionConfiguration` permission is required in a policy" (this
+        // operation's own documentation of its general purpose bucket permissions): resetting
+        // the configuration is a WRITE of it, so it is charged for the same action the put is,
+        // judged against the documents in force on the principal the request signed for and
+        // against the bucket's own policy, before anything is reset — so a caller the policies
+        // refuse leaves the bucket's default encryption exactly as it was.
+        if let Some(message) =
+            crate::service::request_authorization::encryption_configuration_denial(
+                &caller,
+                bucket,
+                &input.bucket,
+                crate::service::request_authorization::EncryptionConfigurationAccess::Write,
+            )
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::ACCESS_DENIED_CODE,
+                crate::state::ACCESS_DENIED_STATUS,
+                message,
+            ));
+        }
+
         let Some(bucket) = store.bucket_mut(&input.bucket) else {
+            // Unreachable: the lookup above ran under this same guard.
             return Err(DeleteBucketEncryptionErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
         };
         // "This implementation of the DELETE action resets the default encryption for the

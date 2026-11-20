@@ -43,6 +43,17 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::bucket_lifecycle::{create_bucket, router, send, Answer};
 
+/// What AUTHORIZES a call on this same subresource: the action each of the three operations
+/// is charged for, and what a caller no document in force allows is answered with.
+///
+/// Declared here rather than in `tests/all.rs`, which declares the suites directly under
+/// `tests/all/`: a file deeper than that is declared by its own parent module, which this
+/// suite is — and this is the module whose payload writer and reported-rule reader it drives
+/// its calls through. The `#[path]` is relative to this file's own directory, and is needed
+/// because `tests/all.rs` pulled this file in with a `#[path]` of its own.
+#[path = "bucket_encryption/authorization.rs"]
+mod authorization;
+
 /// The XML namespace botocore puts on an S3 request payload.
 ///
 /// `pub(crate)` with the two value lists below it: the delete suite beside this one
@@ -145,7 +156,11 @@ pub(crate) fn as_reported(rules: &[Rule]) -> Vec<Rule> {
 /// `xmlName` `Rule`, and `BlockedEncryptionTypes$EncryptionType` likewise with `xmlName`
 /// `EncryptionType` (`smithy_query(query="shape",shape="ServerSideEncryptionConfiguration"`
 /// and `…shape="BlockedEncryptionTypes"`).
-fn configuration_payload(rules: &[Rule]) -> String {
+///
+/// `pub(crate)`: the suite that pins what AUTHORIZES this subresource ([`authorization`])
+/// presents its puts as a named IAM identity rather than as the account, so it spells its
+/// payloads through this one writer rather than keeping a second copy of the XML.
+pub(crate) fn configuration_payload(rules: &[Rule]) -> String {
     let mut body = format!("<ServerSideEncryptionConfiguration xmlns=\"{XMLNS}\">");
     for rule in rules {
         body.push_str("<Rule>");

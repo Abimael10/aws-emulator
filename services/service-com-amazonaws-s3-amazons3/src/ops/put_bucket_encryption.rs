@@ -221,9 +221,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Everything this write needs is in its deserialized input: the expected owner and
-        // the configuration travel as members, not as raw headers.
-        let _ = ctx;
+        // Everything this write needs beyond the credential it presented is in its
+        // deserialized input: the expected owner and the configuration travel as members,
+        // not as raw headers.
 
         // "The account ID of the expected bucket owner. If the account ID that you provide
         // does not match the actual owner of the bucket, the request fails with the HTTP
@@ -286,9 +286,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // looked up FIRST, so a request naming a bucket this emulator does not hold
         // answers that rather than reporting whatever is wrong with a configuration the
         // bucket could never have carried (the order `PutBucketOwnershipControls` keeps).
+        //
+        // WHO is asking is resolved BEFORE the store is locked, so the STS and IAM stores this
+        // service reads the calling principal and its policies from are never reached while
+        // this service's own guard is held.
+        let caller = crate::service::request_authorization::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
-        if store.bucket(&input.bucket).is_none() {
+        let Some(bucket) = store.bucket(&input.bucket) else {
             return Err(PutBucketEncryptionErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+
+        // "The `s3:PutEncryptionConfiguration` permission is required in a policy" (this
+        // operation's own documentation of its general purpose bucket permissions): the write
+        // is charged for THAT action — not for the one a read of the same subresource asks
+        // for, and not for the `s3:PutBucket*` family, neither of which covers it — against
+        // the documents in force on the principal the request signed for and against the
+        // bucket's own policy ([`crate::service::request_authorization`] carries IAM's order).
+        // Decided before a single rule is validated or stored, so a caller the policies refuse
+        // cannot change the bucket's default encryption at all.
+        if let Some(message) =
+            crate::service::request_authorization::encryption_configuration_denial(
+                &caller,
+                bucket,
+                &input.bucket,
+                crate::service::request_authorization::EncryptionConfigurationAccess::Write,
+            )
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::ACCESS_DENIED_CODE,
+                crate::state::ACCESS_DENIED_STATUS,
+                message,
+            ));
         }
 
         if rules.is_empty() {

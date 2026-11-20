@@ -217,21 +217,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(GetBucketEncryptionErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
         };
 
-        // "To use this operation, you must have permission to perform the
-        // `s3:GetEncryptionConfiguration` action" (this operation's own documentation) — an
-        // action whose name does not follow the operation's, so a policy granting the
-        // `s3:GetBucket*` family does NOT cover it. Judged against the documents in force on
-        // the principal the request signed for and against the bucket's own policy
-        // ([`crate::service::request_authorization`] carries IAM's order), before anything
-        // about the bucket's configuration is reported.
-        if let Some(message) = crate::service::request_authorization::denial(
-            &caller,
-            bucket.policy.as_deref(),
-            &crate::service::request_authorization::AddressedTags::of(bucket),
-            crate::service::request_authorization::GET_ENCRYPTION_CONFIGURATION_ACTION,
-            &bucket.arn(&input.bucket),
-            &crate::service::authorization::read_conditions(),
-        ) {
+        // "The `s3:GetEncryptionConfiguration` permission is required in a policy" (this
+        // operation's own documentation) — an action whose name does not follow the
+        // operation's, so a policy granting the `s3:GetBucket*` family does NOT cover it.
+        // Charged through the one decision the whole subresource is authorized by
+        // ([`crate::service::request_authorization::encryption_configuration_denial`], which
+        // carries IAM's order and the directory-bucket namespace), before anything about the
+        // bucket's configuration is reported.
+        if let Some(message) =
+            crate::service::request_authorization::encryption_configuration_denial(
+                &caller,
+                bucket,
+                &input.bucket,
+                crate::service::request_authorization::EncryptionConfigurationAccess::Read,
+            )
+        {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 crate::state::ACCESS_DENIED_CODE,
                 ACCESS_DENIED_STATUS,

@@ -183,6 +183,29 @@ pub const LIST_BUCKET_VERSIONS_ACTION: &str = "s3:ListBucketVersions";
 /// NOT cover it.
 pub const GET_ENCRYPTION_CONFIGURATION_ACTION: &str = "s3:GetEncryptionConfiguration";
 
+/// The IAM action a WRITE of a bucket's default-encryption configuration is authorized under:
+/// "the `s3:PutEncryptionConfiguration` permission is required in a policy"
+/// (`PutBucketEncryption`'s and `DeleteBucketEncryption`'s own documentation of their general
+/// purpose bucket permissions — one action for both, because resetting the configuration is a
+/// write of it). It is a permission of its own: a caller holding
+/// [`GET_ENCRYPTION_CONFIGURATION_ACTION`], or the `s3:PutBucket*` family, does not hold it.
+pub const PUT_ENCRYPTION_CONFIGURATION_ACTION: &str = "s3:PutEncryptionConfiguration";
+
+/// The action a read of a DIRECTORY bucket's default-encryption configuration is authorized
+/// under: "you must have the `s3express:GetEncryptionConfiguration` permission in an IAM
+/// identity-based policy instead of a bucket policy" (`GetBucketEncryption`'s own
+/// documentation of its directory bucket permissions) — the directory-bucket action namespace,
+/// which a grant of the general purpose action does not reach.
+pub const DIRECTORY_GET_ENCRYPTION_CONFIGURATION_ACTION: &str =
+    "s3express:GetEncryptionConfiguration";
+
+/// The action a WRITE of a directory bucket's default-encryption configuration is authorized
+/// under: "you must have the `s3express:PutEncryptionConfiguration` permission in an IAM
+/// identity-based policy instead of a bucket policy" (`PutBucketEncryption`'s and
+/// `DeleteBucketEncryption`'s own documentation of their directory bucket permissions).
+pub const DIRECTORY_PUT_ENCRYPTION_CONFIGURATION_ACTION: &str =
+    "s3express:PutEncryptionConfiguration";
+
 /// The IAM action a bucket-policy write is authorized under: "the `s3:PutBucketPolicy`
 /// permission is required in a policy" (`PutBucketPolicy`'s own documentation).
 pub const PUT_BUCKET_POLICY_ACTION: &str = "s3:PutBucketPolicy";
@@ -1196,6 +1219,73 @@ pub fn object_read_denial(
         LIST_BUCKET_ACTION,
         &bucket.arn(name),
         &conditions,
+    )
+}
+
+/// What a call DOES to a bucket's default-encryption configuration, which is what decides the
+/// action it is charged for ([`encryption_configuration_denial`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncryptionConfigurationAccess {
+    /// Reports the configuration without changing it.
+    Read,
+    /// Replaces it, or resets it to the default the bucket carries — both are writes of the
+    /// same subresource, and AWS charges one action for them.
+    Write,
+}
+
+impl EncryptionConfigurationAccess {
+    /// The IAM action this access is charged for on a bucket of this KIND: the `s3` action for
+    /// a general purpose bucket and the `s3express` one for a directory bucket (see the four
+    /// constants above).
+    #[must_use]
+    pub fn action(self, directory: bool) -> &'static str {
+        match (self, directory) {
+            (Self::Read, false) => GET_ENCRYPTION_CONFIGURATION_ACTION,
+            (Self::Read, true) => DIRECTORY_GET_ENCRYPTION_CONFIGURATION_ACTION,
+            (Self::Write, false) => PUT_ENCRYPTION_CONFIGURATION_ACTION,
+            (Self::Write, true) => DIRECTORY_PUT_ENCRYPTION_CONFIGURATION_ACTION,
+        }
+    }
+}
+
+/// Why the policies in force refuse `caller` this `access` to the DEFAULT-ENCRYPTION
+/// configuration of the bucket held under `name` — the sentence S3 words that refusal in — or
+/// `None` when they leave the call to it.
+///
+/// One place for the whole subresource, so each of the three operations that reach it — the
+/// report, the put and the reset — is charged for the action AWS publishes for what IT does
+/// rather than one of them being charged for nothing: a report asks for the `Get` action and a
+/// put or a reset for the `Put` one ([`EncryptionConfigurationAccess`]), which is a permission
+/// of its own.
+///
+/// A DIRECTORY bucket is judged by the documents in force on the identity alone, under the
+/// directory-bucket action namespace: "you must have the
+/// `s3express:PutEncryptionConfiguration` permission in an IAM identity-based policy instead
+/// of a bucket policy" (`PutBucketEncryption`'s directory bucket permissions), so no bucket
+/// policy is handed to the decision for one, and the bucket is named by whichever ARN its own
+/// kind carries ([`Bucket::arn`]).
+///
+/// Asked BEFORE anything about the configuration is reported or written, so a refused call
+/// leaves the bucket exactly as it was.
+#[must_use]
+pub fn encryption_configuration_denial(
+    caller: &Caller,
+    bucket: &Bucket,
+    name: &str,
+    access: EncryptionConfigurationAccess,
+) -> Option<String> {
+    let directory = bucket.is_directory();
+    let policy = match directory {
+        true => None,
+        false => bucket.policy.as_deref(),
+    };
+    denial(
+        caller,
+        policy,
+        &AddressedTags::of(bucket),
+        access.action(directory),
+        &bucket.arn(name),
+        &authorization::read_conditions(),
     )
 }
 
