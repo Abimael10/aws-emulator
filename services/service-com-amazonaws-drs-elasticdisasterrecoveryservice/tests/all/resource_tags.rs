@@ -31,7 +31,9 @@
 //!    already carries and leaves every other key where it is, so two calls naming
 //!    disjoint keys leave both sets on the resource; `UntagResource` removes the keys it
 //!    names and nothing else. Both are observable through the read AND through the
-//!    resource's own reader, because a resource has ONE tag set.
+//!    resource's own reader, because a resource has ONE tag set. The overlay half of that
+//!    rule is asserted EXHAUSTIVELY as well, over every pair of stored and written sets
+//!    drawn from a small key universe, so no overlap pattern is merely sampled.
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_drs_elasticdisasterrecoveryservice::state::{self, SourceServerRecord};
@@ -45,7 +47,7 @@ use crate::replication_configuration_template_lifecycle::{
 const REGION: &str = "eu-west-1";
 
 /// The account id every generated emulator presents (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
+pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// The code and the whole message EVERY operation of the tagging route answers an ARN it
 /// resolved to no resource with. The route is served ahead of any one resource's
@@ -63,7 +65,7 @@ const VALIDATION_CODE: &str = "ValidationException";
 /// How many tags one resource carries at most: "Each resource can have a maximum of 50
 /// tags" (`TagResource`'s own documentation,
 /// `smithy_query(query="doc",shape="TagResource")`).
-const TAGS_PER_RESOURCE_LIMIT: usize = 50;
+pub(crate) const TAGS_PER_RESOURCE_LIMIT: usize = 50;
 
 /// An ARN as a client percent-encodes a non-greedy `@httpLabel`: `resourceArn` is bound
 /// to one path segment, so the colons and slashes inside it are escaped.
@@ -230,7 +232,7 @@ pub(crate) async fn plan_with_tags(
 }
 
 /// Create a replication configuration template carrying `tags`, and answer its ARN.
-async fn template_with_tags(router: &MultiServiceRouter, tags: &Value) -> String {
+pub(crate) async fn template_with_tags(router: &MultiServiceRouter, tags: &Value) -> String {
     let body = create_body("subnet-0123456789abcdef0", json!({"tags": tags.clone()}));
     let answer = call_in(
         router,
@@ -628,6 +630,95 @@ async fn a_write_overlays_the_keys_it_names_on_the_set_the_resource_carries() {
             Some(expected),
             "case {case:?}: a repeated write must leave {expected}, got {read:?}"
         );
+    }
+}
+
+/// The keys the exhaustive overlay sweep below draws every tag set from. Three keys make
+/// all eight subsets of the universe cheap to enumerate on BOTH sides of a write, which is
+/// what covers every overlap pattern between the set the resource carries and the set the
+/// write names — the rule generalises over the overlap, not over the keys themselves.
+const SWEEP_KEYS: [&str; 3] = ["env", "team", "tier"];
+
+/// The tag set naming the subset of [`SWEEP_KEYS`] that `mask`'s bits select, each value
+/// carrying `origin` so a value a write overwrote is told apart from the one the create
+/// stored.
+fn sweep_tag_set(mask: usize, origin: &str) -> Value {
+    let mut map = Map::new();
+    for (bit, key) in SWEEP_KEYS.iter().enumerate() {
+        if mask & (1 << bit) != 0 {
+            map.insert((*key).to_string(), Value::String(format!("{origin}-{key}")));
+        }
+    }
+    Value::Object(map)
+}
+
+/// `stored` with every entry of `written` overlaid — the set the rule says the resource
+/// carries after the write, computed from the rule rather than listed per row.
+fn overlaid(stored: &Value, written: &Value) -> Value {
+    let mut expected = stored
+        .as_object()
+        .expect("the stored set is a JSON object")
+        .clone();
+    for (key, value) in written.as_object().expect("the written set is a JSON object") {
+        expected.insert(key.clone(), value.clone());
+    }
+    Value::Object(expected)
+}
+
+/// The same rule as the rows above, asserted EXHAUSTIVELY rather than sampled: over all 64
+/// pairs of stored and written tag sets drawn from [`SWEEP_KEYS`], the resource carries the
+/// stored set with the written keys overlaid, so every overlap pattern the rule generalises
+/// over — disjoint, partly overlapping, identical, and either side empty — is covered, with
+/// the expected set computed from the rule instead of written out. Each write answering the
+/// operation's own 200 off the stored set is also what says the write came from a handler
+/// reading and writing state rather than from a scaffold.
+#[tokio::test]
+async fn a_write_overlays_its_keys_for_every_overlap_of_stored_and_written_sets() {
+    let (router, _engine) = drs_with_engine();
+    let subsets = 1usize << SWEEP_KEYS.len();
+
+    for stored_mask in 0..subsets {
+        for written_mask in 0..subsets {
+            let stored = sweep_tag_set(stored_mask, "stored");
+            let written = sweep_tag_set(written_mask, "written");
+            let case = format!("stored {stored}, written {written}");
+
+            // A resource per pair, created carrying the pair's stored set: what the write
+            // has to leave behind is a function of the set that was already there.
+            let arn = plan_with_tags(&router, REGION, Some(&stored)).await;
+            let answer = tag_resource(&router, REGION, &arn, &written).await;
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?}: expected the write to be served, got {answer:?}"
+            );
+            assert!(
+                answer.error_code.is_none(),
+                "case {case:?}: expected the write to carry no error, got {answer:?}"
+            );
+
+            let expected = overlaid(&stored, &written);
+            let read = list_tags(&router, REGION, &arn).await;
+            assert_eq!(
+                reported_tags(&read),
+                Some(&expected),
+                "case {case:?}: expected {expected}, got {read:?}"
+            );
+
+            // A resource has ONE tag set: the resource's own reader reports what the route
+            // wrote, for every pair.
+            let plan = call_in(
+                &router,
+                REGION,
+                "GetRecoveryPlan",
+                &json!({"recoveryPlanArn": arn}),
+            )
+            .await;
+            assert_eq!(
+                plan.member("recoveryPlan").and_then(|plan| plan.get("tags")),
+                Some(&expected),
+                "case {case:?}: the resource must carry {expected}, got {plan:?}"
+            );
+        }
     }
 }
 
