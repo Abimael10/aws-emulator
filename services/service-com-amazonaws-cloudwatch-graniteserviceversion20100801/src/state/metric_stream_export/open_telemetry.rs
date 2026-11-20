@@ -12,6 +12,10 @@
 //!
 //! * an `ExportMetricsServiceRequest` of the OpenTelemetry metrics service, carrying one
 //!   resource, one scope and one metric — the metric this record reports, for one period;
+//! * that metric named and measured as the protocol states a metric: under the qualified name of
+//!   its series ([`QUALIFIED_NAME_CLOUD`]) and in the unit code of the protocol's own unit system
+//!   ([`UCUM_CODES`]), rather than under the two halves and the unit name CloudWatch holds, which
+//!   the data point carries unchanged;
 //! * the metric's measurements as a `Summary`, the OpenTelemetry data type whose data point
 //!   carries exactly what a streamed metric reports: a `count`, a `sum` and quantile values.
 //!   "a metric stream always sends the `MAX`, `MIN`, `SUM`, and `SAMPLECOUNT` statistics for
@@ -68,9 +72,58 @@ const CLOUD_ACCOUNT_KEY: &str = "cloud.account.id";
 const CLOUD_REGION_KEY: &str = "cloud.region";
 const EXPORTER_ARN_KEY: &str = "aws.exporter.arn";
 
+/// How these formats NAME a streamed metric: an OpenTelemetry metric carries ONE name, while a
+/// CloudWatch metric's name is one half of its identity ("a metric is uniquely defined by a name,
+/// a namespace, and zero or more dimensions"), so the name a streamed metric is exported under is
+/// the qualified one — the cloud the series came from, then the series' own namespace and metric
+/// name, each part separated from the next by [`QUALIFIED_NAME_SEPARATOR`]. That is what an
+/// OpenTelemetry consumer keys and routes a series by, so two series sharing a metric name in
+/// different namespaces stay two series; the unqualified halves are carried by the data point's
+/// identifying pairs ([`NAMESPACE_KEY`], [`METRIC_NAME_KEY`]), which is where a consumer reads
+/// them back.
+const QUALIFIED_NAME_CLOUD: &str = "amazonaws.com";
+const QUALIFIED_NAME_SEPARATOR: char = '/';
+
+/// How these formats STATE the unit a measurement is expressed in: an OpenTelemetry metric's
+/// `unit` is a code of the Unified Code for Units of Measure, the system that protocol states
+/// every unit in, while a CloudWatch datapoint is published under one of the enumerated unit
+/// names ("the unit of the metric", `MetricDatum$Unit`) — so an exported record carries the UCUM
+/// code of the name the series was published under: the code of the quantity it measures, with
+/// the UCUM prefix the name's multiple takes (`k`, `M`, `G`, `T`), over the code of a second
+/// where the name states a rate ([`PER_SECOND_NAME`]), an annotation where the quantity is a
+/// count of things rather than a measure of one, and the dimensionless code for a series
+/// published with no unit. A unit name this table does not hold is carried as published, since a
+/// code for it is not one this exporter may invent.
+const UCUM_CODES: &[(&str, &str)] = &[
+    ("Seconds", "s"),
+    ("Microseconds", "us"),
+    ("Milliseconds", "ms"),
+    ("Bytes", "By"),
+    ("Kilobytes", "kBy"),
+    ("Megabytes", "MBy"),
+    ("Gigabytes", "GBy"),
+    ("Terabytes", "TBy"),
+    ("Bits", "bit"),
+    ("Kilobits", "kbit"),
+    ("Megabits", "Mbit"),
+    ("Gigabits", "Gbit"),
+    ("Terabits", "Tbit"),
+    ("Percent", "%"),
+    ("Count", "{Count}"),
+    (crate::state::UNIT_NONE, DIMENSIONLESS),
+];
+
+/// What a unit name's rate form ends in, and the UCUM code one of them is stated over: a rate is
+/// the quantity its name opens with, per second.
+const PER_SECOND_NAME: &str = "/Second";
+const PER_SECOND_CODE: &str = "/s";
+
+/// The UCUM code of a quantity that has no dimension, which is what a measurement published
+/// under no unit is.
+const DIMENSIONLESS: &str = "1";
+
 /// The pairs that identify WHICH metric a data point reports: the two halves of a metric's name
-/// ("a metric is uniquely defined by a name, a namespace, and zero or more dimensions") and its
-/// dimension set.
+/// and its dimension set.
 const NAMESPACE_KEY: &str = "Namespace";
 const METRIC_NAME_KEY: &str = "MetricName";
 const DIMENSIONS_KEY: &str = "Dimensions";
@@ -164,12 +217,42 @@ fn resource_attributes(period: &ExportedPeriod<'_>) -> Vec<KeyValue> {
 /// the period.
 fn metric(period: &ExportedPeriod<'_>) -> Metric {
     Metric {
-        name: period.key.metric_name.clone(),
-        unit: period.unit.to_string(),
+        name: qualified_name(period.key),
+        unit: exported_unit(period.unit),
         summary: Some(Summary {
             data_points: vec![data_point(period)],
         }),
     }
+}
+
+/// The name one streamed series is exported under: the cloud it came from, its namespace and its
+/// metric name, qualified ([`QUALIFIED_NAME_CLOUD`]).
+///
+/// Both halves are taken from the series itself, whatever they are: a namespace of its own carries
+/// the separator too (`AWS/EC2`), and qualifying it is the same join.
+fn qualified_name(key: &MetricKey) -> String {
+    format!(
+        "{QUALIFIED_NAME_CLOUD}{QUALIFIED_NAME_SEPARATOR}{}{QUALIFIED_NAME_SEPARATOR}{}",
+        key.namespace, key.metric_name
+    )
+}
+
+/// The unit an exported record states the period's measurements in: the UCUM code of the unit
+/// name the datapoints were published under ([`UCUM_CODES`]), over the code of a second where
+/// that name states a rate.
+fn exported_unit(unit: &str) -> String {
+    match unit.strip_suffix(PER_SECOND_NAME) {
+        Some(quantity) => format!("{}{PER_SECOND_CODE}", ucum_code(quantity)),
+        None => ucum_code(unit).to_string(),
+    }
+}
+
+/// The UCUM code of one unit name, or the name itself where the table holds no code for it.
+fn ucum_code(unit: &str) -> &str {
+    UCUM_CODES
+        .iter()
+        .find(|(name, _)| *name == unit)
+        .map_or(unit, |(_, code)| code)
 }
 
 /// The period's data point, encoded: which metric it reports, the span it covers and the
@@ -649,6 +732,138 @@ mod tests {
         );
     }
 
+    /// The one metric a decoded record reports.
+    fn only_metric(request: &ExportMetricsServiceRequest) -> Metric {
+        request
+            .resource_metrics
+            .first()
+            .expect("one resource per record")
+            .scope_metrics
+            .first()
+            .expect("one scope per record")
+            .metrics
+            .first()
+            .expect("one metric per record")
+            .clone()
+    }
+
+    /// RULE: the name a streamed metric is exported under is the qualified name of its series —
+    /// the cloud it came from, its namespace and its metric name — whichever release the record is
+    /// framed in, while the unqualified halves stay in the data point's identifying pairs.
+    #[test]
+    fn a_streamed_metric_is_exported_under_its_qualified_name() {
+        // The rows differ along what the rule joins: a namespace of one part and of several, a
+        // metric name of either form, and a namespace carrying characters a custom one admits.
+        let cases: [(&str, &str, &str); 4] = [
+            (
+                "AWS/EC2",
+                "CPUUtilization",
+                "amazonaws.com/AWS/EC2/CPUUtilization",
+            ),
+            (
+                "Custom/Export",
+                "Latency",
+                "amazonaws.com/Custom/Export/Latency",
+            ),
+            (
+                "CwStreamFmt-7f3a_4",
+                "Throughput",
+                "amazonaws.com/CwStreamFmt-7f3a_4/Throughput",
+            ),
+            ("ns", "m", "amazonaws.com/ns/m"),
+        ];
+        for version in [OpenTelemetryVersion::V1_0, OpenTelemetryVersion::V0_7] {
+            for (namespace, metric_name, expected) in cases {
+                let key = MetricKey {
+                    namespace: namespace.to_string(),
+                    metric_name: metric_name.to_string(),
+                    dimensions: DimensionSet::new(),
+                };
+                let bytes = record(&period(version, &key, &[]));
+                let name = only_metric(&decoded(&bytes)).name;
+                assert_eq!(
+                    name, expected,
+                    "case {version:?} {namespace}/{metric_name}: expected {expected:?}, got \
+                     {name:?}"
+                );
+            }
+        }
+    }
+
+    /// RULE: a record states its measurements in the unit system the OpenTelemetry protocol
+    /// states every unit in — the UCUM code of the unit name the datapoints were published under,
+    /// a rate over the code of a second, and the dimensionless code where no unit was named.
+    #[test]
+    fn a_record_states_its_unit_in_the_protocols_own_unit_system() {
+        // One row per enumerated unit name (`StandardUnit`, as
+        // `smithy_query(query="shape",shape="StandardUnit")` lists it and
+        // [`STANDARD_UNIT_VALUES`] holds it), so no name a publisher may declare is unconverted.
+        let cases: [(&str, &str); 27] = [
+            ("Bits", "bit"),
+            ("Bits/Second", "bit/s"),
+            ("Bytes", "By"),
+            ("Bytes/Second", "By/s"),
+            ("Count", "{Count}"),
+            ("Count/Second", "{Count}/s"),
+            ("Gigabits", "Gbit"),
+            ("Gigabits/Second", "Gbit/s"),
+            ("Gigabytes", "GBy"),
+            ("Gigabytes/Second", "GBy/s"),
+            ("Kilobits", "kbit"),
+            ("Kilobits/Second", "kbit/s"),
+            ("Kilobytes", "kBy"),
+            ("Kilobytes/Second", "kBy/s"),
+            ("Megabits", "Mbit"),
+            ("Megabits/Second", "Mbit/s"),
+            ("Megabytes", "MBy"),
+            ("Megabytes/Second", "MBy/s"),
+            ("Microseconds", "us"),
+            ("Milliseconds", "ms"),
+            ("None", "1"),
+            ("Percent", "%"),
+            ("Seconds", "s"),
+            ("Terabits", "Tbit"),
+            ("Terabits/Second", "Tbit/s"),
+            ("Terabytes", "TBy"),
+            ("Terabytes/Second", "TBy/s"),
+        ];
+        let named: Vec<&str> = cases.iter().map(|(unit, _)| *unit).collect();
+        assert_eq!(
+            named.as_slice(),
+            crate::ops::types::shared_types::STANDARD_UNIT_VALUES,
+            "every unit name a publisher may declare must have a row, got {named:?}"
+        );
+        let key = key();
+        for (unit, expected) in cases {
+            for version in [OpenTelemetryVersion::V1_0, OpenTelemetryVersion::V0_7] {
+                let mut period = period(version, &key, &[]);
+                period.unit = unit;
+                let carried = only_metric(&decoded(&record(&period))).unit;
+                assert_eq!(
+                    carried, expected,
+                    "case {version:?} {unit:?}: expected {expected:?}, got {carried:?}"
+                );
+            }
+        }
+    }
+
+    /// RULE: a unit name no code is held for is carried as published — a code for it is not one
+    /// this exporter may invent.
+    #[test]
+    fn an_unconvertible_unit_name_is_carried_as_published() {
+        let key = key();
+        for unit in ["Furlongs", "Furlongs/Second"] {
+            let mut period = period(OpenTelemetryVersion::V1_0, &key, &[]);
+            period.unit = unit;
+            let carried = only_metric(&decoded(&record(&period))).unit;
+            let expected = unit.replace(PER_SECOND_NAME, PER_SECOND_CODE);
+            assert_eq!(
+                carried, expected,
+                "case {unit:?}: expected {expected:?}, got {carried:?}"
+            );
+        }
+    }
+
     /// RULE: the release decides how the identifying pairs are carried — attributes, whose value
     /// may be a list of pairs, in 1.0; one string label per pair in 0.7.
     #[test]
@@ -754,7 +969,7 @@ mod tests {
             .expect("one metric per record");
         assert_eq!(
             (metric.name.as_str(), metric.unit.as_str()),
-            ("Latency", "Milliseconds"),
+            ("amazonaws.com/Custom/Export/Latency", "ms"),
             "the published decode must carry the metric's name and unit, got {metric:?}"
         );
         let Some(Data::Summary(summary)) = metric.data.as_ref() else {

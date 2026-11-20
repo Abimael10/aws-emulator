@@ -68,6 +68,16 @@ const NAMESPACE_KEY: &str = "Namespace";
 const METRIC_NAME_KEY: &str = "MetricName";
 const DIMENSIONS_KEY: &str = "Dimensions";
 
+/// The name one streamed series is exported under: an OpenTelemetry metric carries ONE name, so
+/// the two halves of a CloudWatch metric's identity ("a metric is uniquely defined by a name, a
+/// namespace, and zero or more dimensions") are qualified into it — the cloud the series came
+/// from, its namespace and its metric name, joined by `/`. That is the name an OpenTelemetry
+/// consumer keys and routes a series by; the unqualified halves are read back off the data point's
+/// identifying pairs.
+fn qualified_name(namespace: &str, metric_name: &str) -> String {
+    format!("amazonaws.com/{namespace}/{metric_name}")
+}
+
 // ---------------------------------------------------------------------------------------------
 // The consumer's side of the protocol: the messages an exported record is decoded as here. They
 // are declared from the OpenTelemetry metrics message names, not from this emulator's renderer,
@@ -457,7 +467,11 @@ struct FormatRow {
     /// The namespace the row publishes into, which its stream streams and no other row's does.
     namespace: &'static str,
     metric_name: &'static str,
+    /// The unit the datum is published under.
     unit: &'static str,
+    /// The unit the exported record must state the measurements in: the code the protocol's own
+    /// unit system gives the published unit.
+    exported_unit: &'static str,
     /// The metric's dimensions, which are part of its identity.
     dimensions: Vec<(&'static str, &'static str)>,
     /// The members carrying the row's observations (`Value`, `Values`, `StatisticValues`).
@@ -477,9 +491,9 @@ struct FormatRow {
 ///
 /// The rows differ along what the rule generalises over: which release the stream names, how the
 /// observations were published (one value, a list of values, a statistic set), how many
-/// dimensions the metric carries, which unit it is measured in, and how many additional
-/// percentiles the stream asks for — including one the period cannot define, which is reported
-/// as nothing rather than invented.
+/// dimensions the metric carries, which unit it is measured in — a time, a count, a size, a rate
+/// and no unit at all — and how many additional percentiles the stream asks for — including one
+/// the period cannot define, which is reported as nothing rather than invented.
 fn format_rows() -> Vec<FormatRow> {
     vec![
         FormatRow {
@@ -488,6 +502,7 @@ fn format_rows() -> Vec<FormatRow> {
             namespace: "Custom/OtelPlain",
             metric_name: "StreamedMetric",
             unit: "None",
+            exported_unit: "1",
             dimensions: vec![],
             observations: json!({"Value": 777.0}),
             statistics: None,
@@ -503,6 +518,7 @@ fn format_rows() -> Vec<FormatRow> {
             namespace: "Custom/OtelPercentile",
             metric_name: "Latency",
             unit: "Milliseconds",
+            exported_unit: "ms",
             dimensions: vec![("Service", "checkout")],
             observations: json!({"Values": (1..=10).map(f64::from).collect::<Vec<f64>>()}),
             statistics: Some(vec!["p99"]),
@@ -513,11 +529,28 @@ fn format_rows() -> Vec<FormatRow> {
             quantiles: vec![0.0, 0.99, 1.0],
         },
         FormatRow {
+            case: "the 1.0 release, a rate unit",
+            output_format: OPEN_TELEMETRY_1_0,
+            namespace: "Custom/OtelRate",
+            metric_name: "Throughput",
+            unit: "Bytes/Second",
+            exported_unit: "By/s",
+            dimensions: vec![],
+            observations: json!({"Values": [2.0, 4.0]}),
+            statistics: None,
+            count: 2,
+            sum: 6.0,
+            minimum: 2.0,
+            maximum: 4.0,
+            quantiles: vec![0.0, 1.0],
+        },
+        FormatRow {
             case: "the 0.7 release, a distribution, two dimensions, p50 and p99",
             output_format: OPEN_TELEMETRY_0_7,
             namespace: "Custom/OtelEarlier",
             metric_name: "Latency",
             unit: "Count",
+            exported_unit: "{Count}",
             dimensions: vec![("Service", "checkout"), ("Stage", "prod")],
             observations: json!({"Values": (1..=10).map(f64::from).collect::<Vec<f64>>()}),
             statistics: Some(vec!["p50", "p99"]),
@@ -533,6 +566,7 @@ fn format_rows() -> Vec<FormatRow> {
             namespace: "Custom/OtelStatisticSet",
             metric_name: "PayloadSize",
             unit: "Bytes",
+            exported_unit: "By",
             dimensions: vec![],
             observations: json!({
                 "StatisticValues": {
@@ -648,8 +682,11 @@ async fn an_open_telemetry_stream_exports_each_period_as_a_summary() {
         // WHICH metric it reports, and in which unit.
         assert_eq!(
             (read.metric.name.as_str(), read.metric.unit.as_str()),
-            (row.metric_name, row.unit),
-            "case {:?}: expected the metric's name and unit, got {:?}",
+            (
+                qualified_name(row.namespace, row.metric_name).as_str(),
+                row.exported_unit
+            ),
+            "case {:?}: expected the metric's qualified name and unit, got {:?}",
             row.case,
             read.metric
         );
@@ -864,14 +901,26 @@ async fn the_output_format_decides_the_form_each_stream_delivers() {
                 Some("Shared"),
                 "case {case:?}: expected the published metric in a json record, got {document}"
             );
+            // The json format carries the unit as the publisher declared it; only the
+            // OpenTelemetry releases state it in the protocol's own unit system.
+            assert_eq!(
+                document.get("unit").and_then(Value::as_str),
+                Some("Count"),
+                "case {case:?}: expected the published unit in a json record, got {document}"
+            );
             continue;
         }
         let records = delivered_records(&emulator, &case, &bucket, 1).await;
         let read = exported(&case, format, &records[0]);
         assert_eq!(
-            read.metric.name.as_str(),
-            "Shared",
+            read.metric.name,
+            qualified_name(namespace, "Shared"),
             "case {case:?}: expected the published metric, got {:?}",
+            read.metric
+        );
+        assert_eq!(
+            read.metric.unit, "{Count}",
+            "case {case:?}: expected the published unit as the protocol's own code, got {:?}",
             read.metric
         );
         assert_eq!(
@@ -916,4 +965,75 @@ fn form_stream(format: &str) -> String {
 /// \"-\" and \"_\"", `PutMetricStreamInput$Name`).
 fn slug(format: &str) -> String {
     format.replace('.', "-")
+}
+
+/// RULE: the name a record carries is the QUALIFIED name of its series, so two series that share
+/// one metric name in different namespaces are exported under two names a consumer keys and routes
+/// apart — while each data point keeps the unqualified halves of its own identity.
+#[tokio::test]
+async fn series_sharing_a_metric_name_are_named_apart_by_their_namespace() {
+    // Two namespaces of different shapes — one carrying a separator of its own, one not — both
+    // publishing the same metric name through ONE stream.
+    let namespaces: [&str; 2] = ["Custom/OtelCollide", "OtelCollide-2"];
+    let metric_name = "Latency";
+    let bucket = "collide-sink";
+    let delivery_stream = "collide-delivery";
+    let case = "one metric name in two namespaces";
+
+    let emulator = Emulator::new();
+    given_delivery_stream(&emulator, bucket, delivery_stream).await;
+    until_active(&emulator, delivery_stream).await;
+    emulator
+        .cloudwatch(
+            "PutMetricStream",
+            &json!({
+                "Name": "collide-stream",
+                "FirehoseArn": format!(
+                    "arn:aws:firehose:{REGION}:{ACCOUNT}:deliverystream/{delivery_stream}"
+                ),
+                "RoleArn": ROLE_ARN,
+                "OutputFormat": OPEN_TELEMETRY_1_0,
+                "IncludeFilters": namespaces
+                    .iter()
+                    .map(|namespace| json!({"Namespace": namespace}))
+                    .collect::<Vec<Value>>(),
+            }),
+        )
+        .await;
+    for namespace in namespaces {
+        publish_datum(
+            &emulator,
+            namespace,
+            json!({
+                "MetricName": metric_name,
+                "Value": 5.0,
+                "Unit": "Milliseconds",
+                "Timestamp": stamp(1),
+            }),
+        )
+        .await;
+    }
+
+    let records = delivered_records(&emulator, case, bucket, namespaces.len()).await;
+    let mut names: Vec<String> = Vec::new();
+    for record in &records {
+        let read = exported(case, OPEN_TELEMETRY_1_0, record);
+        names.push(read.metric.name.clone());
+        assert_eq!(
+            attribute(&read.point.attributes, METRIC_NAME_KEY),
+            Some(metric_name.to_string()),
+            "case {case:?}: the data point must keep the unqualified metric name, got {:?}",
+            read.point.attributes
+        );
+    }
+    names.sort();
+    let mut expected: Vec<String> = namespaces
+        .iter()
+        .map(|namespace| qualified_name(namespace, metric_name))
+        .collect();
+    expected.sort();
+    assert_eq!(
+        names, expected,
+        "case {case:?}: expected {expected:?}, got {names:?}"
+    );
 }
