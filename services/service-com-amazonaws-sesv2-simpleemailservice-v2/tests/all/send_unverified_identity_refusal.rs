@@ -783,34 +783,29 @@ async fn an_accepted_templated_send_carries_the_rendered_message() {
     // Once the gates are passed, the message the send carries is the stored template with
     // the request's values substituted into it — the same substitution
     // `TestRenderEmailTemplate` previews, which is the positive control here. The rows
-    // differ along the value substituted, including a variable the data states nothing for;
-    // the last flag says whether the PREVIEW renders that data too, since
-    // `TestRenderEmailTemplate` requires a value for every variable the template
-    // references while a send renders one the data does not state as nothing.
-    let rows: &[(&str, Option<&str>, &str, bool)] = &[
-        (
-            "a value for the variable",
-            Some("{\"name\":\"Ada\"}"),
-            "Ada",
-            true,
-        ),
+    // differ along the value substituted, including data that states no value for the
+    // variable the template names: such a send renders NO message, which is what the
+    // preview of the same template and data reports too, so the two surfaces agree about
+    // one template and one set of values.
+    // (case, the `TemplateData` the send states, the value substituted into the subject —
+    // `None` where nothing is rendered at all)
+    let rows: &[(&str, Option<&str>, Option<&str>)] = &[
+        ("a value for the variable", Some("{\"name\":\"Ada\"}"), Some("Ada")),
         (
             "another value, beside a key the template does not use",
             Some("{\"name\":\"Grace\",\"unused\":\"x\"}"),
-            "Grace",
-            true,
+            Some("Grace"),
         ),
         (
             "data stating no value for the variable",
             Some("{\"other\":\"x\"}"),
-            "",
-            false,
+            None,
         ),
-        ("no TemplateData member at all", None, "", false),
+        ("no TemplateData member at all", None, None),
     ];
     let region = "us-west-2";
 
-    for (case, data, substituted, previews) in rows {
+    for (case, data, substituted) in rows {
         let ses = Ses::new();
         assert_eq!(
             ses.create_template(region).await.status,
@@ -844,8 +839,9 @@ async fn an_accepted_templated_send_carries_the_rendered_message() {
         );
 
         // Read the accepted message back through an implemented reader: the subject it
-        // carries is the rendered one, with no reference left unresolved.
-        let expected_subject = format!("Hello {substituted}");
+        // carries is the rendered one, with no reference left unresolved — and a send that
+        // rendered nothing carries no subject at all.
+        let expected_subject = substituted.map(|value| format!("Hello {value}"));
         let read = ses.insights(region, &message_id).await;
         assert_eq!(
             read.status, 200,
@@ -854,26 +850,48 @@ async fn an_accepted_templated_send_carries_the_rendered_message() {
         );
         assert_eq!(
             read.text("/Subject"),
-            expected_subject,
+            expected_subject.clone().unwrap_or_default(),
             "case {case:?}: expected the rendered subject {expected_subject:?}, got {:?}",
             read.body
         );
 
         // The positive control: the same template and data through
-        // `TestRenderEmailTemplate` render the same subject line into the preview.
-        if *previews {
-            let data = data.expect("a row whose preview renders states its data");
-            let preview = ses.render(region, data).await;
-            assert_eq!(
-                preview.status, 200,
-                "case {case:?}: expected the preview to render, got {} {:?}",
-                preview.status, preview.body
-            );
-            assert!(
-                preview.text("/RenderedTemplate").contains(&expected_subject),
-                "case {case:?}: expected the preview to carry {expected_subject:?}, got {:?}",
-                preview.body
-            );
+        // `TestRenderEmailTemplate`. A render that produces a message renders the same
+        // subject line into the preview; one whose data states no value for the variable is
+        // refused for exactly that attribute, which is the condition the send reports as an
+        // event of its accepted message instead.
+        let preview = ses
+            .render(region, data.unwrap_or("{}"))
+            .await;
+        match &expected_subject {
+            Some(subject) => {
+                assert_eq!(
+                    preview.status, 200,
+                    "case {case:?}: expected the preview to render, got {} {:?}",
+                    preview.status, preview.body
+                );
+                assert!(
+                    preview.text("/RenderedTemplate").contains(subject),
+                    "case {case:?}: expected the preview to carry {subject:?}, got {:?}",
+                    preview.body
+                );
+            }
+            None => {
+                assert_eq!(
+                    (preview.status, preview.error_code().as_str()),
+                    (400, "BadRequestException"),
+                    "case {case:?}: expected the preview of data stating no value to be \
+                     refused, got {} {:?}",
+                    preview.status,
+                    preview.body
+                );
+                assert_eq!(
+                    preview.message(),
+                    "Attribute 'name' is not present in the rendering data.",
+                    "case {case:?}: expected the preview to name the attribute, got {:?}",
+                    preview.message()
+                );
+            }
         }
     }
 }

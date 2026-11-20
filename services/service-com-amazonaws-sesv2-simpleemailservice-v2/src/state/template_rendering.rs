@@ -11,8 +11,16 @@
 //! that variable", and `Template$TemplateContent` adds that Amazon SES "supports only
 //! simple substitutions" for template content supplied in the request. So a render is
 //! exactly that substitution: every `{{ name }}` a part writes is replaced by the value
-//! the data gives that name, a name the data does not give renders as nothing, and the
-//! part is otherwise the template's own text.
+//! the data gives that name, and the part is otherwise the template's own text.
+//!
+//! Every name a part writes has to be one the data GIVES a value for: a reference the data
+//! states no value for produces [`RenderRefusal::MissingAttribute`] rather than rendering as
+//! nothing, so a template and a set of values that do not go together render no message at
+//! all. That is the same reading of a reference the full language's evaluation follows
+//! ([`crate::state::template_language`], which runs its engine in strict mode), so one
+//! template and one set of values are read the same way whichever of the two reads them.
+//! Stating a value is what counts, not what the value is: data that gives a name the JSON
+//! null states a value for it, and that value is written as nothing.
 //!
 //! What this does NOT do is interpret a template. There is no template LANGUAGE here and
 //! no parser for one: a part that writes a section, an inverted section, a partial, a
@@ -63,8 +71,12 @@ pub struct RenderedMessage {
 }
 
 /// Why a render produced no message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RenderRefusal {
+    /// A part names a message variable the data states no value for, and this is its name as
+    /// the template wrote it — a dotted path as the whole path, which is what names the value
+    /// that was looked for.
+    MissingAttribute(String),
     /// A part writes something other than a message variable: a section (`{{#…}}`), an
     /// inverted section, a partial (`{{>…}}`), a comment or a helper call. Substituting
     /// variables is all this emulator does with a template, so a part that asks to be
@@ -90,6 +102,18 @@ pub fn message_variables(raw: &str) -> Option<Value> {
     }
     let parsed: Value = ::serde_json::from_str(raw).ok()?;
     parsed.is_object().then_some(parsed)
+}
+
+/// How this service words the failure of a render whose data states no value for an
+/// attribute the template names.
+///
+/// The sentence this condition is RECORDED answering with: the fixed text "Attribute '" …
+/// "' is not present in the rendering data." around the attribute's own name as the template
+/// wrote it. Stated once here, so the surface that previews a render
+/// (`crate::ops::test_render_email_template`) and the sends that publish the failure of one
+/// word the same condition the same way.
+pub fn missing_rendering_attribute(attribute: &str) -> String {
+    format!("Attribute '{attribute}' is not present in the rendering data.")
 }
 
 /// `content` rendered with `variables`.
@@ -180,7 +204,10 @@ fn substitute(
         if !is_variable_path(name) {
             return Err(RenderRefusal::Unsupported);
         }
-        let value = variable_text(variables, name);
+        let Some(found) = variable_value(variables, name) else {
+            return Err(RenderRefusal::MissingAttribute(name.to_string()));
+        };
+        let value = value_text(found);
         match escape {
             Escape::None => push_bounded(&mut rendered, &value)?,
             Escape::Html => push_bounded(&mut rendered, &html_escaped(&value))?,
@@ -225,22 +252,25 @@ fn is_variable_path(name: &str) -> bool {
     })
 }
 
-/// The text the value at `path` is written as, or the empty string when the data states no
-/// value for it.
+/// The value the data states at `path`, or `None` when it states none.
 ///
-/// A name the data does not give renders as nothing, which is what a template's own
-/// non-strict reading of a missing variable is. A value that is text is written as that
-/// text; any other JSON value is written as the JSON it is, which is the only rendering of
-/// it the data states.
-fn variable_text(variables: &Value, path: &str) -> String {
+/// A dotted path is read key by key, so a path the data stops short of states no value — the
+/// path as a whole is what was looked for, and nothing of it is there to write.
+fn variable_value<'a>(variables: &'a Value, path: &str) -> Option<&'a Value> {
     let mut found = variables;
     for segment in path.split('.') {
-        match found.get(segment) {
-            Some(next) => found = next,
-            None => return String::new(),
-        }
+        found = found.get(segment)?;
     }
-    match found {
+    Some(found)
+}
+
+/// The text a stated value is written as.
+///
+/// A value that is text is written as that text; any other JSON value is written as the JSON
+/// it is, which is the only rendering of it the data states. The JSON null is a stated value
+/// that writes nothing.
+fn value_text(value: &Value) -> String {
+    match value {
         Value::Null => String::new(),
         Value::String(text) => text.clone(),
         other => other.to_string(),

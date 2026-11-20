@@ -5,11 +5,11 @@
 //!
 //! An event destination is "a place that you can send information about these events to",
 //! and the events themselves are what happened to one message: it was accepted (`Send`),
-//! it reached a recipient (`Delivery`), it failed for one (`Bounce`), or a recipient
-//! reported it (`Complaint`). The RULE this module implements: for each event an accepted
-//! message produces, every event destination of the set that is `Enabled` and whose
-//! `MatchingEventTypes` names that event's type receives one notification of it, and every
-//! other destination receives nothing.
+//! nothing was rendered for it (`Rendering Failure`), it reached a recipient (`Delivery`),
+//! it failed for one (`Bounce`), or a recipient reported it (`Complaint`). The RULE this
+//! module implements: for each event an accepted message produces, every event destination
+//! of the set that is `Enabled` and whose `MatchingEventTypes` names that event's type
+//! receives one notification of it, and every other destination receives nothing.
 //!
 //! The document is the published form of what this service already holds: the message as
 //! it was accepted (its id, its sender, its recipients and its headers) and what each
@@ -63,6 +63,16 @@ const BOUNCE: (&str, &str, &str) = ("BOUNCE", "Bounce", "Email Bounced");
 /// RECEIPT of the recipient's report, which is what its documented name says.
 const COMPLAINT: (&str, &str, &str) = ("COMPLAINT", "Complaint", "Email Complaint Received");
 
+/// The same triple for a templated message nothing was rendered for: the send was accepted,
+/// and rendering its template against the values the send stated produced no message
+/// ([`RenderingFailure`]). The event type is one only a TEMPLATED send produces, because
+/// rendering a template is the only thing that can fail this way.
+const RENDERING_FAILURE: (&str, &str, &str) = (
+    "RENDERING_FAILURE",
+    "Rendering Failure",
+    "Email Rendering Failed",
+);
+
 /// The message tag SES applies to every send made through a configuration set: the set
 /// itself. A destination publishes it as a CloudWatch dimension only where its own
 /// configuration declares a dimension of this name ([`super::cloudwatch`]).
@@ -103,6 +113,24 @@ const COMMON_HEADER_NAMES: [&str; 2] = ["Subject", "Date"];
 /// RFC 3464 writes the field: a bounce quotes the field, so it quotes the type too.
 const DELIVERY_STATUS_MTA_TYPE: &str = "dsn";
 
+/// The render that produced NO message for one accepted send, which is what its
+/// `RENDERING_FAILURE` event reports.
+///
+/// The send itself was accepted and answered with its own `MessageId` before any of this
+/// existed, so the failure is reported as an event of that message and in no other way:
+/// "because it already accepted the message, Amazon SES doesn't return a message stating
+/// that it was unable to send the email".
+#[derive(Debug, Clone)]
+pub struct RenderingFailure {
+    /// `failure.templateName`: the template the message was to be rendered from, for a send
+    /// that named a stored one. Content a request carries inline belongs to no named
+    /// template, so such a send names none here either.
+    pub template_name: Option<String>,
+    /// `failure.errorMessage`: what stopped the render, worded as this service words that
+    /// condition ([`crate::state::template_rendering::missing_rendering_attribute`]).
+    pub error_message: String,
+}
+
 /// One notification: the event type a destination has to match for it, and the document
 /// published to the destination.
 #[derive(Debug, Clone)]
@@ -137,8 +165,12 @@ pub struct PublishedSend {
     pub destinations: Vec<crate::state::EventDestinationRecord>,
     /// The message, as the outbound log holds it.
     pub message: crate::state::SentMessage,
-    /// What each recipient did with the message.
+    /// What each recipient did with the message. A message nothing was rendered for was
+    /// handed to no recipient at all, so it has no outcome here.
     pub outcomes: Vec<RecipientOutcome>,
+    /// The render that produced no message for this send, for a templated send whose values
+    /// did not go with its template.
+    pub rendering_failure: Option<RenderingFailure>,
     /// The CloudWatch store a destination that counts events appends its datapoints to
     /// ([`super::cloudwatch`]), or `None` when this emulator carries no CloudWatch at all.
     pub metric_store: Option<::engine::ServiceState<super::cloudwatch::CloudWatchState>>,
@@ -155,6 +187,7 @@ impl ::std::fmt::Debug for PublishedSend {
             .field("destinations", &self.destinations)
             .field("message", &self.message)
             .field("outcomes", &self.outcomes)
+            .field("rendering_failure", &self.rendering_failure)
             .field("counts_events", &self.metric_store.is_some())
             .finish()
     }
@@ -239,7 +272,8 @@ impl PublishedSend {
     }
 
     /// Every notification this send produced, in the order the events happened: the
-    /// message was accepted first, and then each recipient did what it did with it.
+    /// message was accepted first, then — for a send nothing was rendered for — the render
+    /// that produced no message, and then each recipient did what it did with it.
     ///
     /// Recipients that did the SAME thing are reported together, the way a notification
     /// lists the recipients it is about: one `Bounce` per distinct failure, one `Delivery`
@@ -256,6 +290,29 @@ impl PublishedSend {
             detail_type: SEND.2,
             document: document(SEND.1, &mail, "send", json!({})),
         }];
+
+        // A send nothing was rendered for: the message was ACCEPTED (the acceptance above)
+        // and then no message existed to hand on, which is the only signal the sender gets
+        // that its template and its values did not go together. The document names the
+        // template the send was to render and what stopped the render.
+        if let Some(failure) = &self.rendering_failure {
+            let mut reported = Map::new();
+            if let Some(template_name) = &failure.template_name {
+                reported.insert("templateName".to_string(), json!(template_name));
+            }
+            reported.insert("errorMessage".to_string(), json!(failure.error_message));
+            notifications.push(Notification {
+                event_type: RENDERING_FAILURE.0,
+                metric_name: RENDERING_FAILURE.1,
+                detail_type: RENDERING_FAILURE.2,
+                document: document(
+                    RENDERING_FAILURE.1,
+                    &mail,
+                    "failure",
+                    Value::Object(reported),
+                ),
+            });
+        }
 
         // One notification per distinct failure, in the order the recipients were
         // addressed, so a message with recipients that failed differently reports each

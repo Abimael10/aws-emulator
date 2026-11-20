@@ -201,7 +201,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // preview. The sentence names the attribute as the template wrote it.
             Err(crate::state::template_language::EvaluationFailure::MissingAttribute(
                 attribute,
-            )) => return Err(bad_request(missing_rendering_attribute(&attribute))),
+            )) => {
+                return Err(bad_request(
+                    crate::state::template_rendering::missing_rendering_attribute(&attribute),
+                ))
+            }
             // A stored template whose text the language does not accept renders no
             // message for this data or for any other.
             Err(crate::state::template_language::EvaluationFailure::NotAValidTemplate(reason)) => {
@@ -306,16 +310,6 @@ const INVALID_TEMPLATE_DATA: &str = "The template data is not a valid JSON objec
 /// ([`crate::state::template_language::MAX_RENDERS_IN_FLIGHT`]) is taken by a render
 /// already under way.
 const TOO_MANY_RENDERS: &str = "Too many requests have been made to the operation.";
-
-/// How this surface words the refusal of a render whose data states no value for an
-/// attribute the template names.
-///
-/// The sentence this condition is RECORDED answering with on the classic surface of the
-/// same template store: the fixed text "Attribute '" … "' is not present in the rendering
-/// data." around the attribute's own name as the template wrote it.
-fn missing_rendering_attribute(attribute: &str) -> String {
-    format!("Attribute '{attribute}' is not present in the rendering data.")
-}
 
 /// The line ending the document's structural lines use: RFC 5322 section 2.1 terminates
 /// each line of a message with CRLF. A body part's OWN text is written as the template

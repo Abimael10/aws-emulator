@@ -15,6 +15,11 @@
 //! own receive path, which is what the active receipt rule set does with a message
 //! addressed to a recipient the account holds an identity for
 //! ([`::service_com_amazonaws_ses_simpleemailservice::state::inbound_delivery`]).
+//! A TEMPLATED message whose values state nothing for a variable its template names
+//! renders no message at all: the send is still accepted with its own `MessageId`, no
+//! recipient is handed anything, and the render that produced nothing is what the
+//! configuration set's event destinations are told about
+//! ([`crate::state::event_publication::notification::RenderingFailure`]).
 //! This is the ONLY file to touch for this
 //! operation.
 //!
@@ -416,10 +421,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so a sender that failed that check learns nothing about which templates the
         // account holds. Every other form carries its parts in the request itself, and they
         // are already composed.
-        let parts = match carried {
+        let mut parts = match carried {
             RequestContent::Composed(parts) => parts,
             RequestContent::Templated(templated) => templated_parts(templated, &store)?,
         };
+        // A templated message whose values did not go with its template rendered NOTHING,
+        // which is not a refusal of the send: the message is accepted and answered with its
+        // own `MessageId`, nothing is handed to any recipient, and the render that produced
+        // no message is published as an event of it below.
+        let rendering_failure = parts.rendering_failure.take();
 
         // The account's 24-hour sending quota, measured over the window rather
         // than over all time: `settle` above recomputed the counter from the log, so
@@ -444,10 +454,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and for every other form the one Amazon SES assembles from the parts the
         // request sent ("you specify the sender, the recipient, and the message body, and
         // Amazon SES assembles the message for you"). Composed by the ONE composer of the
-        // account's email service rather than by a second one here.
-        let delivered = match input.content.raw.as_ref() {
-            Some(raw) => raw.data.clone(),
-            None => crate::state::account_receiving::assembled_message(
+        // account's email service rather than by a second one here. A send nothing was
+        // rendered for has no document at all: no message was composed, so there is none to
+        // hand on.
+        let delivered = match (&rendering_failure, input.content.raw.as_ref()) {
+            (Some(_), _) => None,
+            (None, Some(raw)) => Some(raw.data.clone()),
+            (None, None) => Some(crate::state::account_receiving::assembled_message(
                 &crate::state::account_receiving::AssembledParts {
                     region: &region,
                     message_id: &message_id,
@@ -461,7 +474,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     html: parts.html.as_deref(),
                     composed_at: now,
                 },
-            ),
+            )),
         };
         let sender = from.clone();
         let message = SentMessage {
@@ -538,8 +551,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What each recipient does with the message, and what the account's suppression
         // list gains from that: the list decides the outcome of a recipient already on it
         // and a recipient's own outcome writes the list, so both are resolved here, in
-        // one pass, under the lock the send holds.
-        let outcomes = event_publication::outcome::outcomes(&mut store, &published, now);
+        // one pass, under the lock the send holds. A message nothing was rendered for was
+        // handed to no recipient, so no recipient did anything with it and the list learns
+        // nothing from it.
+        let outcomes = match &rendering_failure {
+            Some(_) => Vec::new(),
+            None => event_publication::outcome::outcomes(&mut store, &published, now),
+        };
         // Where the events of this send are published: the destinations of the set the
         // message named, read under the same lock.
         let destinations = published
@@ -556,6 +574,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             destinations,
             message: published,
             outcomes,
+            rendering_failure,
             // A destination that COUNTS the events of this send appends its datapoints to
             // the CloudWatch store in this same engine, which is the store CloudWatch's
             // own reads answer from.
@@ -573,18 +592,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // in the classic surface's store, so the accepted message is handed to that receive
         // path rather than a second copy of it being kept here. Behind the acceptance, with
         // no lock of this service held, and with nothing this call answers depending on it.
-        received_by_the_account(
-            &*self.engine,
-            ctx,
-            &crate::state::account_receiving::AcceptedSend {
-                region: &region,
-                message_id: &message_id,
-                sender: &sender,
-                recipients: &addressed,
-                message: &delivered,
-                accepted_at: now,
-            },
-        );
+        // A send nothing was rendered for hands on nothing: there is no message to receive.
+        if let Some(delivered) = &delivered {
+            received_by_the_account(
+                &*self.engine,
+                ctx,
+                &crate::state::account_receiving::AcceptedSend {
+                    region: &region,
+                    message_id: &message_id,
+                    sender: &sender,
+                    recipients: &addressed,
+                    message: delivered,
+                    accepted_at: now,
+                },
+            );
+        }
 
         Ok(SendEmailOutput {
             message_id: Some(message_id),
@@ -642,6 +664,10 @@ struct MessageParts {
     /// added to the email message", which a simple and a templated message carry as their
     /// own member and a raw message writes inside the MIME document itself.
     headers: Vec<(String, String)>,
+    /// The render that produced NO message, for a templated message whose data states no
+    /// value for a variable its template names: there are no parts then, and the send is
+    /// still accepted (`event_publication::notification::RenderingFailure`).
+    rendering_failure: Option<event_publication::notification::RenderingFailure>,
 }
 
 /// Which form carries the message, or the refusal for content that names no single one.
@@ -722,6 +748,17 @@ enum TemplateSelector {
     Inline(EmailTemplateContent),
 }
 
+impl TemplateSelector {
+    /// The name of the template this selects, or `None` for content the request carries
+    /// inline: such content belongs to no named template, so nothing names it.
+    fn template_name(&self) -> Option<&str> {
+        match self {
+            Self::Stored(name) => Some(name),
+            Self::Inline(_) => None,
+        }
+    }
+}
+
 /// The part of the message `content` carries in `form` that the request settles on its own.
 ///
 /// Reads no state: a simple or raw message is composed here in full, and a templated message
@@ -764,6 +801,8 @@ fn request_content(
                     .into_iter()
                     .map(|header| (header.name, header.value))
                     .collect(),
+                // Nothing was rendered for this message: its parts are the request's own.
+                rendering_failure: None,
             }))
         }
         // A raw message is already a MIME document: it is recorded as sent (up to
@@ -774,6 +813,7 @@ fn request_content(
             body: Some(String::from_utf8_lossy(&raw.data).into_owned()),
             html: None,
             headers: Vec::new(),
+            rendering_failure: None,
         })),
         (ContentForm::Templated, _, _, Some(template)) => {
             // "An object that defines the values to use for message variables in the
@@ -821,6 +861,10 @@ fn request_content(
 /// simple substitions" — through the ONE renderer of this service
 /// ([`crate::state::template_rendering`]), which is the same one a bulk send composes each
 /// of its destinations with.
+///
+/// A render the values did not go with produces no parts and no refusal: the message is
+/// ACCEPTED, and what stopped the render is carried back as the send's
+/// [`event_publication::notification::RenderingFailure`] for the handler to publish.
 fn templated_parts(
     templated: TemplatedRequest,
     store: &crate::state::ComAmazonawsSesv2SimpleemailserviceV2State,
@@ -857,12 +901,34 @@ fn templated_parts(
                 crate::state::template_rendering::MAX_RENDERED_PART_BYTES
             )));
         }
+        Err(crate::state::template_rendering::RenderRefusal::MissingAttribute(attribute)) => {
+            // The values the send states do not go with the template it names: nothing was
+            // rendered, and SES had already accepted the message by then, so the send keeps
+            // its `MessageId` and the failure is reported only as an event of it.
+            return Ok(MessageParts {
+                subject: None,
+                body: None,
+                html: None,
+                headers: templated.headers,
+                rendering_failure: Some(event_publication::notification::RenderingFailure {
+                    template_name: templated
+                        .selector
+                        .template_name()
+                        .map(str::to_string),
+                    error_message:
+                        crate::state::template_rendering::missing_rendering_attribute(
+                            &attribute,
+                        ),
+                }),
+            });
+        }
     };
     Ok(MessageParts {
         subject: rendered.subject,
         body: rendered.text,
         html: rendered.html,
         headers: templated.headers,
+        rendering_failure: None,
     })
 }
 

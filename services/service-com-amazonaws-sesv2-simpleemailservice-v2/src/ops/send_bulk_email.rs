@@ -12,7 +12,12 @@
 //! entry's result reports, and each message's recipients then do with it what the
 //! account's suppression list and their own mailboxes decide — which is what the
 //! suppression list is written from and what the configuration set's event destinations
-//! are told about ([`crate::state::event_publication`]). An entry nothing could be sent
+//! are told about ([`crate::state::event_publication`]). A destination whose values state
+//! nothing for a variable the template names has no message rendered for it: that entry is
+//! still accepted with a `MessageId` of its own, nothing is handed to its recipients, and
+//! the render that produced nothing is what the set's event destinations are told about
+//! ([`crate::state::event_publication::notification::RenderingFailure`]). An entry nothing
+//! could be sent
 //! for carries the `BulkEmailStatus` of what stopped it instead of an id, and the other
 //! entries are sent: only a failure of the REQUEST (the template, the sender, the
 //! configuration set, the account's switches) refuses the whole call. This is the ONLY
@@ -458,43 +463,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 sent_at: now,
             };
             let message_id = sent.message_id.clone();
+            // The render that produced NO message for this destination: the entry is
+            // accepted like any other and keeps its own `MessageId`, and the failure is
+            // published as an event of that message below.
+            let rendering_failure = message.rendering_failure;
             // The RFC 5322 document this message IS, which is what the account's own receive
             // path saves when it is addressed to a recipient the account holds an identity
             // for: assembled from the rendered parts by the ONE composer of the account's
-            // email service.
-            let assembled = crate::state::account_receiving::assembled_message(
-                &crate::state::account_receiving::AssembledParts {
-                    region: &region,
-                    message_id: &message_id,
-                    from: &from,
-                    to: &sent.to,
-                    cc: &sent.cc,
-                    reply_to: &sent.reply_to,
-                    subject: sent.subject.as_deref(),
-                    headers: &sent.headers,
-                    text: sent.body.as_deref(),
-                    html: sent.body_html.as_deref(),
-                    composed_at: now,
-                },
-            );
-            received.push((
-                message_id.clone(),
-                sent.to
-                    .iter()
-                    .chain(&sent.cc)
-                    .chain(&sent.bcc)
-                    .cloned()
-                    .collect(),
-                assembled,
-            ));
+            // email service. A message nothing was rendered for has no document at all, so
+            // there is nothing to hand to that path.
+            if rendering_failure.is_none() {
+                let assembled = crate::state::account_receiving::assembled_message(
+                    &crate::state::account_receiving::AssembledParts {
+                        region: &region,
+                        message_id: &message_id,
+                        from: &from,
+                        to: &sent.to,
+                        cc: &sent.cc,
+                        reply_to: &sent.reply_to,
+                        subject: sent.subject.as_deref(),
+                        headers: &sent.headers,
+                        text: sent.body.as_deref(),
+                        html: sent.body_html.as_deref(),
+                        composed_at: now,
+                    },
+                );
+                received.push((
+                    message_id.clone(),
+                    sent.to
+                        .iter()
+                        .chain(&sent.cc)
+                        .chain(&sent.bcc)
+                        .cloned()
+                        .collect(),
+                    assembled,
+                ));
+            }
             // The copy kept here is what the events of this message are built from, so they
             // report it exactly as the log holds it even once the log has evicted it.
             let published = sent.clone();
             store.record_sent(sent);
             // What each recipient does with the message, and what the account's suppression
             // list gains from that: resolved under the lock the send holds, message by
-            // message, exactly as a single send resolves its own.
-            let outcomes = event_publication::outcome::outcomes(&mut store, &published, now);
+            // message, exactly as a single send resolves its own. A message nothing was
+            // rendered for was handed to no recipient, so none of them did anything with it.
+            let outcomes = match &rendering_failure {
+                Some(_) => Vec::new(),
+                None => event_publication::outcome::outcomes(&mut store, &published, now),
+            };
             let destinations = published
                 .configuration_set_name
                 .as_deref()
@@ -507,6 +523,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 destinations,
                 message: published,
                 outcomes,
+                rendering_failure,
                 // A destination that COUNTS this message's events appends its datapoints
                 // to the CloudWatch store in this same engine, which is the store
                 // CloudWatch's own reads answer from.
@@ -637,6 +654,10 @@ struct ComposedMessage {
     headers: Vec<(String, String)>,
     /// The tags this message's events carry.
     tags: Vec<(String, String)>,
+    /// The render that produced NO message for this destination, for values that state
+    /// nothing for a variable the template names: the message carries no part at all then,
+    /// and this is what its `RENDERING_FAILURE` event reports.
+    rendering_failure: Option<event_publication::notification::RenderingFailure>,
 }
 
 /// The template content a bulk send composes its messages from.
@@ -651,15 +672,7 @@ fn template_content(
     store: &crate::state::ComAmazonawsSesv2SimpleemailserviceV2State,
     template: &Template,
 ) -> Result<EmailTemplateContent, SendBulkEmailError> {
-    let named = template.template_name.clone().or_else(|| {
-        template
-            .template_arn
-            .as_deref()
-            .and_then(crate::state::ses_resource_of)
-            .filter(|(resource_type, _)| *resource_type == EMAIL_TEMPLATE_RESOURCE_TYPE)
-            .map(|(_, name)| name.to_string())
-    });
-    if let Some(name) = named {
+    if let Some(name) = template_name_of(template) {
         let Some(stored) = store.email_templates.get(&name) else {
             return Err(SendBulkEmailErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::email_template_not_found(&name)),
@@ -691,6 +704,20 @@ fn template_content(
 /// The resource type an email template's ARN addresses it by, as SES writes the resource
 /// field of one (`crate::state::ses_resource_of`).
 const EMAIL_TEMPLATE_RESOURCE_TYPE: &str = "template";
+
+/// The name of the STORED template `template` identifies, by `TemplateName` or by the
+/// `TemplateArn` that addresses the same template, or `None` for content the request carries
+/// inline — which belongs to no named template, so nothing names it.
+fn template_name_of(template: &Template) -> Option<String> {
+    template.template_name.clone().or_else(|| {
+        template
+            .template_arn
+            .as_deref()
+            .and_then(crate::state::ses_resource_of)
+            .filter(|(resource_type, _)| *resource_type == EMAIL_TEMPLATE_RESOURCE_TYPE)
+            .map(|(_, name)| name.to_string())
+    })
+}
 
 /// The message `entry` gets, or what stopped it.
 ///
@@ -771,8 +798,53 @@ fn compose(
                 ),
             })
         }
+        Err(crate::state::template_rendering::RenderRefusal::MissingAttribute(attribute)) => {
+            // The values THIS destination renders with state nothing for a variable the
+            // template names, so no message was rendered for it. That is not a failure of
+            // the entry: SES accepts the message either way, and the render that produced
+            // nothing is reported asynchronously as an event of it. The destination gets no
+            // part at all — nothing was rendered to give it.
+            return Ok(Composed::Ready(ComposedMessage {
+                to,
+                cc,
+                bcc,
+                subject: None,
+                text: None,
+                html: None,
+                headers: entry_headers(entry, template),
+                tags: entry_tags(entry, default_tags),
+                rendering_failure: Some(event_publication::notification::RenderingFailure {
+                    template_name: template_name_of(template),
+                    error_message:
+                        crate::state::template_rendering::missing_rendering_attribute(
+                            &attribute,
+                        ),
+                }),
+            }));
+        }
     };
 
+    Ok(Composed::Ready(ComposedMessage {
+        to,
+        cc,
+        bcc,
+        subject: rendered.subject,
+        text: rendered.text,
+        html: rendered.html,
+        headers: entry_headers(entry, template),
+        tags: entry_tags(entry, default_tags),
+        rendering_failure: None,
+    }))
+}
+
+/// The headers one entry's message carries: the template's, with the entry's applied over
+/// them.
+///
+/// The rule `BulkEmailEntry$ReplacementHeaders` documents, applied by the one place this
+/// service applies a header over another ([`crate::state::apply_message_headers`]) — which is
+/// also how a message's own headers apply over the envelope headers its events report — so a
+/// header is applied by the NAME it is rather than by the case it was written in.
+fn entry_headers(entry: &BulkEmailEntry, template: &Template) -> Vec<(String, String)> {
     let mut headers: Vec<(String, String)> = template
         .headers
         .clone()
@@ -780,10 +852,6 @@ fn compose(
         .into_iter()
         .map(|header| (header.name, header.value))
         .collect();
-    // The entry's headers apply OVER the template's, by the name each one is rather than by
-    // the case it was written in — the one place this service applies a header over another
-    // ([`crate::state::apply_message_headers`]), which is also how a message's own headers
-    // apply over the envelope headers its events report.
     crate::state::apply_message_headers(
         &mut headers,
         entry
@@ -793,25 +861,19 @@ fn compose(
             .into_iter()
             .map(|header| (header.name, header.value)),
     );
+    headers
+}
 
-    let tags: Vec<(String, String)> = entry
+/// The tags one entry's message carries: the entry's own when it states any, and the
+/// request's default ones otherwise.
+fn entry_tags(entry: &BulkEmailEntry, default_tags: &[MessageTag]) -> Vec<(String, String)> {
+    entry
         .replacement_tags
         .clone()
         .unwrap_or_else(|| default_tags.to_vec())
         .into_iter()
         .map(|tag| (tag.name, tag.value))
-        .collect();
-
-    Ok(Composed::Ready(ComposedMessage {
-        to,
-        cc,
-        bcc,
-        subject: rendered.subject,
-        text: rendered.text,
-        html: rendered.html,
-        headers,
-        tags,
-    }))
+        .collect()
 }
 
 /// Refuse the request with this operation's input error: "The input you provided is

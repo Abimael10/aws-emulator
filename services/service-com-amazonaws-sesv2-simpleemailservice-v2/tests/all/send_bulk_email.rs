@@ -15,7 +15,10 @@
 //!   its own. Each accepted entry answers a `MessageId` of its own.
 //! * `Template$TemplateData` is "a set of key-value pairs. Each key defines a message
 //!   variable in the template", so each `{{ name }}` the template writes is replaced by the
-//!   value the data gives that name and a name the data does not give renders as nothing.
+//!   value the data gives that name, and a name the data gives no value for renders no
+//!   message at all — the send is still accepted, which
+//!   `tests/all/templated_send_rendering_failure.rs` pins together with the event that
+//!   reports it.
 //! * `BulkEmailEntry$ReplacementHeaders`: a header the template defines and the entry does
 //!   not is added as the template wrote it, a header the entry defines "takes precedence
 //!   over any header of the same name specified in Template", and one the template does
@@ -657,8 +660,10 @@ struct EntryCase {
     case: &'static str,
     /// The entry, as the request carries it.
     entry: fn() -> Value,
-    /// The subject the template renders to for this entry.
-    subject: &'static str,
+    /// The subject the template renders to for this entry, or `None` when the values this
+    /// entry renders with state nothing for a variable the template names: nothing is
+    /// rendered then, and the accepted message carries no part at all.
+    subject: Option<&'static str>,
     /// The recipients the message is addressed to, in `To`, `Cc`, `Bcc` order.
     recipients: &'static [&'static str],
     /// The `EmailTags` the accepted message carries.
@@ -672,7 +677,7 @@ const ENTRY_CASES: &[EntryCase] = &[
     EntryCase {
         case: "an entry with nothing of its own",
         entry: || json!({"Destination": {"ToAddresses": ["plain@example.net"]}}),
-        subject: "Your receipt, Ada",
+        subject: Some("Your receipt, Ada"),
         recipients: &["plain@example.net"],
         tags: &[("campaign", "spring")],
     },
@@ -686,7 +691,7 @@ const ENTRY_CASES: &[EntryCase] = &[
                 }},
             })
         },
-        subject: "Your receipt, Grace",
+        subject: Some("Your receipt, Grace"),
         recipients: &["own-data@example.net"],
         tags: &[("campaign", "spring")],
     },
@@ -700,9 +705,11 @@ const ENTRY_CASES: &[EntryCase] = &[
                 }},
             })
         },
-        // The entry's own values REPLACE the request's default ones, so a variable neither
-        // of them names renders as nothing.
-        subject: "Your receipt, ",
+        // The entry's own values REPLACE the request's default ones, so the variables the
+        // template names have no value at all for this destination: nothing is rendered for
+        // it, the entry is still accepted, and the render that produced nothing is published
+        // as an event of its message (`tests/all/templated_send_rendering_failure.rs`).
+        subject: None,
         recipients: &["other-data@example.net"],
         tags: &[("campaign", "spring")],
     },
@@ -717,7 +724,7 @@ const ENTRY_CASES: &[EntryCase] = &[
                 },
             })
         },
-        subject: "Your receipt, Ada",
+        subject: Some("Your receipt, Ada"),
         recipients: &[
             "to-1@example.net",
             "to-2@example.net",
@@ -729,7 +736,7 @@ const ENTRY_CASES: &[EntryCase] = &[
     EntryCase {
         case: "an entry addressing Cc alone",
         entry: || json!({"Destination": {"CcAddresses": ["cc-only@example.net"]}}),
-        subject: "Your receipt, Ada",
+        subject: Some("Your receipt, Ada"),
         recipients: &["cc-only@example.net"],
         tags: &[("campaign", "spring")],
     },
@@ -742,7 +749,7 @@ const ENTRY_CASES: &[EntryCase] = &[
                                     {"Name": "segment", "Value": "new"}],
             })
         },
-        subject: "Your receipt, Ada",
+        subject: Some("Your receipt, Ada"),
         recipients: &["own-tags@example.net"],
         tags: &[("campaign", "autumn"), ("segment", "new")],
     },
@@ -754,7 +761,7 @@ const ENTRY_CASES: &[EntryCase] = &[
                 "ReplacementTags": [],
             })
         },
-        subject: "Your receipt, Ada",
+        subject: Some("Your receipt, Ada"),
         recipients: &["no-tags@example.net"],
         tags: &[],
     },
@@ -809,7 +816,7 @@ async fn every_entry_gets_a_message_of_its_own_composed_from_the_one_template() 
         );
         assert_eq!(
             read.text("/Subject"),
-            row.subject,
+            row.subject.unwrap_or_default(),
             "case {case:?}: expected the subject the template rendered for this entry, got {:?}",
             read.text("/Subject")
         );
@@ -871,15 +878,31 @@ async fn every_entry_gets_a_message_of_its_own_composed_from_the_one_template() 
         // The text part is rendered from the same template with the same values, and no
         // implemented operation reports a message's body.
         let logged = ses.logged(message_id);
-        let expected_text = row.subject.replace("Your receipt, ", "");
-        assert!(
-            logged
-                .body
-                .as_deref()
-                .is_some_and(|text| text.starts_with(&format!("Thanks {expected_text},"))),
-            "case {case:?}: expected the text part rendered with this entry's values, got {:?}",
-            logged.body
-        );
+        match row.subject {
+            Some(subject) => {
+                let expected_text = subject.replace("Your receipt, ", "");
+                assert!(
+                    logged
+                        .body
+                        .as_deref()
+                        .is_some_and(|text| text.starts_with(&format!("Thanks {expected_text},"))),
+                    "case {case:?}: expected the text part rendered with this entry's values, \
+                     got {:?}",
+                    logged.body
+                );
+            }
+            None => {
+                // Nothing was rendered for this entry, so its accepted message carries
+                // neither part — not an empty substitution of the variables it names.
+                assert!(
+                    logged.subject.is_none() && logged.body.is_none(),
+                    "case {case:?}: a message nothing was rendered for carries no part, got \
+                     subject {:?} and body {:?}",
+                    logged.subject,
+                    logged.body
+                );
+            }
+        }
     }
 
     // Every recipient of every accepted message is charged against the account's quota.
@@ -1007,102 +1030,108 @@ async fn an_entry_that_names_no_message_is_the_only_one_that_fails() {
 #[tokio::test]
 async fn the_values_a_send_states_are_substituted_into_the_template() {
     // (case, the template's subject line, the values stated for it, the subject the send
-    // must render). The rows span what a reference can be and what a value can be: a name
-    // the data states and one it does not, the same name twice, whitespace inside the
-    // braces, the unescaped spellings, a dotted path into the data, and each JSON scalar.
-    let cases: &[(&str, &str, &str, &str)] = &[
-        ("one name the data states", "Hi {{name}}", "{\"name\":\"Ada\"}", "Hi Ada"),
-        ("a name the data does not state", "Hi {{name}}", "{}", "Hi "),
+    // must render — `None` where the values state nothing for a variable the subject names,
+    // which renders no message at all). The rows span what a reference can be and what a
+    // value can be: a name the data states and one it does not, the same name twice,
+    // whitespace inside the braces, the unescaped spellings, a dotted path into the data,
+    // and each JSON scalar.
+    let cases: &[(&str, &str, &str, Option<&str>)] = &[
+        ("one name the data states", "Hi {{name}}", "{\"name\":\"Ada\"}", Some("Hi Ada")),
+        // Every name a part writes has to be one the data gives a value for, so a send whose
+        // data gives none renders nothing at all: the message is still accepted, and the
+        // render that produced nothing is published as an event of it
+        // (`tests/all/templated_send_rendering_failure.rs`).
+        ("a name the data does not state", "Hi {{name}}", "{}", None),
         (
             "the same name twice",
             "{{name}} and {{name}}",
             "{\"name\":\"Ada\"}",
-            "Ada and Ada",
+            Some("Ada and Ada"),
         ),
         (
             "whitespace inside the braces",
             "Hi {{ name }}",
             "{\"name\":\"Ada\"}",
-            "Hi Ada",
+            Some("Hi Ada"),
         ),
         (
             "the unescaped triple-brace spelling",
             "Hi {{{name}}}",
             "{\"name\":\"Ada & Grace\"}",
-            "Hi Ada & Grace",
+            Some("Hi Ada & Grace"),
         ),
         (
             "the unescaped ampersand spelling",
             "Hi {{&name}}",
             "{\"name\":\"Ada\"}",
-            "Hi Ada",
+            Some("Hi Ada"),
         ),
         (
             "a dotted path into the data",
             "Hi {{customer.first}} {{customer.last}}",
             "{\"customer\":{\"first\":\"Ada\",\"last\":\"Lovelace\"}}",
-            "Hi Ada Lovelace",
+            Some("Hi Ada Lovelace"),
         ),
         (
             "a dotted path the data stops short of",
             "Hi {{customer.first}}",
             "{\"customer\":{}}",
-            "Hi ",
+            None,
         ),
         (
             "a number",
             "You owe {{amount}}",
             "{\"amount\":42}",
-            "You owe 42",
+            Some("You owe 42"),
         ),
         (
             "a fractional number",
             "You owe {{amount}}",
             "{\"amount\":4.5}",
-            "You owe 4.5",
+            Some("You owe 4.5"),
         ),
         (
             "a boolean",
             "Subscribed: {{subscribed}}",
             "{\"subscribed\":true}",
-            "Subscribed: true",
+            Some("Subscribed: true"),
         ),
         (
-            "a null value, which states nothing",
+            "a null value, which is a value stated and written as nothing",
             "Hi {{name}}",
             "{\"name\":null}",
-            "Hi ",
+            Some("Hi "),
         ),
         (
             "a value that itself reads like a reference, substituted once",
             "Hi {{name}}",
             "{\"name\":\"{{name}}\"}",
-            "Hi {{name}}",
+            Some("Hi {{name}}"),
         ),
         (
             "text with no reference in it at all",
             "Your receipt",
             "{\"name\":\"Ada\"}",
-            "Your receipt",
+            Some("Your receipt"),
         ),
         // Truncated text is no reference at all, and is sent as the template wrote it.
         (
             "an unterminated reference",
             "Hi {{name",
             "{\"name\":\"Ada\"}",
-            "Hi {{name",
+            Some("Hi {{name"),
         ),
         (
             "an unterminated reference after one that closes",
             "Hi {{name}}, {{amount",
             "{\"name\":\"Ada\"}",
-            "Hi Ada, {{amount",
+            Some("Hi Ada, {{amount"),
         ),
         (
             "a closing brace pair with no opening one",
             "Hi name}}",
             "{\"name\":\"Ada\"}",
-            "Hi name}}",
+            Some("Hi name}}"),
         ),
     ];
 
@@ -1141,10 +1170,21 @@ async fn the_values_a_send_states_are_substituted_into_the_template() {
         let read = ses.insights(&results[0].1).await;
         assert_eq!(
             read.text("/Subject"),
-            *expected,
+            expected.unwrap_or_default(),
             "case {case:?}: expected the rendered subject, got {:?}",
             read.text("/Subject")
         );
+        if expected.is_none() {
+            // No message was rendered at all for this send, so the accepted message carries
+            // no subject — not one with the reference substituted by nothing.
+            let logged = ses.logged(&results[0].1);
+            assert!(
+                logged.subject.is_none(),
+                "case {case:?}: a message nothing was rendered for carries no subject, got \
+                 {:?}",
+                logged.subject
+            );
+        }
     }
 }
 
@@ -1556,14 +1596,17 @@ async fn a_template_the_request_carries_or_addresses_by_arn_composes_the_same_me
     let cases: &[(&str, Value, &str)] = &[
         (
             "the stored template by name",
-            json!({"TemplateName": TEMPLATE, "TemplateData": "{\"name\":\"Ada\"}"}),
+            json!({
+                "TemplateName": TEMPLATE,
+                "TemplateData": "{\"name\":\"Ada\",\"amount\":\"$5\"}",
+            }),
             "Your receipt, Ada",
         ),
         (
             "the stored template by ARN",
             json!({
                 "TemplateArn": format!("arn:aws:ses:{HOME}:{account_id}:template/{TEMPLATE}"),
-                "TemplateData": "{\"name\":\"Ada\"}",
+                "TemplateData": "{\"name\":\"Ada\",\"amount\":\"$5\"}",
             }),
             "Your receipt, Ada",
         ),
@@ -1622,10 +1665,12 @@ struct TemplatedCase {
     case: &'static str,
     /// The `EmailContent$Template` document the send carries.
     template: Value,
-    /// The subject line the template renders.
-    subject: &'static str,
+    /// The subject line the template renders, or `None` where the values the send states
+    /// give no value for a variable the template names: nothing is rendered then, and the
+    /// accepted message carries no part at all.
+    subject: Option<&'static str>,
     /// The text part it renders.
-    text: &'static str,
+    text: Option<&'static str>,
     /// The HTML part it renders, for a template that carries one.
     html: Option<&'static str>,
     /// The headers the template states, which are added to the message.
@@ -1636,8 +1681,10 @@ struct TemplatedCase {
 /// body parts with the message variables the request's `TemplateData` supplies substituted
 /// into them — the template being the stored one the request names by `TemplateName` or by the
 /// `TemplateArn` that addresses it, or the content the request carries inline — and a variable
-/// the data gives no value for renders as nothing. One send, one `MessageId`, composed through
-/// the same renderer the bulk send above composes each of its destinations with.
+/// the data gives no value for renders no message at all: the send is accepted, carries no
+/// part, and publishes the render that produced nothing as an event of its message
+/// (`tests/all/templated_send_rendering_failure.rs`). One send, one `MessageId`, composed
+/// through the same renderer the bulk send above composes each of its destinations with.
 ///
 /// The rows differ along what the rule generalises over: HOW the template is identified (name,
 /// ARN, inline content), which parts it carries (subject and text, subject with an HTML part
@@ -1660,8 +1707,8 @@ async fn a_templated_send_composes_its_message_from_the_template() {
                 "TemplateName": TEMPLATE,
                 "TemplateData": "{\"name\":\"Ada\",\"amount\":\"$7.00\"}",
             }),
-            subject: "Your receipt, Ada",
-            text: "Thanks Ada, you paid $7.00.",
+            subject: Some("Your receipt, Ada"),
+            text: Some("Thanks Ada, you paid $7.00."),
             html: None,
             headers: Vec::new(),
         },
@@ -1671,8 +1718,8 @@ async fn a_templated_send_composes_its_message_from_the_template() {
                 "TemplateArn": stored_arn,
                 "TemplateData": "{\"name\":\"Ada\",\"amount\":\"$7.00\"}",
             }),
-            subject: "Your receipt, Ada",
-            text: "Thanks Ada, you paid $7.00.",
+            subject: Some("Your receipt, Ada"),
+            text: Some("Thanks Ada, you paid $7.00."),
             html: None,
             headers: Vec::new(),
         },
@@ -1682,32 +1729,32 @@ async fn a_templated_send_composes_its_message_from_the_template() {
                 "TemplateContent": inline,
                 "TemplateData": "{\"name\":\"Ada\",\"amount\":\"$7.00\"}",
             }),
-            subject: "Welcome Ada",
-            text: "Hello Ada, you paid $7.00.",
+            subject: Some("Welcome Ada"),
+            text: Some("Hello Ada, you paid $7.00."),
             html: Some("<p>Hello Ada</p>"),
             headers: Vec::new(),
         },
         TemplatedCase {
-            case: "data that gives one of the two variables",
+            case: "data that gives one of the two variables, so the other renders nothing",
             template: json!({ "TemplateName": TEMPLATE, "TemplateData": "{\"name\":\"Ada\"}" }),
-            subject: "Your receipt, Ada",
-            text: "Thanks Ada, you paid .",
+            subject: None,
+            text: None,
             html: None,
             headers: Vec::new(),
         },
         TemplatedCase {
             case: "data that gives neither",
             template: json!({ "TemplateName": TEMPLATE, "TemplateData": "{}" }),
-            subject: "Your receipt, ",
-            text: "Thanks , you paid .",
+            subject: None,
+            text: None,
             html: None,
             headers: Vec::new(),
         },
         TemplatedCase {
-            case: "no TemplateData member at all, so every variable renders as nothing",
+            case: "no TemplateData member at all, so no variable has a value",
             template: json!({ "TemplateName": TEMPLATE }),
-            subject: "Your receipt, ",
-            text: "Thanks , you paid .",
+            subject: None,
+            text: None,
             html: None,
             headers: Vec::new(),
         },
@@ -1721,8 +1768,8 @@ async fn a_templated_send_composes_its_message_from_the_template() {
                     {"Name": "X-Audience", "Value": "subscribers"},
                 ],
             }),
-            subject: "Your receipt, Ada",
-            text: "Thanks Ada, you paid $7.00.",
+            subject: Some("Your receipt, Ada"),
+            text: Some("Thanks Ada, you paid $7.00."),
             html: None,
             headers: vec![
                 ("X-Campaign".to_string(), "spring".to_string()),
@@ -1761,13 +1808,13 @@ async fn a_templated_send_composes_its_message_from_the_template() {
         let logged = ses.logged(&message_id);
         assert_eq!(
             logged.subject.as_deref(),
-            Some(subject),
+            subject,
             "case {case:?}: expected the subject the template renders, got {:?}",
             logged.subject
         );
         assert_eq!(
             logged.body.as_deref(),
-            Some(text),
+            text,
             "case {case:?}: expected the text part the template renders, got {:?}",
             logged.body
         );
@@ -1786,7 +1833,7 @@ async fn a_templated_send_composes_its_message_from_the_template() {
         let read = ses.insights(&message_id).await;
         assert_eq!(
             read.text("/Subject"),
-            subject,
+            subject.unwrap_or_default(),
             "case {case:?}: expected the rendered subject to be reported, got {:?}",
             read.body
         );
