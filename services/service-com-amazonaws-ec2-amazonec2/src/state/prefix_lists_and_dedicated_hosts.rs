@@ -1563,8 +1563,12 @@ pub fn host_payload_bytes(host: &Host) -> usize {
 ///
 /// A host id is `h-` followed by 8 or 17 lowercase hexadecimal digits — the short and the
 /// long id form, as the model's own `^h-([0-9a-f]{8}|[0-9a-f]{17})$` style id patterns
-/// read. EC2 answers `InvalidHostID.Malformed` for anything else, BEFORE it looks the id
-/// up.
+/// read — and it is not the all-zero placeholder ([`id_is_not_the_null_id`]), which the mint
+/// counting from one can never produce and which the recorded refusal of
+/// `crate::ops::get_host_reservation_purchase_preview` answers the MALFORMED half for: a
+/// value in the printed form that no host could ever hold is not a host id to look up. EC2
+/// answers the malformed code for anything else too, BEFORE it looks the id up, which is a
+/// different answer from the not-found one a well-formed id no host has gets.
 pub fn host_id_is_well_formed(id: &str) -> bool {
     let Some(suffix) = id.strip_prefix("h-") else {
         return false;
@@ -1573,6 +1577,7 @@ pub fn host_id_is_well_formed(id: &str) -> bool {
         && suffix
             .bytes()
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        && id_is_not_the_null_id("h", id)
 }
 
 /// Refuse a request that named a host id the account holds no such host for: HTTP 400

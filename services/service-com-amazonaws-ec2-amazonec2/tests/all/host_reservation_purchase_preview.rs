@@ -15,9 +15,11 @@
 //!    not result in the offering being purchased" — no reservation id is reported, nothing is
 //!    stored, and two previews of one request answer the same prices;
 //! 3. "YOU MUST HAVE ACTIVE DEDICATED HOSTS IN YOUR ACCOUNT": every host id this operation
-//!    cannot resolve to a host the account holds — a value outside the host id form, one
-//!    inside it the account holds no host under, and one it has released — is refused
-//!    `InvalidHostId.Malformed`;
+//!    cannot resolve to a host the account holds is refused, and WHICH CHECK refused it is
+//!    what the code says — a value outside the host id form is refused for its shape
+//!    (`InvalidHostId.Malformed`), while an id EC2 could have issued that the account holds
+//!    no host under, or has released, reaches the existence check and is refused
+//!    `InvalidHostID.NotFound`;
 //! 4. THE CONFIGURATIONS MUST MATCH: an offering id no published offering carries, and one
 //!    for another instance family than the hosts', are each refused `InvalidParameterValue`.
 //! 5. THE RESERVATION COVERS A SET OF HOSTS: one host is priced ONCE however many times the
@@ -292,21 +294,52 @@ async fn a_host_the_account_does_not_hold_is_refused() {
     );
     let offering_id = published_offering(&router, "m5", "AllUpfront", 365 * 24 * 60 * 60).await;
 
-    // The rows differ in HOW the host id fails to name an active host of the account: a
-    // well-formed id nothing was allocated under, a host the account gave back, the short id
-    // form, another resource's prefix, and something that is not an id at all. Every one of
-    // them is refused the malformed half, this operation's own answer for an id it cannot
-    // resolve.
-    let rows: [(&str, Vec<&str>); 6] = [
-        ("a well-formed id nothing holds", vec![UNHELD_HOST_ID]),
-        ("a released host", vec![released.as_str()]),
-        ("a released host beside a held one", vec![held.as_str(), released.as_str()]),
-        ("the short id form", vec!["h-1234567"]),
-        ("another resource's prefix", vec!["i-0123456789abcdef0"]),
-        ("not an id at all", vec!["not-a-host"]),
+    // The rows differ in HOW the host id fails to name an active host of the account, and in
+    // which of the two checks therefore refuses it: a well-formed id nothing was allocated
+    // under and a host the account gave back are ids EC2 could have issued, so they reach the
+    // existence check; too few digits, another resource's prefix, something that is not an id
+    // at all and the all-zero placeholder no host can hold never could have been issued, so
+    // they are refused for their shape.
+    let rows: [(&str, Vec<&str>, &str); 8] = [
+        (
+            "a well-formed id nothing holds",
+            vec![UNHELD_HOST_ID],
+            "InvalidHostID.NotFound",
+        ),
+        (
+            "the short id form, nothing holds",
+            vec!["h-12345678"],
+            "InvalidHostID.NotFound",
+        ),
+        (
+            "a released host",
+            vec![released.as_str()],
+            "InvalidHostID.NotFound",
+        ),
+        (
+            "a released host beside a held one",
+            vec![held.as_str(), released.as_str()],
+            "InvalidHostID.NotFound",
+        ),
+        (
+            "a digit short of the id form",
+            vec!["h-1234567"],
+            "InvalidHostId.Malformed",
+        ),
+        (
+            "the all-zero placeholder",
+            vec!["h-00000000000000000"],
+            "InvalidHostId.Malformed",
+        ),
+        (
+            "another resource's prefix",
+            vec!["i-0123456789abcdef0"],
+            "InvalidHostId.Malformed",
+        ),
+        ("not an id at all", vec!["not-a-host"], "InvalidHostId.Malformed"),
     ];
 
-    for (case, host_ids) in rows {
+    for (case, host_ids, expected_code) in rows {
         let (status, body) = preview(&router, &host_ids, &offering_id).await;
         assert_eq!(
             status, 400,
@@ -314,8 +347,8 @@ async fn a_host_the_account_does_not_hold_is_refused() {
         );
         assert_eq!(
             error_code(&body),
-            "InvalidHostId.Malformed",
-            "case {case:?}: expected InvalidHostId.Malformed, got {body}"
+            expected_code,
+            "case {case:?}: expected {expected_code}, got {body}"
         );
     }
 
@@ -505,8 +538,8 @@ async fn an_id_list_past_the_ceiling_is_refused_for_its_length() {
     // refusal is the one for an id the account holds no host under, past it the one for the
     // list's length.
     let rows: [(&str, usize, &str); 3] = [
-        ("one id", 1, "InvalidHostId.Malformed"),
-        ("at the ceiling", MAX_RESOURCE_IDS, "InvalidHostId.Malformed"),
+        ("one id", 1, "InvalidHostID.NotFound"),
+        ("at the ceiling", MAX_RESOURCE_IDS, "InvalidHostID.NotFound"),
         (
             "one past the ceiling",
             MAX_RESOURCE_IDS + 1,

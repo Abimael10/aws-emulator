@@ -82,30 +82,58 @@ use crate::ops::describe_host_reservation_offerings::{
 };
 use crate::scaffolded::Scaffolded;
 use crate::state::{
-    MAX_RESOURCE_IDS, deduplicate_ids, host_id_is_well_formed,
+    INVALID_HOST_ID_NOT_FOUND, MAX_RESOURCE_IDS, deduplicate_ids, host_id_is_well_formed,
     host_instance_family, host_is_released, invalid_parameter_value, missing_parameter,
     require_service_state, unresolvable_host_ids_message,
 };
 
-/// `InvalidHostId.Malformed` (HTTP 400): the request named a Dedicated Host id this operation
-/// cannot resolve, so there is nothing to price a reservation for.
+/// The code THIS operation is recorded answering a value outside the Dedicated Host id form:
+/// `InvalidHostId.Malformed`.
 ///
-/// ONE code and ONE wording for both halves of an unresolvable id — a value that is not a
-/// host id at all, and one inside the host id form the account holds no host under — because
-/// the recorded contract for the purchase PREVIEW answers the malformed half for an id it
-/// cannot resolve: to this validator an id it never issued this account is not an id,
-/// whatever its shape. The same reading `crate::ops::move_capacity_reservation_instances` is
-/// recorded making of a Capacity Reservation id.
+/// A spelling of its own beside [`crate::state::INVALID_HOST_ID_MALFORMED`]'s
+/// `InvalidHostID.Malformed`, named here rather than written at the call site because which of
+/// the two an operation answers is a fact OF that operation: the Dedicated Host operations
+/// themselves answer the crate constant, while this preview's recorded refusal of the all-zero
+/// placeholder `h-0…0` carries this one, in the set sentence
+/// ([`unresolvable_host_ids_message`]). The same per-operation split
+/// `crate::ops::purchase_host_reservation` records for its own not-found half.
+const INVALID_HOST_ID_MALFORMED_IN_PREVIEW: &str = "InvalidHostId.Malformed";
+
+/// HTTP 400 [`INVALID_HOST_ID_MALFORMED_IN_PREVIEW`]: the request named a value outside the
+/// Dedicated Host id form, so there is no host id to look up and nothing to price a
+/// reservation for.
 ///
-/// The preview prices a reservation for the whole `HostIdSet`, so the sentence names that SET
-/// — the wording the recorded refusal carries, through the crate's one sentence for it
-/// ([`unresolvable_host_ids_message`]), which `crate::ops::purchase_host_reservation` answers
-/// for the same member. The CODE is this operation's own spelling:
-/// `crate::ops::purchase_host_reservation` is recorded answering `InvalidHostID.Malformed`
-/// for a value outside the id form, so each operation answers the one it was recorded with.
-fn host_ids_not_valid(host_id_set: &[String]) -> GetHostReservationPurchasePreviewError {
+/// The FORM half of an id this preview cannot resolve, which is a different answer from the
+/// existence half ([`hosts_not_found`]): a value EC2 could never have issued — one outside the
+/// published digit counts or alphabet, and the all-zero placeholder no host can hold
+/// ([`host_id_is_well_formed`]) — is refused for its shape, and that is all this refusal says.
+///
+/// The preview prices a reservation for the whole `HostIdSet`, so the sentence names that SET,
+/// through the crate's one sentence for a set of ids it could not resolve
+/// ([`unresolvable_host_ids_message`]) — which `crate::ops::purchase_host_reservation` answers
+/// for the same member.
+fn host_ids_malformed(host_id_set: &[String]) -> GetHostReservationPurchasePreviewError {
     Scaffolded::service_error(
-        "InvalidHostId.Malformed",
+        INVALID_HOST_ID_MALFORMED_IN_PREVIEW,
+        400,
+        unresolvable_host_ids_message(host_id_set.iter().map(String::as_str)),
+    )
+}
+
+/// `InvalidHostID.NotFound` (HTTP 400): every id the request named is a well-formed Dedicated
+/// Host id, and at least one of them names no host this account holds — one it never held, or
+/// one it has given back, whose id "can no longer be specified in another request"
+/// (`ReleaseHosts`).
+///
+/// The EXISTENCE half, reached only once the form check above has passed: a well-formed id EC2
+/// could have issued is resolved against the account's hosts, and an id that resolves to
+/// nothing is a host that is GONE rather than an input a caller mistyped — which is what this
+/// operation's recorded refusal of a released host answers, under the code EC2 publishes for
+/// it ([`INVALID_HOST_ID_NOT_FOUND`]). The sentence is the SET's, like the form half's, because
+/// the preview prices the whole `HostIdSet`.
+fn hosts_not_found(host_id_set: &[String]) -> GetHostReservationPurchasePreviewError {
+    Scaffolded::service_error(
+        INVALID_HOST_ID_NOT_FOUND,
         400,
         unresolvable_host_ids_message(host_id_set.iter().map(String::as_str)),
     )
@@ -201,15 +229,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
         // A value that is not a Dedicated Host id at all names no host in ANY account, so it
-        // is refused for its FORM before anything is looked up — with the same code and the
-        // same sentence an id the account holds no host under gets, since this operation's
-        // validator does not tell the two apart.
+        // is refused for its FORM — before anything is looked up, because there is no id to
+        // look up. An id EC2 could have issued is a different refusal, taken below.
         if input
             .host_id_set
             .iter()
             .any(|host_id| !host_id_is_well_formed(host_id))
         {
-            return Err(host_ids_not_valid(&input.host_id_set));
+            return Err(host_ids_malformed(&input.host_id_set));
         }
         let host_ids = deduplicate_ids(&input.host_id_set);
 
@@ -217,20 +244,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         // "You must have ACTIVE Dedicated Hosts in your account before you purchase a
-        // reservation": a host the account does not hold, and one it has given back — whose
-        // id "can no longer be specified in another request" (`ReleaseHosts`) — is not one a
-        // reservation can be priced for, and each is answered the same code and sentence a
-        // value outside the host id form gets ([`host_ids_not_valid`]). Asked BEFORE the
-        // offering is read, because a preview for a host that is not there cannot be priced
-        // whatever offering it names — which is the order this operation's recorded refusal
-        // shows.
+        // reservation": every id here is well formed, so it reaches the EXISTENCE check — a
+        // host the account does not hold, and one it has given back, whose id "can no longer
+        // be specified in another request" (`ReleaseHosts`), is not one a reservation can be
+        // priced for, and each is answered the not-found half rather than the form half, since
+        // the id itself is one EC2 could have issued. Asked BEFORE the offering is read,
+        // because a preview for a host that is not there cannot be priced whatever offering it
+        // names — which is the order this operation's recorded refusal shows.
         if host_ids.iter().any(|host_id| {
             store
                 .dedicated_hosts
                 .get(host_id.as_str())
                 .is_none_or(host_is_released)
         }) {
-            return Err(host_ids_not_valid(&input.host_id_set));
+            return Err(hosts_not_found(&input.host_id_set));
         }
 
         // "The offering ID of the reservation" (`$OfferingId`): an id no entry of the
