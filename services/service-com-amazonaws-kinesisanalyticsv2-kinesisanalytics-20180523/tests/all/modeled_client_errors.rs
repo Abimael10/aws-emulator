@@ -882,7 +882,7 @@ async fn a_parallelism_per_kpu_past_the_supported_value_is_refused() {
         });
         let expected_message = format!(
             "FlinkApplicationParallelismPerKPU provided for the application {name} should be \
-             a positive integer and should not be larger than the supported value of \
+             a positive integer and should not be larger than the supported limit \
              {SUPPORTED}"
         );
 

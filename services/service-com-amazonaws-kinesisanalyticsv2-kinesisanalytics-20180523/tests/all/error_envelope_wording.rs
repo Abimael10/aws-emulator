@@ -22,7 +22,10 @@
 //! * a value outside an enumerated type's set is refused with that set stated in
 //!   lexicographic order, whatever order the model declares its members in — except for a
 //!   shape whose own refusal of this service states it otherwise, which
-//!   `stated_enum_value_set.rs` owns.
+//!   `stated_enum_value_set.rs` owns;
+//! * a per-KPU parallelism past the one this service runs an application at states the
+//!   application the configuration was supplied for and the supported LIMIT, with the
+//!   ceiling stated directly after the word "limit".
 
 use serde_json::{json, Value};
 
@@ -30,6 +33,10 @@ use service_com_amazonaws_kinesisanalyticsv2_kinesisanalytics_20180523::ops::typ
     APPLICATION_MODE_VALUES, APPLICATION_RESTORE_TYPE_VALUES, CODE_CONTENT_TYPE_VALUES,
     URL_TYPE_VALUES,
 };
+// The ceiling the parallelism refusal states is the service's own supported per-KPU
+// parallelism, read from the one place the handlers bound the member by, so the sentence a
+// client reads and the predicate that produced it cannot state different numbers.
+use service_com_amazonaws_kinesisanalyticsv2_kinesisanalytics_20180523::state::MAX_PARALLELISM_PER_KPU;
 
 use super::harness::{
     call, create_body, create_startable, describe, error_code, error_message, router,
@@ -549,4 +556,118 @@ async fn an_enumerated_value_set_is_stated_in_lexicographic_order() {
         "case \"declaration order\": the set must not be stated as the model declares it, \
          got {actual:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A per-KPU parallelism past the one the service runs an application at
+// ---------------------------------------------------------------------------
+
+/// A `ParallelismPerKPU` past the value this service runs an application at is refused with
+/// HTTP 400 `InvalidArgumentException` worded as one sentence: it names the member, the
+/// application the configuration was supplied for — taken verbatim from the request — and
+/// the supported LIMIT, whose value follows the word "limit" directly.
+///
+/// The rows span both variable parts of the sentence at once — the `ApplicationName` space
+/// (len 1..128, `^[a-zA-Z0-9_.-]+$`) and the magnitudes a value past the supported ceiling
+/// takes: the first value past it, a value far past it, and the largest an `integer` carries
+/// — and each row is asserted on the create that SUPPLIES the configuration and on the
+/// update that REPLACES it, because one rule words both paths. Which values the service runs
+/// an application at, and that a refused call stores nothing, is the predicate's own rule,
+/// owned by `modeled_client_errors.rs`.
+#[tokio::test]
+async fn a_parallelism_per_kpu_past_the_ceiling_states_the_supported_limit() {
+    let longest = "p".repeat(128);
+    // (case, the application the configuration is supplied for, the value configured)
+    let rows: [(&str, &str, i32); 4] = [
+        (
+            "the shortest name, the first value past the ceiling",
+            "p",
+            MAX_PARALLELISM_PER_KPU + 1,
+        ),
+        (
+            "every admitted separator, a value far past the ceiling",
+            "par.probe_2-app",
+            4_096,
+        ),
+        (
+            "a digits-only name, the largest an integer carries",
+            "7",
+            i32::MAX,
+        ),
+        (
+            "the longest name, one past the ceiling",
+            longest.as_str(),
+            MAX_PARALLELISM_PER_KPU + 1,
+        ),
+    ];
+
+    for (case, name, per_kpu) in rows {
+        let router = router();
+        let expected = format!(
+            "FlinkApplicationParallelismPerKPU provided for the application {name} should be \
+             a positive integer and should not be larger than the supported limit \
+             {MAX_PARALLELISM_PER_KPU}"
+        );
+
+        let mut body = create_body(name, "FLINK-1_20");
+        body["ApplicationConfiguration"] = json!({
+            "FlinkApplicationConfiguration": {
+                "ParallelismConfiguration": {
+                    "ConfigurationType": "CUSTOM",
+                    "ParallelismPerKPU": per_kpu,
+                }
+            }
+        });
+        let (status, refused) = call(&router, "CreateApplication", &body).await;
+        assert_eq!(
+            (status, error_code(&refused).as_str()),
+            (400, "InvalidArgumentException"),
+            "case {case:?}: expected the create to be refused, got {status} {refused}"
+        );
+        let actual = error_message(&refused);
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: expected {expected:?}, got {actual:?}"
+        );
+
+        // The update that replaces the parallelism of a stored application states the same
+        // sentence, for the application the update names.
+        let (status, created) = call(
+            &router,
+            "CreateApplication",
+            &create_body(name, "FLINK-1_20"),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: CreateApplication got {status} {created}"
+        );
+        let (status, refused) = call(
+            &router,
+            "UpdateApplication",
+            &json!({
+                "ApplicationName": name,
+                "CurrentApplicationVersionId": 1,
+                "ApplicationConfigurationUpdate": {
+                    "FlinkApplicationConfigurationUpdate": {
+                        "ParallelismConfigurationUpdate": {
+                            "ConfigurationTypeUpdate": "CUSTOM",
+                            "ParallelismPerKPUUpdate": per_kpu,
+                        }
+                    }
+                },
+            }),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&refused).as_str()),
+            (400, "InvalidArgumentException"),
+            "case {case:?}: expected the update to be refused, got {status} {refused}"
+        );
+        let actual = error_message(&refused);
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: expected {expected:?}, got {actual:?}"
+        );
+    }
 }

@@ -2559,7 +2559,7 @@ pub const MAX_PARALLELISM_PER_KPU: i32 = 8;
 pub fn parallelism_per_kpu_message(application: &str) -> String {
     format!(
         "FlinkApplicationParallelismPerKPU provided for the application {application} should \
-         be a positive integer and should not be larger than the supported value of \
+         be a positive integer and should not be larger than the supported limit \
          {MAX_PARALLELISM_PER_KPU}"
     )
 }
