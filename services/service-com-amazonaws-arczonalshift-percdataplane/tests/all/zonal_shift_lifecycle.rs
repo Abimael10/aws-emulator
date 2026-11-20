@@ -938,31 +938,31 @@ async fn every_wire_value_this_service_writes_is_one_the_model_declares() {
 
 #[tokio::test]
 async fn the_operations_this_slice_leaves_unimplemented_still_answer_501() {
-    let (router, engine) = emulator();
-    let (resource, zones) = seeded(&engine)[0].clone();
-    // A practice run is a separate slice: it answers "not written yet", never an empty
-    // success.
-    let (status, body) = call(
-        &router,
-        "POST",
-        "/practiceruns",
-        &serde_json::json!({
-            "resourceIdentifier": resource,
-            "awayFrom": zones[0],
-            "comment": "not implemented yet",
-        })
-        .to_string(),
-    )
-    .await;
-    assert_eq!(
-        status, 501,
-        "StartPracticeRun is still a stub, got {status} {body}"
-    );
-    assert_eq!(
-        error_code(&body),
-        "NotImplemented",
-        "a stub answers NotImplemented, got {body}"
-    );
+    let (router, _engine) = emulator();
+    // The operations outside this slice answer "not written yet", never an empty
+    // success. Rows differ along the method and the shape of the request: a DELETE
+    // keyed by a URI label, and a GET with no member at all.
+    let cases: &[(&str, &str, &str, &str)] = &[
+        (
+            "CancelPracticeRun",
+            "DELETE",
+            "/practiceruns/zs-0000000001",
+            "",
+        ),
+        ("ListAutoshifts", "GET", "/autoshifts", ""),
+    ];
+    for (operation, method, uri, body) in cases {
+        let (status, answered) = call(&router, method, uri, body).await;
+        assert_eq!(
+            status, 501,
+            "case {operation}: it is still a stub, got {status} {answered}"
+        );
+        assert_eq!(
+            error_code(&answered),
+            "NotImplemented",
+            "case {operation}: a stub answers NotImplemented, got {answered}"
+        );
+    }
 }
 
 /// `ListZonalShifts` items for a query string.

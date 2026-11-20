@@ -10130,6 +10130,7 @@ dependencies = [
 name = "service-com-amazonaws-arczonalshift-percdataplane"
 version = "0.1.0"
 dependencies = [
+ "automod",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",
@@ -10145,6 +10146,7 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
  "service-common",
  "sha2 0.10.9",
  "tokio",

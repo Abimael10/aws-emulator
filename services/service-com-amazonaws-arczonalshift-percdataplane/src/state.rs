@@ -32,10 +32,25 @@ pub use published_resources::{managed_resource_registry, published_resources};
 mod practice_runs;
 
 pub use practice_runs::{
-    practice_run_configuration_deletion_conflict, requested_practice_run_configuration,
-    updated_practice_run_configuration, PracticeRunConfigurationRefused, AUTOSHIFT_ENABLED_MESSAGE,
-    AUTOSHIFT_ENABLED_REASON, PRACTICE_CONFIGURATION_EXISTS_MESSAGE,
+    names_the_day_of, practice_run_configuration_deletion_conflict,
+    practice_run_configuration_missing, requested_practice_run_configuration,
+    updated_practice_run_configuration, window_contains, PracticeRunConfigurationRefused,
+    AUTOSHIFT_ENABLED_MESSAGE, AUTOSHIFT_ENABLED_REASON, PRACTICE_CONFIGURATION_EXISTS_MESSAGE,
     PRACTICE_CONFIGURATION_MISSING_MESSAGE, PRACTICE_CONFIGURATION_MISSING_REASON,
+};
+
+/// The practice run zonal shift: how long one runs for, and what blocks one from
+/// starting.
+mod practice_run_shifts;
+
+pub use practice_run_shifts::{
+    alarms_in_alarm_state, practice_run_blocker, practice_run_expiry_time,
+    PRACTICE_BLOCKING_ALARMS_RED_MESSAGE, PRACTICE_BLOCKING_ALARMS_RED_REASON,
+    PRACTICE_IN_BLOCKED_DATES_MESSAGE, PRACTICE_IN_BLOCKED_DATES_REASON,
+    PRACTICE_IN_BLOCKED_WINDOWS_MESSAGE, PRACTICE_IN_BLOCKED_WINDOWS_REASON,
+    PRACTICE_OUTCOME_ALARMS_RED_MESSAGE, PRACTICE_OUTCOME_ALARMS_RED_REASON,
+    PRACTICE_OUTSIDE_ALLOWED_WINDOWS_MESSAGE, PRACTICE_OUTSIDE_ALLOWED_WINDOWS_REASON,
+    PRACTICE_RUN_DURATION, PRACTICE_RUN_EXPIRY_WINDOW,
 };
 
 /// The refusals every zonal-shift mutation answers, each worded once for the class it
@@ -440,14 +455,25 @@ impl ComAmazonawsArczonalshiftPercdataplaneState {
     /// From `ZonalShiftStatus`: "EXPIRED: The zonal shift has expired (the
     /// expiry time was exceeded)."
     ///
+    /// A PRACTICE RUN that has reached the expiry time it reported is not over:
+    /// its expiry stands one minute out and is renewed while its run goes on
+    /// ([`practice_run_shifts::renewed_practice_run_expiry`]), which is the other
+    /// change the clock owes a shift at this instant. Both are materialised here,
+    /// so every operation of this service sees one and the same answer to what the
+    /// clock has already done.
+    ///
     /// The sweep is over the whole map, which [`prune_completed_shifts`] keeps
     /// bounded, so the work one request does under the state lock is bounded too.
     ///
     /// [`prune_completed_shifts`]: Self::prune_completed_shifts
     pub fn expire_due_shifts(&mut self, now: SystemTime) {
         for shift in self.zonal_shifts.values_mut() {
-            if shift.status == ZonalShiftStatus::Active && shift.expiry_time <= now {
-                shift.status = ZonalShiftStatus::Expired;
+            if shift.status != ZonalShiftStatus::Active || shift.expiry_time > now {
+                continue;
+            }
+            match practice_run_shifts::renewed_practice_run_expiry(shift, now) {
+                Some(renewed) => shift.expiry_time = renewed,
+                None => shift.status = ZonalShiftStatus::Expired,
             }
         }
     }

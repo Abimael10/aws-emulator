@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartPracticeRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartPracticeRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartPracticeRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -108,6 +99,12 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{
+    active_zonal_shift_exists, alarms_in_alarm_state, invalid_availability_zone,
+    practice_run_blocker, practice_run_configuration_missing, practice_run_expiry_time, ShiftType,
+    ZonalShift, ZonalShiftStatus,
+};
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -182,18 +179,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartPracticeRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartPracticeRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartPracticeRun"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartPracticeRunError::from(StartPracticeRunErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the ARC zonal shift store is unavailable".to_string()),
+                },
+            ))
+        })?;
+        // The resources the services that own them have registered with ARC, read before
+        // this store is locked: a resource registered through one of them is as much a
+        // target of a practice run as one this store was seeded with.
+        let published = crate::state::published_resources(&*self.engine);
+
+        let now = SystemTime::now();
+        // What the run would be run against, resolved under THIS store's lock alone: the
+        // alarms the configuration watches belong to another service, and its store is
+        // read with this one released, so the two are never held at once.
+        let configuration = {
+            let mut store = state.lock();
+            // A shift whose expiry the clock has passed is EXPIRED, and a practice run
+            // whose expiry it has reached is renewed, whether or not anybody called — so
+            // the conflict check below sees the resource as it really is.
+            store.expire_due_shifts(now);
+
+            // The caller's authorization on the named target is decided BEFORE the
+            // target is resolved: a resourceIdentifier ARC holds nothing for is refused
+            // 403 AccessDeniedException, disclosing nothing about what exists. One
+            // helper takes this branch for every operation that acts on a target.
+            let resource = store
+                .authorized_resource(&published, &input.resource_identifier)
+                .map_err(StartPracticeRunErrorModeled::AccessDeniedException)?;
+
+            // Traffic can only be moved away from a zone the resource is deployed in.
+            // The refusal is the one sentence ARC states for the class, held with the
+            // others.
+            if !resource.availability_zones.contains(&input.away_from) {
+                return Err(StartPracticeRunErrorModeled::ValidationException(
+                    invalid_availability_zone(),
+                )
+                .into());
+            }
+
+            // A practice run is run against the resource's practice run configuration —
+            // the alarms that watch it and the windows it may run in — so a resource
+            // that has none is a conflict in the resource's current state.
+            let Some(configuration) = resource.practice_run_configuration else {
+                return Err(StartPracticeRunErrorModeled::ConflictException(
+                    practice_run_configuration_missing(),
+                )
+                .into());
+            };
+
+            // One practice run at a time per resource, the way one
+            // customer-initiated zonal shift is one at a time.
+            if let Some(existing) =
+                store.active_shift_of_type(&input.resource_identifier, ShiftType::PracticeRun)
+            {
+                return Err(StartPracticeRunErrorModeled::ConflictException(
+                    active_zonal_shift_exists(&existing.zonal_shift_id),
+                )
+                .into());
+            }
+            configuration
+        };
+
+        // The alarms the configuration watches, read out of the store that OWNS them
+        // with this service's own store released.
+        let red_alarms = alarms_in_alarm_state(&*self.engine, &configuration);
+        // Whether the configuration admits a run AT THIS INSTANT: a sounding alarm, a
+        // blocked date, a blocked window, or a time outside the allowed windows is each
+        // a conflict in the resource's current state, answered with the reason the model
+        // names for it.
+        if let Some(blocker) = practice_run_blocker(&configuration, now, &red_alarms) {
+            return Err(StartPracticeRunErrorModeled::ConflictException(blocker).into());
+        }
+
+        // The expiry a practice run reports: one minute out, renewed while the run goes
+        // on by the sweep above.
+        let Some(expiry_time) = practice_run_expiry_time(now) else {
+            return Err(StartPracticeRunErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the practice run expiry time is not representable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // The store was released while the alarms were read, so the conflict another
+        // caller could have created in between is checked once more: a resource still
+        // has at most one practice run in progress.
+        if let Some(existing) =
+            store.active_shift_of_type(&input.resource_identifier, ShiftType::PracticeRun)
+        {
+            return Err(StartPracticeRunErrorModeled::ConflictException(
+                active_zonal_shift_exists(&existing.zonal_shift_id),
+            )
+            .into());
+        }
+
+        let zonal_shift_id = store.next_zonal_shift_id();
+        let shift = ZonalShift {
+            zonal_shift_id: zonal_shift_id.clone(),
+            resource_identifier: input.resource_identifier,
+            away_from: input.away_from,
+            start_time: now,
+            expiry_time,
+            status: ZonalShiftStatus::Active,
+            comment: input.comment,
+            shift_type: ShiftType::PracticeRun,
+            // A practice run that has just started has reached no outcome yet.
+            practice_run_outcome: None,
+        };
+        store.zonal_shifts.insert(zonal_shift_id, shift.clone());
+        // This is one of the sites that adds a record, so it is where the store is
+        // bounded; a read never prunes.
+        store.prune_completed_shifts();
+
+        Ok(StartPracticeRunOutput {
+            zonal_shift_id: shift.zonal_shift_id,
+            resource_identifier: shift.resource_identifier,
+            away_from: shift.away_from,
+            expiry_time: crate::state::as_date_time(shift.expiry_time),
+            start_time: crate::state::as_date_time(shift.start_time),
+            status: shift.status.as_wire().to_string(),
+            comment: shift.comment,
+        })
     }
 }

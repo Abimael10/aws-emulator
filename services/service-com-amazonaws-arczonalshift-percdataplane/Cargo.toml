@@ -17,6 +17,11 @@ service-common = { path = "../common" }
 # written in (`blockedDates`, `allowedWindows`, `blockedWindows`), so a value of the
 # modelled shape that names no real date or clock time is refused.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+# A practice run is blocked while one of the Amazon CloudWatch alarms its practice run
+# configuration names is in the ALARM state, and those alarms live in the CloudWatch
+# emulator's own alarm store: their state is read through the shared engine, which needs
+# the owning service's state TYPE (`state::practice_run_shifts`).
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -37,6 +42,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Declares one suite module per `tests/all/<name>.rs` file, so the integration-test
+# target rooted at `tests/all/main.rs` needs no hand-written declaration list.
+automod = { workspace = true }
 
 [lints]
 workspace = true

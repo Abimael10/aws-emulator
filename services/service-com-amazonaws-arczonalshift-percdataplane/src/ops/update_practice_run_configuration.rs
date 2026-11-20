@@ -213,13 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resource that has none is a conflict in the resource's current state.
         let Some(held) = resource.practice_run_configuration.clone() else {
             return Err(UpdatePracticeRunConfigurationErrorModeled::ConflictException(
-                ConflictException {
-                    message: crate::state::PRACTICE_CONFIGURATION_MISSING_MESSAGE.to_string(),
-                    reason: crate::state::PRACTICE_CONFIGURATION_MISSING_REASON.to_string(),
-                    // The conflict is about the resource's configuration, not about a
-                    // shift, so there is no `zonalShiftId` to associate it with.
-                    zonal_shift_id: None,
-                },
+                crate::state::practice_run_configuration_missing(),
             )
             .into());
         };

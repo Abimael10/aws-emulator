@@ -33,7 +33,9 @@
 //!   asked for while zonal autoshift is enabled is a conflict in the resource's state
 //!   ([`practice_run_configuration_deletion_conflict`]).
 
-use chrono::{NaiveDate, NaiveTime};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, Utc, Weekday};
 
 use super::{
     ComAmazonawsArczonalshiftPercdataplaneState as ZonalShiftState, ManagedResource,
@@ -116,6 +118,23 @@ pub fn practice_run_configuration_deletion_conflict(
         // is no `zonalShiftId` to associate it with.
         zonal_shift_id: None,
     })
+}
+
+/// The refusal a caller gets for a call that NEEDS the practice run configuration the
+/// resource it names does not have: a change to one, and the start of a practice run
+/// that would be run against one.
+///
+/// One wording for the class, built where the configuration is kept, so the operations
+/// that require one cannot drift apart on what they answer.
+#[must_use]
+pub fn practice_run_configuration_missing() -> ConflictException {
+    ConflictException {
+        message: PRACTICE_CONFIGURATION_MISSING_MESSAGE.to_string(),
+        reason: PRACTICE_CONFIGURATION_MISSING_REASON.to_string(),
+        // The conflict is about the resource's configuration, not about a shift, so
+        // there is no `zonalShiftId` to associate it with.
+        zonal_shift_id: None,
+    }
 }
 
 /// Why a write of a practice run configuration is refused: the
@@ -218,6 +237,57 @@ pub fn updated_practice_run_configuration(
     )
 }
 
+/// Whether `date`, written the way a `blockedDates` entry is, names the calendar day
+/// (UTC) the instant `now` falls on.
+///
+/// The dates a configuration holds are read here, where the format they are written in
+/// is read ([`DATE_FORMAT`]), so the operation that refuses a date it cannot read and
+/// the one that asks whether today is one of them agree on what a date means. A value
+/// that names no day of a month — which a configuration this store holds cannot carry
+/// — names no day at all, so it is not today either.
+#[must_use]
+pub fn names_the_day_of(date: &str, now: SystemTime) -> bool {
+    let Ok(date) = NaiveDate::parse_from_str(date, DATE_FORMAT) else {
+        return false;
+    };
+    utc(now).is_some_and(|instant| instant.date_naive() == date)
+}
+
+/// Whether `window`, written the way an `allowedWindows` or `blockedWindows` entry is,
+/// covers the instant `now` falls on: the same day of the week (UTC), at or after the
+/// window's start and before its end.
+///
+/// One reading of a window for the whole service ([`parse_one_day_window`]), so the
+/// operations that refuse a window they cannot read and the one that asks whether a
+/// window covers an instant cannot drift apart on what a window means. The day is one
+/// of the seven the member's `@pattern` admits (`Mon`..`Sun`), and a window naming
+/// anything else covers no instant.
+#[must_use]
+pub fn window_contains(window: &str, now: SystemTime) -> bool {
+    let Some(window) = parse_one_day_window(window) else {
+        return false;
+    };
+    let Ok(day) = window.day.parse::<Weekday>() else {
+        return false;
+    };
+    utc(now).is_some_and(|instant| {
+        instant.weekday() == day
+            && instant.time() >= window.start
+            && instant.time() < window.end
+    })
+}
+
+/// The instant `now` as the calendar date and time of day (UTC) a window and a blocked
+/// date are written in; `None` for an instant outside the calendar's range, which no
+/// clock this emulator reads answers.
+fn utc(now: SystemTime) -> Option<DateTime<Utc>> {
+    let since_epoch = now.duration_since(UNIX_EPOCH).ok()?;
+    DateTime::from_timestamp(
+        i64::try_from(since_epoch.as_secs()).ok()?,
+        since_epoch.subsec_nanos(),
+    )
+}
+
 /// Refuse a window that is not one window of a single day.
 fn check_windows(
     member: &str,
@@ -246,24 +316,37 @@ fn check_windows(
 /// in, and a span of no length allows and blocks nothing.
 #[must_use]
 fn names_one_day_window(window: &str) -> bool {
-    let Some((start, end)) = window.split_once('-') else {
-        return false;
-    };
-    let (Some((start_day, start_time)), Some((end_day, end_time))) =
-        (start.split_once(':'), end.split_once(':'))
-    else {
-        return false;
-    };
+    parse_one_day_window(window).is_some()
+}
+
+/// The one window of a single day a window entry names: the day of the week it is
+/// written for, and the times of day it starts and ends at.
+#[derive(Debug)]
+struct DayWindow {
+    /// The day of the week, as the entry writes it (`Mon`..`Sun`).
+    day: String,
+    start: NaiveTime,
+    end: NaiveTime,
+}
+
+/// The window `window` names, or `None` when it is not one window of a single day: the
+/// ONE reading of the `DAY:HH:MM-DAY:HH:MM` format, which both the write of a
+/// configuration ([`names_one_day_window`]) and the start of a practice run
+/// ([`window_contains`]) go through.
+fn parse_one_day_window(window: &str) -> Option<DayWindow> {
+    let (start, end) = window.split_once('-')?;
+    let (start_day, start_time) = start.split_once(':')?;
+    let (end_day, end_time) = end.split_once(':')?;
     if start_day != end_day {
-        return false;
+        return None;
     }
-    let (Ok(start_time), Ok(end_time)) = (
-        NaiveTime::parse_from_str(start_time, WINDOW_TIME_FORMAT),
-        NaiveTime::parse_from_str(end_time, WINDOW_TIME_FORMAT),
-    ) else {
-        return false;
-    };
-    end_time > start_time
+    let start = NaiveTime::parse_from_str(start_time, WINDOW_TIME_FORMAT).ok()?;
+    let end = NaiveTime::parse_from_str(end_time, WINDOW_TIME_FORMAT).ok()?;
+    (end > start).then(|| DayWindow {
+        day: start_day.to_string(),
+        start,
+        end,
+    })
 }
 
 impl ZonalShiftState {
