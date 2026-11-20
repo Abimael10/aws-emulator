@@ -469,6 +469,25 @@ async fn every_class_is_keyed_by_the_plane_that_answered() {
     let (min, max) = MAX_RESULTS_RANGE;
     let over_long_key = "k".repeat(129);
 
+    // `DeleteDomain`'s modelled 404 is what an id this service ALLOCATED and no longer
+    // holds earns; an id with no allocation history is refused by the front door's own
+    // authorizer instead, ahead of the lookup (pinned in
+    // `tests/all/recorded_refusal_and_create_members.rs`). So the mutation row below
+    // addresses a domain created and deleted here.
+    let purged_domain = string_at(
+        &emulator
+            .create_domain(&json!({ "name": "clinic-purged" }))
+            .await,
+        "domainId",
+    );
+    let (status, deleted) = emulator
+        .send("DELETE", &format!("/domain/{purged_domain}"), None)
+        .await;
+    assert_eq!(
+        status, 200,
+        "DeleteDomain of a live domain got {status} with {deleted}"
+    );
+
     let rows: Vec<Rendered> = vec![
         Rendered {
             case: "GetSubscription of an absent subscription (a reader)".to_string(),
@@ -516,9 +535,9 @@ async fn every_class_is_keyed_by_the_plane_that_answered() {
             member: MODEL_MEMBER_DETAIL,
         },
         Rendered {
-            case: "DeleteDomain of an absent domain (a mutation)".to_string(),
+            case: "DeleteDomain of a domain that is gone (a mutation)".to_string(),
             method: "DELETE",
-            path: format!("/domain/{absent_domain}"),
+            path: format!("/domain/{purged_domain}"),
             body: None,
             status: 404,
             code: "ResourceNotFoundException",

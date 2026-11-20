@@ -38,8 +38,9 @@
 //!
 //! An implemented operation stops needing the 501, but the wrapper is also the only
 //! place it can return an error its own model does not declare — `validation` above,
-//! for a service whose model carries no client-input error. Delete the wrapper and the
-//! handler has no way to refuse a bad request at all.
+//! for a service whose model carries no client-input error, and `unmodeled` for a code
+//! this service answers that its model declares on no shape at all. Delete the wrapper
+//! and the handler has no way to refuse a bad request at all.
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
@@ -180,6 +181,84 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The detail member of the synthetic shape behind [`Scaffolded::Unmodeled`], keyed as the
+/// two synthetic members above are keyed and for the same reason.
+static UNMODELED_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#UnmodeledError$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic shape behind [`Scaffolded::Unmodeled`].
+///
+/// In the `smithy.framework` namespace for the same reason as the two above: the shape is
+/// in no service's model, so it must not collide with a modeled one. ONE schema serves
+/// every such code, because the wire error code comes from [`OperationError::shape_name`]
+/// (the `__type` / `x-amzn-errortype` value) rather than from this schema's shape id, and
+/// the body carries only the detail member every error shape of this service carries.
+pub static UNMODELED_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#UnmodeledError",
+        "smithy.framework",
+        "UnmodeledError",
+    ),
+    ShapeType::Structure,
+    &[&UNMODELED_MESSAGE],
+);
+
+/// A failure the emulated SERVICE answers that its Smithy model declares on no shape.
+///
+/// Real services answer error codes their published model never mentions, and a client
+/// branches on the code and the status, so both are carried here verbatim rather than
+/// being folded into a modeled variant that would put a different code on the wire. Use it
+/// ONLY for a code this service is known to answer; a modeled error stays modeled
+/// ([`Scaffolded::Modeled`]), and a shape the SERVICE models that one OPERATION does not
+/// list is widened in with `#[operation_error]`'s `extra_errors` instead.
+#[derive(Debug, Clone)]
+pub struct UnmodeledError {
+    /// The wire error code (`__type`, and the `x-amzn-errortype` header).
+    pub code: &'static str,
+    /// The HTTP status the service answers it with.
+    pub status: u16,
+    /// The detail text, or `None` for a refusal that carries NO detail at all.
+    ///
+    /// `None` is not the same as empty text, and the difference is what reaches a client:
+    /// the member is written as an explicit null, so a client reading the detail member of
+    /// the body is given nothing rather than an empty string.
+    pub message: Option<String>,
+}
+
+impl std::fmt::Display for UnmodeledError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.code)?;
+        if let Some(message) = &self.message {
+            write!(f, ": {message}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for UnmodeledError {}
+
+impl SerializableStruct for UnmodeledError {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        match self.message.as_deref() {
+            Some(message) => s.write_string(&UNMODELED_MESSAGE, message)?,
+            // The member is still written, as an explicit null: a refusal that carries no
+            // detail says so on the wire, which is what tells a client "there is no detail
+            // here" from "the detail is the empty string".
+            None => s.write_null(&UNMODELED_MESSAGE)?,
+        }
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -199,6 +278,10 @@ pub enum Scaffolded<E> {
     /// `MalformedQueryString` rather than `ValidationException`, so a client
     /// matching on the error code there sees two codes for one logical failure.
     ValidationException(ValidationException),
+    /// An error code the emulated service answers that its model declares on no shape.
+    /// Renders with the code and the HTTP status the service answers. See
+    /// [`UnmodeledError`].
+    Unmodeled(UnmodeledError),
 }
 
 impl<E> Scaffolded<E> {
@@ -224,6 +307,21 @@ impl<E> Scaffolded<E> {
     pub fn validation(message: impl Into<String>) -> Self {
         Self::ValidationException(ValidationException::new(message))
     }
+
+    /// Answer an error code this service's model declares on no shape, with the HTTP
+    /// status the service answers it with and either a detail text or none at all.
+    ///
+    /// Prefer a modeled error whenever the operation declares one that fits: a client
+    /// reads the model. Reach for this only where the service demonstrably answers a code
+    /// the model does not carry (see [`UnmodeledError`]), and NEVER for "not written yet",
+    /// which is [`Scaffolded::not_implemented`].
+    pub fn unmodeled(code: &'static str, status: u16, message: Option<String>) -> Self {
+        Self::Unmodeled(UnmodeledError {
+            code,
+            status,
+            message,
+        })
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -232,6 +330,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
+            Self::Unmodeled(e) => write!(f, "{e}"),
         }
     }
 }
@@ -244,6 +343,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
+            Self::Unmodeled(e) => e.source(),
         }
     }
 }
@@ -258,6 +358,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
+            Self::Unmodeled(e) => e,
         }
     }
 
@@ -266,6 +367,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
+            Self::Unmodeled(_) => &UNMODELED_SCHEMA,
         }
     }
 
@@ -278,6 +380,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
+            // The code the service answers, carried on the error itself.
+            Self::Unmodeled(e) => e.code,
         }
     }
 
@@ -290,6 +394,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
             Self::ValidationException(_) => 400,
+            Self::Unmodeled(e) => e.status,
         }
     }
 
@@ -302,6 +407,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.query_error_code(),
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
+            Self::Unmodeled(_) => None,
         }
     }
 }

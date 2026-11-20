@@ -3,8 +3,10 @@
 //! @op DeleteDomain
 //! IMPLEMENTED: moves the PERSISTED domain into `DELETING` and records when the purge
 //! the clock then owes falls due; the stored record is what the response reports.
-//! Repeating the call is harmless (`@idempotent`). A `domainId` this service resolves no
-//! domain for is the modelled 404 `ResourceNotFoundException`.
+//! Repeating the call is harmless (`@idempotent`). A `domainId` this service MINTED but
+//! resolves no domain for is the modelled 404 `ResourceNotFoundException`; one it never
+//! minted is refused by the front door's authorizer ahead of that lookup
+//! ([`crate::service::authorizer_refusal`]).
 //!
 //! ## Shape of an operation
 //!
@@ -69,6 +71,11 @@
 //!   below): this SERVICE models the shape, this operation's own `errors` list does not
 //!   name it, and it is the channel for the one server-side failure this handler can
 //!   meet — a store it cannot reach ([`crate::state::store_unreachable`]).
+//! * `AuthorizerConfigurationException` — RECORDED, and declared on no shape of this
+//!   model: the refusal the front door's authorizer raises for a `domainId` with no
+//!   allocation history, carrying no detail member value at all. Answered through the
+//!   unmodelled channel of this operation's error type
+//!   ([`crate::service::authorizer_refusal`]).
 //!
 //! ## Beside the model
 //!
@@ -201,16 +208,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The one preamble every handler shares: everything the CLOCK already made due.
         store.materialise_due(now);
 
+        // Whether this service ever minted the requested id, read BEFORE the lookup below
+        // borrows the store mutably. It is what tells the two refusals of an unresolvable
+        // id apart (see the else-arm), and it is consulted ONLY when no domain is held:
+        // the allocation history is bounded ([`crate::state::MAX_DOMAIN_ALLOCATION_HISTORY`]),
+        // so a long-lived store may have forgotten the id of a domain it still holds, and
+        // a held domain is resolved by the record itself.
+        let ever_allocated = store.has_allocated_domain(&input.domain_id);
+
         let Some(domain) = store.held_domain_mut(&region, &input.domain_id) else {
-            // `DeleteDomain` models ONE error, `ResourceNotFoundException` at 404
-            // (`smithy_query(query="operation", operation="DeleteDomain")`), and that is
-            // what a `domainId` this Region resolves no domain for is answered with —
-            // whether the id names a domain this service already purged, one that lives
-            // in another Region, or nothing it ever minted. The id the request addressed
-            // is what tells one 404 from another, so the sentence names it through the
-            // shared constructor. A permanent client-side condition is never a 5xx: an
-            // SDK retries a server fault, so the normal idempotent-cleanup path — delete
-            // a domain that is already gone — has to terminate in "already gone".
+            // An id this Region resolves no domain for takes one of TWO refusals, and
+            // which one is decided by the id's ALLOCATION HISTORY rather than by what is
+            // live now.
+            //
+            // RECORDED behaviour: an id with no allocation history anywhere resolves to no
+            // resource ARN at the edge, so the front door's authorizer refuses the call
+            // before the resource lookup ever runs — an unmodelled
+            // `AuthorizerConfigurationException` carrying no detail at all
+            // ([`crate::service::authorizer_refusal`]). A client that cannot tell that from
+            // "this domain is already gone" silently swallows a misconfigured or mistyped
+            // id in the teardown path that treats the latter as a benign no-op.
+            if !ever_allocated {
+                return Err(crate::service::authorizer_refusal::unresolvable_domain_id());
+            }
+            // An id this service DID mint names a domain that is simply gone — purged
+            // after an earlier delete, or held in another Region — and that is what
+            // `DeleteDomain` models ONE error for, `ResourceNotFoundException` at 404
+            // (`smithy_query(query="operation", operation="DeleteDomain")`). The id the
+            // request addressed is what tells one 404 from another, so the sentence names
+            // it through the shared constructor. A permanent client-side condition is never
+            // a 5xx: an SDK retries a server fault, so the normal idempotent-cleanup path —
+            // delete a domain that is already gone — has to terminate in "already gone".
             return Err(DeleteDomainErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::service::error_detail::domain_not_found_message(

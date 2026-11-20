@@ -1090,8 +1090,10 @@ impl ComAmazonawsConnecthealthConnecthealthState {
     /// Whether `domain_id` was ever allocated to a domain this service created.
     ///
     /// Read by [`Self::mint_domain_id`], so an id it hands out names no domain this
-    /// service ever created, not even one already purged.
-    fn has_allocated_domain(&self, domain_id: &str) -> bool {
+    /// service ever created, not even one already purged — and by the one operation whose
+    /// answer DEPENDS on an id's allocation history rather than on what is held now
+    /// (`DeleteDomain`), which cites the recording for each of its two branches.
+    pub fn has_allocated_domain(&self, domain_id: &str) -> bool {
         self.allocated_domain_ids.contains(domain_id)
     }
 
