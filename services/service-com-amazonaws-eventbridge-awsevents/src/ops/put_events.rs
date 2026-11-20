@@ -3632,7 +3632,9 @@ const STRING_ATTRIBUTE_TYPE: &str = "String";
 /// dead-lettered and counted on `FailedInvocations` like any other failed
 /// invocation (see [`deliver`]), under the condition and sentence the refusing
 /// service's own answer gives it ([`crate::state::queue_access_refusal`] for the
-/// policy, [`queue_key_send_refusal`] for the key).
+/// policy, [`queue_key_send_refusal`] for the key) — the policy refusal's
+/// condition read off that answer's error code through the one classifier every
+/// answered refusal goes through ([`delivery_condition`]).
 ///
 /// The attributes are read through the queue's own `GetQueueAttributes`, so what
 /// decides a delivery is what a client's last write left on the queue — a policy
@@ -3669,8 +3671,11 @@ fn queue_delivery_refusal(
             "an EventBridge delivery was withheld: the queue's own policy does not allow this \
              service to send it a message"
         );
-        let (code, message) = crate::state::queue_access_refusal(resource);
-        return Some(crate::state::InvocationOutcome::Failed { code, message });
+        let (code, message) = crate::state::queue_access_refusal();
+        return Some(crate::state::InvocationOutcome::Failed {
+            code: delivery_condition(code).to_string(),
+            message,
+        });
     }
     queue_key_refusal(kms, attributes, region, resource, handover)
 }

@@ -8,10 +8,12 @@
 //!
 //! The RULE asserted here: the `ERROR_CODE` EventBridge stamps on a dead-lettered
 //! event is the service's OWN classification of why the delivery failed, never the
-//! target service's error code. A target that was not there to take the event is
-//! `NO_RESOURCE`; a target that IS there and refused the identity the call was made
-//! as — a role whose policies withhold the call, and a queue whose own policy grants
-//! this service nothing — is
+//! target service's error code — but it is the classification OF THAT ANSWER, so
+//! which class a failure falls in follows what the target's service answered. A
+//! target that was not there to take the event is `NO_RESOURCE`, and so is one its
+//! service will not disclose to the delivery (Amazon SQS answers a send its queue's
+//! policy does not authorize under its own not-found class); a target that refused
+//! the IDENTITY the call was made as — a role whose policies withhold the call — is
 //! `NO_PERMISSIONS` (the class `tests/all/dead_letter_error_code.rs` spans over the
 //! two steps of a role-governed handover); a failure of any other kind is `UNKNOWN`.
 //! The
@@ -26,10 +28,10 @@
 //! The table spans the class rather than one case: the rows differ along WHICH
 //! classification the failure falls in, along the target's SERVICE (a queue, a
 //! state machine), and along the FORM the failure takes within one class — a queue
-//! that was never created and one deleted after the target was written both being
-//! a resource that is not there, while a queue granting nothing, a queue refused by
-//! a policy scoped to another rule and a queue refusing one parameter of the send
-//! are different classes on the same service.
+//! that was never created, one deleted after the target was written, one granting
+//! nothing and one refused by a policy scoped to another rule all being a resource
+//! the delivery could not address, while a queue refusing one parameter of the send
+//! is another class on the same service.
 //!
 //! The harness (the router with EventBridge, Amazon SQS, Step Functions, IAM and
 //! CloudWatch on one engine, and the queue, role and rule fixtures) is
@@ -37,8 +39,8 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{
-    rule_arn, InvocationOutcome, DEFAULT_EVENT_BUS_NAME, NO_PERMISSIONS, NO_RESOURCE,
-    SERVICE_PRINCIPAL, UNKNOWN_CONDITION,
+    rule_arn, InvocationOutcome, DEFAULT_EVENT_BUS_NAME, NO_RESOURCE, SERVICE_PRINCIPAL,
+    UNKNOWN_CONDITION,
 };
 
 use crate::target_dispatch::{
@@ -246,12 +248,12 @@ async fn the_dead_letter_condition_classifies_the_targets_own_answer() {
         Row {
             case: "a queue whose policy grants this service nothing",
             target: Target::QueueGrantingNothing,
-            condition: Some(NO_PERMISSIONS),
+            condition: Some(NO_RESOURCE),
         },
         Row {
             case: "a queue whose policy is scoped by aws:SourceArn to another rule",
             target: Target::QueueGrantingAnotherRule,
-            condition: Some(NO_PERMISSIONS),
+            condition: Some(NO_RESOURCE),
         },
         Row {
             case: "a queue ARN no queue was created for",
@@ -360,10 +362,10 @@ async fn the_dead_letter_condition_classifies_the_targets_own_answer() {
 }
 
 /// A queue target refused by its own policy reports the answer Amazon SQS gives a
-/// caller its documents grant nothing: the authorization sentence about the
-/// service principal, the action and the queue — which is what tells the owner of
-/// the queue WHICH grant to write, and is why the condition is the permission one
-/// rather than the resource one.
+/// caller it will not disclose the queue to: its not-found class, at HTTP 400,
+/// carrying the sentence that names both facts the class covers — which is the
+/// answer an operator and a replay tool read, and why the condition is the resource
+/// one rather than the permission one.
 #[tokio::test]
 async fn a_queue_refusing_the_send_reports_its_own_authorization_answer() {
     let case = "a queue granting this service nothing";
@@ -393,13 +395,11 @@ async fn a_queue_refusing_the_send_reports_its_own_authorization_answer() {
     let reported = dead_lettered[0]["MessageAttributes"]["ERROR_MESSAGE"]["StringValue"]
         .as_str()
         .unwrap_or_default();
-    let expected = format!(
-        "User: {SERVICE_PRINCIPAL} is not authorized to perform: sqs:sendmessage on resource: \
-         {target_arn} because no resource-based policy allows the sqs:sendmessage action \
-         (Service: AmazonSQS; Status Code: 403; Error Code: AccessDenied; Request ID: "
-    );
+    let expected = "The specified queue does not exist or you do not have access to it. (Service: \
+                    AmazonSQS; Status Code: 400; Error Code: \
+                    AWS.SimpleQueueService.NonExistentQueue; Request ID: ";
     assert!(
-        reported.starts_with(&expected) && reported.ends_with("; Proxy: null)"),
+        reported.starts_with(expected) && reported.ends_with("; Proxy: null)"),
         "case {case:?}: expected {expected:?} and the id of the refused request, got {reported:?}"
     );
 }

@@ -10,12 +10,16 @@
 //! destination queue's own resource policy is what authorizes the delivery
 //! (`PutTargets`: "for Lambda functions, Amazon SNS topics and Amazon SQS queues,
 //! EventBridge relies on resource-based policies"), and the dead letter's
-//! `ERROR_CODE` names the CLASS of the failure in EventBridge's own terms: a target
-//! that IS there and whose documents do not authorize this delivery is the
-//! permission class (`NO_PERMISSIONS`), whatever form the withholding takes, while
-//! the resource class (`NO_RESOURCE`) is reserved for a target that is not there to
-//! take the event. The two classes are never collapsed, because they ask an operator
-//! for opposite repairs — write the missing grant, or re-point the target.
+//! `ERROR_CODE` is EventBridge's classification OF THE ANSWER the target's service
+//! gave — never a verdict this service reaches on its own. Amazon SQS models no
+//! authorization failure on `SendMessage` and answers a send the queue's document
+//! does not authorize under its not-found class
+//! (`AWS.SimpleQueueService.NonExistentQueue`), so a withheld delivery and a queue
+//! that is not there both land in the resource class (`NO_RESOURCE`), whatever form
+//! the withholding takes; the permission class (`NO_PERMISSIONS`) belongs to a
+//! refusal of the IDENTITY the call was made as, which for a queue target is the
+//! key an encrypted queue is encrypted under
+//! (`tests/all/encrypted_queue_target_key_policy.rs`).
 //!
 //! The table spans the class rather than one case: the rows differ along the FORM
 //! the withholding takes (no document at all, an explicit `Deny`, a grant scoped by
@@ -29,17 +33,18 @@
 //! `Policy` is an IAM policy document
 //! (`smithy_query(query="doc",shape="com.amazonaws.sqs#QueueAttributeName")`).
 //!
-//! The last test closes the loop the classification claims: the very queue a dead
-//! letter was classified `NO_PERMISSIONS` for receives the NEXT event once its
-//! policy grants the send, with nothing else changed — so the queue was there all
-//! along and only the authorization had failed.
+//! The last test closes the loop the classification claims: the very queue a
+//! withheld delivery was dead-lettered for receives the NEXT event once its policy
+//! grants the send, with nothing else changed — so the queue was there all along
+//! and only the authorization had failed, which is exactly what the sentence beside
+//! the class says ("does not exist or you do not have access to it").
 //!
 //! The harness (the router with EventBridge, Amazon SQS, Step Functions, IAM and
 //! CloudWatch on one engine) is `tests/all/target_dispatch.rs`'s.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{
-    rule_arn, DEFAULT_EVENT_BUS_NAME, NO_PERMISSIONS, NO_RESOURCE, SERVICE_PRINCIPAL,
+    rule_arn, DEFAULT_EVENT_BUS_NAME, NO_RESOURCE, SERVICE_PRINCIPAL,
 };
 
 use crate::target_dispatch::{
@@ -206,40 +211,40 @@ fn attribute(message: &Value, name: &str) -> String {
         .to_string()
 }
 
-/// The dead-letter `ERROR_CODE` separates a target whose documents withhold the
-/// delivery from a target that is not there, over every form each takes.
+/// The dead-letter `ERROR_CODE` is the class the target service's OWN answer puts
+/// the failure in, over every form a withheld delivery and an absent target take.
 #[tokio::test]
 async fn a_queue_targets_failure_class_is_the_one_its_own_state_puts_it_in() {
     let rows = [
         Row {
             case: "a queue carrying no policy at all",
             setup: Setup::Queue(None),
-            class: NO_PERMISSIONS,
+            class: NO_RESOURCE,
         },
         Row {
             case: "a queue whose policy denies the send beside granting it",
             setup: Setup::Queue(Some(granting_then_denying)),
-            class: NO_PERMISSIONS,
+            class: NO_RESOURCE,
         },
         Row {
             case: "a queue whose grant is scoped by aws:SourceArn to another rule",
             setup: Setup::Queue(Some(granting_another_rule)),
-            class: NO_PERMISSIONS,
+            class: NO_RESOURCE,
         },
         Row {
             case: "a queue granting this service another action",
             setup: Setup::Queue(Some(granting_another_action)),
-            class: NO_PERMISSIONS,
+            class: NO_RESOURCE,
         },
         Row {
             case: "a queue whose grant names another queue as its resource",
             setup: Setup::Queue(Some(granting_another_resource)),
-            class: NO_PERMISSIONS,
+            class: NO_RESOURCE,
         },
         Row {
             case: "a queue granting the send to another service principal",
             setup: Setup::Queue(Some(granting_another_principal)),
-            class: NO_PERMISSIONS,
+            class: NO_RESOURCE,
         },
         Row {
             case: "a queue ARN no queue was created for",
@@ -316,12 +321,12 @@ async fn a_queue_targets_failure_class_is_the_one_its_own_state_puts_it_in() {
     }
 }
 
-/// A queue classified `NO_PERMISSIONS` is one that IS there: the same queue, with
-/// nothing changed but its policy, receives the next event — which is what makes the
-/// class actionable, and what a `NO_RESOURCE` letter would have sent an operator to
-/// re-create for nothing.
+/// The queue a withheld delivery was dead-lettered for IS there: the same queue,
+/// with nothing changed but its policy, receives the next event — which is why the
+/// sentence beside the class covers both facts rather than claiming the queue is
+/// gone, and what an operator reading the letter has to repair.
 #[tokio::test]
-async fn the_queue_a_permission_failure_names_receives_once_its_policy_grants_the_send() {
+async fn the_queue_a_withheld_delivery_names_receives_once_its_policy_grants_the_send() {
     let case = "a target queue granted the send after a withheld delivery";
     let emulator = emulator();
     let (dead_letter_url, dead_letter_arn) = given_queue(&emulator, "regranted-dlq").await;
@@ -349,8 +354,8 @@ async fn the_queue_a_permission_failure_names_receives_once_its_policy_grants_th
     );
     let code = attribute(&dead_lettered[0], ERROR_CODE_ATTRIBUTE);
     assert_eq!(
-        code, NO_PERMISSIONS,
-        "case {case:?}: expected the dead-letter {ERROR_CODE_ATTRIBUTE} {NO_PERMISSIONS:?}, got \
+        code, NO_RESOURCE,
+        "case {case:?}: expected the dead-letter {ERROR_CODE_ATTRIBUTE} {NO_RESOURCE:?}, got \
          {code:?} in {:?}",
         dead_lettered[0]
     );
