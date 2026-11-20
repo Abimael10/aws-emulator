@@ -491,8 +491,10 @@ async fn simulate(
 /// The `(Line, Column)` of every `<tag>` position element in the body, in document order.
 ///
 /// A `Position` is not a leaf, so the shared leaf reader is taken over each position's own
-/// text rather than over the element that carries it.
-fn positions(body: &str, tag: &str) -> Vec<(i32, i32)> {
+/// text rather than over the element that carries it. Shared with the sibling suite about the
+/// form every modelled member is reported in
+/// (`tests/all/query_response_member_form.rs`), so a position is read one way.
+pub(crate) fn positions(body: &str, tag: &str) -> Vec<(i32, i32)> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let mut found = Vec::new();
@@ -539,7 +541,9 @@ fn missing_keys(body: &str) -> Vec<String> {
 /// Whether the body reports `MissingContextValues` AND it names no key: the member present
 /// with no entry in it, which is how the query protocol writes an empty list — either as an
 /// element with nothing between its tags or as a self-closed one.
-fn reports_no_missing_key(body: &str) -> bool {
+///
+/// Shared with the sibling suite named on [`positions`].
+pub(crate) fn reports_no_missing_key(body: &str) -> bool {
     let present = body.contains("<MissingContextValues></MissingContextValues>")
         || body.contains("<MissingContextValues/>");
     present && missing_keys(body).is_empty()

@@ -64,7 +64,11 @@ fn simulation_params(
 }
 
 /// One unsigned `SimulateCustomPolicy` call.
-async fn simulate(
+///
+/// Shared with the sibling suite about the form every modelled member is reported in
+/// (`tests/all/query_response_member_form.rs`), so a custom-policy simulation is requested
+/// exactly one way.
+pub(crate) async fn simulate(
     router: &MultiServiceRouter,
     documents: &[&str],
     actions: &[&str],
