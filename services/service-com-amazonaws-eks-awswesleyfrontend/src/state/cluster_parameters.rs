@@ -138,10 +138,20 @@ pub fn cluster_version_status_message(value: &str) -> String {
 pub const CLUSTER_VERSIONS_FILTER_MESSAGE: &str =
     "Provided Cluster Versions are invalid, it must be comma separated versions ie 1.27,1.28";
 
-/// The sentence a `version` Amazon EKS does not offer a control plane for is refused
-/// with: fixed text plus the version the request asked for.
+/// The fixed phrase every refusal of a `version` Amazon EKS does not offer a control
+/// plane for is worded with, and the WHOLE message an UPDATE to such a version earns.
+///
+/// It states that the version is not one this API offers and nothing else: neither the
+/// versions it does offer — which a caller reads from `DescribeClusterVersions`, and
+/// which would be this service's own state presented as part of the refusal — nor, on
+/// the update path, the version that was asked for, which is the caller's own request.
+pub const UNSUPPORTED_KUBERNETES_VERSION_MESSAGE: &str = "unsupported Kubernetes version";
+
+/// The sentence a CREATE of a cluster at a `version` Amazon EKS does not offer a
+/// control plane for is refused with: the fixed phrase above plus the version the
+/// request asked for, which is the one place this API appends it.
 pub fn unsupported_kubernetes_version_message(version: &str) -> String {
-    format!("unsupported Kubernetes version {version}")
+    format!("{UNSUPPORTED_KUBERNETES_VERSION_MESSAGE} {version}")
 }
 
 /// The sentence a `subnetIds` entry that is not a subnet id is refused with: fixed
@@ -358,6 +368,45 @@ pub fn offers_cluster_version(
     store
         .offered_cluster_versions(now)
         .any(|row| row.cluster_version == version)
+}
+
+/// The Kubernetes `(major, minor)` release `version` names, when it names one of a
+/// release LINE this service publishes control planes for — and `None` when it names no
+/// such version.
+///
+/// A Kubernetes version of this API is `major.minor`
+/// ([`super::kubernetes_minor_version`]), and every row of the calendar this service
+/// publishes sits on one major release line. So a string that is not a minor version at
+/// all, and one whose major release no row of the calendar carries, name no Kubernetes
+/// version this service could publish a control plane for — which is a different fact
+/// from a version OF that line it does not offer at `now`
+/// ([`offers_cluster_version`]): the first is not a version, the second is a version
+/// that is not on offer, and an update to a cluster is refused differently for the two.
+/// The parsed pair is handed back because the caller that asks this question is the one
+/// that then measures the MOVE with it.
+pub fn published_kubernetes_minor_version(
+    store: &ComAmazonawsEksAwswesleyfrontendState,
+    version: &str,
+    now: SystemTime,
+) -> Option<(u32, u32)> {
+    let (major, minor) = kubernetes_minor_version(version)?;
+    store
+        .released_cluster_versions(now)
+        .filter_map(|row| kubernetes_minor_version(&row.cluster_version))
+        .any(|(published, _)| published == major)
+        .then_some((major, minor))
+}
+
+/// The sentence a version update that would move a cluster by more than one Kubernetes
+/// minor version is refused with: fixed text around the version the cluster runs and the
+/// one it was asked to move to, which are the two ends of the move.
+///
+/// "A cluster moves one minor version per update" (`UpdateClusterVersion`) — forward as
+/// an upgrade, backward as the rollback of one — so a target further than that names no
+/// update this cluster can make, and the refusal states the move rather than the
+/// version: the version itself is one this service publishes a line for.
+pub fn unsupported_minor_version_update_message(current: &str, requested: &str) -> String {
+    format!("Unsupported Kubernetes minor version update from {current} to {requested}")
 }
 
 #[cfg(test)]

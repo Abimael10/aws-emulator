@@ -58,8 +58,20 @@ pub(crate) async fn describe_config_in(
     cluster: &str,
     config_name: &str,
 ) -> Answer {
+    describe_config_of_type_in(router, region, cluster, "oidc", config_name).await
+}
+
+/// The same describe, with the `type` half of the pair the request addresses spelled
+/// out — the member that says WHICH kind of identity provider is being asked for.
+pub(crate) async fn describe_config_of_type_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    cluster: &str,
+    config_type: &str,
+    config_name: &str,
+) -> Answer {
     let body = serde_json::json!({
-        "identityProviderConfig": { "type": "oidc", "name": config_name },
+        "identityProviderConfig": { "type": config_type, "name": config_name },
     });
     call(
         router,
@@ -210,6 +222,63 @@ async fn every_absent_configuration_is_the_same_not_found_answer() {
         serde_json::json!("present-config"),
         "the found configuration must be the one that was associated, got {found:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// RULE: the `(type, name)` pair IS the resource the describe addresses, and `oidc`
+// is the only type this API defines — so a pair whose type the stored configuration
+// was not created with names a resource that does not exist, and is the same 404
+// `ResourceNotFoundException` with the same generic payload as a name the cluster
+// carries nothing under.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_type_the_configuration_was_not_created_with_is_the_same_not_found() {
+    let router = emulator();
+    active_cluster_in(&router, REGION, "idp-typed").await;
+    let associated = associate_in(&router, REGION, "idp-typed", "present-config").await;
+    assert_eq!(
+        associated.status, 200,
+        "setup: the association must succeed, got {associated:?}"
+    );
+
+    // The rows differ along HOW the type misses the one this API defines (another
+    // identity system, an invented kind, a version suffix, padding, the empty string)
+    // and are each asked for with the name the cluster DOES carry and with one it does
+    // not — the same answer either way, because the pair is one resource.
+    for config_type in ["saml", "not-a-supported-type", "OIDC-v2", " oidc", ""] {
+        for config_name in ["present-config", "absent-config"] {
+            let case = format!("type {config_type:?} / name {config_name:?}");
+            let answer =
+                describe_config_of_type_in(&router, REGION, "idp-typed", config_type, config_name)
+                    .await;
+            // The empty type is not among the values the payload must not echo: every
+            // string contains it.
+            let named: Vec<&str> = [config_type, config_name]
+                .into_iter()
+                .filter(|value| !value.trim().is_empty())
+                .collect();
+            assert_not_found(&case, &answer, &named);
+        }
+    }
+
+    // CONTROL: the one type this API defines, in every casing, finds the stored
+    // configuration — so the rows above are about the type naming no resource and not
+    // about the describe refusing every pair.
+    for spelling in ["oidc", "OIDC", "Oidc"] {
+        let found =
+            describe_config_of_type_in(&router, REGION, "idp-typed", spelling, "present-config")
+                .await;
+        assert_eq!(
+            found.status, 200,
+            "case {spelling:?}: the stored configuration must be found, got {found:?}"
+        );
+        assert_eq!(
+            found.body["identityProviderConfig"]["oidc"]["identityProviderConfigName"],
+            serde_json::json!("present-config"),
+            "case {spelling:?}: expected the associated configuration, got {found:?}"
+        );
+    }
 }
 
 /// A configuration lives on its cluster, so deleting the cluster takes it with it —

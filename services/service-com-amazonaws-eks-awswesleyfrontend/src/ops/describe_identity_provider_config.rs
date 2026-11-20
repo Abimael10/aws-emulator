@@ -10,11 +10,13 @@
 //!
 //! A configuration is addressed by the `type`/`name` pair of
 //! `IdentityProviderConfig`, within the cluster named by the path. `oidc` is the only
-//! type this API defines, so any other type names no configuration. That pair is ONE
-//! resource, so a describe whose cluster or whose configuration name is not in the
-//! store answers the same way, with the service's generic memberless not-found
-//! payload ([`crate::state::resource_not_found`]) rather than naming the half it could
-//! not find.
+//! type this API defines, so a pair naming any other type names no configuration of
+//! any cluster — absence, reported as the same not-found as a name the cluster carries
+//! nothing under. That pair is ONE resource, so a describe whose cluster, whose type or
+//! whose configuration name is not in the store answers the same way, with the
+//! service's generic memberless not-found payload
+//! ([`crate::state::resource_not_found`]) rather than naming the half it could not
+//! find.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -185,29 +187,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // "The only type available is `oidc`" (`IdentityProviderConfig$type`), so any
-        // other type is not a configuration this API could hold.
-        if !requested
+        // "The only type available is `oidc`" (`IdentityProviderConfig$type`), so a
+        // request naming any other kind of provider names a `(type, name)` pair no
+        // cluster of this API can hold: the resource it addresses does not exist, which
+        // is ABSENCE rather than a parameter the caller must correct — the same 404,
+        // with the same generic payload, as a name this cluster carries no
+        // configuration under. The type is therefore not a gate of its own: it is part
+        // of the pair the lookup below resolves, and the comparison is case-insensitive
+        // exactly as it is everywhere else this service reads the token
+        // ([`crate::state::IDENTITY_PROVIDER_CONFIG_TYPE_OIDC`]).
+        let addresses_a_configuration = requested
             .r#type
-            .eq_ignore_ascii_case(IDENTITY_PROVIDER_CONFIG_TYPE_OIDC)
-        {
-            return Err(
-                DescribeIdentityProviderConfigErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        cluster_name: Some(input.cluster_name.clone()),
-                        message: Some(format!(
-                            "identityProviderConfig.type must be \
-                             {IDENTITY_PROVIDER_CONFIG_TYPE_OIDC}, got {}",
-                            requested.r#type
-                        )),
-                        ..Default::default()
-                    },
-                )
-                .into(),
-            );
-        }
+            .eq_ignore_ascii_case(IDENTITY_PROVIDER_CONFIG_TYPE_OIDC);
 
-        match cluster.identity_provider_configs.get(&requested.name) {
+        match cluster
+            .identity_provider_configs
+            .get(&requested.name)
+            .filter(|_| addresses_a_configuration)
+        {
             Some(record) => Ok(DescribeIdentityProviderConfigOutput {
                 identity_provider_config: Some(IdentityProviderConfigResponse {
                     oidc: Some(record.to_oidc_config(&input.cluster_name)),

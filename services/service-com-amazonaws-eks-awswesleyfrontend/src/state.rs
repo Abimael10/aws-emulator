@@ -4649,6 +4649,9 @@ pub const UPDATES_LISTING: &str = "updates";
 /// The scope `ListInsights`'s tokens carry, over the ids of the insights of one
 /// cluster. See [`CLUSTERS_LISTING`].
 pub const INSIGHTS_LISTING: &str = "insights";
+/// The scope `ListIdentityProviderConfigs`'s tokens carry, over one cluster's
+/// identity-provider configuration names. See [`CLUSTERS_LISTING`].
+pub const IDENTITY_PROVIDER_CONFIGS_LISTING: &str = "identity-provider-configs";
 /// The scope `ListEksAnywhereSubscriptions`'s tokens carry, over the ids of one
 /// Region's subscriptions. See [`CLUSTERS_LISTING`].
 pub const EKS_ANYWHERE_SUBSCRIPTIONS_LISTING: &str = "eks-anywhere-subscriptions";

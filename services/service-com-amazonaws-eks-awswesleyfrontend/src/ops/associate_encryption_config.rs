@@ -246,15 +246,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Use this API to enable encryption on existing clusters that don't already have
         // encryption enabled": the association is one-way, so a cluster that already
-        // reports an `encryptionConfig` cannot take another.
+        // reports an `encryptionConfig` cannot take another. What the caller has to change
+        // is the `encryptionConfig` it sent — no wait makes this call succeed — so this is
+        // the PARAMETER refusal, in the sentence this API states for it
+        // ([`crate::state::ENCRYPTION_ALREADY_ENABLED`]).
         if !record.encryption_config.is_empty() {
             return Err(
-                AssociateEncryptionConfigErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
+                AssociateEncryptionConfigErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
                         cluster_name: Some(cluster_name.clone()),
-                        message: Some(format!(
-                            "Cluster {cluster_name} already has encryption enabled"
-                        )),
+                        message: Some(state::ENCRYPTION_ALREADY_ENABLED.to_string()),
                         ..Default::default()
                     },
                 )
@@ -262,11 +263,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // Everything the model cannot express about `encryptionConfig` is judged here;
-        // the modelled constraints (required, at most one entry) were already refused
-        // before this handler ran.
-        let key_arn =
-            validate_encryption_config(&input.encryption_config, &region).map_err(|message| {
+        // Everything the model cannot express about `encryptionConfig` is judged here,
+        // through the one reading of that member this service has
+        // ([`crate::state::encryption_config_key_arn`], shared with `CreateCluster`); the
+        // modelled constraints (required, at most one entry) were already refused before
+        // this handler ran.
+        let key_arn = state::encryption_config_key_arn(&input.encryption_config, &region)
+            .map_err(|message| {
                 AssociateEncryptionConfigError::from(
                     AssociateEncryptionConfigErrorModeled::InvalidParameterException(
                         InvalidParameterException {
@@ -327,103 +330,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             update: Some(answer),
         })
     }
-}
-
-/// The only value `EncryptionConfig$resources` supports: "Specifies the resources to be
-/// encrypted. The only supported value is `secrets`".
-const ENCRYPTABLE_RESOURCE: &str = "secrets";
-
-/// The KMS key the requested `encryptionConfig` names, or the reason the request cannot
-/// be acted on.
-///
-/// The rules are the ones the model states and the modelled constraints cannot express:
-/// exactly one entry must name a provider, its `keyArn` must be a KMS key reference —
-/// "Amazon Resource Name (ARN) or alias of the KMS key" — and an ARN's region must be the
-/// cluster's, because "the KMS key must be symmetric and created in the same Amazon Web
-/// Services Region as the cluster". The key's ACCOUNT is deliberately not constrained: a
-/// key "created in a different account" is explicitly allowed. Whether the key exists is
-/// not checked either — that lives in KMS's own store, which this service does not read.
-fn validate_encryption_config(
-    entries: &[EncryptionConfig],
-    region: &str,
-) -> Result<String, String> {
-    // `EncryptionConfigList` is modelled `len 0..1`, so the boundary validator passes an
-    // EMPTY list: a request that names no provider enables no encryption and cannot be
-    // acted on.
-    let [entry] = entries else {
-        return Err(format!(
-            "encryptionConfig must contain exactly 1 entry, got {}",
-            entries.len()
-        ));
-    };
-
-    for resource in entry.resources.iter().flatten() {
-        if resource != ENCRYPTABLE_RESOURCE {
-            return Err(format!(
-                "encryptionConfig[0].resources supports only {ENCRYPTABLE_RESOURCE:?}, got \
-                 {resource:?}"
-            ));
-        }
-    }
-
-    let key_arn = entry
-        .provider
-        .as_ref()
-        .and_then(|provider| provider.key_arn.as_deref())
-        .map(str::trim)
-        .filter(|key_arn| !key_arn.is_empty())
-        .ok_or_else(|| {
-            "encryptionConfig[0].provider.keyArn is required and must name a KMS key".to_string()
-        })?;
-
-    validate_kms_key_reference(key_arn, region)?;
-    Ok(key_arn.to_string())
-}
-
-/// Refuse a `keyArn` that is not a KMS key reference, or that names a key in another
-/// region.
-fn validate_kms_key_reference(key_arn: &str, region: &str) -> Result<(), String> {
-    let malformed = || {
-        format!(
-            "encryptionConfig[0].provider.keyArn must be a KMS key ARN \
-             (arn:<partition>:kms:{region}:<account>:key/<id> or :alias/<name>) or an alias \
-             name (alias/<name>), got {key_arn:?}"
-        )
-    };
-
-    // The bare alias form: an alias name with no account or region of its own, which KMS
-    // resolves in the caller's own account and region.
-    if let Some(alias) = key_arn.strip_prefix("alias/") {
-        return if alias.is_empty() {
-            Err(malformed())
-        } else {
-            Ok(())
-        };
-    }
-
-    // The ARN form: `arn:<partition>:kms:<region>:<account>:<key/id|alias/name>`.
-    let fields: Vec<&str> = key_arn.splitn(6, ':').collect();
-    let ["arn", partition, "kms", key_region, account, resource] = fields.as_slice() else {
-        return Err(malformed());
-    };
-    if partition.is_empty() || account.is_empty() {
-        return Err(malformed());
-    }
-    let names_a_key = ["key/", "alias/"].iter().any(|prefix| {
-        resource
-            .strip_prefix(prefix)
-            .is_some_and(|rest| !rest.is_empty())
-    });
-    if !names_a_key {
-        return Err(malformed());
-    }
-    if *key_region != region {
-        return Err(format!(
-            "encryptionConfig[0].provider.keyArn names a KMS key in region {key_region:?}, but \
-             the key must be in the cluster's own region {region:?}"
-        ));
-    }
-    Ok(())
 }
 
 /// The requested configuration as an `UpdateParam$value`: the `encryptionConfig` list in

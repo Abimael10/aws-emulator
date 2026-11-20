@@ -363,35 +363,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // "The desired Kubernetes version following a successful update": a version
-        // Amazon EKS offers, which is a released row of the calendar this service
-        // publishes through `DescribeClusterVersions` — so the catalog a caller reads to
-        // pick a version and the versions an update accepts cannot disagree.
-        if !guard
-            .released_cluster_versions(now)
-            .any(|row| row.cluster_version == input.version)
-        {
-            let offered: Vec<&str> = guard
-                .released_cluster_versions(now)
-                .map(|row| row.cluster_version.as_str())
-                .collect();
+        // WHAT THE REQUESTED VERSION IS, before what this service offers it for: "the
+        // desired Kubernetes version following a successful update" has to name a
+        // Kubernetes version of a release line this service publishes control planes for
+        // ([`state::published_kubernetes_minor_version`], which hands back the release
+        // the move below is measured with) — a string that is no minor version, or one
+        // of a major release the calendar carries nothing of, names no control plane
+        // this API could run, which is the fixed phrase this API states for an
+        // unsupported version ([`state::UNSUPPORTED_KUBERNETES_VERSION_MESSAGE`]).
+        // That phrase is the WHOLE message: it names neither the version asked for nor
+        // the ones on offer, which a caller reads from `DescribeClusterVersions` itself.
+        let Some(target) = state::published_kubernetes_minor_version(&guard, &input.version, now)
+        else {
             return Err(invalid_parameter(
                 &cluster_name,
-                format!(
-                    "Unsupported Kubernetes version {}. Amazon EKS offers {}.",
-                    input.version,
-                    offered.join(", ")
-                ),
-            ));
-        }
-
-        let Some(target) = kubernetes_minor_version(&input.version) else {
-            return Err(invalid_parameter(
-                &cluster_name,
-                format!(
-                    "version {} is not a Kubernetes minor version",
-                    input.version
-                ),
+                state::UNSUPPORTED_KUBERNETES_VERSION_MESSAGE.to_string(),
             ));
         };
         let Some(current) = kubernetes_minor_version(&current_version) else {
@@ -411,15 +397,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // A cluster moves ONE minor version per update — forward as an upgrade, backward
         // as the rollback of one — so the direction decides the `UpdateType` and a request
-        // that skips versions names no update this cluster can make.
+        // that skips versions names no update this cluster can make. The MOVE is judged
+        // before what the calendar offers: a version of the published line that is
+        // further away than one minor release is refused as the move it asks for
+        // ([`state::unsupported_minor_version_update_message`]), whether or not that
+        // version is still on offer, because no catalogue row would make the move legal.
         if target.0 != current.0 || target.1.abs_diff(current.1) != 1 {
             return Err(invalid_parameter(
                 &cluster_name,
-                format!(
-                    "Unsupported Kubernetes minor version update from {current_version} to {}: a \
-                     cluster moves one minor version per update",
-                    input.version
-                ),
+                state::unsupported_minor_version_update_message(&current_version, &input.version),
+            ));
+        }
+
+        // And only then whether this service OFFERS that version: a released row of the
+        // calendar it publishes ([`state::released_cluster_versions`]), so the catalog a
+        // caller reads to pick a version and the versions an update accepts cannot
+        // disagree.
+        if !guard
+            .released_cluster_versions(now)
+            .any(|row| row.cluster_version == input.version)
+        {
+            return Err(invalid_parameter(
+                &cluster_name,
+                state::UNSUPPORTED_KUBERNETES_VERSION_MESSAGE.to_string(),
             ));
         }
         let update_type = attempted_update_type(&input.version, Some(&current_version));

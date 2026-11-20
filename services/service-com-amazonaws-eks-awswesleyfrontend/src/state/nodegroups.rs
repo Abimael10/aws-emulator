@@ -304,33 +304,113 @@ impl NodegroupRecord {
     }
 }
 
+/// The sentence a `diskSize` that is not a positive number of GiB is refused
+/// with. Entirely fixed text — it states the bound the value broke and echoes
+/// nothing the request sent.
+///
+/// "The root device disk size (in GiB) for your node group instances"
+/// (`CreateNodegroupRequest$diskSize`) — a disk is at least one GiB, and the
+/// member is a `BoxedInteger` with no modelled range, so a zero or negative size
+/// reaches the handler and earns this.
+pub const DISK_SIZE_MUST_BE_POSITIVE_MESSAGE: &str = "diskSize must be > 0";
+
+/// The sentence a `scalingConfig` whose desired size is above its maximum is
+/// refused with, as a node group is CREATED with. Entirely fixed text, naming the
+/// two members of the violated relation and no number.
+pub const DESIRED_SIZE_ABOVE_MAX_SIZE_MESSAGE: &str =
+    "desiredSize can't be greater than maxSize";
+
+/// The sentence a `scalingConfig` whose minimum is above its desired size is
+/// refused with, as a node group is CREATED with — see
+/// [`DESIRED_SIZE_ABOVE_MAX_SIZE_MESSAGE`].
+pub const MIN_SIZE_ABOVE_DESIRED_SIZE_MESSAGE: &str =
+    "minSize can't be greater than desiredSize";
+
+/// WHICH of the two relations of a `scalingConfig` a triple of capacities breaks.
+///
+/// "The Cluster Autoscaler doesn't scale a managed node group lower than `minSize`
+/// or higher than `maxSize`" (`NodegroupScalingConfig$desiredSize`), so the desired
+/// size sits between the two bounds: a minimum above it and a maximum below it are
+/// the two ways that fails, and they are reported as the relation they are rather
+/// than as one restatement of the whole ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalingRelation {
+    /// The minimum capacity is above the desired size.
+    MinimumAboveDesired,
+    /// The desired size is above the maximum capacity.
+    DesiredAboveMaximum,
+}
+
+/// The relation the capacities a node group would carry break, or `None` when the
+/// desired size sits between the two bounds.
+///
+/// The ONE reading of that ordering, so the two operations that judge a
+/// `scalingConfig` — `CreateNodegroup` for what a node group is created with,
+/// `UpdateNodegroupConfig` for what a change would leave it with — cannot drift
+/// apart about WHICH relation a triple breaks; each words the answer in the sentence
+/// its own refusal states ([`scaling_relation_violation`],
+/// [`scaling_capacity_violation`]). The lower relation is answered first, so a triple
+/// that breaks both is reported on its minimum.
+///
+/// The two relations are the whole rule: a `minSize` above `maxSize` leaves no
+/// desired size between them, so such a triple always breaks one of them. Each
+/// member's own lower bound is modelled and so already refused before a handler asks
+/// this.
+pub fn violated_scaling_relation(
+    min_size: i32,
+    max_size: i32,
+    desired_size: i32,
+) -> Option<ScalingRelation> {
+    if min_size > desired_size {
+        return Some(ScalingRelation::MinimumAboveDesired);
+    }
+    if desired_size > max_size {
+        return Some(ScalingRelation::DesiredAboveMaximum);
+    }
+    None
+}
+
+/// Why the triple a node group would be CREATED with is not one it can scale
+/// between, or `None` when it is — the sentence `CreateNodegroup` states for the
+/// relation the triple broke ([`violated_scaling_relation`]), naming that relation's
+/// two members and no number.
+///
+/// A CHANGE to a node group's capacities is worded differently — by the capacity the
+/// bound carries ([`scaling_capacity_violation`]) — because that is the sentence
+/// `UpdateNodegroupConfig` states.
+pub fn scaling_relation_violation(
+    min_size: i32,
+    max_size: i32,
+    desired_size: i32,
+) -> Option<&'static str> {
+    Some(
+        match violated_scaling_relation(min_size, max_size, desired_size)? {
+            ScalingRelation::MinimumAboveDesired => MIN_SIZE_ABOVE_DESIRED_SIZE_MESSAGE,
+            ScalingRelation::DesiredAboveMaximum => DESIRED_SIZE_ABOVE_MAX_SIZE_MESSAGE,
+        },
+    )
+}
+
 /// Why the capacities a `scalingConfig` change would leave the node group with
 /// are not ones it can scale between, or `None` when they are.
 ///
-/// "The Cluster Autoscaler doesn't scale a managed node group lower than
-/// `minSize` or higher than `maxSize`" (`NodegroupScalingConfig$desiredSize`), so
-/// the desired size has to sit between the two bounds — and the refusal names the
-/// BOUND the desired size falls outside of, with the capacities themselves, the
-/// way Amazon EKS words each one. Each member's own lower bound is modelled and
-/// so already refused before a handler asks this.
-///
-/// The two relations are the whole rule: a `minSize` above `maxSize` leaves no
-/// desired size between them, so such a triple always falls outside one of the
-/// two bounds and is reported as that bound.
+/// The relation is [`violated_scaling_relation`]'s answer — the same ordering the
+/// create path is judged by — and the refusal names the BOUND the desired size falls
+/// outside of, with the capacities themselves, the way Amazon EKS words each one for
+/// a change.
 pub fn scaling_capacity_violation(
     min_size: i32,
     max_size: i32,
     desired_size: i32,
 ) -> Option<String> {
-    if desired_size < min_size {
-        return Some(format!(
-            "Minimum capacity {min_size} can't be greater than desired size {desired_size}"
-        ));
-    }
-    if desired_size > max_size {
-        return Some(format!(
-            "Maximum capacity {max_size} can't be less than desired size {desired_size}"
-        ));
-    }
-    None
+    Some(
+        match violated_scaling_relation(min_size, max_size, desired_size)? {
+            ScalingRelation::MinimumAboveDesired => format!(
+                "Minimum capacity {min_size} can't be greater than desired size {desired_size}"
+            ),
+            ScalingRelation::DesiredAboveMaximum => format!(
+                "Maximum capacity {max_size} can't be less than desired size {desired_size}"
+            ),
+        },
+    )
 }

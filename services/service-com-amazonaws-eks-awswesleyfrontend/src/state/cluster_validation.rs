@@ -350,3 +350,117 @@ pub fn username_refusal(entry_type: &str) -> Option<String> {
          \"{entry_type}\"."
     ))
 }
+
+/// The only value `EncryptionConfig$resources` supports: "Specifies the resources to
+/// be encrypted. The only supported value is `secrets`".
+pub const ENCRYPTABLE_RESOURCE: &str = "secrets";
+
+/// The refusal a `keyArn` that does not reference a KMS key this cluster can encrypt
+/// its secrets with earns. Entirely fixed text.
+///
+/// `Provider$keyArn` is the "Amazon Resource Name (ARN) or alias of the KMS key", and
+/// "the KMS key must be symmetric and created in the same Amazon Web Services Region
+/// as the cluster" — so a value that is neither of those two forms, or that names a
+/// key in another Region, references no key the cluster could use. The sentence states
+/// that of the member it is about and echoes nothing the request carried: the value is
+/// the caller's own.
+pub const ENCRYPTION_KEY_ARN_INVALID: &str = "The keyArn for encryptionConfig is invalid.";
+
+/// The refusal a request that would enable secret encryption on a cluster that already
+/// has it earns. Entirely fixed text, naming no cluster — the request addresses one in
+/// its own `@httpLabel`.
+///
+/// "Use this API to enable encryption on existing clusters that don't already have
+/// encryption enabled" (`AssociateEncryptionConfig`): the association is one-way, so a
+/// cluster that already reports an `encryptionConfig` cannot take another, and the
+/// `encryptionConfig` the caller sent is the parameter it has to drop.
+pub const ENCRYPTION_ALREADY_ENABLED: &str = "Encryption is already enabled on the cluster";
+
+/// The refusal an `encryptionConfig` naming a resource Amazon EKS does not encrypt
+/// earns: the member's own documented value and the one the request named.
+pub fn unsupported_encryption_resource(resource: &str) -> String {
+    format!("encryptionConfig[0].resources supports only {ENCRYPTABLE_RESOURCE:?}, got {resource:?}")
+}
+
+/// The KMS key the requested `encryptionConfig` names, or the sentence the request is
+/// refused with — the ONE reading of that member, so the create of a cluster carrying
+/// one and the association of one onto a running cluster judge it identically.
+///
+/// The rules are the ones the member documents and the modelled constraints cannot
+/// express: one entry naming a provider, whose `keyArn` is a KMS key reference — "Amazon
+/// Resource Name (ARN) or alias of the KMS key" — in the cluster's own Region, because
+/// "the KMS key must be symmetric and created in the same Amazon Web Services Region as
+/// the cluster". Every way the member fails to name such a key earns the one sentence
+/// this API states for it ([`ENCRYPTION_KEY_ARN_INVALID`]); the `resources` it encrypts
+/// is a separate member with its own.
+///
+/// The key's ACCOUNT is deliberately not constrained: a key "created in a different
+/// account" is explicitly allowed. Whether the key EXISTS is not checked either — that
+/// lives in KMS's own store, which this service does not read.
+pub fn encryption_config_key_arn(entries: &[EncryptionConfig], region: &str) -> Result<String, String> {
+    // `EncryptionConfigList` is modelled `len 0..1`, so the boundary validator passes an
+    // EMPTY list: a request that names no provider names no key either.
+    let [entry] = entries else {
+        return Err(ENCRYPTION_KEY_ARN_INVALID.to_string());
+    };
+
+    for resource in entry.resources.iter().flatten() {
+        if resource != ENCRYPTABLE_RESOURCE {
+            return Err(unsupported_encryption_resource(resource));
+        }
+    }
+
+    let key_arn = entry
+        .provider
+        .as_ref()
+        .and_then(|provider| provider.key_arn.as_deref())
+        .map(str::trim)
+        .filter(|key_arn| !key_arn.is_empty())
+        .ok_or_else(|| ENCRYPTION_KEY_ARN_INVALID.to_string())?;
+
+    if !names_a_kms_key(key_arn, region) {
+        return Err(ENCRYPTION_KEY_ARN_INVALID.to_string());
+    }
+    Ok(key_arn.to_string())
+}
+
+/// Whether `key_arn` references a KMS key usable by a cluster in `region`: the bare
+/// alias form KMS resolves in the caller's own account and Region, or the ARN of a KMS
+/// key or alias in that same Region.
+///
+/// The ARN is read through the one ARN parse this tree has
+/// ([`::service_common::arn::parse_of`]), so what counts as an ARN of KMS here is what
+/// counts as one everywhere else.
+///
+/// This is the FORM of the reference, not the key's existence: whether this account and
+/// Region hold a key an identifier resolves to is KMS's to answer, which the tree asks
+/// through `service_common::kms_key` — a different question, and one `Provider$keyArn`'s
+/// own documentation does not make this operation ask ("a key created in a different
+/// account" is explicitly allowed).
+fn names_a_kms_key(key_arn: &str, region: &str) -> bool {
+    // The bare alias form: an alias name with no account or Region of its own.
+    if let Some(alias) = key_arn.strip_prefix(KMS_ALIAS_PREFIX) {
+        return !alias.is_empty();
+    }
+
+    let Some(arn) = ::service_common::arn::parse_of(key_arn, KMS_ARN_NAMESPACE) else {
+        return false;
+    };
+    !arn.account.is_empty()
+        && arn.region == region
+        && [KMS_KEY_PREFIX, KMS_ALIAS_PREFIX].iter().any(|prefix| {
+            arn.resource
+                .strip_prefix(*prefix)
+                .is_some_and(|rest| !rest.is_empty())
+        })
+}
+
+/// The ARN namespace of AWS KMS, the service whose keys `Provider$keyArn` references.
+const KMS_ARN_NAMESPACE: &str = "kms";
+
+/// The resource prefix of a KMS key: `key/<id>` in an ARN's resource field.
+const KMS_KEY_PREFIX: &str = "key/";
+
+/// The resource prefix of a KMS alias, which is also the whole of the bare alias form
+/// (`alias/<name>`) `Provider$keyArn` accepts beside an ARN.
+const KMS_ALIAS_PREFIX: &str = "alias/";

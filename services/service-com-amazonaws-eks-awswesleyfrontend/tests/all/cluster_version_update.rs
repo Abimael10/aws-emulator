@@ -28,10 +28,11 @@
 use std::time::{Duration, SystemTime};
 
 use service_com_amazonaws_eks_awswesleyfrontend::state::{
-    offers_cluster_version, ComAmazonawsEksAwswesleyfrontendState, CLUSTER_ACTIVATION_DELAY,
-    MAX_ROLLBACK_TIMEOUT_MINUTES, MIN_ROLLBACK_TIMEOUT_MINUTES, PLATFORM_VERSION, STATUS_ACTIVE,
-    STATUS_UPDATING, UPDATE_COMPLETION_DELAY, UPDATE_IN_PROGRESS, UPDATE_SUCCESSFUL,
-    UPDATE_TYPE_VERSION, UPDATE_TYPE_VERSION_ROLLBACK,
+    offers_cluster_version, unsupported_minor_version_update_message,
+    ComAmazonawsEksAwswesleyfrontendState, CLUSTER_ACTIVATION_DELAY, MAX_ROLLBACK_TIMEOUT_MINUTES,
+    MIN_ROLLBACK_TIMEOUT_MINUTES, PLATFORM_VERSION, STATUS_ACTIVE, STATUS_UPDATING,
+    UNSUPPORTED_KUBERNETES_VERSION_MESSAGE, UPDATE_COMPLETION_DELAY, UPDATE_IN_PROGRESS,
+    UPDATE_SUCCESSFUL, UPDATE_TYPE_VERSION, UPDATE_TYPE_VERSION_ROLLBACK,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -470,6 +471,129 @@ async fn a_version_this_service_does_not_offer_or_a_move_of_more_than_one_minor_
         "InvalidParameterException",
         "case \"a patch version rather than a minor version\": expected \
          InvalidParameterException for {patch:?}, got {answer:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RULE: a target version this service publishes no control plane for is refused 400
+// `InvalidParameterException` with the fixed phrase this API states for it ALONE —
+// the message carries neither the version that was asked for nor the versions the
+// calendar does offer, which a caller reads from `DescribeClusterVersions` itself.
+// A version OF the published release line that is further than one minor release
+// from the cluster's own is a refusal of the MOVE instead, which states its two
+// ends.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_version_the_service_does_not_offer_is_refused_in_the_fixed_phrase_alone() {
+    let (router, engine) = emulator_with_engine();
+    // The phrase as Amazon EKS words it — lower case, no version, no catalogue —
+    // anchored here so a re-wording of the constant the rows are keyed by is caught on
+    // the wire text itself.
+    assert_eq!(
+        UNSUPPORTED_KUBERNETES_VERSION_MESSAGE, "unsupported Kubernetes version",
+        "the unsupported-version phrase must stay the one Amazon EKS states"
+    );
+    let published = published_versions(&engine);
+    let newest = published
+        .first()
+        .expect("the calendar publishes a version")
+        .clone();
+    create_cluster(&router, "phrase-cluster", Some(&newest)).await;
+    settle_creation().await;
+
+    // The rows differ along HOW the requested version names no control plane of this
+    // service: a major release line the calendar carries nothing of, a patch version
+    // of an offered one, a prefixed one, a major version alone, a word, and the empty
+    // string.
+    let rows: Vec<(&str, String)> = vec![
+        ("a release line nothing publishes", "9.99".to_string()),
+        ("another release line, one minor up", "2.1".to_string()),
+        ("a patch version of an offered one", format!("{newest}.0")),
+        ("a prefixed version", format!("v{newest}")),
+        ("a major version alone", "1".to_string()),
+        ("a word", "latest".to_string()),
+        ("the empty string", String::new()),
+    ];
+
+    for (case, version) in &rows {
+        let answer =
+            update_version(&router, "phrase-cluster", &serde_json::json!({ "version": version }))
+                .await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: expected HTTP 400 for {version:?}, got {answer:?}"
+        );
+        assert_eq!(
+            error_code(&answer),
+            "InvalidParameterException",
+            "case {case:?}: expected InvalidParameterException for {version:?}, got {:?}",
+            error_code(&answer)
+        );
+        assert_eq!(
+            answer.message(),
+            UNSUPPORTED_KUBERNETES_VERSION_MESSAGE,
+            "case {case:?}: expected the fixed phrase alone for {version:?}, got {:?}",
+            answer.message()
+        );
+        // Nothing of this service's own state is published in the refusal: not one
+        // version of the calendar it offers.
+        for offered in &published {
+            assert!(
+                !answer.message().contains(offered.as_str()),
+                "case {case:?}: the refusal must not publish the offered version \
+                 {offered:?}, got {:?}",
+                answer.message()
+            );
+        }
+    }
+
+    // A version OF the line this service publishes, further than one minor release
+    // away — including ones the calendar no longer carries at all — is refused as the
+    // MOVE it asks for, naming the version the cluster runs and the one asked for.
+    let (older_major, _) = newest
+        .split_once('.')
+        .expect("a published version is major.minor");
+    for (case, version) in [
+        ("a retired minor version", format!("{older_major}.15")),
+        ("a minor version far ahead", format!("{older_major}.99")),
+    ] {
+        let answer =
+            update_version(&router, "phrase-cluster", &serde_json::json!({ "version": version }))
+                .await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: expected HTTP 400 for {version:?}, got {answer:?}"
+        );
+        assert_eq!(
+            error_code(&answer),
+            "InvalidParameterException",
+            "case {case:?}: expected InvalidParameterException for {version:?}, got {:?}",
+            error_code(&answer)
+        );
+        assert_eq!(
+            answer.message(),
+            unsupported_minor_version_update_message(&newest, &version),
+            "case {case:?}: expected the move's own sentence, got {:?}",
+            answer.message()
+        );
+    }
+
+    // CONTROL: the neighbour version the calendar DOES offer is accepted, so the
+    // refusals above are about the version and the move rather than about the call.
+    let neighbour = published
+        .get(1)
+        .expect("the calendar publishes a second version")
+        .clone();
+    let accepted = update_version(
+        &router,
+        "phrase-cluster",
+        &serde_json::json!({ "version": neighbour }),
+    )
+    .await;
+    assert_eq!(
+        accepted.status, 200,
+        "case \"the neighbour version the calendar offers\": expected 200, got {accepted:?}"
     );
 }
 

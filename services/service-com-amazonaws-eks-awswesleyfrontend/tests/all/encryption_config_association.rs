@@ -16,7 +16,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use service_com_amazonaws_eks_awswesleyfrontend::state::{
-    CLUSTER_ACTIVATION_DELAY, UPDATE_COMPLETION_DELAY,
+    unsupported_encryption_resource, CLUSTER_ACTIVATION_DELAY, ENCRYPTION_ALREADY_ENABLED,
+    ENCRYPTION_KEY_ARN_INVALID, UPDATE_COMPLETION_DELAY,
 };
 use service_com_amazonaws_eks_awswesleyfrontend::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -558,13 +559,25 @@ async fn an_association_against_a_cluster_this_region_does_not_hold_is_not_found
 // RULE: an `encryptionConfig` that does not name exactly one KMS key the cluster
 // can use — "ARN or alias of the KMS key", in the cluster's own region, encrypting
 // only `secrets` — is refused with 400 `InvalidParameterException` and nothing is
-// persisted.
+// persisted. Every way the `keyArn` fails to reference such a key earns the ONE
+// sentence this API states for that member ([`ENCRYPTION_KEY_ARN_INVALID`]), which
+// echoes nothing the request carried; the `resources` member has its own.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn an_invalid_encryption_config_is_refused_and_persists_nothing() {
     let router = emulator();
     let name = "validation";
+    // The two sentences as Amazon EKS words them, anchored here so a re-wording of the
+    // constants the rows below are keyed by is caught on the wire text itself.
+    assert_eq!(
+        ENCRYPTION_KEY_ARN_INVALID, "The keyArn for encryptionConfig is invalid.",
+        "the keyArn sentence must stay the one Amazon EKS states"
+    );
+    assert_eq!(
+        ENCRYPTION_ALREADY_ENABLED, "Encryption is already enabled on the cluster",
+        "the already-enabled sentence must stay the one Amazon EKS states"
+    );
     let created = create(&router, name).await;
     assert_eq!(
         created.status, 200,
@@ -576,51 +589,71 @@ async fn an_invalid_encryption_config_is_refused_and_persists_nothing() {
     // of entries, no key named at all, a key reference that is not one of the two
     // documented forms, a key outside the cluster's region, and a resource the
     // member does not support.
-    let cases: Vec<(&str, serde_json::Value)> = vec![
-        ("no entry at all", serde_json::json!([])),
+    let cases: Vec<(&str, serde_json::Value, String)> = vec![
+        (
+            "no entry at all",
+            serde_json::json!([]),
+            ENCRYPTION_KEY_ARN_INVALID.to_string(),
+        ),
         (
             "an entry with no provider",
             serde_json::json!([{ "resources": ["secrets"] }]),
+            ENCRYPTION_KEY_ARN_INVALID.to_string(),
         ),
         (
             "an entry whose provider names no key",
             serde_json::json!([{ "provider": {} }]),
+            ENCRYPTION_KEY_ARN_INVALID.to_string(),
         ),
         (
             "a blank keyArn",
             serde_json::json!([{ "provider": { "keyArn": "   " } }]),
+            ENCRYPTION_KEY_ARN_INVALID.to_string(),
         ),
         (
             "a keyArn that is not an ARN or an alias",
             serde_json::json!([{ "provider": { "keyArn": "my-kms-key" } }]),
+            ENCRYPTION_KEY_ARN_INVALID.to_string(),
         ),
         (
             "a bare key id, which is neither the ARN nor the alias form",
             serde_json::json!([{
                 "provider": { "keyArn": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d" },
             }]),
+            ENCRYPTION_KEY_ARN_INVALID.to_string(),
         ),
         (
             "an ARN of another service",
             serde_json::json!([{
                 "provider": { "keyArn": format!("arn:aws:s3:{REGION}:000000000000:bucket/keys") },
             }]),
+            ENCRYPTION_KEY_ARN_INVALID.to_string(),
         ),
         (
             "a KMS ARN naming no key resource",
             serde_json::json!([{
                 "provider": { "keyArn": format!("arn:aws:kms:{REGION}:000000000000:key/") },
             }]),
+            ENCRYPTION_KEY_ARN_INVALID.to_string(),
         ),
         (
             "a KMS ARN with no account",
             serde_json::json!([{
                 "provider": { "keyArn": format!("arn:aws:kms:{REGION}::key/abcd") },
             }]),
+            ENCRYPTION_KEY_ARN_INVALID.to_string(),
+        ),
+        (
+            "a KMS ARN with no partition",
+            serde_json::json!([{
+                "provider": { "keyArn": format!("arn::kms:{REGION}:000000000000:key/abcd") },
+            }]),
+            ENCRYPTION_KEY_ARN_INVALID.to_string(),
         ),
         (
             "an empty alias name",
             serde_json::json!([{ "provider": { "keyArn": "alias/" } }]),
+            ENCRYPTION_KEY_ARN_INVALID.to_string(),
         ),
         (
             "a key in another region than the cluster",
@@ -628,6 +661,14 @@ async fn an_invalid_encryption_config_is_refused_and_persists_nothing() {
                 "resources": ["secrets"],
                 "provider": { "keyArn": key_arn_in("eu-west-1") },
             }]),
+            ENCRYPTION_KEY_ARN_INVALID.to_string(),
+        ),
+        (
+            "an alias ARN in another region than the cluster",
+            serde_json::json!([{
+                "provider": { "keyArn": "arn:aws:kms:eu-west-1:000000000000:alias/eks-secrets" },
+            }]),
+            ENCRYPTION_KEY_ARN_INVALID.to_string(),
         ),
         (
             "a resources value other than secrets",
@@ -635,6 +676,7 @@ async fn an_invalid_encryption_config_is_refused_and_persists_nothing() {
                 "resources": ["configmaps"],
                 "provider": { "keyArn": key_arn_in(REGION) },
             }]),
+            unsupported_encryption_resource("configmaps"),
         ),
         (
             "secrets plus an unsupported resource",
@@ -642,10 +684,11 @@ async fn an_invalid_encryption_config_is_refused_and_persists_nothing() {
                 "resources": ["secrets", "configmaps"],
                 "provider": { "keyArn": key_arn_in(REGION) },
             }]),
+            unsupported_encryption_resource("configmaps"),
         ),
     ];
 
-    for (case, encryption_config) in &cases {
+    for (case, encryption_config, expected) in &cases {
         let answer = associate(&router, name, &association_of(encryption_config.clone())).await;
         assert_eq!(
             answer.status, 400,
@@ -655,6 +698,12 @@ async fn an_invalid_encryption_config_is_refused_and_persists_nothing() {
             answer.error_type.as_deref(),
             Some("InvalidParameterException"),
             "case {case:?}: expected InvalidParameterException, got {answer:?}"
+        );
+        assert_eq!(
+            answer.body["message"].as_str(),
+            Some(expected.as_str()),
+            "case {case:?}: expected the sentence {expected:?}, got {:?}",
+            answer.body["message"]
         );
 
         // Nothing was started and nothing was stored: the cluster is still ACTIVE
@@ -691,11 +740,166 @@ async fn an_invalid_encryption_config_is_refused_and_persists_nothing() {
 }
 
 // ---------------------------------------------------------------------------
+// RULE (the same one, on the other operation that takes the member): a
+// `CreateCluster` whose `encryptionConfig` does not reference a KMS key the cluster
+// could use is refused 400 `InvalidParameterException` with that same fixed sentence
+// and no cluster is created; one that does is created with it and reports it back.
+// ---------------------------------------------------------------------------
+
+/// A `CreateCluster` body carrying `encryption_config`, otherwise the smallest
+/// request this service accepts.
+async fn create_with(
+    router: &MultiServiceRouter,
+    name: &str,
+    encryption_config: serde_json::Value,
+) -> Answer {
+    let mut body = create_request(name);
+    body["encryptionConfig"] = encryption_config;
+    call(router, REGION, "POST", "/clusters", &body.to_string()).await
+}
+
+#[tokio::test]
+async fn a_create_judges_its_encryption_config_by_the_same_rule() {
+    let router = emulator();
+
+    // The rows differ along HOW the member fails to reference a usable key: no
+    // provider, a value that is no key reference at all, an ARN of another service,
+    // an alias with no name, and a key of another Region.
+    let refused: Vec<(&str, serde_json::Value)> = vec![
+        (
+            "an entry with no provider",
+            serde_json::json!([{ "resources": ["secrets"] }]),
+        ),
+        (
+            "a keyArn that is not an ARN or an alias",
+            serde_json::json!([{ "provider": { "keyArn": "not-a-kms-arn" } }]),
+        ),
+        (
+            "an ARN of another service",
+            serde_json::json!([{
+                "provider": { "keyArn": format!("arn:aws:s3:{REGION}:000000000000:bucket/keys") },
+            }]),
+        ),
+        (
+            "an empty alias name",
+            serde_json::json!([{ "provider": { "keyArn": "alias/" } }]),
+        ),
+        (
+            "a key in another region than the cluster",
+            serde_json::json!([{
+                "resources": ["secrets"],
+                "provider": { "keyArn": key_arn_in("eu-west-1") },
+            }]),
+        ),
+    ];
+
+    for (index, (case, encryption_config)) in refused.iter().enumerate() {
+        let name = format!("create-enc-bad-{index}");
+        let answer = create_with(&router, &name, encryption_config.clone()).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: expected 400 from CreateCluster, got {answer:?}"
+        );
+        assert_eq!(
+            answer.error_type.as_deref(),
+            Some("InvalidParameterException"),
+            "case {case:?}: expected InvalidParameterException, got {answer:?}"
+        );
+        assert_eq!(
+            answer.body["message"].as_str(),
+            Some(ENCRYPTION_KEY_ARN_INVALID),
+            "case {case:?}: expected the keyArn sentence, got {:?}",
+            answer.body["message"]
+        );
+        // A refused create writes nothing: no cluster of that name exists.
+        let described = describe(&router, &name).await;
+        assert_eq!(
+            described.status, 404,
+            "case {case:?}: a refused create must leave no cluster, got {described:?}"
+        );
+    }
+
+    // The forms `Provider$keyArn` documents — "Amazon Resource Name (ARN) or alias of
+    // the KMS key" — are each created with and read back off the cluster.
+    let accepted: Vec<(&str, serde_json::Value)> = vec![
+        (
+            "a key ARN in the cluster's region",
+            serde_json::json!([{
+                "resources": ["secrets"],
+                "provider": { "keyArn": key_arn_in(REGION) },
+            }]),
+        ),
+        (
+            "an alias ARN in the cluster's region",
+            serde_json::json!([{
+                "provider": { "keyArn": format!("arn:aws:kms:{REGION}:000000000000:alias/eks-secrets") },
+            }]),
+        ),
+        (
+            "a bare alias name",
+            serde_json::json!([{ "provider": { "keyArn": "alias/eks-secrets" } }]),
+        ),
+    ];
+
+    for (index, (case, encryption_config)) in accepted.iter().enumerate() {
+        let name = format!("create-enc-ok-{index}");
+        let answer = create_with(&router, &name, encryption_config.clone()).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: expected 200 from CreateCluster, got {answer:?}"
+        );
+        let described = describe(&router, &name).await;
+        assert_eq!(
+            described.cluster()["encryptionConfig"],
+            *encryption_config,
+            "case {case:?}: expected the created configuration to read back, got {:?}",
+            described.cluster()["encryptionConfig"]
+        );
+    }
+
+    // `EncryptionConfigList` is modelled `len 0..1` and the member is OPTIONAL on a
+    // create, so an EMPTY list names no configuration at all: the same request as one
+    // that omits the member, which creates a cluster with no secret encryption rather
+    // than refusing the key it never named. The cluster then reports none — and takes an
+    // association later, which is what says nothing was stored for it.
+    let empty = create_with(&router, "create-enc-empty", serde_json::json!([])).await;
+    assert_eq!(
+        empty.status, 200,
+        "case \"an empty encryptionConfig\": expected 200 from CreateCluster, got {empty:?}"
+    );
+    let described = describe(&router, "create-enc-empty").await;
+    assert_eq!(
+        described.cluster()["encryptionConfig"],
+        serde_json::Value::Null,
+        "case \"an empty encryptionConfig\": expected no configuration on the cluster, got {:?}",
+        described.cluster()["encryptionConfig"]
+    );
+    settle_creation().await;
+    let associated = associate(
+        &router,
+        "create-enc-empty",
+        &association_of(serde_json::json!([{
+            "resources": ["secrets"],
+            "provider": { "keyArn": key_arn_in(REGION) },
+        }])),
+    )
+    .await;
+    assert_eq!(
+        associated.status, 200,
+        "case \"an empty encryptionConfig\": the cluster must still take an association, \
+         got {associated:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // RULE: a cluster takes one encryption association at a time and only once — it must
-// be ACTIVE to take one (else 400 `InvalidRequestException`), another cannot start
-// while one is in flight (409 `ResourceInUseException`), none can start once
-// encryption is enabled (400 `InvalidRequestException`), and a retry carrying the
-// same `clientRequestToken` is answered with the update it already started.
+// be ACTIVE to take one (else 400 `InvalidRequestException`, a state a caller can
+// wait out), another cannot start while one is in flight (409
+// `ResourceInUseException`), none can start once encryption is enabled (400
+// `InvalidParameterException` with EKS's fixed sentence, because no wait makes that
+// request succeed — the `encryptionConfig` it carries is what must go), and a retry
+// carrying the same `clientRequestToken` is answered with the update it already
+// started.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -814,8 +1018,14 @@ async fn a_cluster_takes_one_encryption_association_at_a_time_and_only_once() {
         );
         assert_eq!(
             refused.error_type.as_deref(),
-            Some("InvalidRequestException"),
-            "case {case:?}: expected InvalidRequestException, got {refused:?}"
+            Some("InvalidParameterException"),
+            "case {case:?}: expected InvalidParameterException, got {refused:?}"
+        );
+        assert_eq!(
+            refused.body["message"].as_str(),
+            Some(ENCRYPTION_ALREADY_ENABLED),
+            "case {case:?}: expected the already-enabled sentence, got {:?}",
+            refused.body["message"]
         );
     }
 

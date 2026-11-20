@@ -16,7 +16,9 @@ use service_com_amazonaws_eks_awswesleyfrontend::state::{
     service_state, DEFAULT_AMI_TYPE, DEFAULT_CAPACITY_TYPE, DEFAULT_DISK_SIZE_GIB,
     DEFAULT_INSTANCE_TYPE, DEFAULT_MAX_UNAVAILABLE, DEFAULT_SCALING_DESIRED_SIZE,
     DEFAULT_SCALING_MAX_SIZE, DEFAULT_SCALING_MIN_SIZE, DEFAULT_WINDOWS_DISK_SIZE_GIB,
-    MAX_INSTANCE_TYPES, MAX_NODEGROUPS_PER_CLUSTER, MIN_DISK_SIZE_GIB, NODEGROUP_ACTIVATION_DELAY,
+    DESIRED_SIZE_ABOVE_MAX_SIZE_MESSAGE, DISK_SIZE_MUST_BE_POSITIVE_MESSAGE, MAX_INSTANCE_TYPES,
+    MAX_NODEGROUPS_PER_CLUSTER, MIN_DISK_SIZE_GIB, MIN_SIZE_ABOVE_DESIRED_SIZE_MESSAGE,
+    NODEGROUP_ACTIVATION_DELAY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -1081,6 +1083,197 @@ async fn the_documented_request_rules_are_enforced() {
                 described.status, 404,
                 "case {case:?}: a refused create must store nothing, got {described:?}"
             );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RULE: the two `CreateNodegroup` members with a bound this API words itself —
+// `diskSize` and the `scalingConfig` triple — are refused in EKS's own sentence for
+// the rule that was broken: one fixed sentence for a non-positive disk, and one per
+// violated scaling relation, each naming the two members of that relation and no
+// number. Nothing is stored.
+// ---------------------------------------------------------------------------
+
+/// One row: the members the request adds to the smallest accepted one, and the
+/// sentence it earns — `None` for a request that must be ACCEPTED, which is what
+/// keeps each refusal about the relation rather than about the member being present.
+struct RefusalCase {
+    case: &'static str,
+    members: serde_json::Value,
+    refusal: Option<&'static str>,
+}
+
+/// The rows differ along which bound is broken, the magnitude of the values, the
+/// ordering of the triple, and the boundary values on each published bound.
+///
+/// Source for the sentences: `state::DISK_SIZE_MUST_BE_POSITIVE_MESSAGE`,
+/// `state::MIN_SIZE_ABOVE_DESIRED_SIZE_MESSAGE` and
+/// `state::DESIRED_SIZE_ABOVE_MAX_SIZE_MESSAGE`, the rules
+/// `CreateNodegroupRequest$diskSize` and `NodegroupScalingConfig$desiredSize` state.
+fn member_bound_rows() -> Vec<RefusalCase> {
+    vec![
+        RefusalCase {
+            case: "a zero GiB disk, one past the published floor",
+            members: serde_json::json!({ "diskSize": 0 }),
+            refusal: Some(DISK_SIZE_MUST_BE_POSITIVE_MESSAGE),
+        },
+        RefusalCase {
+            case: "a disk of minus one GiB",
+            members: serde_json::json!({ "diskSize": -1 }),
+            refusal: Some(DISK_SIZE_MUST_BE_POSITIVE_MESSAGE),
+        },
+        RefusalCase {
+            case: "a disk of minus one thousand GiB",
+            members: serde_json::json!({ "diskSize": -1000 }),
+            refusal: Some(DISK_SIZE_MUST_BE_POSITIVE_MESSAGE),
+        },
+        RefusalCase {
+            case: "a disk of exactly the published floor",
+            members: serde_json::json!({ "diskSize": MIN_DISK_SIZE_GIB }),
+            refusal: None,
+        },
+        RefusalCase {
+            case: "a three-digit disk",
+            members: serde_json::json!({ "diskSize": 300 }),
+            refusal: None,
+        },
+        RefusalCase {
+            case: "the desired size one above the maximum",
+            members: serde_json::json!({
+                "scalingConfig": { "minSize": 1, "maxSize": 3, "desiredSize": 4 },
+            }),
+            refusal: Some(DESIRED_SIZE_ABOVE_MAX_SIZE_MESSAGE),
+        },
+        RefusalCase {
+            case: "the desired size far above the maximum",
+            members: serde_json::json!({
+                "scalingConfig": { "minSize": 2, "maxSize": 3, "desiredSize": 9 },
+            }),
+            refusal: Some(DESIRED_SIZE_ABOVE_MAX_SIZE_MESSAGE),
+        },
+        RefusalCase {
+            case: "three-digit capacities, the desired size above the maximum",
+            members: serde_json::json!({
+                "scalingConfig": { "minSize": 100, "maxSize": 200, "desiredSize": 400 },
+            }),
+            refusal: Some(DESIRED_SIZE_ABOVE_MAX_SIZE_MESSAGE),
+        },
+        RefusalCase {
+            case: "the minimum one above the desired size",
+            members: serde_json::json!({
+                "scalingConfig": { "minSize": 2, "maxSize": 3, "desiredSize": 1 },
+            }),
+            refusal: Some(MIN_SIZE_ABOVE_DESIRED_SIZE_MESSAGE),
+        },
+        RefusalCase {
+            case: "a desired size of zero, below the minimum",
+            members: serde_json::json!({
+                "scalingConfig": { "minSize": 1, "maxSize": 3, "desiredSize": 0 },
+            }),
+            refusal: Some(MIN_SIZE_ABOVE_DESIRED_SIZE_MESSAGE),
+        },
+        // Both relations are broken at once: the lower one is the one reported, so
+        // which sentence a caller gets is a fact about the rule and not about the row.
+        RefusalCase {
+            case: "the minimum above the desired size and the desired size above the maximum",
+            members: serde_json::json!({
+                "scalingConfig": { "minSize": 5, "maxSize": 2, "desiredSize": 3 },
+            }),
+            refusal: Some(MIN_SIZE_ABOVE_DESIRED_SIZE_MESSAGE),
+        },
+        RefusalCase {
+            case: "the desired size exactly on the lower bound",
+            members: serde_json::json!({
+                "scalingConfig": { "minSize": 2, "maxSize": 4, "desiredSize": 2 },
+            }),
+            refusal: None,
+        },
+        RefusalCase {
+            case: "the desired size exactly on the upper bound",
+            members: serde_json::json!({
+                "scalingConfig": { "minSize": 0, "maxSize": 2, "desiredSize": 2 },
+            }),
+            refusal: None,
+        },
+        RefusalCase {
+            case: "all three capacities equal",
+            members: serde_json::json!({
+                "scalingConfig": { "minSize": 3, "maxSize": 3, "desiredSize": 3 },
+            }),
+            refusal: None,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_create_states_eks_sentence_for_the_member_bound_it_broke() {
+    let router = emulator();
+    // The three sentences as Amazon EKS words them, anchored here so a re-wording of
+    // the constants the rows are keyed by is caught on the wire text itself.
+    assert_eq!(
+        DISK_SIZE_MUST_BE_POSITIVE_MESSAGE, "diskSize must be > 0",
+        "the diskSize sentence must stay the one Amazon EKS states"
+    );
+    assert_eq!(
+        MIN_SIZE_ABOVE_DESIRED_SIZE_MESSAGE, "minSize can't be greater than desiredSize",
+        "the minSize sentence must stay the one Amazon EKS states"
+    );
+    assert_eq!(
+        DESIRED_SIZE_ABOVE_MAX_SIZE_MESSAGE, "desiredSize can't be greater than maxSize",
+        "the desiredSize sentence must stay the one Amazon EKS states"
+    );
+    create_cluster(&router, "bound-cluster").await;
+
+    for (index, row) in member_bound_rows().into_iter().enumerate() {
+        let name = format!("bound-{index}");
+        let mut body = minimal_request(&name);
+        let (Some(object), Some(members)) = (body.as_object_mut(), row.members.as_object()) else {
+            panic!("case {:?}: the row's members are a JSON object", row.case);
+        };
+        for (member, value) in members {
+            object.insert(member.clone(), value.clone());
+        }
+
+        let answer = create_nodegroup(&router, "bound-cluster", &body).await;
+        let case = row.case;
+        match row.refusal {
+            Some(expected) => {
+                assert_eq!(
+                    answer.status, 400,
+                    "case {case:?}: expected 400 from CreateNodegroup, got {answer:?}"
+                );
+                assert_eq!(
+                    answer.error_type.as_deref(),
+                    Some("InvalidParameterException"),
+                    "case {case:?}: expected InvalidParameterException, got {answer:?}"
+                );
+                assert_eq!(
+                    answer.message(),
+                    expected,
+                    "case {case:?}: expected the sentence {expected:?}, got {:?}",
+                    answer.message()
+                );
+                // A refused create stores nothing.
+                let described = describe_nodegroup(&router, "bound-cluster", &name).await;
+                assert_eq!(
+                    described.status, 404,
+                    "case {case:?}: a refused create must store nothing, got {described:?}"
+                );
+            }
+            None => {
+                assert_eq!(
+                    answer.status, 200,
+                    "case {case:?}: a request inside both bounds must be accepted, got \
+                     {answer:?} ({})",
+                    answer.message()
+                );
+                let described = describe_nodegroup(&router, "bound-cluster", &name).await;
+                assert_eq!(
+                    described.status, 200,
+                    "case {case:?}: an accepted node group reads back, got {described:?}"
+                );
+            }
         }
     }
 }

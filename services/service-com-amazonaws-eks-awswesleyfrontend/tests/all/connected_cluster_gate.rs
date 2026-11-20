@@ -265,6 +265,12 @@ fn probes(cluster: &str) -> Vec<Probe> {
             .to_string(),
         ),
         probe(
+            "ListIdentityProviderConfigs",
+            "GET",
+            format!("/clusters/{label}/identity-provider-configs"),
+            String::new(),
+        ),
+        probe(
             "CreatePodIdentityAssociation",
             "POST",
             format!("/clusters/{label}/pod-identity-associations"),

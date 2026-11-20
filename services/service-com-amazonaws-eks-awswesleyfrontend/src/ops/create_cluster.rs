@@ -503,6 +503,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The KMS key the cluster's secrets are encrypted with, read through the one
+        // reading of that member this service has
+        // ([`state::encryption_config_key_arn`], shared with
+        // `AssociateEncryptionConfig`): "Amazon Resource Name (ARN) or alias of the KMS
+        // key", created "in the same Amazon Web Services Region as the cluster". A
+        // value that references no such key is refused with the sentence this API
+        // states for it, and nothing is written — a cluster whose secrets no key can
+        // encrypt is not one this service provisions.
+        //
+        // `encryptionConfig` is OPTIONAL here, and `EncryptionConfigList` is modelled
+        // `len 0..1`: an empty list names no configuration at all, which on a create is
+        // the same request as one that omits the member — a cluster created with no
+        // secret encryption — so there is no key to judge. On
+        // `AssociateEncryptionConfig`, where the member is `@required` because the
+        // whole call is the association, that same empty list names the key the call
+        // exists to supply and is refused there.
+        let requested_encryption = input
+            .encryption_config
+            .as_deref()
+            .filter(|entries| !entries.is_empty());
+        if let Some(entries) = requested_encryption {
+            if let Err(why) = state::encryption_config_key_arn(entries, &region) {
+                return Err(invalid_parameter(&input.name, why));
+            }
+        }
+
         // "The desired Kubernetes version for your cluster": a version Amazon EKS
         // offers a control plane for, which is a released row of the calendar this
         // service publishes through `DescribeClusterVersions`

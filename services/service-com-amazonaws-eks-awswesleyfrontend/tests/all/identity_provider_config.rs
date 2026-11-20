@@ -952,8 +952,9 @@ async fn a_cluster_takes_one_association_at_a_time() {
 
 // ---------------------------------------------------------------------------
 // RULE: a read addresses a configuration by the `type`/`name` pair of
-// `IdentityProviderConfig`; `oidc` is the only type this API defines, and a name the
-// cluster does not carry is not found.
+// `IdentityProviderConfig`; `oidc` is the only type this API defines, so a pair whose
+// type or whose name the cluster carries no configuration under names a resource that
+// does not exist and is not found.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -994,15 +995,15 @@ async fn a_read_addresses_a_configuration_by_type_and_name() {
             "a type this API does not define",
             "saml",
             "addressed",
-            400,
-            "InvalidParameterException",
+            404,
+            "ResourceNotFoundException",
         ),
         (
             "an empty type",
             "",
             "addressed",
-            400,
-            "InvalidParameterException",
+            404,
+            "ResourceNotFoundException",
         ),
         (
             "the documented type and a name the cluster does not carry",
@@ -1096,4 +1097,199 @@ async fn the_ceiling_bounds_how_many_configurations_one_cluster_holds() {
         "case \"one past the ceiling\": the refused association stored nothing, got \
          {described:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// RULE: `ListIdentityProviderConfigs` reports the configurations the cluster holds as
+// the `(type, name)` pairs that address them — every one that was associated, none
+// that was not, in pages of at most `maxResults` resumed through `nextToken` — and a
+// cluster this Region does not hold is the 404 that names it.
+// ---------------------------------------------------------------------------
+
+async fn list_configs(
+    router: &MultiServiceRouter,
+    cluster: &str,
+    query: &str,
+) -> Answer {
+    call(
+        router,
+        REGION,
+        "GET",
+        &format!(
+            "/clusters/{}/identity-provider-configs{query}",
+            encode_label(cluster)
+        ),
+        "",
+    )
+    .await
+}
+
+/// The `(type, name)` pairs an answer lists, in the order it listed them.
+fn listed_pairs(answer: &Answer) -> Vec<(String, String)> {
+    answer.body["identityProviderConfigs"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|entry| {
+            (
+                entry["type"].as_str().unwrap_or_default().to_string(),
+                entry["name"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn the_listing_reports_every_configuration_the_cluster_holds() {
+    let router = emulator();
+    let cluster = "idp-listing";
+    active_cluster(&router, cluster).await;
+    // A second cluster with a configuration of its own, so the listing is of ONE
+    // cluster rather than of the store.
+    let other = "idp-listing-other";
+    active_cluster(&router, other).await;
+
+    // Before anything is associated the cluster holds none: an empty page, not a
+    // refusal, and no token to resume from.
+    let empty = list_configs(&router, cluster, "").await;
+    assert_eq!(
+        empty.status, 200,
+        "case \"a cluster that holds none\": expected 200, got {empty:?}"
+    );
+    assert_eq!(
+        listed_pairs(&empty),
+        Vec::new(),
+        "case \"a cluster that holds none\": expected an empty listing, got {empty:?}"
+    );
+    assert_eq!(
+        empty.body["nextToken"],
+        serde_json::Value::Null,
+        "case \"a cluster that holds none\": expected no token, got {:?}",
+        empty.body["nextToken"]
+    );
+
+    // The names differ in length and ordering relative to each other, so a page
+    // boundary is not the order they were created in.
+    let names = ["zeta-provider", "alpha-provider", "mid"];
+    for name in names {
+        let answer = associate(
+            &router,
+            cluster,
+            &serde_json::json!({ "oidc": minimal_oidc(name) }),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "setup {name:?}: expected 200 from the association, got {answer:?}"
+        );
+        settle_update().await;
+    }
+    let elsewhere = associate(
+        &router,
+        other,
+        &serde_json::json!({ "oidc": minimal_oidc("elsewhere") }),
+    )
+    .await;
+    assert_eq!(
+        elsewhere.status, 200,
+        "setup: the other cluster's association must succeed, got {elsewhere:?}"
+    );
+    settle_update().await;
+
+    // A whole page: every configuration of this cluster and nothing of the other's,
+    // each reported as the pair `DescribeIdentityProviderConfig` resolves one by.
+    let mut expected: Vec<(String, String)> = names
+        .iter()
+        .map(|name| ("oidc".to_string(), (*name).to_string()))
+        .collect();
+    expected.sort();
+    let listed = list_configs(&router, cluster, "").await;
+    assert_eq!(
+        listed.status, 200,
+        "case \"the whole listing\": expected 200, got {listed:?}"
+    );
+    assert_eq!(
+        listed_pairs(&listed),
+        expected,
+        "case \"the whole listing\": expected every associated pair, got {listed:?}"
+    );
+    assert_eq!(
+        listed.body["nextToken"],
+        serde_json::Value::Null,
+        "case \"the whole listing\": a complete page carries no token, got {:?}",
+        listed.body["nextToken"]
+    );
+
+    // And each listed pair resolves through the read, so the listing addresses the
+    // configurations it reports rather than describing them.
+    for (config_type, name) in listed_pairs(&listed) {
+        let read = describe_config(&router, cluster, &config_type, &name).await;
+        assert_eq!(
+            read.status, 200,
+            "case {name:?}: a listed pair must resolve through the read, got {read:?}"
+        );
+    }
+
+    // Paged, one page size per row: the pages concatenate to the whole listing and
+    // each page is at most the size asked for.
+    for page_size in [1usize, 2, 3] {
+        let mut walked: Vec<(String, String)> = Vec::new();
+        let mut query = format!("?maxResults={page_size}");
+        loop {
+            let page = list_configs(&router, cluster, &query).await;
+            assert_eq!(
+                page.status, 200,
+                "case \"pages of {page_size}\": expected 200, got {page:?}"
+            );
+            let pairs = listed_pairs(&page);
+            assert!(
+                pairs.len() <= page_size,
+                "case \"pages of {page_size}\": a page carries at most that many, got \
+                 {pairs:?}"
+            );
+            walked.extend(pairs);
+            match page.body["nextToken"].as_str() {
+                Some(token) => query = format!("?maxResults={page_size}&nextToken={token}"),
+                None => break,
+            }
+        }
+        assert_eq!(
+            walked, expected,
+            "case \"pages of {page_size}\": the pages must concatenate to the whole \
+             listing, got {walked:?}"
+        );
+    }
+
+    // A token this listing never minted names no page to resume from.
+    let forged = list_configs(&router, cluster, "?nextToken=not-a-token").await;
+    assert_eq!(
+        forged.status, 400,
+        "case \"a forged token\": expected HTTP 400, got {forged:?}"
+    );
+    assert!(
+        forged
+            .error_type
+            .as_deref()
+            .is_some_and(|actual| actual.ends_with("InvalidParameterException")),
+        "case \"a forged token\": expected InvalidParameterException, got {forged:?}"
+    );
+
+    // And the cluster half: a name this Region does not hold is the 404 that names it.
+    for (case, cluster) in [
+        ("a cluster nothing holds", "idp-listing-absent"),
+        ("a name differing only in case", "IDP-LISTING"),
+    ] {
+        let answer = list_configs(&router, cluster, "").await;
+        assert_eq!(
+            answer.status, 404,
+            "case {case:?}: expected HTTP 404, got {answer:?}"
+        );
+        assert_eq!(
+            answer.body["clusterName"].as_str(),
+            Some(cluster),
+            "case {case:?}: the payload names the cluster it could not resolve, got {:?}",
+            answer.body["clusterName"]
+        );
+    }
 }

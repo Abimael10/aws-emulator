@@ -480,15 +480,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The root device disk size (in GiB) for your node group instances"
         // (`CreateNodegroupRequest$diskSize`) — a disk is at least one GiB. The
         // member is a `BoxedInteger` with no modelled range, so a zero or
-        // negative size reaches this handler.
+        // negative size reaches this handler, and the sentence it earns is the one
+        // this API states for that bound
+        // ([`state::DISK_SIZE_MUST_BE_POSITIVE_MESSAGE`]).
         if let Some(disk_size) = input.disk_size {
             if disk_size < MIN_DISK_SIZE_GIB {
                 return Err(invalid_parameter(
                     cluster_name,
                     nodegroup_name,
-                    format!(
-                        "diskSize must be at least {MIN_DISK_SIZE_GIB} GiB, got {disk_size}"
-                    ),
+                    state::DISK_SIZE_MUST_BE_POSITIVE_MESSAGE.to_string(),
                 ));
             }
         }
@@ -578,19 +578,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // minSize or higher than maxSize" (`NodegroupScalingConfig$desiredSize`),
         // so the three sizes must be ordered for the node group to be scalable
         // at all. Each member's own lower bound is modelled and already refused.
+        // The refusal names the RELATION the triple broke, in the sentence this
+        // API states for it ([`state::scaling_relation_violation`]).
         let min_size = scaling_config.min_size.unwrap_or(DEFAULT_SCALING_MIN_SIZE);
         let max_size = scaling_config.max_size.unwrap_or(DEFAULT_SCALING_MAX_SIZE);
         let desired_size = scaling_config
             .desired_size
             .unwrap_or(DEFAULT_SCALING_DESIRED_SIZE);
-        if min_size > max_size || desired_size < min_size || desired_size > max_size {
+        if let Some(why) = state::scaling_relation_violation(min_size, max_size, desired_size) {
             return Err(invalid_parameter(
                 cluster_name,
                 nodegroup_name,
-                format!(
-                    "scalingConfig must satisfy minSize <= desiredSize <= maxSize, got minSize \
-                     {min_size}, desiredSize {desired_size}, maxSize {max_size}"
-                ),
+                why.to_string(),
             ));
         }
 
