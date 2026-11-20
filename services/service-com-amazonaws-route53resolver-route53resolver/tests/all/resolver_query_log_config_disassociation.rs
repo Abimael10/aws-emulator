@@ -35,7 +35,9 @@ use super::harness::{
     call, emulator, error_type, expect_error, ok, parse_time, string_member, traced_message,
     without_status, Emulator,
 };
-use super::resolver_query_log_config_associations::{association, association_count, config_id};
+use super::resolver_query_log_config_associations::{
+    association, association_count, config_id, config_id_for, DESTINATION_PER_KIND,
+};
 
 /// The longest `ResourceId` there is: 64 characters, the maximum of its length
 /// 1..64.
@@ -135,11 +137,29 @@ struct Fixture {
 }
 
 /// Build one row's configurations and associations on a fresh emulator.
+///
+/// Each configuration delivers to a destination of its own KIND
+/// ([`DESTINATION_PER_KIND`]), because a VPC logs its queries to one destination
+/// of each kind at a time and the rows below associate one VPC with every
+/// configuration they create.
 async fn fixture(row_index: usize, row: &DisassociateCase) -> Fixture {
     let router = emulator();
+    assert!(
+        row.configs <= DESTINATION_PER_KIND.len(),
+        "case {:?}: a row creates at most one configuration per destination kind, it asks for {}",
+        row.case,
+        row.configs
+    );
     let mut configs = Vec::new();
-    for index in 0..row.configs {
-        configs.push(config_id(&router, &format!("disassociate-{row_index}-{index}")).await);
+    for (index, (kind, destination)) in DESTINATION_PER_KIND.iter().take(row.configs).enumerate() {
+        configs.push(
+            config_id_for(
+                &router,
+                &format!("disassociate-{row_index}-{index}-{kind}"),
+                destination,
+            )
+            .await,
+        );
     }
     // Every VPC an associate names is one of the account's own, which the
     // associate resolves against the Amazon EC2 store.

@@ -168,13 +168,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The policy document is checked before the store is touched, so a
         // document outside the policy grammar leaves the configuration with
-        // whatever policy it already carried.
-        if let Some(fault) =
-            crate::state::policy_document_fault(&input.resolver_query_log_config_policy)
-        {
+        // whatever policy it already carried. The document itself is echoed
+        // nowhere: this slice words the fault with its own coded sentence
+        // (`crate::state::invalid_query_log_config_policy`).
+        if crate::state::policy_document_fault(&input.resolver_query_log_config_policy).is_some() {
             return Err(
-                PutResolverQueryLogConfigPolicyErrorModeled::InvalidPolicyDocument(
-                    crate::state::invalid_policy_document(&fault),
+                PutResolverQueryLogConfigPolicyErrorModeled::InvalidRequestException(
+                    crate::state::invalid_query_log_config_policy(),
                 )
                 .into(),
             );

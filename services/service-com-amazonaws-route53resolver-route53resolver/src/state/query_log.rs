@@ -284,6 +284,107 @@ pub fn query_log_access_denied_message() -> String {
     format!("[{RSLVR_CODE_QUERY_LOG_ACCESS_DENIED}] Access denied")
 }
 
+/// The Route 53 Resolver service error code reported when an associate names a
+/// VPC the configuration it names already logs queries for.
+///
+/// Carried for the same reason as [`RSLVR_CODE_QUERY_LOG_CONFIG_NOT_FOUND`]: the
+/// HTTP status (400) and the exception shape name together do not say which
+/// Resolver fault occurred, and the model states no message text, so this code
+/// comes from the recorded response of the associate that refuses a pair it
+/// already holds. See [`query_log_config_vpc_already_associated`].
+pub const RSLVR_CODE_QUERY_LOG_CONFIG_VPC_ALREADY_ASSOCIATED: &str = "RSLVR-01303";
+
+/// The Route 53 Resolver service error code reported when an associate names a
+/// VPC that already logs its queries to the requested KIND of destination,
+/// through another configuration.
+///
+/// Carried for the same reason as
+/// [`RSLVR_CODE_QUERY_LOG_CONFIG_VPC_ALREADY_ASSOCIATED`], and it is what tells
+/// this fault from that one when both answer the one error shape under the one
+/// HTTP status. See [`query_log_destination_type_already_associated`].
+pub const RSLVR_CODE_QUERY_LOG_DESTINATION_TYPE_ALREADY_ASSOCIATED: &str = "RSLVR-01306";
+
+/// The Route 53 Resolver service error code reported when a policy write is
+/// handed a document that is not an IAM policy for sharing a query logging
+/// configuration.
+///
+/// Carried for the same reason as
+/// [`RSLVR_CODE_QUERY_LOG_CONFIG_VPC_ALREADY_ASSOCIATED`]: the code comes from
+/// the recorded response of the query-logging policy write that refuses a
+/// document it cannot attach. See [`invalid_query_log_config_policy`].
+pub const RSLVR_CODE_QUERY_LOG_CONFIG_POLICY_INVALID: &str = "RSLVR-00312";
+
+/// The `InvalidRequestException` `AssociateResolverQueryLogConfig` answers for a
+/// VPC the configuration it names is already associated with.
+///
+/// The sentence is the service's own for this fault
+/// ([`RSLVR_CODE_QUERY_LOG_CONFIG_VPC_ALREADY_ASSOCIATED`]) and is ENTIRELY
+/// fixed text: it names neither the configuration, nor the VPC, nor the
+/// association already in place — the same reticence as
+/// [`resolver_query_log_config_association_not_found`], and the reason the fault
+/// is told apart by its code rather than by anything of the request. It is
+/// closed with the trace clause of the request ([`traced_message`]), which is
+/// the only part of the body that is not fixed text.
+pub fn query_log_config_vpc_already_associated(trace_root: &str) -> InvalidRequestException {
+    InvalidRequestException {
+        message: Some(traced_message(
+            rslvr_message(
+                RSLVR_CODE_QUERY_LOG_CONFIG_VPC_ALREADY_ASSOCIATED,
+                "The specified resource is already associated with the specified query logging \
+                 configuration",
+            ),
+            trace_root,
+        )),
+    }
+}
+
+/// The `InvalidRequestException` `AssociateResolverQueryLogConfig` answers for a
+/// VPC whose queries another configuration already sends to the SAME kind of
+/// destination.
+///
+/// The sentence is the service's own for this fault
+/// ([`RSLVR_CODE_QUERY_LOG_DESTINATION_TYPE_ALREADY_ASSOCIATED`]) and is fixed
+/// text for the same reason as [`query_log_config_vpc_already_associated`]: it
+/// names neither the VPC, nor the configuration that holds it, nor the kind of
+/// destination the two share. The recorded refusal of this fault closes with no
+/// trace clause, as the policy read's denial
+/// ([`query_log_config_policy_access_denied`]) closes with none, so none is
+/// appended here.
+pub fn query_log_destination_type_already_associated() -> InvalidRequestException {
+    InvalidRequestException {
+        message: Some(rslvr_message(
+            RSLVR_CODE_QUERY_LOG_DESTINATION_TYPE_ALREADY_ASSOCIATED,
+            "The resource is already associated with a query logging configuration that is \
+             sending query logs to the specified destination type",
+        )),
+    }
+}
+
+/// The `InvalidRequestException` `PutResolverQueryLogConfigPolicy` answers for a
+/// document that is not an IAM policy for sharing a query logging
+/// configuration.
+///
+/// The sentence is the service's own for this fault
+/// ([`RSLVR_CODE_QUERY_LOG_CONFIG_POLICY_INVALID`]) and is fixed text: it echoes
+/// no part of the document it refused, so WHY the document was refused is not
+/// part of the body and one sentence covers every document outside the policy
+/// grammar ([`policy_document_fault`]). The rule-policy write of this service
+/// answers its own modelled `InvalidPolicyDocument` for the same class of
+/// document ([`invalid_policy_document`]), which is the shape that operation
+/// models for it.
+///
+/// The recorded refusal of this fault closes with no trace clause either, for
+/// the same reason as [`query_log_destination_type_already_associated`].
+pub fn invalid_query_log_config_policy() -> InvalidRequestException {
+    InvalidRequestException {
+        message: Some(rslvr_message(
+            RSLVR_CODE_QUERY_LOG_CONFIG_POLICY_INVALID,
+            "The specified IAM policy for sharing a query logging configuration with another AWS \
+             account is invalid",
+        )),
+    }
+}
+
 /// One association between a VPC and a Resolver query logging configuration, as
 /// stored. It lives on the configuration it belongs to, so the configuration's
 /// `AssociationCount` and the associations it holds cannot disagree.
@@ -855,5 +956,45 @@ impl QueryLogConfigAssociationSortKey {
             "STATUS" => Some(Self::Status),
             _ => None,
         }
+    }
+}
+
+/// What `AssociateResolverQueryLogConfig` consults before it writes: which
+/// configuration already logs a VPC's queries to a given KIND of destination.
+///
+/// A lookup over the configurations this slice stores, beside the ones
+/// [`ComAmazonawsRoute53resolverRoute53resolverState::query_log_config_association`]
+/// and
+/// [`ComAmazonawsRoute53resolverRoute53resolverState::query_log_config_associations_in_creation_order`]
+/// make over the same collection.
+impl ComAmazonawsRoute53resolverRoute53resolverState {
+    /// The association that already sends the VPC `resource_id`'s queries to the
+    /// kind of destination `destination_arn` names, if the store holds one.
+    ///
+    /// A VPC logs its queries to one destination of each KIND at a time, so an
+    /// associate whose configuration delivers to the kind another configuration
+    /// already delivers that VPC's queries to is refused
+    /// ([`query_log_destination_type_already_associated`]) rather than written.
+    /// The kind, and not the destination itself, is what is compared
+    /// ([`query_log_destination_kind`]): two configurations delivering to two
+    /// different log groups still deliver to CloudWatch Logs.
+    ///
+    /// Only associations the store still HOLDS are considered — a disassociate
+    /// takes its record out
+    /// ([`ResolverQueryLogConfigRecord::remove_association_for_vpc`]), so once a
+    /// VPC has been disassociated the identical associate is served. The scan is
+    /// over collections bounded by [`MAX_STORED_QUERY_LOG_CONFIGS`] and
+    /// [`MAX_QUERY_LOG_CONFIG_ASSOCIATIONS`].
+    pub fn query_log_association_of_destination_kind(
+        &self,
+        resource_id: &str,
+        destination_arn: &str,
+    ) -> Option<&ResolverQueryLogConfigAssociationRecord> {
+        let kind = query_log_destination_kind(destination_arn)?;
+        self.resolver_query_log_configs
+            .values()
+            .filter(|config| query_log_destination_kind(&config.destination_arn) == Some(kind))
+            .flat_map(|config| config.associations.iter())
+            .find(|record| record.resource_id == resource_id)
     }
 }

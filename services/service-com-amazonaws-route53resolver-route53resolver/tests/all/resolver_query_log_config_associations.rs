@@ -21,10 +21,38 @@ use super::harness::{
     without_status, Emulator,
 };
 
-/// The destination every configuration these cases create delivers to: one
-/// Amazon S3 bucket of the account, which the create resolves its
-/// `DestinationArn` against.
+/// The destination every configuration these cases create delivers to, unless a
+/// case names another: one Amazon S3 bucket of the account, which the create
+/// resolves its `DestinationArn` against.
 const DESTINATION: &str = "arn:aws:s3:::amzn-s3-demo-bucket";
+
+/// One destination of each KIND Resolver delivers query logs to, by the name the
+/// `Destination` filter selects that kind with
+/// (`smithy_query(query="doc",shape="Filter",member="Name")`, section
+/// **ListResolverQueryLogConfigs**: `S3`, `CloudWatchLogs`, `KinesisFirehose`).
+///
+/// A VPC logs its queries to one destination of each kind at a time, so a case
+/// that associates one VPC with several configurations gives each of them a
+/// destination of a DIFFERENT kind, taken from here.
+pub const DESTINATION_PER_KIND: [(&str, &str); 3] = [
+    ("S3", "arn:aws:s3:::amzn-s3-demo-bucket-per-kind"),
+    (
+        "CloudWatchLogs",
+        "arn:aws:logs:us-west-2:000000000000:log-group:/per-kind:*",
+    ),
+    (
+        "KinesisFirehose",
+        "arn:aws:firehose:us-west-2:000000000000:deliverystream/per-kind",
+    ),
+];
+
+/// The sentence Resolver answers for a VPC the configuration the request names
+/// already logs queries for: fixed text behind that fault's own service error
+/// code, which is what tells it from the fault a VPC already logging to the same
+/// destination KIND is refused with.
+pub const DUPLICATE_PAIR_SENTENCE: &str =
+    "[RSLVR-01303] The specified resource is already associated with the specified query logging \
+     configuration.";
 
 /// The `ResolverQueryLogConfigAssociation` of an associate/get response.
 pub fn association(body: &Value) -> &Value {
@@ -45,14 +73,21 @@ async fn settle() {
 /// The destination the create names is one the account holds: a create resolves
 /// its `DestinationArn` against the store of the service that owns it.
 pub async fn config_id(router: &Emulator, name: &str) -> String {
-    router.hold_query_log_destinations([DESTINATION]);
+    config_id_for(router, name, DESTINATION).await
+}
+
+/// The same create, delivering to `destination` — which the create resolves
+/// against the store of the service that owns it, so the resource it names is
+/// registered here first.
+pub async fn config_id_for(router: &Emulator, name: &str, destination: &str) -> String {
+    router.hold_query_log_destinations([destination]);
     let created = ok(
         router,
         "CreateResolverQueryLogConfig",
         json!({
             "CreatorRequestId": format!("req-{name}"),
             "Name": name,
-            "DestinationArn": DESTINATION,
+            "DestinationArn": destination,
         }),
     )
     .await;
@@ -251,16 +286,22 @@ async fn an_associated_vpc_is_read_back_from_state() {
 /// One VPC may be associated with several configurations, and one configuration
 /// with several VPCs: what identifies an association is the PAIR, so each pair
 /// gets its own record and each configuration counts only its own.
+///
+/// A VPC logs its queries to one destination of each KIND at a time, so the
+/// configurations one VPC is associated with here each deliver to a destination
+/// of a different kind ([`DESTINATION_PER_KIND`]).
 #[tokio::test]
 async fn one_vpc_associates_with_several_configurations() {
     let router = emulator();
-    let first = config_id(&router, "first-config").await;
-    let second = config_id(&router, "second-config").await;
+    let [(first_kind, first_destination), (second_kind, second_destination), _] =
+        DESTINATION_PER_KIND;
+    let first = config_id_for(&router, "first-config", first_destination).await;
+    let second = config_id_for(&router, "second-config", second_destination).await;
     let vpc = "vpc-0123456789abcdef0";
     router.hold_vpcs([vpc]);
 
     let mut ids: Vec<String> = Vec::new();
-    for (case, config) in [("the first configuration", &first), ("the second", &second)] {
+    for (case, config) in [(first_kind, &first), (second_kind, &second)] {
         let made = ok(
             &router,
             "AssociateResolverQueryLogConfig",
@@ -414,9 +455,169 @@ async fn an_unknown_configuration_id_is_refused() {
     );
 }
 
+/// One row of the destination-kind table: what the configuration that already
+/// holds the VPC delivers to, what the second configuration delivers to, and
+/// whether the two deliver to the same KIND of destination — in which case the
+/// second associate is refused.
+struct DestinationKindCase {
+    case: &'static str,
+    held: &'static str,
+    requested: &'static str,
+    same_kind: bool,
+}
+
+/// The rows differ along what the rule generalises over: the kind of destination
+/// each configuration delivers to, whether two destinations of one kind are two
+/// different resources (two buckets, two log groups in two Regions) and whether
+/// two destinations of one kind are held by two different services (a Kinesis
+/// data stream and a Firehose delivery stream are both the `KinesisFirehose`
+/// destination the `Destination` filter selects,
+/// `smithy_query(query="doc",shape="Filter",member="Name")`).
+const DESTINATION_KIND_CASES: &[DestinationKindCase] = &[
+    DestinationKindCase {
+        case: "two Amazon S3 buckets",
+        held: "arn:aws:s3:::amzn-s3-demo-bucket-kind-one",
+        requested: "arn:aws:s3:::amzn-s3-demo-bucket-kind-two",
+        same_kind: true,
+    },
+    DestinationKindCase {
+        case: "two CloudWatch Logs log groups, in two Regions",
+        held: "arn:aws:logs:us-west-2:000000000000:log-group:/kind-one:*",
+        requested: "arn:aws:logs:eu-west-1:000000000000:log-group:/kind-two",
+        same_kind: true,
+    },
+    DestinationKindCase {
+        case: "a Kinesis data stream and a Firehose delivery stream",
+        held: "arn:aws:kinesis:us-west-2:000000000000:stream/kind-three",
+        requested: "arn:aws:firehose:us-west-2:000000000000:deliverystream/kind-four",
+        same_kind: true,
+    },
+    DestinationKindCase {
+        case: "an S3 bucket, then a CloudWatch Logs log group",
+        held: "arn:aws:s3:::amzn-s3-demo-bucket-kind-five",
+        requested: "arn:aws:logs:us-west-2:000000000000:log-group:/kind-five",
+        same_kind: false,
+    },
+    DestinationKindCase {
+        case: "a CloudWatch Logs log group, then a Firehose delivery stream",
+        held: "arn:aws:logs:us-west-2:000000000000:log-group:/kind-six",
+        requested: "arn:aws:firehose:us-west-2:000000000000:deliverystream/kind-six",
+        same_kind: false,
+    },
+];
+
+/// The sentence Resolver answers for a VPC whose queries another configuration
+/// already sends to the requested KIND of destination: fixed text behind that
+/// fault's own service error code.
+const DESTINATION_KIND_SENTENCE: &str =
+    "[RSLVR-01306] The resource is already associated with a query logging configuration that is \
+     sending query logs to the specified destination type.";
+
+/// A VPC logs its queries to one destination of each KIND at a time: an
+/// associate whose configuration delivers to a kind another configuration
+/// already delivers that VPC's queries to is refused with the
+/// `InvalidRequestException` the operation models and writes nothing, while a
+/// configuration delivering to a DIFFERENT kind is associated with the same VPC.
+///
+/// Once the association in force is taken out, the identical call that was
+/// refused is served — so what refuses it is the association that exists and not
+/// the request.
+#[tokio::test]
+async fn a_vpc_already_logging_to_that_destination_kind_is_refused() {
+    let vpc = "vpc-0123456789abcdef0";
+
+    for (index, row) in DESTINATION_KIND_CASES.iter().enumerate() {
+        let case = row.case;
+        let router = emulator();
+        router.hold_vpcs([vpc]);
+        let held = config_id_for(&router, &format!("kind-held-{index}"), row.held).await;
+        let requested =
+            config_id_for(&router, &format!("kind-requested-{index}"), row.requested).await;
+        ok(
+            &router,
+            "AssociateResolverQueryLogConfig",
+            json!({ "ResolverQueryLogConfigId": held.clone(), "ResourceId": vpc }),
+        )
+        .await;
+
+        let request =
+            json!({ "ResolverQueryLogConfigId": requested.clone(), "ResourceId": vpc });
+        let (status, body) = call(
+            &router,
+            "AssociateResolverQueryLogConfig",
+            request.clone(),
+        )
+        .await;
+
+        if !row.same_kind {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: a different destination kind must be associated, got {status}: \
+                 {body}"
+            );
+            assert_eq!(
+                string_member(association(&body), "ResourceId"),
+                vpc,
+                "case {case:?}: the association must name the VPC the request did, got {body}"
+            );
+            assert_eq!(
+                association_count(&router, &requested).await,
+                1,
+                "case {case:?}: the second configuration must count the VPC it now logs for"
+            );
+            continue;
+        }
+
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a second configuration of that destination kind must be refused, got \
+             {status}: {body}"
+        );
+        assert!(
+            error_type(&body).contains("InvalidRequestException"),
+            "case {case:?}: the refusal must name InvalidRequestException, got {body}"
+        );
+        let message = string_member(&body, "Message");
+        assert_eq!(
+            message, DESTINATION_KIND_SENTENCE,
+            "case {case:?}: the refusal must carry the service's own coded sentence, got {body}"
+        );
+        assert_eq!(
+            association_count(&router, &requested).await,
+            0,
+            "case {case:?}: the refused associate must mint no association"
+        );
+        assert_eq!(
+            association_count(&router, &held).await,
+            1,
+            "case {case:?}: the association already in force must be untouched"
+        );
+
+        // The refusal is about the association that exists: once it is gone the
+        // identical call is served.
+        ok(
+            &router,
+            "DisassociateResolverQueryLogConfig",
+            json!({ "ResolverQueryLogConfigId": held.clone(), "ResourceId": vpc }),
+        )
+        .await;
+        let served = ok(&router, "AssociateResolverQueryLogConfig", request).await;
+        assert_eq!(
+            string_member(association(&served), "ResolverQueryLogConfigId"),
+            requested,
+            "case {case:?}: the identical call must be served once the VPC is disassociated, got \
+             {served}"
+        );
+    }
+}
+
 /// Associating a VPC that is already associated with that configuration is
-/// refused with the `ResourceExistsException` the operation models, and leaves
-/// the association that is already there exactly as it was.
+/// refused with the `InvalidRequestException` the operation models, carrying
+/// that fault's own coded sentence, and leaves the association that is already
+/// there exactly as it was.
+///
+/// The sentence is fixed text: it names neither the configuration, nor the VPC,
+/// nor the association already in place, so every row states the same one.
 #[tokio::test]
 async fn a_vpc_already_associated_is_refused() {
     let router = emulator();
@@ -441,9 +642,27 @@ async fn a_vpc_already_associated_is_refused() {
             "case {case:?}: a VPC already associated must be refused, got {status}: {body}"
         );
         assert!(
-            error_type(&body).contains("ResourceExistsException"),
-            "case {case:?}: the refusal must name ResourceExistsException, got {body}"
+            error_type(&body).contains("InvalidRequestException"),
+            "case {case:?}: the refusal must name InvalidRequestException, got {body}"
         );
+        let message = string_member(&body, "Message");
+        let (stated, _) = traced_message(&message).unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: the refusal must close with the trace clause of the request, got \
+                 {message:?}"
+            )
+        });
+        assert_eq!(
+            stated, DUPLICATE_PAIR_SENTENCE,
+            "case {case:?}: the refusal must carry the service's own coded sentence, got {body}"
+        );
+        for (part, value) in [("the configuration", config.as_str()), ("the VPC", vpc)] {
+            assert!(
+                !stated.contains(value),
+                "case {case:?}: the refusal must name nothing of the request, it named {part} in \
+                 {message:?}"
+            );
+        }
         assert_eq!(
             association_count(&router, &config).await,
             count,

@@ -24,6 +24,7 @@
 //! ones in [`super::resolver_rule_deletion`].
 
 use serde_json::{json, Value};
+use smithy_server_runtime::MultiServiceRouter;
 
 use super::harness::{call, emulator, error_type, ok, string_member};
 use super::resolver_rule_deletion::{associate, forward_rule, outbound_endpoint};
@@ -40,6 +41,11 @@ const CODE_RULE_IN_USE: &str = "RSLVR-00702";
 /// The code for a rule/VPC pair the service holds no association for, from the
 /// recorded `ResourceNotFoundException` body of `DisassociateResolverRule`.
 const CODE_ASSOCIATION_NOT_FOUND: &str = "RSLVR-00800";
+
+/// The code for an associate naming a rule/VPC pair the service already holds an
+/// association for, from the recorded `ResourceExistsException` body of
+/// `AssociateResolverRule`.
+const CODE_ASSOCIATION_EXISTS: &str = "RSLVR-00704";
 
 /// Ids spanning what the not-found rule changes over: the form this service
 /// mints, a form it never mints, and both published bounds of the modelled
@@ -279,6 +285,112 @@ async fn an_in_use_rule_is_refused_with_the_one_fixed_sentence() {
             );
         }
     }
+}
+
+/// One row of the duplicate-associate table: the VPC the pair is made with.
+const DUPLICATE_VPCS: &[(&str, &str)] = &[
+    ("a VPC id in the 17-hex-digit form AWS mints", "vpc-00000000000000061"),
+    ("a VPC id in the 8-hex-digit form", "vpc-0a1b2c3d"),
+    ("the shortest ResourceId (length 1)", "v"),
+];
+
+/// Re-associating a rule with a VPC it is already associated with is refused
+/// with the coded sentence for a pair that already EXISTS, whose only variable
+/// parts are the rule and the VPC the request named: the association already in
+/// place is not named, nothing is written, and the association that is there is
+/// left as it was.
+///
+/// The rows differ along the form and the length of the VPC id — including the
+/// shortest modelled `ResourceId` and, appended below, the longest — and along
+/// whether the rule already holds another VPC, which the sentence must not vary
+/// with.
+#[tokio::test]
+async fn a_duplicate_association_is_refused_with_the_coded_sentence() {
+    let router = emulator();
+    let endpoint = outbound_endpoint(&router, "endpoint-duplicate-pair").await;
+    let rule_id = forward_rule(
+        &router,
+        "rule-duplicate-pair",
+        "duplicates.example.com",
+        &endpoint,
+    )
+    .await;
+
+    let mut rows: Vec<(&str, String)> = DUPLICATE_VPCS
+        .iter()
+        .map(|(case, vpc)| (*case, (*vpc).to_string()))
+        .collect();
+    // The longest modelled `ResourceId` (length 64).
+    rows.push(("the longest ResourceId (length 64)", "v".repeat(64)));
+
+    for (case, vpc) in &rows {
+        // The pair the duplicate names, made once. Each row adds another VPC to
+        // the same rule, so the refusal is asserted for a rule holding one
+        // association and for one holding several. The associate is made with
+        // no `Name`, so a row naming the longest `ResourceId` is not refused for
+        // a name derived from it.
+        router.hold_vpcs([vpc]);
+        let made = ok(
+            &router,
+            "AssociateResolverRule",
+            json!({ "ResolverRuleId": rule_id.clone(), "VPCId": vpc }),
+        )
+        .await;
+        let existing = string_member(
+            made.get("ResolverRuleAssociation")
+                .unwrap_or_else(|| panic!("case {case:?}: the associate answers one, got {made}")),
+            "Id",
+        );
+        let before = list_associations(&router).await;
+
+        let (status, parsed) = call(
+            &router,
+            "AssociateResolverRule",
+            json!({ "ResolverRuleId": rule_id, "VPCId": vpc }),
+        )
+        .await;
+        let expected = format!(
+            r#"[{CODE_ASSOCIATION_EXISTS}] Resolver rule "{rule_id}" is already associated with VPC "{vpc}"."#
+        );
+        assert_refusal(
+            case,
+            "AssociateResolverRule",
+            status,
+            &parsed,
+            "ResourceExistsException",
+            &expected,
+            "ResolverRuleAssociation",
+        );
+
+        // The association already in place is NOT part of the sentence: what the
+        // caller asked for is the pair, so the pair is what is reported.
+        let message = string_member(&parsed, "Message");
+        assert!(
+            !message.contains(&existing),
+            "case {case:?}: the sentence must not name the association already in place, got \
+             {message:?}"
+        );
+        assert_eq!(
+            list_associations(&router).await,
+            before,
+            "case {case:?}: the refused associate must write nothing"
+        );
+    }
+}
+
+/// The `Id`s of every association `ListResolverRuleAssociations` reports.
+async fn list_associations(router: &MultiServiceRouter) -> Vec<String> {
+    let listed = ok(router, "ListResolverRuleAssociations", json!({})).await;
+    listed
+        .get("ResolverRuleAssociations")
+        .and_then(Value::as_array)
+        .map(|associations| {
+            associations
+                .iter()
+                .map(|association| string_member(association, "Id"))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// One row of the association table: the pair a disassociate names, and why the

@@ -33,6 +33,13 @@ const OTHER_ACCOUNT: &str = "123456789012";
 /// words that fault with, as the recorded response of that read states it.
 const CODE_ACCESS_DENIED: &str = "RSLVR-01600";
 
+/// The sentence a write of a document the service will not attach as a sharing
+/// policy is refused with, behind the service error code for that fault — fixed
+/// text that echoes no part of the document it refused.
+const INVALID_POLICY_SENTENCE: &str =
+    "[RSLVR-00312] The specified IAM policy for sharing a query logging configuration with \
+     another AWS account is invalid.";
+
 /// Create a query logging configuration and return `(Id, Arn)`.
 ///
 /// The destination it delivers to is one the account holds, which the create
@@ -314,9 +321,9 @@ async fn a_configuration_with_no_policy_refuses_the_read() {
     expect_read_denied(&router, "the same configuration, read again", &arn).await;
 }
 
-/// A document outside the policy grammar is refused with
-/// `InvalidPolicyDocument`, and the policy the configuration already carried
-/// stays.
+/// A document outside the policy grammar is refused with the modelled
+/// `InvalidRequestException`, carrying this fault's own coded sentence, and the
+/// policy the configuration already carried stays.
 #[tokio::test]
 async fn an_invalid_document_is_refused_and_stores_nothing() {
     let router = emulator();
@@ -371,14 +378,26 @@ async fn an_invalid_document_is_refused_and_stores_nothing() {
     ];
 
     for (case, policy) in cases {
-        expect_error(
+        let (status, refused) = call(
             &router,
             "PutResolverQueryLogConfigPolicy",
-            json!({ "Arn": arn, "ResolverQueryLogConfigPolicy": policy }),
-            case,
-            "InvalidPolicyDocument",
+            json!({ "Arn": arn.clone(), "ResolverQueryLogConfigPolicy": policy }),
         )
         .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a document outside the grammar must be refused, got {status}: \
+             {refused}"
+        );
+        assert!(
+            error_type(&refused).contains("InvalidRequestException"),
+            "case {case:?}: the refusal must name InvalidRequestException, got {refused}"
+        );
+        let message = string_member(&refused, "Message");
+        assert_eq!(
+            message, INVALID_POLICY_SENTENCE,
+            "case {case:?}: the refusal must state this fault's coded sentence, got {message:?}"
+        );
         let read = stored_policy(&router, &arn).await;
         assert_eq!(
             read, shared,

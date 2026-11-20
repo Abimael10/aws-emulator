@@ -217,18 +217,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // One rule is associated with one VPC at most once: associating a pair
         // the store already holds is the resource that "you tried to create
-        // [and] already exists", so it is refused and nothing is written.
-        if let Some(existing) = store.find_rule_association(&input.resolver_rule_id, &input.vpc_id) {
+        // [and] already exists", so it is refused and nothing is written. The
+        // body is the service's own coded sentence for that fault
+        // (`crate::state::resolver_rule_already_associated`), whose variable
+        // parts are the pair the request named and nothing else.
+        if store
+            .find_rule_association(&input.resolver_rule_id, &input.vpc_id)
+            .is_some()
+        {
             return Err(AssociateResolverRuleErrorModeled::ResourceExistsException(
-                ResourceExistsException {
-                    message: Some(format!(
-                        r#"Resolver rule "{}" is already associated with VPC "{}" by association "{}""#,
-                        input.resolver_rule_id, input.vpc_id, existing.id
-                    )),
-                    resource_type: Some(
-                        crate::state::RESOURCE_TYPE_RESOLVER_RULE_ASSOCIATION.to_string(),
-                    ),
-                },
+                crate::state::resolver_rule_already_associated(
+                    &input.resolver_rule_id,
+                    &input.vpc_id,
+                ),
             )
             .into());
         }

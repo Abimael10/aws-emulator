@@ -235,22 +235,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "To associate more than one VPC with a configuration, submit one
         // AssociateResolverQueryLogConfig request for each VPC": one VPC is
-        // associated with one configuration at most once, so associating a pair
-        // the configuration already holds is the resource that "you tried to
-        // create [and] already exists" and nothing is written.
-        if let Some(existing) = config.association_for_vpc(&input.resource_id) {
+        // associated with one configuration at most once, so a pair the
+        // configuration already holds is refused and nothing is written. The
+        // body is the service's own coded sentence for that fault
+        // (`crate::state::query_log_config_vpc_already_associated`), which
+        // names nothing of the request.
+        if config.association_for_vpc(&input.resource_id).is_some() {
             return Err(
-                AssociateResolverQueryLogConfigErrorModeled::ResourceExistsException(
-                    ResourceExistsException {
-                        message: Some(format!(
-                            r#"Resolver query log config "{}" is already associated with VPC "{}" by association "{}""#,
-                            input.resolver_query_log_config_id, input.resource_id, existing.id
-                        )),
-                        resource_type: Some(
-                            crate::state::RESOURCE_TYPE_RESOLVER_QUERY_LOG_CONFIG_ASSOCIATION
-                                .to_string(),
-                        ),
-                    },
+                AssociateResolverQueryLogConfigErrorModeled::InvalidRequestException(
+                    crate::state::query_log_config_vpc_already_associated(&trace_root),
+                )
+                .into(),
+            );
+        }
+
+        // A VPC logs its queries to one destination of each KIND at a time, so
+        // a VPC another configuration already sends to the kind of destination
+        // THIS configuration delivers to is refused as well, under that fault's
+        // own code
+        // (`crate::state::query_log_destination_type_already_associated`), and
+        // no second association is minted. The pair above is resolved first:
+        // the configuration that already holds the VPC also delivers to the
+        // same kind, and the fault the caller is told about is the pair.
+        if store
+            .query_log_association_of_destination_kind(
+                &input.resource_id,
+                &config.destination_arn,
+            )
+            .is_some()
+        {
+            return Err(
+                AssociateResolverQueryLogConfigErrorModeled::InvalidRequestException(
+                    crate::state::query_log_destination_type_already_associated(),
                 )
                 .into(),
             );

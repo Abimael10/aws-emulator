@@ -375,6 +375,17 @@ pub const RSLVR_CODE_RULE_IN_USE: &str = "RSLVR-00702";
 /// its rule/VPC pair and raises `ResourceNotFoundException`.
 pub const RSLVR_CODE_RULE_VPC_ASSOCIATION_NOT_FOUND: &str = "RSLVR-00800";
 
+/// The Route 53 Resolver service error code reported when an associate names a
+/// rule and a VPC that are already associated with each other.
+///
+/// Carried for the same reason as [`RSLVR_CODE_RULE_VPC_ASSOCIATION_NOT_FOUND`],
+/// and it is the counterpart of that code on the write side: the HTTP status
+/// (400) and the exception shape name together do not say which Resolver fault
+/// occurred, and the model states no message text, so this code comes from the
+/// recorded response of the rule associate that raises `ResourceExistsException`
+/// for a pair it already holds. See [`resolver_rule_already_associated`].
+pub const RSLVR_CODE_RULE_VPC_ALREADY_ASSOCIATED: &str = "RSLVR-00704";
+
 /// The Route 53 Resolver service error code reported when a request names a
 /// resource the caller cannot address: one the service holds nothing under, and
 /// one it keeps to itself.
@@ -1964,6 +1975,31 @@ pub fn resolver_rule_vpc_association_not_found(
             RSLVR_CODE_RULE_VPC_ASSOCIATION_NOT_FOUND,
             &format!(
                 r#"Resolver Rule Association between Resolver Rule "{resolver_rule_id}" and VPC "{vpc_id}" does not exist"#
+            ),
+        )),
+        resource_type: Some(RESOURCE_TYPE_RESOLVER_RULE_ASSOCIATION.to_string()),
+    }
+}
+
+/// The `ResourceExistsException` `AssociateResolverRule` answers for a rule and
+/// a VPC that are already associated with each other.
+///
+/// The sentence is the service's own for this fault
+/// ([`RSLVR_CODE_RULE_VPC_ALREADY_ASSOCIATED`]) and has exactly two variable
+/// parts, the rule and the VPC the request named, each double-quoted — the
+/// counterpart of [`resolver_rule_vpc_association_not_found`], which words the
+/// same pair for the association that is MISSING. The association already in
+/// place is not named: what the caller asked for is the pair, so the pair is
+/// what the refusal reports.
+pub fn resolver_rule_already_associated(
+    resolver_rule_id: &str,
+    vpc_id: &str,
+) -> ResourceExistsException {
+    ResourceExistsException {
+        message: Some(rslvr_message(
+            RSLVR_CODE_RULE_VPC_ALREADY_ASSOCIATED,
+            &format!(
+                r#"Resolver rule "{resolver_rule_id}" is already associated with VPC "{vpc_id}""#
             ),
         )),
         resource_type: Some(RESOURCE_TYPE_RESOLVER_RULE_ASSOCIATION.to_string()),
