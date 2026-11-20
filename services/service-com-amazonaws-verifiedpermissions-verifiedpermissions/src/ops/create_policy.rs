@@ -343,6 +343,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (policy_type, statement, description, template_link, scope) =
             match &input.definition {
                 PolicyDefinition::Static(def) => {
+                    // The submitted Cedar text is PARSED first, before the store
+                    // is asked what to validate it against: text Cedar cannot
+                    // read is a malformed request, so it is refused naming the
+                    // member that carries it, whatever state the store is in —
+                    // the same order the other three handlers that submit
+                    // caller-written Cedar apply.
+                    let scope = crate::state::cedar::parse_static_policy(&def.statement)
+                        .map_err(invalid)?;
                     if let Some(schema_json) = store
                         .schema_to_validate_against(crate::state::ValidatedContent::Policy)
                         .map_err(invalid)?
@@ -350,8 +358,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::cedar::validate_static_policy(schema_json, &def.statement)
                             .map_err(refused)?;
                     }
-                    let scope = crate::state::cedar::parse_static_policy(&def.statement)
-                        .map_err(invalid)?;
                     (
                         "STATIC",
                         Some(def.statement.clone()),

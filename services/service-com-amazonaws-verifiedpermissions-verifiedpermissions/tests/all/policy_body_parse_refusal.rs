@@ -16,6 +16,12 @@
 //! `UpdatePolicy`) and the store's validation mode (`OFF`, and `STRICT` with a
 //! schema, which is the other path that hands the statement to the parser).
 //!
+//! The PARSE also comes FIRST: a store validating `STRICT` while holding no
+//! schema has nothing to validate against, and that refusal still cannot answer
+//! for text the parser could not read — so all four writers that submit
+//! caller-written Cedar refuse the member carrying the text
+//! ([`an_unparseable_statement_is_refused_before_the_store_has_nothing_to_validate_against`]).
+//!
 //! Two neighbouring classes keep their own wording, and the rows that pin them
 //! say so: a statement past the size this emulator admits is refused by a bound
 //! check rather than by a parse, and a statement that PARSES and is then refused
@@ -30,6 +36,10 @@ use service_com_amazonaws_verifiedpermissions_verifiedpermissions::state::cedar:
 
 use crate::harness::{call, error_code, fault_message, field_list, ok, router, store_with_mode};
 use crate::schema::photo_app_schema;
+use crate::store_validation_settings::{
+    no_schema_reason, policy_in, stored_policy_statement, stored_template_statement, template_in,
+    CONFORMANT_TEMPLATE,
+};
 
 /// The classification a policy body that does not parse is refused with, as the
 /// wire carries it. Written out here rather than imported on purpose: this suite
@@ -227,6 +237,231 @@ async fn an_unparseable_policy_body_is_refused_with_one_classification() {
         "STATIC",
         "case \"a conformant statement\": the policy must be stored, got {accepted}"
     );
+}
+
+/// Every statement a template row submits as the template body, each broken in a
+/// different way, so what they share is only that the Cedar TEMPLATE parser will
+/// not read them.
+const UNPARSEABLE_TEMPLATES: &[(&str, &str)] = &[
+    ("not Cedar at all", "this is not cedar"),
+    (
+        "no terminating semicolon",
+        "permit(principal == ?principal, action, resource)",
+    ),
+    (
+        "an effect keyword Cedar does not have",
+        "allow(principal == ?principal, action, resource);",
+    ),
+    (
+        "an unbalanced scope",
+        "permit(principal == ?principal, action, resource;",
+    ),
+    (
+        // A slot in a position Cedar admits none in.
+        "a placeholder Cedar admits nowhere",
+        "permit(principal, action == ?action, resource);",
+    ),
+];
+
+/// The JSON pointer of the member a policy TEMPLATE's text lives at, which a
+/// refusal of that text names.
+const TEMPLATE_STATEMENT_PATH: &str = "/template/statement";
+
+/// Text that does not PARSE is refused at the member that carries it even when
+/// the store has nothing to validate it against.
+///
+/// RULE: the four writers that submit caller-written Cedar
+/// (`CreatePolicy`, `UpdatePolicy`, `CreatePolicyTemplate`,
+/// `UpdatePolicyTemplate`) all read the submitted text BEFORE they ask the store
+/// what to validate it against, so text the Cedar parser cannot read is refused
+/// naming the member that carries it — never the store — whatever validation
+/// state that store is in. The store's own `STRICT`-with-no-schema refusal
+/// (pinned for well-formed content in [`crate::store_validation_settings`])
+/// answers a question about content Cedar could read, so it cannot be the answer
+/// to text that is not Cedar.
+///
+/// The rows span the four operations, both kinds of content, the KIND of syntax
+/// error, and both ways a store holds no schema while validating `STRICT`: one
+/// switched to `STRICT` after it was given content, and one whose schema was
+/// DELETED with the empty document.
+#[tokio::test]
+async fn an_unparseable_statement_is_refused_before_the_store_has_nothing_to_validate_against() {
+    let router = router();
+
+    // A store switched to STRICT after its content went in while it validated
+    // nothing: it holds a policy and a template to update, and no schema.
+    let switched = store_with_mode(&router, "OFF").await;
+    let switched_policy = policy_in(&router, &switched, CONFORMANT).await;
+    let switched_template = template_in(&router, &switched, CONFORMANT_TEMPLATE).await;
+    ok(
+        &router,
+        "UpdatePolicyStore",
+        &json!({
+            "policyStoreId": &switched,
+            "validationSettings": { "mode": "STRICT" },
+        }),
+    )
+    .await;
+
+    // A STRICT store that was GIVEN a schema, filled, and then had that schema
+    // deleted by putting the empty document — the other way the same state is
+    // reached.
+    let emptied = store_with_mode(&router, "STRICT").await;
+    ok(
+        &router,
+        "PutSchema",
+        &json!({
+            "policyStoreId": &emptied,
+            "definition": { "cedarJson": photo_app_schema() },
+        }),
+    )
+    .await;
+    let emptied_policy = policy_in(&router, &emptied, CONFORMANT).await;
+    let emptied_template = template_in(&router, &emptied, CONFORMANT_TEMPLATE).await;
+    ok(
+        &router,
+        "PutSchema",
+        &json!({ "policyStoreId": &emptied, "definition": { "cedarJson": "{}" } }),
+    )
+    .await;
+
+    // Both stores now validate STRICT with no schema: a WELL-FORMED write is
+    // refused at the store, which is what makes the rows below a statement about
+    // ORDER rather than about a store that refuses nothing.
+    for (store, label) in [(&switched, "switched to STRICT"), (&emptied, "schema deleted")] {
+        let (status, body) = call(
+            &router,
+            "CreatePolicy",
+            &json!({
+                "policyStoreId": store,
+                "definition": { "static": { "statement": CONFORMANT } },
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {label:?}: a store with nothing to validate against refuses a well-formed \
+             policy, got {status} {body}"
+        );
+        let fields = field_list(&body);
+        assert_eq!(
+            fields.first().map(|(path, message)| (
+                path.as_str(),
+                message == &no_schema_reason("a policy")
+            )),
+            Some(("/policyStoreId", true)),
+            "case {label:?}: the store is the member at fault for well-formed content, got \
+             {fields:?}"
+        );
+    }
+
+    for (store, policy_id, template_id, how) in [
+        (
+            &switched,
+            &switched_policy,
+            &switched_template,
+            "switched to STRICT",
+        ),
+        (
+            &emptied,
+            &emptied_policy,
+            &emptied_template,
+            "schema deleted",
+        ),
+    ] {
+        for (kind, statement) in UNPARSEABLE {
+            let create_case = format!("CreatePolicy, {kind}, a store {how}");
+            let fields = refusal(
+                &router,
+                &create_case,
+                "CreatePolicy",
+                &json!({
+                    "policyStoreId": store,
+                    "definition": { "static": { "statement": statement } },
+                }),
+            )
+            .await;
+            assert_eq!(
+                fields[0],
+                (
+                    STATIC_STATEMENT_PATH.to_string(),
+                    POLICY_BODY_REFUSAL.to_string()
+                ),
+                "case {create_case:?}: expected {STATIC_STATEMENT_PATH:?} refused with \
+                 {POLICY_BODY_REFUSAL:?}, got {fields:?}"
+            );
+
+            let update_case = format!("UpdatePolicy, {kind}, a store {how}");
+            let fields = refusal(
+                &router,
+                &update_case,
+                "UpdatePolicy",
+                &json!({
+                    "policyStoreId": store,
+                    "policyId": policy_id,
+                    "definition": { "static": { "statement": statement } },
+                }),
+            )
+            .await;
+            assert_eq!(
+                fields[0],
+                (
+                    STATIC_STATEMENT_PATH.to_string(),
+                    POLICY_BODY_REFUSAL.to_string()
+                ),
+                "case {update_case:?}: expected {STATIC_STATEMENT_PATH:?} refused with \
+                 {POLICY_BODY_REFUSAL:?}, got {fields:?}"
+            );
+        }
+
+        // The template writers submit TEMPLATE text, whose refusal carries the
+        // template parser's own diagnostic — so what is pinned is the member it
+        // names and that it is not the store's reason.
+        for (kind, statement) in UNPARSEABLE_TEMPLATES {
+            for (operation, request, label) in [
+                (
+                    "CreatePolicyTemplate",
+                    json!({ "policyStoreId": store, "statement": statement }),
+                    format!("CreatePolicyTemplate, {kind}, a store {how}"),
+                ),
+                (
+                    "UpdatePolicyTemplate",
+                    json!({
+                        "policyStoreId": store,
+                        "policyTemplateId": template_id,
+                        "statement": statement,
+                    }),
+                    format!("UpdatePolicyTemplate, {kind}, a store {how}"),
+                ),
+            ] {
+                let fields = refusal(&router, &label, operation, &request).await;
+                assert_eq!(
+                    fields[0].0, TEMPLATE_STATEMENT_PATH,
+                    "case {label:?}: expected the refusal to name {TEMPLATE_STATEMENT_PATH:?}, \
+                     got {fields:?}"
+                );
+                assert_ne!(
+                    fields[0].1,
+                    no_schema_reason("a policy template"),
+                    "case {label:?}: text the parser cannot read is not refused for the \
+                     store's missing schema, got {fields:?}"
+                );
+            }
+        }
+
+        // Every refusal above left the content these stores were filled with
+        // exactly as it was.
+        assert_eq!(
+            stored_policy_statement(&router, store, policy_id).await,
+            CONFORMANT,
+            "case {how:?}: a refused update must leave the stored policy untouched"
+        );
+        assert_eq!(
+            stored_template_statement(&router, store, template_id).await,
+            CONFORMANT_TEMPLATE,
+            "case {how:?}: a refused update must leave the stored template untouched"
+        );
+    }
 }
 
 /// The neighbouring classes keep their own wording: a statement refused by this
