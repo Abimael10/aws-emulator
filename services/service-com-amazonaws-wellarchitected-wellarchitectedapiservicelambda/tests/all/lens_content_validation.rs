@@ -502,10 +502,12 @@ async fn a_question_the_lens_does_not_ask_is_refused_naming_the_question() {
 
 /// A `PillarId` the lens under review does not define is the modelled 400 naming
 /// `PillarId`, on every operation that takes one — rather than an empty page, which a
-/// client cannot tell from a rejected filter. The value is MATCHED against the lens's
-/// pillar set rather than naming a resource, so the finding states the rule and hands back
-/// the pillars that lens defines; the whole table of lenses, forms and operations the rule
-/// covers is `super::pillar_filter_refusal`.
+/// client cannot tell from a rejected filter. The value arrives in a query parameter, so it
+/// is refused the way this service refuses any value bound outside its body that the
+/// parameter it was read as does not admit — that parameter reported as invalid, in
+/// `Message` as well as in its `Fields` entry — and the pillars the lens DOES define, which
+/// a read of the lens review serves, appear nowhere in it; the whole table of parameters,
+/// lenses, forms and operations the rule covers is `super::pillar_filter_refusal`.
 #[tokio::test]
 async fn a_pillar_the_lens_does_not_define_is_refused_naming_the_pillar() {
     let client = Client::new();
@@ -514,12 +516,11 @@ async fn a_pillar_the_lens_does_not_define_is_refused_naming_the_pillar() {
 
     // The forms a `PillarId` that is no pillar of the lens can take: a bare word, a pillar
     // of the lens in another case, and a word a custom lens document might define but this
-    // lens does not. The valid values the finding must hand back are read back over the
-    // wire from the lens review itself (`super::pillar_filter_refusal`), so the expectation
-    // comes from a READ of the lens content rather than from a list spelled here.
-    let valid = reported_pillars(&client, "pillar-host", &workload_id, FRAMEWORK_LENS)
-        .await
-        .join(", ");
+    // lens does not. The lens's own pillars are read back over the wire from the lens review
+    // itself (`super::pillar_filter_refusal`), so what the refusal must NOT publish comes
+    // from a READ of the lens content rather than from a list spelled here.
+    let defined = reported_pillars(&client, "pillar-host", &workload_id, FRAMEWORK_LENS).await;
+    let sentence = "The PillarId that was passed in is invalid.";
     for (form, pillar_id) in [
         ("bare-word", "notapillar"),
         ("right-pillar-in-another-case", "OPERATIONALEXCELLENCE"),
@@ -554,14 +555,20 @@ async fn a_pillar_the_lens_does_not_define_is_refused_naming_the_pillar() {
                     .await,
             ),
         ] {
-            assert_fields_failed(
+            assert_field_validation(
                 &format!("{form}/{operation}"),
                 &answer,
                 "PillarId",
-                &format!(
-                    "PillarId contains an invalid pillar. Valid pillars are: [{valid}]."
-                ),
+                sentence,
             );
+            let body = answer.body.to_string();
+            for pillar in &defined {
+                assert!(
+                    !body.contains(pillar.as_str()),
+                    "case {form:?}/{operation:?}: the refusal must not publish the lens's \
+                     pillar {pillar:?}, got {answer:?}"
+                );
+            }
         }
     }
 

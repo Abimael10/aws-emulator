@@ -24,20 +24,26 @@
 //!
 //! The envelope — this service's `[Validation]` message tag, `Reason` and the `Fields`
 //! list — is built by the one place this service builds a field validation
-//! ([`crate::state::field_validation_exception`]) for a member that IDENTIFIES the lens
-//! content addressed, and by [`fields_failed`] for one whose value was MATCHED against that
-//! content and found outside it. What lives here is the SENTENCES these failures are worded
-//! with and the rule that decides them.
+//! ([`crate::state::field_validation_exception`]), which states each finding in `Message`
+//! behind that tag as well as in its `Fields` entry, and by [`fields_failed`] for the one
+//! class recorded the other way round. What lives here is the SENTENCES these failures are
+//! worded with and the rule that decides them.
 //!
-//! Those two kinds of value are worded differently, because the caller has to do different
-//! things about them. A member that IDENTIFIES the lens content addressed — the lens whose
-//! review it is, the question an answer is of — reports the lookup that found nothing, in
-//! `Message` as well as in its `Fields` entry. A member whose value is MATCHED against that
-//! content — a choice of the question being answered, a pillar a read is scoped to — leaves
-//! `Message` stating only the class of the failure and carries, in its `Fields` entry, the
-//! rule the value broke together with the values that content DOES define: those are what
-//! the caller needs to repair the request, and they are not discoverable from the refusal
-//! otherwise.
+//! How a finding is worded follows how the value reached the service. A member that
+//! IDENTIFIES the lens content addressed — the lens whose review it is, the question an
+//! answer is of — reports the lookup that found nothing. A value bound OUTSIDE the body
+//! that the parameter it was read as does not admit — a `PillarId` a read is scoped to, as
+//! much as a query parameter whose enumerated type does not admit its value — reports that
+//! parameter as invalid and nothing about the value, because the parameter is what the
+//! caller has to fix. Both put the finding in `Message` too, so a client that attributes a
+//! failure from `Message` reads the same diagnostic as one that reads `Fields`.
+//!
+//! A BODY member carrying a LIST of values matched against that content — the choices of
+//! the question being answered — is the one class worded the other way round
+//! ([`fields_failed`]): `Message` states only the class of the failure, and the `Fields`
+//! entry carries the rule the value broke together with the values that content DOES
+//! define, which are what the caller needs to repair the request and are not discoverable
+//! from the refusal otherwise.
 
 use std::collections::HashMap;
 
@@ -138,51 +144,47 @@ pub fn no_question(lens: &str, question_id: &str) -> ValidationException {
 /// review: it SELECTS nothing because there is nothing of that name to select, which is a
 /// bad value rather than an empty answer set.
 ///
-/// The value is MATCHED against that content rather than naming the resource the request
-/// addresses, so it is refused the way [`undefined_choices`] refuses a choice outside a
-/// question's catalog — the envelope [`fields_failed`] builds, whose finding hands back the
-/// pillars the lens defines — instead of reporting a lookup that found nothing: a caller
-/// cannot discover a lens's pillar set from a sentence that only repeats the value it
-/// already sent.
+/// Every operation that takes one takes it OUTSIDE the body, in the `PillarId` query
+/// parameter (`ListAnswersInput$PillarId`, `ListLensReviewImprovementsInput$PillarId`,
+/// `ListReviewTemplateAnswersInput$PillarId`, each bound `@httpQuery("PillarId")` and
+/// targeting `PillarId`), so a value it cannot accept is refused the way this service
+/// refuses any value bound outside its body that the parameter it was read as does not
+/// admit (the enumerated-type finding this service's front door words): that parameter
+/// reported as invalid, in `Message` as well as in its `Fields` entry, and nothing about
+/// the pillars this emulator holds — those are the lens's content, which a caller discovers
+/// from the lens's own review (`GetLensReview`'s `PillarReviewSummaries`) rather than from
+/// a refusal.
 pub fn undefined_pillar(
     content: &state::LensContentView,
     pillar_id: Option<&str>,
 ) -> Option<ValidationException> {
     let pillar_id = pillar_id?;
-    // The pillar set is resolved ONCE, in the lens's own pillar order and with a pillar a
-    // document names twice kept once, and serves both the membership test and the valid
-    // values the finding hands back — so the list is exactly the set `GetLensReview` serves
-    // and the order rule lives in one place.
-    let mut defined: Vec<&str> = Vec::new();
-    for (pillar, _) in content.pillars() {
-        if !defined.contains(&pillar.as_str()) {
-            defined.push(pillar.as_str());
-        }
-    }
+    // The pillar set the value is judged against is the lens's own
+    // ([`state::LensContentView::pillar_ids`]) — the same set every read of that lens's
+    // review reports a summary for — so membership is tested in one place.
+    let defined = content.pillar_ids();
     if defined.is_empty() || defined.contains(&pillar_id) {
         return None;
     }
-    Some(undefined_pillar_finding(&defined))
+    Some(undefined_pillar_finding())
 }
 
-/// The finding [`undefined_pillar`] reports: the member that carried the value, and the
-/// lens's whole pillar set as the valid values, in the lens's own pillar order — the order
-/// every read of that lens's review reports its pillars in, so the list reads the same way
-/// the caller saw them.
+/// The finding [`undefined_pillar`] reports: the parameter the value arrived in, named as
+/// the model names it, and this service's sentence for a parameter value it would not
+/// accept ([`state::invalid_parameter_sentence`]) — the one place that sentence is worded,
+/// so a `PillarId` the lens does not define reads exactly like a query parameter whose
+/// enumerated type does not admit its value, which is the only wording this service's
+/// recordings show for a refused value bound outside the body.
 ///
-/// Worded in the form this service states a value outside a catalog in — the member, then
-/// the values that catalog defines, as [`invalid_choices`] states a choice outside a
-/// question's — with the noun of what this member names and in the singular, because
-/// `PillarId` carries ONE pillar where `SelectedChoices` carries a list.
-fn undefined_pillar_finding(defined: &[&str]) -> ValidationException {
-    fields_failed(
-        state::PILLAR_ID_MEMBER,
-        format!(
-            "{} contains an invalid pillar. Valid pillars are: [{}].",
-            state::PILLAR_ID_MEMBER,
-            defined.join(", ")
-        ),
-    )
+/// The envelope is the one place this service builds a field validation
+/// ([`state::field_validation_exception`]), which states the finding in `Message` behind
+/// this service's tag as well as in `Fields`, so a client attributing the failure from
+/// `Message` reads the same diagnostic as one reading `Fields`.
+fn undefined_pillar_finding() -> ValidationException {
+    state::field_validation_exception(&[(
+        state::PILLAR_ID_MEMBER.to_string(),
+        state::invalid_parameter_sentence(state::PILLAR_ID_MEMBER),
+    )])
 }
 
 /// The refusal for the `ChoiceId`s an answer-recording request names that the question it
@@ -242,11 +244,14 @@ fn invalid_choices(member: &str, question: &state::ReviewQuestion) -> Validation
     )
 }
 
-/// The envelope a value MATCHED against lens content and found outside it is refused with:
-/// the CLASS of the failure in `Message` — which therefore carries no value from the
-/// request or from the store — the modelled `FIELD_VALIDATION_FAILED` classification, and
-/// ONE `Fields` entry naming the input member the value arrived in and carrying that
-/// member's own detail, which is where the values the content defines are handed back.
+/// The envelope a BODY member carrying a LIST of values matched against lens content and
+/// found outside it is refused with: the CLASS of the failure in `Message` — which
+/// therefore carries no value from the request or from the store — the modelled
+/// `FIELD_VALIDATION_FAILED` classification, and ONE `Fields` entry naming the input member
+/// the values arrived in and carrying that member's own detail, which is where the values
+/// the content defines are handed back. That split is what this service's recorded refusal
+/// of this class does, and it is why a value bound outside the body is worded the other way
+/// round ([`undefined_pillar`]).
 ///
 /// Every finding of this class is built here, so the member a client attributes the failure
 /// to, and the place the actionable detail lives, cannot drift between the members and the

@@ -1067,10 +1067,11 @@ pub const JIRA_CONFIGURATION_MEMBER: &str = "JiraConfiguration";
 /// the caller which entry of its request to fix.
 ///
 /// The member that merely SCOPES a read of one lens review to one pillar is worded by
-/// [`crate::service::lens_content_validation::undefined_pillar`] instead: there the request
-/// names a single pillar and there is no offending entry to point at, so the finding hands
-/// back the pillars the lens defines, in the envelope this service's recorded refusal of
-/// that class uses.
+/// [`crate::service::lens_content_validation::undefined_pillar`] instead: there the value
+/// arrives in a query parameter carrying a single pillar, so there is no offending entry to
+/// point at and the finding reports that parameter as invalid, in the form this service
+/// states any value bound outside its body that the parameter it was read as does not
+/// admit.
 pub fn undefined_pillar_refusal<'id>(
     member: &str,
     lens: &str,
