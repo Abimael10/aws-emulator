@@ -167,7 +167,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
-        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         // A report of the stored session's endpoint. The only write it performs on the
         // store is materialising the state changes the clock already owed at this
@@ -206,8 +205,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every id reported is the STORED session's own, never the request's.
         let application_id = session.session.application_id.clone();
         let session_id = session.session.session_id.clone();
-        let endpoint = crate::state::session_endpoint_url(&region, &session_id);
         drop(store);
+
+        // The address this emulator is REACHED at, with the session's own path under it: a
+        // client takes this value and connects to it, so it leads back here rather than to a
+        // host AWS publishes its own endpoints at (`crate::state::session_endpoint_url`).
+        let endpoint = crate::state::session_endpoint_url(
+            ctx.endpoint().as_str(),
+            &application_id,
+            &session_id,
+        );
 
         // A fresh token per call, which is what "Call this operation again when the
         // authentication token expires to obtain a new token" asks of a client. Nothing

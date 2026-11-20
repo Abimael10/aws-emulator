@@ -1273,6 +1273,10 @@ async fn stop_application_requires_its_job_runs_to_have_finished() {
 /// emulator runs the Spark submit of a Python application in Amazon S3, so a submit whose
 /// entry point the object store holds nothing at ends in the modelled failure state carrying
 /// what the STORE answered — and never in a success nothing computed.
+///
+/// A run that terminated also reports what it TOOK: the instant it moved to `RUNNING`, the
+/// instant it was terminated, the seconds between them, the total time it spent `QUEUED`, and
+/// the resources its own worker held over the span it executed for.
 #[tokio::test]
 async fn a_job_run_whose_application_cannot_be_downloaded_ends_failed() {
     let router = emulator();
@@ -1332,6 +1336,40 @@ async fn a_job_run_whose_application_cannot_be_downloaded_ends_failed() {
     assert!(
         duration.as_i64().is_some_and(|seconds| seconds >= 1),
         "a run that executed reports the seconds it took, got {duration:?}"
+    );
+    // "The total time for a job in the QUEUED state in milliseconds"
+    // (`JobRun$queuedDurationMilliseconds`): the run passed through that state, so the span
+    // it spent there is reported.
+    let queued = settled.at("/jobRun/queuedDurationMilliseconds");
+    assert!(
+        queued.as_i64().is_some_and(|milliseconds| milliseconds >= 0),
+        "a run that passed through QUEUED reports the time it spent there, got {queued:?}"
+    );
+    // ... and what the span it executed for consumed, in both utilisation structures: the
+    // aggregate, and the billed figures under the documented one-minute minimum and the 20 GB
+    // of per-worker storage that is not billed.
+    for member in ["vCPUHour", "memoryGBHour", "storageGBHour"] {
+        let used = settled.at(&format!("/jobRun/totalResourceUtilization/{member}"));
+        assert!(
+            used.as_f64().is_some_and(|value| value > 0.0),
+            "a terminated run reports the {member} it used, got {used:?}"
+        );
+    }
+    let billed_v_cpu = settled.at("/jobRun/billedResourceUtilization/vCPUHour");
+    let used_v_cpu = settled.at("/jobRun/totalResourceUtilization/vCPUHour");
+    assert!(
+        billed_v_cpu.as_f64().is_some_and(|billed| {
+            used_v_cpu.as_f64().is_some_and(|used| billed >= used)
+        }),
+        "the billed vCPU-hours cover at least the minimum usage, got {billed_v_cpu:?} against \
+         {used_v_cpu:?}"
+    );
+    let billed_storage = settled.at("/jobRun/billedResourceUtilization/storageGBHour");
+    assert_eq!(
+        billed_storage.as_f64(),
+        Some(0.0),
+        "a worker at the storage size that is not billed is billed none of it, got \
+         {billed_storage:?}"
     );
 }
 

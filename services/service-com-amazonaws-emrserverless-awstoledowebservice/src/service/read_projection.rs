@@ -27,12 +27,13 @@
 //!
 //! [`ReadProjection`] is that wrapper: every write delegates to the serializer the
 //! framework's protocol built, unchanged, except where the member being written is one
-//! the projection extends. A struct member named `application` or `session` is descended
-//! into with the projection applied one level down; inside an application, the auto-start
-//! and auto-stop blocks are written a second time under their other spelling and the
-//! extended-support block is appended; inside an auto-stop block, the idle timeout is
-//! written a second time under its other name; inside a session, the extended-support
-//! flag is appended. Every other member, at every depth, is the framework's own bytes.
+//! the projection extends. A struct member named `application`, `session` or `jobRun` is
+//! descended into with the projection applied one level down; inside an application, the
+//! auto-start and auto-stop blocks are written a second time under their other spelling and
+//! the extended-support block is appended; inside an auto-stop block, the idle timeout is
+//! written a second time under its other name; inside a session and inside a job run, the
+//! extended-support flag is appended. Every other member, at every depth, is the framework's
+//! own bytes.
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
@@ -44,12 +45,16 @@ use aws_smithy_types::{BigDecimal, BigInteger, DateTime, Document};
 /// process: the JSON codec writes a member's NAME as the object key.
 const NAMESPACE: &str = "com.amazonaws.emrserverless";
 
-/// The output member that carries an `Application` (`GetApplication`,
-/// `UpdateApplication`) — `smithy_query(query="operation",operation="GetApplication")`.
+/// The output member that carries an `Application`, as the model's own `GetApplication` and
+/// `UpdateApplication` output structures name it.
 const APPLICATION_MEMBER: &str = "application";
 
 /// The output member that carries a `Session` (`GetSession`).
 const SESSION_MEMBER: &str = "session";
+
+/// The output member that carries a `JobRun`, as the model's own `GetJobRun` output structure
+/// names it.
+const JOB_RUN_MEMBER: &str = "jobRun";
 
 /// `Application$autoStartConfiguration`, the modelled spelling of the auto-start block.
 const AUTO_START_CONFIGURATION_MEMBER: &str = "autoStartConfiguration";
@@ -177,6 +182,21 @@ static M_SESSION_EXTENDED_SUPPORT_ENABLED: Schema = Schema::new_member(
     SYNTHETIC_INDEX,
 );
 
+/// The same flag of one job run: a run is served under the extended support of the
+/// application it runs on, and the service's own wire response for a job run carries the flag
+/// that this service's Smithy model does not declare — so a client reading it cannot tell
+/// "off" from "not reported".
+static M_JOB_RUN_EXTENDED_SUPPORT_ENABLED: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.emrserverless#JobRun$extendedSupportEnabled",
+        NAMESPACE,
+        "extendedSupportEnabled",
+    ),
+    ShapeType::Boolean,
+    "extendedSupportEnabled",
+    SYNTHETIC_INDEX,
+);
+
 /// Which shape's members are being written, and therefore what the projection adds to
 /// them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,6 +208,8 @@ enum Level {
     Application,
     /// One `Session`.
     Session,
+    /// One `JobRun`.
+    JobRun,
     /// One `AutoStopConfig`, inside either of its spellings.
     AutoStop,
 }
@@ -240,6 +262,10 @@ impl SerializableStruct for ReadProjection<'_> {
             }
             Level::Session => s.write_boolean(
                 &M_SESSION_EXTENDED_SUPPORT_ENABLED,
+                crate::state::EXTENDED_SUPPORT_ENABLED,
+            ),
+            Level::JobRun => s.write_boolean(
+                &M_JOB_RUN_EXTENDED_SUPPORT_ENABLED,
                 crate::state::EXTENDED_SUPPORT_ENABLED,
             ),
             // The timeout under its other name, and only when the block reported one:
@@ -300,6 +326,9 @@ impl ShapeSerializer for Projecting<'_> {
             (Level::Output, Some(SESSION_MEMBER)) => self
                 .inner
                 .write_struct(schema, &ReadProjection::at(value, Level::Session)),
+            (Level::Output, Some(JOB_RUN_MEMBER)) => self
+                .inner
+                .write_struct(schema, &ReadProjection::at(value, Level::JobRun)),
             // One setting, under both of the spellings the service's response carries:
             // the same value written twice, so the two can never disagree.
             (Level::Application, Some(AUTO_START_CONFIGURATION_MEMBER)) => {

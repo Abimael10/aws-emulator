@@ -287,9 +287,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartJobRun<Eng> 
         let job_run_id = record.mint_job_run_id();
         let arn = crate::state::job_run_arn(&record.application.arn, &job_run_id);
         let created_at = crate::state::now_timestamp(now);
-        // The overrides this submit carried: reported back on the run verbatim, and read
-        // once more below for the monitoring destination they may redirect.
-        let configuration_overrides = input.configuration_overrides;
+        // The configuration this run is in force under: the overrides this submit carried,
+        // with the monitoring configuration every run publishes under materialised inside
+        // them. Reported back on the run, and read once more below for the monitoring
+        // destinations they may redirect.
+        let configuration_overrides =
+            crate::state::adopt_job_run_configuration_overrides(input.configuration_overrides);
+        // The mode the run is in, which is also what decides which member of its retry policy
+        // is in force.
+        let mode = crate::state::adopt_job_run_mode(input.mode);
+        let retry_policy = crate::state::adopt_retry_policy(
+            mode.as_deref().unwrap_or(crate::state::DEFAULT_JOB_RUN_MODE),
+            input.retry_policy,
+        );
+        // The work this submit named is what the run will be settled on
+        // (`crate::state::spark_job_run`); nothing of the driver is resolved here.
         let job_run = JobRun {
             application_id: record.application.application_id.clone(),
             job_run_id: job_run_id.clone(),
@@ -306,7 +318,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartJobRun<Eng> 
             release_label: record.application.release_label.clone(),
             configuration_overrides: configuration_overrides.clone(),
             job_driver,
-            tags: input.tags,
+            tags: crate::state::adopt_tags(input.tags),
             // Resource utilisation is measured while a job executes, and is reported once
             // the run has finished; nothing has executed at the instant the submit returns.
             total_resource_utilization: None,
@@ -318,8 +330,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartJobRun<Eng> 
                     .unwrap_or(crate::state::DEFAULT_EXECUTION_TIMEOUT_MINUTES),
             ),
             billed_resource_utilization: None,
-            mode: input.mode,
-            retry_policy: input.retry_policy,
+            mode,
+            retry_policy,
             // The first attempt of this job run.
             attempt: Some(1),
             attempt_created_at: Some(created_at),
@@ -344,6 +356,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartJobRun<Eng> 
                 // terminal one: what the run comes to REST in is what running the work
                 // this driver named answered (`crate::state::spark_job_run`).
                 pending: crate::state::job_run_stages(now),
+                queued_since: None,
                 dashboard: None,
                 dashboard_grants: 0,
                 // Where this run's log artifacts are published, resolved HERE from the

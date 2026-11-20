@@ -46,6 +46,10 @@ pub mod job_run_logs;
 /// Amazon S3 — and the state the run comes to rest in because of it.
 pub mod spark_job_run;
 
+/// The worker a job run's driver ran as, and what a run that terminated consumed over the
+/// span it executed for.
+pub mod job_run_program;
+
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt::Debug;
 use std::time::{Duration, SystemTime};
@@ -55,12 +59,13 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     Application, ApplicationSummary, AutoStartConfig, AutoStopConfig, CloudWatchLoggingConfiguration,
-    Configuration, ConflictException, CreateApplicationInput, DiskEncryptionConfiguration,
-    IdentityCenterConfiguration, IdentityCenterConfigurationInput, ImageConfiguration,
-    ImageConfigurationInput, JobRun, JobRunSummary, JobLevelCostAllocationConfiguration,
-    ManagedPersistenceMonitoringConfiguration, MonitoringConfiguration,
-    ResourceNotFoundException, Session, SessionSummary, ValidationException,
-    WorkerTypeSpecification, WorkerTypeSpecificationInput,
+    Configuration, ConfigurationOverrides, ConflictException, CreateApplicationInput,
+    DiskEncryptionConfiguration, IdentityCenterConfiguration, IdentityCenterConfigurationInput,
+    ImageConfiguration, ImageConfigurationInput, JobDriver, JobRun, JobRunSummary,
+    JobLevelCostAllocationConfiguration, ManagedPersistenceMonitoringConfiguration,
+    MonitoringConfiguration, ResourceNotFoundException, ResourceUtilization, RetryPolicy, Session,
+    SessionSummary, TotalResourceUtilization, ValidationException, WorkerTypeSpecification,
+    WorkerTypeSpecificationInput,
 };
 
 /// This service's ARN namespace, and the `sigv4Name` the model declares
@@ -185,11 +190,6 @@ pub const EXTENDED_SUPPORT_ENABLED: bool = false;
 /// Which level the extended-support setting an application runs under was set at: the
 /// account, since nothing sets it per application (see [`EXTENDED_SUPPORT_ENABLED`]).
 pub const EXTENDED_SUPPORT_SOURCE: &str = "ACCOUNT";
-
-/// The domain EMR Serverless publishes an interactive session's endpoint under, between
-/// the label naming the session and the region: a session is reached at
-/// `https://<sessionId>.<this>.<region>.amazonaws.com`.
-pub const SESSION_ENDPOINT_DOMAIN: &str = "s.emr-serverless-services";
 
 /// How long a resource stays in the state the call that started the work returned
 /// (`CREATING` after a create, `STARTING` after a start, `STOPPING` after a stop,
@@ -336,6 +336,11 @@ pub const SUPPORTED_ENGINES: &[SupportedEngine] = &[
 /// `JobRun$stateDetails` for a job run that has been accepted but not yet run.
 pub const SUBMITTED_STATE_DETAILS: &str = "Job run submitted.";
 
+/// The `JobRunState` a run sits in while it waits for capacity, and the one
+/// `queuedDurationMilliseconds` is the total time in.
+pub const QUEUED_JOB_RUN_STATE: &str = "QUEUED";
+
+
 /// `JobRun$stateDetails` for a job run a caller cancelled.
 pub const CANCELLED_STATE_DETAILS: &str = "Job run cancelled at the request of the caller.";
 
@@ -359,7 +364,7 @@ pub const SCHEDULED_STATE_DETAILS: &str = "Job run scheduled on the application.
 /// been executed yet stays `RUNNING` rather than being reported as finished.
 pub const JOB_RUN_STAGES: &[(&str, &str)] = &[
     ("PENDING", PENDING_STATE_DETAILS),
-    ("QUEUED", QUEUED_STATE_DETAILS),
+    (QUEUED_JOB_RUN_STATE, QUEUED_STATE_DETAILS),
     ("SCHEDULED", SCHEDULED_STATE_DETAILS),
     ("RUNNING", spark_job_run::RUNNING_STATE_DETAILS),
 ];
@@ -795,6 +800,9 @@ pub struct JobRunRecord {
     /// two calls that find the same run owed cannot both run it, and cleared when the
     /// execution answers or when nothing performed it.
     pub workload_claimed: bool,
+    /// The instant this run entered [`QUEUED_JOB_RUN_STATE`], which is what
+    /// `queuedDurationMilliseconds` is measured from.
+    pub queued_since: Option<SystemTime>,
 }
 
 /// A dashboard URL this service minted for one job run: the token the URL carries and
@@ -827,12 +835,20 @@ impl JobRunRecord {
                 break;
             };
             let at = DateTime::from(pending.due);
+            // The total time the run spent QUEUED is closed as it LEAVES that state:
+            // `queuedDurationMilliseconds` is "the total time for a job in the QUEUED state
+            // in milliseconds", so it is the span between the two due instants rather than
+            // anything measured at a read.
+            self.close_queued_span(pending.due);
             self.job_run.state = pending.state.clone();
             if let Some(details) = pending.state_details.as_ref() {
                 self.job_run.state_details = details.clone();
             }
             self.job_run.updated_at = at;
             self.job_run.attempt_updated_at = Some(at);
+            if self.job_run.state == QUEUED_JOB_RUN_STATE {
+                self.queued_since = Some(pending.due);
+            }
             // "The date and time when the job moved to the RUNNING state"
             // (`JobRun$startedAt`): the instant that move fell due, recorded once.
             if self.job_run.state == RUNNING_JOB_RUN_STATE && self.job_run.started_at.is_none() {
@@ -848,6 +864,8 @@ impl JobRunRecord {
                 // never reached `RUNNING` executed nothing, so it reports no duration.
                 self.job_run.total_execution_duration_seconds =
                     execution_duration_seconds(self.job_run.started_at.as_ref(), at);
+                // ... and what that span CONSUMED, on the worker the run executed on.
+                self.report_consumption();
                 self.pending.clear();
                 finished_at = Some(pending.due);
                 // The artifacts a finished run leaves in its configured destinations are
@@ -858,6 +876,54 @@ impl JobRunRecord {
             }
         }
         finished_at
+    }
+
+    /// The worker this run's DRIVER ran as, read off the `sparkSubmitParameters` the submit
+    /// carried ([`job_run_program::DriverWorker::of`]).
+    #[must_use]
+    pub fn driver_worker(&self) -> job_run_program::DriverWorker {
+        let parameters = match &self.job_run.job_driver {
+            JobDriver::sparkSubmit(submit) => submit.spark_submit_parameters.as_deref(),
+            JobDriver::Hive(_) => None,
+        };
+        job_run_program::DriverWorker::of(parameters)
+    }
+
+    /// What this run CONSUMED over the span it executed for, reported as it comes to rest.
+    ///
+    /// Reported only for a run that EXECUTED: `JobRun$startedAt` is "the date and time when
+    /// the job moved to the RUNNING state", so a run that never moved there executed nothing
+    /// and reports no utilisation, exactly as it reports no duration. For one that did, the
+    /// two structures are what that duration on the run's own worker came to
+    /// ([`job_run_program::DriverWorker`]) — `totalResourceUtilization` "from the time the job
+    /// starts to execute, until the time the job terminates", and
+    /// `billedResourceUtilization` under the billing rule the member documents.
+    fn report_consumption(&mut self) {
+        let Some(seconds) = self.job_run.total_execution_duration_seconds else {
+            return;
+        };
+        let executed = Duration::from_secs(u64::try_from(seconds).unwrap_or(0));
+        let worker = self.driver_worker();
+        self.job_run.total_resource_utilization = Some(worker.total_utilization(executed));
+        self.job_run.billed_resource_utilization = Some(worker.billed_utilization(executed));
+    }
+
+    /// Close the span this run spent QUEUED, if it is in that state, at `at`.
+    ///
+    /// `JobRun$queuedDurationMilliseconds` is "the total time for a job in the QUEUED state in
+    /// milliseconds", so it is the span between the instant the run entered that state and the
+    /// instant it left it — both of them instants the clock owed, not instants a read happened
+    /// at.
+    fn close_queued_span(&mut self, at: SystemTime) {
+        if self.job_run.state != QUEUED_JOB_RUN_STATE {
+            return;
+        }
+        let Some(since) = self.queued_since.take() else {
+            return;
+        };
+        let queued = at.duration_since(since).unwrap_or(Duration::ZERO);
+        self.job_run.queued_duration_milliseconds =
+            Some(i64::try_from(queued.as_millis()).unwrap_or(i64::MAX));
     }
 
     /// Record the state this run carries now as a line of its driver log, stamped at the
@@ -1247,9 +1313,9 @@ pub struct ComAmazonawsEmrserverlessAwstoledowebserviceState {
     /// The counter session ids are minted from.
     ///
     /// Store-wide rather than per application, because a session id names ONE session:
-    /// the endpoint a client is handed for a session is a host built from that id
+    /// the endpoint a client is handed for a session is a path built from that id
     /// ([`session_endpoint_url`]), so two sessions carrying the same id would be reached
-    /// at the same host.
+    /// at the same address.
     pub next_session_seq: u64,
     /// The job-run executions this process has STARTED and that have not answered yet,
     /// keyed by the run each belongs to ([`spark_job_run::in_flight_key`]).
@@ -1747,32 +1813,52 @@ pub fn mint_session_auth_token(store: &::emulator_server::CredentialStore) -> Op
     token
 }
 
-/// The endpoint a client connects a Livy or Spark Connect client to one interactive
-/// session on: an https ORIGIN whose host names that session under the EMR Serverless
-/// session-endpoint domain of the region the call was signed for, and nothing else — no
-/// port, no path, no query.
+/// The endpoint a client connects a Livy or Spark Connect client to one interactive session
+/// on: the address THIS emulator is reached at, with the path naming the application and the
+/// session the client is connecting to.
 ///
-/// A client reads this value to build a connection: it takes the host out of it for an
-/// SNI or `Host` header, or hands the whole origin to a client library that appends its
-/// own protocol path. So the value is an origin naming the session, derived from the
-/// STORED session's own id and the request's region — every call for one session reports
-/// the same endpoint, and two sessions never share one.
-pub fn session_endpoint_url(region: &str, session_id: &str) -> String {
-    let url = session_endpoint_origin(region, session_id);
-    if url.chars().count() <= ENDPOINT_URL_MAX_LENGTH {
-        return url;
+/// A client reads this value to build a connection and then DIALS it, so it has to lead back
+/// to this emulator: `served_base` is
+/// [`::smithy_server_runtime::OperationContext::endpoint`], "the base URL a later request
+/// addresses", and nothing of the value is derived from a host AWS publishes its own endpoints
+/// at — an address under one of those resolves nowhere near this process or, worse, to genuine
+/// AWS infrastructure, which takes the client out of the emulated environment carrying the
+/// credentials it is holding.
+///
+/// The applicationId/sessionId path structure is kept, so a client that parses the value for
+/// the session it names still reads it there: every call about one session reports the same
+/// endpoint, and two sessions never share one.
+///
+/// What answers AT that address is this emulator's own API: it serves this service's control
+/// plane and runs no interactive-session protocol behind the path, so a client that dials the
+/// endpoint reaches this emulator rather than a Livy or Spark Connect server. The value's
+/// authority is this process's, which is what the member is for — an endpoint naming a host
+/// nothing here answers on leads the client out of the emulated environment altogether.
+pub fn session_endpoint_url(served_base: &str, application_id: &str, session_id: &str) -> String {
+    let base = served_base.trim_end_matches('/');
+    // The session's whole path, and the shortest form that still names the session, for an
+    // address long enough that the first does not fit inside `EndpointUrl`'s bound: the value
+    // stays inside the modelled length while two sessions keep two endpoints.
+    for path in [
+        format!("/{APPLICATIONS_PATH_SEGMENT}/{application_id}/{SESSIONS_PATH_SEGMENT}/{session_id}"),
+        format!("/{SESSIONS_PATH_SEGMENT}/{session_id}"),
+    ] {
+        let url = format!("{base}{path}");
+        if url.chars().count() <= ENDPOINT_URL_MAX_LENGTH {
+            return url;
+        }
     }
-    // A request signed for a region name long enough to push the origin past
-    // `EndpointUrl`'s bound is answered for this service's default region, whose length
-    // no request can influence.
-    session_endpoint_origin(DEFAULT_REGION, session_id)
+    // An address so long that not even that fits is one no emulator of this process reports;
+    // the base alone still leads back here rather than past the modelled length.
+    base.to_string()
 }
 
-/// The one place the session-endpoint host is spelled: the session's label, the
-/// session-endpoint domain, the region, and the AWS suffix.
-fn session_endpoint_origin(region: &str, session_id: &str) -> String {
-    format!("https://{session_id}.{SESSION_ENDPOINT_DOMAIN}.{region}.amazonaws.com")
-}
+/// The path segment naming an application, as this service's own routes spell it
+/// (`/applications/{applicationId}/sessions/{sessionId}/endpoint`).
+const APPLICATIONS_PATH_SEGMENT: &str = "applications";
+
+/// The path segment naming a session under it, from the same route.
+const SESSIONS_PATH_SEGMENT: &str = "sessions";
 
 /// The endpoint this request arrived on, falling back to the public EMR Serverless
 /// endpoint for `region` when the request names no authority at all.
@@ -1818,9 +1904,80 @@ pub fn adopt_auto_stop(config: Option<AutoStopConfig>) -> Option<AutoStopConfig>
 ///
 /// `Application$tags` is "the tags assigned to the application", a `@length(0..200)`
 /// map, so an application with none has an EMPTY tag map rather than no tag map, and
-/// every read reports it.
+/// every read reports it. `JobRun$tags` and `Session$tags` are the same member of their
+/// own resource, so a run or a session submitted with no tags reports the empty map too.
 pub fn adopt_tags(tags: Option<HashMap<String, String>>) -> Option<HashMap<String, String>> {
     Some(tags.unwrap_or_default())
+}
+
+/// The `JobRunMode` a submit that named none runs in.
+///
+/// `JobRunMode` is `BATCH | STREAMING`, and the two members of `RetryPolicy` say which mode
+/// is which: `maxAttempts` "is only applicable for BATCH mode" and `maxFailedAttemptsPerHour`
+/// "is only applicable for STREAMING mode" — so `STREAMING` is the mode a submit opts into
+/// and a run submitted without a mode is a batch job, which every read of it reports.
+pub const DEFAULT_JOB_RUN_MODE: &str = "BATCH";
+
+/// The `JobRunMode` whose retry policy counts FAILED ATTEMPTS PER HOUR rather than attempts,
+/// from the same two member docs.
+pub const STREAMING_JOB_RUN_MODE: &str = "STREAMING";
+
+/// `RetryPolicy$maxAttempts` for a `BATCH` run whose submit named no retry policy: one
+/// attempt, the run itself, which is what a job that names no retries gets.
+pub const DEFAULT_MAX_ATTEMPTS: i32 = 1;
+
+/// `RetryPolicy$maxFailedAttemptsPerHour` for a `STREAMING` run whose submit named none: the
+/// hourly ceiling a streaming job retries under when it asks for no other.
+pub const DEFAULT_MAX_FAILED_ATTEMPTS_PER_HOUR: i32 = 5;
+
+/// The `mode` to persist: the caller's, or [`DEFAULT_JOB_RUN_MODE`].
+pub fn adopt_job_run_mode(mode: Option<String>) -> Option<String> {
+    Some(mode.unwrap_or_else(|| DEFAULT_JOB_RUN_MODE.to_string()))
+}
+
+/// The `retryPolicy` to persist: the caller's, with the member that applies to the run's own
+/// MODE filled in where the submit left it out.
+///
+/// `JobRun$retryPolicy` is "the retry policy of the job run", which every run has — a run
+/// that asked for none still retries by some policy — so a read reports the policy in force
+/// rather than omitting the block. Which member carries it is the mode's:
+/// `maxAttempts` "is only applicable for BATCH mode" and `maxFailedAttemptsPerHour` "is only
+/// applicable for STREAMING mode", so only the applicable one is filled in and a value the
+/// caller gave is kept whichever member it set.
+pub fn adopt_retry_policy(mode: &str, policy: Option<RetryPolicy>) -> Option<RetryPolicy> {
+    let policy = policy.unwrap_or_default();
+    if mode == STREAMING_JOB_RUN_MODE {
+        return Some(RetryPolicy {
+            max_attempts: policy.max_attempts,
+            max_failed_attempts_per_hour: Some(
+                policy
+                    .max_failed_attempts_per_hour
+                    .unwrap_or(DEFAULT_MAX_FAILED_ATTEMPTS_PER_HOUR),
+            ),
+        });
+    }
+    Some(RetryPolicy {
+        max_attempts: Some(policy.max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS)),
+        max_failed_attempts_per_hour: policy.max_failed_attempts_per_hour,
+    })
+}
+
+/// The `configurationOverrides` to persist for a job run: the caller's, with the monitoring
+/// configuration the run really publishes under materialised inside it.
+///
+/// `JobRun$configurationOverrides` reports "the configuration settings that are used to
+/// override default configuration", and the monitoring half of it is in force for every run —
+/// managed log persistence is on unless a configuration turns it off
+/// ([`DEFAULT_MANAGED_PERSISTENCE_ENABLED`]) — so a read reports that block with its
+/// documented default filled in rather than omitting it. Nothing else is invented: the
+/// application configuration and the disk encryption of a submit that named none stay absent.
+pub fn adopt_job_run_configuration_overrides(
+    overrides: Option<ConfigurationOverrides>,
+) -> Option<ConfigurationOverrides> {
+    let mut overrides = overrides.unwrap_or_default();
+    overrides.monitoring_configuration =
+        adopt_monitoring(overrides.monitoring_configuration.take());
+    Some(overrides)
 }
 
 /// The resource a `ResourceArn` names: the application ARN that owns it, and the child

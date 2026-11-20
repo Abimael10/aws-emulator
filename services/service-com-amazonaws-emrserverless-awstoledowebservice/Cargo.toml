@@ -19,7 +19,10 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true, features = ["time", "sync"] }
+# `sync` and `time` on top of the workspace features: a job run's own program runs on a thread
+# of its own and reports back over a oneshot channel, waited for no longer than the run's
+# bounds allow (`state::job_run_execution`), and a timed wait is what bounds every such wait.
+tokio = { workspace = true, features = ["sync", "time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }

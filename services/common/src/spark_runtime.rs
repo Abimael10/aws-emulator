@@ -20,6 +20,12 @@
 //! program that computes a sum gets the sum of its own data, and one whose function raises
 //! gets that exception.
 //!
+//! Beside the package, this module holds the ENTRY module a submitted program is run FROM
+//! ([`submitted_program_modules`]): running one as `spark-submit` runs it — as `__main__`,
+//! with its own path and arguments on `sys.argv` — and reporting the status it exited with,
+//! its two console streams and the exception it ended on is the same for every service whose
+//! data plane submits a program, so it is spelled here once as well.
+//!
 //! What they are not is a distributed Spark. The partitions are lists in this process, there
 //! is no cluster to schedule them on, and the surface is the one this emulator can compute —
 //! the resilient distributed dataset, the session and context that hand one out, and the
@@ -159,6 +165,150 @@ class SparkConf(object):
 
     def toDebugString(self):
         return "\n".join("%s=%s" % (key, value) for key, value in self.getAll())
+"#;
+
+/// The module every service of this workspace RUNS a submitted Spark program FROM, and the
+/// function in it the interpreter calls.
+///
+/// A `spark-submit` runs its program as the `__main__` module, with the program's own path and
+/// arguments on `sys.argv`, and reports what the run came to; that is the same for every
+/// service whose data plane submits one, so it is spelled here rather than per service
+/// ([`submitted_program_source`]).
+pub const SUBMITTED_PROGRAM_MODULE: &str = "__spark_submit_program";
+
+/// See [`SUBMITTED_PROGRAM_MODULE`].
+pub const SUBMITTED_PROGRAM_FUNCTION: &str = "run";
+
+/// The handler the interpreter resolves for it: `<module>.<function>`.
+#[must_use]
+pub fn submitted_program_handler() -> String {
+    format!("{SUBMITTED_PROGRAM_MODULE}.{SUBMITTED_PROGRAM_FUNCTION}")
+}
+
+/// The modules a submitted Spark program finds on its import path, as `(module path, source)`
+/// pairs: the `pyspark` package ([`pyspark_modules`]) and the entry module that RUNS the
+/// program ([`SUBMITTED_PROGRAM_MODULE`]).
+///
+/// This is what a calling service hands the interpreter. `spark_version` is the version of
+/// Spark the environment the program runs in ships, as [`pyspark_modules`] states it.
+#[must_use]
+pub fn submitted_program_modules(spark_version: Option<&str>) -> Vec<(String, String)> {
+    ::std::iter::once((
+        format!("{SUBMITTED_PROGRAM_MODULE}.py"),
+        SUBMITTED_PROGRAM_SOURCE.to_string(),
+    ))
+    .chain(pyspark_modules(spark_version))
+    .collect()
+}
+
+/// The entry module's own source, for a reader of this module.
+#[must_use]
+pub fn submitted_program_source() -> &'static str {
+    SUBMITTED_PROGRAM_SOURCE
+}
+
+/// The entry module: it runs the submitted program the way `spark-submit` runs one — as the
+/// `__main__` module, with the program's path and its own arguments on `sys.argv` — and
+/// reports what the run came to: the status it exited with, the two console streams it wrote,
+/// and the exception it ended on when it ended on one.
+///
+/// The streams are reported SEPARATELY because that is what a client-mode `spark-submit`
+/// leaves: the driver's own output on standard output, and the engine's logging and any
+/// traceback on standard error. What each keeps is bounded by the `streamCharacters` the
+/// calling service passes in the run's event, so a chatty program cannot grow the answer
+/// without limit.
+///
+/// Reporting rather than raising is how the run's outcome reaches the calling service: the
+/// engine's own bounds are unaffected, because a run whose budget was spent is reported as
+/// stopped whatever the program answered.
+const SUBMITTED_PROGRAM_SOURCE: &str = r#"
+"""Runs a submitted Spark program, as the Python program it is."""
+
+import sys
+import traceback
+
+
+class _Console:
+    """One console stream of the program, bounded by what one run keeps of it."""
+
+    def __init__(self, limit):
+        self._parts = []
+        self._kept = 0
+        self._limit = limit
+
+    def write(self, text):
+        if not isinstance(text, str):
+            text = str(text)
+        room = self._limit - self._kept
+        if room > 0:
+            kept = text[:room]
+            self._parts.append(kept)
+            self._kept += len(kept)
+        return len(text)
+
+    def writelines(self, lines):
+        for line in lines:
+            self.write(line)
+
+    def flush(self):
+        return None
+
+    def isatty(self):
+        return False
+
+    def text(self):
+        return "".join(self._parts)
+
+
+def run(event, context):
+    out = _Console(event["streamCharacters"])
+    err = _Console(event["streamCharacters"])
+    held = (sys.stdout, sys.stderr)
+    sys.stdout = out
+    sys.stderr = err
+    status = 0
+    error_type = ""
+    error_message = ""
+    try:
+        # The command line a Spark program resolves its arguments off: its own path followed
+        # by the arguments the submit passed it, which is what spark-submit hands it.
+        sys.argv = [event["path"]] + list(event["arguments"])
+        globals_of_main = {"__name__": "__main__", "__file__": event["path"]}
+        exec(compile(event["source"], event["path"], "exec"), globals_of_main)
+    except SystemExit as ended:
+        # sys.exit() is how a program names the status it exits with: no argument and None are
+        # a clean exit, an integer is that status — masked to the eight bits a process exit
+        # carries, which is what a submit observes of a real driver — and anything else is
+        # printed on standard error and exits non-zero, exactly as the interpreter does with it.
+        code = ended.code
+        if code is None or code is False:
+            status = 0
+        elif code is True:
+            status = 1
+        elif isinstance(code, int):
+            status = int(code) & 0xFF
+        else:
+            status = 1
+            err.write("%s\n" % (code,))
+    except BaseException as raised:
+        # spark-submit writes the driver's traceback on standard error and exits non-zero.
+        status = 1
+        error_type = type(raised).__name__
+        error_message = str(raised)
+        trace = sys.exc_info()[2]
+        # This module's own frame is not part of the program's traceback.
+        if trace is not None and trace.tb_next is not None:
+            trace = trace.tb_next
+        err.write("".join(traceback.format_exception(type(raised), raised, trace)))
+    finally:
+        sys.stdout, sys.stderr = held
+    return {
+        "exitStatus": status,
+        "stdout": out.text(),
+        "stderr": err.text(),
+        "errorType": error_type,
+        "errorMessage": error_message,
+    }
 "#;
 
 #[cfg(test)]

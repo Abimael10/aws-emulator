@@ -328,11 +328,13 @@ pub fn job_run_workload_unanswered() -> String {
 
 /// `JobRun$stateDetails` of a run that ran to its end.
 ///
-/// `JobRun$stateDetails` is "The state details of the job run" and is `@required` with
-/// `@pattern(".*\\S.*")`, so a finished run carries a sentence rather than nothing; this is the
-/// one for a run whose work completed, in the same voice as the stages before it
-/// ([`super::PENDING_STATE_DETAILS`] and its siblings).
-pub const SUCCESS_STATE_DETAILS: &str = "Job run completed successfully.";
+/// RECORDED behaviour: EMR Serverless reports the state details of a SUCCESSFUL run as the
+/// EMPTY string — there is no detail beyond the state itself — while `String256`, the shape
+/// the member targets, declares `@length(min: 1)` with `@pattern(".*\\S.*")`. The wire
+/// behaviour is what is reproduced here: a client that logs or parses this member reads what
+/// the service sends. Every run that did NOT run to its end carries a sentence saying what
+/// happened instead ([`WorkloadOutcome::Failed`]).
+pub const SUCCESS_STATE_DETAILS: &str = "";
 
 /// `JobRun$stateDetails` while the run's own work is executing.
 pub const RUNNING_STATE_DETAILS: &str = "Job run is executing on the application.";
@@ -365,22 +367,28 @@ impl WorkloadOutcome {
 
     /// The `JobRun$stateDetails` it carries once it has come to rest, held inside `String256`'s
     /// modelled `@length(max: 256)`.
+    ///
+    /// A run that SUCCEEDED carries what the service sends for one, which is nothing at all
+    /// ([`SUCCESS_STATE_DETAILS`]); every other outcome carries the sentence that says what
+    /// happened.
     #[must_use]
     pub fn state_details(&self) -> String {
-        let text = match self {
+        match self {
             Self::Succeeded => SUCCESS_STATE_DETAILS.to_string(),
-            Self::Failed(details) => details.clone(),
-        };
-        held_to_state_details(&text)
+            Self::Failed(details) => held_to_state_details(details),
+        }
     }
 }
 
 /// `text` held inside `String256`'s modelled `@length(min: 1, max: 256)`, cut on a character
-/// boundary, and the one sentence a cut text would otherwise lose its meaning without.
+/// boundary.
+///
+/// A failure whose text says nothing is one nothing is known about, so it carries the sentence
+/// for an execution that answered nothing rather than an empty detail.
 fn held_to_state_details(text: &str) -> String {
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return SUCCESS_STATE_DETAILS.to_string();
+        return job_run_workload_unanswered();
     }
     if trimmed.chars().count() <= STATE_DETAILS_MAX_CHARS {
         return trimmed.to_string();
@@ -1228,6 +1236,18 @@ mod tests {
                 details.contains(says),
                 "case {case:?}: expected the details to say {says:?}, got {details:?}"
             );
+            if outcome == WorkloadOutcome::Succeeded {
+                // RECORDED behaviour: a run that ran to its end carries NO details, which is
+                // what the service sends for one ([`SUCCESS_STATE_DETAILS`]).
+                assert_eq!(
+                    details, SUCCESS_STATE_DETAILS,
+                    "case {case:?}: expected a successful run to carry no details, got \
+                     {details:?}"
+                );
+                continue;
+            }
+            // Every outcome that says what happened says it inside `String256`'s modelled
+            // length.
             assert!(
                 (1..=STATE_DETAILS_MAX_CHARS).contains(&details.chars().count()),
                 "case {case:?}: stateDetails is String256, got {} characters: {details:?}",

@@ -9,17 +9,17 @@
 //! The rule under test: a read of an application or of an interactive session reports
 //! the configuration the service APPLIED to it — every configuration block present, each
 //! carrying the value the create or update named or the documented default the service
-//! filled in, under every key the service's wire response carries for it — and the
-//! endpoint a session is reached at is reported as the origin a client connects to.
+//! filled in, under every key the service's wire response carries for it — and the endpoint a
+//! session is reached at is reported as an address that leads back to this emulator.
 //! Three suites, each over a SET of inputs rather than over one recorded request:
 //!
 //! 1. `GetApplication` reports the whole projection, for an application created with
 //!    none of the blocks and for one created with each of them at a different value, and
 //!    `UpdateApplication` leaves the same projection behind.
 //! 2. `GetSession` always reports a session's extended-support flag, as a boolean.
-//! 3. `GetSessionEndpoint` reports an https ORIGIN naming the session under the EMR
-//!    Serverless session-endpoint domain of the region the call was signed for: no port,
-//!    no path, no query.
+//! 3. `GetSessionEndpoint` reports an endpoint a client can actually connect to: the
+//!    address THIS emulator is served at, with the application and the session it names in
+//!    its path — never a host AWS publishes its own endpoints at.
 
 use serde_json::{json, Value};
 
@@ -30,14 +30,16 @@ use super::application_lifecycle::{
 use super::session_lifecycle::{get_session, minimal_session, session_application, start_session};
 use super::update_application::update_application;
 
-/// The region every test request is signed for (`application_lifecycle`'s credential
-/// scope), which is the region a reported endpoint names.
-const REGION: &str = "eu-west-1";
+/// The base URL this emulator reports as its own while it is served on no port at all — what
+/// [`::smithy_server_runtime::OperationContext::endpoint`] answers a handler in this
+/// in-process harness, and a host RFC 6761 reserves so that nothing resolves it. A served
+/// emulator reports the `host:port` it is reached at instead; either way the value is THIS
+/// emulator's, which is what suite 3 pins.
+const SERVED_BASE: &str = ::smithy_server_runtime::UNSERVED_URL_BASE;
 
-/// The host form an EMR Serverless interactive session is reached at: the session's own
-/// id, this domain, the region and the AWS suffix. Written out here rather than read from
-/// `crate::state`, so a wrong constant in `src/` cannot make this test pass.
-const SESSION_ENDPOINT_DOMAIN: &str = "s.emr-serverless-services";
+/// The suffix of every host AWS publishes its own endpoints under: an endpoint naming one of
+/// those takes a client out of the emulated environment, which is what suite 3 refuses.
+const AWS_HOST_SUFFIX: &str = "amazonaws.com";
 
 /// `AutoStopConfig$idleTimeoutMinutes` is `@range(min: 1, max: 10080)` and documents
 /// "Defaults to 15 minutes" (`smithy_query(query="shape",shape="AutoStopConfig")`).
@@ -486,11 +488,11 @@ async fn a_read_reports_a_sessions_extended_support_flag() {
     }
 }
 
-/// Suite 3: the endpoint reported for a session is an https ORIGIN naming that session
-/// under the session-endpoint domain of the region the call was signed for — no port, no
-/// path, no query — and two sessions never share one.
+/// Suite 3: the endpoint reported for a session is an address of THIS emulator — the base a
+/// later request addresses it at, with the application and the session in its path — and two
+/// sessions never share one.
 #[tokio::test]
-async fn a_session_endpoint_is_an_origin_naming_the_session() {
+async fn a_session_endpoint_leads_back_to_this_emulator() {
     let router = emulator();
     let (shared_application, _) = session_application(&router, "tok-origin-app").await;
 
@@ -547,23 +549,29 @@ async fn a_session_endpoint_is_an_origin_naming_the_session() {
             .unwrap_or_default()
             .to_string();
         let expected =
-            format!("https://{session_id}.{SESSION_ENDPOINT_DOMAIN}.{REGION}.amazonaws.com");
+            format!("{SERVED_BASE}/applications/{application_id}/sessions/{session_id}");
         assert_eq!(
             endpoint, expected,
             "case {case:?}: endpoint expected {expected:?}, got {endpoint:?}"
         );
-        // An ORIGIN: everything after the scheme is the host, so a client that splits
-        // the value on `/` gets a host it can put in an SNI or `Host` header.
-        let after_scheme = endpoint.strip_prefix("https://").unwrap_or(&endpoint);
+        // A client takes this value and CONNECTS to it, so its authority is this emulator's
+        // own and never one of AWS's hosts.
+        let authority = endpoint
+            .strip_prefix("https://")
+            .unwrap_or(&endpoint)
+            .split('/')
+            .next()
+            .unwrap_or_default()
+            .to_string();
         assert!(
-            !after_scheme.contains('/')
-                && !after_scheme.contains(':')
-                && !after_scheme.contains('?'),
-            "case {case:?}: the endpoint carries no port, path or query, got {endpoint:?}"
+            !authority.ends_with(AWS_HOST_SUFFIX),
+            "case {case:?}: the endpoint must not name a host AWS publishes its own \
+             endpoints at, got {endpoint:?}"
         );
         assert!(
-            after_scheme.starts_with(&format!("{session_id}.")),
-            "case {case:?}: the host's first label names the session, got {endpoint:?}"
+            endpoint.contains(&format!("/{application_id}/")) && endpoint.ends_with(&session_id),
+            "case {case:?}: the endpoint's path names the application and the session, got \
+             {endpoint:?}"
         );
 
         seen.push((session_id, endpoint));
