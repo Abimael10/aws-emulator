@@ -17,7 +17,12 @@
 //! already drives the service with, so these cases reach the service exactly the way a
 //! client does.
 
+use std::time::{Duration, SystemTime};
+
 use serde_json::{json, Value};
+use service_com_amazonaws_appflow_sandstoneconfigurationservicelambda::state::{
+    stamped_after, to_date_time,
+};
 
 use super::flow_lifecycle::{
     appflow, call, contains, event_bridge_destination, event_trigger, filter_task, map_task,
@@ -750,4 +755,117 @@ async fn an_update_keeps_the_flow_s_run_history() {
         "expected the same run StartFlow recorded, got {:?}",
         runs[0].get("executionId")
     );
+}
+
+/// How many re-definitions the ordering case performs back to back: enough that several of
+/// them land inside one millisecond of the host's clock, however fast it runs.
+const RE_DEFINITIONS: usize = 8;
+
+/// A flow's reported `lastUpdatedAt` moves STRICTLY forward with every re-definition, and
+/// past the `createdAt` the flow was created with, however many of the writes the host
+/// performs inside one millisecond.
+///
+/// The instants are reported at millisecond resolution, so this is the resolution at which
+/// the order of a flow's own writes has to stay readable; the case performs its updates
+/// back to back and waits for nothing, so what it proves is a property of the stamps rather
+/// than of how fast this host happens to be.
+#[tokio::test]
+async fn each_re_definition_is_reported_later_than_the_definition_it_replaced() {
+    let router = appflow();
+    let flow_name = "ordered-updates-flow";
+    let created = create_base_flow(&router, "ordered updates", flow_name).await;
+    let created_at = created
+        .get("createdAt")
+        .as_f64()
+        .unwrap_or_else(|| panic!("expected a createdAt on the created flow, got {created:?}"));
+
+    let mut reported = vec![("createdAt".to_string(), created_at)];
+    for round in 1..=RE_DEFINITIONS {
+        let updated = call(
+            &router,
+            "/update-flow",
+            &json!({
+                "flowName": flow_name,
+                "description": format!("Re-definition {round}"),
+                "triggerConfig": on_demand_trigger(),
+                "sourceFlowConfig": s3_source("orders-landing"),
+                "destinationFlowConfigList": [s3_destination("orders-curated")],
+                "tasks": [map_task("order_id", "id")]
+            }),
+        )
+        .await;
+        assert!(
+            updated.is_ok(),
+            "case {round}: expected UpdateFlow to succeed, got {} {:?}",
+            updated.status,
+            updated.body
+        );
+        let described = call(&router, "/describe-flow", &json!({ "flowName": flow_name })).await;
+        let at = described.get("lastUpdatedAt").as_f64().unwrap_or_else(|| {
+            panic!("case {round}: expected a lastUpdatedAt, got {:?}", described.body)
+        });
+        assert_eq!(
+            described.get("createdAt").as_f64(),
+            Some(created_at),
+            "case {round}: expected createdAt to survive the re-definition, got {:?}",
+            described.get("createdAt")
+        );
+        reported.push((format!("re-definition {round}"), at));
+    }
+
+    for pair in reported.windows(2) {
+        let (earlier_label, earlier) = &pair[0];
+        let (later_label, later) = &pair[1];
+        assert!(
+            later > earlier,
+            "case {later_label:?}: expected an instant strictly later than {earlier_label:?} \
+             ({earlier:?}), got {later:?}"
+        );
+    }
+}
+
+/// The instant the stored definition of the table below carries: a present-day epoch
+/// second with a remainder of its own, so the rows are stamped the way a host's clock
+/// hands an instant out.
+fn a_stored_definition_instant() -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::new(1_794_607_132, 123_456_789)
+}
+
+/// The rule, driven at the state layer so it holds whatever this host's clock does: a
+/// stamp a re-definition persists is reported LATER than the one it replaces, and never
+/// earlier than the clock the write read.
+///
+/// The rows differ along the one thing the rule generalises over: how far the clock moved
+/// between the two writes — not at all, a nanosecond, every digit short of a millisecond,
+/// exactly one millisecond, and well past it.
+#[test]
+fn a_stamp_a_re_definition_persists_is_reported_later_than_the_one_it_replaces() {
+    for (case, elapsed) in [
+        ("a clock that has not moved at all", Duration::ZERO),
+        ("one nanosecond later", Duration::from_nanos(1)),
+        (
+            "one nanosecond short of a millisecond later",
+            Duration::from_nanos(999_999),
+        ),
+        ("exactly one millisecond later", Duration::from_millis(1)),
+        ("well past a millisecond later", Duration::from_millis(250)),
+    ] {
+        let previous = a_stored_definition_instant();
+        let clock = previous + elapsed;
+        let stamped = stamped_after(clock, previous);
+
+        let before = to_date_time(previous);
+        let after = to_date_time(stamped);
+        assert!(
+            (after.secs(), after.subsec_nanos()) > (before.secs(), before.subsec_nanos()),
+            "case {case:?}: expected the re-definition to be reported later than {:?}, got {:?}",
+            (before.secs(), before.subsec_nanos()),
+            (after.secs(), after.subsec_nanos())
+        );
+        assert!(
+            stamped >= clock,
+            "case {case:?}: expected the stamp to be no earlier than the clock the write \
+             read, got {stamped:?} for a clock at {clock:?}"
+        );
+    }
 }

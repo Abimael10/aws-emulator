@@ -17,7 +17,11 @@
 //!   queried its source for, so only a run of a flow that DECLARES an incremental data pull
 //!   reports them — whatever volume that run moved;
 //! * the message of the most recent run is the one sentence the flow reports for it too
-//!   (`lastRunExecutionDetails.mostRecentExecutionMessage`).
+//!   (`lastRunExecutionDetails.mostRecentExecutionMessage`);
+//! * every instant AppFlow mints from its own clock is reported at MILLISECOND resolution,
+//!   whichever read reports it — a run's instants and its data-pull window, a flow's
+//!   `createdAt`/`lastUpdatedAt` and its summary of its most recent run — so the number on
+//!   the wire carries the whole milliseconds of the stored instant and nothing finer.
 //!
 //! The wire half is driven end to end over `restJson1`, on the ONE shared engine AppFlow
 //! and Amazon S3 both live on, so the counters asserted here are the ones a real transfer
@@ -34,23 +38,31 @@ use service_com_amazonaws_appflow_sandstoneconfigurationservicelambda::ops::type
     SourceFlowConfig, TriggerConfig, TriggerProperties,
 };
 use service_com_amazonaws_appflow_sandstoneconfigurationservicelambda::state::{
-    ExecutionStatus, FlowExecution, EXECUTION_NOT_PERFORMED_MESSAGE, RUN_SUCCEEDED_MESSAGE,
+    service_state, ExecutionStatus, FlowExecution, EXECUTION_NOT_PERFORMED_MESSAGE,
+    NANOS_PER_MILLISECOND, RUN_SUCCEEDED_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::flow_lifecycle::{
-    appflow_with_engine, call, on_demand_trigger, s3_destination, s3_source, salesforce_source,
-    settled_runs, stored_flow, FIXTURE_ACCESS_KEY_ID, REGION,
+    appflow_with_engine, call, on_demand_trigger, raw_response, s3_destination, s3_source,
+    salesforce_source, settled_runs, stored_execution, stored_flow, FIXTURE_ACCESS_KEY_ID, REGION,
 };
 
-/// AppFlow and Amazon S3 on one engine: the AppFlow calls reach the control plane, the
-/// Amazon S3 call seeds the source location the run reads.
-fn appflow_and_object_store() -> MultiServiceRouter {
+/// AppFlow and Amazon S3 on one engine, with the engine handed back so a case can read
+/// the record a call wrote: the AppFlow calls reach the control plane, the Amazon S3 call
+/// seeds the source location the run reads.
+fn appflow_and_object_store_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let (mut router, engine) = appflow_with_engine();
     router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
         Arc::clone(&engine),
     ));
-    router
+    (router, engine)
+}
+
+/// AppFlow and Amazon S3 on one engine: the AppFlow calls reach the control plane, the
+/// Amazon S3 call seeds the source location the run reads.
+fn appflow_and_object_store() -> MultiServiceRouter {
+    appflow_and_object_store_with_engine().0
 }
 
 /// `PUT /<bucket>/<key>` — Amazon S3's `PutObject`, signed (in the routing sense) for the
@@ -624,6 +636,329 @@ fn the_record_of_a_run_reports_what_that_run_holds_and_nothing_else() {
             record.last_updated_time.map(|at| at.as_secs_f64()),
             record.last_updated_at.map(|at| at.as_secs_f64()),
             "case {case:?}: expected lastUpdatedTime to be lastUpdatedAt, got {record:?}"
+        );
+    }
+}
+
+/// One row of the stored-remainder table: the subsecond part of the instant the store
+/// holds, and the subsecond part a report of it must carry.
+struct Remainder {
+    case: &'static str,
+    /// The nanoseconds past the second the stored instant carries.
+    nanos: u32,
+    /// The nanoseconds past the second the reported instant must carry: the whole
+    /// milliseconds of `nanos`, and nothing finer.
+    reported_nanos: u32,
+}
+
+/// The second the stored instants below sit on: a present-day epoch second, so each
+/// reported instant renders as a number the size of the ones AppFlow puts on the wire.
+const A_STORED_SECOND: u64 = 1_794_607_132;
+
+/// The rows differ along the one thing the rule generalises over: how fine the remainder
+/// of the stored instant is — none at all, a single nanosecond, every digit short of a
+/// millisecond, a whole millisecond, a millisecond with a remainder of its own, the
+/// hundred-nanosecond remainder a host clock hands out, and the largest remainder a second
+/// can hold.
+fn remainders() -> Vec<Remainder> {
+    vec![
+        Remainder {
+            case: "an instant stored on the second",
+            nanos: 0,
+            reported_nanos: 0,
+        },
+        Remainder {
+            case: "one nanosecond past the second",
+            nanos: 1,
+            reported_nanos: 0,
+        },
+        Remainder {
+            case: "one nanosecond short of a millisecond",
+            nanos: 999_999,
+            reported_nanos: 0,
+        },
+        Remainder {
+            case: "a whole millisecond",
+            nanos: 1_000_000,
+            reported_nanos: 1_000_000,
+        },
+        Remainder {
+            case: "a millisecond and one nanosecond",
+            nanos: 1_000_001,
+            reported_nanos: 1_000_000,
+        },
+        Remainder {
+            case: "a host clock's hundred-nanosecond remainder",
+            nanos: 774_560_700,
+            reported_nanos: 774_000_000,
+        },
+        Remainder {
+            case: "the largest remainder a second holds",
+            nanos: 999_999_999,
+            reported_nanos: 999_000_000,
+        },
+    ]
+}
+
+/// Every instant AppFlow mints carries the whole milliseconds of the instant that was
+/// stored — truncated, never rounded up — whichever read reports it.
+#[test]
+fn a_reported_instant_carries_the_whole_milliseconds_of_the_stored_one() {
+    for row in remainders() {
+        let case = row.case;
+        let stored = SystemTime::UNIX_EPOCH + Duration::new(A_STORED_SECOND, row.nanos);
+        let later = SystemTime::UNIX_EPOCH + Duration::new(A_STORED_SECOND + 1, row.nanos);
+
+        let mut run = stored_execution("resolution-run", stored);
+        run.execution_status = ExecutionStatus::Successful;
+        run.execution_result = Some(transferred(1, 32));
+        run.last_updated_at = later;
+        run.data_pull_start_time = Some(stored);
+        run.data_pull_end_time = Some(later);
+        let record = run.to_execution_record();
+
+        let mut flow = stored_flow("resolution-flow");
+        flow.created_at = stored;
+        flow.last_updated_at = later;
+        flow.executions = vec![run];
+        let definition = flow.to_flow_definition();
+        let summary = flow
+            .last_run_execution_details()
+            .expect("a flow that has run summarises its most recent run");
+
+        // Every instant an AppFlow read reports, with the second each one is expected to
+        // carry: the run's own two and its data-pull window, the flow's two, and the
+        // flow's summary of its most recent run.
+        let reported = [
+            ("startedAt", record.started_at, A_STORED_SECOND),
+            (
+                "executionStartTime",
+                record.execution_start_time,
+                A_STORED_SECOND,
+            ),
+            ("lastUpdatedAt", record.last_updated_at, A_STORED_SECOND + 1),
+            (
+                "lastUpdatedTime",
+                record.last_updated_time,
+                A_STORED_SECOND + 1,
+            ),
+            (
+                "dataPullStartTime",
+                record.data_pull_start_time,
+                A_STORED_SECOND,
+            ),
+            (
+                "dataPullEndTime",
+                record.data_pull_end_time,
+                A_STORED_SECOND + 1,
+            ),
+            ("createdAt", definition.created_at, A_STORED_SECOND),
+            (
+                "flowDefinition.lastUpdatedAt",
+                definition.last_updated_at,
+                A_STORED_SECOND + 1,
+            ),
+            (
+                "mostRecentExecutionTime",
+                summary.most_recent_execution_time,
+                A_STORED_SECOND + 1,
+            ),
+        ];
+        for (member, at, expected_secs) in reported {
+            let Some(at) = at else {
+                panic!("case {case:?}: expected {member} to be reported, got nothing")
+            };
+            assert_eq!(
+                at.subsec_nanos() % NANOS_PER_MILLISECOND,
+                0,
+                "case {case:?}: expected {member} to carry whole milliseconds, got {} \
+                 nanoseconds past the second",
+                at.subsec_nanos()
+            );
+            assert_eq!(
+                (at.secs(), at.subsec_nanos()),
+                (expected_secs as i64, row.reported_nanos),
+                "case {case:?}: expected {member} to report {expected_secs} seconds and {} \
+                 nanoseconds, got {:?}",
+                row.reported_nanos,
+                (at.secs(), at.subsec_nanos())
+            );
+        }
+    }
+}
+
+/// Every member of an AppFlow response that carries an instant the service mints from its
+/// own clock: the four `ExecutionRecord` members the model declares
+/// (`smithy_query(query="shape", shape="ExecutionRecord")`), the two spellings AppFlow
+/// reports beside the first two, the two a flow carries
+/// (`smithy_query(query="shape", shape="FlowDefinition")`) and the one its run summary
+/// carries (`smithy_query(query="shape", shape="ExecutionDetails")`). A caller-supplied
+/// instant (a schedule's window) is not here: it is echoed as it arrived.
+const REPORTED_INSTANT_MEMBERS: [&str; 8] = [
+    "createdAt",
+    "dataPullEndTime",
+    "dataPullStartTime",
+    "executionStartTime",
+    "lastUpdatedAt",
+    "lastUpdatedTime",
+    "mostRecentExecutionTime",
+    "startedAt",
+];
+
+/// The TEXT of every JSON number the member `member` carries in `body`, as the service
+/// wrote it.
+///
+/// Read off the raw response bytes rather than a parsed value, because the shape under
+/// test is the FORM of the number — how many fractional digits it carries — which parsing
+/// it into an `f64` and printing it again would hide. The scan is the member name followed
+/// by its colon, so a member written as anything other than a number yields a token that
+/// is not one, which the case reports by name rather than skipping.
+fn wire_numbers(body: &str, member: &str) -> Vec<String> {
+    let needle = format!("\"{member}\":");
+    body.match_indices(&needle)
+        .map(|(at, _)| {
+            let rest = &body[at + needle.len()..];
+            let end = rest
+                .find(|c: char| !matches!(c, '0'..='9' | '.' | '-' | '+' | 'e' | 'E'))
+                .unwrap_or(rest.len());
+            rest[..end].to_string()
+        })
+        .collect()
+}
+
+/// How many digits the text of a number carries after its decimal point.
+fn fractional_digits(number: &str) -> usize {
+    number
+        .split_once('.')
+        .map_or(0, |(_, fraction)| fraction.len())
+}
+
+/// The epoch milliseconds the text of a JSON epoch-seconds number names, read off its
+/// digits rather than through an `f64`, so nothing here depends on float rounding.
+fn epoch_millis(number: &str) -> Option<u128> {
+    let (seconds, fraction) = number.split_once('.').unwrap_or((number, ""));
+    let seconds: u128 = seconds.parse().ok()?;
+    let mut digits: String = fraction.chars().take(3).collect();
+    while digits.len() < 3 {
+        digits.push('0');
+    }
+    Some(seconds * 1_000 + digits.parse::<u128>().ok()?)
+}
+
+/// The whole milliseconds of every instant the store holds for `flow_name`: the values a
+/// report of that flow may carry.
+fn stored_instant_millis(engine: &engine::InMemoryEngine, flow_name: &str) -> Vec<u128> {
+    let state = service_state(engine).expect("the AppFlow store is reachable");
+    let store = state.lock();
+    let flow = store
+        .flows
+        .get(flow_name)
+        .expect("the flow the case created is stored");
+    let mut instants = vec![flow.created_at, flow.last_updated_at];
+    for run in &flow.executions {
+        instants.push(run.started_at);
+        instants.push(run.last_updated_at);
+        instants.extend(run.data_pull_start_time);
+        instants.extend(run.data_pull_end_time);
+    }
+    instants
+        .iter()
+        .map(|at| {
+            at.duration_since(SystemTime::UNIX_EPOCH)
+                .expect("a present-day instant")
+                .as_millis()
+        })
+        .collect()
+}
+
+/// Driven over the wire: every instant the three reads of a flow write is a JSON
+/// epoch-seconds number carrying at most three fractional digits, and those digits are the
+/// whole milliseconds of an instant the store holds.
+#[tokio::test]
+async fn a_read_writes_every_instant_it_reports_at_millisecond_resolution() {
+    let (router, engine) = appflow_and_object_store_with_engine();
+    put_object(
+        &router,
+        "orders-in",
+        "inbound/orders.json",
+        r#"[{"id":"1"},{"id":"2"}]"#,
+    )
+    .await;
+
+    let flow_name = "instant-resolution-flow";
+    let created = call(
+        &router,
+        "/create-flow",
+        &json!({
+            "flowName": flow_name,
+            "triggerConfig": on_demand_trigger(),
+            "sourceFlowConfig": s3_source_pulling_from("orders-in", Some("updated_at")),
+            "destinationFlowConfigList": [s3_destination("orders-out")],
+            "tasks": [map_all()],
+        }),
+    )
+    .await;
+    assert!(
+        created.is_ok(),
+        "expected CreateFlow to succeed, got {} {:?}",
+        created.status,
+        created.body
+    );
+    let started = call(&router, "/start-flow", &json!({ "flowName": flow_name })).await;
+    assert!(
+        started.is_ok(),
+        "expected StartFlow to succeed, got {} {:?}",
+        started.status,
+        started.body
+    );
+    let runs = settled_runs(&router, flow_name).await;
+    assert!(!runs.is_empty(), "expected the flow to have run, got {runs:?}");
+
+    let stored = stored_instant_millis(&engine, flow_name);
+    for path in [
+        "/describe-flow-execution-records",
+        "/describe-flow",
+        "/list-flows",
+    ] {
+        let request = if path == "/list-flows" {
+            json!({})
+        } else {
+            json!({ "flowName": flow_name })
+        };
+        let response = raw_response(&router, FIXTURE_ACCESS_KEY_ID, path, &request).await;
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "case {path:?}: expected the read to succeed, got {}",
+            response.status()
+        );
+        let body = String::from_utf8_lossy(response.body()).to_string();
+
+        let mut reported = 0_usize;
+        for member in REPORTED_INSTANT_MEMBERS {
+            for number in wire_numbers(&body, member) {
+                reported += 1;
+                assert!(
+                    !number.is_empty() && number.starts_with(|c: char| c.is_ascii_digit()),
+                    "case {path:?}: expected {member} to be written as an epoch-seconds \
+                     number, got {number:?}"
+                );
+                assert!(
+                    fractional_digits(&number) <= 3,
+                    "case {path:?}: expected {member} to be written with at most three \
+                     fractional digits, got {number:?}"
+                );
+                let millis = epoch_millis(&number);
+                assert!(
+                    millis.is_some_and(|millis| stored.contains(&millis)),
+                    "case {path:?}: expected {member} to report the whole milliseconds of an \
+                     instant the store holds ({stored:?}), got {number:?}"
+                );
+            }
+        }
+        assert!(
+            reported >= 2,
+            "case {path:?}: expected the read to report the flow's instants, got {body:?}"
         );
     }
 }

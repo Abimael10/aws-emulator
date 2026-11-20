@@ -253,17 +253,19 @@ pub(crate) async fn call(router: &MultiServiceRouter, uri_path: &str, body: &Val
     call_as(router, FIXTURE_ACCESS_KEY_ID, uri_path, body).await
 }
 
-/// One call signed (in the routing sense) with `access_key_id`: the same request
-/// [`call`] builds, with the credential scope naming the key the caller presents.
+/// What the service ANSWERED a call to `uri_path`, response bytes and all.
 ///
 /// It is the ONE request builder of this test target, because a service that records
-/// WHO called it can only be tested by calling as more than one principal.
-pub(crate) async fn call_as(
+/// WHO called it can only be tested by calling as more than one principal, and the
+/// answer is handed back unparsed because a case whose finding is in the FORM of a value
+/// the service wrote — how many fractional digits a JSON number carries, say — can only
+/// see it in the bytes. [`call_as`] parses what this returns.
+pub(crate) async fn raw_response(
     router: &MultiServiceRouter,
     access_key_id: &str,
     uri_path: &str,
     body: &Value,
-) -> Answer {
+) -> http::Response<bytes::Bytes> {
     let request = http::Request::builder()
         .method("POST")
         .uri(format!("https://appflow.us-east-1.amazonaws.com{uri_path}"))
@@ -279,7 +281,18 @@ pub(crate) async fn call_as(
             serde_json::to_vec(body).expect("the request body serializes"),
         ))
         .expect("a well-formed request");
-    let response = router.dispatch(request).await;
+    router.dispatch(request).await
+}
+
+/// One call signed (in the routing sense) with `access_key_id`: the same request
+/// [`call`] builds, with the credential scope naming the key the caller presents.
+pub(crate) async fn call_as(
+    router: &MultiServiceRouter,
+    access_key_id: &str,
+    uri_path: &str,
+    body: &Value,
+) -> Answer {
+    let response = raw_response(router, access_key_id, uri_path, body).await;
     let status = response.status().as_u16();
     let error = response
         .headers()

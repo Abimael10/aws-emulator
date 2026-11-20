@@ -844,13 +844,48 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .map(::engine::InMemoryEngine::state::<ComAmazonawsAppflowSandstoneconfigurationservicelambdaState>)
 }
 
-/// A stored instant as the modelled `timestamp` the wire carries.
+/// Nanoseconds in one millisecond: the resolution [`to_date_time`] reports an instant at.
+pub const NANOS_PER_MILLISECOND: u32 = 1_000_000;
+
+/// A stored instant as the modelled `timestamp` the wire carries, at the MILLISECOND
+/// resolution this service reports an instant at.
 ///
-/// Converted with the SDK's own `From<SystemTime>`, which keeps the seconds and the
-/// subsecond nanoseconds the instant was stored with — a round trip through `f64`
-/// seconds would silently drop sub-microsecond resolution for a present-day epoch.
+/// The clock a stored `SystemTime` is read from is far finer than that — it carries
+/// nanoseconds — but those extra digits are a property of this host rather than of the
+/// value the service reports, so they are dropped HERE, once, for every instant any
+/// operation answers with: a run's `startedAt`/`lastUpdatedAt` and the window it pulled
+/// over, a flow's `createdAt`/`lastUpdatedAt`, and the flow's summary of its most recent
+/// run. Truncation and not rounding, so the reported instant never moves past the instant
+/// that was stored, and every reader of one stored value sees the same number.
 pub fn to_date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
-    ::aws_smithy_types::DateTime::from(at)
+    let at = ::aws_smithy_types::DateTime::from(at);
+    ::aws_smithy_types::DateTime::from_secs_and_nanos(
+        at.secs(),
+        at.subsec_nanos() / NANOS_PER_MILLISECOND * NANOS_PER_MILLISECOND,
+    )
+}
+
+/// The smallest step between two instants a reader can tell apart: one millisecond, the
+/// resolution [`to_date_time`] reports an instant at.
+pub const REPORTED_INSTANT_STEP: Duration = Duration::from_millis(1);
+
+/// The instant to stamp a write with when the record already carries one this write has to
+/// be reported as LATER than: the clock's own instant, or one step past `previous` when the
+/// clock has not moved that far yet.
+///
+/// A reported instant is millisecond-resolution ([`to_date_time`]), so two writes a host
+/// performs inside one millisecond would otherwise be stamped with instants that report
+/// identically, and the ORDER of one record's own writes — what tells a flow that has been
+/// re-defined from the definition it was created with — would be unreadable on a fast host
+/// and readable on a slow one.
+///
+/// The stamp it hands back can be up to one step ahead of the clock when writes arrive
+/// faster than the resolution, which is why it is used for the DEFINITION stamp a reader
+/// orders (`UpdateFlow`) and nowhere else: no elapsed span is computed from that stamp —
+/// a run's own instants, which the settlement clock does compare against, are stamped from
+/// the clock itself.
+pub fn stamped_after(now: SystemTime, previous: SystemTime) -> SystemTime {
+    now.max(previous + REPORTED_INSTANT_STEP)
 }
 
 /// The region this request was signed for; [`DEFAULT_REGION`] when it was not signed.

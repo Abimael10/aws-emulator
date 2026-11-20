@@ -306,7 +306,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         flow.destination_flow_config_list = input.destination_flow_config_list;
         flow.tasks = input.tasks;
         flow.metadata_catalog_config = input.metadata_catalog_config;
-        flow.last_updated_at = now;
+        // The re-definition is stamped as LATER than the definition it replaces, whichever
+        // millisecond this host performed the two writes in: the instant is reported at
+        // millisecond resolution, so a reader can only tell the two definitions apart when
+        // the stamps are at least that far apart.
+        flow.last_updated_at = crate::state::stamped_after(now, flow.last_updated_at);
         flow.last_updated_by = caller;
         flow.last_update_client_token = input.client_token;
         if schema_changed {
