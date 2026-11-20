@@ -19,21 +19,26 @@
 //! object storage holds nothing readable at is the modelled validation refusal
 //! ([`s3_source_not_accessible`]) rather than a dataset that could never be
 //! populated; only what the file's CONTENT turns out to be is reported
-//! asynchronously. The SCHEMA check an inline batch has to pass before any of it
-//! is persisted is here as well ([`validate_inline_examples`]), so the create
+//! asynchronously. The SCHEMA check a batch of examples has to pass before any
+//! of it is persisted is here as well ([`validate_examples`]), so the create
 //! and any later write of examples cannot disagree about what an example must
-//! carry.
+//! carry ([`validate_examples`]).
+//!
+//! Every example in the working copy carries the id it was assigned when it
+//! entered ([`DatasetExampleRecord`]), because an example is addressed by that
+//! id once it is stored: the add answers the ids it minted, and a later update
+//! or delete names them.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use ::aws_smithy_types::Document;
 use ::serde_json::Value;
 
 use crate::ops::types::{
-    ConflictException, CreateDatasetInput, CreateDatasetOutput, CreateDatasetVersionOutput,
-    DataSourceType, DatasetSummary, DatasetVersionSummary, GetDatasetOutput,
-    ResourceNotFoundException, UpdateDatasetOutput, ValidationException,
+    AddDatasetExamplesOutput, ConflictException, CreateDatasetInput, CreateDatasetOutput,
+    CreateDatasetVersionOutput, DataSourceType, DatasetSummary, DatasetVersionSummary,
+    GetDatasetOutput, ResourceNotFoundException, UpdateDatasetOutput, ValidationException,
 };
 
 use super::{sorted_map, timestamp, VALIDATION_REASON_FIELD_VALIDATION_FAILED};
@@ -97,6 +102,10 @@ pub const DATASET_STATUS_ACTIVE: &str = "ACTIVE";
 pub const DATASET_STATUS_CREATE_FAILED: &str = "CREATE_FAILED";
 pub const DATASET_STATUS_UPDATING: &str = "UPDATING";
 pub const DATASET_STATUS_DELETING: &str = "DELETING";
+/// `UPDATE_FAILED` is "Last example mutation or CreateDatasetVersion failed.
+/// DRAFT may be partially modified", which is where a dataset lands when the
+/// source an example mutation named yielded nothing to write.
+pub const DATASET_STATUS_UPDATE_FAILED: &str = "UPDATE_FAILED";
 
 /// `DraftStatus` members a dataset reports. The enum's full value list is
 /// `MODIFIED | UNMODIFIED` (`smithy_query shape=DraftStatus`): `MODIFIED` is
@@ -231,13 +240,17 @@ pub fn example_schema_violation(index: usize, field: &str) -> ValidationExceptio
     }
 }
 
-/// Check every example a request carried INLINE against the dataset's schema,
+/// Check every example of a submitted BATCH against the dataset's schema,
 /// answering the modelled refusal of the FIRST example that does not satisfy it.
 ///
 /// Whole-batch, before anything is persisted: a batch is one commit, so one
 /// example that fails the schema refuses the whole call and leaves no dataset
-/// holding the examples that would have passed.
-pub fn validate_inline_examples(
+/// holding the examples that would have passed — "all examples are validated
+/// against the dataset's schema type before any writes occur. If any example
+/// fails validation, the entire batch is rejected" (`smithy_query doc
+/// shape=AddDatasetExamples`). Which batch it is does not change the rule, so
+/// the create and every later write of examples check theirs here.
+pub fn validate_examples(
     schema_type: &str,
     examples: &[Document],
 ) -> Result<(), ValidationException> {
@@ -280,15 +293,18 @@ pub fn dataset_blocks_writes(status: &str) -> bool {
 }
 
 /// The modelled conflict a dataset write gets while the dataset is in a status
-/// that blocks it: the operation that was asked for, and the status it found.
+/// that blocks it ("Dataset is not in a state that allows this operation:
+/// <status>").
 ///
-/// The sentence is fixed; its variable parts are the asking operation's own name
-/// and the dataset's current status, spelled as the wire's enum token. Shared by
-/// the handlers so one refusal cannot be worded two ways.
-pub fn dataset_status_conflict(operation: &str, status: &str) -> ConflictException {
+/// The sentence is fixed and its one variable part is the dataset's current
+/// status, spelled as the wire's enum token: the dataset resource reports a
+/// blocked write by the state it is in rather than by the call that was refused,
+/// which the caller already knows. Shared by the handlers so one refusal cannot
+/// be worded two ways.
+pub fn dataset_status_conflict(status: &str) -> ConflictException {
     ConflictException {
         message: Some(format!(
-            "Cannot perform operation {operation} when dataset is in {status} status"
+            "Dataset is not in a state that allows this operation: {status}"
         )),
     }
 }
@@ -557,6 +573,24 @@ fn json_number(number: &::serde_json::Number) -> ::aws_smithy_types::Number {
     }
 }
 
+/// One example of a dataset: the free-form JSON document the source carried,
+/// under the id it was assigned when it entered the dataset.
+///
+/// An example is addressed by that id for the rest of its life — "each example
+/// is assigned an auto-generated UUID" (`smithy_query shape=InlineExamplesSource
+/// member=examples`), which is what an add answers and what a later update or
+/// delete names (`ExampleId`, `^[a-zA-Z0-9_.:-]+$`) — so the id is stored beside
+/// the content rather than derived from the example's position in the working
+/// copy, which every later write would change.
+#[derive(Debug, Clone)]
+pub struct DatasetExampleRecord {
+    /// The `ExampleId` this example is addressed by, unique within the dataset.
+    pub example_id: String,
+    /// The example itself: "a free-form JSON document whose structure is
+    /// defined by the dataset's schema type".
+    pub content: Document,
+}
+
 /// One published version of a dataset: the numbered snapshot
 /// `CreateDatasetVersion` publishes the working copy as.
 ///
@@ -568,8 +602,9 @@ pub struct DatasetVersionRecord {
     /// The version number, as `DatasetVersion` spells it: "a non-negative
     /// integer string representing a published version number".
     pub version: u32,
-    /// The examples the draft held when this version was published.
-    pub examples: Vec<Document>,
+    /// The examples the draft held when this version was published, each under
+    /// the id it is addressed by in the draft.
+    pub examples: Vec<DatasetExampleRecord>,
     pub created_at: SystemTime,
 }
 
@@ -608,8 +643,12 @@ pub struct DatasetRecord {
     pub schema_type: String,
     pub kms_key_arn: Option<String>,
     pub tags: BTreeMap<String, String>,
-    /// The DRAFT working copy's examples, in the order the source listed them.
-    pub draft_examples: Vec<Document>,
+    /// The DRAFT working copy's examples, in the order they entered it, each
+    /// under the id it is addressed by. Grown only through
+    /// [`Self::push_examples`], which caps it at [`MAX_DATASET_EXAMPLES`], so no
+    /// write path can grow it past that ceiling — the same reason
+    /// [`Self::versions`] is private.
+    draft_examples: Vec<DatasetExampleRecord>,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
     /// The status the dataset reports until [`Self::settles_at`].
@@ -630,6 +669,10 @@ pub struct DatasetRecord {
     /// which is what `draftStatus` reports. True for a dataset no version has
     /// been published from, false from the instant one is.
     draft_modified: bool,
+    /// How many examples have entered this dataset, counting those already
+    /// removed from the working copy: the sequence the next `ExampleId` is
+    /// derived from, so an id is never reused after a delete.
+    next_example_seq: u64,
 }
 
 impl DatasetRecord {
@@ -648,7 +691,7 @@ impl DatasetRecord {
         ingestion: DatasetIngestion,
         now: SystemTime,
     ) -> Self {
-        let (draft_examples, settled_status, failure_reason) = match ingestion {
+        let (examples, settled_status, failure_reason) = match ingestion {
             DatasetIngestion::Ingested(examples) => {
                 (examples, DATASET_STATUS_ACTIVE.to_string(), None)
             }
@@ -659,7 +702,7 @@ impl DatasetRecord {
                 Some(reason),
             ),
         };
-        Self {
+        let mut record = Self {
             dataset_arn: dataset_arn(region, &dataset_id),
             dataset_id,
             dataset_name: requested.dataset_name,
@@ -667,7 +710,7 @@ impl DatasetRecord {
             schema_type: requested.schema_type,
             kms_key_arn: requested.kms_key_arn,
             tags: sorted_map(requested.tags),
-            draft_examples,
+            draft_examples: Vec::new(),
             created_at: now,
             updated_at: now,
             transient_status: DATASET_STATUS_CREATING.to_string(),
@@ -676,7 +719,20 @@ impl DatasetRecord {
             failure_reason,
             versions: Vec::new(),
             draft_modified: true,
+            next_example_seq: 0,
+        };
+        // "Each example is assigned an auto-generated UUID": an example gets
+        // the id it is addressed by where it ENTERS the working copy, whichever
+        // call put it there, so the create and a later add mint ids the same
+        // way. A source yielding more examples than the working copy holds is
+        // refused by that append, which leaves the draft empty: the dataset
+        // settles in the failure state its source earned, as "DRAFT record
+        // exists but contains no examples" describes.
+        if record.push_examples(examples, now).is_none() {
+            record.settled_status = DATASET_STATUS_CREATE_FAILED.to_string();
+            record.failure_reason = Some(too_many_examples_reason());
         }
+        record
     }
 
     /// The status at `now`: the transient one until the clock owes the
@@ -761,6 +817,105 @@ impl DatasetRecord {
         // The publication succeeded, so nothing of an earlier failure is owed.
         self.failure_reason = None;
         Some(version)
+    }
+
+    /// Append `examples` to the DRAFT working copy, answering the `ExampleId`
+    /// minted for each one in the order they were added — or `None` when the
+    /// batch would take the working copy past [`MAX_DATASET_EXAMPLES`], where
+    /// the caller answers the operation's modelled quota error rather than
+    /// growing this process's memory. Nothing of a refused batch is written.
+    ///
+    /// "Adds examples to the dataset's DRAFT": the working copy grows and no
+    /// published version is touched, so the draft now holds changes no version
+    /// reflects. The mutation is ASYNCHRONOUS, so the dataset reports `UPDATING`
+    /// — in which "an async example mutation … is in progress" and "all writes
+    /// are blocked" — until the clock owes it `ACTIVE`.
+    pub fn add_examples(&mut self, examples: Vec<Document>, now: SystemTime) -> Option<Vec<String>> {
+        let minted = self.push_examples(examples, now)?;
+        self.draft_modified = true;
+        self.updated_at = now;
+        self.transient_status = DATASET_STATUS_UPDATING.to_string();
+        self.settled_status = DATASET_STATUS_ACTIVE.to_string();
+        self.settles_at = now + DATASET_SETTLE_DELAY;
+        // The mutation succeeded, so nothing of an earlier failure is owed.
+        self.failure_reason = None;
+        Some(minted)
+    }
+
+    /// Record that an example mutation of this dataset wrote NOTHING, because
+    /// the source it named yielded no examples.
+    ///
+    /// The mutation is asynchronous either way, so the dataset reports
+    /// `UPDATING` until the clock owes it `UPDATE_FAILED` — where "the last
+    /// example mutation … failed" — and `reason` is the `failureReason` it
+    /// reports from then on. The working copy is left exactly as it was.
+    pub fn fail_example_mutation(&mut self, reason: String, now: SystemTime) {
+        self.updated_at = now;
+        self.transient_status = DATASET_STATUS_UPDATING.to_string();
+        self.settled_status = DATASET_STATUS_UPDATE_FAILED.to_string();
+        self.settles_at = now + DATASET_SETTLE_DELAY;
+        self.failure_reason = Some(reason);
+    }
+
+    /// What an add of examples to this dataset reports: the six members
+    /// `AddDatasetExamplesResponse` declares, every one of them off the record
+    /// just written, so the `updatedAt` it answers is the one a later read
+    /// reports and `addedCount` is the number of ids it hands back.
+    pub fn add_examples_output(
+        &self,
+        example_ids: Vec<String>,
+        now: SystemTime,
+    ) -> AddDatasetExamplesOutput {
+        AddDatasetExamplesOutput {
+            dataset_arn: self.dataset_arn.clone(),
+            dataset_id: self.dataset_id.clone(),
+            status: self.status_at(now).to_string(),
+            added_count: i64::try_from(example_ids.len()).unwrap_or(i64::MAX),
+            updated_at: timestamp(self.updated_at),
+            example_ids,
+        }
+    }
+
+    /// Put `examples` into the working copy under freshly minted ids, answering
+    /// those ids in the order the examples were appended — or `None` when the
+    /// batch would take the working copy past [`MAX_DATASET_EXAMPLES`], in which
+    /// case not one of them is appended.
+    ///
+    /// The ONE place an example enters a dataset, which is why the ceiling lives
+    /// here (`draft_examples` is private for exactly that reason): so every
+    /// example the dataset holds carries an id, no two of them carry the same
+    /// one, and no write path can grow the working copy without bound.
+    fn push_examples(&mut self, examples: Vec<Document>, now: SystemTime) -> Option<Vec<String>> {
+        if self.draft_examples.len().saturating_add(examples.len()) > MAX_DATASET_EXAMPLES {
+            return None;
+        }
+        let mut held: HashSet<String> = self
+            .draft_examples
+            .iter()
+            .map(|example| example.example_id.clone())
+            .collect();
+        let mut minted = Vec::with_capacity(examples.len());
+        for content in examples {
+            let example_id = self.next_example_id(&mut held, now);
+            minted.push(example_id.clone());
+            self.draft_examples
+                .push(DatasetExampleRecord { example_id, content });
+        }
+        Some(minted)
+    }
+
+    /// An `ExampleId` no example of this dataset holds: the UUID form the model
+    /// documents ("an auto-generated UUID"), derived from this dataset's id and
+    /// the next example sequence, which `ExampleId`'s own pattern
+    /// `^[a-zA-Z0-9_.:-]+$` admits.
+    fn next_example_id(&mut self, held: &mut HashSet<String>, at: SystemTime) -> String {
+        loop {
+            self.next_example_seq = self.next_example_seq.wrapping_add(1);
+            let candidate = super::uuid_shaped(&self.dataset_id, self.next_example_seq, at);
+            if held.insert(candidate.clone()) {
+                return candidate;
+            }
+        }
     }
 
     /// The tags as a response reports them: the map the create carried, or no
@@ -939,6 +1094,53 @@ impl super::ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolStat
             &mut self.dataset_idempotency_order,
             super::token_key(operation, &token),
             dataset_id.to_string(),
+        );
+    }
+
+    /// The example ids a previous request to `operation` carrying this
+    /// `clientToken` added to THIS dataset, if the record is still held and the
+    /// dataset still exists.
+    ///
+    /// Answered only for the dataset the record names: a token replayed against
+    /// a different dataset is a different request, so it is served as a fresh
+    /// one rather than answering ids the dataset the request named does not
+    /// hold.
+    ///
+    /// Separate from the records above because what an example mutation
+    /// produced is a set of examples rather than a resource of its own: a
+    /// replayed add answers the ids it minted the first time instead of
+    /// appending the batch twice.
+    pub fn replayed_dataset_examples(
+        &self,
+        operation: &str,
+        client_token: Option<&str>,
+        dataset_id: &str,
+    ) -> Option<Vec<String>> {
+        let (remembered, example_ids) = self
+            .dataset_examples_idempotency
+            .get(&super::token_key(operation, client_token?))?;
+        (remembered == dataset_id && self.datasets.contains_key(dataset_id))
+            .then(|| example_ids.clone())
+    }
+
+    /// Record which examples a `clientToken` added for `operation`, evicting the
+    /// oldest record once `MAX_REMEMBERED_CLIENT_TOKENS` are held, on the same
+    /// rule as every other idempotency record of this service.
+    pub fn remember_dataset_examples_client_token(
+        &mut self,
+        operation: &str,
+        client_token: Option<String>,
+        dataset_id: &str,
+        example_ids: &[String],
+    ) {
+        let Some(token) = client_token else {
+            return;
+        };
+        super::remember_token(
+            &mut self.dataset_examples_idempotency,
+            &mut self.dataset_examples_idempotency_order,
+            super::token_key(operation, &token),
+            (dataset_id.to_string(), example_ids.to_vec()),
         );
     }
 

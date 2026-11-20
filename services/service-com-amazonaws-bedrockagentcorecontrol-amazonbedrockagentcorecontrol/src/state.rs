@@ -3409,6 +3409,20 @@ pub struct ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState
     /// The keys of [`Self::dataset_version_idempotency`] in the order they were
     /// first recorded, so the oldest record is the one evicted at the ceiling.
     dataset_version_idempotency_order: VecDeque<String>,
+    /// `<operation>/<clientToken>` -> the (dataset, example ids) that token
+    /// first added, so a replayed `AddDatasetExamples` answers with the ids it
+    /// minted the first time instead of appending the batch twice. Separate
+    /// from the maps above because what an example mutation produced is a set
+    /// of examples rather than a resource of its own; the key carries the
+    /// operation for the same reason as there. Bounded by
+    /// [`MAX_REMEMBERED_CLIENT_TOKENS`] records, each holding at most the
+    /// `DatasetExampleList` ceiling of ids one request can add, so a caller
+    /// looping on add with fresh tokens evicts the oldest record rather than
+    /// growing this process's memory without bound.
+    dataset_examples_idempotency: BTreeMap<String, (String, Vec<String>)>,
+    /// The keys of [`Self::dataset_examples_idempotency`] in the order they were
+    /// first recorded, so the oldest record is the one evicted at the ceiling.
+    dataset_examples_idempotency_order: VecDeque<String>,
     /// Every OAuth2 credential provider of this account's default token vault,
     /// keyed by `name` — the identifier every OAuth2-credential-provider route
     /// addresses it by, and what the provider's own ARN ends in. The key order is

@@ -203,7 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let status = record.status_at(now).to_string();
         if crate::state::dataset_blocks_writes(&status) {
             return Err(UpdateDatasetErrorModeled::ConflictException(
-                crate::state::dataset_status_conflict(Self::NAME, &status),
+                crate::state::dataset_status_conflict(&status),
             )
             .into());
         }

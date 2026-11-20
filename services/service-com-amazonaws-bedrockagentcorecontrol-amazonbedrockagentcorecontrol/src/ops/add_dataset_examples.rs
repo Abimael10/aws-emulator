@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddDatasetExamples
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddDatasetExamples`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddDatasetExamples::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Appends examples to a dataset's DRAFT working copy in [`crate::state`], under
+//! the `ExampleId` each one is assigned as it enters, and answers those ids. The
+//! examples live on the dataset's record, so the count every later read of the
+//! dataset reports is the number the working copy really holds.
+//!
+//! The batch is checked against the DATASET's schema type — the one the create
+//! persisted, not anything the request carries — before any of it is written, so
+//! one example that omits a field the schema requires refuses the whole call and
+//! leaves the working copy exactly as it was.
+//!
+//! The mutation is ASYNCHRONOUS: it reports `UPDATING`, in which "all writes are
+//! blocked", so a second write arriving before the clock settles the dataset
+//! meets the modelled conflict; the clock owes the dataset `ACTIVE`, or
+//! `UPDATE_FAILED` for a source that yielded no examples at all.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +179,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddDatasetExamples` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddDatasetExamplesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AddDatasetExamplesErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the dataset store is unavailable".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let arrived = ::std::time::SystemTime::now();
+
+        // The dataset is resolved BEFORE the source is read: which schema the
+        // batch is checked against is a property of the dataset, an id naming no
+        // stored dataset is the modelled 404, and a dataset whose own ingestion
+        // or last mutation is still in flight blocks every write — "all writes
+        // are blocked" while it is `CREATING` or `UPDATING` — whatever the
+        // source turns out to hold. The guard is released before the source is
+        // read, so a read of the caller's object storage cannot hold the store.
+        let schema_type = {
+            let store = state.lock();
+
+            // A replayed request carrying the same `clientToken` answers with
+            // the examples that token first added to THIS dataset, rather than
+            // appending the batch a second time: "If this token matches a
+            // previous request, the service ignores the request, but doesn't
+            // return an error."
+            if let Some(example_ids) = store.replayed_dataset_examples(
+                Self::NAME,
+                input.client_token.as_deref(),
+                &input.dataset_id,
+            ) {
+                // `replayed_dataset_examples` answers only for a dataset the
+                // store still holds, so this lookup cannot miss.
+                if let Some(record) = store.datasets.get(&input.dataset_id) {
+                    return Ok(record.add_examples_output(example_ids, arrived));
+                }
+            }
+
+            let record = store.datasets.get(&input.dataset_id).ok_or_else(|| {
+                AddDatasetExamplesErrorModeled::ResourceNotFoundException(
+                    crate::state::dataset_not_found(),
+                )
+            })?;
+            let status = record.status_at(arrived).to_string();
+            if crate::state::dataset_blocks_writes(&status) {
+                return Err(AddDatasetExamplesErrorModeled::ConflictException(
+                    crate::state::dataset_status_conflict(&status),
+                )
+                .into());
+            }
+            record.schema_type.clone()
+        };
+
+        // The examples the source yields, read BEFORE the store is locked for
+        // the write: an inline source carries them in the request, and an
+        // Amazon S3 source names a JSONL file in the caller's own bucket, which
+        // this emulator reads out of its own object storage, so the number of
+        // examples the add reports is the number it really wrote.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddDatasetExamples"))
+        // The source is RESOLVED before anything is written: a location holding
+        // no readable object is refused to the caller, naming the URI.
+        let ingestion = crate::state::ingest_dataset_source(ctx, &region, &input.source)
+            .await
+            .map_err(AddDatasetExamplesErrorModeled::ValidationException)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Resolved a second time: the dataset could have been deleted, or
+        // another write could have started on it, while this request was
+        // reading its source.
+        let record = store.datasets.get_mut(&input.dataset_id).ok_or_else(|| {
+            AddDatasetExamplesErrorModeled::ResourceNotFoundException(
+                crate::state::dataset_not_found(),
+            )
+        })?;
+        let status = record.status_at(now).to_string();
+        if crate::state::dataset_blocks_writes(&status) {
+            return Err(AddDatasetExamplesErrorModeled::ConflictException(
+                crate::state::dataset_status_conflict(&status),
+            )
+            .into());
+        }
+
+        let examples = match ingestion {
+            crate::state::DatasetIngestion::Ingested(examples) => examples,
+            // A source that yielded no examples wrote nothing, which is the
+            // asynchronous failure of an example mutation rather than a refusal
+            // of the request: the dataset reports why once the clock owes it
+            // `UPDATE_FAILED`, and the working copy is left as it was.
+            crate::state::DatasetIngestion::Failed(reason) => {
+                record.fail_example_mutation(reason, now);
+                return Ok(record.add_examples_output(Vec::new(), now));
+            }
+        };
+
+        // "All examples are validated against the dataset's schema type before
+        // any writes occur. If any example fails validation, the entire batch is
+        // rejected (all-or-nothing semantics)" — checked against the schema the
+        // DATASET carries, through the same rule the create applies, so the two
+        // cannot disagree about what an example must carry.
+        crate::state::validate_examples(&schema_type, &examples)
+            .map_err(AddDatasetExamplesErrorModeled::ValidationException)?;
+
+        // The working copy this request would grow is bounded, so a caller
+        // looping on add meets the modelled quota instead of this process's
+        // memory limit. The ceiling is the record's own, at the one place an
+        // example is appended, and nothing of a refused batch is written.
+        let Some(example_ids) = record.add_examples(examples, now) else {
+            return Err(
+                AddDatasetExamplesErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "dataset {} cannot hold more than {} examples",
+                            input.dataset_id,
+                            crate::state::MAX_DATASET_EXAMPLES
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        let output = record.add_examples_output(example_ids.clone(), now);
+        store.remember_dataset_examples_client_token(
+            Self::NAME,
+            input.client_token,
+            &input.dataset_id,
+            &example_ids,
+        );
+
+        Ok(output)
     }
 }

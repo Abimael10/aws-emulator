@@ -196,7 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // first and the whole call is refused if one of them fails: a refused
         // example leaves no dataset holding the rest.
         if let DataSourceType::inlineExamples(inline) = &input.source {
-            crate::state::validate_inline_examples(&input.schema_type, &inline.examples)
+            crate::state::validate_examples(&input.schema_type, &inline.examples)
                 .map_err(CreateDatasetErrorModeled::ValidationException)?;
         }
 
