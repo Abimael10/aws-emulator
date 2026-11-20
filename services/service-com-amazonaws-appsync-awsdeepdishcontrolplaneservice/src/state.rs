@@ -3218,6 +3218,14 @@ pub const CACHE_ALREADY_EXISTS_MESSAGE: &str = "The API has already enabled cach
 pub const CACHE_NOT_DELETABLE_MESSAGE: &str =
     "Cannot delete cache as it is either not available or its creation failed.";
 
+/// The text `BadRequestException` (HTTP 400) carries for an UPDATE of an instance that
+/// was never created ([`ApiCacheRecord::was_created`]): the same precondition the
+/// teardown reads ([`CACHE_NOT_DELETABLE_MESSAGE`]) — there is no provisioned instance
+/// to reconfigure — worded as the service words it for a reconfiguration, and like that
+/// one entirely fixed text, naming neither the API nor the status the instance is in.
+pub const CACHE_NOT_YET_AVAILABLE_MESSAGE: &str =
+    "The cache is not yet available. Please wait until it becomes available.";
+
 /// The `DataSourceType` of an HTTP endpoint, the one type whose need for a service
 /// role depends on how the endpoint is authorized ([`data_source_needs_service_role`]).
 pub const HTTP_DATA_SOURCE_TYPE: &str = "HTTP";

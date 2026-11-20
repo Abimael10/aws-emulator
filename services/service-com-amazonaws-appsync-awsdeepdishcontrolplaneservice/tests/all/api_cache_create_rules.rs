@@ -54,6 +54,38 @@ fn update_cache_body(ttl: i64, behavior: &str, cache_type: &str) -> Value {
     })
 }
 
+/// How long a poll for a transition the clock owes keeps looking before it gives up.
+/// Generous: the suite waits for the CONDITION, so a loaded host only makes it look
+/// again rather than fail.
+const POLL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a poll waits between two looks.
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Poll `GetApiCache` until the API's instance reports `status` — the transition to it is
+/// one the clock owes, so the suite looks again until it holds rather than waiting a
+/// fixed time for it.
+async fn poll_until_status(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    api_id: &str,
+    status: &str,
+    case: &str,
+) {
+    let deadline = std::time::Instant::now() + POLL_DEADLINE;
+    loop {
+        let read: Answer =
+            call(router, "GET", &format!("/v1/apis/{api_id}/ApiCaches"), None).await;
+        if read.body["apiCache"]["status"].as_str() == Some(status) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: expected the instance to reach {status}, last answer {read:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// Rule 1: the id's SHAPE decides bad-request from not-found, on every cache
 /// operation that resolves an `apiId`.
 ///
@@ -272,6 +304,9 @@ async fn an_update_touches_only_the_addressed_apis_cache() {
         );
     }
 
+    // New settings are only applied to an instance that has finished being created, so
+    // the addressed API's cache has to have come due before the update is sent.
+    poll_until_status(&router, &first, "AVAILABLE", "update the first API's cache").await;
     let updated = call(
         &router,
         "POST",

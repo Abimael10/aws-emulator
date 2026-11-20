@@ -95,6 +95,37 @@ async fn get_cache(router: &smithy_server_runtime::MultiServiceRouter, api_id: &
     call(router, "GET", &format!("/v1/apis/{api_id}/ApiCaches"), None).await
 }
 
+/// How long a poll for a transition the clock owes keeps looking before it gives up.
+/// Generous: the suite waits for the CONDITION, so a loaded host only makes it look
+/// again rather than fail.
+const POLL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a poll waits between two looks.
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Poll `GetApiCache` until the instance reports `status`, and answer that reply — the
+/// transition to that status is one the clock owes, so the suite looks again until it
+/// holds rather than waiting a fixed time for it.
+async fn poll_until_status(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    api_id: &str,
+    status: &str,
+    case: &str,
+) -> Answer {
+    let deadline = std::time::Instant::now() + POLL_DEADLINE;
+    loop {
+        let read = get_cache(router, api_id).await;
+        if read.body["apiCache"]["status"].as_str() == Some(status) {
+            return read;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: expected the instance to reach {status}, last answer {read:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// Rule 1, on the create: a `ttl` inside the documented window is accepted and stored;
 /// one outside it is refused with `BadRequestException` naming the window, and leaves
 /// the API with no cache at all — so the following read is a not-found.
@@ -249,6 +280,9 @@ async fn a_ttl_outside_the_documented_window_is_refused_by_the_update_too() {
         created.status, 200,
         "case seed a cache: expected 200, got {created:?}"
     );
+    // New settings are only applied to an instance that has finished being created, so
+    // the seeded cache has to have come due before the window below is exercised on it.
+    poll_until_status(&router, &api_id, "AVAILABLE", "seed a cache").await;
 
     // Accepted values, then refused ones; after each refusal the stored ttl is still
     // the last accepted one.

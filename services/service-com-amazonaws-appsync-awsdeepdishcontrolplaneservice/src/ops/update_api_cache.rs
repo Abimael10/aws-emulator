@@ -5,6 +5,13 @@
 //! the new settings to the API's stored `ApiCache` in [`crate::state`]. This is the
 //! ONLY file to touch for this operation.
 //!
+//! The settings are only applied to an instance that has finished being provisioned
+//! ([`crate::state::ApiCacheRecord::was_created`], the precondition `DeleteApiCache`
+//! reads as well): while the instance is still being created, or its creation failed,
+//! there is nothing to reconfigure, so the call is refused with the modelled
+//! `BadRequestException` (400, [`crate::state::CACHE_NOT_YET_AVAILABLE_MESSAGE`]) and
+//! the stored cache is left exactly where it was.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -226,6 +233,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
+
+        // The reconfiguration precondition, which is the one the teardown reads
+        // ([`crate::state::ApiCacheRecord::was_created`]): an instance whose CREATION has
+        // not completed — it is still being created, or its creation failed — is not there
+        // to be reconfigured, so the new settings are refused and nothing is written, and
+        // a caller can read the cache again and retry once it exists. Once it has been
+        // created it takes new settings whatever the service is doing to it at the moment,
+        // so settings already being applied never make it unconfigurable.
+        if !cache.was_created() {
+            return Err(UpdateApiCacheErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::CACHE_NOT_YET_AVAILABLE_MESSAGE.to_string()),
+                ..Default::default()
+            })
+            .into());
+        }
 
         // The three required members are replaced by what the request carries;
         // `healthMetricsConfig` is optional, so an absent one leaves the stored

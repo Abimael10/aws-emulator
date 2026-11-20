@@ -238,9 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if guard.graphql_apis.len() >= APIS_PER_REGION {
                 return Err(CreateGraphqlApiErrorModeled::ApiLimitExceededException(
                     ApiLimitExceededException {
-                        message: Some(format!(
-                            "an account may hold at most {APIS_PER_REGION} GraphQL APIs in a Region"
-                        )),
+                        message: Some(API_LIMIT_REACHED_MESSAGE.to_string()),
                     },
                 )
                 .into());
@@ -298,9 +296,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             guard.graphql_data_plane.forget_api(&api_id);
             return Err(CreateGraphqlApiErrorModeled::ApiLimitExceededException(
                 ApiLimitExceededException {
-                    message: Some(format!(
-                        "an account may hold at most {APIS_PER_REGION} GraphQL APIs in a Region"
-                    )),
+                    message: Some(API_LIMIT_REACHED_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -405,6 +401,15 @@ const ARN_SERVICE: &str = crate::state::ARN_SERVICE;
 /// The AppSync service quota for GraphQL APIs an account holds in one Region, which
 /// `ApiLimitExceededException` reports. It is also what bounds this service's store.
 const APIS_PER_REGION: usize = 25;
+
+/// The text `ApiLimitExceededException` (HTTP 400) carries for a create past that quota.
+///
+/// The sentence is entirely fixed text: it names the limited resource and states that
+/// the limit has been reached, and interpolates nothing — not the request, and not
+/// [`APIS_PER_REGION`], so raising or lowering the quota cannot change the wording a
+/// client branches or reports on.
+const API_LIMIT_REACHED_MESSAGE: &str =
+    "The service limit for number of GraphQL APIs has been reached.";
 
 /// The model's documented value for `apiType` when the request omits it.
 const DEFAULT_API_TYPE: &str = crate::state::GRAPHQL_API_TYPE;

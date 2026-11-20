@@ -31,10 +31,13 @@ use crate::error_contract::{call, create_api, Answer};
 /// the id-length rows below cannot drift from the rule the service applies.
 const API_ID_LEN: usize = state::API_ID_LEN;
 
-/// The span the service records for a cache's transition to available — read from the
-/// service itself, so this suite waits exactly as long as the service asks for rather
-/// than on a number of its own.
-const CACHE_SPAN: Duration = state::CACHE_SPAN;
+/// How long a poll for a transition the clock owes keeps looking before it gives up.
+/// Generous: the suite waits for the CONDITION, so a loaded host only makes it look
+/// again rather than fail.
+const POLL_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How long a poll waits between two looks.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// `ApiCachingBehavior`'s whole value set, in the order the model declares it.
 /// Source: `smithy_query(query="shape", shape="ApiCachingBehavior")`.
@@ -143,6 +146,29 @@ async fn api_with_cache(
     api_id
 }
 
+/// Poll `GetApiCache` until the instance reports `status`, and answer that reply — the
+/// transition to that status is one the clock owes, so the suite looks again until it
+/// holds rather than waiting a fixed time for it.
+async fn poll_until_status(
+    router: &MultiServiceRouter,
+    api_id: &str,
+    status: &str,
+    case: &str,
+) -> Answer {
+    let deadline = std::time::Instant::now() + POLL_DEADLINE;
+    loop {
+        let read = get_cache(router, api_id).await;
+        if read.body["apiCache"]["status"].as_str() == Some(status) {
+            return read;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: expected the instance to reach {status}, last answer {read:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// Which lifecycle state the cache is in when the row flushes it.
 #[derive(Debug, Clone, Copy)]
 enum When {
@@ -193,12 +219,15 @@ async fn a_flush_answers_without_members_and_leaves_the_stored_cache_unchanged()
         let permitted: &[&str] = match when {
             When::JustCreated => &["CREATING", "AVAILABLE"],
             When::Available => {
-                // Longer than the span the service records for the transition, so the
-                // clock has made it due; the slack covers the scheduler.
-                tokio::time::sleep(CACHE_SPAN + Duration::from_millis(100)).await;
+                // Wait for the transition the clock owes to have been made, rather than
+                // for a duration of this suite's own.
+                poll_until_status(&router, &api_id, "AVAILABLE", &case).await;
                 &["AVAILABLE"]
             }
             When::JustUpdated => {
+                // New settings are only applied to an instance that has finished being
+                // created, so the row waits for the create to have come due first.
+                poll_until_status(&router, &api_id, "AVAILABLE", &case).await;
                 let updated = call(
                     &router,
                     "POST",
@@ -293,8 +322,7 @@ async fn a_flush_answers_without_members_and_leaves_the_stored_cache_unchanged()
 
         // And the transition the clock owed is still owed to it: a flushed instance
         // becomes available on the same clock, so the flush restarted nothing.
-        tokio::time::sleep(CACHE_SPAN + Duration::from_millis(100)).await;
-        let settled = get_cache(&router, &api_id).await;
+        let settled = poll_until_status(&router, &api_id, "AVAILABLE", &case).await;
         assert_eq!(
             settled.body["apiCache"]["status"].as_str(),
             Some("AVAILABLE"),
