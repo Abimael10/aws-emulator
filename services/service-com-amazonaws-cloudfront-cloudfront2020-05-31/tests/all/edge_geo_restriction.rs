@@ -32,10 +32,12 @@
 //! "the origin answered" distinguishable from "CloudFront answered instead".
 
 use bytes::Bytes;
+use service_com_amazonaws_cloudfront_cloudfront2020_05_31::service::edge::generated_headers::EDGE_COUNTRY;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::distribution_lifecycle::{
-    call, create_distribution, emulator, past_propagation, API_VERSION, HOST,
+    awaited_deployment, call, create_distribution, emulator, past_propagation, update_distribution,
+    API_VERSION, HOST,
 };
 
 /// The AWS-managed cache policy `Managed-CachingOptimized`, whose `DefaultTTL` is a day, so
@@ -248,7 +250,7 @@ async fn the_edge_refuses_the_viewers_the_geo_restriction_names() {
     let router = emulator();
 
     // (case, the Restrictions element, the country the viewer states, refused)
-    let cases: [(&str, String, Option<&str>, bool); 13] = [
+    let cases: [(&str, String, Option<&str>, bool); 15] = [
         (
             "a blocklisted country",
             restrictions("blacklist", &["RU"]),
@@ -327,6 +329,21 @@ async fn the_edge_refuses_the_viewers_the_geo_restriction_names() {
             Some("RU"),
             false,
         ),
+        // The country a viewer that states none is resolved to is a country like any other, so
+        // a restriction naming IT decides that viewer: the case a client blocklisting the
+        // country the edge reported for its own viewer drives.
+        (
+            "a blocklist naming the country a viewer that states none is in",
+            restrictions("blacklist", &[EDGE_COUNTRY]),
+            None,
+            true,
+        ),
+        (
+            "an allowlist naming that same country",
+            restrictions("whitelist", &[EDGE_COUNTRY]),
+            None,
+            false,
+        ),
     ];
 
     for (index, (case, restrictions, country, refused)) in cases.into_iter().enumerate() {
@@ -339,6 +356,118 @@ async fn the_edge_refuses_the_viewers_the_geo_restriction_names() {
             assert_served(case, &answer);
         }
     }
+}
+
+/// RULE, over the write that is not the create: the edge serves one viewer request from the
+/// configuration the distribution RUNS UNDER, which is the one the last write stored — so a
+/// geographic restriction a client puts on a deployed distribution with `UpdateDistribution`
+/// decides the very next viewer the edge answers, and a restriction it takes off stops
+/// deciding it.
+///
+/// The configuration the update submits is the document `GetDistributionConfig` ANSWERED, with
+/// its `Restrictions` element replaced — the round trip a client makes — so what is stored is
+/// the configuration the service itself reported plus the one member the client changed.
+#[tokio::test]
+async fn a_restriction_an_update_stores_decides_the_next_viewer() {
+    let router = emulator();
+    let reference = "geo-updated";
+    let created = create_distribution(&router, &config(reference, &restrictions("none", &[]))).await;
+    assert_eq!(
+        created.status, 201,
+        "case {reference:?}: creating the distribution answered {}: {}",
+        created.status, created.raw
+    );
+    let id = created
+        .root()
+        .find_text("Id")
+        .expect("the created distribution reports an id")
+        .to_string();
+    let domain = created
+        .root()
+        .find_text("DomainName")
+        .expect("the created distribution reports a domain name")
+        .to_string();
+    awaited_deployment(&router, reference, &id).await;
+
+    // Rows differ along what the write puts on the distribution: a blocklist naming the
+    // viewer's country, an allowlist naming another country, and the restriction taken off
+    // again — and each one is read by the viewer request that follows it.
+    // (case, the restriction the update stores, the country the viewer states, refused)
+    let rows: [(&str, String, Option<&str>, bool); 4] = [
+        (
+            "a blocklist an update added",
+            restrictions("blacklist", &["DE"]),
+            Some("DE"),
+            true,
+        ),
+        (
+            "a viewer outside the blocklist that update added",
+            restrictions("blacklist", &["DE"]),
+            Some("FR"),
+            false,
+        ),
+        (
+            "an allowlist naming another country",
+            restrictions("whitelist", &["JP"]),
+            Some("DE"),
+            true,
+        ),
+        (
+            "the restriction taken off again",
+            restrictions("none", &[]),
+            Some("DE"),
+            false,
+        ),
+    ];
+
+    for (case, restriction, country, refused) in rows {
+        let read = call(
+            &router,
+            "GET",
+            &format!("/{API_VERSION}/distribution/{id}/config"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: reading the configuration answered {}: {}",
+            read.status, read.raw
+        );
+        let etag = read.header("etag").to_string();
+        let submitted = with_restrictions(&read.raw, &restriction);
+        let updated = update_distribution(&router, &id, &submitted, Some(&etag)).await;
+        assert_eq!(
+            updated.status, 200,
+            "case {case:?}: the update answered {} for {submitted:?}: {}",
+            updated.status, updated.raw
+        );
+        awaited_deployment(&router, case, &id).await;
+        let answer = view(&router, &domain, SERVED_PATH, country).await;
+        if refused {
+            assert_refused(case, &answer);
+        } else {
+            assert_served(case, &answer);
+        }
+    }
+}
+
+/// The `DistributionConfig` document `configuration` carries, with its `Restrictions` element
+/// replaced by `restriction` — the one member the update above changes, in the place the
+/// document already holds it.
+fn with_restrictions(configuration: &str, restriction: &str) -> String {
+    let open = configuration
+        .find("<Restrictions>")
+        .expect("the reported configuration carries a Restrictions element");
+    let close = configuration
+        .find("</Restrictions>")
+        .map(|at| at + "</Restrictions>".len())
+        .expect("the reported configuration closes its Restrictions element");
+    format!(
+        "{}{restriction}{}",
+        &configuration[..open],
+        &configuration[close..]
+    )
 }
 
 /// RULE, the part of it a status alone cannot pin: the restriction is applied BEFORE the

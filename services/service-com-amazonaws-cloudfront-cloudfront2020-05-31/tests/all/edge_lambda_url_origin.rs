@@ -573,7 +573,10 @@ impl Topology {
 
     /// One deployed distribution over the function URL `origin` with the behaviours
     /// `behaviors` carries: the `DomainName` it published.
-    async fn deployed_distribution(
+    ///
+    /// `pub(crate)` so a sibling suite over the same topology stages its distribution the same
+    /// way rather than writing a second configuration for it.
+    pub(crate) async fn deployed_distribution(
         &self,
         case: &str,
         caller_reference: &str,

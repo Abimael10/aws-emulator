@@ -311,6 +311,12 @@ impl LoggedRequest<'_> {
             "timestamp" => epoch_seconds(self.at),
             // "The IP address of the viewer that made the request."
             "c-ip" => self.client_ip().to_string(),
+            // "The port number of the request from the viewer" — the viewer's end of the
+            // connection the request arrived on, the same one the
+            // `CloudFront-Viewer-Address` header reports beside the address
+            // ([`super::generated_headers::IN_PROCESS_CLIENT_PORT`]), so a record and an
+            // origin never report one viewer two connections.
+            "c-port" => generated_headers::IN_PROCESS_CLIENT_PORT.to_string(),
             // "The number of seconds between receiving the request and writing the first
             // byte of the response", and the whole span for an answer with no separate first
             // byte to time.
@@ -388,8 +394,8 @@ impl LoggedRequest<'_> {
                 .primary
                 .map_or_else(no_value, |primary| primary.domain_name.to_string()),
             // Every other field of the catalog describes something this request HAS NOT: the
-            // edge location and the viewer's port and autonomous system, which an in-process
-            // viewer connection has none of; the TLS parameters of a connection whose
+            // edge location and the viewer's autonomous system, which an in-process viewer
+            // connection has none of; the TLS parameters of a connection whose
             // encryption this plane did not negotiate; the field-level encryption of a
             // request no profile encrypted; and the range of an answer that is not a range. A
             // name the catalog does not carry describes nothing about a request either.
@@ -661,9 +667,11 @@ mod tests {
             ),
             ("a header the viewer did not send", "cs-referer", NO_VALUE),
             (
-                "the viewer's port, which an in-process request has none of",
+                // The port [`generated_headers::IN_PROCESS_CLIENT_PORT`] names, rendered as
+                // the record carries it.
+                "the viewer's port, the viewer's own end of the connection it arrived on",
                 "c-port",
-                NO_VALUE,
+                "49152",
             ),
         ];
         for (case, field, expected) in rows {

@@ -45,6 +45,20 @@
 //! and the one a web ACL's address rules are evaluated against, so one viewer has one address
 //! whichever part of the edge asks — which is what makes a signed URL's source-address
 //! condition ([`super::signed_access`]) and the header an origin reads the same value.
+//!
+//! That header reports the viewer's CONNECTION rather than its address alone, so it carries
+//! both ends of it: the address and the PORT the request came from, `<address>:<port>`
+//! ([`viewer_socket_address`]). The port of a request that crossed no socket is the one such a
+//! viewer's connection has here ([`IN_PROCESS_CLIENT_PORT`]), for the reason the address is
+//! [`IN_PROCESS_CLIENT_IP`], and it is the value the log record reports as `c-port` as well.
+//!
+//! A viewer that DIALLED a distribution's own edge address opened a socket, and its end of that
+//! socket has a port of its own — but nothing here can read it: the core owns the socket and
+//! hands a native handler a byte stream alone (`emulator_server::ListenerConn`, a boxed
+//! `AsyncRead + AsyncWrite` with no peer address on it), so the connection a viewer opened
+//! reaches `crate::state::edge_endpoint` without the address it was opened from. Such a viewer
+//! is therefore reported exactly as an in-process one is, and that is the whole of why one port
+//! answers for every viewer here rather than the port each of them really came from.
 
 use aws_smithy_runtime_api::http::Request as RtRequest;
 
@@ -73,7 +87,22 @@ pub const VIEWER_ADDRESS: &str = "cloudfront-viewer-address";
 /// United States. Every viewer of this emulator dials a loopback address, so this is the one
 /// location there is to report, and it is the same for every request, which is what an
 /// origin comparing two requests' countries reads.
-const EDGE_COUNTRY: &str = "US";
+///
+/// `pub` because it is what the edge REPORTS: a suite holding a geographic restriction that
+/// names this country to deciding such a viewer reads the value here rather than restating it.
+pub const EDGE_COUNTRY: &str = "US";
+
+/// The port the edge reports for the viewer's end of the connection one request arrived on.
+///
+/// `CloudFront-Viewer-Address` describes that connection — the address the request came from
+/// and the port it came from — so the value carries a port wherever it is reported. A request
+/// this plane serves crossed no socket from a remote peer, which is why its address is
+/// [`IN_PROCESS_CLIENT_IP`]: there is no peer port to read either, so the ONE connection such a
+/// viewer has is reported with one port, and this is it — the first of the range RFC 6335
+/// reserves for the end of a connection a client opens from (the dynamic ports, 49152-65535).
+/// It is the same for every such request, exactly as the address is, which is what a reader
+/// comparing two of them sees.
+pub const IN_PROCESS_CLIENT_PORT: u16 = 49_152;
 
 /// The scheme a viewer that reached an address of this emulator dialled, unless its request
 /// states otherwise: every endpoint this emulator publishes is served over TLS.
@@ -121,7 +150,7 @@ impl Generated {
         Self {
             country: viewer_country(req),
             scheme: viewer_scheme(req.uri()),
-            address: viewer_address(req).to_string(),
+            address: viewer_socket_address(req),
         }
     }
 
@@ -151,6 +180,20 @@ pub fn viewer_address(req: &RtRequest) -> &str {
         .map(str::trim)
         .filter(|address| address.parse::<::std::net::IpAddr>().is_ok())
         .unwrap_or(IN_PROCESS_CLIENT_IP)
+}
+
+/// The viewer's CONNECTION as `CloudFront-Viewer-Address` reports it: the address the request
+/// came from and the port it came from, `<address>:<port>`.
+///
+/// The address is the one reading of it above and the port [`IN_PROCESS_CLIENT_PORT`]. An IPv6
+/// address is bracketed, which is where its own colons live, through the one reading of a
+/// `host:port` this emulator has — so the two halves of the value stay readable for every
+/// address a viewer can come from.
+pub fn viewer_socket_address(req: &RtRequest) -> String {
+    ::service_common::data_plane_addressing::host_port_authority(
+        viewer_address(req),
+        IN_PROCESS_CLIENT_PORT,
+    )
 }
 
 /// The country the edge resolves for one viewer request — the ONE value this request's
@@ -352,12 +395,34 @@ mod tests {
                 actual.parse::<::std::net::IpAddr>().is_ok(),
                 "case {case:?}: expected an IP address, got {actual:?}"
             );
-            // And it is the value the generated header carries, so one viewer has one
-            // address wherever the edge reports it.
+            // And it is the address half of the value the generated header carries, whose
+            // other half is the port that connection came from: one viewer has one connection
+            // wherever the edge reports it.
             let generated = Generated::of_request(&req);
+            let reported = ::service_common::data_plane_addressing::host_port_authority(
+                expected,
+                IN_PROCESS_CLIENT_PORT,
+            );
             assert_eq!(
-                generated.address, expected,
-                "case {case:?}: expected the generated header to carry {expected:?}, got {:?}",
+                generated.address, reported,
+                "case {case:?}: expected the generated header to carry {reported:?}, got {:?}",
+                generated.address
+            );
+            // Whatever the address is, the value splits into the address and a port: an
+            // origin reading the header reads both halves of the connection.
+            let (address, port) = generated
+                .address
+                .rsplit_once(':')
+                .unwrap_or_else(|| panic!("case {case:?}: no port in {:?}", generated.address));
+            assert_eq!(
+                address.trim_start_matches('[').trim_end_matches(']'),
+                expected,
+                "case {case:?}: expected the address {expected:?} in {:?}",
+                generated.address
+            );
+            assert!(
+                port.parse::<u16>().is_ok_and(|port| port >= 49_152),
+                "case {case:?}: expected a dynamic port in {:?}, got {port:?}",
                 generated.address
             );
         }
