@@ -3492,6 +3492,11 @@ impl StoredStack {
             // the operation deploying a template fills this in
             // ([`Self::declarations_reading_unpublished_attributes`]).
             reads_unpublished_attributes: BTreeSet::new(),
+            // ...and it asks the owning services for what the records state, so nothing is
+            // re-declared over and above what those records say changed: the ROLLBACK of a
+            // failed operation is what names the resources whose change was not carried
+            // through ([`provisioning::StackProvenance::reapplied`]).
+            reapplied: BTreeSet::new(),
         }
     }
 
@@ -4408,6 +4413,10 @@ impl StoredStack {
         let plan = held.unwrap_or_else(|| OwedRollback {
             previous: in_force.clone(),
             applied: in_force,
+            // Nothing is known about what any owning service carried out, so nothing is
+            // declared again over and above what the records say
+            // ([`OwedRollback::part_changed`]).
+            part_changed: BTreeSet::new(),
         });
         // The failed operation's own deployment is ABANDONED, as it is for a rollback the
         // failure itself owed ([`Self::begin_update_rollback`]): the stack keeps the

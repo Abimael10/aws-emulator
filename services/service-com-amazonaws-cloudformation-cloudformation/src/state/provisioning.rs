@@ -404,6 +404,10 @@ mod repointing;
 /// CloudFormation words itself (a name another stack manages, a call the service role is
 /// denied).
 mod sdk_diagnostics;
+/// What a deployment does to ONE resource whose change the service that owns it refused:
+/// whose work putting it back is, and the events that report it ([`failed_resource`]).
+mod failed_resource;
+use failed_resource::*;
 pub(crate) use sdk_diagnostics::*;
 use repointing::*;
 
@@ -773,27 +777,44 @@ pub struct StackProvenance {
     /// deployment, which creates and changes resources rather than adopting them — and for
     /// every later deployment over the adopted resource, which is one the stack HAS by then.
     pub adopted: BTreeSet<String>,
+    /// The resources this deployment asks the owning service for the declared configuration
+    /// of AGAIN, even where the stack's record already states it.
+    ///
+    /// A change to a resource that exists is not one call but several — a function's
+    /// configuration and its deployment package are two — so a change the owning service
+    /// refused PART WAY leaves the resource carrying some of it while the stack's record
+    /// still states the configuration in force before it ([`carry_forward`]). CloudFormation
+    /// puts such a resource back the only way it can: by declaring the previous
+    /// configuration again in that service. That re-declaration reads everything the
+    /// configuration points at — an `AWS::Lambda::Function`'s `Code` is fetched from Amazon
+    /// S3 again — so a rollback the owning service will not take is a rollback that FAILED,
+    /// reported as such, rather than one reported complete over a call nobody made.
+    ///
+    /// Filled by the ROLLBACK of a failed update and by the resumption of a rollback that
+    /// failed, from the resources the walk that failed reported as part-changed
+    /// ([`Materialised::part_changed`]). EMPTY for every deployment that deploys a
+    /// TEMPLATE, which asks those services for what its declarations state and compares
+    /// that with the records to decide what changed.
+    pub reapplied: BTreeSet<String>,
 }
 
-/// How a deployment puts back a resource whose change it could not carry through
-/// ([`roll_back_failed_resource`]).
+/// Whether THIS deployment is what puts back a resource whose change it could not carry
+/// through ([`roll_back_failed_resource`]).
 ///
 /// CloudFormation does not leave such a resource half-changed: the configuration in force
-/// before the deployment is put back through the owning service's own update API. Which
-/// statuses REPORT that revert is what the variants separate, because that follows from what
-/// becomes of the stack.
+/// before the deployment is declared again in the service that owns it. WHOSE work that is
+/// is what the variants separate, because that follows from what becomes of the stack.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FailedResourceRevert {
-    /// Nothing is put back: this deployment IS the putting back (a rollback, a resumption, a
-    /// revert), or it is a CREATE, where a resource that failed has no earlier configuration
+    /// Not this deployment's work. Either the stack ROLLS BACK, and that rollback is what
+    /// declares the previous configuration again in the owning services
+    /// ([`StackProvenance::reapplied`] carries the resources it has to ask for) — so putting
+    /// the resource back here would make that call twice and report it before the rollback it
+    /// belongs to; or this deployment IS the putting back (a rollback, a resumption, a
+    /// revert); or it is a CREATE, where a resource that failed has no earlier configuration
     /// of its own to go back to.
     #[default]
     None,
-    /// The revert belongs to the STACK's own rollback, which follows this deployment: a
-    /// rollback reports every resource it puts back as that resource's own update reaching
-    /// its terminal status, so the revert is reported as `UPDATE_IN_PROGRESS` and then
-    /// `UPDATE_COMPLETE`.
-    WithTheStackRollback,
     /// The revert is the RESOURCE's alone: the stack rests in the failed status
     /// (`DisableRollback`), so there is no rollback of the stack's own to report it and the
     /// resource's `UPDATE_ROLLBACK_IN_PROGRESS`/`UPDATE_ROLLBACK_COMPLETE` transitions are
@@ -944,6 +965,17 @@ impl ResourceTransition {
         }
     }
 
+    /// The same transition, carrying the sentence CloudFormation words for what it is DOING
+    /// — as distinct from a refusal, which is the reason a failed transition carries.
+    ///
+    /// `StackEvent$ResourceStatusReason` is "Success/failure message associated with the
+    /// resource", and the events that report a resource being put back carry such a message
+    /// on both halves of the pair ([`failed_resource`]).
+    fn because(mut self, reason: &str) -> Self {
+        self.reason = Some(reason.to_string());
+        self
+    }
+
     /// The same transition, reporting the properties the deployment ASKED the owning service
     /// for rather than the ones the resource carries now.
     ///
@@ -1044,6 +1076,18 @@ pub struct Materialised {
     /// the operation — open until that service says otherwise
     /// ([`super::stabilising`]).
     pub stabilising: Vec<Stabilising>,
+    /// The resources whose configuration change the owning service was ASKED for and
+    /// REFUSED, so the resource may be PART-CHANGED: a change reaches that service as
+    /// several calls (a function's configuration and its deployment package are two), and a
+    /// refusal part way through leaves the resource carrying some of the change while the
+    /// stack's record still states what it had ([`carry_forward`]).
+    ///
+    /// What the ROLLBACK of this deployment has to declare again in those services whatever
+    /// the records say ([`StackProvenance::reapplied`]). A resource this deployment never
+    /// asked about — one whose type has no in-place update path, one whose declaration
+    /// CloudFormation itself refused — cannot be part-changed and is not here: there is
+    /// nothing in any service to put back for it.
+    pub part_changed: BTreeSet<String>,
 }
 
 /// One resource whose creation an owning service accepted and has not finished, or whose
@@ -2454,7 +2498,12 @@ pub async fn reconcile(
                     .map(|(name, value)| (name.clone(), value.clone()))
                     .collect()
             };
-            let changed = declared_properties != existing.properties;
+            // What the record states is not always what the owning service holds: a change
+            // that service refused PART WAY left the resource carrying some of it, and the
+            // deployment that puts such a resource back declares its configuration again
+            // whatever the records say ([`StackProvenance::reapplied`]).
+            let changed = declared_properties != existing.properties
+                || stack.reapplied.contains(&resource.logical_id);
             carry_forward(existing, &mut resource);
             if changed {
                 // ...but this deployment asks for a DIFFERENT configuration of a resource
@@ -2866,9 +2915,14 @@ pub async fn reconcile(
                         continue;
                     }
                     Err(refusal) => {
-                        // The owning service refused the change: nothing changed there, so
-                        // the deployment reports that refusal rather than a configuration
-                        // nothing applied.
+                        // The owning service was asked to apply the change and refused. A
+                        // change reaches it as several calls, so what it has carried out of
+                        // this one is its own to say: the resource may be PART-CHANGED, and
+                        // the rollback of this deployment declares its previous
+                        // configuration again there rather than reading the record and
+                        // concluding there is nothing to put back
+                        // ([`Materialised::part_changed`]).
+                        outcome.part_changed.insert(resource.logical_id.clone());
                         failed.push((
                             resource.logical_id.clone(),
                             super::failed_action::UPDATE,
@@ -4144,99 +4198,6 @@ async fn take_down_replaced_resource(
                 Some(reason.clone()),
             ));
             Err(reason)
-        }
-    }
-}
-
-/// Put ONE resource whose change this deployment could not carry through back the way it
-/// was, through the owning service's own update API, and report that revert on the
-/// resource's own transitions.
-///
-/// CloudFormation does not leave a resource whose provider refused its change half-changed:
-/// the resource is rolled back to the configuration in force before the deployment. WHICH
-/// statuses report that revert follows from what becomes of the stack
-/// ([`FailedResourceRevert`]), and a deployment that is itself a revert puts nothing back.
-///
-/// `in_force` is the record of the same resource the stack had BEFORE this deployment, whose
-/// properties are the configuration being put back; a refusal of the change never applied it,
-/// so for most failures the call confirms the configuration rather than changing it — which
-/// is what the owning service's answer is asked for. The record is left stating that
-/// configuration, and a service that would not take it leaves the resource in the failed
-/// status with its own refusal, never a revert nothing carried out.
-async fn roll_back_failed_resource(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
-    region: &str,
-    stack: &StackProvenance,
-    resource: &mut StoredResource,
-    in_force: &StoredResource,
-    outcome: &mut Materialised,
-) {
-    // The statuses this revert is reported under, which is what the deployment's own mode
-    // says: a stack that goes on to roll back reports every resource it puts back as that
-    // resource's own update reaching its terminal status, while one that rests in the failed
-    // status has only the resource's own rollback transitions to report it.
-    let (opened, ended, refused) = match stack.failed_resource_revert {
-        FailedResourceRevert::None => return,
-        FailedResourceRevert::WithTheStackRollback => (
-            super::resource_status::UPDATE_IN_PROGRESS,
-            super::resource_status::UPDATE_COMPLETE,
-            super::resource_status::UPDATE_FAILED,
-        ),
-        FailedResourceRevert::OfTheResourceAlone => (
-            super::resource_status::UPDATE_ROLLBACK_IN_PROGRESS,
-            super::resource_status::UPDATE_ROLLBACK_COMPLETE,
-            super::resource_status::UPDATE_ROLLBACK_FAILED,
-        ),
-    };
-    outcome
-        .transitions
-        .push(ResourceTransition::starting(resource, opened));
-    let restored = in_force.properties.clone();
-    let owner = owner_for(&resource.resource_type);
-    let put_back = match owner {
-        Some(provisioner) => {
-            // BOXED, like every other provider call this walk makes from inside a future
-            // this big: the call's own future is the owning service's whole handler, and
-            // holding a second one of those inline in [`reconcile`]'s state machine is what
-            // takes a deployment of a wide template past the thread's stack.
-            Box::pin(super::service_role::on_resource(
-                super::service_role::target_of(resource),
-                provisioner.update(
-                    ctx,
-                    region,
-                    resource,
-                    &restored,
-                    &stack.tags_for(&resource.logical_id),
-                    &stack.capabilities,
-                ),
-            ))
-            .await
-        }
-        // Nothing exists in any owning service for this type, so there is nothing anywhere
-        // to put back: the stack's own record IS the resource, and restoring the record
-        // below is the whole revert.
-        None => Ok(Some(Created::default())),
-    };
-    match put_back {
-        // Either the owning service took the previous configuration, or the type has no
-        // update path at all and so was never changed: the resource carries the
-        // configuration it had before this deployment, which is what the record states.
-        Ok(_) => {
-            resource.properties = restored;
-            outcome
-                .transitions
-                .push(ResourceTransition::finished(resource, ended, None));
-        }
-        Err(refusal) => {
-            outcome.transitions.push(ResourceTransition::finished(
-                resource,
-                refused,
-                Some(handler_failure_reason(
-                    owner,
-                    &refusal,
-                    &resource.physical_resource_id,
-                )),
-            ));
         }
     }
 }

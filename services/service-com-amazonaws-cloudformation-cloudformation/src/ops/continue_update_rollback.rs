@@ -332,12 +332,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(rollback) => rollback.applied.clone(),
                 None => declared.clone(),
             });
+            // The resources the rollback this resumption continues still has to DECLARE
+            // again, which is what it could not carry through: the ones an owning service
+            // was asked to change and refused ([`crate::state::OwedRollback::part_changed`]).
+            // The resources `ResourcesToSkip` names are left out of this too — they are left
+            // exactly as the failed update made them — and a stack whose outstanding
+            // rollback this service does not hold re-declares nothing.
+            let part_changed: ::std::collections::BTreeSet<String> = outstanding
+                .as_ref()
+                .map(|rollback| {
+                    rollback
+                        .part_changed
+                        .iter()
+                        .filter(|logical_id| !skipped.contains(logical_id))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
             (
                 stack.stack_id.clone(),
                 stack.region.clone(),
                 declared,
                 against,
-                stack.provenance(),
+                crate::state::provisioning::StackProvenance {
+                    reapplied: part_changed,
+                    ..stack.provenance()
+                },
                 // The role the resumed rollback's own calls are made under: the one in
                 // force on the stack, which this request may have just replaced.
                 stack.role_arn.clone(),

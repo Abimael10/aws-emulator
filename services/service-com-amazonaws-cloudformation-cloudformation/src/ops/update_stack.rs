@@ -1437,12 +1437,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // This deployment CHANGES resources the stack already has, so a resource
                     // whose change its provider refuses is put back the way it was. Where
                     // the stack RESTS in `UPDATE_FAILED` there is no rollback of the stack's
-                    // own to report that revert, so the resource's own rollback transitions
-                    // are ([`crate::state::provisioning::FailedResourceRevert`]).
+                    // own to report that revert, so this deployment performs it and the
+                    // resource's own rollback transitions report it; where the stack rolls
+                    // back, that rollback is what declares the previous configuration again
+                    // ([`crate::state::provisioning::FailedResourceRevert`]).
                     failed_resource_revert: if stack.disable_rollback {
                         crate::state::provisioning::FailedResourceRevert::OfTheResourceAlone
                     } else {
-                        crate::state::provisioning::FailedResourceRevert::WithTheStackRollback
+                        crate::state::provisioning::FailedResourceRevert::None
                     },
                     // ...and the declarations this update deploys are resolved again where a
                     // value one of them reads has moved, so a resource is deployed with the
@@ -1544,6 +1546,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             } else {
                 materialised.resources.clone()
             },
+            // ...and the resources an owning service was ASKED to change and refused, which
+            // this rollback declares the previous configuration of again whatever the
+            // records say ([`crate::state::provisioning::Materialised::part_changed`]).
+            part_changed: materialised.part_changed.clone(),
         };
         {
             let mut store = state.lock();

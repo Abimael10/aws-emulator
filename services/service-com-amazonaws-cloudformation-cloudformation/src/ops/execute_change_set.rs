@@ -829,13 +829,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 managed_names: managed,
                 // Executing a change set deploys a template over the resources the stack
                 // already has, so a resource whose change its provider refuses is put back
-                // the way it was — and where the stack RESTS in the failed status there is
-                // no rollback of its own to report that revert
+                // the way it was — by this deployment where the stack RESTS in the failed
+                // status, having no rollback of its own to report that revert, and by the
+                // stack's rollback where it has one
                 // ([`crate::state::provisioning::FailedResourceRevert`]).
                 failed_resource_revert: if stack.disable_rollback {
                     crate::state::provisioning::FailedResourceRevert::OfTheResourceAlone
                 } else {
-                    crate::state::provisioning::FailedResourceRevert::WithTheStackRollback
+                    crate::state::provisioning::FailedResourceRevert::None
                 },
                 // ...and the declarations it deploys are resolved again where a value one of
                 // them reads has moved, so a resource is deployed with the values in force
@@ -987,6 +988,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         } else {
                             materialised.resources.clone()
                         },
+                        // ...and the resources an owning service was ASKED to change and
+                        // refused, which this rollback declares the previous configuration
+                        // of again whatever the records say
+                        // ([`crate::state::provisioning::Materialised::part_changed`]).
+                        part_changed: materialised.part_changed.clone(),
                     };
                     stack.record_materialised_resources(materialised.resources);
                     // WHICH operation this execution opened, read once for both arms: a
