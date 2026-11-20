@@ -24,6 +24,11 @@
 //! with the same name") is AWS's own propagation guidance, not a refusal this operation
 //! models, so nothing here holds a name back.
 //!
+//! A delete that really removed a parameter announces the change on the account's default
+//! EventBridge bus, as `aws.ssm` / "Parameter Store Change" with the operation `Delete`
+//! ([`crate::state::parameter_events`]), built from the record this call took out of the
+//! store. A call that removed nothing publishes nothing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -214,11 +219,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let mut store = state.lock();
-        // `query.name` is already the canonical form the store keys a parameter under.
-        let key = (region, query.name.to_string());
-        if store.parameters.remove(&key).is_none() {
-            return Err(not_found().into());
+        let now = ::std::time::SystemTime::now();
+        // The store is read and written under its lock, which this block holds for its own
+        // body alone: the guard is not `Send`, and the publication that follows is awaited.
+        let change = {
+            let mut store = state.lock();
+            // `query.name` is already the canonical form the store keys a parameter under.
+            let key = (region.clone(), query.name.to_string());
+            let Some(removed) = store.parameters.remove(&key) else {
+                return Err(not_found().into());
+            };
+            // What the delete REMOVED is what the event it publishes reports, read off the
+            // record this call took out of the store rather than off anything invented: the
+            // parameter's own name, and the type and description of the version it held
+            // last.
+            removed
+                .latest()
+                .map(|latest| crate::state::parameter_events::ParameterChange {
+                    name: removed.name.clone(),
+                    type_: latest.type_.clone(),
+                    operation: crate::state::parameter_events::OPERATION_DELETE,
+                    description: latest.description.clone(),
+                    at: now,
+                })
+        };
+        // The delete CHANGED the store, so Parameter Store publishes the change it made,
+        // with the store's lock released — EventBridge delivers the event to every rule
+        // that matches it, and a target of one may call back into this service.
+        if let Some(change) = change {
+            crate::state::parameter_events::publish(ctx.callback(), &region, &[change]).await;
         }
 
         Ok(DeleteParameterOutput {})

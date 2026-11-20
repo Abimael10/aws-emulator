@@ -54,6 +54,16 @@
 //! ([`TAGS_WITH_OVERWRITE_REJECTION`]), before anything is read or written, so neither an
 //! existing parameter's value, versions and tags nor a new parameter come of it.
 //!
+//! ## A write is announced on the account's event bus
+//!
+//! Parameter Store is an event source as well as a store: a put that creates a parameter or
+//! stores another version of one publishes the change it made onto the account's default
+//! EventBridge bus, as `aws.ssm` / "Parameter Store Change"
+//! ([`crate::state::parameter_events`]), so a rule scoped to that source and detail-type
+//! reaches its targets with the parameter's name, type, the operation performed and its
+//! description. The event is published from what the write PERSISTED, after the store's lock
+//! is released, and a put this operation refused changes nothing and publishes nothing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -1007,54 +1017,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        let mut store = state.lock();
-        // The version this put creates, read from the store it is written to: the number
-        // follows the versions the parameter holds now.
-        let version = store
-            .parameter(&region, name)
-            .map_or(1, crate::state::ParameterRecord::next_version);
-        let stored_version = crate::state::ParameterVersionRecord {
-            version,
-            value: stored_value,
-            type_,
-            // "The aws:ec2:image value is validated asynchronously, and the PutParameter
-            // call returns before the validation is complete": the check this put still
-            // owes falls due a span from now, and nothing else is owed for any other data
-            // type ([`crate::state::parameter_image_validation`]).
-            image_validation_due_at:
-                crate::state::parameter_image_validation::validation_due_at(&data_type),
-            data_type,
-            tier: tier.clone(),
-            description,
-            allowed_pattern,
-            key_id,
-            policies: stored_policies,
-            last_modified_date: now,
-            // "ARN of the Amazon Web Services user who last changed the parameter": this
-            // put is that change, so the version records the principal it was signed for.
-            last_modified_user: Some(writer),
-            // Only `LabelParameterVersion` attaches a label, so a version is created
-            // carrying none.
-            labels: ::std::collections::BTreeSet::new(),
-        };
+        // The store is written under its lock, which this block holds for its own body
+        // alone: the guard is not `Send`, and the publication that follows is awaited.
+        let (version, change) = {
+            let mut store = state.lock();
+            // The version this put creates, read from the store it is written to: the
+            // number follows the versions the parameter holds now.
+            let version = store
+                .parameter(&region, name)
+                .map_or(1, crate::state::ParameterRecord::next_version);
+            let stored_version = crate::state::ParameterVersionRecord {
+                version,
+                value: stored_value,
+                type_,
+                // "The aws:ec2:image value is validated asynchronously, and the
+                // PutParameter call returns before the validation is complete": the check
+                // this put still owes falls due a span from now, and nothing else is owed
+                // for any other data type ([`crate::state::parameter_image_validation`]).
+                image_validation_due_at:
+                    crate::state::parameter_image_validation::validation_due_at(&data_type),
+                data_type,
+                tier: tier.clone(),
+                description,
+                allowed_pattern,
+                key_id,
+                policies: stored_policies,
+                last_modified_date: now,
+                // "ARN of the Amazon Web Services user who last changed the parameter":
+                // this put is that change, so the version records the principal it was
+                // signed for.
+                last_modified_user: Some(writer),
+                // Only `LabelParameterVersion` attaches a label, so a version is created
+                // carrying none.
+                labels: ::std::collections::BTreeSet::new(),
+            };
 
-        match store.parameter_mut(&region, name) {
-            Some(record) => {
-                record.push_version(stored_version);
-                // Tags are a property of the parameter rather than of one version, and a
-                // put that supplies tags beside `Overwrite` is refused above, so an update
-                // never rewrites the set: the parameter keeps the tags it carries.
-            }
-            None => store.insert_parameter(crate::state::ParameterRecord {
-                // The name is rendered the one way the service renders a parameter name
-                // before it is persisted ([`crate::state::reported_name`]), so every read
-                // of this parameter reports the name it is addressed and ARN'd by rather
-                // than the spelling one create happened to use.
-                name: crate::state::reported_name(name).to_string(),
-                region,
-                tags: crate::state::to_btree_map(supplied_tags),
-                versions: vec![stored_version],
-            }),
+            // Which change this put MADE, which is what the event it publishes reports: a
+            // put that found the parameter already there stored another version of it, and
+            // one that did not created it.
+            let operation = match store.parameter_mut(&region, name) {
+                Some(record) => {
+                    record.push_version(stored_version);
+                    // Tags are a property of the parameter rather than of one version, and
+                    // a put that supplies tags beside `Overwrite` is refused above, so an
+                    // update never rewrites the set: the parameter keeps its tags.
+                    crate::state::parameter_events::OPERATION_UPDATE
+                }
+                None => {
+                    store.insert_parameter(crate::state::ParameterRecord {
+                        // The name is rendered the one way the service renders a parameter
+                        // name before it is persisted ([`crate::state::reported_name`]), so
+                        // every read of this parameter reports the name it is addressed and
+                        // ARN'd by rather than the spelling one create happened to use.
+                        name: crate::state::reported_name(name).to_string(),
+                        region: region.clone(),
+                        tags: crate::state::to_btree_map(supplied_tags),
+                        versions: vec![stored_version],
+                    });
+                    crate::state::parameter_events::OPERATION_CREATE
+                }
+            };
+            // What the change is REPORTED as is read off the record the write left behind,
+            // so the event states the parameter a read of the same instant states and never
+            // a second, invented copy of it.
+            let change = store.parameter(&region, name).and_then(|record| {
+                record
+                    .latest()
+                    .map(|latest| crate::state::parameter_events::ParameterChange {
+                        name: record.name.clone(),
+                        type_: latest.type_.clone(),
+                        operation,
+                        description: latest.description.clone(),
+                        at: latest.last_modified_date,
+                    })
+            });
+            (version, change)
+        };
+        // The put CHANGED a parameter, so Parameter Store publishes the change it made,
+        // with the store's lock released — EventBridge delivers the event to every rule
+        // that matches it, and a target of one may call back into this service.
+        if let Some(change) = change {
+            crate::state::parameter_events::publish(ctx.callback(), &region, &[change]).await;
         }
 
         Ok(PutParameterOutput {

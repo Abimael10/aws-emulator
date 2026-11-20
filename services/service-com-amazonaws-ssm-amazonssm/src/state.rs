@@ -246,6 +246,10 @@ pub mod parameter_retrieval;
 /// read resolves beside the parameters this account wrote.
 pub mod public_parameters;
 
+/// The EventBridge event a write to Parameter Store publishes: the create, the update and
+/// the delete of a parameter, each announced on the account's default event bus.
+pub mod parameter_events;
+
 /// The AWS Global Infrastructure reference data published in that hierarchy: the Regions,
 /// their long names, the partition each belongs to and the domain its endpoints are served
 /// from.

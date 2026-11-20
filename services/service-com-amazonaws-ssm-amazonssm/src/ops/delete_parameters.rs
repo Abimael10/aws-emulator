@@ -16,6 +16,12 @@
 //! bare parameter name at all — in `InvalidParameters` ("the names of parameters that
 //! weren't deleted because the parameters aren't valid").
 //!
+//! Each parameter this call really removed is announced on the account's default EventBridge
+//! bus, as `aws.ssm` / "Parameter Store Change" with the operation `Delete`
+//! ([`crate::state::parameter_events`]): one event per removed parameter, built from the
+//! record this call took out of the store, so a name reported in `InvalidParameters`
+//! publishes nothing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -173,31 +179,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // credential scope's — never a Region the request body chose.
         let region = crate::state::request_region(ctx.parts());
 
-        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
         let mut deleted_parameters: Vec<String> = Vec::new();
         let mut invalid_parameters: Vec<String> = Vec::new();
-        for name in asked {
-            // "You can't enter the Amazon Resource Name (ARN) for a parameter, only the
-            // parameter name itself" (`DeleteParametersRequest$Names`), and a delete
-            // addresses the parameter rather than one of its versions — so a name that is
-            // an ARN or carries a version or label selector names nothing this operation
-            // can delete, which it REPORTS rather than refuses.
-            let Some(query) = crate::state::parse_parameter_query(name) else {
-                invalid_parameters.push(name.to_string());
-                continue;
-            };
-            if query.selector.is_some() || query.account.is_some() || query.region.is_some() {
-                invalid_parameters.push(name.to_string());
-                continue;
-            }
-            // `query.name` is already the canonical form the store keys a parameter under.
-            let key = (region.clone(), query.name.to_string());
-            if store.parameters.remove(&key).is_some() {
-                deleted_parameters.push(name.to_string());
-            } else {
-                invalid_parameters.push(name.to_string());
+        // One change per parameter this call really removed, in the order the names were
+        // given: a name that resolved to nothing changed nothing and publishes nothing.
+        let mut changes: Vec<crate::state::parameter_events::ParameterChange> = Vec::new();
+        // The store is written under its lock, which this block holds for its own body
+        // alone: the guard is not `Send`, and the publication that follows is awaited.
+        {
+            let mut store = state.lock();
+            for name in asked {
+                // "You can't enter the Amazon Resource Name (ARN) for a parameter, only the
+                // parameter name itself" (`DeleteParametersRequest$Names`), and a delete
+                // addresses the parameter rather than one of its versions — so a name that
+                // is an ARN or carries a version or label selector names nothing this
+                // operation can delete, which it REPORTS rather than refuses.
+                let Some(query) = crate::state::parse_parameter_query(name) else {
+                    invalid_parameters.push(name.to_string());
+                    continue;
+                };
+                if query.selector.is_some() || query.account.is_some() || query.region.is_some()
+                {
+                    invalid_parameters.push(name.to_string());
+                    continue;
+                }
+                // `query.name` is already the canonical form the store keys a parameter
+                // under.
+                let key = (region.clone(), query.name.to_string());
+                if let Some(removed) = store.parameters.remove(&key) {
+                    deleted_parameters.push(name.to_string());
+                    // What the delete REMOVED is what the event it publishes reports, read
+                    // off the record this call took out of the store rather than off
+                    // anything invented: the parameter's own name, and the type and
+                    // description of the version it held last.
+                    changes.extend(removed.latest().map(|latest| {
+                        crate::state::parameter_events::ParameterChange {
+                            name: removed.name.clone(),
+                            type_: latest.type_.clone(),
+                            operation: crate::state::parameter_events::OPERATION_DELETE,
+                            description: latest.description.clone(),
+                            at: now,
+                        }
+                    }));
+                } else {
+                    invalid_parameters.push(name.to_string());
+                }
             }
         }
+        // Each parameter this call really removed is one change Parameter Store publishes,
+        // with the store's lock released — EventBridge delivers each event to every rule
+        // that matches it, and a target of one may call back into this service.
+        crate::state::parameter_events::publish(ctx.callback(), &region, &changes).await;
 
         Ok(DeleteParametersOutput {
             // Both reported even when empty, as `GetParameters` reports its own

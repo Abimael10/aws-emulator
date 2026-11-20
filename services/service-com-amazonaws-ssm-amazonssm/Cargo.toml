@@ -107,6 +107,12 @@ iso8601 = "0.6"
 # the private hosted zones associated with that VPC hold, read through that service's own
 # state accessors rather than from a second copy of them here (`state::guest_resolver`).
 service-com-amazonaws-route53resolver-route53resolver = { workspace = true }
+# The AWS SDK for EventBridge, driven over the in-process callback
+# (`OperationContext::callback`): a write to Parameter Store — a create, an update, a delete —
+# is published onto the account's default event bus (`state::parameter_events`). Only the
+# generated client is needed — the emulator supplies the transport, so the SDK's own HTTPS
+# stack and runtime are left out.
+aws-sdk-eventbridge = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
