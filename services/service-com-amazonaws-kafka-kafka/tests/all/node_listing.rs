@@ -455,7 +455,12 @@ async fn the_node_listing_refuses_an_unresolvable_request() {
             "/api/v2/clusters",
             Some(json!({
                 "clusterName": "nodes-serverless",
-                "serverless": { "vpcConfigs": [{ "subnetIds": ["subnet-0a1b2c3d"] }] }
+                "serverless": {
+                    "vpcConfigs": [{ "subnetIds": ["subnet-0a1b2c3d"] }],
+                    // The one client-authentication scheme a serverless cluster may
+                    // use, which MSK requires a serverless create to turn on.
+                    "clientAuthentication": { "sasl": { "iam": { "enabled": true } } }
+                }
             })),
         )
         .await;

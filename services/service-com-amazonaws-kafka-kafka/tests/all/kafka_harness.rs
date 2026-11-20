@@ -249,10 +249,15 @@ impl Emulator {
 
     /// Create a SERVERLESS cluster through `CreateClusterV2`, assert it succeeded,
     /// and hand back the minted ARN. `vpc_configs` is one subnet list per
-    /// `VpcConfig` the create submits and `iam` turns SASL/IAM client
-    /// authentication on when the row names it, which is the whole `Serverless`
-    /// body a suite needs to stand a serverless cluster up; the full
-    /// serverless-create matrix lives in the `create_cluster_v2` suite.
+    /// `VpcConfig` the create submits, which is the whole `Serverless` body a suite
+    /// needs to stand a serverless cluster up; the full serverless-create matrix
+    /// lives in the `create_cluster_v2` suite.
+    ///
+    /// `iam` states the `ClientAuthentication.Sasl.Iam.Enabled` the create submits.
+    /// A row that names none still submits the SASL/IAM authentication a serverless
+    /// cluster must use — MSK admits a serverless cluster's clients through that one
+    /// scheme and refuses a create that does not turn it on — so every caller of
+    /// this helper stands up a cluster MSK would have created.
     pub async fn create_serverless_ok(
         &self,
         name: &str,
@@ -265,10 +270,8 @@ impl Emulator {
                 .map(|subnets| json!({ "subnetIds": subnets }))
                 .collect::<Vec<Value>>(),
         });
-        if let Some(enabled) = iam {
-            serverless["clientAuthentication"] =
-                json!({ "sasl": { "iam": { "enabled": enabled } } });
-        }
+        serverless["clientAuthentication"] =
+            json!({ "sasl": { "iam": { "enabled": iam.unwrap_or(true) } } });
         let reply = self
             .create_cluster_v2(json!({ "clusterName": name, "serverless": serverless }))
             .await;

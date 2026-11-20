@@ -240,6 +240,11 @@ impl Provisioner {
             Self::MskCluster | Self::MskServerlessCluster => {
                 describe_msk_cluster(ctx, region, physical_resource_id).await
             }
+            // And `DescribeConfiguration` reads a configuration back, by the ARN that
+            // service minted for it.
+            Self::MskConfiguration => {
+                describe_msk_configuration(ctx, region, physical_resource_id).await
+            }
             Self::MqBroker => describe_mq_broker(ctx, region, physical_resource_id).await,
             Self::RdsDbInstance => {
                 describe_db_instance(ctx, region, physical_resource_id).await

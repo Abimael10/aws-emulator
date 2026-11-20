@@ -824,6 +824,41 @@ pub const TRANSFER_SERVER: &str = "AWS::Transfer::Server";
 pub const MSK_CLUSTER: &str = "AWS::MSK::Cluster";
 pub const MSK_SERVERLESS_CLUSTER: &str = "AWS::MSK::ServerlessCluster";
 
+/// The type of an Amazon MSK CONFIGURATION: the `server.properties` document a cluster of
+/// either kind can be given, declared in that same `MSK` namespace.
+///
+/// "Ref returns the ARN of the configuration" — the type's primary identifier — and
+/// `Fn::GetAtt` reads that ARN beside the configuration's LATEST REVISION, whose members are
+/// read under the nested names the type publishes them at
+/// (`LatestRevision.CreationTime`, `LatestRevision.Revision`). Amazon MSK MINTS that ARN
+/// (its resource path is `configuration/<name>/<id>-<ordinal>`, where the id and the ordinal
+/// are the service's own) and mints the revision, so [`identity_is_service_assigned`] names
+/// this type too: what a completed stack reports is what `CreateConfiguration` answered.
+pub const MSK_CONFIGURATION: &str = "AWS::MSK::Configuration";
+
+/// The `Fn::GetAtt` attribute an [`MSK_CONFIGURATION`] publishes the creation instant of its
+/// latest revision at, as the type spells the nested read.
+pub const MSK_CONFIGURATION_REVISION_CREATION_TIME: &str = "LatestRevision.CreationTime";
+
+/// The same for that revision's NUMBER, which a created configuration's first revision is
+/// `1` of.
+pub const MSK_CONFIGURATION_REVISION_NUMBER: &str = "LatestRevision.Revision";
+
+/// The revision number a configuration Amazon MSK has just created carries: its FIRST, which
+/// `CreateConfiguration` answers as its `LatestRevision.Revision` and
+/// `ListConfigurationRevisions` then reports as the only revision there is.
+pub(super) const MSK_CONFIGURATION_FIRST_REVISION: u32 = 1;
+
+/// The same for that revision's DESCRIPTION, which is the declaration's own `Description`
+/// where it states one.
+///
+/// Not among the names [`published_attribute_names`] carries for the type: a revision has a
+/// description only where the create was given one (`ConfigurationRevision$Description` is
+/// optional), so the value comes from what Amazon MSK reported for the revision it created
+/// rather than from a stand-in computed before the create, which for a configuration
+/// described by nothing would be a value no read of it answers.
+pub const MSK_CONFIGURATION_REVISION_DESCRIPTION: &str = "LatestRevision.Description";
+
 /// Amazon MSK's ARN namespace, which is its model's own `awsService.arnNamespace`
 /// (`kafka`) rather than the `MSK` its resource types are spelled with.
 pub const MSK_ARN_NAMESPACE: &str = "kafka";
@@ -852,15 +887,16 @@ pub const MQ_ARN_NAMESPACE: &str = "mq";
 /// shape of the identifier a declaration reports BEFORE its create answers.
 pub(super) const MQ_BROKER_ID_PREFIX: &str = "b-";
 
-/// The 1-based ordinal an Amazon MSK cluster ARN ends with
-/// (`cluster/<name>/<id>-<ordinal>`), as the stand-in identifier computed here carries it.
+/// The 1-based ordinal an Amazon MSK cluster or configuration ARN ends with
+/// (`cluster/<name>/<id>-<ordinal>`, `configuration/<name>/<id>-<ordinal>`), as the stand-in
+/// identifier computed here carries it.
 ///
-/// A PLACEHOLDER, and one that is never reported for a cluster that exists: the ARN a
-/// created cluster carries is the one Amazon MSK minted, where the ordinal is that
-/// service's own count of the clusters it has registered, and
+/// A PLACEHOLDER, and one that is never reported for a resource that exists: the ARN a
+/// created cluster or configuration carries is the one Amazon MSK minted, where the ordinal
+/// is that service's own count of the resources it has registered, and
 /// [`super::provisioning::reconcile`] adopts that ARN over this one. What this value is
 /// for is the shape of the identifier a declaration reports BEFORE its create answers.
-pub(super) const MSK_CLUSTER_ARN_ORDINAL: u32 = 1;
+pub(super) const MSK_RESOURCE_ARN_ORDINAL: u32 = 1;
 
 /// The same for an Amazon SQS queue: the SQS model carries
 /// `awsService.cloudFormationName: SQS`.

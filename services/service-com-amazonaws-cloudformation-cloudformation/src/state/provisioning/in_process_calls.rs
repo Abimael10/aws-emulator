@@ -966,6 +966,11 @@ pub(super) fn refusal_of(signing_name: &str, status: u16, document: &Value) -> R
 
 /// [`refusal_of`] for a caller that states WHICH operation of that service was refused,
 /// which is part of the diagnostic some SDKs word ([`call_rest_json_named`]).
+///
+/// It is also what says which PROVIDER made the call, and a provider of some services states
+/// the input member the refusal was attributed to after that diagnostic
+/// ([`attributed_parameter`]) — so a refused resource reports the member a caller has to fix
+/// as well as the sentence.
 pub(super) fn refusal_of_call(
     signing_name: &str,
     operation: Option<&str>,
@@ -984,10 +989,14 @@ pub(super) fn refusal_of_call(
         .or_else(|| document.get("Message"))
         .and_then(Value::as_str)
         .unwrap_or_default();
-    Refusal {
-        message: sdk_message_of(signing_name, operation, status, &code, message),
-        code,
+    let mut message = sdk_message_of(signing_name, operation, status, &code, message);
+    if let Some(parameter) = attributed_parameter(signing_name, operation, document) {
+        message = match message.is_empty() {
+            true => parameter,
+            false => format!("{message} {parameter}"),
+        };
     }
+    Refusal { message, code }
 }
 
 /// Sign a request with the emulator's own credentials and dispatch it in-process to the

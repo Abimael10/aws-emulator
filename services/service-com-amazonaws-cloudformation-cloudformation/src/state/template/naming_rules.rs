@@ -407,6 +407,15 @@ pub(super) fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // `__stringMin1Max64`, `@length(min: 1, max: 64)` (that service's own Smithy
         // model), which a generated name is already inside but may be longer than.
         MSK_CLUSTER | MSK_SERVERLESS_CLUSTER => rules(64, Characters::AsGenerated),
+        // Amazon MSK `CreateConfiguration.name`: that service admits a configuration name of
+        // 1 to 128 characters built from ASCII alphanumerics and `.`, `_` and `-`
+        // (`crate::state::provisioner::MSK_CONFIGURATION_NAME_LENGTH` records where the bound
+        // is read from), which a generated name is already inside — letters, digits and the
+        // hyphen are all admitted — but may be longer than.
+        MSK_CONFIGURATION => rules(
+            crate::state::provisioner::MSK_CONFIGURATION_NAME_LENGTH,
+            Characters::AsGenerated,
+        ),
         // AWS Backup `CreateBackupVault.BackupVaultName`: `BackupVaultName`, pattern
         // `^[a-zA-Z0-9\-\_]{2,50}$` (that service's own Smithy model), which admits the
         // letters, digits and hyphens a generated name is built from but is shorter than

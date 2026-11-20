@@ -222,7 +222,13 @@ async fn create(emulator: &Emulator, row: &Row) -> String {
                     CREATE_V2_URI,
                     Some(json!({
                         "clusterName": row.case,
-                        "serverless": { "vpcConfigs": [{ "subnetIds": ["subnet-0a1b2c3d"] }] },
+                        "serverless": {
+                            "vpcConfigs": [{ "subnetIds": ["subnet-0a1b2c3d"] }],
+                            // The one client-authentication scheme a serverless
+                            // cluster may use, which MSK requires a serverless
+                            // create to turn on.
+                            "clientAuthentication": { "sasl": { "iam": { "enabled": true } } },
+                        },
                     })),
                 )
                 .await

@@ -537,7 +537,8 @@ async fn refuses_a_cluster_arn_that_names_no_cluster() {
 async fn refuses_a_cluster_with_no_broker_nodes() {
     let emulator = Emulator::new();
     // The rows differ along the serverless cluster's own configuration: one VPC
-    // configuration without client authentication, and two with SASL/IAM on.
+    // configuration and two, each with the SASL/IAM authentication a serverless
+    // cluster must use.
     let serverless = [
         ("one-vpc", vec![vec!["subnet-0a1b2c3d", "subnet-1a2b3c4d"]], None),
         (

@@ -386,6 +386,11 @@ pub(crate) const MSK_CLUSTERS_URI: &str = "/v1/clusters";
 /// cluster has none of — while the v2 `Cluster` shape models a member for each kind.
 pub(crate) const MSK_CLUSTERS_V2_URI: &str = "/api/v2/clusters";
 
+/// The operation that URI's create IS, as Amazon MSK's own model names it — stated so the
+/// refusal a failed serverless cluster reports is the one that service's SDK and this type's
+/// provider would raise for THIS call.
+pub(crate) const MSK_CREATE_CLUSTER_V2: &str = "CreateClusterV2";
+
 /// The error code Amazon MSK answers for a cluster ARN it holds no cluster for
 /// (`NotFoundException`, a modelled error of `DescribeCluster`, `DescribeClusterV2` and
 /// `DeleteCluster`).
@@ -502,6 +507,11 @@ pub(crate) async fn create_msk_cluster(
 /// `sasl.iam.enabled`) and is walked; a `VpcConfigs` entry is not, because the type
 /// publishes its security-group list under a different name
 /// ([`MSK_SERVERLESS_VPC_CONFIG_MEMBERS`]).
+///
+/// The call NAMES the operation it makes ([`MSK_CREATE_CLUSTER_V2`]), because this type's
+/// provider states the input member Amazon MSK attributed a refusal to after the SDK's own
+/// diagnostic, and only a caller that says which call it made is known to be that provider
+/// ([`super::super::provisioning::call_rest_json_named`]).
 pub(crate) async fn create_msk_serverless_cluster(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -536,10 +546,11 @@ pub(crate) async fn create_msk_serverless_cluster(
     if !tags.is_empty() {
         request.insert("tags".to_string(), Value::Object(tags));
     }
-    let reported = call_rest_json(
+    let reported = call_rest_json_named(
         ctx,
         MSK_SIGNING_NAME,
         region,
+        MSK_CREATE_CLUSTER_V2,
         "POST",
         MSK_CLUSTERS_V2_URI,
         Some(&Value::Object(request)),

@@ -436,6 +436,15 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         ROUTE53_TRAFFIC_POLICY => &["Id", "Type", "Version"],
         KMS_KEY => &["Arn", "KeyId"],
         MSK_CLUSTER | MSK_SERVERLESS_CLUSTER => &["Arn"],
+        // A configuration publishes its ARN and the LATEST REVISION's number and creation
+        // instant, each read under the nested name the type publishes it at. The revision's
+        // DESCRIPTION is not among them, for the reason
+        // [`MSK_CONFIGURATION_REVISION_DESCRIPTION`] records.
+        MSK_CONFIGURATION => &[
+            "Arn",
+            MSK_CONFIGURATION_REVISION_CREATION_TIME,
+            MSK_CONFIGURATION_REVISION_NUMBER,
+        ],
         MQ_BROKER => &["Arn"],
         EVENTS_RULE => &["Arn"],
         EVENTS_EVENT_BUS => EVENTS_EVENT_BUS_ATTRIBUTES,
@@ -775,6 +784,11 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         || resource_type == ACMPCA_CERTIFICATE
         || resource_type == MSK_CLUSTER
         || resource_type == MSK_SERVERLESS_CLUSTER
+        // An Amazon MSK CONFIGURATION is the same case: `CreateConfiguration` takes the
+        // configuration's NAME and answers the `Arn` it minted, whose resource path carries
+        // an identifier and an ordinal that service allocated — so the ARN that type's `Ref`
+        // returns cannot be recomputed from the template.
+        || resource_type == MSK_CONFIGURATION
         || resource_type == ROUTE53RESOLVER_ENDPOINT
         || resource_type == ROUTE53RESOLVER_RULE
         || resource_type == ROUTE53RESOLVER_RULE_ASSOCIATION

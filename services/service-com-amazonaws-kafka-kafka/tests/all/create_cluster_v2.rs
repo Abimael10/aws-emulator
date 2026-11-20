@@ -73,12 +73,16 @@ struct ServerlessRow {
 }
 
 impl ServerlessRow {
-    /// The simplest serverless create: one VPC configuration with one subnet.
+    /// The simplest serverless create: one VPC configuration with one subnet, and
+    /// the SASL/IAM client authentication a serverless cluster must use — the one
+    /// scheme MSK admits a serverless cluster's clients through, and one a
+    /// serverless create has to turn on (the refusals of a body that does not are
+    /// the `create_cluster_v2_serverless_authentication` suite's).
     fn named(name: &'static str) -> Self {
         Self {
             name,
             vpc_configs: vec![(vec!["subnet-0a1b2c3d"], Vec::new())],
-            iam: None,
+            iam: Some(true),
             tags: Vec::new(),
         }
     }
@@ -342,7 +346,7 @@ async fn a_provisioned_body_registers_the_record_a_v1_create_registers() {
 #[tokio::test]
 async fn a_serverless_body_registers_a_serverless_cluster() {
     // The rows differ along VPC-configuration count, subnets per configuration,
-    // security groups, whether IAM authentication is named, and tag count.
+    // security groups and tag count.
     let rows = vec![
         ServerlessRow::named("sl-minimal"),
         ServerlessRow {
@@ -359,7 +363,7 @@ async fn a_serverless_body_registers_a_serverless_cluster() {
                 (vec!["subnet-aaa"], vec!["sg-aaa", "sg-bbb"]),
                 (vec!["subnet-bbb", "subnet-ccc"], Vec::new()),
             ],
-            iam: Some(false),
+            iam: Some(true),
             tags: vec![("a", "1"), ("b", "2")],
             ..ServerlessRow::named("sl-two-vpcs")
         },
@@ -442,23 +446,16 @@ async fn a_serverless_body_registers_a_serverless_cluster() {
             "case {row:?}: expected the submitted vpcConfigs, got {:?}",
             cluster.pointer("/serverless/vpcConfigs")
         );
-        match row.iam {
-            Some(enabled) => assert_eq!(
-                cluster
-                    .pointer("/serverless/clientAuthentication/sasl/iam/enabled")
-                    .and_then(Value::as_bool),
-                Some(enabled),
-                "case {row:?}: expected the submitted IAM setting, got {:?}",
-                cluster.pointer("/serverless/clientAuthentication")
-            ),
-            None => assert!(
-                cluster
-                    .pointer("/serverless/clientAuthentication")
-                    .is_none(),
-                "case {row:?}: a create that named no authentication reports none, got {:?}",
-                cluster.pointer("/serverless/clientAuthentication")
-            ),
-        }
+        // Every row states the SASL/IAM setting it submitted, which is what the
+        // reader must report back for it.
+        assert_eq!(
+            cluster
+                .pointer("/serverless/clientAuthentication/sasl/iam/enabled")
+                .and_then(Value::as_bool),
+            row.iam,
+            "case {row:?}: expected the submitted IAM setting, got {:?}",
+            cluster.pointer("/serverless/clientAuthentication")
+        );
         // `ServerlessRequest` models no connectivity member, so the cluster runs
         // the documented default network type (`NetworkType`: "By default, a
         // cluster uses the IPv4 network type").

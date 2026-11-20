@@ -3091,6 +3091,9 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     MQ_BROKER,
     MSK_CLUSTER,
     MSK_SERVERLESS_CLUSTER,
+    // An Amazon MSK configuration, publishing the ARN that service minted and the number and
+    // creation instant of the revision it created.
+    MSK_CONFIGURATION,
     // The two Amazon MemoryDB groups, each publishing the ARN its own service reports for
     // the group of that name.
     MEMORYDB_PARAMETER_GROUP,

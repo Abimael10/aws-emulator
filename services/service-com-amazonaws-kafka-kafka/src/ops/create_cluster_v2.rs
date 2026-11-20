@@ -23,6 +23,14 @@
 //! `BrokerNodeGroupInfo$InstanceType` against the broker types the service offers
 //! ([`crate::state::create_instance_type_violation`]) before anything is minted.
 //!
+//! A serverless body also says how clients are admitted, and MSK Serverless admits
+//! them through SASL/IAM alone, so a body that does not turn that scheme on —
+//! because it carries no `ClientAuthentication`, no `Sasl`, no `Iam`, or an
+//! `Iam$Enabled` of `false` — describes a cluster nothing could connect to and is a
+//! `BadRequestException` attributed to `clientAuthentication`
+//! ([`SERVERLESS_SASL_IAM_REQUIRED_MESSAGE`]), refused before any cluster record is
+//! written.
+//!
 //! A cluster name is unique within an account and region, so a second create under
 //! a name already taken — by a cluster of either kind — is a `ConflictException`,
 //! and the `Tags` the request carries go through the same admission check a later
@@ -148,6 +156,24 @@ const UNREADABLE_BODY_MESSAGE: &str = "Invalid request body";
 /// The member a serverless body carries its VPC configurations — and so the
 /// subnets each one is reached through — in, as the wire spells it.
 const SERVERLESS_VPC_CONFIGS_MEMBER: &str = "vpcConfigs";
+
+/// The member a serverless body carries its client authentication in, as the wire
+/// spells it — the parameter a refusal of that authentication reports as being at
+/// fault, since the whole structure is what the request got wrong.
+const SERVERLESS_CLIENT_AUTHENTICATION_MEMBER: &str = "clientAuthentication";
+
+/// What MSK answers a serverless create that does not turn SASL/IAM access control
+/// ON: one fixed sentence, stating the rule and naming nothing of the request.
+///
+/// MSK Serverless authenticates and authorizes every client through IAM — it offers
+/// no other scheme, and the model's `ServerlessClientAuthentication` carries the one
+/// `Sasl$Iam` member — so a serverless cluster that does not use it is a cluster no
+/// client could be admitted to. The model leaves `ClientAuthentication`, its `Sasl`
+/// and that structure's `Iam$Enabled` all optional, so the requirement is recorded
+/// behaviour: a body that leaves any of them out, or that states `Enabled: false`,
+/// asks for the same unauthenticated cluster and earns this same refusal.
+const SERVERLESS_SASL_IAM_REQUIRED_MESSAGE: &str =
+    "A serverless cluster must use SASL/IAM authentication.";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -493,6 +519,17 @@ impl ClusterBody {
                     })
             }
             Self::Serverless(request) => {
+                // MSK Serverless admits a client only through SASL/IAM, so a body
+                // that does not turn it on describes a cluster nothing could
+                // connect to. Decided from the request alone, and before anything
+                // is minted: the refusal blames the whole authentication
+                // structure, which is what the caller has to supply.
+                if !serverless_sasl_iam_enabled(request.client_authentication.as_ref()) {
+                    return Some((
+                        SERVERLESS_CLIENT_AUTHENTICATION_MEMBER,
+                        SERVERLESS_SASL_IAM_REQUIRED_MESSAGE.to_string(),
+                    ));
+                }
                 let entries = crate::state::MAX_SERVERLESS_VPC_ENTRIES;
                 if request.vpc_configs.is_empty() {
                     // A serverless cluster is reached through the VPCs its
@@ -576,6 +613,22 @@ impl ClusterBody {
                 .collect(),
         }
     }
+}
+
+/// Whether a serverless body's client authentication turns SASL/IAM access control
+/// ON — the one scheme MSK Serverless admits a client through.
+///
+/// Every level of the structure is optional in the model
+/// (`ServerlessRequest$ClientAuthentication` -> `ServerlessClientAuthentication$Sasl`
+/// -> `ServerlessSasl$Iam` -> `Iam$Enabled`), and a level the request left out states
+/// nothing about IAM being on: only `Iam$Enabled` set to `true` does, so an absent
+/// level and an explicit `false` are the same answer here.
+fn serverless_sasl_iam_enabled(authentication: Option<&ServerlessClientAuthentication>) -> bool {
+    authentication
+        .and_then(|authentication| authentication.sasl.as_ref())
+        .and_then(|sasl| sasl.iam.as_ref())
+        .and_then(|iam| iam.enabled)
+        .unwrap_or(false)
 }
 
 /// One placement a create asks for: the subnets it names, the member it names them

@@ -460,8 +460,8 @@ async fn pages_the_operations_a_cluster_recorded_latest_first() {
 /// and names the kind, so a cluster with no customer broker nodes is SERVED
 /// rather than refused on its kind: it has recorded nothing, which is an empty
 /// history. The rows differ along the serverless cluster's own configuration:
-/// one VPC configuration without client authentication, and two with SASL/IAM
-/// on.
+/// one VPC configuration and two, each with the SASL/IAM authentication a
+/// serverless cluster must use.
 #[tokio::test(flavor = "current_thread")]
 async fn serves_a_cluster_with_no_broker_nodes() {
     let emulator = Emulator::new();

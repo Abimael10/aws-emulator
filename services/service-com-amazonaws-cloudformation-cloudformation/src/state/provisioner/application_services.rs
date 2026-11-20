@@ -9,6 +9,11 @@ use super::*;
 // readable; re-exported, so this module is the one path to them.
 mod databases_and_networks;
 pub(crate) use databases_and_networks::*;
+// The Amazon MSK CONFIGURATION arm, whose create, delete and published revision are a
+// concern of their own beside that service's two cluster types; re-exported the same way, so
+// this module is the one path to it.
+mod msk_configuration;
+pub(crate) use msk_configuration::*;
 
 /// The path IAM gives a user created without one ("if it is not included, it defaults to a
 /// slash", `CreateUser$Path`), which is what a user goes back to when a deployment stops

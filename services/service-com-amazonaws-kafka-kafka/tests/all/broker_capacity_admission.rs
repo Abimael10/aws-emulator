@@ -116,11 +116,16 @@ fn v2_provisioned_body(name: &str, instance_type: &str, brokers: i64, subnets: &
 }
 
 /// A `CreateClusterV2` body whose `Serverless` block names ONE VPC configuration
-/// over `subnets`.
+/// over `subnets`, with the SASL/IAM client authentication a serverless cluster
+/// must use — the one scheme MSK admits a serverless cluster's clients through, and
+/// one a serverless create has to turn on.
 fn v2_serverless_body(name: &str, subnets: &[&str]) -> Value {
     json!({
         "clusterName": name,
-        "serverless": { "vpcConfigs": [{ "subnetIds": subnets }] },
+        "serverless": {
+            "vpcConfigs": [{ "subnetIds": subnets }],
+            "clientAuthentication": { "sasl": { "iam": { "enabled": true } } },
+        },
     })
 }
 

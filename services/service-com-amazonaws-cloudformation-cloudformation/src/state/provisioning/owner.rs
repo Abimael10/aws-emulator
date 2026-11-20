@@ -1564,10 +1564,11 @@ impl Owner {
     }
 
     /// How this type's provider words a refusal it classified — see
-    /// [`Provisioner::handler_message`](super::provisioner::Provisioner::handler_message).
-    pub(super) fn handler_message(self, class: &str, message: &str) -> String {
+    /// [`Provisioner::handler_message`](super::provisioner::Provisioner::handler_message),
+    /// which `token` is the resource request's own token for.
+    pub(super) fn handler_message(self, class: &str, message: &str, token: &str) -> String {
         match self {
-            Self::Builtin(provisioner) => provisioner.handler_message(class, message),
+            Self::Builtin(provisioner) => provisioner.handler_message(class, message, token),
             // AWS IAM's resource provider reports the service's own message as it came.
             Self::IamPolicy(_) => message.to_string(),
             // The mapping's provider is written against the CloudFormation

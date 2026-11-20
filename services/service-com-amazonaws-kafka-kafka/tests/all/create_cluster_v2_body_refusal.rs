@@ -55,12 +55,16 @@ fn provisioned(version: &str, brokers: i64) -> Value {
     })
 }
 
-/// A `serverless` block naming `configurations` VPC configurations of one subnet each.
+/// A `serverless` block naming `configurations` VPC configurations of one subnet
+/// each, with the SASL/IAM client authentication a serverless cluster must use —
+/// the one scheme MSK admits a serverless cluster's clients through, and one a
+/// serverless create has to turn on.
 fn serverless(configurations: usize) -> Value {
     json!({
         "vpcConfigs": (0..configurations)
             .map(|index| json!({ "subnetIds": [format!("subnet-{index:017x}")] }))
             .collect::<Vec<Value>>(),
+        "clientAuthentication": { "sasl": { "iam": { "enabled": true } } },
     })
 }
 

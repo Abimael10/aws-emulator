@@ -2512,11 +2512,42 @@ pub(crate) fn return_values(
                 MSK_ARN_NAMESPACE,
                 region,
                 &format!(
-                    "cluster/{name}/{}-{MSK_CLUSTER_ARN_ORDINAL}",
+                    "cluster/{name}/{}-{MSK_RESOURCE_ARN_ORDINAL}",
                     generated_uuid(resource_type, name)
                 ),
             );
             attributes.insert("Arn".to_string(), arn.clone());
+            (arn, attributes)
+        }
+        // "Ref returns the ARN of the configuration", and `Fn::GetAtt` reads that ARN
+        // beside the configuration's LATEST REVISION — its number and the instant it was
+        // created. Amazon MSK MINTS all three: the ARN's resource path is
+        // `configuration/<name>/<id>-<ordinal>`, where the id and the ordinal are that
+        // service's own, and a revision is numbered and timestamped by it — so what is
+        // computed here is an ARN of that published shape with a stand-in id derived from
+        // the resource's name, the number a created configuration's FIRST revision carries,
+        // and a stand-in for the instant only that service can report. This is also the
+        // type `super::provisioning` creates in Amazon MSK itself, which reports the ARN and
+        // the revision IT minted back as the resource's identity — and THOSE, not the
+        // values computed here, are what the stack reports for a configuration MSK created.
+        MSK_CONFIGURATION => {
+            let arn = ::emulator_server::emulator_arn(
+                MSK_ARN_NAMESPACE,
+                region,
+                &format!(
+                    "configuration/{name}/{}-{MSK_RESOURCE_ARN_ORDINAL}",
+                    generated_uuid(resource_type, name)
+                ),
+            );
+            attributes.insert("Arn".to_string(), arn.clone());
+            attributes.insert(
+                MSK_CONFIGURATION_REVISION_CREATION_TIME.to_string(),
+                service_assigned_document(name, MSK_CONFIGURATION_REVISION_CREATION_TIME),
+            );
+            attributes.insert(
+                MSK_CONFIGURATION_REVISION_NUMBER.to_string(),
+                MSK_CONFIGURATION_FIRST_REVISION.to_string(),
+            );
             (arn, attributes)
         }
         // "Ref returns the Amazon MQ broker ID"; Fn::GetAtt: Arn ("the broker's ARN").

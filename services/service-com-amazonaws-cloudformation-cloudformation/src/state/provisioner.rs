@@ -516,7 +516,9 @@ use super::template::{
     KMS_ALIAS, KMS_KEY,
     MASTER_USER_SECRET_ARN_ATTRIBUTE,
     MEDIACONVERT_CERTIFICATE_ASSOCIATION,
-    MQ_BROKER, MSK_CLUSTER,
+    MQ_BROKER, MSK_CLUSTER, MSK_CONFIGURATION,
+    MSK_CONFIGURATION_REVISION_CREATION_TIME, MSK_CONFIGURATION_REVISION_DESCRIPTION,
+    MSK_CONFIGURATION_REVISION_NUMBER,
     MSK_SERVERLESS_CLUSTER, MWAA_ENVIRONMENT, NEPTUNE_GRAPH_GRAPH, NEPTUNE_GRAPH_GRAPH_SNAPSHOT,
     OPENSEARCH_DOMAIN, PIPES_PIPE, RBIN_RULE,
     REDSHIFT_CLUSTER,
@@ -629,6 +631,22 @@ const NOT_IMPLEMENTED: &str = "NotImplemented";
 /// exception is raised around the TYPE it manages as well as the message
 /// ([`super::provisioning::logs_resources`]), so there is one spelling of that opener.
 pub(in crate::state) const INVALID_REQUEST_PROVIDED: &str = "Invalid request provided: ";
+
+/// How the resource providers of the `AWS::MSK::*` types OPEN the message they report for a
+/// refusal of Amazon MSK: the token of the resource request they were answering, in square
+/// brackets, before the service's own message
+/// ([`Provisioner::handler_message`]).
+///
+/// Recorded behaviour, read from the `ResourceStatusReason` of a failed resource of each of
+/// those types (in the behavioral corpus `simparity-behavioral-aws-v1`, checks
+/// `cloudformation__kafka.deploy-cfn-msk-serverless-cluster-rejects-iam-auth-disabled` and
+/// `cloudformation__kafka.deploy-msk-configuration-invalid-kafka-version-rejected-and-\
+/// rolled-back`, whose reasons read `Resource handler returned message:
+/// "[ClientRequestToken: <token>] <the service's sentence> (Service: Kafka, Status Code:
+/// 400, Request ID: …) (SDK Attempt Count: …)…"`), where that service's own API answers the
+/// sentence alone. The token is the one the event's own `(RequestToken: …)` carries, since
+/// it is the same resource request.
+const MSK_HANDLER_REQUEST_TOKEN_LABEL: &str = "ClientRequestToken";
 
 /// The services whose resources this emulator creates. One variant per resource type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -878,6 +896,14 @@ pub(super) enum Provisioner {
     KmsAlias,
     MskCluster,
     MskServerlessCluster,
+    /// `AWS::MSK::Configuration`: the `server.properties` document a cluster of either kind
+    /// can be given, which `CreateConfiguration` creates under the name the declaration
+    /// states and `DeleteConfiguration` deletes — addressed by the `Arn` Amazon MSK minted,
+    /// which is what this type's `Ref` returns. That create is also what ADMITS the Apache
+    /// Kafka versions the declaration names, so a template naming one that service does not
+    /// offer fails the resource instead of reporting a configuration no cluster could be
+    /// given.
+    MskConfiguration,
     MqBroker,
     RdsDbInstance,
     /// `AWS::RDS::DBCluster`: a DB cluster of Amazon RDS, which `CreateDBCluster` creates
@@ -1392,6 +1418,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         KMS_ALIAS => Some(Provisioner::KmsAlias),
         MSK_CLUSTER => Some(Provisioner::MskCluster),
         MSK_SERVERLESS_CLUSTER => Some(Provisioner::MskServerlessCluster),
+        MSK_CONFIGURATION => Some(Provisioner::MskConfiguration),
         MQ_BROKER => Some(Provisioner::MqBroker),
         RDS_DB_INSTANCE => Some(Provisioner::RdsDbInstance),
         RDS_DB_CLUSTER => Some(Provisioner::RdsDbCluster),
@@ -1848,6 +1875,9 @@ impl Provisioner {
             Self::MskServerlessCluster => {
                 create_msk_serverless_cluster(ctx, region, resource, propagated).await
             }
+            // `AWS::MSK::Configuration` publishes no `Tags` property — a configuration is not
+            // a taggable Amazon MSK resource — so no tags are propagated to one.
+            Self::MskConfiguration => create_msk_configuration(ctx, region, resource).await,
             Self::MqBroker => create_mq_broker(ctx, region, resource, propagated).await,
             Self::RdsDbInstance => {
                 create_db_instance(ctx, region, resource, propagated).await
@@ -2573,10 +2603,24 @@ impl Provisioner {
     /// Which of the two a type is, is that type's provider's and cannot be derived from the
     /// type's name, so it is stated per type here — the same per-type half of provisioning
     /// the create and delete arms are. A type not named below reports the message unchanged.
-    pub(super) fn handler_message(self, class: &str, message: &str) -> String {
+    ///
+    /// `token` is the token of the resource request this refusal answered, which the provider
+    /// of an `AWS::MSK::*` type states at the head of its message
+    /// ([`MSK_HANDLER_REQUEST_TOKEN_LABEL`]) — the same token the event's own
+    /// `(RequestToken: …)` reports, since one resource request earned both.
+    pub(super) fn handler_message(self, class: &str, message: &str, token: &str) -> String {
         let plugin_worded = matches!(self, Self::OpenSearchServiceDomain);
         if plugin_worded && class == super::provisioning::HANDLER_ERROR_INVALID_REQUEST {
             return format!("{INVALID_REQUEST_PROVIDED}{message}");
+        }
+        // Every Amazon MSK type's provider opens its message with the resource request's own
+        // token, whatever class the refusal falls in: it is how that provider reports a
+        // refusal rather than something it says about one kind of refusal.
+        if matches!(
+            self,
+            Self::MskCluster | Self::MskServerlessCluster | Self::MskConfiguration
+        ) {
+            return format!("[{MSK_HANDLER_REQUEST_TOKEN_LABEL}: {token}] {message}");
         }
         message.to_string()
     }
@@ -3122,6 +3166,13 @@ impl Provisioner {
             // ([`compute_fleet::auto_scaling_group_removal`]).
             Self::AutoScalingGroup => {
                 auto_scaling_group_removal(ctx, region, physical_resource_id).await
+            }
+            // `DeleteConfiguration` answers the configuration `DELETING` — Amazon MSK takes a
+            // deleted configuration away asynchronously, so its own reads still resolve the
+            // ARN while they do — and the deletion is finished once that service no longer
+            // holds it.
+            Self::MskConfiguration => {
+                msk_configuration_removal(ctx, region, physical_resource_id).await
             }
             _ => Ok(Removal::Gone),
         }
@@ -4125,6 +4176,11 @@ impl Provisioner {
             // Amazon MSK minted for it.
             Self::MskCluster | Self::MskServerlessCluster => {
                 delete_msk_cluster(ctx, region, physical_resource_id).await
+            }
+            // A configuration is deleted by its own call, addressed by the ARN Amazon MSK
+            // minted for it.
+            Self::MskConfiguration => {
+                delete_msk_configuration(ctx, region, physical_resource_id).await
             }
             Self::MqBroker => delete_mq_broker(ctx, region, physical_resource_id).await,
             // The delete carries one member off the resource's own declaration

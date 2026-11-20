@@ -138,6 +138,21 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
     ("elasticmapreduce", "Emr", SdkDiagnostic::Attempts),
     ("es", "OpenSearch", SdkDiagnostic::Attempts),
     ("iam", "Iam", SdkDiagnostic::Attempts),
+    // Amazon MSK's SDK names it `Kafka` — that model's own `sdkId` (`Kafka`,
+    // `smithy_query(query="service_info")` on that service's model), which is the signing name
+    // with its initial capitalised rather than the `MSK` its resource types are spelled with.
+    // The shape is the ATTEMPT-counting one, as the recorded `ResourceStatusReason` of an
+    // `AWS::MSK::ServerlessCluster` declared without SASL/IAM authentication and of an
+    // `AWS::MSK::Configuration` naming an unsupported Apache Kafka version each carry it (in
+    // the behavioral corpus `simparity-behavioral-aws-v1`, checks
+    // `cloudformation__kafka.deploy-cfn-msk-serverless-cluster-rejects-iam-auth-disabled` and
+    // `cloudformation__kafka.deploy-msk-configuration-invalid-kafka-version-rejected-and-\
+    // rolled-back`, whose reasons read `Resource handler returned message: "[ClientRequestToken:
+    // …] <the service's sentence> (Service: Kafka, Status Code: 400, Request ID: …) (SDK Attempt
+    // Count: …)…" (RequestToken: …, HandlerErrorCode: InvalidRequest)`). Every type this
+    // emulator provisions over this signing name is that service's (the two cluster types and
+    // the configuration).
+    ("kafka", "Kafka", SdkDiagnostic::Attempts),
     ("lambda", "Lambda", SdkDiagnostic::Attempts),
     // Amazon CloudWatch Logs's SDK names it by that model's own `sdkId` (`CloudWatch Logs`,
     // `smithy_query(query="service_info")` on that service's model) written as one word,
@@ -478,6 +493,52 @@ pub(crate) fn sdk_message(signing_name: &str, status: u16, code: &str, message: 
     sdk_message_of(signing_name, None, status, code, message)
 }
 
+/// The member an error DOCUMENT attributes its refusal to, as the wire spells that member:
+/// the value a service that reports which input parameter was at fault carries beside its
+/// message (Amazon MSK's `BadRequestException$InvalidParameter`, `jsonName:
+/// invalidParameter`).
+const ATTRIBUTED_PARAMETER_MEMBER: &str = "invalidParameter";
+
+/// The CALLS whose provider states the attributed member after the SDK's own diagnostic,
+/// keyed by the OPERATION the refused call named.
+///
+/// A service that reports WHICH input parameter it refused reports it as a member of its error
+/// shape, and most providers report the message alone. One that states it quotes it at the END
+/// of what it reports, past the SDK's diagnostic — and whether a provider does is the
+/// PROVIDER's, not the service's: Amazon MSK's serverless-cluster provider states it where
+/// that service's configuration provider does not, which is why this is per operation, exactly
+/// as [`SDK_PROVIDER_SHAPES`] is.
+///
+/// Read from the recorded `ResourceStatusReason` of an `AWS::MSK::ServerlessCluster` refused
+/// for its client authentication (in the behavioral corpus `simparity-behavioral-aws-v1`,
+/// check `cloudformation__kafka.deploy-cfn-msk-serverless-cluster-rejects-iam-auth-disabled`,
+/// whose reason closes the quoted message `… (SDK Attempt Count: …) 'clientAuthentication'`),
+/// against the `AWS::MSK::Configuration` reason beside it, which closes at the diagnostic
+/// although that service attributes its refusal to `kafkaVersions` just the same.
+const SDK_ATTRIBUTED_PARAMETER_CALLS: &[(&str, &str)] = &[("kafka", "CreateClusterV2")];
+
+/// What such a provider adds to the message for a refusal `document` attributes to an input
+/// member: that member, quoted, or `None` for a call whose provider words none and for an
+/// answer that attributed its refusal to nothing.
+pub(super) fn attributed_parameter(
+    signing_name: &str,
+    operation: Option<&str>,
+    document: &Value,
+) -> Option<String> {
+    let operation = operation?;
+    if !SDK_ATTRIBUTED_PARAMETER_CALLS
+        .iter()
+        .any(|(name, called)| *name == signing_name && *called == operation)
+    {
+        return None;
+    }
+    let parameter = document
+        .get(ATTRIBUTED_PARAMETER_MEMBER)
+        .and_then(Value::as_str)
+        .filter(|parameter| !parameter.is_empty())?;
+    Some(format!("'{parameter}'"))
+}
+
 /// [`sdk_message`] for a caller that knows WHICH operation of that service it called, which
 /// is part of the diagnostic some SDKs word ([`SdkDiagnostic::Operation`]).
 pub(crate) fn sdk_message_of(
@@ -638,19 +699,24 @@ pub(in crate::state) fn handler_failure_reason(owner: Option<Owner>, refusal: &R
         Some(owner) => owner.handler_error_class(&refusal.code, handler_error_code(&refusal.code)),
         None => handler_error_code(&refusal.code),
     };
+    // The token of the resource request this refusal answered, minted here because this is
+    // where that request ends: it is reported once as the `RequestToken` of the event and
+    // again inside the message of a provider that words it there
+    // ([`crate::state::provisioner::Provisioner::handler_message`]), and the two are the same
+    // request, so they are the same token.
+    let token = crate::state::new_request_id();
     let message = match owner {
         // The bucket provider's own wording, which lives beside this algorithm for the
         // reason [`s3_bucket`] records.
         Some(Owner::Builtin(Provisioner::S3Bucket)) => {
             s3_bucket::handler_message(class, identifier, message)
         }
-        Some(provisioner) => provisioner.handler_message(class, message),
+        Some(provisioner) => provisioner.handler_message(class, message, &token),
         None => message.to_string(),
     };
     format!(
-        "Resource handler returned message: \"{message}\" (RequestToken: {}, \
+        "Resource handler returned message: \"{message}\" (RequestToken: {token}, \
          HandlerErrorCode: {class})",
-        crate::state::new_request_id(),
     )
 }
 
