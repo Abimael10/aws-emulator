@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVoiceConnectorGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateVoiceConnectorGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateVoiceConnectorGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a Voice Connector group from the request and persists it, then reports the
+//! stored record. The group's routing is CHECKED against the Voice Connector store: a
+//! `VoiceConnectorItems` entry naming a connector no record holds is an unresolved
+//! reference (404), not a malformed request, so the group is created only when every
+//! connector it routes to exists.
 //!
 //! ## Shape of an operation
 //!
@@ -128,6 +124,11 @@ impl From<CreateVoiceConnectorGroupErrorModeled> for CreateVoiceConnectorGroupEr
     }
 }
 
+/// The priority a `VoiceConnectorItem` carries when the request names none: the member's
+/// own modelled `@default` (`smithy_query(query="shape", shape="VoiceConnectorItem")` reports
+/// `"default": 1` on `Priority`), where 1 is the highest priority.
+const DEFAULT_ITEM_PRIORITY: i32 = 1;
+
 /// The `CreateVoiceConnectorGroup` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -164,18 +165,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateVoiceConnectorGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateVoiceConnectorGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateVoiceConnectorGroup"))
+        // `ctx` carries request metadata only. The emulator verifies the request
+        // signature centrally before dispatch, and this operation models no principal
+        // to authorize against, so nothing here reads it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateVoiceConnectorGroupErrorModeled::ServiceFailureException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
+
+        // The `Name` constraints and each item's `VoiceConnectorId` pattern are modelled, so
+        // a request that breaks one never reaches here. What is left to check is what the
+        // model cannot express: whether each referenced connector EXISTS, how many
+        // connectors one group may route to, and the store's own ceiling. The REFERENCES are
+        // resolved first, in the same order as the seam that answers them ahead of the
+        // modelled walk (`crate::service`'s `referenced_connectors`), so the two layers
+        // cannot answer one request differently.
+        let items: Vec<(String, i32)> = input
+            .voice_connector_items
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| {
+                (
+                    item.voice_connector_id,
+                    item.priority.unwrap_or(DEFAULT_ITEM_PRIORITY),
+                )
+            })
+            .collect();
+
+        let mut store = state.lock();
+        // A reference the account does not hold is a LOOKUP failure, answered 404 with the
+        // identifier that resolved to nothing — not a 400 about the request's form.
+        if let Some(absent) =
+            store.first_absent_voice_connector(items.iter().map(|(id, _)| id.as_str()))
+        {
+            return Err(crate::scaffolded::Scaffolded::unresolved_reference(absent));
+        }
+        if items.len() > crate::state::MAX_VOICE_CONNECTOR_ITEMS_PER_GROUP {
+            return Err(CreateVoiceConnectorGroupErrorModeled::ResourceLimitExceededException(
+                crate::state::voice_connector_items_limit_reached(items.len()),
+            )
+            .into());
+        }
+        if store.voice_connector_groups.len() >= crate::state::MAX_VOICE_CONNECTOR_GROUPS {
+            return Err(CreateVoiceConnectorGroupErrorModeled::ResourceLimitExceededException(
+                crate::state::voice_connector_group_limit_reached(),
+            )
+            .into());
+        }
+
+        let id = store.mint_voice_connector_group_id();
+        let record = crate::state::VoiceConnectorGroupRecord::new(
+            id.clone(),
+            input.name,
+            input.call_distribution_type,
+            items,
+            crate::state::current_timestamp(),
+        );
+        let shape = record.to_shape();
+        store.voice_connector_groups.insert(id, record);
+
+        Ok(CreateVoiceConnectorGroupOutput {
+            voice_connector_group: Some(shape),
+        })
     }
 }

@@ -39,11 +39,52 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## The two things every answer of this service carries
+//!
+//! Both are stated once here rather than per operation, because both hold for every
+//! response this service renders:
+//!
+//! - a request the framework refused before any handler ran is stated in AWS's standard
+//!   validation report — the COUNTED envelope `N validation error(s) detected: …` — which
+//!   `service_common::validation_message` words for every emulated service, under the
+//!   framework's own validation error class rather than under one of this model's shapes;
+//! - every client-error body names the request it answers in a `RequestId` member, which
+//!   the shared request-id report writes ([`query_error_envelope`]): the member belongs to
+//!   this service's error ENVELOPE and no model declares it, so no handler can set it.
+//!
+//! One thing more is answered ahead of the modelled walk, for the reason its own module
+//! gives: the Voice Connectors a group's routing references ([`referenced_connectors`]).
 
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service, Violation,
+use service_common::query_error_envelope::{
+    with_request_id_error_member_named, RequestIdEnvelopeDefinition, RequestIdReportedOperation,
 };
+use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service, Violation};
 use std::sync::Arc;
+
+/// The Voice Connectors a group's routing references, resolved ahead of the modelled walk.
+mod referenced_connectors;
+
+/// The member this service's JSON error bodies name the request they answer in.
+///
+/// Capitalized, beside the `Code` and `Message` the model declares capitalized
+/// (`smithy_query(query="shape", shape="NotFoundException")`), which is how this service's
+/// recorded error bodies spell it. The id itself is minted per response by the shared
+/// report; nothing here states its form.
+const REQUEST_ID_MEMBER: &str = "RequestId";
+
+/// How one response of this service names the request it answers: the `RequestId` member of
+/// its JSON error body.
+///
+/// A `Report` the service hands BOTH seams that can answer — the wrapper around every
+/// modelled operation and the wrapper around the framework-level renderers — so a response
+/// an operation produced and a response no operation produced name their request the same
+/// way. A success is left untouched: its body is the modelled output.
+fn report_request_id(
+    resp: aws_smithy_runtime_api::http::Response,
+) -> aws_smithy_runtime_api::http::Response {
+    with_request_id_error_member_named(resp, REQUEST_ID_MEMBER)
+}
 
 /// This service's own `aws.api#service$endpointPrefix`, the name that identifies it
 /// among the six services that sign as `chime`.
@@ -54,13 +95,28 @@ use std::sync::Arc;
 /// `awsService.endpointPrefix`.
 const OWN_ENDPOINT_PREFIX: &str = "voice-chime";
 
+/// The `@pattern` expressions this API publishes exactly as the model declares them, anchors
+/// included; every other expression is quoted without the whole-value `^`/`$` pair.
+///
+/// Keyed by the EXPRESSION, because what is published belongs to the member's SHAPE and so
+/// holds for every member targeting it, in any operation. The one row is the ARN expression
+/// `Arn` declares (`smithy_query(query="shape", shape="Arn")`), which every ARN-valued member
+/// of this model targets — a voice profile domain's `KmsKeyArn` among them.
+const PATTERNS_PUBLISHED_AS_DECLARED: &[&str] = &[r"^arn[\/\:\-\_\.a-zA-Z0-9]+$"];
+
 /// The `com-amazonaws-chimesdkvoice-chimesdktelephonyservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
+    /// The generated entry, with its three framework-level error renderers wrapped so a
+    /// response no operation produced names the request it answers too.
+    entry: RequestIdEnvelopeDefinition<crate::ServiceDefinition<Eng>>,
+    /// Serves every modelled operation, so each response passes the one place the request
+    /// id is reported and a group's connector references are resolved ahead of the modelled
+    /// walk. Held, not built per request: `override_operation` hands back a reference to it.
+    served: referenced_connectors::ResolvedReferenceOperation<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -69,7 +125,14 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: RequestIdEnvelopeDefinition::reporting(
+                crate::ServiceDefinition::new(Arc::clone(&engine)),
+                report_request_id,
+            ),
+            served: referenced_connectors::ResolvedReferenceOperation::new(
+                engine,
+                RequestIdReportedOperation::new(report_request_id),
+            ),
         }
     }
 }
@@ -119,47 +182,66 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // NOT a re-route: every request is served by the operation this service's OWN
+        // routing table names for it, through the two things stated once for the whole
+        // service — the request-id report, the one place every operation's response passes,
+        // so no answer can leave without naming the request it answered (a success, a
+        // modelled error, or a constraint refusal raised while the operation was being
+        // served); and the reference resolution the modelled walk runs too late for
+        // ([`referenced_connectors`]). A request the table does not answer declines here
+        // exactly as it would there, leaving the router's routing-error path unchanged.
+        self.entry
+            .routes(req)
+            .then_some(&self.served as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // Amazon Chime SDK Voice states a request that breaks a declared input rule
-        // as `BadRequestException` ("The input parameters don't match the service's
-        // restrictions.", HTTP 400) — the error EVERY operation in this service's
-        // model declares for exactly that case. The framework's default code here is
-        // the generic `ValidationException`, which no operation of this service
-        // declares, so a client branching on the modelled code would never match it.
-        // The message keeps the framework's per-violation clause, which names the
-        // member and the constraint it failed, so the caller can fix the request.
+        // A request the framework refused before any handler ran — an absent `@required`
+        // member, a value outside a declared bound — is refused by AWS's own input
+        // validation layer, which answers the COUNTED report
+        // `N validation error(s) detected: <clause>; …` under the validation error class
+        // that layer owns. That class is NOT one of this model's shapes: the modelled
+        // `BadRequestException` ("The input parameters don't match the service's
+        // restrictions.") is what an OPERATION answers for a rule it enforces itself, and
+        // labelling a pre-handler validation failure with it tells a client that dispatches
+        // on the error type that the service refused the request, not that the request never
+        // reached it.
         //
-        // The status stays with the protocol (400 for a declared-rule violation),
-        // which is `BadRequestException`'s own `httpError`, so code and status agree.
-        match refusal {
-            Refusal::Invalid(violations) => {
-                let message = if violations.is_empty() {
-                    "The input parameters don't match the service's restrictions.".to_string()
-                } else {
-                    violations
-                        .iter()
-                        .map(Violation::message)
-                        .collect::<Vec<String>>()
-                        .join("; ")
-                };
-                Some(Refused {
-                    code: "BadRequestException".to_string(),
-                    message,
-                })
-            }
-            // An authentication refusal is a 403 the framework already words; this
-            // service's modelled `UnauthorizedClientException` is a 401, so renaming
-            // it here would answer a 401 code with a 403 status.
-            _ => None,
-        }
+        // The envelope, the per-violation clauses, the member paths and the count all belong
+        // to `service_common::validation_message`, the shared home for this wording, so this
+        // service cannot word a constraint differently from the services that state the same
+        // sentence; and the code travels with the message from there too. TWO renderings
+        // inside it are this service's own, and nothing else is:
+        //
+        // * a `@pattern` requirement quotes the expression this API PUBLISHES for the
+        //   member's shape, which is the model's text without the whole-value `^`/`$` pair
+        //   for most shapes and the text as declared for the shapes in
+        //   [`PATTERNS_PUBLISHED_AS_DECLARED`]. The shared home for that keying decides it;
+        //   the CHECK is always the model's pattern as written.
+        // * an enumerated type's value set is listed in LEXICOGRAPHIC order
+        //   (`in_sorted_enum_order`, the shared home for that order), whatever order this
+        //   model declares the type's members in. Re-ordered BEFORE the clauses are
+        //   rendered, so the clause itself still comes from the one place that writes it.
+        //
+        // An authentication refusal keeps the framework's wording: this service's modelled
+        // `UnauthorizedClientException` is a 401 while that refusal is a 403, so renaming it
+        // here would answer a 401 code with a 403 status.
+        let Refusal::Invalid(violations) = refusal else {
+            return None;
+        };
+        let stated: Vec<Violation> = violations
+            .iter()
+            .map(service_common::validation_message::in_sorted_enum_order)
+            .collect();
+        service_common::validation_message::aws_validation_refusal_with(
+            &Refusal::Invalid(stated),
+            |pattern| {
+                service_common::validation::unanchored_unless_published_as_declared(
+                    pattern,
+                    PATTERNS_PUBLISHED_AS_DECLARED,
+                )
+            },
+        )
     }
 
     fn override_routing_error(

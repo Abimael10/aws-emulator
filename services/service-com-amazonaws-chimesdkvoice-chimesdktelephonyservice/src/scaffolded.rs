@@ -45,6 +45,21 @@ use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
 use smithy_server_runtime::OperationError;
 
+// The one payload this service answers that its model does not declare in full: the wire's
+// `NotFoundException` for an unresolved REFERENCE, which carries one member more than the
+// modelled shape (see that module's docs). It is declared from here because this wrapper is
+// the only place an operation can return such a shape, and because the crate root is
+// GENERATED — it declares a fixed set of modules and nothing may be added beside them. The
+// `#[path]` keeps the file beside the crate's other modules rather than in a directory of
+// its own for one file.
+#[path = "unresolved_reference.rs"]
+pub mod unresolved_reference;
+
+use unresolved_reference::{
+    UnresolvedReference, UNRESOLVED_REFERENCE_SCHEMA, UNRESOLVED_REFERENCE_SHAPE,
+    UNRESOLVED_REFERENCE_STATUS,
+};
+
 /// The `message` member of the synthetic `NotImplemented` error shape.
 ///
 /// `with_xml_name("Message")` matches the casing the restXml / awsQuery error
@@ -196,6 +211,10 @@ pub enum Scaffolded<E> {
     /// `MalformedQueryString` rather than `ValidationException`, so a client
     /// matching on the error code there sees two codes for one logical failure.
     ValidationException(ValidationException),
+    /// The request referenced a resource that does not exist. Renders as HTTP 404 under
+    /// the `NotFoundException` the model declares, with the `Resource` member the wire
+    /// carries beside that shape's modelled pair (see [`unresolved_reference`]).
+    UnresolvedReference(UnresolvedReference),
 }
 
 impl<E> Scaffolded<E> {
@@ -221,6 +240,18 @@ impl<E> Scaffolded<E> {
     pub fn validation(message: impl Into<String>) -> Self {
         Self::ValidationException(ValidationException::new(message))
     }
+
+    /// Refuse the request because `identifier`, which it referenced, names no resource.
+    ///
+    /// For a reference a request carries in its BODY. A resource the request addresses by
+    /// id in its URI is refused with the operation's own modelled `NotFoundException`
+    /// instead (`crate::state::voice_connector_not_found` and its siblings), which state the
+    /// resource class and
+    /// that id in its message; this one states the fixed sentence the wire answers a
+    /// reference with, and names the identifier in the member that carries it.
+    pub fn unresolved_reference(identifier: impl Into<String>) -> Self {
+        Self::UnresolvedReference(UnresolvedReference::new(identifier))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -229,6 +260,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
+            Self::UnresolvedReference(e) => write!(f, "{e}"),
         }
     }
 }
@@ -241,6 +273,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
+            Self::UnresolvedReference(e) => e.source(),
         }
     }
 }
@@ -255,6 +288,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
+            Self::UnresolvedReference(e) => e,
         }
     }
 
@@ -263,6 +297,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
+            Self::UnresolvedReference(_) => &UNRESOLVED_REFERENCE_SCHEMA,
         }
     }
 
@@ -275,6 +310,10 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
+            // The shape the MODEL declares for this failure: the extra member the wire
+            // carries is not a second error class, so a client resolving the error shape
+            // from this name resolves the modelled `NotFoundException`.
+            Self::UnresolvedReference(_) => UNRESOLVED_REFERENCE_SHAPE,
         }
     }
 
@@ -287,6 +326,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
             Self::ValidationException(_) => 400,
+            // `NotFoundException`'s own `@httpError` (`smithy_query(query="shape",
+            // shape="NotFoundException")`), so status and shape agree.
+            Self::UnresolvedReference(_) => UNRESOLVED_REFERENCE_STATUS,
         }
     }
 
@@ -299,6 +341,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.query_error_code(),
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
+            // This service's protocol is restJson1, which has no `awsQueryError` code at
+            // all; the modelled shape carries no such trait either.
+            Self::UnresolvedReference(_) => None,
         }
     }
 }

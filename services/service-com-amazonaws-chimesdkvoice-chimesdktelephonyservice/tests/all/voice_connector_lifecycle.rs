@@ -11,6 +11,10 @@
 //! enum catalogs, the pagination test is an invariant check over a grid of store sizes
 //! and page sizes, and the refusal table walks each published bound and one value past
 //! it.
+//!
+//! The harness below — the emulator, the call and the answer it hands back — is shared with
+//! the sibling suite `refusal_envelope`, which pins what this service ANSWERS a refused
+//! request with, so both suites drive one wire path.
 
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
@@ -31,6 +35,13 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 
 /// The outbound host suffix a Voice Connector's `OutboundHostName` is built from.
 const OUTBOUND_SUFFIX: &str = "voiceconnector.chime.aws";
+
+/// The error class that states a refusal of a rule the MODEL declares.
+///
+/// Such a request is refused before any handler runs, by the input-validation layer AWS
+/// fronts the service with, so the class is that layer's own and not one of this model's
+/// shapes. `refusal_envelope.rs` pins the report it states.
+pub(crate) const MODELLED_RULE_CLASS: &str = "ValidationException";
 
 /// Every Region `VoiceConnectorAwsRegion` admits.
 /// Source: `smithy_query(query="shape", shape="VoiceConnectorAwsRegion")`.
@@ -60,7 +71,10 @@ const INTEGRATION_TYPES: [&str; 2] = [
 
 /// One emulator: a shared engine, the Chime SDK Voice service, and the router that
 /// dispatches to it. Authentication is off so a test needs no signing key.
-fn emulator() -> MultiServiceRouter {
+///
+/// Shared with the sibling suite, so every case of this crate's end-to-end tests drives one
+/// wire path.
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -72,13 +86,16 @@ fn emulator() -> MultiServiceRouter {
 
 /// One HTTP answer, kept as raw bytes so a test can assert on an EMPTY body (which a
 /// 204 must have) as well as on JSON.
-struct Reply {
-    status: u16,
-    body: Bytes,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) body: Bytes,
+    /// The error SHAPE a restJson1 client resolves a failure from, as the response's
+    /// `x-amzn-errortype` header names it. `None` on a response that names none.
+    pub(crate) error_type: Option<String>,
 }
 
 impl Reply {
-    fn json(&self, case: &str) -> Value {
+    pub(crate) fn json(&self, case: &str) -> Value {
         serde_json::from_slice(&self.body).unwrap_or_else(|e| {
             panic!(
                 "case {case:?}: expected a JSON body, got {:?} ({e})",
@@ -88,7 +105,7 @@ impl Reply {
     }
 
     /// The wire error code: restJson1 carries it as the body's `__type`.
-    fn error_code(&self, case: &str) -> String {
+    pub(crate) fn error_code(&self, case: &str) -> String {
         self.json(case)["__type"]
             .as_str()
             .unwrap_or_else(|| panic!("case {case:?}: error body has no __type: {:?}", self.body))
@@ -99,7 +116,7 @@ impl Reply {
     }
 }
 
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     path_and_query: &str,
@@ -120,9 +137,15 @@ async fn call(
         .expect("a well-formed request");
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
+    let error_type = response
+        .headers()
+        .get("x-amzn-errortype")
+        .and_then(|named| named.to_str().ok())
+        .map(str::to_string);
     Reply {
         status,
         body: response.into_body(),
+        error_type,
     }
 }
 
@@ -722,9 +745,15 @@ async fn the_store_is_bounded_and_the_ceiling_is_a_resource_limit() {
     );
 }
 
-/// RULE: a request that breaks a declared input rule is refused as
-/// `BadRequestException` (HTTP 400) — never a 501, never a silent success — while a value
-/// ON a published bound is accepted.
+/// RULE: a request that breaks a declared input rule is refused with HTTP 400 — never a
+/// 501, never a silent success — while a value ON a published bound is accepted.
+///
+/// WHICH error class states the refusal depends on WHO refused it, and the rows below carry
+/// that expectation one by one: a rule the MODEL declares is enforced before any handler
+/// runs, by the input-validation layer that owns the counted validation report, so its class
+/// is that layer's (`refusal_envelope.rs` pins the report itself); a rule only the service
+/// can enforce — a pagination token it never issued — is the operation's own modelled
+/// `BadRequestException`.
 #[tokio::test]
 async fn input_outside_a_declared_rule_is_a_bad_request() {
     let router = emulator();
@@ -743,89 +772,106 @@ async fn input_outside_a_declared_rule_is_a_bad_request() {
 
     // Each row breaks exactly one declared rule: `Name`'s @length (both bounds) and
     // @pattern, `RequireEncryption`'s @required, `AwsRegion`'s enum value set,
-    // `MaxResults`'s @range (both bounds), and `VoiceConnectorId`'s @pattern.
-    let refused: Vec<(String, &str, String, Option<Value>)> = vec![
+    // `MaxResults`'s @range (both bounds), and `VoiceConnectorId`'s @pattern. The last
+    // element of a row is the error class that states the refusal — see this test's docs.
+    let refused: Vec<(String, &str, String, Option<Value>, &str)> = vec![
         (
             "Name one below the minimum length".to_string(),
             "POST",
             "/voice-connectors".to_string(),
             Some(json!({ "Name": "", "RequireEncryption": true })),
+            MODELLED_RULE_CLASS,
         ),
         (
             "Name one above the maximum length".to_string(),
             "POST",
             "/voice-connectors".to_string(),
             Some(json!({ "Name": "n".repeat(257), "RequireEncryption": true })),
+            MODELLED_RULE_CLASS,
         ),
         (
             "Name outside the pattern".to_string(),
             "POST",
             "/voice-connectors".to_string(),
             Some(json!({ "Name": "bad name!!", "RequireEncryption": true })),
+            MODELLED_RULE_CLASS,
         ),
         (
             "Name absent".to_string(),
             "POST",
             "/voice-connectors".to_string(),
             Some(json!({ "RequireEncryption": true })),
+            MODELLED_RULE_CLASS,
         ),
         (
             "RequireEncryption absent".to_string(),
             "POST",
             "/voice-connectors".to_string(),
             Some(json!({ "Name": "no-flag" })),
+            MODELLED_RULE_CLASS,
         ),
         (
             "AwsRegion outside the enum".to_string(),
             "POST",
             "/voice-connectors".to_string(),
             Some(json!({ "Name": "nowhere", "RequireEncryption": true, "AwsRegion": "mars-east-1" })),
+            MODELLED_RULE_CLASS,
         ),
         (
             "MaxResults one below the minimum".to_string(),
             "GET",
             "/voice-connectors?max-results=0".to_string(),
             None,
+            MODELLED_RULE_CLASS,
         ),
         (
             "MaxResults one above the maximum".to_string(),
             "GET",
             "/voice-connectors?max-results=101".to_string(),
             None,
+            MODELLED_RULE_CLASS,
         ),
         (
             "VoiceConnectorId outside the pattern on a read".to_string(),
             "GET",
             "/voice-connectors/NOT-AN-ID".to_string(),
             None,
+            MODELLED_RULE_CLASS,
         ),
         (
             "VoiceConnectorId outside the pattern on an update".to_string(),
             "PUT",
             "/voice-connectors/NOT-AN-ID".to_string(),
             Some(json!({ "Name": "whoever", "RequireEncryption": true })),
+            MODELLED_RULE_CLASS,
         ),
         (
             "VoiceConnectorId outside the pattern on a delete".to_string(),
             "DELETE",
             "/voice-connectors/NOT-AN-ID".to_string(),
             None,
+            MODELLED_RULE_CLASS,
         ),
         (
             "Name outside the pattern on an update".to_string(),
             "PUT",
             format!("/voice-connectors/{known_id}"),
             Some(json!({ "Name": "bad name!!", "RequireEncryption": true })),
+            MODELLED_RULE_CLASS,
         ),
         (
             "NextToken this service never issued".to_string(),
             "GET",
             "/voice-connectors?next-token=not-a-token".to_string(),
             None,
+            // Not a modelled rule: the model gives `NextToken` no structure, so only the
+            // service can tell a token it issued from one it did not, and it refuses that
+            // with the error its own model declares.
+            "BadRequestException",
         ),
     ];
 
-    for (label, method, path, body) in refused {
+    for (label, method, path, body, class) in refused {
         let reply = call(&router, method, &path, body).await;
         assert_eq!(
             reply.status, 400,
@@ -835,8 +881,8 @@ async fn input_outside_a_declared_rule_is_a_bad_request() {
         );
         assert_eq!(
             reply.error_code(&label),
-            "BadRequestException",
-            "case {label:?}: expected BadRequestException, got {}",
+            class,
+            "case {label:?}: expected {class}, got {}",
             reply.error_code(&label)
         );
     }

@@ -33,6 +33,8 @@ hex = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# `automod::dir!` is what `tests/all/main.rs` declares this crate's suites with.
+automod = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 

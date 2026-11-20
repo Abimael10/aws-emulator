@@ -60,6 +60,10 @@
 //!   [`RequestIdErrorMemberOperation`] (a service serving its generated routing table
 //!   unchanged), [`RequestIdReportingOperation::error_member`] (one serving its operations
 //!   already wrapped) and [`RequestIdEnvelopeDefinition::error_member`].
+//!   [`with_request_id_error_member_named`] is that same report for a service whose error
+//!   bodies SPELL the member another way, reached through [`RequestIdReportedOperation`]:
+//!   the spelling is the service's own fact, read off its recordings, so it is passed in
+//!   rather than restated here.
 //!
 //! WHERE the id is stated is the protocol's; WHAT it is spelled like is the service's. The
 //! three writers above mint [`new_request_id`], the form almost every AWS service reports,
@@ -314,17 +318,21 @@ const FIRST_FAILURE_STATUS: u16 = 400;
 /// the member — so this is idempotent, and a renderer that starts writing the member itself
 /// cannot end up with two. The insertion is TEXTUAL, at the object's closing brace, so every
 /// other byte of the body — the member order a renderer chose, its escaping, its spacing —
-/// survives exactly as it was written.
-fn add_error_request_id(body: &str, request_id: &str) -> Option<String> {
+/// survives exactly as it was written; the pair that goes in is SERIALIZED rather than
+/// formatted, so a member name or an id holding a character JSON escapes cannot produce a
+/// body that no longer parses.
+fn add_error_request_id(body: &str, request_id: &str, member: &str) -> Option<String> {
     let document: serde_json::Value = serde_json::from_str(body).ok()?;
     let members = document.as_object()?;
-    if members.contains_key(REQUEST_ID_MEMBER) {
+    if members.contains_key(member) {
         return None;
     }
     let close = body.rfind('}')?;
     let separator = if members.is_empty() { "" } else { "," };
+    let name = serde_json::to_string(member).ok()?;
+    let value = serde_json::to_string(request_id).ok()?;
     Some(format!(
-        "{}{separator}\"{REQUEST_ID_MEMBER}\":\"{request_id}\"{}",
+        "{}{separator}{name}:{value}{}",
         &body[..close],
         &body[close..]
     ))
@@ -345,7 +353,20 @@ fn add_error_request_id(body: &str, request_id: &str) -> Option<String> {
 /// does not declare. A failure whose body is not a JSON object (an XML envelope, a streamed
 /// body) is left untouched too, and one that already names its request keeps the id it has,
 /// so two layers of one service cannot report two ids for one call.
-pub fn with_request_id_error_member(mut resp: RtResponse) -> RtResponse {
+pub fn with_request_id_error_member(resp: RtResponse) -> RtResponse {
+    with_request_id_error_member_named(resp, REQUEST_ID_MEMBER)
+}
+
+/// [`with_request_id_error_member`], with the MEMBER the error body spells the id in chosen
+/// by the caller.
+///
+/// WHICH member a service's error bodies carry the id in is that service's own fact, read off
+/// its recordings — several spell it `requestId`, others `RequestId` beside the capitalized
+/// members their models declare — and it is the ONLY thing a caller chooses here. Everything
+/// else is the body [`with_request_id_error_member`] runs: the same minted id, the same
+/// idempotence, the same textual insertion that leaves every other byte as the renderer wrote
+/// it, and the same silence about a success or a body that is not a JSON object.
+pub fn with_request_id_error_member_named(mut resp: RtResponse, member: &str) -> RtResponse {
     if resp.status().as_u16() < FIRST_FAILURE_STATUS {
         return resp;
     }
@@ -358,7 +379,7 @@ pub fn with_request_id_error_member(mut resp: RtResponse) -> RtResponse {
         let Ok(text) = std::str::from_utf8(bytes) else {
             return resp;
         };
-        add_error_request_id(text, &new_request_id())
+        add_error_request_id(text, &new_request_id(), member)
     };
     if let Some(rewritten) = rewritten {
         // Only a renderer that advertised a length needs it corrected; the framework's
@@ -588,6 +609,47 @@ impl ErasedOperation for RequestIdErrorMemberOperation {
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(serve_reporting(svc, req, ctx, with_request_id_error_member))
+    }
+
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        // See [`RequestIdEnvelopeOperation::auth_schemes`]: the modelled operation this
+        // wrapper delegates to is what decides, so wrapping cannot weaken its schemes.
+        None
+    }
+}
+
+/// Serves the modelled operation the service's own routing table names for a request exactly
+/// as that table would, then reports the request id on whatever it answered — with the report
+/// the SERVICE chose.
+///
+/// The three wrappers above each hold ONE of the reports this module states. A service whose
+/// report is its own — because the FORM of the id, or the MEMBER its error bodies spell it in,
+/// is that service's fact — holds this one instead and hands it the same [`Report`] it hands
+/// [`RequestIdEnvelopeDefinition::reporting`], so the response an operation produced and the
+/// response no operation produced name their request the same way. It stores no operation of
+/// its own: the one it delegates to is the one the service's routing table names for the
+/// request, so the framework still owns the whole deserialize -> validate -> handle ->
+/// serialize sequence and every status, code and message it answers with.
+pub struct RequestIdReportedOperation {
+    report: Report,
+}
+
+impl RequestIdReportedOperation {
+    /// Serve every modelled operation of the service, reporting the request id with `report`.
+    #[must_use]
+    pub fn new(report: Report) -> Self {
+        Self { report }
+    }
+}
+
+impl ErasedOperation for RequestIdReportedOperation {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(serve_reporting(svc, req, ctx, self.report))
     }
 
     fn auth_schemes(&self) -> Option<&'static [&'static str]> {
@@ -1188,6 +1250,91 @@ mod tests {
                 aws_smithy_runtime_api::http::StatusCode::try_from(status).expect("a status"),
                 SdkBody::from(answered_body.clone()),
             ));
+            assert_eq!(
+                std::str::from_utf8(again.body().bytes().expect("bytes")).expect("utf-8"),
+                answered_body,
+                "case {case:?}: expected a second report to change nothing"
+            );
+        }
+    }
+
+    /// RULE: the MEMBER the id is named in is the caller's, and everything else about the
+    /// report is unchanged — the id's form, the members the renderer wrote, and the
+    /// idempotence that keeps a second report from adding a second id.
+    ///
+    /// The rows span what the choice generalises over: the default spelling, a capitalized
+    /// one (what a service whose modelled members are capitalized carries), a member whose
+    /// text needs JSON escaping, and a body that already names the chosen member while
+    /// carrying the default one.
+    #[test]
+    fn the_error_member_report_names_the_request_in_the_member_it_was_given() {
+        // (case, the member to name, the rendered body, whether the member is added)
+        let rows = [
+            ("the default spelling", REQUEST_ID_MEMBER, r#"{"message":"no"}"#, true),
+            ("a capitalized member", "RequestId", r#"{"Code":"NotFound","Message":"no"}"#, true),
+            ("a member needing escaping", r#"Req"Id"#, r#"{"message":"no"}"#, true),
+            ("an empty object", "RequestId", "{}", true),
+            (
+                "a body already naming the chosen member",
+                "RequestId",
+                r#"{"message":"no","RequestId":"11112222-3333-4444-5555-666677778888"}"#,
+                false,
+            ),
+            (
+                "a body naming only the DEFAULT member",
+                "RequestId",
+                r#"{"message":"no","requestId":"11112222-3333-4444-5555-666677778888"}"#,
+                true,
+            ),
+            ("a success", "RequestId", r#"{"message":"fine"}"#, false),
+        ];
+
+        for (case, member, body, adds) in rows {
+            let status = if case == "a success" { 200u16 } else { 400 };
+            let answered = with_request_id_error_member_named(
+                RtResponse::new(
+                    aws_smithy_runtime_api::http::StatusCode::try_from(status).expect("a status"),
+                    SdkBody::from(body),
+                ),
+                member,
+            );
+            let answered_body = std::str::from_utf8(answered.body().bytes().expect("bytes"))
+                .expect("utf-8")
+                .to_string();
+            if !adds {
+                assert_eq!(
+                    answered_body, body,
+                    "case {case:?}: expected the body to survive byte for byte, got \
+                     {answered_body:?}"
+                );
+                continue;
+            }
+            let document: serde_json::Value = serde_json::from_str(&answered_body)
+                .unwrap_or_else(|e| panic!("case {case:?}: expected JSON, got {answered_body:?} ({e})"));
+            let reported = document
+                .get(member)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            assert!(
+                is_request_id(reported),
+                "case {case:?}: expected a well-formed id in {member:?}, got {answered_body:?}"
+            );
+            let original: serde_json::Value = serde_json::from_str(body).expect("a JSON object");
+            for (name, value) in original.as_object().expect("an object") {
+                assert_eq!(
+                    document.get(name),
+                    Some(value),
+                    "case {case:?}: expected the member {name:?} to survive"
+                );
+            }
+            // Idempotent under the SAME member: a second report adds no second id.
+            let again = with_request_id_error_member_named(
+                RtResponse::new(
+                    aws_smithy_runtime_api::http::StatusCode::try_from(status).expect("a status"),
+                    SdkBody::from(answered_body.clone()),
+                ),
+                member,
+            );
             assert_eq!(
                 std::str::from_utf8(again.body().bytes().expect("bytes")).expect("utf-8"),
                 answered_body,
