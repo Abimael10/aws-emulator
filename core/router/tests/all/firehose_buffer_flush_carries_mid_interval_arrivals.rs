@@ -100,7 +100,12 @@ fn prefix_of(row: &Row) -> String {
 }
 
 /// One `awsJson1_1` Firehose or S3 operation that must succeed.
-async fn json_call(
+///
+/// `pub(crate)` with the two destination reads below, so the sibling suite driving the same
+/// rule through an EventBridge rule's Firehose target
+/// (`events_rule_firehose_trickle_rides_the_pending_flush`) sends its calls and reads its
+/// objects exactly as this one does rather than keeping another copy of them.
+pub(crate) async fn json_call(
     router: &MultiServiceRouter,
     case: &str,
     signing_name: &str,
@@ -127,13 +132,18 @@ async fn json_call(
     serde_json::from_str(&text).unwrap_or(Value::Null)
 }
 
-/// Every key the bucket holds under `prefix`, in key order.
-async fn keys_under(router: &MultiServiceRouter, case: &str, prefix: &str) -> Vec<String> {
+/// Every key `bucket` holds under `prefix`, in key order.
+pub(crate) async fn keys_under(
+    router: &MultiServiceRouter,
+    case: &str,
+    bucket: &str,
+    prefix: &str,
+) -> Vec<String> {
     let (status, body) = send(
         router,
         "s3",
         "GET",
-        &format!("/{BUCKET}?list-type=2&prefix={prefix}"),
+        &format!("/{bucket}?list-type=2&prefix={prefix}"),
         &[],
         Vec::new(),
     )
@@ -148,10 +158,15 @@ async fn keys_under(router: &MultiServiceRouter, case: &str, prefix: &str) -> Ve
     keys
 }
 
-/// The bytes the bucket holds at `key`, read through `GetObject`.
-async fn body_of(router: &MultiServiceRouter, case: &str, key: &str) -> String {
+/// The bytes `bucket` holds at `key`, read through `GetObject`.
+pub(crate) async fn body_of(
+    router: &MultiServiceRouter,
+    case: &str,
+    bucket: &str,
+    key: &str,
+) -> String {
     let (status, body) =
-        send(router, "s3", "GET", &format!("/{BUCKET}/{key}"), &[], Vec::new()).await;
+        send(router, "s3", "GET", &format!("/{bucket}/{key}"), &[], Vec::new()).await;
     assert_eq!(
         status,
         200,
@@ -164,8 +179,8 @@ async fn body_of(router: &MultiServiceRouter, case: &str, key: &str) -> String {
 /// The body of each object the bucket holds under `prefix`, in key order.
 async fn objects_under(router: &MultiServiceRouter, case: &str, prefix: &str) -> Vec<String> {
     let mut bodies = Vec::new();
-    for key in keys_under(router, case, prefix).await {
-        bodies.push(body_of(router, case, &key).await);
+    for key in keys_under(router, case, BUCKET, prefix).await {
+        bodies.push(body_of(router, case, BUCKET, &key).await);
     }
     bodies
 }
@@ -304,7 +319,7 @@ async fn one_flush_carries_every_record_buffered_since_the_last_one() {
             )
             .await;
             put += 1;
-            let keys = keys_under(&router, case, &prefix).await;
+            let keys = keys_under(&router, case, BUCKET, &prefix).await;
             if keys != known {
                 let fresh: Vec<String> = keys
                     .iter()
@@ -334,7 +349,7 @@ async fn one_flush_carries_every_record_buffered_since_the_last_one() {
         // in the order it was put: the flush carries what arrived while its interval ran.
         let mut delivered = Vec::new();
         for key in &fresh {
-            delivered.push(body_of(&router, case, key).await);
+            delivered.push(body_of(&router, case, BUCKET, key).await);
         }
         let first = marker(&row, buffered_from);
         let holder = delivered
