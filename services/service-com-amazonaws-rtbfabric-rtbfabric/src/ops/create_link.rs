@@ -238,8 +238,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The store's own bound, checked before the insert; `DeleteLink` releases
-        // a record, so this bounds what is live.
-        if store.links.len() >= crate::state::LINK_QUOTA {
+        // a record, so this bounds what is live. A link of either kind — between
+        // two gateways or to an endpoint outside the fabric — counts against it,
+        // so the two creates cannot together hold twice the bound.
+        if store.links_held() >= crate::state::LINK_QUOTA {
             return Err(CreateLinkErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
                     message: format!(

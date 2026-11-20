@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateOutboundExternalLink
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateOutboundExternalLink`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateOutboundExternalLink::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a `linkId` and persists the link to an endpoint OUTSIDE the fabric that the
+//! requester gateway in the path opened, including `publicEndpoint`, `attributes`,
+//! `logSettings` and `tags` — which this operation's response shape does not carry, so
+//! `GetOutboundExternalLink` can only read them from state. An unknown requester
+//! gateway -> `ResourceNotFoundException` (404); a replayed `clientToken` answers with
+//! the link the first call minted.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +172,152 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateOutboundExternalLink` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateOutboundExternalLinkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateOutboundExternalLink"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateOutboundExternalLinkErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the rtbfabric emulator has no state store for this request"
+                        .to_string(),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+        store.settle_all(now);
+
+        // An outbound external link is opened FROM a requester gateway — the one the
+        // `@http` URI addresses — so it is stored only where that gateway is. A
+        // responder gateway of that id is no requester gateway: it takes inbound
+        // external links instead.
+        if !store.requester_gateways.contains_key(&input.gateway_id) {
+            return Err(
+                CreateOutboundExternalLinkErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // See `create_requester_gateway` for the `@idempotencyToken` contract; the
+        // token is scoped to this operation, so it never collides with a create of
+        // another resource.
+        let fingerprint = crate::state::parameter_fingerprint(&format!(
+            "gatewayId={:?}|publicEndpoint={:?}|attributes={:?}|logSettings={:?}|tags={}",
+            input.gateway_id,
+            input.public_endpoint,
+            input.attributes,
+            input.log_settings,
+            crate::state::canonical_tags(input.tags.as_ref()),
+        ));
+        let token = crate::state::idempotency_key(Self::NAME, &input.client_token);
+        if let Some(prior) = store.idempotency.get(&token).cloned() {
+            if prior.fingerprint != fingerprint {
+                return Err(CreateOutboundExternalLinkErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "clientToken {} was already used for a {} request with different parameters",
+                            input.client_token,
+                            Self::NAME,
+                        ),
+                    },
+                )
+                .into());
+            }
+            if let Some(link) =
+                store.find_outbound_external_link(&input.gateway_id, &prior.resource_id)
+            {
+                return Ok(CreateOutboundExternalLinkOutput {
+                    gateway_id: link.gateway_id.clone(),
+                    link_id: link.link_id.clone(),
+                    status: link.status.clone(),
+                });
+            }
+        }
+
+        // The store's own bounds, checked before the insert. A link of either kind
+        // counts against the one link bound, and a gateway delete releases both.
+        if store.links_held() >= crate::state::LINK_QUOTA {
+            return Err(
+                CreateOutboundExternalLinkErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "this emulator holds its limit of {} links",
+                            crate::state::LINK_QUOTA
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        if store.idempotency.len() >= crate::state::IDEMPOTENCY_QUOTA {
+            return Err(
+                CreateOutboundExternalLinkErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "this emulator holds its limit of {} client-token records",
+                            crate::state::IDEMPOTENCY_QUOTA
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The tags the create assigns are held in the record it writes, so the
+        // same per-resource bound `TagResource` enforces is enforced here: a
+        // resource holds at most that many tags whichever call assigned them.
+        let tag_count = input.tags.as_ref().map_or(0, std::collections::HashMap::len);
+        if tag_count > crate::state::TAGS_PER_RESOURCE_QUOTA {
+            return Err(CreateOutboundExternalLinkErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "a resource holds at most {} tags",
+                        crate::state::TAGS_PER_RESOURCE_QUOTA
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let link_id = store.mint_link_id();
+        let link = crate::state::OutboundExternalLink {
+            link_id: link_id.clone(),
+            gateway_id: input.gateway_id.clone(),
+            // Creation is asynchronous, and nothing accepts a link to an endpoint
+            // outside the fabric: it starts here and the clock owes it ACTIVE.
+            status: crate::state::LINK_STATUS_PENDING_CREATION.to_string(),
+            settles_at: Some(now + crate::state::PROVISIONING_DELAY),
+            public_endpoint: input.public_endpoint,
+            // The traffic leaves the fabric for a public endpoint.
+            connectivity_type: crate::state::CONNECTIVITY_TYPE_PUBLIC_EGRESS.to_string(),
+            attributes: input.attributes,
+            log_settings: input.log_settings,
+            // No module flow is configured until UpdateLinkModuleFlow runs.
+            flow_modules: Vec::new(),
+            pending_flow_modules: Vec::new(),
+            tags: input.tags.unwrap_or_default(),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let output = CreateOutboundExternalLinkOutput {
+            gateway_id: link.gateway_id.clone(),
+            link_id: link.link_id.clone(),
+            status: link.status.clone(),
+        };
+        store
+            .outbound_external_links
+            .insert((input.gateway_id, link_id.clone()), link);
+        store.idempotency.insert(
+            token,
+            crate::state::IdempotentCreate {
+                resource_id: link_id,
+                fingerprint,
+            },
+        );
+        Ok(output)
     }
 }
