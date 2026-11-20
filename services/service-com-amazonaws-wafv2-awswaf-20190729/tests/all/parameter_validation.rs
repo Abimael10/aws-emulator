@@ -9,8 +9,8 @@
 //!    with its `Field`, `Parameter` and `Reason` members filled, and a `message`
 //!    composed from exactly those three — never an unmodelled error shape with the
 //!    structured members absent.
-//! 2. WAF judges the resource ARNs a request CARRIES before it judges the syntax
-//!    of the request's other members, so an ARN WAF will not accept at all is
+//! 2. WAF judges a resource ARN a request CARRIES that it cannot even READ as one
+//!    before it judges the syntax of the request's other members, so such an ARN is
 //!    reported even when another member also violates its modelled constraint.
 //! 3. A collection whose ELEMENTS fail the element shape's constraints is reported
 //!    against the collection member's own path, with the value rendered as the
@@ -22,6 +22,7 @@
 
 use serde_json::{json, Value};
 
+use crate::managed_rule_sets::provision_managed_rule_set;
 use crate::web_acl_lifecycle::{create_ip_set, create_web_acl, rule, visibility, Waf};
 
 /// The `ErrorReason` WAF carries for an ARN it will not accept, as recorded.
@@ -65,12 +66,12 @@ pub(crate) fn error_code(body: &Value) -> String {
 }
 
 /// A `PutManagedRuleSetVersions` request publishing ONE version whose
-/// `AssociatedRuleGroupArn` is `arn`, under `lock_token`.
-fn put_versions(arn: Option<&str>, lock_token: &str) -> Value {
+/// `AssociatedRuleGroupArn` is `arn`, against `(name, id)`, under `lock_token`.
+fn put_versions_for(name: &str, id: &str, arn: Option<&str>, lock_token: &str) -> Value {
     let mut request = json!({
-        "Name": "vendor-managed-set",
+        "Name": name,
         "Scope": "REGIONAL",
-        "Id": ENTITY_ID,
+        "Id": id,
         "LockToken": lock_token,
         "RecommendedVersion": "Version_1.0",
     });
@@ -80,6 +81,12 @@ fn put_versions(arn: Option<&str>, lock_token: &str) -> Value {
         });
     }
     request
+}
+
+/// [`put_versions_for`] against an identity no managed rule set of the account
+/// carries.
+fn put_versions(arn: Option<&str>, lock_token: &str) -> Value {
+    put_versions_for("vendor-managed-set", ENTITY_ID, arn, lock_token)
 }
 
 /// One refusal WAF words itself: the call, and the three structured members the
@@ -279,9 +286,9 @@ async fn every_invalid_parameter_refusal_carries_field_parameter_and_reason() {
 /// boundary constraints are not what refuses it.
 ///
 /// A well-formed `rulegroup` ARN naming a rule group that does not exist carries
-/// the same `Reason`, from the same judgement made against the store (see
-/// `crate::refusal_precedence`); the rows here are the ones that need no store at
-/// all.
+/// the same `Reason`, from the same judgement made against the store once the
+/// target the request acts on has resolved (see `crate::refusal_precedence`); the
+/// rows here are the ones that need no store at all.
 #[tokio::test]
 async fn an_unacceptable_resource_reference_carries_the_arn_reason() {
     let waf = Waf::new();
@@ -334,17 +341,23 @@ async fn an_unacceptable_resource_reference_carries_the_arn_reason() {
     }
 }
 
-/// WAF judges the resource ARNs a request CARRIES before it judges the syntax of
-/// the request's other members: with both wrong, the ARN is what is reported.
+/// WAF judges a resource ARN a request CARRIES that it cannot even READ as one
+/// before it judges the syntax of the request's other members: with both wrong, the
+/// ARN is what is reported.
 ///
-/// The table crosses the reference (an ARN WAF will not accept / absent) with the
-/// lock token (malformed in three different ways / well formed), so every
-/// combination is pinned — including that a request whose reference is acceptable
-/// still has its token checked, and that a request with neither fault reaches the
-/// operation itself.
+/// The table crosses the reference (an ARN WAF cannot read as one / absent) with the
+/// lock token (malformed in three different ways / well formed) and with the target
+/// (a managed rule set the account holds / an identity it does not), so every
+/// combination is pinned — including that a request whose reference is readable has
+/// its token checked against the set that exists, that the target the request acts on
+/// is resolved before that token, and that a request with no fault at all reaches the
+/// operation.
 #[tokio::test]
 async fn a_resource_reference_is_resolved_before_the_lock_token() {
-    let waf = Waf::new();
+    let (waf, engine) = Waf::sharing_engine();
+    let set_name = "vendor-managed-set";
+    let (set_id, _set_arn, _set_lock) =
+        provision_managed_rule_set(&engine, "REGIONAL", set_name, None);
     // Not a wafv2 resource ARN at all, so it is a bad PARAMETER whatever the store
     // holds.
     let unacceptable_arn = "arn:aws:s3:::a-bucket-named-like-this";
@@ -355,37 +368,47 @@ async fn a_resource_reference_is_resolved_before_the_lock_token() {
     let bad_tokens = ["stale-token", "1111111", ""];
 
     for token in bad_tokens {
-        // Reference unacceptable AND token bad: the reference wins.
+        for (target, name, id) in [
+            ("a set the account holds", set_name, set_id.as_str()),
+            ("an identity it does not", "never-provisioned", ENTITY_ID),
+        ] {
+            // Reference unreadable AND token bad: the reference wins, whichever
+            // target the request addresses.
+            let (status, body) = waf
+                .call(
+                    "PutManagedRuleSetVersions",
+                    put_versions_for(name, id, Some(unacceptable_arn), token),
+                )
+                .await;
+            let case = format!("unacceptable reference with LockToken {token:?}, against {target}");
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected 400, got status {status} and body {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "WAFInvalidParameterException",
+                "case {case:?}: the unacceptable reference must be what is reported, got {body}"
+            );
+            assert_eq!(
+                body["Field"].as_str().unwrap_or_default(),
+                "RESOURCE_ARN",
+                "case {case:?}: expected Field RESOURCE_ARN, got {body}"
+            );
+            assert!(
+                !body.to_string().contains(token) || token.is_empty(),
+                "case {case:?}: the answer must name the ARN, not the token, got {body}"
+            );
+        }
+
+        // No reference to resolve, against the set the account holds: the token's own
+        // modelled constraint is reported, in the framework's envelope and naming the
+        // token.
         let (status, body) = waf
             .call(
                 "PutManagedRuleSetVersions",
-                put_versions(Some(unacceptable_arn), token),
+                put_versions_for(set_name, &set_id, None, token),
             )
-            .await;
-        let case = format!("unacceptable reference with LockToken {token:?}");
-        assert_eq!(
-            status, 400,
-            "case {case:?}: expected 400, got status {status} and body {body}"
-        );
-        assert_eq!(
-            error_code(&body),
-            "WAFInvalidParameterException",
-            "case {case:?}: the unacceptable reference must be what is reported, got {body}"
-        );
-        assert_eq!(
-            body["Field"].as_str().unwrap_or_default(),
-            "RESOURCE_ARN",
-            "case {case:?}: expected Field RESOURCE_ARN, got {body}"
-        );
-        assert!(
-            !body.to_string().contains(token) || token.is_empty(),
-            "case {case:?}: the answer must name the ARN, not the token, got {body}"
-        );
-
-        // No reference to resolve: the token's own modelled constraint is reported,
-        // in the framework's envelope and naming the token.
-        let (status, body) = waf
-            .call("PutManagedRuleSetVersions", put_versions(None, token))
             .await;
         let case = format!("no reference with LockToken {token:?}");
         assert_eq!(
@@ -403,6 +426,25 @@ async fn a_resource_reference_is_resolved_before_the_lock_token() {
             message.contains("validation error")
                 && message.contains("at 'lockToken' failed to satisfy constraint:"),
             "case {case:?}: the clause must name lockToken, got {message:?}"
+        );
+
+        // The same request against an identity the account does not hold reports the
+        // target instead: the target a write acts on is resolved before its token.
+        let (status, body) = waf
+            .call(
+                "PutManagedRuleSetVersions",
+                put_versions_for("never-provisioned", ENTITY_ID, None, token),
+            )
+            .await;
+        let case = format!("no reference with LockToken {token:?}, against an absent target");
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got status {status} and body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "WAFNonexistentItemException",
+            "case {case:?}: the target must be resolved before the token, got {body}"
         );
     }
 

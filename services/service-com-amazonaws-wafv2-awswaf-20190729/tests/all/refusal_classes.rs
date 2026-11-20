@@ -371,8 +371,8 @@ async fn a_managed_rule_group_that_resolves_to_nothing_is_named_in_the_refusal()
 /// token that is not even `LockToken`-shaped and against a set no account holds, so
 /// what the refusal reports is the ARN rather than either of those. Each of those
 /// faults is in the REQUEST, which is why it is reported ahead of both. An ARN that
-/// is well formed and only fails to RESOLVE is the same refusal, made against the
-/// store and reported just as early
+/// is well formed and only fails to RESOLVE is judged against the store, so it comes
+/// after the target the put acts on
 /// (`crate::refusal_precedence`).
 #[tokio::test]
 async fn an_arn_the_put_cannot_use_is_refused_before_anything_else() {
@@ -417,9 +417,9 @@ async fn an_arn_the_put_cannot_use_is_refused_before_anything_else() {
         assert_invalid_parameter(&body.1, FIELD_RESOURCE_ARN, &arn, ARN_NOT_VALID, case);
     }
 
-    // With an ARN WAF CAN use, the next thing judged is the lock token's own
-    // modelled form — which is how the rows above are shown to have reported the ARN
-    // first rather than only ever reporting ARNs.
+    // With an ARN WAF CAN use, the next thing judged is the target the put acts on —
+    // which is how the rows above are shown to have reported the ARN first rather than
+    // only ever reporting the missing set.
     let (status, body) = waf
         .call_from(
             TEST_REGION,
@@ -437,11 +437,11 @@ async fn an_arn_the_put_cannot_use_is_refused_before_anything_else() {
         .await;
     assert_eq!(
         status, 400,
-        "a lock token that is not LockToken-shaped is refused, got {body}"
+        "a put against a set no account holds is refused, got {body}"
     );
     assert!(
-        error_message(&body).contains("lockToken"),
-        "once the ARN resolves, the lock token is what is reported, got {body}"
+        error_code(&body).ends_with("WAFNonexistentItemException"),
+        "once the ARN is one WAF can read, the missing set is what is reported, got {body}"
     );
 }
 

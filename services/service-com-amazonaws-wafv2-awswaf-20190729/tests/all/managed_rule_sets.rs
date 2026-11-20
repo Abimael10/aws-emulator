@@ -9,9 +9,8 @@
 //! `PutManagedRuleSetVersions` and `UpdateManagedRuleSetVersionExpiryDate`. The rule
 //! these suites assert is: each of them addresses a set the ACCOUNT holds, so an
 //! identity no set of the account carries is refused with 400
-//! `WAFNonexistentItemException` and nothing is published under it — once every
-//! reference the request CARRIES is one WAF can use (see
-//! `crate::refusal_precedence`) — while against
+//! `WAFNonexistentItemException` and nothing is published under it — whatever the
+//! request's body references (see `crate::refusal_precedence`) — while against
 //! a set that IS held, a put stores the versions it names (each priced by the rule
 //! group that defines it) and an expiry update stores the instant it names on one
 //! published version, both rotating the set's optimistic-lock token, and both
@@ -573,8 +572,8 @@ async fn an_expiry_update_stores_the_instant_it_names() {
 
 /// A put whose `AssociatedRuleGroupArn` names no rule group of the account is
 /// refused as the invalid PARAMETER the ARN is — the one refusal WAF answers for
-/// every ARN it cannot use for that member, malformed or merely unresolvable — and
-/// it is answered before the set the put targets is resolved at all.
+/// every ARN it cannot use for that member, malformed or merely unresolvable — once
+/// the set the put targets has itself resolved.
 ///
 /// The rows differ in HOW the ARN fails to name one — a well-formed rule-group ARN
 /// nothing minted, and a rule group of the OTHER scope, since a scope is a

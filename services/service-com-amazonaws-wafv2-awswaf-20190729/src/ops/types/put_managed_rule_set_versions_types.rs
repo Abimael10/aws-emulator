@@ -11,14 +11,14 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-wafv2-awswaf-20190729.json");
 
-// `skip_validation` names `LockToken`: WAF resolves what this request REFERENCES —
-// each published version's `AssociatedRuleGroupArn` — before it judges the
-// optimistic-lock token, and the recorded WAF answer to a request whose ARN is
-// unresolvable AND whose token is malformed reports the ARN. The boundary walk runs
-// every modelled constraint BEFORE the handler, so leaving the token there reports
-// the token instead; the handler checks it after the reference resolution, against
-// the same constraints re-declared in `crate::state::M_LOCK_TOKEN`. Every other
-// member keeps its boundary check.
+// `skip_validation` names `LockToken`: WAF resolves what this request ADDRESSES — the
+// managed rule set the put targets — and what it REFERENCES — each published
+// version's `AssociatedRuleGroupArn` — before it judges the optimistic-lock token, so
+// a request whose reference is unresolvable AND whose token is malformed is answered
+// on the reference. The boundary walk runs every modelled constraint BEFORE the
+// handler, so leaving the token there reports the token instead; the handler checks it
+// after both, against the same constraints re-declared in
+// `crate::state::M_LOCK_TOKEN`. Every other member keeps its boundary check.
 #[smithy_macros::smithy(
     shape = "com.amazonaws.wafv2#PutManagedRuleSetVersionsRequest",
     skip_validation = ["LockToken"]
