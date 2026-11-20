@@ -510,8 +510,9 @@ pub(super) fn member_text(document: &Value, member: &str) -> Option<String> {
     }
 }
 
-/// Which part of a request-target a member's value goes into, which decides one thing:
-/// whether an EMPTY value is one that part can carry.
+/// Which part of a request-target a member's value goes into, which decides two things:
+/// whether an EMPTY value is one that part can carry, and whether the path SEPARATOR is a
+/// character of the value or one the component escapes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Component {
     /// A path label, which stands for one whole segment: an empty one would collapse
@@ -519,7 +520,7 @@ pub(super) enum Component {
     Label,
     /// A GREEDY path label (`{Key+}`), which stands for as many segments as the value
     /// holds: the separator between them is part of the value, so it is carried rather
-    /// than refused. An empty one still collapses the path.
+    /// than escaped. An empty one still collapses the path.
     GreedyLabel,
     /// A query parameter's value, which an operation may model as admitting the empty
     /// string (`Invoke`'s `Qualifier` does), and which a request carries as the
@@ -527,46 +528,62 @@ pub(super) enum Component {
     Query,
 }
 
-/// `value`, when it is text a request-target carries as ONE component — a path segment
-/// or a query parameter's value — and `Err` naming `member` when it is not.
+/// `value` as a request-target carries it as ONE component — a path segment or a query
+/// parameter's value — percent-escaped where the component cannot carry a byte as it
+/// stands, and `Err` naming `member` for a value that names no component at all.
 ///
-/// A member an operation binds to the path or the query is one whose own modelled
-/// pattern admits only characters a URI component admits: a function's name, its ARN and
-/// a version qualifier are written with the unreserved characters plus `:` and `$`, all
-/// of which a component carries as they stand. A caller's parameter CAN hold anything,
-/// so a value outside that set is one the request cannot address — the delimiters are
-/// what would make it more than one component — and the call is not made rather than
-/// made against a target assembled out of it. Nothing is escaped here: a value that
-/// needed escaping names no resource of the invoked operation either.
+/// WHETHER a value is one the invoked operation admits is that operation's own question,
+/// answered by its own front door against its own modelled constraints: a caller's
+/// parameter can hold anything, and what a client's SDK does with a value bound to the
+/// path or the query is to percent-escape the bytes the component cannot carry and SEND
+/// it. So that is what is done here — the call is made, and the answer is the invoked
+/// operation's, whether it serves the request or refuses it as one of its members'
+/// constraints does not admit. A value written with the unreserved characters plus the
+/// two sub-delimiters an ARN and a version qualifier carry (`:`, `$`) travels untouched,
+/// which is every value the invoked operations' own patterns admit.
+///
+/// The only value that names no component is an EMPTY path segment: a label stands for
+/// one whole segment, so an empty one collapses the path it is part of and there is no
+/// request-target to send. A query parameter's value may be empty — an operation may
+/// model it so (`Invoke`'s `Qualifier` does) — and is carried as the parameter with
+/// nothing after its `=`.
 ///
 /// The path SEPARATOR is the one character whose place depends on the component: a
 /// greedy label spans several segments and a prefix or a key written in a query names
-/// one, so each of those carries it, while a single-segment label does not.
-pub(super) fn one_component(value: &str, member: &str, component: Component) -> Result<String, String> {
-    let punctuation = match component {
-        Component::Label => URI_COMPONENT_PUNCTUATION,
-        Component::GreedyLabel | Component::Query => URI_PATH_PUNCTUATION,
-    };
-    let carried = value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || punctuation.contains(&byte));
-    let empty = value.is_empty()
-        && matches!(component, Component::Label | Component::GreedyLabel);
-    if empty || !carried {
+/// one, so each of those carries it, while a single-segment label escapes it.
+pub(super) fn one_component(
+    value: &str,
+    member: &str,
+    component: Component,
+) -> Result<String, String> {
+    if value.is_empty() && matches!(component, Component::Label | Component::GreedyLabel) {
         return Err(format!(
-            "this task's '{member}' is not text a request-target carries as one component, so it \
-             addresses nothing the call can be made against"
+            "this task's '{member}' is empty, so the path segment it stands for addresses \
+             nothing the call can be made against"
         ));
     }
-    Ok(value.to_string())
+    let escaped = match component {
+        Component::Label => URI_COMPONENT_ESCAPED,
+        Component::GreedyLabel | Component::Query => URI_PATH_ESCAPED,
+    };
+    Ok(::percent_encoding::utf8_percent_encode(value, escaped).to_string())
 }
 
-/// The punctuation a URI component carries unescaped beside the alphanumerics: RFC
-/// 3986's unreserved set (`-`, `.`, `_`, `~`) and the two sub-delimiters an ARN and a
-/// version qualifier are written with (`:`, `$`).
-pub(super) const URI_COMPONENT_PUNCTUATION: &[u8] = b"-._~:$";
+/// The bytes a URI component is written with ESCAPED: everything but the alphanumerics,
+/// RFC 3986's unreserved punctuation (`-`, `.`, `_`, `~`) and the two sub-delimiters an
+/// ARN and a version qualifier are written with (`:`, `$`), each of which a component
+/// carries as it stands.
+///
+/// Those last two are a DELIBERATE narrowing of the escaping a client's SDK performs,
+/// which escapes every byte outside the unreserved set: an ARN and a version qualifier
+/// are what the invoked operations' own members are written with, every service's front
+/// door reads the two forms as the same value, and carrying them as they stand keeps a
+/// request that is made today byte for byte what it was.
+pub(super) const URI_COMPONENT_ESCAPED: &::percent_encoding::AsciiSet =
+    &UNRESERVED_ONLY.remove(b':').remove(b'$');
 
-/// [`URI_COMPONENT_PUNCTUATION`] plus the path separator, for the components that span
-/// segments: a greedy label (an object's key) and a query parameter naming a path (a
+/// [`URI_COMPONENT_ESCAPED`] with the path separator carried too, for the components that
+/// span segments: a greedy label (an object's key) and a query parameter naming a path (a
 /// listing's prefix).
-pub(super) const URI_PATH_PUNCTUATION: &[u8] = b"-._~:$/";
+pub(super) const URI_PATH_ESCAPED: &::percent_encoding::AsciiSet =
+    &URI_COMPONENT_ESCAPED.remove(b'/');

@@ -1323,7 +1323,7 @@ fn an_instant_in_a_result_is_reported_in_epoch_millis() {
 fn a_rest_integrations_request_binds_each_member_where_the_operation_does() {
     let call = read("arn:aws:states:::lambda:invoke").expect("this names a call");
     let path = "/2015-03-31/functions";
-    let rows: [RestRow; 10] = [
+    let rows: [RestRow; 11] = [
         (
             "a function named by its bare name, the payload a document",
             ::serde_json::json!({"FunctionName": "handler", "Payload": {"a": 1}}),
@@ -1346,9 +1346,22 @@ fn a_rest_integrations_request_binds_each_member_where_the_operation_does() {
             )),
         ),
         (
-            "a name carrying a character a request-target does not carry as one \
-                 component",
+            // A value bound to the path is PERCENT-ESCAPED and sent, exactly as a
+            // client's SDK sends one: whether the invoked operation admits it is that
+            // operation's own question, answered by its own front door.
+            "a name carrying a character a path segment does not carry as it stands",
             ::serde_json::json!({"FunctionName": "two words"}),
+            Some((
+                "/2015-03-31/functions/two%20words/invocations",
+                Vec::new(),
+                "",
+            )),
+        ),
+        (
+            // The one value that names no component at all: a label stands for a whole
+            // path segment, so an empty one collapses the path it is part of.
+            "a name given as the empty string, which no path segment stands for",
+            ::serde_json::json!({"FunctionName": ""}),
             None,
         ),
         (
@@ -1473,6 +1486,124 @@ fn a_rest_integrations_request_binds_each_member_where_the_operation_does() {
             (Err(why), Some(_)) => {
                 panic!("case {case:?}: expected a request, got the refusal {why:?}")
             }
+        }
+    }
+}
+
+/// A value bound to the request-target is carried percent-escaped, and WHICH bytes it
+/// carries as they stand is the COMPONENT's own: a single-segment label escapes the path
+/// separator, while a greedy label and a query parameter's value — each of which spans
+/// segments — carry it and escape the delimiters that would end the component instead.
+///
+/// The rows differ along the component and along the byte: the path separator, the two
+/// delimiters a query is built of, the characters that would start a query or a fragment,
+/// text outside ASCII (whose UTF-8 is escaped byte by byte), the punctuation an ARN and a
+/// version qualifier are written with, and the empty value each component does or does
+/// not carry.
+#[test]
+fn a_request_target_component_escapes_what_it_cannot_carry() {
+    // (case, the component, the value a caller's parameter held, what it is carried as)
+    let rows: [(&str, Component, &str, Option<&str>); 12] = [
+        (
+            "a space in a single path segment",
+            Component::Label,
+            "two words",
+            Some("two%20words"),
+        ),
+        (
+            // A label stands for ONE segment, so the separator is escaped: a caller
+            // cannot make a second segment out of its own value.
+            "the path separator in a single path segment",
+            Component::Label,
+            "a/b",
+            Some("a%2Fb"),
+        ),
+        (
+            "the characters that would start a query or a fragment",
+            Component::Label,
+            "a?b#c",
+            Some("a%3Fb%23c"),
+        ),
+        (
+            "text outside ASCII, escaped byte by byte as its UTF-8",
+            Component::Label,
+            "café",
+            Some("caf%C3%A9"),
+        ),
+        (
+            // Every form of the members these operations bind to the path is written
+            // with these, so each travels untouched.
+            "an ARN and a version qualifier, which a component carries as they stand",
+            Component::Label,
+            "arn:aws:lambda:us-west-2:000000000000:function:handler:$LATEST",
+            Some("arn:aws:lambda:us-west-2:000000000000:function:handler:$LATEST"),
+        ),
+        (
+            "an empty single path segment, which collapses the path",
+            Component::Label,
+            "",
+            None,
+        ),
+        (
+            // A greedy label spans as many segments as the value holds, so the
+            // separator between them is the value's own.
+            "the path separator in a greedy label",
+            Component::GreedyLabel,
+            "prefix/nested/object.txt",
+            Some("prefix/nested/object.txt"),
+        ),
+        (
+            "a space in a greedy label",
+            Component::GreedyLabel,
+            "prefix/two words.txt",
+            Some("prefix/two%20words.txt"),
+        ),
+        (
+            "an empty greedy label, which collapses the path just the same",
+            Component::GreedyLabel,
+            "",
+            None,
+        ),
+        (
+            // The two delimiters a query is built of: escaped, so a caller's value is
+            // ONE parameter rather than several.
+            "the delimiters a query is built of, in a query parameter's value",
+            Component::Query,
+            "a&b=c",
+            Some("a%26b%3Dc"),
+        ),
+        (
+            "a path written in a query parameter, which names one",
+            Component::Query,
+            "prefix/nested/",
+            Some("prefix/nested/"),
+        ),
+        (
+            // `Qualifier`'s own pattern admits the empty string, so the parameter is
+            // carried with nothing after its `=`.
+            "an empty query parameter's value, which its member may admit",
+            Component::Query,
+            "",
+            Some(""),
+        ),
+    ];
+
+    for (case, component, value, expected) in rows {
+        match (one_component(value, "Member", component), expected) {
+            (Ok(carried), Some(expected)) => assert_eq!(
+                carried, expected,
+                "case {case:?}: expected the component {expected:?}, got {carried:?}"
+            ),
+            (Err(why), None) => assert!(
+                why.contains("'Member'"),
+                "case {case:?}: expected the member naming no component to be named, got {why:?}"
+            ),
+            (Ok(carried), None) => {
+                panic!("case {case:?}: expected no component, got {carried:?}")
+            }
+            (Err(why), Some(expected)) => panic!(
+                "case {case:?}: expected the component {expected:?}, got the refusal {why:?}"
+            ),
         }
     }
 }

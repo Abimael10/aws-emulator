@@ -42,14 +42,14 @@ use crate::query_wire::elements;
 /// Every schedule below names an instant seconds ahead, so the deadline is room for the
 /// clock's tick and the calls on a loaded host rather than a latency expectation of its
 /// own — it is reached only where nothing was invoked at all.
-const PATIENCE: Duration = Duration::from_secs(180);
-const LOOK_INTERVAL: Duration = Duration::from_millis(100);
+pub(crate) const PATIENCE: Duration = Duration::from_secs(180);
+pub(crate) const LOOK_INTERVAL: Duration = Duration::from_millis(100);
 
 /// How far ahead each schedule's one occurrence is placed.
 const OCCURRENCE_IN: Duration = Duration::from_secs(4);
 
 /// The account every emulated ARN carries.
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// The universal target every row names: CloudFront's `CreateInvalidation`, written the
 /// way the AWS SDK integration family names an operation — the SDK SERVICE ID and that
@@ -118,7 +118,7 @@ async fn sqs(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16
 }
 
 /// The queue the schedules name for their failed events: its url and its ARN.
-async fn given_queue(router: &MultiServiceRouter, name: &str) -> (String, String) {
+pub(crate) async fn given_queue(router: &MultiServiceRouter, name: &str) -> (String, String) {
     let (status, created) = sqs(router, "CreateQueue", &json!({ "QueueName": name })).await;
     assert_eq!(
         status, 200,
@@ -148,7 +148,7 @@ async fn given_queue(router: &MultiServiceRouter, name: &str) -> (String, String
 /// A role EventBridge Scheduler may assume, granted each `(action, resource)` pair the
 /// invocation needs: the pair AWS documents for an execution role — a trust policy for
 /// the scheduler service principal, and the permissions the schedule's own calls need.
-async fn given_execution_role(
+pub(crate) async fn given_execution_role(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
@@ -220,12 +220,13 @@ fn whole_seconds_ahead(ahead: Duration) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(now) + ahead
 }
 
-/// A one-time schedule whose universal target carries `input` as the invoked operation's
-/// request, with `queue` as the queue its failed events go to.
-async fn given_schedule(
+/// A one-time schedule whose universal target `target` carries `input` as the invoked
+/// operation's request, with `queue` as the queue its failed events go to.
+pub(crate) async fn given_schedule(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
+    target: &str,
     role: &str,
     queue: &str,
     input: &str,
@@ -241,7 +242,7 @@ async fn given_schedule(
             "FlexibleTimeWindow": { "Mode": "OFF" },
             "State": "ENABLED",
             "Target": {
-                "Arn": UNIVERSAL_TARGET,
+                "Arn": target,
                 "RoleArn": role,
                 "Input": input,
                 "DeadLetterConfig": { "Arn": queue },
@@ -258,7 +259,7 @@ async fn given_schedule(
     let (status, read) = scheduler(router, "GET", &format!("/schedules/{name}"), None).await;
     assert_eq!(
         (status, read["Target"]["Arn"].as_str(), read["State"].as_str()),
-        (200, Some(UNIVERSAL_TARGET), Some("ENABLED")),
+        (200, Some(target), Some("ENABLED")),
         "case {case:?}: GetSchedule must report the universal target enabled, got {status} \
          with {read}"
     );
@@ -302,7 +303,12 @@ async fn invalidations(router: &MultiServiceRouter, distribution: &str) -> Vec<V
 }
 
 /// Every message the dead-letter queue holds, with its attributes.
-async fn dead_lettered(router: &MultiServiceRouter, url: &str) -> Vec<Value> {
+///
+/// `pub(crate)` with the helpers above: the sibling suite that reads the same rule for a
+/// universal target of ANOTHER service
+/// ([`super::scheduler_universal_target_invokes_its_lambda`]) reads a queue exactly this
+/// way, and a second copy of that wire would let the two readings of it drift.
+pub(crate) async fn dead_lettered(router: &MultiServiceRouter, url: &str) -> Vec<Value> {
     let (status, received) = sqs(
         router,
         "ReceiveMessage",
@@ -390,6 +396,7 @@ async fn a_universal_target_submits_the_invalidation_its_input_names() {
             &router,
             case,
             &format!("universal-schedule-{index}"),
+            UNIVERSAL_TARGET,
             &role,
             &queue_arn,
             &input,
