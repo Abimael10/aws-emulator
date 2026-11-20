@@ -133,7 +133,23 @@ uuid = { version = "1", features = ["v4"] }
 # `sql_wire_planes`: the same traits each wire reads and writes its own protocol through,
 # the blocking pool every statement of a SQL-wire session runs on (`rt`, from the
 # workspace's own feature set), and the clock its own cases wait on.
-tokio = { workspace = true, features = ["io-util", "time"] }
+# `iot_mqtt_broker`: `sync` carries the per-connection channel the broker hands a live
+# client's session its deliveries over, and the notification that closes one.
+tokio = { workspace = true, features = ["io-util", "sync", "time"] }
+# `iot_mqtt_broker`: the MQTT 3.1.1 packet codec the broker reads a client's CONNECT,
+# SUBSCRIBE and PUBLISH with and writes its own CONNACK, SUBACK, PUBLISH and PINGRESP
+# with — the maintained serializer of the protocol, so the wire a stock MQTT client
+# speaks is read by that codec rather than by a framing reader written here. A codec
+# over bytes: it opens no socket (the core owns it) and reaches nothing off this process.
+mqttbytes = "0.6"
+# `iot_mqtt_broker`: the published broker address serves the IoT HTTPS data plane as well
+# as MQTT — one address, both wires, as the host AWS publishes for an account's data
+# endpoint does — so that socket speaks HTTP/1.1 with the same server its sibling planes
+# are served by. `hyper-util` carries the tokio IO and timer adapters for it, and
+# `http-body-util` the bounded body reader and the whole-body answer.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 # `sql_wire_planes`: the SQL engine a database endpoint's statements run against, in memory
 # and per resource — the `bundled` SQLite already in this workspace, at the version and
 # feature set the Amazon RDS engine endpoint builds (`vendor/emulator-telemetry` and the

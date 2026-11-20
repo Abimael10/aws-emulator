@@ -77,6 +77,10 @@
 //!   create, which reports the id and ARN of the job that applies the deployment) and
 //!   read by the IoT jobs plane, which is where a client then describes, deletes or
 //!   waits on that job and so must find the very job the other service reported;
+//! * [`iot_mqtt_broker`], the MQTT message broker an IoT device connects to — its
+//!   sessions, and the endpoint it answers at — because the IoT control plane PUBLISHES
+//!   that address and the IoT data plane REPORTS on the sessions, and the broker that
+//!   holds them is neither of the two;
 //! * [`db_data_sources`], the directory of which database service minted an immutable
 //!   DB resource id — written by the database control planes when they mint one, read
 //!   by the services that monitor those resources, which cannot tell an RDS id from a
@@ -534,6 +538,7 @@ pub mod iam_trust_policy;
 pub mod iot_commands;
 pub mod iot_job_executions;
 pub mod iot_jobs;
+pub mod iot_mqtt_broker;
 /// The ONE construction of the in-process Kinesis client a service DELIVERS a data record
 /// through, so that hop — and the fact that it opens no socket — is configured once rather
 /// than per service.

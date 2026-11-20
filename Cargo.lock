@@ -6494,6 +6494,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mqttbytes"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7bd39d24e28e1544d74ff5746e322a477e52353c8ba7adcaa83d2e760752853"
+dependencies = [
+ "bytes",
+]
+
+[[package]]
 name = "mt19937"
 version = "3.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22061,10 +22070,14 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "ipnet",
  "iso8601-duration",
  "jsonata-rs",
  "mp4",
+ "mqttbytes",
  "percent-encoding",
  "pkcs1",
  "pkcs8 0.10.2",

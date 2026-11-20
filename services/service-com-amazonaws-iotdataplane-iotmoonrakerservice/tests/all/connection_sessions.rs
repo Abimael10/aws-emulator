@@ -28,12 +28,14 @@
 //! * A disconnected client's record is reported for exactly as long as the model
 //!   documents, and is released once the clock has passed that window.
 //!
-//! A session is opened by an MQTT CONNECT, a transport this emulator does not serve, so
-//! these cases put sessions in the table directly — which is what the broker's own
-//! CONNECT handling would do — and then drive every operation over HTTP. Each table row
-//! varies what the rule generalises over: client id form, connection state, session
-//! settings, subscription count, page size, payload size, topic form, and how long ago
-//! the client disconnected.
+//! A session is opened by an MQTT CONNECT on the broker's own endpoint, which is a
+//! transport these cases do not stand up: they put sessions in the broker's table
+//! directly — which is what that CONNECT handling does — and then drive every operation
+//! over HTTP. The connection itself, end to end over a socket, is driven in
+//! `core/router/tests/all/iot_mqtt_broker_sessions.rs`. Each table row varies what the
+//! rule generalises over: client id form, connection state, session settings,
+//! subscription count, page size, payload size, topic form, and how long ago the client
+//! disconnected.
 
 use std::sync::Arc;
 
@@ -48,7 +50,6 @@ use service_com_amazonaws_iotdataplane_iotmoonrakerservice::state::{
     MAX_QUEUED_SESSION_MESSAGES, MAX_TOPIC_BYTES, MAX_TOPIC_PARTS, NO_DELIVERY_CONFIRMATION,
     SERVER_INITIATED_DISCONNECT,
 };
-use service_com_amazonaws_iotdataplane_iotmoonrakerservice::ComAmazonawsIotdataplaneIotmoonrakerserviceState as IotDataState;
 
 /// A signed-looking request header so the router's `can_handle` resolves this service by
 /// its SigV4 credential scope (signing name `iotdata`), the way an SDK request does.
@@ -121,26 +122,28 @@ impl Harness {
 
     /// Open `session` in the broker's session table, which is what an MQTT CONNECT does.
     fn connect(&self, session: MqttSession) {
-        self.engine
-            .state::<IotDataState>()
+        self.broker()
             .lock()
-            .connections
+            .sessions
             .insert(session.client_id.clone(), session);
+    }
+
+    /// The broker's session table, in the SAME shared engine this service is mounted on:
+    /// the sessions the connection operations report on belong to the broker a device
+    /// connects to, not to this service's own store.
+    fn broker(&self) -> engine::ServiceState<service_common::iot_mqtt_broker::MqttBrokerState> {
+        service_common::iot_mqtt_broker::broker_state(&*self.engine)
+            .expect("the engine vends the broker's store")
     }
 
     /// The session the broker holds for `client_id`, as it stands now.
     fn stored_session(&self, client_id: &str) -> Option<MqttSession> {
-        self.engine
-            .state::<IotDataState>()
-            .lock()
-            .connections
-            .get(client_id)
-            .cloned()
+        self.broker().lock().sessions.get(client_id).cloned()
     }
 
     /// How many client ids the table holds, reported without releasing anything.
     fn session_count(&self) -> usize {
-        self.engine.state::<IotDataState>().lock().connections.len()
+        self.broker().lock().sessions.len()
     }
 
     async fn send(&self, method: &str, uri: &str, body: Vec<u8>) -> Answer {

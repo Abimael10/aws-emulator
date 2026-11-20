@@ -187,7 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+        let state = crate::state::broker(&*self.engine).ok_or_else(|| {
             GetConnectionErrorModeled::InternalFailureException(InternalFailureException::new(
                 "An unexpected error has occurred.",
             ))

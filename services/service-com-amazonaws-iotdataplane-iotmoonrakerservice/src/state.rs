@@ -2,7 +2,7 @@
 
 //! Engine state for the com-amazonaws-iotdataplane-iotmoonrakerservice service.
 //!
-//! Three stores, and every handler computes its whole response from them:
+//! Two stores, and every handler computes its whole response from them:
 //!
 //! * `shadows` — one [`ShadowSlot`] per `(thingName, shadowName)`, with the empty
 //!   shadow name standing for the unnamed ("classic") shadow. The slot holds the
@@ -12,12 +12,15 @@
 //!   is the slot's, not the document's, so it survives the document's deletion.
 //! * `retained_messages` — the MQTT retained message of each topic, as the last
 //!   `Publish` with `retain=true` left it.
-//! * `connections` — the MQTT session the broker holds per client id, which is what the
-//!   connection operations (`GetConnection`, `ListSubscriptions`, `SendDirectMessage`,
-//!   `DeleteConnection`) report on; a client id with no session is their shared
-//!   not-found condition.
 //!
-//! All three are `BTreeMap`s so a list operation walks them in a stable key order and an
+//! The MQTT SESSIONS the connection operations (`GetConnection`, `ListSubscriptions`,
+//! `SendDirectMessage`, `DeleteConnection`) report on are not here: they belong to the
+//! BROKER a device connects to, which is neither this service nor the control plane, and
+//! live in the shared store both reach ([`::service_common::iot_mqtt_broker`], reached
+//! through [`broker`]). A client id the broker holds no session for is those operations'
+//! shared not-found condition.
+//!
+//! Both are `BTreeMap`s so a list operation walks them in a stable key order and an
 //! offset-style `nextToken` keeps meaning across calls.
 //!
 //! Beside the two stores, this module holds the service's RESPONSE TEXT: the fixed
@@ -26,7 +29,7 @@
 //! same condition and a message composed per handler drifts into describing the
 //! emulator's internals instead of the service's contract.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -705,15 +708,52 @@ pub const CLIENT_ID_NOT_VALID: &str = "This client ID isn't valid. Client IDs mu
 /// request is in it.
 pub const INVALID_THING_NAME: &str = "Invalid thing name specified in request";
 
-/// The service's answer when a `SendDirectMessage` asked for delivery confirmation.
+/// The service's answer when a `SendDirectMessage` asked for delivery confirmation and the
+/// addressed client holds no connection that could give one.
 ///
 /// `confirmation=true` means the service delivers at QoS 1 and answers only once the
-/// RECEIVING CLIENT has sent a PUBACK; this emulator serves no MQTT transport, so no
-/// client process can ever send one, and the modelled 504 is the honest answer rather
-/// than a 200 that claims a confirmation nothing produced.
+/// RECEIVING CLIENT has sent a PUBACK. A client whose session the broker holds but whose
+/// connection is closed has no transport to acknowledge over — the message waits on its
+/// persistent session for the client's return — so the modelled 504 is the honest answer
+/// rather than a 200 that claims a confirmation nothing produced.
 pub const NO_DELIVERY_CONFIRMATION: &str =
     "this emulator holds the client's session but serves no MQTT connection it could \
      acknowledge the delivery over, so no delivery confirmation can be received";
+
+/// The service's answer when the message WAS written to the client's connection and the
+/// client did not acknowledge it in time: the condition the modelled
+/// `GatewayTimeoutException` states — "The delivery confirmation was not received from the
+/// client within the specified timeout period"
+/// (`smithy_query(query="operation", operation="SendDirectMessage")`).
+pub const DELIVERY_NOT_CONFIRMED: &str =
+    "The delivery confirmation was not received from the client within the specified \
+     timeout period.";
+
+/// How long a `SendDirectMessage` asking for delivery confirmation waits for the client's
+/// PUBACK, for the `timeout` the request carried.
+///
+/// Source: `SendDirectMessageRequest$timeout`'s own documentation — "the maximum time, in
+/// seconds, to wait for a delivery confirmation (PUBACK) from the receiving client …
+/// Valid range: 1 to 15 seconds. Default value: 5 seconds"
+/// (`smithy_query(query="doc", shape="SendDirectMessageRequest", member="timeout")`). A
+/// request that carries no timeout of its own carries the member's modelled default of 0,
+/// which names no wait, so it waits the documented default.
+pub fn confirmation_timeout(requested_seconds: i32) -> std::time::Duration {
+    let seconds = if requested_seconds < MIN_CONFIRMATION_TIMEOUT_SECONDS {
+        DEFAULT_CONFIRMATION_TIMEOUT_SECONDS
+    } else {
+        requested_seconds.min(MAX_CONFIRMATION_TIMEOUT_SECONDS)
+    };
+    std::time::Duration::from_secs(seconds as u64)
+}
+
+/// The bounds and the default of that wait, as the member documents them (see
+/// [`confirmation_timeout`]).
+pub const MIN_CONFIRMATION_TIMEOUT_SECONDS: i32 = 1;
+/// See [`MIN_CONFIRMATION_TIMEOUT_SECONDS`].
+pub const MAX_CONFIRMATION_TIMEOUT_SECONDS: i32 = 15;
+/// See [`MIN_CONFIRMATION_TIMEOUT_SECONDS`].
+pub const DEFAULT_CONFIRMATION_TIMEOUT_SECONDS: i32 = 5;
 
 /// The lifecycle disconnect reason a disconnect the SERVICE performed carries — which is
 /// what `DeleteConnection` is, as against a client closing its own connection
@@ -721,118 +761,20 @@ pub const NO_DELIVERY_CONFIRMATION: &str =
 /// `disconnectReason` takes.
 pub const SERVER_INITIATED_DISCONNECT: &str = "SERVER_INITIATED_DISCONNECT";
 
-/// How long a disconnected client's connection information is still reported, in
-/// MILLISECONDS.
-///
-/// Source: `GetConnectionResponse$disconnectedSince`'s own documentation — "This
-/// information is available for 30 minutes after the client disconnects"
-/// (`smithy_query(query="doc", shape="GetConnectionResponse", member="disconnectedSince")`).
-/// Past it the session record is no longer something the service reports, so the
-/// connection operations answer [`CLIENT_NOT_FOUND`] and the record is released.
-pub const DISCONNECT_INFORMATION_RETENTION_MILLIS: i64 = 30 * 60 * 1000;
-
-/// How many messages one session queues for a client that is offline. The IoT Core
-/// message-broker quota "Maximum number of queued messages per persistent session" is
-/// 100, and a 101st delivery pushes the oldest out, as a broker's bounded queue does.
-pub const MAX_QUEUED_SESSION_MESSAGES: usize = 100;
-
-/// One message `SendDirectMessage` delivered to a client, kept verbatim: the message a
-/// session queues for a client that is offline is exactly the bytes and MQTT5 properties
-/// that were sent.
-#[derive(Debug, Clone)]
-pub struct DirectMessage {
-    pub topic: String,
-    pub payload: Vec<u8>,
-    /// The QoS the delivery used: 1 when the sender asked for confirmation, else 0 —
-    /// what `SendDirectMessageRequest$confirmation` documents.
-    pub qos: i32,
-    pub content_type: Option<String>,
-    pub response_topic: Option<String>,
-    pub user_properties: Option<String>,
-    pub payload_format_indicator: Option<String>,
-    pub correlation_data: Option<String>,
-    /// When the message was delivered, in epoch MILLISECONDS.
-    pub delivered_at_millis: i64,
-}
-
-/// One MQTT client session the broker is holding: what the connection operations report
-/// on, and what `DeleteConnection` disconnects or discards.
-///
-/// A session is opened by an MQTT CONNECT, which is a transport this emulator does not
-/// serve, so nothing in the HTTP data plane puts a session in the table: a client id that
-/// has never connected has no session, which is why every connection operation answers
-/// it with [`CLIENT_NOT_FOUND`] — the 404 AWS answers for one. Every field is a fact
-/// about the session, so each operation's response is computed from the record and never
-/// from the request that asked for it.
-#[derive(Debug, Clone, Default)]
-pub struct MqttSession {
-    /// The client id the session was opened under, which `GetConnection` reports back.
-    pub client_id: String,
-    /// Whether the client's network connection is open. A session outlives it when the
-    /// client asked for a persistent session.
-    pub connected: bool,
-    /// Whether the client connected with a clean session.
-    pub clean_session: bool,
-    /// The thing associated with the client's principal, when there is one.
-    pub thing_name: Option<String>,
-    /// The keep-alive interval the client asked for, in SECONDS.
-    pub keep_alive_seconds: i32,
-    /// The session expiry interval the client configured, in SECONDS.
-    pub session_expiry_seconds: i64,
-    /// When the client connected, in epoch MILLISECONDS — the unit
-    /// `GetConnectionResponse$connectedSince` documents.
-    pub connected_since_millis: i64,
-    /// When the client disconnected, in epoch MILLISECONDS, or 0 while it is connected.
-    pub disconnected_since_millis: i64,
-    /// Why the client last disconnected, when it is disconnected.
-    pub disconnect_reason: Option<String>,
-    /// The socket information, which `GetConnection` reports only to a request that
-    /// asked for it (`includeSocketInformation`).
-    pub source_ip: Option<String>,
-    pub source_port: i32,
-    pub target_ip: Option<String>,
-    pub target_port: i32,
-    /// The VPC endpoint the client connected through, for a client that connected
-    /// through one.
-    pub vpc_endpoint_id: Option<String>,
-    /// The topic filters this session subscribes to, each with its QoS, in stable
-    /// filter order — the order `ListSubscriptions` pages over.
-    pub subscriptions: BTreeMap<String, i32>,
-    /// What `SendDirectMessage` delivered to this session while the client was offline,
-    /// oldest first and bounded by [`MAX_QUEUED_SESSION_MESSAGES`]. A message to a
-    /// CONNECTED client is handed to the connection and queues nothing, exactly as a
-    /// publish to a live subscriber leaves no trace.
-    pub queued_messages: VecDeque<DirectMessage>,
-}
-
-impl MqttSession {
-    /// Whether the service still reports this session at `now_millis`: always while the
-    /// client is connected, and for [`DISCONNECT_INFORMATION_RETENTION_MILLIS`] after it
-    /// disconnected.
-    pub fn is_reported_at(&self, now_millis: i64) -> bool {
-        self.connected
-            || now_millis.saturating_sub(self.disconnected_since_millis)
-                < DISCONNECT_INFORMATION_RETENTION_MILLIS
-    }
-
-    /// Close this session's network connection at `at_millis`, recording why. The
-    /// session state (its subscriptions and queued messages) is kept: that is what makes
-    /// it a persistent session.
-    pub fn disconnect(&mut self, reason: &str, at_millis: i64) {
-        self.connected = false;
-        self.disconnected_since_millis = at_millis;
-        self.disconnect_reason = Some(reason.to_string());
-    }
-
-    /// Queue `message` for this offline session, dropping the oldest once the queue is
-    /// at [`MAX_QUEUED_SESSION_MESSAGES`].
-    pub fn queue(&mut self, message: DirectMessage) {
-        self.queued_messages.push_back(message);
-        while self.queued_messages.len() > MAX_QUEUED_SESSION_MESSAGES {
-            self.queued_messages.pop_front();
-        }
-    }
-}
+/// The MQTT session a client id is held under, the message one carries and the live
+/// connection one holds, together with how long a disconnected client's connection
+/// information is reported and how many messages a session queues: all of them facts about
+/// the BROKER's sessions, which live in the shared store
+/// ([`::service_common::iot_mqtt_broker`]) because the broker that holds them is neither
+/// this service nor the control plane.
+pub use ::service_common::iot_mqtt_broker::{
+    DirectMessage, LiveConnection, MqttSession, DISCONNECT_INFORMATION_RETENTION_MILLIS,
+    MAX_QUEUED_SESSION_MESSAGES,
+};
+/// The broker itself, re-exported: the store this service's connection operations read and
+/// write, and the MQTT wire a client of it speaks — so a test of this emulator reaches
+/// both through the service whose operations report on them.
+pub use ::service_common::iot_mqtt_broker;
 
 /// Per-service state for com-amazonaws-iotdataplane-iotmoonrakerservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -842,8 +784,6 @@ pub struct ComAmazonawsIotdataplaneIotmoonrakerserviceState {
     pub shadows: BTreeMap<(String, String), ShadowSlot>,
     /// Retained messages keyed by topic.
     pub retained_messages: BTreeMap<String, RetainedMessage>,
-    /// The MQTT session the broker holds per client id — see [`MqttSession`].
-    pub connections: BTreeMap<String, MqttSession>,
 }
 
 impl ComAmazonawsIotdataplaneIotmoonrakerserviceState {
@@ -872,23 +812,6 @@ impl ComAmazonawsIotdataplaneIotmoonrakerserviceState {
     /// A delete consumes one too, so this does not fall back after a delete.
     pub fn shadow_version(&self, key: &(String, String)) -> i64 {
         self.shadows.get(key).map_or(0, |slot| slot.version)
-    }
-
-    /// Release every session whose record the service no longer reports — see
-    /// [`MqttSession::is_reported_at`]. A release the CLOCK already made due: it was owed
-    /// at this instant whether or not anybody called, so a reporting operation may
-    /// materialise it before it answers.
-    pub fn release_retired_sessions(&mut self, now_millis: i64) {
-        self.connections
-            .retain(|_, session| session.is_reported_at(now_millis));
-    }
-
-    /// The session the broker holds for `client_id`, after the sessions the clock has
-    /// already retired are released. `None` is the condition every connection operation
-    /// answers with [`CLIENT_NOT_FOUND`].
-    pub fn session(&mut self, client_id: &str, now_millis: i64) -> Option<&mut MqttSession> {
-        self.release_retired_sessions(now_millis);
-        self.connections.get_mut(client_id)
     }
 }
 
@@ -926,4 +849,19 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsIotdataplaneIotmoonrakerserviceState>)
+}
+
+/// The BROKER's store in the shared engine: the sessions the connection operations report
+/// on, which an MQTT CONNECT on the published endpoint opens and this service's
+/// `DeleteConnection` closes.
+///
+/// It is not this service's own store, and not the control plane's: the broker holds the
+/// sessions, the control plane publishes the address a device opens one at, and this plane
+/// reports on them, so the three read ONE store
+/// ([`::service_common::iot_mqtt_broker`]). Answer `None` with a modelled server error,
+/// never with a store of this handler's own.
+pub fn broker<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<::service_common::iot_mqtt_broker::MqttBrokerState>> {
+    ::service_common::iot_mqtt_broker::broker_state(engine)
 }

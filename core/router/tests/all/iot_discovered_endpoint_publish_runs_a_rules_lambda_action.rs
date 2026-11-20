@@ -5,13 +5,15 @@
 //! (`DescribeEndpoint`), build a data-plane client on the address it published, publish there —
 //! and read the invocation the matched topic rule's `lambda` action made.
 //!
-//! RULE: a discovery operation publishes an address this emulator SERVES, so whatever endpoint
-//! type a client asks for it is handed the `host[:port]` the emulator's own endpoint is served
-//! at and never a host outside it; and a message the data plane accepted at that address is
-//! evaluated by the rules engine exactly as one accepted at any other address of the same
-//! emulator is, so each matched rule's `lambda` action invokes the function its `functionArn`
-//! names — as the IoT service principal, and therefore only where that FUNCTION's own
-//! resource-based policy admits `lambda:InvokeFunction` for the invoking rule's ARN.
+//! RULE: a discovery operation publishes an address this emulator SERVES the asked-for endpoint
+//! type's protocols at, so whatever type a client asks for it is handed a `host[:port]` of this
+//! emulator's own and never a host outside it — the message broker's own socket for a data
+//! endpoint, which carries MQTT as well as the HTTPS data plane, and the emulator's own endpoint
+//! for the credentials provider, which carries HTTPS alone; and a message the data plane accepted
+//! at that address is evaluated by the rules engine exactly as one accepted at any other address
+//! of the same emulator is, so each matched rule's `lambda` action invokes the function its
+//! `functionArn` names — as the IoT service principal, and therefore only where that FUNCTION's
+//! own resource-based policy admits `lambda:InvokeFunction` for the invoking rule's ARN.
 //!
 //! Three crates have to agree for that to hold — the IoT control plane answers the discovery and
 //! holds the rules, the IoT data plane takes the publish addressed at the published value, and
@@ -158,6 +160,27 @@ fn authority_of(base: &EndpointUrl) -> String {
         .map(|(_, authority)| authority)
         .unwrap_or(url)
         .to_string()
+}
+
+/// The address the endpoint type `endpoint_type` is SERVED at on the emulator behind `engine`,
+/// which is what discovery has to publish for it.
+///
+/// A DATA endpoint is the account's message-broker address — the host AWS serves MQTT over TLS
+/// and the HTTPS data-plane API at — so this emulator publishes the socket it opened for that
+/// broker (`service_common::iot_mqtt_broker`, reached through the data plane that reports on its
+/// sessions); every other type carries HTTPS alone and is published at the emulator's own
+/// endpoint, `control`.
+fn served_at(
+    engine: &Arc<::engine::InMemoryEngine>,
+    endpoint_type: Option<&str>,
+    control: &str,
+) -> String {
+    let data_endpoint = matches!(endpoint_type, None | Some("iot:Data") | Some("iot:Data-ATS"));
+    if !data_endpoint {
+        return control.to_string();
+    }
+    service_com_amazonaws_iotdataplane_iotmoonrakerservice::state::iot_mqtt_broker::published_broker_endpoint(&**engine)
+        .expect("discovering a data endpoint opens the broker's socket")
 }
 
 /// The whole emulator over one engine, exactly as the binary assembles it, served at `base` as
@@ -472,14 +495,16 @@ async fn an_estate_served_at(base: &str) {
         let case = format!("{base} / {}", endpoint_type.unwrap_or("no endpointType"));
         let address = discover(&router, &case, &control, *endpoint_type).await;
 
-        // The published value is the address this emulator is SERVED at, whatever type was asked
-        // for: one endpoint serves its whole surface here, where AWS gives each type its own
-        // hostname. It is therefore an address a client of this emulator can DIAL — and never one
-        // of AWS's own hosts, which resolves off this machine and reaches no plane of this
-        // emulator at all.
+        // The published value is the address this emulator SERVES that endpoint type at: the
+        // broker's own socket for a data endpoint, which carries the MQTT a device connects with
+        // beside this HTTPS plane, and the emulator's own endpoint for the credentials provider.
+        // Either way it is an address a client of this emulator can DIAL — and never one of AWS's
+        // own hosts, which resolves off this machine and reaches no plane of this emulator at all.
+        let expected = served_at(&engine, *endpoint_type, &control);
         assert_eq!(
-            address, control,
-            "case {case:?}: expected the address this emulator is served at, got {address:?}"
+            address, expected,
+            "case {case:?}: expected the address this emulator serves that endpoint type at, got \
+             {address:?}"
         );
 
         // The second leg, made exactly as a client that only ever learns its endpoint from

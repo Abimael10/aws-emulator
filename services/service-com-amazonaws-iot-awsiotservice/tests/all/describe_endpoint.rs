@@ -10,13 +10,16 @@
 //! The rules under test, none of them specific to one endpoint type, one region or one
 //! address this emulator is served at:
 //!
-//! * the `endpointAddress` published is the address THIS emulator answers on — the
-//!   `host[:port]` of the endpoint it serves its whole surface at — because a client
-//!   DIALS that value to reach the data plane, so it names no host outside the emulator
-//!   and no AWS service endpoint;
+//! * the `endpointAddress` published is an address THIS emulator answers the asked-for
+//!   type's protocols on, because a client DIALS that value: a DATA endpoint is the
+//!   account's message-broker address, so it names the broker's own socket — which serves
+//!   both an MQTT connection and the HTTPS data plane — while the credentials provider
+//!   endpoint carries HTTPS alone and names the endpoint this emulator serves its whole
+//!   surface at. Either way it names no host outside the emulator and no AWS service
+//!   endpoint;
 //! * it does not come from the request: the signed region, the host addressed and the
-//!   recorded endpoint identifier change nothing about it, and it changes when the
-//!   address the emulator is served at changes;
+//!   recorded endpoint identifier change nothing about it, and the address of a type
+//!   served at the emulator's own endpoint changes when that address changes;
 //! * an account still has ONE endpoint per region — created by the first call there,
 //!   recorded in this service's state, and reused by every later call — so repeating the
 //!   call returns the same endpoint;
@@ -106,14 +109,13 @@ const ADDRESSING_CASES: &[(&str, &str)] = &[
     ("a bracketed IPv6 address", "[::1]:65535"),
 ];
 
-/// One endpoint-type case: what the request asks for.
-///
-/// There is no per-type address form here on purpose: this emulator serves every one of
-/// those endpoints at the single endpoint it answers on, so each type's address is that
-/// one address.
+/// One endpoint-type case: what the request asks for, and whether the address it is told
+/// is one a DEVICE opens an MQTT connection to — the data endpoints are the account's
+/// message-broker address, and the credentials provider endpoint carries HTTPS alone.
 struct TypeCase {
     name: &'static str,
     endpoint_type: Option<&'static str>,
+    serves_the_broker: bool,
 }
 
 /// Every endpoint type the `endpointType` member documents that AWS still resolves an
@@ -126,18 +128,22 @@ const TYPE_CASES: &[TypeCase] = &[
     TypeCase {
         name: "no endpointType at all",
         endpoint_type: None,
+        serves_the_broker: true,
     },
     TypeCase {
         name: "iot:Data",
         endpoint_type: Some("iot:Data"),
+        serves_the_broker: true,
     },
     TypeCase {
         name: "iot:Data-ATS",
         endpoint_type: Some("iot:Data-ATS"),
+        serves_the_broker: true,
     },
     TypeCase {
         name: "iot:CredentialProvider",
         endpoint_type: Some("iot:CredentialProvider"),
+        serves_the_broker: false,
     },
 ];
 
@@ -191,6 +197,27 @@ impl Emulator {
             .lock()
             .endpoint_identifier(region)
             .map(str::to_string)
+    }
+
+    /// The `host:port` the MQTT message broker of this emulator answers at, once a call
+    /// has opened it — the address a data endpoint is published at.
+    fn broker_authority(&self) -> Option<String> {
+        service_common::iot_mqtt_broker::published_broker_endpoint(&*self.engine)
+    }
+
+    /// The address `type_case` must be published at on an emulator served at `served`: the
+    /// broker's own socket for a data endpoint, and the emulator's own endpoint for a type
+    /// that carries HTTPS alone.
+    fn expected_address(&self, type_case: &TypeCase, served: &str) -> String {
+        if !type_case.serves_the_broker {
+            return served.to_string();
+        }
+        self.broker_authority().unwrap_or_else(|| {
+            panic!(
+                "case {}: a data endpoint must open the broker's socket",
+                type_case.name
+            )
+        })
     }
 
     async fn describe_endpoint(&self, signing: Signing<'_>, endpoint_type: Option<&str>) -> Reply {
@@ -339,15 +366,17 @@ fn assert_addresses_the_emulator(case: &str, address: &str) {
     );
 }
 
-/// Every documented endpoint type is served, and each one is published at the address
-/// this emulator answers on — whatever address that is.
+/// Every documented endpoint type is served, and each one is published at an address this
+/// emulator answers that type's protocols on — the broker's own socket for a data
+/// endpoint, and the address this emulator is served at for the credentials provider,
+/// whatever address that is.
 #[tokio::test]
 async fn every_documented_endpoint_type_is_published_at_the_served_address() {
     // A region the issue did not cite, to keep the rule region-independent.
     let signing = Signing::SignedFor("eu-west-1");
     let region = "eu-west-1";
 
-    for (base, expected) in SERVING_CASES {
+    for (base, served) in SERVING_CASES {
         let emulator = Emulator::served_at(base);
         for type_case in TYPE_CASES {
             let case = format!("{} served at {base}", type_case.name);
@@ -362,11 +391,21 @@ async fn every_documented_endpoint_type_is_published_at_the_served_address() {
                 reply.text()
             );
             let address = reply.endpoint_address();
+            let expected = emulator.expected_address(type_case, served);
             assert_eq!(
-                &address, expected,
-                "case {case}: expected the served address {expected:?}, got {address:?}"
+                address, expected,
+                "case {case}: expected {expected:?}, got {address:?}"
             );
             assert_addresses_the_emulator(&case, &address);
+            // A data endpoint is the broker's socket, which is NOT the emulator's own
+            // endpoint: one address cannot serve two protocols on one port.
+            if type_case.serves_the_broker {
+                assert_ne!(
+                    &address, served,
+                    "case {case}: a data endpoint must name the broker's own socket, got \
+                     the emulator's endpoint {address:?}"
+                );
+            }
 
             // The endpoint itself is still created and recorded for the region.
             let identifier = emulator.recorded_identifier(region).unwrap_or_else(|| {
@@ -422,9 +461,10 @@ async fn the_endpoint_is_created_once_and_every_later_call_returns_it() {
                 reply.status,
                 reply.text()
             );
+            let expected = emulator.expected_address(type_case, served);
             assert_eq!(
                 reply.endpoint_address(),
-                served,
+                expected,
                 "case {case}: the endpoint changed between calls, got {:?}",
                 reply.endpoint_address()
             );
@@ -439,10 +479,10 @@ async fn the_endpoint_is_created_once_and_every_later_call_returns_it() {
 
 /// Nothing in the request moves the published address: every signed region, a request
 /// signed for one region on another region's host, and a request with no readable
-/// credential scope are all told the one address this emulator answers on — while each
-/// region still gets its own endpoint record.
+/// credential scope are all told the ONE address the asked-for type answers at — while
+/// each region still gets its own endpoint record.
 #[tokio::test]
-async fn the_published_address_is_the_served_one_whatever_the_request_names() {
+async fn the_published_address_is_the_same_whatever_the_request_names() {
     // Regions from four partitions' naming forms, none of them cited by the issue.
     const SIGNED_REGIONS: &[&str] = &[
         "us-east-1",
@@ -456,6 +496,9 @@ async fn the_published_address_is_the_served_one_whatever_the_request_names() {
 
     let emulator = Emulator::new();
     let served = service_common::data_plane_addressing::url_authority(SERVED_AT);
+    // Every call below asks for a data endpoint or for none, so the address every one of
+    // them must answer with is the broker's own socket. It is read back after the first
+    // call, which is the call that opens it.
     let mut identifiers: BTreeSet<String> = BTreeSet::new();
 
     for region in SIGNED_REGIONS {
@@ -470,11 +513,19 @@ async fn the_published_address_is_the_served_one_whatever_the_request_names() {
             reply.status,
             reply.text()
         );
+        let broker = emulator
+            .broker_authority()
+            .unwrap_or_else(|| panic!("region {region}: the call must open the broker"));
         assert_eq!(
             reply.endpoint_address(),
-            served,
-            "region {region}: expected the served address {served:?}, got {:?}",
+            broker,
+            "region {region}: expected the broker's address {broker:?}, got {:?}",
             reply.endpoint_address()
+        );
+        assert_ne!(
+            reply.endpoint_address(),
+            served,
+            "region {region}: a data endpoint must name the broker's own socket"
         );
         assert_addresses_the_emulator(region, &reply.endpoint_address());
         let identifier = emulator
@@ -488,8 +539,11 @@ async fn the_published_address_is_the_served_one_whatever_the_request_names() {
 
     // A request signed for one region but addressed to another region's endpoint host,
     // and a request whose region cannot be read from a credential scope at all: the
-    // address is the served one in every case, and the record is keyed by the signed
-    // region (or the default region when there is none).
+    // address is the same in every case, and the record is keyed by the signed region (or
+    // the default region when there is none).
+    let broker = emulator
+        .broker_authority()
+        .expect("the calls above opened the broker");
     let foreign = emulator
         .describe_endpoint(Signing::SignedForOnForeignHost("sa-east-1"), None)
         .await;
@@ -502,8 +556,8 @@ async fn the_published_address_is_the_served_one_whatever_the_request_names() {
     );
     assert_eq!(
         foreign.endpoint_address(),
-        served,
-        "case signed for sa-east-1 on an {FALLBACK_HOST_REGION} host: expected {served:?}, got {:?}",
+        broker,
+        "case signed for sa-east-1 on an {FALLBACK_HOST_REGION} host: expected {broker:?}, got {:?}",
         foreign.endpoint_address()
     );
     assert!(
@@ -523,8 +577,8 @@ async fn the_published_address_is_the_served_one_whatever_the_request_names() {
         );
         assert_eq!(
             reply.endpoint_address(),
-            served,
-            "case {signing:?}: expected the served address {served:?}, got {:?}",
+            broker,
+            "case {signing:?}: expected the broker's address {broker:?}, got {:?}",
             reply.endpoint_address()
         );
         assert!(
@@ -534,9 +588,9 @@ async fn the_published_address_is_the_served_one_whatever_the_request_names() {
     }
 }
 
-/// The address is where this emulator is SERVED, not something rendered from state: a
-/// record seeded with another identifier changes nothing, and two emulators served at
-/// two addresses answer with their own.
+/// The address is where the asked-for type is SERVED, not something rendered from state:
+/// a record seeded with another identifier changes nothing, and the identifier never
+/// appears in the address.
 #[tokio::test]
 async fn the_published_address_is_not_rendered_from_the_endpoint_record() {
     // Two seeded records, so no single hardcoded value can satisfy both rows.
@@ -546,7 +600,7 @@ async fn the_published_address_is_not_rendered_from_the_endpoint_record() {
     ];
 
     for (region, seeded) in SEEDED {
-        for (base, expected) in SERVING_CASES {
+        for (base, served) in SERVING_CASES {
             let emulator = Emulator::served_at(base);
             emulator
                 .state()
@@ -567,9 +621,10 @@ async fn the_published_address_is_not_rendered_from_the_endpoint_record() {
                     reply.text()
                 );
                 let address = reply.endpoint_address();
+                let expected = emulator.expected_address(type_case, served);
                 assert_eq!(
-                    &address, expected,
-                    "case {case}: expected the served address {expected:?}, got {address:?}"
+                    address, expected,
+                    "case {case}: expected {expected:?}, got {address:?}"
                 );
                 assert!(
                     !address.contains(seeded),
@@ -587,9 +642,11 @@ async fn the_published_address_is_not_rendered_from_the_endpoint_record() {
 }
 
 /// The host a CLIENT addressed the emulator by never becomes the address it is handed:
-/// whatever host the request carries, the answer is the address this emulator is served
-/// at, so the value a caller then dials is the emulator's own and no host of the caller's
-/// choosing — or of AWS's — can be published through it.
+/// whatever host the request carries, the answer is the address this emulator serves the
+/// asked-for endpoint type at — the broker's own socket for a data endpoint, the
+/// emulator's own endpoint otherwise — so the value a caller then dials is this
+/// emulator's own and no host of the caller's choosing, or of AWS's, can be published
+/// through it.
 #[tokio::test]
 async fn the_published_address_is_never_the_host_the_client_addressed() {
     let served = service_common::data_plane_addressing::url_authority(SERVED_AT);
@@ -617,9 +674,10 @@ async fn the_published_address_is_never_the_host_the_client_addressed() {
                 reply.text()
             );
             let address = reply.endpoint_address();
+            let expected = emulator.expected_address(type_case, served);
             assert_eq!(
-                address, served,
-                "case {case}: expected the served address {served:?}, got {address:?}"
+                address, expected,
+                "case {case}: expected {expected:?}, got {address:?}"
             );
             assert!(
                 !address.contains(addressed),
@@ -632,7 +690,7 @@ async fn the_published_address_is_never_the_host_the_client_addressed() {
 
     // The request that addresses the emulator's own endpoint directly is told the same
     // address, so the rule above is not "anything but the request's host": it is "the
-    // address this emulator is served at", whichever host asked.
+    // address this emulator serves that endpoint type at", whichever host asked.
     let emulator = Emulator::new();
     let reply = emulator
         .describe_endpoint_addressed_to(served, Signing::SignedFor(REGION), Some("iot:Data-ATS"))
@@ -644,10 +702,13 @@ async fn the_published_address_is_never_the_host_the_client_addressed() {
         reply.status,
         reply.text()
     );
+    let broker = emulator
+        .broker_authority()
+        .expect("the call must open the broker");
     assert_eq!(
         reply.endpoint_address(),
-        served,
-        "case addressed to the served address: expected {served:?}, got {:?}",
+        broker,
+        "case addressed to the served address: expected the broker's address {broker:?}, got {:?}",
         reply.endpoint_address()
     );
     assert_addresses_the_emulator("addressed to the served address", &reply.endpoint_address());
@@ -775,12 +836,11 @@ async fn a_retired_endpoint_type_is_refused_naming_its_replacement() {
 }
 
 /// Past `MAX_ENDPOINT_REGIONS` the store stops recording new regions — and every region
-/// is still told the address this emulator is served at, because that is where its
+/// is still told the address its data endpoint answers at, because that is where that
 /// endpoint answers whether or not a record for it fit.
 #[tokio::test]
 async fn the_address_stays_stable_past_the_recorded_region_bound() {
     let emulator = Emulator::new();
-    let served = service_common::data_plane_addressing::url_authority(SERVED_AT);
     // Enough distinct signed regions to cross the bound twice over.
     let regions: Vec<String> = (0..(MAX_ENDPOINT_REGIONS * 2))
         .map(|index| format!("zz-test-{index}"))
@@ -797,10 +857,13 @@ async fn the_address_stays_stable_past_the_recorded_region_bound() {
             reply.status,
             reply.text()
         );
+        let broker = emulator
+            .broker_authority()
+            .unwrap_or_else(|| panic!("region {region}: the call must open the broker"));
         assert_eq!(
             reply.endpoint_address(),
-            served,
-            "region {region}: expected the served address {served:?}, got {:?}",
+            broker,
+            "region {region}: expected the broker's address {broker:?}, got {:?}",
             reply.endpoint_address()
         );
     }
@@ -812,13 +875,16 @@ async fn the_address_stays_stable_past_the_recorded_region_bound() {
     );
 
     // Every region — recorded or not — answers with the same address on a later call.
+    let broker = emulator
+        .broker_authority()
+        .expect("the calls above opened the broker");
     for region in &regions {
         let again = emulator
             .describe_endpoint(Signing::SignedFor(region), Some("iot:Data-ATS"))
             .await;
         assert_eq!(
             again.endpoint_address(),
-            served,
+            broker,
             "region {region}: the endpoint changed after the recorded-region bound was reached"
         );
     }

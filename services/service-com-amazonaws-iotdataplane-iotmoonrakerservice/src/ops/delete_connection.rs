@@ -4,7 +4,7 @@
 //! Closes the client's MQTT connection and, when the caller asks for it, discards the
 //! session state behind it — both written to the stored session
 //! (`crate::state::MqttSession`), so every later reader of that session sees the
-//! disconnect.
+//! disconnect, and the client's own network connection is closed with it.
 //!
 //! A client id the broker holds no OPEN connection for has nothing to close — whether it
 //! has never connected or its session is already disconnected — so it is a 404
@@ -19,9 +19,8 @@
 //! `GetConnection` report `connected: false` with the disconnect reason afterwards.
 //!
 //! `preventWillMessage` controls whether the client's Last Will and Testament is
-//! published on disconnect. A session this emulator holds carries no LWT — an MQTT
-//! CONNECT is what sets one, and this emulator serves no MQTT transport — so there is
-//! never a will message to publish or to suppress, and neither value publishes anything.
+//! published on disconnect. The broker records no LWT for a session it holds, so there is
+//! never a will message to publish or to suppress and neither value publishes anything.
 //!
 //! ## Shape of an operation
 //!
@@ -191,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+        let state = crate::state::broker(&*self.engine).ok_or_else(|| {
             DeleteConnectionErrorModeled::InternalFailureException(InternalFailureException::new(
                 "An unexpected error has occurred.",
             ))
@@ -211,14 +210,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         // The connection closes, and the record says the SERVICE closed it — this call is
-        // not the client hanging up.
-        session.disconnect(crate::state::SERVER_INITIATED_DISCONNECT, now_millis);
+        // not the client hanging up. The client's own network connection is handed back so
+        // it can be closed too: this call disconnects the CLIENT, not only the record.
+        let live = session.disconnect(crate::state::SERVER_INITIATED_DISCONNECT, now_millis);
         // The session state goes when the caller asks for it, and for a client that
         // connected with a clean session there is no persistent state to preserve, so
         // the parameter is ignored for one.
         if input.clean_session || session.clean_session {
             session.subscriptions.clear();
             session.queued_messages.clear();
+        }
+        drop(guard);
+        if let Some(connection) = live {
+            connection.close();
         }
 
         Ok(DeleteConnectionOutput)

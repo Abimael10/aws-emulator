@@ -13,14 +13,16 @@
 //! Where the message goes is the session's state: a message to an OFFLINE client is
 //! queued on its persistent session (bounded by
 //! `crate::state::MAX_QUEUED_SESSION_MESSAGES`), and a message to a connected client is
-//! handed to its connection and queues nothing — exactly as a publish to a live
+//! written to its own MQTT connection and queues nothing — exactly as a publish to a live
 //! subscriber leaves no trace.
 //!
 //! `confirmation=true` asks the service to answer only once the RECEIVING CLIENT has
-//! acknowledged the delivery (PUBACK). This emulator serves no MQTT transport, so no
-//! client process can send one: that request is answered with the modelled
-//! `GatewayTimeoutException` (504) rather than a 200 claiming a confirmation nothing
-//! produced.
+//! acknowledged the delivery (PUBACK): the message is delivered at QoS 1 and this call
+//! waits for that acknowledgement for as long as the request's `timeout` allows
+//! (`crate::state::confirmation_timeout`). A client that acknowledges it is answered 200;
+//! one that does not, and one whose session the broker holds with no connection to
+//! acknowledge over at all, are answered with the modelled `GatewayTimeoutException`
+//! (504) rather than a 200 claiming a confirmation nothing produced.
 //!
 //! ## Shape of an operation
 //!
@@ -222,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+        let state = crate::state::broker(&*self.engine).ok_or_else(|| {
             SendDirectMessageErrorModeled::InternalFailureException(InternalFailureException::new(
                 "An unexpected error has occurred.",
             ))
@@ -249,39 +251,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now_millis = crate::state::now_millis();
-        let mut guard = state.lock();
-        let session = guard.session(&input.client_id, now_millis).ok_or_else(|| {
-            SendDirectMessageErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException::new(crate::state::CLIENT_NOT_FOUND),
-            )
-        })?;
-
-        let message = crate::state::DirectMessage {
-            topic: input.topic.clone(),
-            payload,
-            qos: delivery_qos(input.confirmation),
-            content_type: input.content_type.clone(),
-            response_topic: input.response_topic.clone(),
-            user_properties: input.user_properties.clone(),
-            payload_format_indicator: input.payload_format_indicator.clone(),
-            correlation_data: input.correlation_data.clone(),
-            delivered_at_millis: now_millis,
+        // A caller that asked for delivery confirmation is told once the RECEIVING CLIENT
+        // has acknowledged the delivery, so it waits on the acknowledgement this handle
+        // carries; a caller that did not ask waits on nothing.
+        let (acknowledged, confirmation) = if input.confirmation {
+            let (acknowledged, confirmation) = ::tokio::sync::oneshot::channel();
+            (Some(acknowledged), Some(confirmation))
+        } else {
+            (None, None)
         };
-        // A connected client is handed the message over its connection, so nothing is
-        // queued; an offline client's persistent session holds it until the client
-        // returns.
-        if !session.connected {
-            session.queue(message);
-        }
-        drop(guard);
+        // The store is taken for the delivery alone and released before anything is
+        // waited on: a guard held across an await would make this handler's future
+        // non-`Send`, and the broker's store is never held while a client is written to.
+        let handed_to_the_client = {
+            let mut guard = state.lock();
+            let session = guard.session(&input.client_id, now_millis).ok_or_else(|| {
+                SendDirectMessageErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException::new(crate::state::CLIENT_NOT_FOUND),
+                )
+            })?;
 
-        if input.confirmation {
-            // The message was delivered as far as this emulator can deliver it, but no
-            // client can acknowledge it — which is the condition this 504 states.
-            return Err(SendDirectMessageErrorModeled::GatewayTimeoutException(
-                GatewayTimeoutException::new(crate::state::NO_DELIVERY_CONFIRMATION),
+            let message = crate::state::DirectMessage {
+                topic: input.topic.clone(),
+                payload,
+                qos: delivery_qos(input.confirmation),
+                content_type: input.content_type.clone(),
+                response_topic: input.response_topic.clone(),
+                user_properties: input.user_properties.clone(),
+                payload_format_indicator: input.payload_format_indicator.clone(),
+                correlation_data: input.correlation_data.clone(),
+                delivered_at_millis: now_millis,
+            };
+            // A connected client is handed the message over its own connection; an
+            // offline client's persistent session holds it until the client returns.
+            session.deliver(message, acknowledged)
+        };
+
+        if let Some(confirmation) = confirmation {
+            if !handed_to_the_client {
+                // The message is as far as it can go — on the session, for the client's
+                // return — but the client is not connected, so nothing can acknowledge
+                // it; the modelled 504 says so rather than a 200 claiming a confirmation
+                // nothing produced.
+                return Err(SendDirectMessageErrorModeled::GatewayTimeoutException(
+                    GatewayTimeoutException::new(crate::state::NO_DELIVERY_CONFIRMATION),
+                )
+                .into());
+            }
+            // "waits for the client to send a delivery confirmation (PUBACK) before
+            // returning a successful response. If delivery confirmation is not received
+            // within the specified timeout period, the API returns HTTP 504"
+            // (`SendDirectMessageRequest$confirmation`).
+            let waited = ::tokio::time::timeout(
+                crate::state::confirmation_timeout(input.timeout),
+                confirmation,
             )
-            .into());
+            .await;
+            if !matches!(waited, Ok(Ok(()))) {
+                return Err(SendDirectMessageErrorModeled::GatewayTimeoutException(
+                    GatewayTimeoutException::new(crate::state::DELIVERY_NOT_CONFIRMED),
+                )
+                .into());
+            }
         }
 
         Ok(SendDirectMessageOutput {

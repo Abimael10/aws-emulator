@@ -4,8 +4,10 @@
 //!
 //! Implemented: resolves the account's IoT endpoint for the region the request was
 //! signed for — creating and persisting it on the first call, reading the persisted one
-//! on every later call — and answers with the address that endpoint is SERVED at, which
-//! is the address of this emulator's own endpoint.
+//! on every later call — and answers with the address that endpoint is SERVED at: for a
+//! DATA endpoint the message broker's own socket, which this emulator opens on the first
+//! call and serves both an MQTT connection and the HTTPS data plane on, and for every
+//! other type the address of this emulator's own endpoint.
 //!
 //! An `endpointType` the request names is resolved against the documented catalog
 //! ([`EndpointType`]) before anything is read or created: a token that names no type at
@@ -192,7 +194,6 @@ impl EndpointType {
     }
 
     /// Why this type resolves no endpoint any more, or `None` for one AWS still serves.
-    ///
     /// The Jobs endpoint type is retired: the Jobs and Commands APIs it used to serve are
     /// reached through the ATS data endpoint, so an account has no `iot:Jobs` endpoint to
     /// be told about at all.
@@ -203,6 +204,21 @@ impl EndpointType {
                 replacement: Self::DataAts,
             }),
             Self::Data | Self::DataAts | Self::CredentialProvider => None,
+        }
+    }
+
+    /// Whether the address of this endpoint type is one a DEVICE opens an MQTT connection
+    /// to.
+    ///
+    /// The data endpoints are the account's MESSAGE BROKER address: "iot:Data - Returns a
+    /// VeriSign signed data endpoint. iot:Data-ATS - Returns an ATS signed data endpoint"
+    /// — the host AWS serves MQTT over TLS on 8883 and the HTTPS data-plane API on 443 at.
+    /// The credentials provider endpoint carries an HTTPS API alone, so nothing opens an
+    /// MQTT connection to it.
+    pub const fn serves_the_message_broker(self) -> bool {
+        match self {
+            Self::Data | Self::DataAts => true,
+            Self::CredentialProvider | Self::Jobs => false,
         }
     }
 
@@ -240,29 +256,49 @@ pub fn retired_endpoint_type_message(retired: EndpointType, retirement: Retireme
     )
 }
 
-/// The address this account's IoT endpoint is PUBLISHED at: the `host[:port]` of the one
-/// endpoint this emulator serves its whole surface at.
+/// The address this account's IoT endpoint is PUBLISHED at: the `host[:port]` a client
+/// then DIALS to reach the endpoint type it asked for.
 ///
-/// `endpointAddress` is not a label a client reads — it is the address it then DIALS:
+/// `endpointAddress` is not a label a client reads — it is the address it DIALS:
 /// "Returns or creates a unique endpoint specific to the Amazon Web Services account
-/// making the call", and every SDK sample builds its IoT data, Jobs or credentials client
-/// with that value as its endpoint. So the address announced has to be one THIS emulator
-/// answers on, with the configuration the calling client already has; the host AWS names
-/// an account's endpoint resolves off this machine, and a client sent there leaves the
-/// emulator entirely and reaches no data plane at all.
+/// making the call", and every SDK sample builds its IoT data or credentials client with
+/// that value as its endpoint, while a DEVICE opens its MQTT connection to it. So the
+/// address announced has to be one THIS emulator answers the asked-for type's protocols
+/// on; the host AWS names an account's endpoint resolves off this machine, and a client
+/// sent there leaves the emulator entirely and reaches no data plane at all.
 ///
-/// What this emulator answers on is its own front door
-/// ([`::service_common::data_plane_addressing::emulator_endpoint_authority`]), which binds
-/// the whole surface — the IoT control plane, the IoT data plane, and the Jobs and
-/// Commands data plane the discovered endpoint is used for — and resolves a request to the
-/// service its SigV4 credential scope names, so a client built from this address reaches
-/// the plane it signs for. It is therefore the address of EVERY endpoint type: one
-/// endpoint serves them all here, where AWS gives each its own hostname.
+/// AWS publishes one HOST per endpoint type and serves everything that type carries on it:
+/// for a data endpoint, MQTT over TLS on 8883 and the HTTPS data-plane API on 443. This
+/// emulator has one host and an address it hands out has to carry a PORT, so a data
+/// endpoint is published at the MESSAGE BROKER's own socket
+/// ([`::service_common::iot_mqtt_broker::ensure_broker_endpoint`], opened by this call
+/// — which is the call that creates the account's endpoint), and that socket serves both
+/// wires: an MQTT connection and the HTTPS data plane, which it hands to this emulator's
+/// own router. A client handed that address reaches the whole of what the type carries.
+///
+/// Every other endpoint type carries HTTPS alone, and is published at the endpoint this
+/// emulator serves its whole surface at
+/// ([`::service_common::data_plane_addressing::emulator_endpoint_authority`]) — which
+/// binds the IoT control plane, the IoT data plane and the credentials provider, and
+/// resolves a request to the service its SigV4 credential scope names. It is also the
+/// address a data endpoint falls back to on an emulator that could open no socket of its
+/// own, which still serves that type's HTTPS half.
 ///
 /// Scheme and host only, no path: the value is an address a client appends the modelled
 /// path to, exactly as the `identifier.iot.region.amazonaws.com` form the member
 /// documents is.
-fn published_endpoint_address(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+async fn published_endpoint_address<Eng: Send + Sync + 'static>(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    engine: &Eng,
+    endpoint_type: EndpointType,
+) -> String {
+    if endpoint_type.serves_the_message_broker() {
+        if let Some(broker) =
+            ::service_common::iot_mqtt_broker::ensure_broker_endpoint(engine, ctx.callback()).await
+        {
+            return broker;
+        }
+    }
     ::service_common::data_plane_addressing::emulator_endpoint_authority(ctx)
 }
 
@@ -422,9 +458,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             !already_created
         };
 
-        // WHERE that endpoint answers, which is what the caller is told: this emulator's
-        // own endpoint, the one address its IoT planes are served at.
-        let endpoint_address = published_endpoint_address(ctx);
+        // WHERE that endpoint answers, which is what the caller is told: the socket this
+        // emulator serves the asked-for type's protocols on.
+        let endpoint_address = published_endpoint_address(ctx, &*self.engine, endpoint_type).await;
 
         audit(
             ctx,

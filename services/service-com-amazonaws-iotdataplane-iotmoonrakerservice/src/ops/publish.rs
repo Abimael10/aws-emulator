@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op Publish
-//! Publishes an MQTT message. The emulator has no MQTT subscribers, so a plain
-//! publish leaves no trace of its own — exactly what a broker does for a topic
-//! nobody is subscribed to. A publish with `retain=true` IS persistent state: it
-//! stores the message as the topic's retained message, and an empty retained payload
-//! clears it, which is how MQTT deletes a retained message.
+//! Publishes an MQTT message: the broker hands it to every MQTT session subscribed to a
+//! topic filter that covers the published topic
+//! (`service_common::iot_mqtt_broker::publish_to_subscribers`), and a publish to a topic
+//! nobody is subscribed to leaves no trace of its own — exactly what a broker does with
+//! one. A publish with `retain=true` IS persistent state: it stores the message as the
+//! topic's retained message, and an empty retained payload clears it, which is how MQTT
+//! deletes a retained message.
 //!
 //! An accepted message is also what the RULES ENGINE runs on: every enabled topic rule
 //! of the account whose SQL statement selects the published topic has its actions
@@ -361,6 +363,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     },
                 );
             }
+        }
+
+        // The broker took the message, so it goes to the SUBSCRIBERS of the topic: every
+        // MQTT session whose subscription covers it is handed the message over its own
+        // connection, and an offline client's persistent session holds it for its return.
+        // A topic nobody subscribes to reaches nobody, which is what a broker does with
+        // one, and none of it changes this response.
+        if let Some(broker) = crate::state::broker(&*self.engine) {
+            ::service_common::iot_mqtt_broker::publish_to_subscribers(
+                &broker,
+                &::service_common::iot_mqtt_broker::DirectMessage {
+                    topic: input.topic.clone(),
+                    payload: payload.clone(),
+                    qos: input.qos,
+                    user_properties: input.user_properties.clone(),
+                    delivered_at_millis: crate::state::now_millis(),
+                    ..::service_common::iot_mqtt_broker::DirectMessage::default()
+                },
+            );
         }
 
         // The broker took the message, so the RULES ENGINE evaluates it: every enabled
