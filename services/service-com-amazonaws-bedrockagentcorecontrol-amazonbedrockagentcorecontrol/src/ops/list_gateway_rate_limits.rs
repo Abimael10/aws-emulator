@@ -167,8 +167,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // A gateway whose deletion the clock has already made due is gone before
-        // this read looks for it, and so are the rate limits it held.
+        // this read looks for it, and so are the rate limits it held — and, on the
+        // gateways that remain, every rate limit whose own deletion has come due.
         store.expire_deleted_gateways_and_targets(now);
+        store.expire_deleted_gateway_rate_limits(now);
 
         // A rate limit is addressed only through its gateway, so a listing for a
         // gateway that does not exist is the modelled 404 — never an empty page,

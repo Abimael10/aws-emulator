@@ -13,12 +13,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    BatchPutLimitEntry, CreateGatewayRateLimitOutput, GatewayRateLimitDetail,
-    GetGatewayRateLimitOutput, LimitEntry, ResourceNotFoundException, UpdateGatewayRateLimitOutput,
-    ValidationException,
+    BatchPutLimitEntry, CreateGatewayRateLimitOutput, DeleteGatewayRateLimitOutput,
+    GatewayRateLimitDetail, GetGatewayRateLimitOutput, LimitEntry, ResourceNotFoundException,
+    UpdateGatewayRateLimitOutput, ValidationException,
 };
 
-use super::{field_validation_failed, gateway_status_conflict, timestamp, GatewayRecord};
+use super::{
+    field_validation_failed, gateway_status_conflict, timestamp, GatewayRecord,
+    VALIDATION_REASON_RESOURCE_CONFLICT,
+};
 
 /// `GatewayRateLimitStatus` members this service drives. The enum's full value
 /// list is `CREATING | ACTIVE | UPDATING | DELETING`
@@ -26,6 +29,7 @@ use super::{field_validation_failed, gateway_status_conflict, timestamp, Gateway
 pub const GATEWAY_RATE_LIMIT_STATUS_CREATING: &str = "CREATING";
 pub const GATEWAY_RATE_LIMIT_STATUS_UPDATING: &str = "UPDATING";
 pub const GATEWAY_RATE_LIMIT_STATUS_ACTIVE: &str = "ACTIVE";
+pub const GATEWAY_RATE_LIMIT_STATUS_DELETING: &str = "DELETING";
 
 /// How long a rate limit one asynchronous write accepted stays in its transient
 /// status (`CREATING` for one a create added, `UPDATING` for one an update
@@ -92,6 +96,11 @@ pub struct GatewayRateLimitRecord {
     /// The instant the transient status is owed its transition. Stored, never
     /// slept on: a read materialises the transition the clock already made due.
     pub settles_at: SystemTime,
+    /// The instant this rate limit's accepted deletion is owed its removal from
+    /// the gateway that held it, or `None` while no deletion has been accepted.
+    /// Stored, never slept on, and materialised by
+    /// [`super::ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState::expire_deleted_gateway_rate_limits`].
+    pub removal_due_at: Option<SystemTime>,
 }
 
 impl GatewayRateLimitRecord {
@@ -181,7 +190,37 @@ impl GatewayRateLimitRecord {
             transient_status,
             settled_status: GATEWAY_RATE_LIMIT_STATUS_ACTIVE.to_string(),
             settles_at,
+            // A stored rate limit is one nobody has asked to delete: a write
+            // records a configuration, never a removal.
+            removal_due_at: None,
         }
+    }
+
+    /// Whether this rate limit's deletion has been accepted, so it is on its way
+    /// out and reports `DELETING` until the clock owes its removal.
+    pub fn is_deleting(&self) -> bool {
+        self.removal_due_at.is_some()
+    }
+
+    /// Accept this rate limit's deletion at `now`: it reports `DELETING` from
+    /// this instant and is removed from the gateway that held it once
+    /// [`GATEWAY_RATE_LIMIT_SETTLE_DELAY`] passes, so a caller that deletes and
+    /// then polls sees `DELETING` and then the modelled 404 rather than a limit
+    /// that vanished mid-call.
+    ///
+    /// `DeleteGatewayRateLimit` is `@idempotent`
+    /// (`smithy_query(query="operation",operation="DeleteGatewayRateLimit")`), so a
+    /// repeat while the removal is still owed reports that same limit instead of
+    /// re-arming the clock.
+    pub fn accept_deletion(&mut self, now: SystemTime) {
+        if self.is_deleting() {
+            return;
+        }
+        self.transient_status = GATEWAY_RATE_LIMIT_STATUS_DELETING.to_string();
+        self.settled_status = GATEWAY_RATE_LIMIT_STATUS_DELETING.to_string();
+        self.settles_at = now;
+        self.removal_due_at = Some(now + GATEWAY_RATE_LIMIT_SETTLE_DELAY);
+        self.updated_at = now;
     }
 
     /// The status this rate limit reports at `now`: the transient one until the
@@ -272,6 +311,61 @@ impl GatewayRateLimitRecord {
             updated_at: detail.updated_at,
         }
     }
+
+    /// This rate limit as `DeleteGatewayRateLimit`'s response envelope: the id
+    /// the request addressed it by and the status it reports from this instant,
+    /// read off the same record every other response of it is read off.
+    pub fn delete_output(&self, now: SystemTime) -> DeleteGatewayRateLimitOutput {
+        DeleteGatewayRateLimitOutput {
+            rate_limit_id: self.rate_limit_id.clone(),
+            status: self.status_at(now).to_string(),
+        }
+    }
+}
+
+/// The modelled validation error a write of a rate limit gets while the limit it
+/// addresses is in a status that cannot take it: the operation that was asked
+/// for, the limit it named and the status it found.
+///
+/// A rate limit whose deletion has been accepted is on its way out on the clock
+/// and takes no further configuration, so a write of it is refused rather than
+/// cancelling the removal the clock already owes. The sentence is fixed and its
+/// variable parts are the asking operation's name, the `rateLimitId` the request
+/// carried and the status token the limit's enum declares
+/// (`smithy_query(query="shape",shape="GatewayRateLimitStatus")`) — the same form the
+/// response members carry it in.
+///
+/// `reason` is [`VALIDATION_REASON_RESOURCE_CONFLICT`] and there is no
+/// `fieldList`, for the reason [`gateway_status_conflict`] has none: nothing is
+/// wrong with the request's members, it is the limit's state that refuses it.
+pub fn rate_limit_status_conflict(
+    operation: &str,
+    rate_limit_id: &str,
+    status: &str,
+) -> ValidationException {
+    ValidationException {
+        message: format!(
+            "Cannot perform operation {operation} when rate limit {rate_limit_id} is in {status} \
+             status"
+        ),
+        reason: VALIDATION_REASON_RESOURCE_CONFLICT.to_string(),
+        field_list: None,
+    }
+}
+
+/// The refusal a write of a STORED rate limit owes when that limit is already on
+/// its way out, or `None` when it can still take the write.
+///
+/// Shared by every operation that reconfigures one limit in place, so a deletion
+/// the clock owes cannot be cancelled by one of them.
+pub fn refusal_for_rate_limit(
+    operation: &str,
+    record: &GatewayRateLimitRecord,
+    now: SystemTime,
+) -> Option<ValidationException> {
+    record.is_deleting().then(|| {
+        rate_limit_status_conflict(operation, &record.rate_limit_id, record.status_at(now))
+    })
 }
 
 /// The refusal a write of ONE rate limit owes when a submitted rule entry names

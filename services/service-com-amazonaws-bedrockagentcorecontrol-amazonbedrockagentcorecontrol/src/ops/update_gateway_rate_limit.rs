@@ -181,9 +181,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // A gateway whose deletion the clock has already made due is gone before
-        // this call looks for it, and the rate limits it held with it: the removal
-        // was owed at this instant whether or not anybody called.
+        // this call looks for it, and the rate limits it held with it, and so is a
+        // rate limit whose own deletion has come due: each removal was owed at this
+        // instant whether or not anybody called.
         store.expire_deleted_gateways_and_targets(now);
+        store.expire_deleted_gateway_rate_limits(now);
 
         let gateway = store.gateways.get(&input.gateway_identifier).ok_or_else(|| {
             UpdateGatewayRateLimitErrorModeled::ResourceNotFoundException(
@@ -216,6 +218,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?
             .clone();
+        // A rate limit whose deletion has been accepted is on its way out on the
+        // clock and takes no further configuration, so reconfiguring it is refused
+        // with the status the caller found rather than cancelling the removal the
+        // clock already owes it.
+        if let Some(refusal) = crate::state::refusal_for_rate_limit(Self::NAME, &replaced, now) {
+            return Err(UpdateGatewayRateLimitErrorModeled::ValidationException(refusal).into());
+        }
 
         // "The dimension keys are immutable after creation and cannot be changed":
         // this request carries none, so the limit stays scoped by the keys it was

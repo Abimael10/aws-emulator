@@ -171,8 +171,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // A gateway whose deletion the clock has already made due is gone before
-        // this read looks for it, and so are the rate limits it held.
+        // this read looks for it, and so are the rate limits it held — and, on the
+        // gateways that remain, every rate limit whose own deletion has come due.
         store.expire_deleted_gateways_and_targets(now);
+        store.expire_deleted_gateway_rate_limits(now);
 
         let gateway = store.gateways.get(&input.gateway_identifier).ok_or_else(|| {
             GetGatewayRateLimitErrorModeled::ResourceNotFoundException(

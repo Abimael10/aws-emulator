@@ -385,6 +385,23 @@ impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
         }
     }
 
+    /// On every gateway that remains, drop every RATE LIMIT whose accepted
+    /// deletion the clock has already made due.
+    ///
+    /// `DeleteGatewayRateLimit` accepts the deletion and reports the limit
+    /// `DELETING`; the record itself goes when the span it owes passes, so a
+    /// caller polling it sees `DELETING` and then the modelled 404. The removal
+    /// is owed by the CLOCK — it was due at this instant whether or not anybody
+    /// called — so every operation that reaches a gateway's rate limits
+    /// materialises it first, and nothing ever sleeps for it.
+    pub fn expire_deleted_gateway_rate_limits(&mut self, now: SystemTime) {
+        for gateway in self.gateways.values_mut() {
+            gateway
+                .rate_limits
+                .retain(|_, limit| limit.removal_due_at.is_none_or(|at| now < at));
+        }
+    }
+
     /// Mint a `harnessId` for `name` that no stored harness holds: the name + `-`
     /// + 10 alphanumerics, per `HarnessId`'s pattern
     /// `^[a-zA-Z][a-zA-Z0-9_]{0,39}-[a-zA-Z0-9]{10}$`.

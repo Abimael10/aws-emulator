@@ -193,9 +193,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // A gateway whose deletion the clock has already made due is gone before
-        // this call looks for it: the removal was owed at this instant whether or
-        // not anybody called.
+        // this call looks for it, and so is a rate limit whose own deletion has
+        // come due: the removal was owed at this instant whether or not anybody
+        // called.
         store.expire_deleted_gateways_and_targets(now);
+        store.expire_deleted_gateway_rate_limits(now);
 
         // A replayed request carrying the same `clientToken` answers with the rate
         // limit that token first created, rather than adding a second one: "if this

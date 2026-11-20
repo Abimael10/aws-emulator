@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteGatewayRateLimit
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteGatewayRateLimit`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteGatewayRateLimit::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes ONE rate limit from the gateway the path names: the deletion is accepted
+//! here, the limit reports `DELETING`, and the record goes from [`crate::state`] when
+//! the span the clock owes it passes, so a later read of it is the modelled 404. A
+//! mutation — the limit it removes is gone from every later read of that gateway.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +154,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteGatewayRateLimit` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteGatewayRateLimitErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteGatewayRateLimit"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteGatewayRateLimitErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the gateway store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A gateway whose deletion the clock has already made due is gone before
+        // this call looks for it, the rate limits it held with it, and so is a
+        // rate limit whose own earlier deletion has come due: each removal was
+        // owed at this instant whether or not anybody called.
+        store.expire_deleted_gateways_and_targets(now);
+        store.expire_deleted_gateway_rate_limits(now);
+
+        let gateway = store.gateways.get(&input.gateway_identifier).ok_or_else(|| {
+            DeleteGatewayRateLimitErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY),
+            )
+        })?;
+        // A rate limit is enforced BY the gateway, so the gateway has to exist and
+        // not be on its way out — the one precondition every write of a gateway's
+        // rate limits puts on it, decided in `crate::state` so the create, the
+        // update, the batch write and this delete cannot drift.
+        if let Some(refusal) = crate::state::refusal_for_gateway(Self::NAME, gateway, now) {
+            return Err(DeleteGatewayRateLimitErrorModeled::ValidationException(refusal).into());
+        }
+        let gateway_id = gateway.gateway_id.clone();
+        let gateway = store.gateways.get_mut(&gateway_id).ok_or_else(|| {
+            DeleteGatewayRateLimitErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY),
+            )
+        })?;
+        // A rate limit is addressed through its gateway, so an id no limit of THIS
+        // gateway holds is the modelled 404 for the rate limit rather than for the
+        // gateway, which was found — named by the id the path carried, in the one
+        // sentence every operation that resolves a limit reports a missing one
+        // with. That is also what a delete of a limit whose removal has already
+        // come due answers.
+        let record = gateway
+            .rate_limits
+            .get_mut(&input.rate_limit_id)
+            .ok_or_else(|| {
+                DeleteGatewayRateLimitErrorModeled::ResourceNotFoundException(
+                    crate::state::gateway_rate_limit_not_found(&input.rate_limit_id),
+                )
+            })?;
+
+        // The deletion is ACCEPTED here and the limit reports `DELETING` from now
+        // on; the record is removed when the span the clock owes passes, so a
+        // caller that deletes and then polls sees `DELETING` and then the modelled
+        // 404 rather than a limit that vanished mid-call. `@idempotent`, so a
+        // repeat while the removal is still owed reports that same limit instead of
+        // re-arming the clock.
+        record.accept_deletion(now);
+        let output = record.delete_output(now);
+
+        // The gateway's configuration includes the rate limits it enforces, so
+        // removing one touches the gateway too — the same bookkeeping the
+        // rate-limit create and update do.
+        gateway.updated_at = now;
+
+        Ok(output)
     }
 }
