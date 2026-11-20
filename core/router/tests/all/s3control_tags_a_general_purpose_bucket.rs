@@ -36,6 +36,9 @@ use aws_emulator_router::{build_router, InMemoryEngine};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cloudformation_provisions_stack_resources::xml_texts;
+// The escaper that puts a value safely inside a request's XML text node lives ONCE in this
+// test crate, beside its inverse, rather than in each suite that builds a request document.
+use crate::query_wire::xml_escape;
 
 /// Keep this at or above `boot_serve.rs`'s stack: the same assembly runs here.
 const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
@@ -119,15 +122,6 @@ fn send(
         status: response.status().as_u16(),
         body: String::from_utf8_lossy(response.body()).into_owned(),
     }
-}
-
-/// Escape a value for an XML text node, the way a client's XML writer does.
-fn xml_escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
 }
 
 /// The `<Tag>` elements of a tag set, the element name both models give `TagList`'s and

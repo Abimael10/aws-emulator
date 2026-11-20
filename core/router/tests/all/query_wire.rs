@@ -2,9 +2,10 @@
 
 //! What a suite in this test crate needs to write a request's text and to read an XML
 //! answer's: the percent-encoders that build a form body ([`form_encode`]) and a URI path
-//! ([`path_encode`], which a REST suite addressing a resource by name needs), and the readers
-//! that pull one element's text — or every occurrence of a repeated one — out of the XML
-//! answer.
+//! ([`path_encode`], which a REST suite addressing a resource by name needs), the escaper
+//! that puts a value safely inside a request's XML text node ([`xml_escape`]), and the
+//! readers that pull one element's text — or every occurrence of a repeated one — out of the
+//! XML answer.
 //!
 //! They live here, ONCE, because a suite that writes its own drifts from the others: an
 //! encoder that leaves one more byte literal, or a reader that stops at a different tag,
@@ -170,6 +171,22 @@ pub(crate) fn elements(body: &str, name: &str) -> Vec<String> {
         rest = &after[end + close.len()..];
     }
     found
+}
+
+/// Escape the five entities an XML text node cannot carry literally, the way a client's XML
+/// writer does — so a value a suite interpolates into a request document (an ARN, a policy, a
+/// document that is itself JSON) keeps that request well-formed.
+///
+/// The inverse of [`unescape`] below, and here beside it for the reason this module exists: a
+/// suite that writes its own escaper drifts from the others, and an escaper that leaves one
+/// more byte literal changes what the suite is actually sending. `&` is replaced FIRST, so the
+/// ampersands this introduces are not escaped again.
+pub(crate) fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 /// The five entities an XML serializer escapes, decoded back. `&amp;` LAST, so a value
@@ -501,6 +518,37 @@ mod tests {
             assert_eq!(
                 read, expected,
                 "case {case:?}: expected {expected:?}, got {read:?}"
+            );
+        }
+    }
+
+    /// The escaper and the decoder are inverses over every entity either of them knows, so a
+    /// value a suite interpolates into a request comes back out of an answer as it went in.
+    #[test]
+    fn escaping_a_value_and_decoding_it_again_is_the_value() {
+        // (case, the value)
+        let rows: [(&str, &str); 6] = [
+            ("text carrying none of the five", "a plain value"),
+            ("an ampersand", "a & b"),
+            ("markup", "<a>text</a>"),
+            ("quotes of both kinds", "he said \"it's here\""),
+            (
+                "a document that is itself JSON",
+                r#"{"AWSPolicyFormatVersion":"2015-10-01","RecordType":"A"}"#,
+            ),
+            ("an already-escaped entity", "&lt;a&gt;"),
+        ];
+
+        for (case, value) in rows {
+            let escaped = xml_escape(value);
+            assert!(
+                !escaped.contains('<') && !escaped.contains('>'),
+                "case {case:?}: an escaped value carries no markup, got {escaped:?}"
+            );
+            let decoded = unescape(&escaped);
+            assert_eq!(
+                decoded, value,
+                "case {case:?}: expected {value:?} back, got {decoded:?}"
             );
         }
     }

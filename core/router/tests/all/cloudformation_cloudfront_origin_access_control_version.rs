@@ -40,7 +40,7 @@ use smithy_server_runtime::MultiServiceRouter;
 // The awsQuery form encoder and the XML element readers this test crate writes ONCE
 // (`tests/all/query_wire.rs`): "Nothing new should write another one — call this module."
 use super::query_wire::{
-    block_of, elements, form_encode, opt_element, outputs_of, physical_ids_of,
+    block_of, elements, form_encode, opt_element, outputs_of, physical_ids_of, xml_escape,
 };
 
 /// The Region every call here is signed for. CloudFront is global; the credential scope is
@@ -408,7 +408,7 @@ impl Row {
         let members: String = self
             .declared(Some(description))
             .into_iter()
-            .map(|(member, value)| format!("<{member}>{}</{member}>", escaped(&value)))
+            .map(|(member, value)| format!("<{member}>{}</{member}>", xml_escape(&value)))
             .collect();
         format!(
             "<OriginAccessControlConfig \
@@ -441,16 +441,6 @@ impl Row {
             self.case
         );
     }
-}
-
-/// The five entities an XML document escapes, applied to a value this suite SENDS.
-fn escaped(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
 }
 
 /// The text of the first `<name>` element, with the serializer's entity escaping undone — so
