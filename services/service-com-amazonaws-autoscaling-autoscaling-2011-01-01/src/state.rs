@@ -169,6 +169,15 @@ pub mod metrics_collection;
 
 pub use metrics_collection::{EnabledMetrics, MetricsRefusal};
 
+/// The CloudWatch series those collected metrics are published into — the `AWS/AutoScaling`
+/// namespace a client watches its groups through — and the clock they are published on.
+pub mod group_metrics;
+
+pub use group_metrics::{
+    metric_value, series_key, GroupMetricPublisher, GROUP_NAME_DIMENSION, METRIC_NAMESPACE,
+    PUBLISH_INTERVAL,
+};
+
 /// The scaling policies of a group — what `PutScalingPolicy` creates and
 /// `DescribePolicies` reports — and the CloudWatch alarms a target-tracking policy is
 /// driven by, which live in the account's own CloudWatch store.
@@ -1507,6 +1516,10 @@ pub struct ComAmazonawsAutoscalingAutoscaling20110101State {
     /// ([`requested_launches`]). At most [`MAX_RETAINED_LAUNCH_REQUESTS`] entries, the
     /// oldest dropped first.
     launch_requests: Vec<StoredLaunchRequest>,
+    /// Where the CloudWatch series of each collecting group has got to: the minute each
+    /// group's collected metrics are next published at, and when that minute comes due
+    /// ([`group_metrics`]). A group that collects nothing has no schedule here.
+    group_metrics: GroupMetricPublisher,
 }
 
 /// A shorter name for this service's state, for use inside the crate.
@@ -2011,6 +2024,11 @@ impl AutoScalingState {
                 activity.progress = 100;
             }
         }
+        // And the minute each collecting group owes CloudWatch: the group metrics it
+        // aggregates, published from the state this pass has just brought up to date
+        // ([`group_metrics`]). Last, so a datapoint reports the instances this instant left in
+        // service rather than the ones it was about to move.
+        self.publish_due_group_metrics(engine, now);
     }
 
     /// Recompute the `HealthStatus` of the instances of every group that checks their health

@@ -417,6 +417,11 @@ impl AutoScalingState {
             // one resolves itself at, and the publication of each announcement
             // ([`super::lifecycle_actions`]).
             .chain(self.lifecycle_action_timeouts())
+            // And the next minute each collecting group owes CloudWatch
+            // ([`super::group_metrics`]): a client watching a group through those series makes
+            // no further Auto Scaling call, so a datapoint published only by the next reader
+            // would never be published at all.
+            .chain(self.group_metric_due_instants())
             .min()
     }
 
@@ -443,6 +448,9 @@ impl AutoScalingState {
             .iter()
             .any(|event| event.due <= now)
             || self.owes_lifecycle_action_event(now)
+            // A group that has just begun collecting owes its first datapoints at once, and
+            // has no schedule for the chain above to report yet.
+            || self.owes_group_metrics(now)
         {
             return Some(now);
         }

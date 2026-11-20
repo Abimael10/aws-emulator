@@ -220,6 +220,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &group_name,
             "group metrics collection enabled",
         );
+        // A collecting group aggregates its metrics into CloudWatch as each minute falls due,
+        // which the clock pump is what carries out ([`crate::state::group_metrics`]): a client
+        // watching the group through those series makes no further Auto Scaling call, so a
+        // datapoint published only by the next reader would never be published at all. The
+        // store's lock is released above; the pump takes it itself.
+        crate::state::drive_lifecycle_clock(ctx, &self.engine);
         Ok(EnableMetricsCollectionOutput)
     }
 }
