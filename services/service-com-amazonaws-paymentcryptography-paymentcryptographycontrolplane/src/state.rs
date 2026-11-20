@@ -67,6 +67,9 @@ mod resource_policy;
 /// The asymmetric key pair an asymmetric key is, and the certificate signing request
 /// made from it.
 mod key_pair;
+/// The public key certificate this service hands out for an asymmetric key, and the
+/// authority that signs it.
+mod public_key_certificate;
 /// One protected operation's Multi-Party Approval team association.
 mod mpa_association;
 
@@ -75,6 +78,11 @@ pub use resource_policy::{
 };
 
 pub use key_pair::{AsymmetricKeyPair, CertificateRequestRejection};
+pub use public_key_certificate::{
+    mint_public_key_certificate_authority, IssuedPublicKeyCertificate,
+    PublicKeyCertificateAuthority, PublicKeyCertificateRejection,
+    PUBLIC_KEY_CERTIFICATE_REUSE_REMAINING, PUBLIC_KEY_CERTIFICATE_VALIDITY,
+};
 pub use mpa_association::{
     approval_team_exists, StoredMpaAssociation, ASSOCIATION_STATE_ACTIVE,
     ASSOCIATION_STATE_DELETE_PENDING, ASSOCIATION_STATE_UPDATE_PENDING, MPA_ASSOCIATION_SPAN,
@@ -418,6 +426,14 @@ pub struct StoredKey {
     /// signed by the private half, which — like the symmetric material above — never
     /// leaves the service and is redacted in every formatter.
     key_pair: Option<AsymmetricKeyPair>,
+    /// The public key certificate last issued for this key's public half, if any.
+    ///
+    /// Written by the issuance this record's own public half is certified by
+    /// ([`public_key_certificate`]) and read by it alone, so a caller asking for this
+    /// key's certificate is answered with the certificate that was issued for it until
+    /// the clock has taken that one below the remaining validity
+    /// `KeyCertificate`'s documentation names.
+    public_key_certificate: Option<IssuedPublicKeyCertificate>,
 }
 
 /// A key's generated secret, whose `Debug` reports its length and never its bytes.
@@ -890,6 +906,12 @@ pub struct ComAmazonawsPaymentcryptographyPaymentcryptographycontrolplaneState {
     /// `GetMpaTeamAssociation` reports it; the clock settles each of those moves (see
     /// [`mpa_association`]).
     pub mpa_associations: BTreeMap<String, StoredMpaAssociation>,
+    /// The certificate authority this store signs every public key certificate with,
+    /// minted by the first call that has to issue one.
+    ///
+    /// One authority per store and never replaced, so every public key certificate this
+    /// service hands out verifies against the one chain it hands out beside it.
+    public_key_certificate_authority: Option<PublicKeyCertificateAuthority>,
     /// Mixed into generated key ids and key material, so two creates in the same
     /// nanosecond differ.
     counter: u64,
@@ -1105,6 +1127,9 @@ impl ComAmazonawsPaymentcryptographyPaymentcryptographycontrolplaneState {
             resource_policy: None,
             material: record.material,
             key_pair: record.key_pair,
+            // No certificate of this key's public half has been issued yet: one is
+            // issued by the first call that asks for it.
+            public_key_certificate: None,
         };
         stored.key_check_value = stored.check_value_under(&kcv_algorithm).ok_or_else(|| {
             MintRejection::Invalid(format!(

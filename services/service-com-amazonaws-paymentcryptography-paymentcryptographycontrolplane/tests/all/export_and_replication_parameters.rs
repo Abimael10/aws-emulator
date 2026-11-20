@@ -400,7 +400,10 @@ fn assert_export_token(case: &str, token: &str) {
 
 /// The DER of the one PEM certificate a certificate member carries: every such member is
 /// "in PEM format (base64 encoded)", so the value is base64 of a PEM block.
-fn certificate_der(case: &str, member: &str, value: &str) -> Vec<u8> {
+///
+/// Shared with the public key certificate suite, whose members carry the same kind of
+/// document.
+pub(crate) fn certificate_der(case: &str, member: &str, value: &str) -> Vec<u8> {
     let pem = ::aws_smithy_types::base64::decode(value)
         .unwrap_or_else(|e| panic!("case {case}: {member} is not base64 ({e}): {value}"));
     let pem = String::from_utf8(pem)

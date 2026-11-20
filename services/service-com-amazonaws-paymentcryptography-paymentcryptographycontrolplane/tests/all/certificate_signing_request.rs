@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The certificate signing request `GetCertificateSigningRequest` makes, end to end
-//! over the wire.
+//! The certificates this service makes from a key's own key pair, end to end over the
+//! wire: the PKCS#10 certificate signing request `GetCertificateSigningRequest` makes,
+//! and the X.509 public key certificate `GetPublicKeyCertificate` hands out.
 //!
 //! Every call goes through the real `MultiServiceRouter` (`POST /` with
 //! `X-Amz-Target: PaymentCryptographyControlPlane.<Op>`, awsJson1_0) and the
 //! modelled-constraint walk, through the same harness `key_lifecycle` uses, so what
 //! these tests assert is what a signed SDK request observes.
 //!
-//! The rule under test: a certificate signing request is a real PKCS#10 request over
-//! the key pair the named key has held since it was created — its subject is the
+//! The first rule under test: a certificate signing request is a real PKCS#10 request
+//! over the key pair the named key has held since it was created — its subject is the
 //! metadata the call named, its `SubjectPublicKeyInfo` is that pair's public half (the
 //! same public key on every call, whether the key is named by ARN or by alias), and its
 //! signature is made by that pair's private half under the signature algorithm the
@@ -17,17 +18,29 @@
 //! request for is refused rather than answered with some other signature, and so is a
 //! key that is not a key pair or an identifier that names no key.
 //!
-//! The tables below span what the rule generalises over: every modelled `KeyAlgorithm`
+//! The second rule, from the end of this file: the public key certificate of a key is a
+//! real X.509 certificate of that same stored pair's public half, signed by this
+//! service's own certificate authority, whose certificate is the chain answered beside
+//! it; it is valid for the span `KeyCertificate`'s documentation gives, and a key is
+//! answered the certificate that was issued for it on every later call.
+//!
+//! The tables below span what the rules generalise over: every modelled `KeyAlgorithm`
 //! a key pair is generated for, every modelled `SigningAlgorithm`, and subjects from
 //! the one required member up to every optional one.
 
+use std::time::Duration;
+
 use serde_json::{json, Value};
+use x509_cert::der::oid::AssociatedOid;
 use x509_cert::der::{Decode, Encode};
+use x509_cert::ext::pkix::BasicConstraints;
 use x509_cert::request::CertReq;
 
 use service_com_amazonaws_paymentcryptography_paymentcryptographycontrolplane::ops::types::SIGNING_ALGORITHM_TYPE_VALUES;
+use service_com_amazonaws_paymentcryptography_paymentcryptographycontrolplane::state::PUBLIC_KEY_CERTIFICATE_VALIDITY;
 
-use crate::key_lifecycle::{call, error_code, ok_call, router, string};
+use crate::export_and_replication_parameters::{assert_real_certificate_chain, certificate_der};
+use crate::key_lifecycle::{call, error_code, error_message, ok_call, router, string};
 
 /// One asymmetric key algorithm, with the attributes a key of it is created with.
 ///
@@ -630,6 +643,374 @@ async fn a_request_is_refused_for_a_key_that_is_not_a_key_pair_and_for_an_unknow
             status, 400,
             "case {identifier}: no key is named, expected this service's client-error status \
              400, got {status} {parsed}"
+        );
+        assert_eq!(
+            error_code(&parsed),
+            "ResourceNotFoundException",
+            "case {identifier}: expected ResourceNotFoundException, got {parsed}"
+        );
+        assert_eq!(
+            parsed.get("ResourceId").and_then(Value::as_str),
+            Some(identifier),
+            "case {identifier}: expected the identifier the request gave as ResourceId, got \
+             {parsed}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GetPublicKeyCertificate: the certificate of the stored pair's public half
+// ---------------------------------------------------------------------------
+
+/// The modelled `CertificateType`: 1..32768 with the pattern `^[^\[;\]<>]+$` (source:
+/// `smithy_query(query="operation",operation="GetPublicKeyCertificate")`), checked by
+/// hand because this crate has no regex dependency.
+fn assert_certificate_member(case: &str, member: &str, value: &str) {
+    assert!(
+        (1..=32768).contains(&value.len()) && !value.chars().any(|c| "[;]<>".contains(c)),
+        "case {case}: {member} has length {} and must match the modelled pattern, got {value}",
+        value.len()
+    );
+}
+
+/// The account id a key ARN carries: the fifth field of the ARN layout
+/// `arn:aws:<service>:<region>:<account-id>:<resource>`.
+fn account_id(arn: &str) -> &str {
+    arn.split(':')
+        .nth(4)
+        .unwrap_or_else(|| panic!("the key ARN {arn} carries no account field"))
+}
+
+/// The common names a certificate's subject carries, in DER order.
+fn common_names(certificate: &x509_cert::Certificate) -> Vec<String> {
+    certificate
+        .tbs_certificate
+        .subject
+        .0
+        .iter()
+        .flat_map(|rdn| rdn.0.iter())
+        .filter(|attribute| attribute.oid.to_string() == OID_COMMON_NAME)
+        .map(|attribute| String::from_utf8_lossy(attribute.value.value()).to_string())
+        .collect()
+}
+
+/// How long a certificate is valid for, from its own validity window.
+fn validity_span(case: &str, certificate: &x509_cert::Certificate) -> Duration {
+    let validity = &certificate.tbs_certificate.validity;
+    validity
+        .not_after
+        .to_unix_duration()
+        .checked_sub(validity.not_before.to_unix_duration())
+        .unwrap_or_else(|| panic!("case {case}: the certificate expires before it is valid"))
+}
+
+/// `GetPublicKeyCertificate` for one identifier, which must be served.
+async fn public_key_certificate(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    identifier: &str,
+) -> Value {
+    ok_call(
+        router,
+        "GetPublicKeyCertificate",
+        &json!({"KeyIdentifier": identifier}),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_public_key_certificate_certifies_the_stored_pair_of_every_asymmetric_algorithm() {
+    let router = router();
+    let mut certificates: Vec<String> = Vec::new();
+    let mut chains: Vec<String> = Vec::new();
+
+    // Every modelled algorithm this service generates a key pair for, which
+    // `every_asymmetric_algorithm_is_covered` pins against the generated value list: the
+    // certificate carries the public half of whatever pair the key holds, RSA or
+    // elliptic curve.
+    for row in KEY_ROWS {
+        let case = row.key_algorithm;
+        let arn = create_key(&router, &create_key_body(row)).await;
+        let answered = public_key_certificate(&router, &arn).await;
+
+        let certificate_value = string(&answered, "KeyCertificate").to_string();
+        let chain_value = string(&answered, "KeyCertificateChain").to_string();
+        assert_certificate_member(case, "KeyCertificate", &certificate_value);
+        assert_certificate_member(case, "KeyCertificateChain", &chain_value);
+
+        // Real documents: both parse as X.509, the chain certificate is the issuer, and
+        // the signature over the key certificate verifies under the chain's public key.
+        let certificate =
+            assert_real_certificate_chain(case, "KeyCertificate", "KeyCertificateChain", &answered);
+        let chain_der = certificate_der(case, "KeyCertificateChain", &chain_value);
+        let chain = x509_cert::Certificate::from_der(&chain_der)
+            .unwrap_or_else(|e| panic!("case {case}: the chain is not X.509 DER ({e})"));
+
+        // "The root certificate authority (CA) that signed the public key certificate"
+        // (`KeyCertificateChain`'s own documentation): a root, so it is self-issued, and
+        // an authority, which RFC 5280 section 4.2.1.9 states as a critical
+        // `basicConstraints` extension with `cA` set.
+        assert_eq!(
+            chain.tbs_certificate.issuer, chain.tbs_certificate.subject,
+            "case {case}: expected a self-issued root in the chain, got issuer {:?} and subject \
+             {:?}",
+            chain.tbs_certificate.issuer, chain.tbs_certificate.subject
+        );
+        let extension = chain
+            .tbs_certificate
+            .extensions
+            .as_ref()
+            .and_then(|extensions| {
+                extensions
+                    .iter()
+                    .find(|extension| extension.extn_id == BasicConstraints::OID)
+            })
+            .unwrap_or_else(|| panic!("case {case}: the chain carries no basicConstraints"));
+        let constraints = BasicConstraints::from_der(extension.extn_value.as_bytes())
+            .unwrap_or_else(|e| panic!("case {case}: basicConstraints does not decode ({e})"));
+        assert!(
+            constraints.ca,
+            "case {case}: expected the chain certificate to be a certificate authority, got \
+             {constraints:?}"
+        );
+
+        // The certified public key is the public half of the pair this key has held since
+        // it was created: the very key a certificate signing request for the same key
+        // carries, so a certificate over a pair minted per call fails here.
+        let request = parse_request(
+            case,
+            string(
+                &ok_call(
+                    &router,
+                    "GetCertificateSigningRequest",
+                    &json!({
+                        "KeyIdentifier": arn,
+                        "SigningAlgorithm": row.signed_with[0],
+                        "CertificateSubject": {"CommonName": "same-pair"},
+                    }),
+                )
+                .await,
+                "CertificateSigningRequest",
+            ),
+        );
+        let certified = certificate
+            .tbs_certificate
+            .subject_public_key_info
+            .to_der()
+            .unwrap_or_else(|e| panic!("case {case}: the certified public key re-encodes ({e})"));
+        let in_request = request
+            .info
+            .public_key
+            .to_der()
+            .unwrap_or_else(|e| panic!("case {case}: the request public key re-encodes ({e})"));
+        assert_eq!(
+            certified, in_request,
+            "case {case}: expected the certificate to carry this key's own public half, got {} \
+             bytes against the request's {}",
+            certified.len(),
+            in_request.len()
+        );
+
+        // "The certificate is valid for 90 days from the time it is issued"
+        // (`KeyCertificate`'s own documentation).
+        let ninety_days = Duration::from_secs(90 * 24 * 60 * 60);
+        assert_eq!(
+            validity_span(case, &certificate),
+            ninety_days,
+            "case {case}: expected a certificate valid for {ninety_days:?}, got {:?}",
+            validity_span(case, &certificate)
+        );
+        assert_eq!(
+            PUBLIC_KEY_CERTIFICATE_VALIDITY, ninety_days,
+            "case {case}: the service's own validity constant must be the documented 90 days, \
+             got {PUBLIC_KEY_CERTIFICATE_VALIDITY:?}"
+        );
+
+        // The certificate names the account the key belongs to, which is how the real
+        // service names the subject of a public key certificate.
+        assert_eq!(
+            common_names(&certificate),
+            vec![account_id(&arn).to_string()],
+            "case {case}: expected the subject to name the key's own account {}, got {:?}",
+            account_id(&arn),
+            common_names(&certificate)
+        );
+
+        certificates.push(certificate_value);
+        chains.push(chain_value);
+    }
+
+    // One authority per store: every key's certificate comes with the same chain.
+    assert!(
+        chains.windows(2).all(|pair| pair[0] == pair[1]),
+        "every public key certificate must be signed by the one authority of this store, got {} \
+         distinct chains",
+        {
+            let mut distinct = chains.clone();
+            distinct.dedup();
+            distinct.len()
+        }
+    );
+    // And each key gets its own certificate: these certify different public keys.
+    let distinct: std::collections::BTreeSet<&String> = certificates.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        certificates.len(),
+        "each key must be certified by its own certificate, got {} distinct certificates for {} \
+         keys",
+        distinct.len(),
+        certificates.len()
+    );
+}
+
+#[tokio::test]
+async fn every_call_for_one_key_is_answered_the_certificate_issued_for_it() {
+    let router = router();
+
+    // One RSA key and one elliptic curve key, so the rule is checked on a key of each
+    // family rather than on one algorithm.
+    let mut chains: Vec<String> = Vec::new();
+    let mut certificates: Vec<String> = Vec::new();
+    for row in [&KEY_ROWS[0], &KEY_ROWS[3]] {
+        let case = row.key_algorithm;
+        let arn = create_key(&router, &create_key_body(row)).await;
+        let alias = format!("alias/certificate-{}", row.key_algorithm.to_lowercase());
+        ok_call(
+            &router,
+            "CreateAlias",
+            &json!({"AliasName": alias, "KeyArn": arn}),
+        )
+        .await;
+
+        // The same key, named by ARN, by alias, and by ARN again: a certificate issued
+        // per call, or one looked up by the identifier's spelling, would differ on one of
+        // these. "The service returns a cached certificate if one exists with at least 30
+        // days of remaining validity" (`KeyCertificate`'s own documentation), and a
+        // freshly issued one has 90.
+        let mut answered: Vec<(String, String)> = Vec::new();
+        for identifier in [arn.as_str(), alias.as_str(), arn.as_str()] {
+            let answer = public_key_certificate(&router, identifier).await;
+            answered.push((
+                string(&answer, "KeyCertificate").to_string(),
+                string(&answer, "KeyCertificateChain").to_string(),
+            ));
+        }
+        assert!(
+            answered.windows(2).all(|pair| pair[0] == pair[1]),
+            "case {case}: every call for one key must be answered the certificate issued for it, \
+             got {} distinct answers",
+            {
+                let mut distinct = answered.clone();
+                distinct.dedup();
+                distinct.len()
+            }
+        );
+        certificates.push(answered[0].0.clone());
+        chains.push(answered[0].1.clone());
+    }
+
+    assert_ne!(
+        certificates[0], certificates[1],
+        "two keys certify different public keys, so their certificates must differ"
+    );
+    assert_eq!(
+        chains[0], chains[1],
+        "both keys are certified by the one authority of this store, so the chain must be the \
+         same document"
+    );
+}
+
+#[tokio::test]
+async fn a_public_key_certificate_is_refused_for_a_key_with_no_public_key_and_for_an_unknown_name()
+{
+    let router = router();
+
+    // A symmetric key is one secret, not a pair, so there is no public key to certify.
+    // One row per symmetric family, so the refusal is not keyed to one algorithm.
+    let symmetric: &[(&str, &str, &[&str])] = &[
+        (
+            "AES_128",
+            "TR31_D0_SYMMETRIC_DATA_ENCRYPTION_KEY",
+            &["NoRestrictions"],
+        ),
+        (
+            "TDES_3KEY",
+            "TR31_P0_PIN_ENCRYPTION_KEY",
+            &["Encrypt", "Decrypt"],
+        ),
+        ("HMAC_SHA256", "TR31_M7_HMAC_KEY", &["Generate", "Verify"]),
+    ];
+    for (key_algorithm, key_usage, modes) in symmetric {
+        let mut flags = serde_json::Map::new();
+        for flag in *modes {
+            flags.insert((*flag).to_string(), json!(true));
+        }
+        let created = ok_call(
+            &router,
+            "CreateKey",
+            &json!({
+                "KeyAttributes": {
+                    "KeyUsage": key_usage,
+                    "KeyClass": "SYMMETRIC_KEY",
+                    "KeyAlgorithm": key_algorithm,
+                    "KeyModesOfUse": Value::Object(flags),
+                },
+                "Exportable": true,
+            }),
+        )
+        .await;
+        let arn = string(
+            created
+                .get("Key")
+                .unwrap_or_else(|| panic!("case {key_algorithm}: CreateKey answered no Key")),
+            "KeyArn",
+        )
+        .to_string();
+
+        let (status, parsed) = call(
+            &router,
+            "GetPublicKeyCertificate",
+            &json!({"KeyIdentifier": arn}),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {key_algorithm}: a symmetric key has no public key, expected 400, got {status} \
+             {parsed}"
+        );
+        assert_eq!(
+            error_code(&parsed),
+            "ValidationException",
+            "case {key_algorithm}: expected ValidationException, got {parsed}"
+        );
+        let expected = format!(
+            "KeyIdentifier names the key {arn}, which is a SYMMETRIC_KEY, and a public key \
+             certificate is the certificate of the public key of an ASYMMETRIC_KEY_PAIR"
+        );
+        assert_eq!(
+            error_message(&parsed),
+            expected,
+            "case {key_algorithm}: expected the message {expected:?}, got {parsed}"
+        );
+    }
+
+    // An identifier this store holds no key for, in each form the modelled
+    // `KeyArnOrKeyAliasType` admits: a well-formed ARN of no key, and an alias that was
+    // never created.
+    let absent = format!(
+        "arn:aws:payment-cryptography:{}:000000000000:key/abcdefghijklmnop",
+        crate::key_lifecycle::REGION
+    );
+    for identifier in [absent.as_str(), "alias/certificate-never-created"] {
+        let (status, parsed) = call(
+            &router,
+            "GetPublicKeyCertificate",
+            &json!({"KeyIdentifier": identifier}),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {identifier}: no key is named, expected this service's client-error status 400, \
+             got {status} {parsed}"
         );
         assert_eq!(
             error_code(&parsed),

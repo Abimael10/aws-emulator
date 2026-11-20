@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPublicKeyCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPublicKeyCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Hands out the X.509 certificate of the public half of an asymmetric key's key pair:
+//! it reads the pair the key has held in [`crate::state`] since it was minted, puts that
+//! pair's public half into a certificate naming the account the key belongs to, and
+//! signs that certificate with
+//! this store's own certificate authority, whose certificate is the chain answered
+//! beside it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPublicKeyCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A certificate is kept with the key it certifies and answered again while it still has
+//! the remaining validity `KeyCertificate`'s own documentation names, so two calls for
+//! one key carry the same certificate — both documented spans live in this service's
+//! public key certificate state module.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +181,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPublicKeyCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPublicKeyCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPublicKeyCertificate"))
+        // Every modelled constraint on this input is refused by the centralized walk
+        // before this body runs: `KeyIdentifier` being present, and its
+        // `KeyArnOrKeyAliasType` pattern and 7..322 length. What is left for this body is
+        // what the model cannot say: that the identifier names a key this store still
+        // holds, and that the key has a public half to certify.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal)?;
+
+        let now = crate::state::now();
+        // The certificate already issued for this key is what this call answers while it
+        // still has enough validity left, so that case takes the lock once and generates
+        // nothing. The refusals are earned here too, before any work: a call naming no
+        // key, or a key with no public half, costs no key generation.
+        let (reusable, needs_authority) = {
+            let store = state.lock();
+            (
+                store
+                    .reusable_public_key_certificate(&input.key_identifier, now)
+                    .map_err(rejected)?,
+                !store.has_public_key_certificate_authority(),
+            )
+        };
+        if let Some(issued) = reusable {
+            return Ok(answer(&issued));
+        }
+
+        // This store's authority is minted once, on tokio's BOUNDED blocking pool, so the
+        // hundreds of milliseconds of RSA key generation it costs does not starve the
+        // runtime, and no lock is held while it runs. Every later call signs under the
+        // authority already in the store and mints nothing.
+        let minted_authority = if needs_authority {
+            match ::tokio::task::spawn_blocking(move || {
+                crate::state::mint_public_key_certificate_authority(now)
+            })
+            .await
+            {
+                Ok(Some(authority)) => Some(authority),
+                _ => return Err(internal()),
+            }
+        } else {
+            None
+        };
+
+        // The certificate is issued under the ONE borrow that stores it, so what this call
+        // answers is what this store holds for the key and what the next call is answered
+        // with. Issuing is one signature by the authority's key, which is why it is made
+        // here rather than against a copy of the authority taken out from under the lock:
+        // a copy would let two calls hand out certificates only one of which was kept.
+        let issued = state
+            .lock()
+            .public_key_certificate(&input.key_identifier, minted_authority, now)
+            .map_err(rejected)?;
+        if issued.issued == now {
+            // The one call that changed this store — issuing the certificate the
+            // documentation says is issued when no cached one has enough validity left —
+            // leaves the same structured trace every state change of this service does,
+            // naming the resource the request named. A call answered from the stored
+            // certificate changes nothing and records nothing.
+            crate::state::record_mutation(ctx.parts(), Self::NAME, &input.key_identifier);
+        }
+        Ok(answer(&issued))
     }
+}
+
+/// One issued certificate, as this operation's output: "the public key component of the
+/// asymmetric key pair in a certificate PEM format (base64 encoded)" and "the root
+/// certificate authority (CA) that signed" it, as the two members' own documentation puts
+/// it.
+fn answer(issued: &crate::state::IssuedPublicKeyCertificate) -> GetPublicKeyCertificateOutput {
+    GetPublicKeyCertificateOutput {
+        key_certificate: issued.certificate.clone(),
+        key_certificate_chain: issued.certificate_chain.clone(),
+    }
+}
+
+/// The modelled refusal a rejection from the store earns.
+fn rejected(
+    rejection: crate::state::PublicKeyCertificateRejection,
+) -> GetPublicKeyCertificateError {
+    match rejection {
+        // The identifier AS THE REQUEST GAVE IT, which is what that shape's `ResourceId`
+        // reports.
+        crate::state::PublicKeyCertificateRejection::NotFound(identifier) => {
+            GetPublicKeyCertificateErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    resource_id: Some(identifier),
+                },
+            )
+            .into()
+        }
+        crate::state::PublicKeyCertificateRejection::Invalid(why) => {
+            GetPublicKeyCertificateErrorModeled::ValidationException(ValidationException {
+                message: Some(why),
+            })
+            .into()
+        }
+        crate::state::PublicKeyCertificateRejection::Internal => internal(),
+    }
+}
+
+/// This service's own failure, which is the modelled `InternalServerException`.
+fn internal() -> GetPublicKeyCertificateError {
+    GetPublicKeyCertificateErrorModeled::InternalServerException(InternalServerException {
+        message: Some(
+            "the payment cryptography public key certificate could not be issued".to_string(),
+        ),
+    })
+    .into()
 }
