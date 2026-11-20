@@ -9,7 +9,8 @@
 //! > a DynamoDB request whose server-side encryption key KMS refuses is answered HTTP 400
 //! > `ValidationException` whose message WRAPS the KMS fault — the fully qualified class of
 //! > the KMS exception the attempt raised, that exception's own sentence, and the context
-//! > of the KMS call — rather than a sentence of DynamoDB's own, so a client can tell a key
+//! > of the KMS call (the KMS service name, the status, the error code and the id of the
+//! > call) — rather than a sentence of DynamoDB's own, so a client can tell a key
 //! > that does not exist from one that is disabled from one being destroyed.
 //!
 //! > every data-plane request on a table encrypted with a customer managed key resolves
@@ -145,7 +146,7 @@ async fn a_key_kms_does_not_serve_is_refused_with_the_kms_exception_it_raised() 
         );
         let expected_head = format!(
             "KMS validation error: {KMS_PACKAGE}.NotFoundException: Key '{key}' does not exist \
-             (Service: Kms, Status Code: 400, Request ID: "
+             (Service: AWSKMS; Status Code: 400; Error Code: NotFoundException; Request ID: "
         );
         assert!(
             refusal.starts_with(&expected_head) && refusal.ends_with(CONTEXT_TAIL),

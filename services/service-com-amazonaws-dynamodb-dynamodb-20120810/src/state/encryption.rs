@@ -251,13 +251,16 @@ fn unusable_key_fault(
 /// The attempt to use the key raised `NotFoundException` in KMS, and DynamoDB reports the
 /// KMS exception it caught rather than a sentence of its own
 /// ([`wrapped_kms_fault`]) — so the class name is in the message and a caller can tell
-/// this fault from a disabled or a deleted key.
+/// this fault from a disabled or a deleted key. The CONTEXT of that call is the one
+/// context every wrapped fault states, whichever exception it wraps: the KMS service
+/// name, the status, the error code and the id of the call, which is why this draws the
+/// same builder rather than wording a context of its own.
 pub fn unknown_sse_key(key_id: &str) -> super::RequestError {
-    super::RequestError::Validation(format!(
-        "{KMS_VALIDATION_PREFIX}: {KMS_EXCEPTION_PACKAGE}.{NOT_FOUND_EXCEPTION}: Key '{key_id}' \
-         does not exist (Service: Kms, Status Code: 400, Request ID: {}; Proxy: null)",
-        kms_request_id()
-    ))
+    wrapped_kms_fault(
+        KMS_VALIDATION_PREFIX,
+        NOT_FOUND_EXCEPTION,
+        &format!("Key '{key_id}' does not exist"),
+    )
 }
 
 /// The KMS fault a request met, as DynamoDB reports it: the class of the exception the

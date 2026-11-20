@@ -1768,18 +1768,28 @@ fn operand_type_name(value: &AttributeValue) -> &'static str {
     }
 }
 
+/// The ONE name AWS gives the domain a value operand has to fall in, which every refusal
+/// of an operand outside its operator's domain states.
+///
+/// Both operators that take a value operand are the SET-valued actions — "The ADD action
+/// only supports Number and set data types" and "The DELETE action only supports set data
+/// types" (`UpdateItem$UpdateExpression`) — and the recorded refusals of both name this one
+/// type set, the `ADD` operand's, whichever of them the expression wrote: the message names
+/// the operator separately, so the type set is not what tells the two apart. There is no
+/// second name to state, which is why it is a constant of this module rather than a field
+/// of [`ValueOperand`].
+const SET_OPERAND_TYPE_SET: &str = "ALLOWED_FOR_ADD_OPERAND";
+
 /// What ONE update operator may be given as its value operand: the operator keyword a
-/// refusal names, the name AWS gives the set of types that operator takes, and which
-/// values are in it.
+/// refusal names, and which values are in the domain that operator takes.
 ///
 /// The domain is a property of the OPERATOR, not of the item: an operand outside it
 /// cannot be applied whatever the attribute holds, so it is refused naming the operator
-/// and that type set ([`ValueOperand::check`]), while an operand INSIDE the domain that
-/// does not match the type the item holds is the class refusal
+/// and the type set above ([`ValueOperand::check`]), while an operand INSIDE the domain
+/// that does not match the type the item holds is the class refusal
 /// ([`INCORRECT_UPDATE_OPERAND_TYPE_MESSAGE`]) the two set walkers raise.
 struct ValueOperand {
     operator: &'static str,
-    type_set: &'static str,
     takes: fn(&AttributeValue) -> bool,
 }
 
@@ -1793,7 +1803,7 @@ impl ValueOperand {
         Err(incorrect_update_operand_type_for(
             member,
             self.operator,
-            self.type_set,
+            SET_OPERAND_TYPE_SET,
             value,
         ))
     }
@@ -1803,7 +1813,6 @@ impl ValueOperand {
 /// (`UpdateItem$UpdateExpression`), so a number or one of the three set types.
 const ADD_OPERAND: ValueOperand = ValueOperand {
     operator: "ADD",
-    type_set: "ALLOWED_FOR_ADD_OPERAND",
     takes: |value| {
         matches!(
             value,
@@ -1819,7 +1828,6 @@ const ADD_OPERAND: ValueOperand = ValueOperand {
 /// doc), so one of the three set types and nothing else.
 const DELETE_OPERAND: ValueOperand = ValueOperand {
     operator: "DELETE",
-    type_set: "ALLOWED_FOR_DELETE_OPERAND",
     takes: |value| {
         matches!(
             value,

@@ -15,7 +15,9 @@ use super::*;
 // The shape of one `BatchGetItem` `RequestItems` entry, which the rendering of that
 // member walks ([`rendered_batch_get_request_items`]); `super` reaches only the shapes it
 // names itself.
-use crate::ops::types::{KeysAndAttributes, TransactGetItem, TransactWriteItem, WriteRequest};
+use crate::ops::types::{
+    KeysAndAttributes, ParameterizedStatement, TransactGetItem, TransactWriteItem, WriteRequest,
+};
 
 /// How many put-or-delete operations one `BatchWriteItem` may carry: "up to 25 item
 /// put or delete operations" (the `BatchWriteItem` doc), which is also the length the
@@ -735,6 +737,74 @@ pub fn rendered_transact_write_items(items: &[TransactWriteItem]) -> String {
     out.into_text()
 }
 
+/// An `ExecuteTransaction`'s `TransactStatements` list as the refusal of that member
+/// quotes it.
+///
+/// The same OBJECT rendering the transactional item lists above are quoted in, over the
+/// statements this operation carries —
+/// `[ParameterizedStatement(statement=<the statement the request sent>, parameters=null,
+/// returnValuesOnConditionCheckFailure=null)]`. Every value in it comes from the request;
+/// the field names and their order are the model's own
+/// (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#ParameterizedStatement")`
+/// gives `Statement Parameters ReturnValuesOnConditionCheckFailure`), and a member the
+/// request left out renders as the unset field it is. A parameter is an `AttributeValue`,
+/// so each one is written in the attribute-value frame every value of this rendering is
+/// written in.
+///
+/// Bounded exactly as those renderings are: every byte goes through one [`BoundedText`], so
+/// what the clause quotes is clamped before it is produced rather than clipped afterwards.
+pub fn rendered_parameterized_statements(statements: &[ParameterizedStatement]) -> String {
+    let mut out = BoundedText::default();
+    out.push("[");
+    for (at, statement) in statements.iter().enumerate() {
+        if !out.has_room() {
+            break;
+        }
+        if at > 0 {
+            out.push(", ");
+        }
+        out.push("ParameterizedStatement(statement=");
+        out.push(&statement.statement);
+        push_rendered_value_list(&mut out, "parameters", statement.parameters.as_deref());
+        push_rendered_text(
+            &mut out,
+            "returnValuesOnConditionCheckFailure",
+            statement.return_values_on_condition_check_failure.as_deref(),
+        );
+        out.push(")");
+    }
+    out.push("]");
+    out.into_text()
+}
+
+/// One field carrying a LIST of attribute values: the bracketed form a list takes, each
+/// element in the attribute-value frame, and the unset field for a member the request left
+/// out.
+fn push_rendered_value_list(
+    out: &mut BoundedText,
+    field: &str,
+    values: Option<&[AttributeValue]>,
+) {
+    out.push(", ");
+    out.push(field);
+    out.push("=");
+    let Some(values) = values else {
+        out.push(NULL_FIELD);
+        return;
+    };
+    out.push("[");
+    for (at, value) in values.iter().enumerate() {
+        if !out.has_room() {
+            break;
+        }
+        if at > 0 {
+            out.push(", ");
+        }
+        render(out, vec![RenderStep::Value(value)], 1);
+    }
+    out.push("]");
+}
+
 /// The members every action of a transactional write carries BEYOND the item or key it
 /// addresses and the table it names, in the order the model declares them, and the
 /// service's own trailing field after them — the frame closed.
@@ -926,6 +996,12 @@ pub fn exactly_one_operation(member: &str, choices: &str) -> RequestError {
 /// in the paths it reports (lowerCamel) — the member a `TransactWriteItem` that states no
 /// action at all violates.
 pub const TRANSACT_ITEMS_MEMBER_PATH: &str = "transactItems";
+
+/// The member a PartiQL transaction's statements arrive in, spelled the same way — the
+/// member whose own `@length` maximum a list of more statements than the model admits
+/// breaks (`smithy_query(query="operation", operation="ExecuteTransaction")` gives
+/// `TransactStatements` with `@length{min:1,max:100}`).
+pub const TRANSACT_STATEMENTS_MEMBER_PATH: &str = "transactStatements";
 
 /// The constraint an element of a transactional write that names NONE of the four actions
 /// broke, as AWS's request validator words the requirement: the shape that must carry one

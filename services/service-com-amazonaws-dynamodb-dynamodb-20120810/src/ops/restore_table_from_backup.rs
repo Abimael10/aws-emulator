@@ -605,30 +605,29 @@ fn unsupported_member(input: &RestoreTableFromBackupInput) -> Option<&'static st
 fn clamped_overrides(
     input: &RestoreTableFromBackupInput,
 ) -> Result<(), crate::state::RequestError> {
-    let indexes = input
-        .global_secondary_index_override
-        .as_ref()
-        .map_or(0, Vec::len);
-    if indexes > crate::state::MAX_GLOBAL_SECONDARY_INDEXES {
-        return Err(crate::state::RequestError::Validation(format!(
-            "Invalid GlobalSecondaryIndexOverride: a table may carry at most {} global \
-             secondary indexes, got {indexes}",
-            crate::state::MAX_GLOBAL_SECONDARY_INDEXES
-        )));
-    }
-    let local_indexes = input
-        .local_secondary_index_override
-        .as_ref()
-        .map_or(0, Vec::len);
-    if local_indexes > crate::state::MAX_LOCAL_SECONDARY_INDEXES {
-        return Err(crate::state::RequestError::Validation(format!(
-            "Invalid LocalSecondaryIndexOverride: a table may carry at most {} local \
-             secondary indexes, got {local_indexes}",
-            crate::state::MAX_LOCAL_SECONDARY_INDEXES
-        )));
-    }
+    crate::state::check_index_count(
+        GLOBAL_SECONDARY_INDEX_OVERRIDE_MEMBER,
+        input
+            .global_secondary_index_override
+            .as_ref()
+            .map_or(0, Vec::len),
+        crate::state::MAX_GLOBAL_SECONDARY_INDEXES,
+    )?;
+    crate::state::check_index_count(
+        LOCAL_SECONDARY_INDEX_OVERRIDE_MEMBER,
+        input
+            .local_secondary_index_override
+            .as_ref()
+            .map_or(0, Vec::len),
+        crate::state::MAX_LOCAL_SECONDARY_INDEXES,
+    )?;
     Ok(())
 }
+
+/// The two members this operation's index overrides arrive in, as the model spells them on
+/// the wire — which is how the refusal of a list past the per-table limit names it.
+const GLOBAL_SECONDARY_INDEX_OVERRIDE_MEMBER: &str = "GlobalSecondaryIndexOverride";
+const LOCAL_SECONDARY_INDEX_OVERRIDE_MEMBER: &str = "LocalSecondaryIndexOverride";
 
 /// The capacity mode and provisioned throughput the restored table starts life with.
 ///

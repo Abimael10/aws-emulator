@@ -15,7 +15,10 @@
 //! types" and "The DELETE action only supports set data types". The type names the
 //! message spells are the `AttributeValue` members' own documented type names
 //! (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#AttributeValue")`: "An
-//! attribute of type String Set" for `SS`, and so on).
+//! attribute of type String Set" for `SS`, and so on). The TYPE SET the message names is
+//! one name for both operators, the `ADD` operand's, which is what the recorded refusals
+//! of either operator carry: the operator is named separately, so the type set is not
+//! what tells the two apart.
 //!
 //! Driven as a TABLE over the operators, every `AttributeValue` type (including the ones
 //! each operator DOES take, which must be served or refused for the stored type
@@ -112,13 +115,16 @@ async fn refusal(
     message(&body)
 }
 
-/// One operator that takes a value operand: its keyword, the type-set name its refusal
-/// states, and the type names it accepts.
+/// One operator that takes a value operand: its keyword and the type names it accepts.
+/// The type-set NAME its refusal states is the same for both ([`SET_OPERAND_TYPE_SET`]).
 struct Operator {
     keyword: &'static str,
-    type_set: &'static str,
     accepts: &'static [&'static str],
 }
+
+/// The one name AWS gives the operand domain of either set-valued action, as the recorded
+/// refusals of both state it.
+const SET_OPERAND_TYPE_SET: &str = "ALLOWED_FOR_ADD_OPERAND";
 
 /// The two update operators whose operand is a value, with the domains the model's
 /// `UpdateExpression` doc states for them.
@@ -126,12 +132,10 @@ fn operators() -> Vec<Operator> {
     vec![
         Operator {
             keyword: "ADD",
-            type_set: "ALLOWED_FOR_ADD_OPERAND",
             accepts: &["NUMBER", "STRING_SET", "NUMBER_SET", "BINARY_SET"],
         },
         Operator {
             keyword: "DELETE",
-            type_set: "ALLOWED_FOR_DELETE_OPERAND",
             accepts: &["STRING_SET", "NUMBER_SET", "BINARY_SET"],
         },
     ]
@@ -174,7 +178,7 @@ async fn an_operand_outside_its_operator_type_set_names_the_operator_and_the_set
             let stated = refusal(&router, &case, "UpdateItem", request).await;
             assert_eq!(
                 stated,
-                expected_message(operator.keyword, type_name, operator.type_set),
+                expected_message(operator.keyword, type_name, SET_OPERAND_TYPE_SET),
                 "case {case:?}: expected AWS's operand-type message, got {stated:?}"
             );
         }
@@ -190,7 +194,7 @@ async fn the_refusal_does_not_depend_on_the_item_or_the_operation() {
     // message is the same whether the path holds a number, a set, nothing at all, or
     // sits behind a key no item is stored under — and the same whichever operation read
     // the expression.
-    let add_string = expected_message("ADD", "STRING", "ALLOWED_FOR_ADD_OPERAND");
+    let add_string = expected_message("ADD", "STRING", SET_OPERAND_TYPE_SET);
     let rows: Vec<(&str, Value)> = vec![
         (
             "UpdateItem over a stored number",

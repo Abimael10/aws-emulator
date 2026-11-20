@@ -131,14 +131,16 @@ fn transact_items_clauses(document: &Value) -> Vec<String> {
 }
 
 // =============================================================================
-// THE TRANSACTIONAL LIST PAST ITS CAP
+// A CAPPED LIST PAST ITS MAXIMUM
 //
-// A `TransactItems` list carrying more elements than the model admits is a violation the
-// validating WALK reports — so the request is refused before the handler that has the
-// decoded list in hand runs — and AWS's recorded refusal of it states the REJECTED LIST:
+// A list member carrying more elements than the model admits is a violation the validating
+// WALK reports — so the request is refused before the handler that has the decoded list in
+// hand runs — and AWS's recorded refusals of it state the REJECTED LIST:
 // `Value '[TransactGetItem(get=Get(key={pk=AttributeValue(s=…, n=null, …)}, …))]' at
 // 'transactItems' failed to satisfy constraint: …`, the same object rendering a refused
-// `BatchWriteItem` request map is quoted in. That walk hands
+// `BatchWriteItem` request map is quoted in, and
+// `Value '[ParameterizedStatement(statement=…, …)]' at 'transactStatements' …` for the
+// PartiQL transaction's own list. That walk hands
 // [`super::EmulatedService::override_refusal`] its own summary of the collection (`<n>
 // items`) rather than the collection, so there is nothing there to render from.
 //
@@ -146,9 +148,11 @@ fn transact_items_clauses(document: &Value) -> Vec<String> {
 // OWN deserializer for the served operation's input — the same protocol, the same input
 // schema and the same generated reader the dispatch that follows uses, so this layer
 // cannot disagree with it — and rendered by the one renderer this crate states that form
-// with (`crate::state::rendered_transact_get_items` and
-// `crate::state::rendered_transact_write_items`). The BOUND is read off the same generated
-// input schema the walk reads it off, never off a second transcription of the model.
+// with (`crate::state::rendered_transact_get_items`,
+// `crate::state::rendered_transact_write_items` and
+// `crate::state::rendered_parameterized_statements`). The BOUND is read off the same
+// generated input schema the walk reads it off, never off a second transcription of the
+// model.
 //
 // Only a list past the MAXIMUM is stated this way, which is the class the recorded
 // refusals carry. A list below the member's minimum is the empty list, whose recorded
@@ -159,22 +163,43 @@ fn transact_items_clauses(document: &Value) -> Vec<String> {
 /// The other operation whose `TransactItems` list is quoted back that way.
 const TRANSACT_GET_ITEMS: &str = "TransactGetItems";
 
-/// The clause the served operation's `TransactItems` earns for carrying more elements than
-/// the model admits, with the rejected list rendered from the request itself.
+/// The PartiQL transaction, whose own statement list is quoted back the same way.
+const EXECUTE_TRANSACTION: &str = "ExecuteTransaction";
+
+/// The list member of `ExecuteTransaction`, as the model spells it on the wire.
+const TRANSACT_STATEMENTS_MEMBER: &str = "TransactStatements";
+
+/// The clause one capped list earns, beside the member path the walk reports that list
+/// under — so the refusal substitutes it for the walk's own clause about THAT member and
+/// leaves every other clause of the same refusal alone.
+#[derive(Debug, Clone)]
+pub struct CappedListClause {
+    /// The member path the validating walk reports the violated list under.
+    pub path: &'static str,
+    /// The clause this service words for it, with the rejected list rendered from the
+    /// request.
+    pub clause: String,
+}
+
+/// The clause the served operation's capped list earns for carrying more elements than the
+/// model admits, with the rejected list rendered from the request itself.
 ///
-/// `None` for every other operation, for a body no input can be read from, and for a list
-/// inside its declared bound — including an empty one, which keeps the walk's clause.
-pub fn transact_items_cap_clause(
+/// `None` for an operation that has no such list, for a body no input can be read from, and
+/// for a list inside its declared bound — including an empty one, which keeps the walk's
+/// clause.
+pub fn capped_list_clause(
     operation: &str,
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
-) -> Option<String> {
-    let (rendered, requirement) = match operation {
+) -> Option<CappedListClause> {
+    let (path, rendered, requirement) = match operation {
         TRANSACT_GET_ITEMS => {
             let schema = crate::ops::types::TRANSACT_GET_ITEMS_INPUT_SCHEMA;
             let input: crate::ops::types::TransactGetItemsInput = decoded(protocol, req, schema)?;
-            let requirement = past_declared_maximum(schema, input.transact_items.len())?;
+            let requirement =
+                past_declared_maximum(schema, TRANSACT_ITEMS_MEMBER, input.transact_items.len())?;
             (
+                crate::state::TRANSACT_ITEMS_MEMBER_PATH,
                 crate::state::rendered_transact_get_items(&input.transact_items),
                 requirement,
             )
@@ -182,19 +207,34 @@ pub fn transact_items_cap_clause(
         TRANSACT_WRITE_ITEMS => {
             let schema = crate::ops::types::TRANSACT_WRITE_ITEMS_INPUT_SCHEMA;
             let input: crate::ops::types::TransactWriteItemsInput = decoded(protocol, req, schema)?;
-            let requirement = past_declared_maximum(schema, input.transact_items.len())?;
+            let requirement =
+                past_declared_maximum(schema, TRANSACT_ITEMS_MEMBER, input.transact_items.len())?;
             (
+                crate::state::TRANSACT_ITEMS_MEMBER_PATH,
                 crate::state::rendered_transact_write_items(&input.transact_items),
+                requirement,
+            )
+        }
+        EXECUTE_TRANSACTION => {
+            let schema = crate::ops::types::EXECUTE_TRANSACTION_INPUT_SCHEMA;
+            let input: crate::ops::types::ExecuteTransactionInput = decoded(protocol, req, schema)?;
+            let requirement = past_declared_maximum(
+                schema,
+                TRANSACT_STATEMENTS_MEMBER,
+                input.transact_statements.len(),
+            )?;
+            (
+                crate::state::TRANSACT_STATEMENTS_MEMBER_PATH,
+                crate::state::rendered_parameterized_statements(&input.transact_statements),
                 requirement,
             )
         }
         _ => return None,
     };
-    Some(crate::state::constraint_clause(
-        crate::state::TRANSACT_ITEMS_MEMBER_PATH,
-        Some(&rendered),
-        &requirement,
-    ))
+    Some(CappedListClause {
+        path,
+        clause: crate::state::constraint_clause(path, Some(&rendered), &requirement),
+    })
 }
 
 /// `req`'s body read as the input `schema` declares, by the framework's own deserializer
@@ -209,19 +249,20 @@ fn decoded<I: DeserializableStruct>(
     I::deserialize(&mut *deserializer).ok()
 }
 
-/// The requirement phrase for the `@length` MAXIMUM the `TransactItems` member of `input`
-/// declares, when `elements` is past it — read off the generated schema the validating
-/// walk reads it off. `None` when the member declares no maximum, and when the list is
-/// inside it.
+/// The requirement phrase for the `@length` MAXIMUM `member` of `input` declares, when
+/// `elements` is past it — read off the generated schema the validating walk reads it off.
+/// `None` when the member declares no maximum, and when the list is inside it.
 fn past_declared_maximum(
     input: &'static ::aws_smithy_schema::Schema,
+    member: &str,
     elements: usize,
 ) -> Option<String> {
-    let member = input
+    let declared_member = input
         .members()
         .iter()
-        .find(|member| member.member_name() == Some(TRANSACT_ITEMS_MEMBER))?;
-    let declared = declared_trait::<LengthTrait>(member.traits()?, &LengthTrait::TRAIT_ID)?;
+        .find(|declared| declared.member_name() == Some(member))?;
+    let declared =
+        declared_trait::<LengthTrait>(declared_member.traits()?, &LengthTrait::TRAIT_ID)?;
     let max = declared.max?;
     let length = i64::try_from(elements).unwrap_or(i64::MAX);
     (length > max).then(|| crate::state::max_length_requirement(usize::try_from(max).unwrap_or(0)))

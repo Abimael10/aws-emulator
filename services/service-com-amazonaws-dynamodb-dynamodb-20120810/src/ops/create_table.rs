@@ -723,17 +723,22 @@ fn requested_capacities(input: &CreateTableInput) -> impl Iterator<Item = &Provi
         .flatten()
 }
 
+/// The two members a table's secondary indexes are declared in, as the model spells them
+/// on the wire — which is how every refusal about one of those lists names it.
+const GLOBAL_SECONDARY_INDEXES_MEMBER: &str = "GlobalSecondaryIndexes";
+const LOCAL_SECONDARY_INDEXES_MEMBER: &str = "LocalSecondaryIndexes";
+
 /// Every secondary-index list this request carries, with the number of indexes it states
 /// for each — the pairs [`crate::state::check_lists_not_empty`] holds to a list that names
 /// at least one index, in the order this handler reads them.
 fn declared_index_lists(input: &CreateTableInput) -> [(&'static str, Option<usize>); 2] {
     [
         (
-            "GlobalSecondaryIndexes",
+            GLOBAL_SECONDARY_INDEXES_MEMBER,
             input.global_secondary_indexes.as_ref().map(Vec::len),
         ),
         (
-            "LocalSecondaryIndexes",
+            LOCAL_SECONDARY_INDEXES_MEMBER,
             input.local_secondary_indexes.as_ref().map(Vec::len),
         ),
     ]
@@ -821,14 +826,11 @@ impl<'d> DeclaredTable<'d> {
                 crate::state::MAX_ATTRIBUTE_DEFINITIONS
             )));
         }
-        let indexes = self.global_secondary_indexes.len();
-        if indexes > crate::state::MAX_GLOBAL_SECONDARY_INDEXES {
-            return Err(crate::state::RequestError::Validation(format!(
-                "Invalid GlobalSecondaryIndexes: a table may carry at most {} global secondary \
-                 indexes, got {indexes}",
-                crate::state::MAX_GLOBAL_SECONDARY_INDEXES
-            )));
-        }
+        crate::state::check_index_count(
+            GLOBAL_SECONDARY_INDEXES_MEMBER,
+            self.global_secondary_indexes.len(),
+            crate::state::MAX_GLOBAL_SECONDARY_INDEXES,
+        )?;
         for index in self.global_secondary_indexes {
             if index.key_schema.len() > crate::state::MAX_INDEX_KEY_ELEMENTS {
                 return Err(crate::state::RequestError::Validation(format!(
@@ -840,14 +842,11 @@ impl<'d> DeclaredTable<'d> {
                 )));
             }
         }
-        let local_indexes = self.local_secondary_indexes.len();
-        if local_indexes > crate::state::MAX_LOCAL_SECONDARY_INDEXES {
-            return Err(crate::state::RequestError::Validation(format!(
-                "Invalid LocalSecondaryIndexes: a table may carry at most {} local secondary \
-                 indexes, got {local_indexes}",
-                crate::state::MAX_LOCAL_SECONDARY_INDEXES
-            )));
-        }
+        crate::state::check_index_count(
+            LOCAL_SECONDARY_INDEXES_MEMBER,
+            self.local_secondary_indexes.len(),
+            crate::state::MAX_LOCAL_SECONDARY_INDEXES,
+        )?;
         for index in self.local_secondary_indexes {
             if index.key_schema.len() > crate::state::MAX_INDEX_KEY_ELEMENTS {
                 return Err(crate::state::RequestError::Validation(format!(
@@ -1313,11 +1312,13 @@ fn validated_local_indexes(
             .find(|element| element.key_type == "HASH")
             .map_or("", |element| element.attribute_name.as_str());
         if hash_key != partition_key {
-            return Err(crate::state::RequestError::Validation(format!(
-                "Invalid KeySchema for index {}: a local secondary index must have the table's \
-                 partition key {partition_key} as its HASH key, got {hash_key}",
-                index.index_name
-            )));
+            return Err(crate::state::RequestError::Validation(
+                crate::state::index_leading_hash_key_message(
+                    &index.index_name,
+                    hash_key,
+                    partition_key,
+                ),
+            ));
         }
         indexes.push(crate::state::LocalSecondaryIndex {
             arn: crate::state::index_arn(region, table, &index.index_name),
