@@ -120,6 +120,61 @@ pub(crate) async fn call_signed_for(
     (status, parsed)
 }
 
+/// One `awsJson1_1` call that must answer 200, carrying the `Host` field and the request-URI
+/// authority given — the only two places a request states the address its caller reached this
+/// emulator at.
+///
+/// `pub(crate)` so every suite about an ADDRESS this registry publishes (the gallery URIs, the
+/// hosted logo) drives the same front door by the same request rather than keeping a copy of
+/// it.
+pub(crate) async fn call_addressed(
+    router: &MultiServiceRouter,
+    case: &str,
+    host: Option<&str>,
+    uri_authority: Option<&str>,
+    operation: &str,
+    body: Value,
+) -> Value {
+    let uri = match uri_authority {
+        Some(authority) => format!("https://{authority}/"),
+        None => "/".to_string(),
+    };
+    let mut request = ::http::Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/x-amz-json-1.1")
+        .header("x-amz-target", format!("{TARGET_PREFIX}.{operation}"))
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDECRPUBLIC/20260101/{API_REGION}\
+                 /ecr-public/aws4_request, SignedHeaders=host;x-amz-target, Signature=00"
+            ),
+        );
+    if let Some(host) = host {
+        request = request.header("host", host);
+    }
+    let request = request
+        .body(bytes::Bytes::from(
+            serde_json::to_vec(&body).expect("the request body serializes"),
+        ))
+        .expect("a well-formed request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let payload = response.into_body();
+    let answered: Value = serde_json::from_slice(&payload).unwrap_or_else(|error| {
+        panic!(
+            "case {case:?}: {operation} answered a body that is not JSON ({error}): {:?}",
+            String::from_utf8_lossy(&payload)
+        )
+    });
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from {operation}, got {status} with {answered}"
+    );
+    answered
+}
+
 /// A call that must succeed, returning its body.
 pub(crate) async fn ok(
     router: &MultiServiceRouter,

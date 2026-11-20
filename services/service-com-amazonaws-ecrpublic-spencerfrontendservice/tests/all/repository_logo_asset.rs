@@ -20,11 +20,13 @@
 //! request.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_ecrpublic_spencerfrontendservice::state::GALLERY_HOST;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::error_message;
 use crate::repository_image_lifecycle::{
-    call, logo_url_on, ok, published_logo_origin, refused, service, text, REGISTRY_ID,
+    call, call_addressed, logo_url_on, ok, published_logo_origin, refused, service, text,
+    REGISTRY_ID,
 };
 
 /// The refusal a payload below the pixel floor is answered with: the member at fault and
@@ -542,4 +544,161 @@ async fn a_logo_supplied_at_create_is_published_and_the_floor_holds_there_too() 
         status, 400,
         "case \"an undersized logo at create\": expected no repository to have been created"
     );
+}
+
+/// One catalog write that must answer 200, addressed by the `Host` field and the request-URI
+/// authority given.
+async fn put_logo_addressed(
+    router: &MultiServiceRouter,
+    case: &str,
+    host: Option<&str>,
+    uri_authority: Option<&str>,
+    name: &str,
+    blob: &[u8],
+) -> Value {
+    call_addressed(
+        router,
+        case,
+        host,
+        uri_authority,
+        "PutRepositoryCatalogData",
+        json!({
+            "repositoryName": name,
+            "catalogData": {"description": "a logo", "logoImageBlob": blob_member(blob)},
+        }),
+    )
+    .await
+}
+
+/// RULE: a URL this service publishes for a client to FETCH later names an address THIS
+/// emulator answers on — the loopback host and the port of the socket it serves its asset
+/// plane at — and a client that dereferences it is served the stored payload. The address is
+/// the emulator's own whatever address the request that published the asset stated, so no
+/// host a caller sends, and no host of the real service, can reach a published `logoUrl`.
+///
+/// The rows span the endpoint forms a caller reaches this emulator by, the two among them a
+/// compiled-in base would be indistinguishable from (the real gallery host and this service's
+/// own AWS endpoint host) included, crossed with the repository-name forms the modelled
+/// `RepositoryName` pattern admits and the payload formats the asset is published in. No row
+/// is the recorded request.
+#[tokio::test]
+async fn a_minted_logo_url_names_an_address_this_emulator_answers_on() {
+    let router = service();
+
+    // (how the caller addressed the emulator, the `Host` field, the request-URI authority),
+    // crossed below with (repository name, payload). Every port here is outside the range an
+    // operating system assigns an ephemeral one from, so none of them can be the port this
+    // emulator's own asset socket was handed.
+    let addressed: [(&str, Option<&str>, Option<&str>); 6] = [
+        ("a loopback address on a fixed port", Some("127.0.0.1:9297"), None),
+        (
+            "a loopback name with another port",
+            Some("localhost:9444"),
+            None,
+        ),
+        (
+            "an endpoint carried only on the request URI",
+            None,
+            Some("127.0.0.1:8443"),
+        ),
+        ("the real gallery's own host", Some(GALLERY_HOST), None),
+        (
+            "this service's AWS endpoint host",
+            Some("api.ecr-public.us-east-1.amazonaws.com"),
+            None,
+        ),
+        ("no endpoint on the request at all", None, None),
+    ];
+    let payloads: [(&str, Vec<u8>); 3] = [
+        ("nginx", png(64, 64)),
+        ("org/team/app", png(1024, 60)),
+        ("ab", gif(120, 90)),
+    ];
+
+    let mut origins: Vec<(String, String)> = Vec::new();
+    for (index, (addressing, host, uri_authority)) in addressed.into_iter().enumerate() {
+        for (suffix, blob) in &payloads {
+            let case = format!("{addressing}, repository {suffix}");
+            let name = format!("addressed-{index}/{suffix}");
+            repository(&router, &name).await;
+
+            let written =
+                put_logo_addressed(&router, &case, host, uri_authority, &name, blob).await;
+            let url = text(&written, &["catalogData", "logoUrl"], &case);
+
+            // The address half is the socket this emulator serves the plane at: `https` on
+            // this machine's own address and a port of its own, never a host somebody
+            // else's resolver decides.
+            let origin = published_logo_origin(&url, &case);
+            let authority = origin
+                .split_once("://")
+                .map(|(_scheme, authority)| authority.to_string())
+                .unwrap_or_default();
+            let published_host = authority
+                .rsplit_once(':')
+                .map_or(authority.as_str(), |(host, _port)| host);
+            assert!(
+                !published_host.eq_ignore_ascii_case(GALLERY_HOST),
+                "case {case:?}: expected an address this emulator answers on, got the real \
+                 gallery host in {url:?}"
+            );
+            assert!(
+                !published_host.to_ascii_lowercase().ends_with(".amazonaws.com"),
+                "case {case:?}: expected an address this emulator answers on, got an AWS \
+                 endpoint host in {url:?}"
+            );
+            if let Some(sent) = host.or(uri_authority) {
+                assert_ne!(
+                    authority, sent,
+                    "case {case:?}: the published address is the emulator's own, not the one \
+                     the request carried, yet {url:?} names {sent:?}"
+                );
+            }
+            assert_eq!(
+                url,
+                logo_url_on(&origin, &name, blob),
+                "case {case:?}: expected the payload's own digest on the address this \
+                 emulator serves the asset at, got {url:?}"
+            );
+
+            // Every reader reports that URL, and dereferencing it serves the stored bytes:
+            // the address leads back to this emulator rather than out of it.
+            let read = ok(
+                &router,
+                "GetRepositoryCatalogData",
+                json!({"repositoryName": name}),
+                &case,
+            )
+            .await;
+            assert_eq!(
+                text(&read, &["catalogData", "logoUrl"], &case),
+                url,
+                "case {case:?}: expected the stored record to report the same URL, got {read}"
+            );
+            let (status, _media_type, body) = fetch(&router, &url, &case).await;
+            assert_eq!(
+                (status, &body),
+                (200, blob),
+                "case {case:?}: expected the {} uploaded bytes served at {url:?}, got {} of \
+                 them",
+                blob.len(),
+                body.len()
+            );
+            origins.push((case, origin));
+        }
+    }
+
+    // ONE address serves every repository of this registry, so a URL a client is holding
+    // keeps naming the address that serves it however the next caller addresses the API.
+    let (first_case, first) = origins
+        .first()
+        .cloned()
+        .expect("the table publishes at least one asset");
+    for (case, origin) in &origins {
+        assert_eq!(
+            origin, &first,
+            "case {case:?}: expected the asset plane published at one address ({first:?}, \
+             from case {first_case:?}), got {origin:?}"
+        );
+    }
 }

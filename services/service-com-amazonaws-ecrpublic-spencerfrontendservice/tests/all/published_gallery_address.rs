@@ -30,18 +30,14 @@
 
 use std::sync::Arc;
 
-use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_ecrpublic_spencerfrontendservice::state::{
-    API_REGION, DEFAULT_REGISTRY_ALIAS, GALLERY_HOST,
+    DEFAULT_REGISTRY_ALIAS, GALLERY_HOST,
 };
 use service_com_amazonaws_ecrpublic_spencerfrontendservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::repository_image_lifecycle::{ARN_PREFIX, REGISTRY_ID};
-
-/// The `X-Amz-Target` prefix from the crate's `OPERATIONS.md` wire-protocol section.
-const TARGET_PREFIX: &str = "SpencerFrontendService";
+use crate::repository_image_lifecycle::{call_addressed, ARN_PREFIX, REGISTRY_ID};
 
 /// The address this emulator is SERVED at in this suite: the base a call that reached it on
 /// no usable endpoint of its own is told to come back to.
@@ -148,55 +144,6 @@ async fn call_at(
         body,
     )
     .await
-}
-
-/// One `awsJson1_1` call that must answer 200, with the `Host` and URI authority given.
-async fn call_addressed(
-    router: &MultiServiceRouter,
-    case: &str,
-    host: Option<&str>,
-    uri_authority: Option<&str>,
-    operation: &str,
-    body: Value,
-) -> Value {
-    let uri = match uri_authority {
-        Some(authority) => format!("https://{authority}/"),
-        None => "/".to_string(),
-    };
-    let mut request = ::http::Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/x-amz-json-1.1")
-        .header("x-amz-target", format!("{TARGET_PREFIX}.{operation}"))
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDECRPUBLIC/20260101/{API_REGION}\
-                 /ecr-public/aws4_request, SignedHeaders=host;x-amz-target, Signature=00"
-            ),
-        );
-    if let Some(host) = host {
-        request = request.header("host", host);
-    }
-    let request = request
-        .body(Bytes::from(
-            serde_json::to_vec(&body).expect("the request body serializes"),
-        ))
-        .expect("a well-formed request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let payload = response.into_body();
-    let answered: Value = serde_json::from_slice(&payload).unwrap_or_else(|error| {
-        panic!(
-            "case {case:?}: {operation} answered a body that is not JSON ({error}): {:?}",
-            String::from_utf8_lossy(&payload)
-        )
-    });
-    assert_eq!(
-        status, 200,
-        "case {case:?}: expected HTTP 200 from {operation}, got {status} with {answered}"
-    );
-    answered
 }
 
 /// The string `value` carries, or a panic naming the case and what was read instead.
