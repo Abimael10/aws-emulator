@@ -29,6 +29,13 @@
 //! for the same reason: a suite that pairs a keyed list by zipping two document-ordered
 //! element lists reads the wrong pair the moment one member omits half of it, so the pairing
 //! is written once, over the `<member>` that carries both.
+//!
+//! Beside the wire readers, this module also holds the readings of a VALUE that several
+//! suites judge an answer by rather than write a request with — whether a block holds an
+//! address ([`block_contains`]), whether an identifier has the shape a service's model fixes
+//! for it ([`is_waf_entity_id`]) — for the one reason the rest of it is here: a suite that
+//! writes its own masking or its own reading of a pattern asserts something slightly
+//! different from the suite beside it. A new such reading belongs here, not in one suite.
 
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
@@ -323,9 +330,88 @@ pub(crate) fn block_contains(block: &str, address: &str) -> bool {
     (u32::from(address) & mask) == (u32::from(base) & mask)
 }
 
+/// Whether `id` has the shape AWS WAF's `EntityId` takes:
+/// `^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$`
+/// (`smithy_query(query="shape",shape="EntityId")`), the id every WAFv2 entity is addressed
+/// by — and what distinguishes an id that service MINTED from a name a template or
+/// CloudFormation chose.
+///
+/// Here, ONCE, for the reason this module exists: several suites judge the identifier a
+/// CloudFormation stack published for a WAFv2 resource against the form that service's own
+/// model fixes, and a suite that writes its own reading of the pattern drifts from the others
+/// — one of the three copies this replaced accepted upper-case hex digits the pattern does
+/// not allow. The prefix is deliberately not checked for: the pattern is the whole rule.
+pub(crate) fn is_waf_entity_id(id: &str) -> bool {
+    let groups: Vec<&str> = id.split('-').collect();
+    groups.len() == 5
+        && [8, 4, 4, 4, 12]
+            .iter()
+            .zip(&groups)
+            .all(|(width, group)| {
+                group.len() == *width
+                    && group
+                        .bytes()
+                        .all(|digit| matches!(digit, b'0'..=b'9' | b'a'..=b'f'))
+            })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `EntityId` reading answers for each way a value can miss that pattern: a group of
+    /// the wrong width, a group count other than five, a digit outside `[0-9a-f]` (including
+    /// the upper-case hex the pattern excludes), and an empty value.
+    #[test]
+    fn the_entity_id_reading_holds_to_the_pattern_the_model_fixes() {
+        // (case, the value, whether it is an EntityId)
+        let rows: [(&str, &str, bool); 8] = [
+            (
+                "the pattern's own shape",
+                "0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d",
+                true,
+            ),
+            (
+                "every digit a decimal one",
+                "00000000-0000-0000-0000-000000000000",
+                true,
+            ),
+            (
+                "every digit the last hex one",
+                "ffffffff-ffff-ffff-ffff-ffffffffffff",
+                true,
+            ),
+            (
+                "an upper-case hex digit, which the pattern excludes",
+                "0A1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d",
+                false,
+            ),
+            (
+                "a digit outside the hex alphabet",
+                "0g1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d",
+                false,
+            ),
+            (
+                "the first group one digit short",
+                "0a1b2c3-4e5f-6a7b-8c9d-0e1f2a3b4c5d",
+                false,
+            ),
+            (
+                "four groups rather than five",
+                "0a1b2c3d-4e5f-6a7b-8c9d0e1f2a3b4c5d",
+                false,
+            ),
+            ("an empty value", "", false),
+        ];
+
+        for (case, id, expected) in rows {
+            let read = is_waf_entity_id(id);
+            assert_eq!(
+                read, expected,
+                "case {case:?}: expected is_waf_entity_id({id:?}) = {expected}, got {read}"
+            );
+        }
+    }
 
     /// The containment reader answers for each bound of a block, over the block sizes a VPC's
     /// subnets carry between the two published ones (`/16` is the largest block a VPC takes and

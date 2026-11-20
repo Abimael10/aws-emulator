@@ -39,7 +39,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 // The awsQuery wire helpers this test crate publishes ONCE, in `query_wire`: a suite that
 // writes its own percent-encoder or element reader drifts from the others.
-use crate::query_wire::{elements, form_encode};
+use crate::query_wire::{elements, form_encode, is_waf_entity_id};
 
 /// The region every request here is signed for, and so the region the stack's resources
 /// belong to.
@@ -617,23 +617,6 @@ fn stage_arn() -> String {
     format!("arn:aws:apigateway:{REGION}::/restapis/a1b2c3d4e5/stages/prod")
 }
 
-/// Whether `id` is an `EntityId`: "^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$"
-/// (`smithy_query(query="shape",shape="EntityId")`), the id every WAFv2 entity is addressed
-/// by.
-fn is_entity_id(id: &str) -> bool {
-    let groups: Vec<&str> = id.split('-').collect();
-    groups.len() == 5
-        && [8, 4, 4, 4, 12]
-            .iter()
-            .zip(&groups)
-            .all(|(width, group)| {
-                group.len() == *width
-                    && group
-                        .chars()
-                        .all(|digit| digit.is_ascii_digit() || ('a'..='f').contains(&digit))
-            })
-}
-
 /// The whole protection a template deploys: an IP set, a web ACL whose rule blocks the
 /// addresses in it, and the binding that puts the ACL in front of a REST API stage. Every
 /// identifier the stack publishes is one AWS WAF minted, and each resolves against that
@@ -686,7 +669,7 @@ async fn a_deployed_protection_publishes_identifiers_waf_resolves() {
     // The identifier published for the IP set is the one AWS WAF assigned, so that service
     // resolves it — and answers the addresses the template declared.
     assert!(
-        is_entity_id(&ip_set_id),
+        is_waf_entity_id(&ip_set_id),
         "case {case:?}: expected the published IP set id to be an EntityId, got {ip_set_id:?}"
     );
     let read = waf_ok(
@@ -732,7 +715,7 @@ async fn a_deployed_protection_publishes_identifiers_waf_resolves() {
     // The web ACL's ARN carries the triple that service addresses an entity by, so it can be
     // decomposed again: its tail is the entity's name and the id AWS WAF assigned.
     assert!(
-        is_entity_id(&web_acl_id),
+        is_waf_entity_id(&web_acl_id),
         "case {case:?}: expected the published web ACL id to be an EntityId, got {web_acl_id:?}"
     );
     let tail = format!("/webacl/{PROTECTING_ACL}/{web_acl_id}");

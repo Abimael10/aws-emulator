@@ -42,7 +42,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 // The awsQuery wire helpers this test crate publishes ONCE, in `query_wire`: a suite that
 // writes its own percent-encoder or element reader drifts from the others.
-use crate::query_wire::{elements, form_encode, opt_element};
+use crate::query_wire::{elements, form_encode, is_waf_entity_id, opt_element};
 
 /// The region every request here is signed for, and so the region the stack's entities
 /// belong to.
@@ -201,22 +201,6 @@ async fn create_and_settle(
         "case {case:?}: expected HTTP 200 from DescribeStacks, got {status} with body {body}"
     );
     body
-}
-
-/// Whether `id` has the shape WAF's `EntityId` takes —
-/// `^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$`, from that model — which is the form of an
-/// id that service minted, and what distinguishes it from a name the template or
-/// CloudFormation chose.
-fn is_waf_entity_id(id: &str) -> bool {
-    let groups: Vec<&str> = id.split('-').collect();
-    groups.len() == 5
-        && [8, 4, 4, 4, 12]
-            .iter()
-            .zip(&groups)
-            .all(|(len, group)| group.len() == *len)
-        && groups
-            .iter()
-            .all(|group| group.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 /// Whether `name` is the `<stack>-<logical id>-<suffix>` name CloudFormation generates for a
