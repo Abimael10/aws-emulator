@@ -287,10 +287,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         directory.ip_routes = merged;
 
-        // `UpdateSecurityGroupForDirectoryControllers` asks for the directory
-        // controllers' security group to be rewritten. That group lives in the VPC data
-        // plane this emulator does not have, so the member is accepted and nothing is
-        // invented for it: no security group is reported anywhere.
+        // `UpdateSecurityGroupForDirectoryControllers` is ACCEPTED AND NOT ACTED ON here. The
+        // group it names is a real one in the service that OWNS security groups — the
+        // directory's create provisioned it there and authorized the rules this member writes
+        // out, from the same directory VPC block
+        // (`crate::state::provision_controllers_group`) — so a group nothing has changed since
+        // already carries them. What this call does NOT do is author them again: a caller that
+        // revoked one of those rules itself gets it back from no operation of this service.
         Ok(AddIpRoutesOutput {})
     }
 }

@@ -650,3 +650,235 @@ async fn every_reporting_read_of_a_placed_directory_names_the_one_group_ec2_hold
         );
     }
 }
+
+/// The inbound rules the group provisioned for a directory's servers carries, as
+/// `(protocol, fromPort, toPort)`.
+///
+/// Source: the MODEL. `AddIpRoutesRequest$UpdateSecurityGroupForDirectoryControllers` writes
+/// out the rules of "the security group that has the description: 'Amazon Web Services created
+/// security group for <directory ID> directory controllers'" — each sourced from the directory
+/// VPC's IPv4 CIDR, with all traffic outbound
+/// (`smithy_query(query="doc",shape="AddIpRoutesRequest",member="UpdateSecurityGroupForDirectoryControllers")`):
+/// Kerberos (88) and its change/set-password service (464), time (123), the NetBIOS datagram
+/// service (138), LDAP (389) and LDAPS (636), SMB (445), the RPC endpoint mapper (135) and the
+/// range it hands a client into (1024-65535), the global catalog (3268-3269, the model's
+/// "3268-33269" ending at the published 3269), DNS (53) and all ICMP (every type and code,
+/// which `IpPermission$FromPort`/`$ToPort` spell `-1`).
+const DOCUMENTED_CONTROLLER_INGRESS: [(&str, i32, i32); 17] = [
+    ("udp", 88, 88),
+    ("udp", 123, 123),
+    ("udp", 138, 138),
+    ("udp", 389, 389),
+    ("udp", 464, 464),
+    ("udp", 445, 445),
+    ("tcp", 88, 88),
+    ("tcp", 135, 135),
+    ("tcp", 445, 445),
+    ("tcp", 464, 464),
+    ("tcp", 636, 636),
+    ("tcp", 1024, 65535),
+    ("tcp", 3268, 3269),
+    ("udp", 53, 53),
+    ("tcp", 53, 53),
+    ("tcp", 389, 389),
+    ("icmp", -1, -1),
+];
+
+/// The `IpProtocol` spelling of every protocol, which the outbound rule EC2 mints with a new
+/// group carries and no inbound rule of the authored set does.
+const ALL_PROTOCOLS: &str = "-1";
+
+/// The range no rule of the authored set may be scoped to: every IPv4 address there is.
+const ALL_IPV4: &str = "0.0.0.0/0";
+
+/// The IPv4 block EC2 — the service that owns VPCs — reports for `vpc_id`: the network the
+/// directory's servers sit on, and so the source every rule admitting their traffic carries.
+async fn block_of_vpc(ec2: &::aws_sdk_ec2::Client, vpc_id: &str) -> String {
+    let described = ec2
+        .describe_vpcs()
+        .vpc_ids(vpc_id)
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("EC2 must report the VPC {vpc_id}: {error:?}"));
+    described
+        .vpcs()
+        .iter()
+        .find(|vpc| vpc.vpc_id() == Some(vpc_id))
+        .and_then(::aws_sdk_ec2::types::Vpc::cidr_block)
+        .unwrap_or_else(|| panic!("EC2 must report a block for the VPC {vpc_id}"))
+        .to_string()
+}
+
+/// The `(protocol, fromPort, toPort)` triple of each permission of one side of a group.
+fn protocol_ports(
+    permissions: &[::aws_sdk_ec2::types::IpPermission],
+) -> BTreeSet<(String, i32, i32)> {
+    permissions
+        .iter()
+        .map(|permission| {
+            (
+                permission.ip_protocol().unwrap_or_default().to_string(),
+                permission.from_port().unwrap_or_default(),
+                permission.to_port().unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+/// The directory `directory_id`, polled through `DescribeDirectories` until it reports itself in
+/// service, with room for a host running every other suite beside this one.
+///
+/// Its own deadline rather than the suite's [`POLL_DEADLINE`]: this case reads the group twice,
+/// before and after the build, so the wait is the only thing between it and a loaded host — and
+/// a wait bounded tightly enough to expire under load is a case that fails for the machine
+/// rather than for the behaviour.
+async fn settled_in_service(
+    router: &MultiServiceRouter,
+    directory_id: &str,
+    case: &str,
+) -> Value {
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
+    let started = std::time::Instant::now();
+    loop {
+        let described = describe_one(router, directory_id, case).await;
+        if described["Stage"] == json!(STAGE_ACTIVE) {
+            return described;
+        }
+        assert!(
+            started.elapsed() < DEADLINE,
+            "case {case:?}: expected {directory_id} to report itself in service within \
+             {DEADLINE:?}, last observed {described}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// RULE: the security group provisioned for a directory's servers is authored REACHABLE — it
+/// carries the inbound rules of the directory protocol traffic those servers answer, every one
+/// of them sourced from the block of the VPC the servers were placed in rather than from a
+/// wider range — and the all-traffic outbound rule EC2 gives a new group is left as it was. A
+/// group with no inbound rule admits nothing, so the directory would be reporting a group that
+/// says its own servers cannot be reached.
+///
+/// The rows differ along what the rule generalises over: the directory type and so the create
+/// that provisioned the group (Managed Microsoft AD, Simple AD, AD Connector), the VPC the
+/// servers sit on and therefore the block every rule is scoped to (the client's own VPC and the
+/// account's default one), and the blocks and order of the chosen subnets.
+#[tokio::test]
+async fn the_group_a_create_provisions_admits_the_directory_traffic_from_its_own_vpc() {
+    let network = network().await;
+    let router = &network.router;
+    let ec2 = ec2_client(&EmbeddedEmulator::from_router(router.clone()));
+
+    let rows: [(&str, Kind, Vec<AccountSubnet>); 4] = [
+        (
+            "a Managed Microsoft AD in two /24 subnets of the client's VPC",
+            Kind::MicrosoftAd,
+            vec![network.client[0].clone(), network.client[1].clone()],
+        ),
+        (
+            "a Simple AD in a /20 and a /28, named in that order",
+            Kind::SimpleAd,
+            vec![network.client[3].clone(), network.client[2].clone()],
+        ),
+        (
+            "a Managed Microsoft AD in the account's default subnets",
+            Kind::MicrosoftAd,
+            vec![network.default[0].clone(), network.default[1].clone()],
+        ),
+        (
+            "an AD Connector sharing the client's VPC with the rows above",
+            Kind::Connector,
+            vec![network.client[1].clone(), network.client[0].clone()],
+        ),
+    ];
+
+    let documented: BTreeSet<(String, i32, i32)> = DOCUMENTED_CONTROLLER_INGRESS
+        .iter()
+        .map(|(protocol, from_port, to_port)| {
+            ((*protocol).to_string(), *from_port, *to_port)
+        })
+        .collect();
+
+    for (index, (case, kind, subnets)) in rows.iter().enumerate() {
+        let name = format!("ingress{index}.example.com");
+        let directory_id = create_in(router, *kind, &name, &subnets[0].vpc, subnets, case).await;
+
+        // The rules are part of the network the create provisions, so they are there from the
+        // create on — read before the build the directory owes has finished — and still there
+        // once it is in service, because a read authorizes nothing and revokes nothing.
+        let at_create = string(
+            &describe_one(router, &directory_id, case).await[kind.placement()],
+            "SecurityGroupId",
+            case,
+        );
+        let fresh = group_reported_by_ec2(&ec2, &at_create, case).await;
+        let settled = settled_in_service(router, &directory_id, case).await;
+        let group_id = string(&settled[kind.placement()], "SecurityGroupId", case);
+        let group = group_reported_by_ec2(&ec2, &group_id, case).await;
+        assert_eq!(
+            protocol_ports(group.ip_permissions()),
+            protocol_ports(fresh.ip_permissions()),
+            "case {case:?}: expected the inbound rules at create to be the ones in service, \
+             got {group:?}"
+        );
+
+        // The block of the VPC the servers are really on, as the OWNER of VPCs reports it: the
+        // source every rule admitting their traffic carries.
+        let expected_vpc = vpc_of(&ec2, &subnets[0].id).await;
+        let expected_block = block_of_vpc(&ec2, &expected_vpc).await;
+
+        let ingress = group.ip_permissions();
+        assert!(
+            !ingress.is_empty(),
+            "case {case:?}: expected the group to carry inbound rules, so the directory's \
+             servers can be reached, got {group:?}"
+        );
+        assert_eq!(
+            protocol_ports(ingress),
+            documented,
+            "case {case:?}: expected the documented inbound set, got {ingress:?}"
+        );
+        for permission in ingress {
+            let ranges: Vec<&str> = permission
+                .ip_ranges()
+                .iter()
+                .filter_map(::aws_sdk_ec2::types::IpRange::cidr_ip)
+                .collect();
+            assert_eq!(
+                ranges,
+                vec![expected_block.as_str()],
+                "case {case:?}: expected every inbound rule to be scoped to the directory \
+                 VPC's own block ({expected_block}), got {permission:?}"
+            );
+            assert!(
+                !ranges.contains(&ALL_IPV4),
+                "case {case:?}: expected no inbound rule open to every address, got \
+                 {permission:?}"
+            );
+        }
+
+        // The outbound side is the one EC2 mints with a new group — all traffic to every
+        // address — and nothing above changed it.
+        let egress = group.ip_permissions_egress();
+        assert_eq!(
+            egress.len(),
+            1,
+            "case {case:?}: expected the one outbound rule EC2 mints, got {egress:?}"
+        );
+        assert_eq!(
+            egress[0].ip_protocol(),
+            Some(ALL_PROTOCOLS),
+            "case {case:?}: expected the outbound rule to admit every protocol, got {egress:?}"
+        );
+        assert_eq!(
+            egress[0]
+                .ip_ranges()
+                .iter()
+                .filter_map(::aws_sdk_ec2::types::IpRange::cidr_ip)
+                .collect::<Vec<&str>>(),
+            vec![ALL_IPV4],
+            "case {case:?}: expected the outbound rule to every address, got {egress:?}"
+        );
+    }
+}

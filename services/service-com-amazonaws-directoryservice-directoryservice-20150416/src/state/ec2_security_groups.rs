@@ -26,6 +26,13 @@
 //! provisions no group and the directory reports none, exactly as it reports no address for
 //! a subnet the account does not have.
 //!
+//! Provisioning the group is not minting it alone: a group with no inbound rule admits
+//! nothing, so the servers behind it would be reachable by nothing and the id this service
+//! reports would say so. The rules the directory's servers are reached through are authorized
+//! on it in the same owner ([`provision_controllers_group`]), each scoped to the block of the
+//! VPC those servers sit on, so a client reading the group off the directory finds the
+//! baseline it reasons about, adds to, diffs or revokes.
+//!
 //! A group provisioned FOR a directory's servers lives exactly as long as they do, so the
 //! teardown `DeleteDirectory` starts releases it again ([`release_controllers_group`]) — in
 //! the same owner, over the same hop — and the directory stops naming a group EC2 no longer
@@ -51,6 +58,158 @@ const CONTROLLERS_GROUP_SUFFIX: &str = "_controllers";
 pub fn controllers_group_name(directory_id: &str) -> String {
     format!("{directory_id}{CONTROLLERS_GROUP_SUFFIX}")
 }
+
+/// One INBOUND rule of the set this service authorizes on the group it provisions for a
+/// directory's servers: a protocol, and the ports that protocol's traffic arrives on.
+#[derive(Debug, Clone, Copy)]
+struct ControllerIngressRule {
+    /// The protocol the rule admits, spelled as `IpPermission$IpProtocol` spells one.
+    protocol: &'static str,
+    /// The first port of the range the rule admits — for ICMP the type rather than a port
+    /// ("if the protocol is ICMP, this is the ICMP type", `IpPermission$FromPort`).
+    from_port: i32,
+    /// The last port of that range — for ICMP the code ("if the protocol is ICMP, this is the
+    /// ICMP code", `IpPermission$ToPort`).
+    to_port: i32,
+}
+
+/// The `tcp` value of `IpPermission$IpProtocol`.
+const IP_PROTOCOL_TCP: &str = "tcp";
+
+/// The `udp` value of `IpPermission$IpProtocol`.
+const IP_PROTOCOL_UDP: &str = "udp";
+
+/// The `icmp` value of `IpPermission$IpProtocol`.
+const IP_PROTOCOL_ICMP: &str = "icmp";
+
+/// Every ICMP type and every ICMP code: "the ICMP type or -1 (all ICMP types)"
+/// (`IpPermission$FromPort`) with "-1 (all ICMP codes)" (`IpPermission$ToPort`).
+const ALL_ICMP: i32 = -1;
+
+/// The first port of the range the RPC endpoint mapper hands a client into, as the model's
+/// rule list writes it ("Range: 1024-65535").
+const FIRST_DYNAMIC_PORT: i32 = 1024;
+
+/// The last port of that range, which is the last port there is.
+const LAST_DYNAMIC_PORT: i32 = 65535;
+
+/// The first port the global catalog answers on, as the model's rule list writes that rule
+/// ("Range: 3268-33269", whose upper end is the published 3269 — the catalog's two ports are
+/// 3268 and its TLS port 3269, and no port above them is part of this rule).
+const FIRST_GLOBAL_CATALOG_PORT: i32 = 3268;
+
+/// The last port of that range: the global catalog's TLS port.
+const LAST_GLOBAL_CATALOG_PORT: i32 = 3269;
+
+/// The inbound rules a directory's servers are reachable through, which is the set this
+/// service authorizes on the group it provisions for them.
+///
+/// Source: the MODEL. `AddIpRoutesRequest$UpdateSecurityGroupForDirectoryControllers` writes
+/// out the rules of "the security group that has the description: 'Amazon Web Services created
+/// security group for <directory ID> directory controllers'" — one entry per protocol and port
+/// range, each sourced from the directory VPC's IPv4 CIDR, with all traffic outbound — and that
+/// is the group this service provisions
+/// (`smithy_query(query="doc",shape="AddIpRoutesRequest",member="UpdateSecurityGroupForDirectoryControllers")`).
+/// This table is that list, in the order the model writes it; nothing else is admitted, so a
+/// port absent from the model's list is absent here — deliberately NARROWER than the set some
+/// Directory Service prose lists for this group (the NetBIOS name and session ports, the
+/// directory's web services port): the model is this emulator's contract, and the rules it
+/// writes out are the rules authored.
+const CONTROLLER_INGRESS_RULES: &[ControllerIngressRule] = &[
+    // The UDP half of the model's list: Kerberos, time, the NetBIOS datagram service, LDAP,
+    // the Kerberos change/set-password service and SMB.
+    ControllerIngressRule {
+        protocol: IP_PROTOCOL_UDP,
+        from_port: 88,
+        to_port: 88,
+    },
+    ControllerIngressRule {
+        protocol: IP_PROTOCOL_UDP,
+        from_port: 123,
+        to_port: 123,
+    },
+    ControllerIngressRule {
+        protocol: IP_PROTOCOL_UDP,
+        from_port: 138,
+        to_port: 138,
+    },
+    ControllerIngressRule {
+        protocol: IP_PROTOCOL_UDP,
+        from_port: 389,
+        to_port: 389,
+    },
+    ControllerIngressRule {
+        protocol: IP_PROTOCOL_UDP,
+        from_port: 464,
+        to_port: 464,
+    },
+    ControllerIngressRule {
+        protocol: IP_PROTOCOL_UDP,
+        from_port: 445,
+        to_port: 445,
+    },
+    // The TCP half: Kerberos, the RPC endpoint mapper, SMB, the change/set-password service,
+    // LDAPS, the range the endpoint mapper hands a client into, and the global catalog.
+    ControllerIngressRule {
+        protocol: IP_PROTOCOL_TCP,
+        from_port: 88,
+        to_port: 88,
+    },
+    ControllerIngressRule {
+        protocol: IP_PROTOCOL_TCP,
+        from_port: 135,
+        to_port: 135,
+    },
+    ControllerIngressRule {
+        protocol: IP_PROTOCOL_TCP,
+        from_port: 445,
+        to_port: 445,
+    },
+    ControllerIngressRule {
+        protocol: IP_PROTOCOL_TCP,
+        from_port: 464,
+        to_port: 464,
+    },
+    ControllerIngressRule {
+        protocol: IP_PROTOCOL_TCP,
+        from_port: 636,
+        to_port: 636,
+    },
+    ControllerIngressRule {
+        protocol: IP_PROTOCOL_TCP,
+        from_port: FIRST_DYNAMIC_PORT,
+        to_port: LAST_DYNAMIC_PORT,
+    },
+    ControllerIngressRule {
+        protocol: IP_PROTOCOL_TCP,
+        from_port: FIRST_GLOBAL_CATALOG_PORT,
+        to_port: LAST_GLOBAL_CATALOG_PORT,
+    },
+    // DNS, which the directory's servers are their clients' name servers over both protocols,
+    // and LDAP itself.
+    ControllerIngressRule {
+        protocol: IP_PROTOCOL_UDP,
+        from_port: 53,
+        to_port: 53,
+    },
+    ControllerIngressRule {
+        protocol: IP_PROTOCOL_TCP,
+        from_port: 53,
+        to_port: 53,
+    },
+    ControllerIngressRule {
+        protocol: IP_PROTOCOL_TCP,
+        from_port: 389,
+        to_port: 389,
+    },
+    // "Type: All ICMP, Protocol: All, Range: N/A": every ICMP type and every ICMP code, which
+    // is how a client reaches a server at all.
+    ControllerIngressRule {
+        protocol: IP_PROTOCOL_ICMP,
+        from_port: ALL_ICMP,
+        to_port: ALL_ICMP,
+    },
+];
 
 /// The description that group carries: a sentence naming the service that created it and the
 /// directory whose servers it is for.
@@ -131,8 +290,10 @@ pub fn placement_vpc_id(subnet_networks: &BTreeMap<String, SubnetNetwork>) -> Op
 /// resolved — so a create that could not resolve its placement asks for nothing at all.
 ///
 /// Called by a create BEFORE it takes, or AFTER it has released, this service's store, so no
-/// guard is held across the hop. ONE call, with no caller-sized value in it: the group's name
-/// and description are built from the directory's own identifier.
+/// guard is held across the hops. THREE calls, with no caller-sized value in any of them: the
+/// group's name and description are built from the directory's own identifier, and the rules
+/// authored on it are a fixed set ([`CONTROLLER_INGRESS_RULES`]) scoped to the block the owner
+/// of VPCs reports.
 ///
 /// A hop that could not be made is evidence of nothing and gates no create: the directory
 /// keeps the placement the request named and simply reports no security group, rather than an
@@ -151,7 +312,7 @@ pub async fn provision_controllers_group(
         );
         None
     })?;
-    match client
+    let group_id = match client
         .create_security_group()
         .group_name(controllers_group_name(directory_id))
         .description(controllers_group_description(directory_id))
@@ -173,5 +334,85 @@ pub async fn provision_controllers_group(
             );
             None
         }
+    }?;
+    // The group is what the directory's servers are REACHED through, so provisioning it is
+    // not finished until the traffic those servers answer is admitted through it: the rules
+    // are authorized in the same owner, against the group it just minted.
+    //
+    // The id is reported whatever that authorization answers, and deliberately: the group
+    // EC2 minted EXISTS, it is the one the teardown has to release again
+    // ([`release_controllers_group`]), and a directory that reported none while the owner of
+    // security groups held one would leave that group behind for good. A group the rules
+    // could not be authorized on is logged at `warn` where it happens.
+    authorize_controllers_ingress(&client, region, &group_id, vpc_id).await;
+    Some(group_id)
+}
+
+/// Author the inbound rules of the group this service provisioned for a directory's servers,
+/// each scoped to the block of the VPC those servers sit on.
+///
+/// A group with no inbound rule admits nothing, so the servers behind it are reachable by
+/// nothing — which is why the set is part of provisioning the group rather than something a
+/// caller is left to add: the directory would otherwise report a group that says its own
+/// servers cannot be reached. The rules are authorized in the service that OWNS security
+/// groups, over the same hop the group was minted through, so `DescribeSecurityGroups` on the
+/// id this service reports answers with them.
+///
+/// The SOURCE of every rule is the VPC's own block, as the owner of VPCs reports it
+/// ([`super::ec2_subnets::vpc_cidr_block`]): what the directory's servers serve is the
+/// network they are placed on, so a group open to every address would admit traffic from
+/// outside the VPC the caller put the directory in. A VPC whose block that owner does not
+/// report leaves the group as EC2 minted it rather than being given a wider range.
+///
+/// Called with this service's store RELEASED, so no guard is held across the hops. ONE hop
+/// for the block and ONE for the rules, with no caller-sized value in either: the set is
+/// fixed ([`CONTROLLER_INGRESS_RULES`]).
+async fn authorize_controllers_ingress(
+    client: &::aws_sdk_ec2::Client,
+    region: &str,
+    group_id: &str,
+    vpc_id: &str,
+) {
+    let Some(block) = super::ec2_subnets::vpc_cidr_block(client, region, vpc_id).await else {
+        ::tracing::warn!(
+            %region,
+            %vpc_id,
+            "the VPC of a directory's servers reports no block, so the group provisioned for \
+             them carries no inbound rule"
+        );
+        return;
+    };
+    let permissions: Vec<::aws_sdk_ec2::types::IpPermission> = CONTROLLER_INGRESS_RULES
+        .iter()
+        .map(|rule| {
+            ::aws_sdk_ec2::types::IpPermission::builder()
+                .ip_protocol(rule.protocol)
+                .from_port(rule.from_port)
+                .to_port(rule.to_port)
+                .ip_ranges(
+                    ::aws_sdk_ec2::types::IpRange::builder()
+                        .cidr_ip(block.as_str())
+                        .build(),
+                )
+                .build()
+        })
+        .collect();
+    if let Err(error) = client
+        .authorize_security_group_ingress()
+        .group_id(group_id)
+        .set_ip_permissions(Some(permissions))
+        .send()
+        .await
+    {
+        // At `warn`: a directory reporting a group that admits nothing is worth seeing, and
+        // this IS why.
+        ::tracing::warn!(
+            %region,
+            %group_id,
+            %block,
+            error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+            "the inbound rules of the group for a directory's servers could not be \
+             authorized in EC2"
+        );
     }
 }

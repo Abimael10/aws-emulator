@@ -88,6 +88,46 @@ pub(super) fn ec2(
 /// and "the owner of VPCs could not be asked" stay two different answers.
 const VPC_ID_FILTER: &str = "vpc-id";
 
+/// The VPC `vpc_id` as the owner of VPCs reports it, asked BY ID: `None` when the hop could
+/// not be made at all, `Some(None)` when it was made and the account has no such VPC, and
+/// `Some(Some(vpc))` when it holds it.
+///
+/// THE one `DescribeVpcs` of this service, so the two readings of a placement's VPC — whether
+/// the account has it ([`vpc_absence`]) and what block it carries ([`vpc_cidr_block`]) — cannot
+/// drift on the filter they ask with or on what counts as a match. The three-way answer is what
+/// keeps "could not be asked" apart from "asked, and the account does not have it": a caller
+/// that folds them together says so where it does.
+async fn described_vpc(
+    client: &::aws_sdk_ec2::Client,
+    region: &str,
+    vpc_id: &str,
+) -> Option<Option<::aws_sdk_ec2::types::Vpc>> {
+    let by_id = ::aws_sdk_ec2::types::Filter::builder()
+        .name(VPC_ID_FILTER)
+        .values(vpc_id)
+        .build();
+    match client.describe_vpcs().filters(by_id).send().await {
+        Ok(output) => Some(
+            output
+                .vpcs()
+                .iter()
+                .find(|vpc| vpc.vpc_id() == Some(vpc_id))
+                .cloned(),
+        ),
+        Err(error) => {
+            // At `warn` for the same reason the subnet hop logs one: a create served without
+            // the owner of VPCs having been asked is worth seeing, and this IS why.
+            ::tracing::warn!(
+                %region,
+                %vpc_id,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the VPC a directory is placed in could not be resolved against EC2"
+            );
+            None
+        }
+    }
+}
+
 /// Why `vpc_id` cannot hold a directory's servers — that the account has no such VPC in
 /// `region` — or `None` when it has one, and `None` when the owner of VPCs could not be
 /// asked at all.
@@ -106,27 +146,38 @@ pub async fn vpc_absence(
     vpc_id: &str,
 ) -> Option<&'static str> {
     let client = ec2(ctx, region)?;
-    let by_id = ::aws_sdk_ec2::types::Filter::builder()
-        .name(VPC_ID_FILTER)
-        .values(vpc_id)
-        .build();
-    match client.describe_vpcs().filters(by_id).send().await {
-        Ok(output) => output
-            .vpcs()
-            .iter()
-            .all(|vpc| vpc.vpc_id() != Some(vpc_id))
-            .then_some(super::INVALID_VPC_ID),
-        Err(error) => {
-            // At `warn` for the same reason the subnet hop logs one: a create served without
-            // the owner of VPCs having been asked is worth seeing, and this IS why.
-            ::tracing::warn!(
-                %region,
-                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                "the VPC a directory is placed in could not be resolved against EC2"
-            );
-            None
-        }
+    match described_vpc(&client, region, vpc_id).await? {
+        Some(_) => None,
+        None => Some(super::INVALID_VPC_ID),
     }
+}
+
+/// The IPv4 block the VPC `vpc_id` carries, as the owner of VPCs reports it — `None` when
+/// the account has no such VPC, when that owner reports no IPv4 block for it, or when the
+/// hop could not be made at all.
+///
+/// What it is for: the network a directory's servers sit on is the one the traffic they serve
+/// comes from, so the rules this service authorizes on the group it provisions for those
+/// servers are scoped to THIS block ([`super::ec2_security_groups`]). The block is EC2's to
+/// report — it is the VPC's own value, chosen when the caller created it — so it is asked for
+/// over the same in-process hop every other fact about the placement's network is, and never
+/// derived from a request.
+///
+/// The three answers are folded into one here, and that is the whole decision: a block nobody
+/// could be asked for and a block of a VPC the account does not have are both "no block to
+/// scope a rule to", and the caller then authorizes nothing rather than widening a rule.
+///
+/// Takes the client the caller already built, so provisioning a group and scoping its rules
+/// is one client and one hop each rather than two of both.
+pub(super) async fn vpc_cidr_block(
+    client: &::aws_sdk_ec2::Client,
+    region: &str,
+    vpc_id: &str,
+) -> Option<String> {
+    described_vpc(client, region, vpc_id)
+        .await
+        .flatten()
+        .and_then(|vpc| vpc.cidr_block().map(str::to_string))
 }
 
 /// What the owner of subnets ANSWERED about the subnets a placement named.
