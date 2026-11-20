@@ -84,6 +84,32 @@ pub(crate) async fn create_data_grant(router: &MultiServiceRouter, body: Value) 
     call(router, "POST", "/v1/data-grants", Some(body)).await
 }
 
+/// Seconds in a UTC day, for the instants these tests name relative to the clock.
+pub(crate) const DAY_SECONDS: f64 = 86_400.0;
+
+/// Now, as the service itself reads the clock.
+pub(crate) fn now() -> DateTime {
+    DateTime::from(std::time::SystemTime::now())
+}
+
+/// The instant `offset_seconds` from now, as the RFC 3339 `date-time` string a client
+/// sends for a `@timestampFormat("date-time")` member.
+///
+/// An `EndsAt` a request may carry is bounded below by the clock, so a row that is to be
+/// ACCEPTED names its instant relative to now rather than as a literal that ages into a
+/// refusal.
+pub(crate) fn instant_from_now(offset_seconds: f64) -> String {
+    DateTime::from_secs_f64(now().as_secs_f64() + offset_seconds)
+        .fmt(Format::DateTime)
+        .expect("an instant near now renders as RFC 3339")
+}
+
+/// The UTC midnight that opens the day `days` days after today, as the same RFC 3339
+/// string — the form the service's own end bound is stated at.
+pub(crate) fn midnight_in_days(days: i64) -> String {
+    instant_text(midnight_secs(days))
+}
+
 /// Read one data grant back, by its id or by its ARN (the member admits both).
 pub(crate) async fn get_data_grant(router: &MultiServiceRouter, identifier: &str) -> Answer {
     call(
@@ -269,17 +295,22 @@ async fn ends_at_is_read_as_an_rfc3339_string() {
         .string("Id");
 
     // The rows differ along the FORM of the instant: whole seconds, fractional seconds, a
-    // leap day, the far future, an instant in the past, and the one minute of a day's end.
-    let rows: &[(&str, &str)] = &[
-        ("whole seconds", "2026-11-28T12:00:00Z"),
-        ("fractional seconds", "2026-11-28T12:00:00.123Z"),
-        ("a leap day", "2028-02-29T23:59:59Z"),
-        ("the far future", "2099-12-31T23:59:59Z"),
-        ("an instant in the past", "2001-09-09T01:46:40Z"),
-        ("midnight", "2030-01-01T00:00:00Z"),
+    // leap day, the far future, and the midnight that opens a day. Every row names an
+    // instant the service admits as an end (see
+    // `an_end_before_the_published_bound_is_refused`), so what is under test here is the
+    // wire form and not the bound.
+    let rows: Vec<(&str, String)> = vec![
+        ("whole seconds", instant_from_now(4.0 * DAY_SECONDS)),
+        (
+            "fractional seconds",
+            instant_from_now(4.0 * DAY_SECONDS + 0.123),
+        ),
+        ("a leap day", "2032-02-29T23:59:59Z".to_string()),
+        ("the far future", "2099-12-31T23:59:59Z".to_string()),
+        ("midnight", midnight_in_days(3)),
     ];
 
-    for (case, ends_at) in rows {
+    for (case, ends_at) in &rows {
         let created = create_data_grant(
             &router,
             json!({
@@ -415,7 +446,7 @@ async fn a_created_grant_is_pending_receiver_acceptance() {
             "NONE",
             "777788889999",
             Some("ends in a month"),
-            Some("2026-12-28T00:00:00Z"),
+            Some("2033-12-28T00:00:00Z"),
             Some(json!({ "team": "data", "tier": "gold" })),
         ),
         (
@@ -1178,8 +1209,7 @@ async fn a_grant_outside_the_modelled_constraints_is_refused() {
     );
 
     // Nothing was stored by any refused create: the store holds no grant at all.
-    let state = dataexchange::state::service_state(&*engine).expect("the dataexchange store");
-    let stored = state.lock().data_grants.len();
+    let stored = stored_grants(&engine);
     assert_eq!(
         stored, 0,
         "case refused creates: expected no stored grant, got {stored}"
@@ -1205,3 +1235,385 @@ async fn a_grant_outside_the_modelled_constraints_is_refused() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The create's own request validation: the end a grant may name, and the parameter
+// that names an AWS account.
+// ---------------------------------------------------------------------------
+
+/// What every refusal about the request's OWN PARAMETERS opens with, stated here
+/// independently of the constant the crate composes it from (see
+/// `invalid_parameter_message.rs`, which pins the same opening for the other parameter
+/// faults of this service).
+const PARAMETERS_PREFIX: &str = "The following parameter(s) are not valid: ";
+
+/// How many whole UTC days after the current date the earliest end a grant may name
+/// falls on. Recorded behaviour: the model declares no temporal bound on `EndsAt`.
+const END_LEAD_DAYS: i64 = 2;
+
+/// The epoch seconds of the UTC midnight that opens the day `days` days after today.
+fn midnight_secs(days: i64) -> f64 {
+    (now().as_secs_f64() / DAY_SECONDS).floor() * DAY_SECONDS + days as f64 * DAY_SECONDS
+}
+
+/// An absolute instant as the RFC 3339 `date-time` string a client sends.
+fn instant_text(epoch_seconds: f64) -> String {
+    DateTime::from_secs_f64(epoch_seconds)
+        .fmt(Format::DateTime)
+        .expect("an instant these rows name renders as RFC 3339")
+}
+
+/// The calendar date (`YYYY-MM-DD`) of the UTC midnight `days` days after today.
+fn utc_date_in_days(days: i64) -> String {
+    let midnight = midnight_in_days(days);
+    midnight.split('T').next().unwrap_or_default().to_string()
+}
+
+/// The whole `Message` AWS states for an end before the bound, for a bound falling on
+/// `date`: the fixed opening, the parameter AWS names this bound under (`endDate`, not
+/// the wire member `EndsAt`), and the bound as an instant at millisecond precision.
+fn end_bound_message(date: &str) -> String {
+    format!(
+        "{PARAMETERS_PREFIX}\"endDate\" must be greater than or equal to \
+         \"{date}T00:00:00.000Z\"."
+    )
+}
+
+/// The whole `Message` AWS states for a parameter constrained to an AWS account id that
+/// carries something else: the fixed opening, the member as the MODEL spells it, and the
+/// value the request sent.
+fn not_an_account_id_message(parameter: &str, value: &str) -> String {
+    format!(
+        "{PARAMETERS_PREFIX}\"{parameter}\" with value \"{value}\" fails to match the AWS \
+         Account Id pattern."
+    )
+}
+
+/// How many data grants the store holds, which is what `ListDataGrants` projects.
+fn stored_grants(engine: &Arc<engine::InMemoryEngine>) -> usize {
+    let state = dataexchange::state::service_state(&**engine).expect("the dataexchange store");
+    // Bound rather than returned directly: the guard has to be dropped before `state` is.
+    let held = state.lock().data_grants.len();
+    held
+}
+
+/// `ListDataGrants`, as the ids it reports.
+async fn listed_grant_ids(router: &MultiServiceRouter) -> Vec<String> {
+    let answer = call(router, "GET", "/v1/data-grants", None).await;
+    assert_eq!(
+        answer.status, 200,
+        "case ListDataGrants: expected 200, got {} body {:?}",
+        answer.status, answer.body
+    );
+    answer
+        .member("DataGrantSummaries")
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|entry| entry["Id"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// RULE: a data grant's end has to be at or after the UTC midnight that opens the day
+/// two days after the current UTC date; a request naming an earlier end is refused with
+/// the modelled 400, whose message states that bound as an instant, and nothing is
+/// created by it.
+///
+/// The rows span what the rule generalises over — how far before the bound the end falls
+/// (one second, a day, the day of the call, the day before it, years) and how far after
+/// it (the bound itself, one second, days, years) — rather than one recorded instant, and
+/// every one is computed from the clock, so no row ages into the wrong side of the bound.
+#[tokio::test]
+async fn an_end_before_the_published_bound_is_refused() {
+    let (router, engine) = harness();
+    let data_set_id = create_data_set(&router, "grant-end-bound", "e", "S3_SNAPSHOT", None)
+        .await
+        .string("Id");
+
+    let bound = midnight_secs(END_LEAD_DAYS);
+    let refused_rows: Vec<(&str, String)> = vec![
+        ("one second before the bound", instant_text(bound - 1.0)),
+        (
+            "a millisecond before the bound",
+            instant_text(bound - 0.001),
+        ),
+        (
+            "the midnight before the bound",
+            instant_text(bound - DAY_SECONDS),
+        ),
+        ("the instant of the call", instant_text(now().as_secs_f64())),
+        (
+            "the day before the call",
+            instant_text(now().as_secs_f64() - DAY_SECONDS),
+        ),
+        ("an instant in the past", "2001-09-09T01:46:40Z".to_string()),
+        ("the epoch", "1970-01-01T00:00:00Z".to_string()),
+    ];
+
+    // The bound is read off the clock on every call, so the date it falls on is read on
+    // both sides of the call: the service's own reading lies between them, and they are
+    // the same date on every run that does not straddle a UTC midnight.
+    for (case, ends_at) in &refused_rows {
+        let before = utc_date_in_days(END_LEAD_DAYS);
+        let refused = create_data_grant(
+            &router,
+            json!({
+                "Name": format!("grant ending {case}"),
+                "GrantDistributionScope": "NONE",
+                "ReceiverPrincipal": "111122223333",
+                "SourceDataSetId": data_set_id,
+                "EndsAt": ends_at,
+            }),
+        )
+        .await;
+        let after = utc_date_in_days(END_LEAD_DAYS);
+        assert_eq!(
+            refused.status, 400,
+            "case {case}: expected 400 for EndsAt={ends_at:?}, got {} body {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error.as_deref(),
+            Some("ValidationException"),
+            "case {case}: expected ValidationException for EndsAt={ends_at:?}, got {:?}",
+            refused.error
+        );
+        let stated = message(&refused);
+        let admitted = [end_bound_message(&before), end_bound_message(&after)];
+        assert!(
+            admitted.contains(&stated),
+            "case {case}: expected {:?}, got {stated:?}",
+            admitted[0]
+        );
+    }
+
+    // A refused create has no side effect: nothing was stored and the list is empty.
+    let stored = stored_grants(&engine);
+    assert_eq!(
+        stored, 0,
+        "case refused ends: expected no stored grant, got {stored}"
+    );
+    let listed = listed_grant_ids(&router).await;
+    assert!(
+        listed.is_empty(),
+        "case refused ends: expected ListDataGrants to report nothing, got {listed:?}"
+    );
+
+    // The bound itself and everything after it IS admitted, so the refusals above are
+    // about where the end falls and not about the member.
+    let admitted_rows: Vec<(&str, String)> = vec![
+        ("the bound itself", instant_text(bound)),
+        ("one second after the bound", instant_text(bound + 1.0)),
+        ("a day after the bound", instant_text(bound + DAY_SECONDS)),
+        ("the far future", "2099-12-31T23:59:59Z".to_string()),
+    ];
+    let mut created_ids: Vec<String> = Vec::new();
+    for (case, ends_at) in &admitted_rows {
+        let created = create_data_grant(
+            &router,
+            json!({
+                "Name": format!("grant ending {case}"),
+                "GrantDistributionScope": "NONE",
+                "ReceiverPrincipal": "111122223333",
+                "SourceDataSetId": data_set_id,
+                "EndsAt": ends_at,
+            }),
+        )
+        .await;
+        assert_eq!(
+            created.status, 201,
+            "case {case}: expected 201 for EndsAt={ends_at:?}, got {} body {:?}",
+            created.status, created.body
+        );
+        // Round trip: the stored grant carries the end the request named.
+        let grant_id = created.string("Id");
+        let fetched = get_data_grant(&router, &grant_id).await;
+        let sent = DateTime::from_str(ends_at, Format::DateTime)
+            .unwrap_or_else(|error| panic!("case {case}: the row's own value parses: {error}"));
+        assert_eq!(
+            instant(case, "EndsAt", fetched.member("EndsAt")).as_secs_f64(),
+            sent.as_secs_f64(),
+            "case {case}: expected GetDataGrant to report the end that was stored, got {:?}",
+            fetched.member("EndsAt")
+        );
+        created_ids.push(grant_id);
+    }
+
+    // A grant with no end at all is admitted too: the member is optional, so an absent
+    // end is open-ended rather than an end before the bound.
+    let open_ended = create_data_grant(
+        &router,
+        json!({
+            "Name": "grant with no end",
+            "GrantDistributionScope": "NONE",
+            "ReceiverPrincipal": "111122223333",
+            "SourceDataSetId": data_set_id,
+        }),
+    )
+    .await;
+    assert_eq!(
+        open_ended.status, 201,
+        "case no end at all: expected 201, got {} body {:?}",
+        open_ended.status, open_ended.body
+    );
+    created_ids.push(open_ended.string("Id"));
+
+    let listed = listed_grant_ids(&router).await;
+    assert_eq!(
+        listed, created_ids,
+        "case admitted ends: expected ListDataGrants to report exactly the grants the \
+         admitted rows created, got {listed:?}"
+    );
+}
+
+/// RULE: a parameter the model constrains to the AWS account id pattern (`^\d{12}$`)
+/// refuses anything else with the modelled 400, whose message names the parameter as the
+/// MODEL spells it and quotes the value the request sent; nothing is created by it.
+///
+/// The rows span what the rule generalises over: too few and too many digits, no digits
+/// at all, digits with something else among or around them, an empty value, and digits
+/// written in another script — not only the recorded value.
+#[tokio::test]
+async fn a_receiver_that_is_not_an_account_id_is_refused_in_the_services_own_words() {
+    let (router, engine) = harness();
+    let data_set_id = create_data_set(&router, "grant-receiver", "r", "S3_SNAPSHOT", None)
+        .await
+        .string("Id");
+
+    // Source: the model's `ReceiverPrincipal` pattern
+    // (`smithy_query(query="shape", shape="ReceiverPrincipal")` -> `^\d{12}$`), so a
+    // value is an account id only when it is exactly twelve ASCII digits.
+    let refused_rows: &[(&str, &str)] = &[
+        ("not a number at all", "not-an-account-id"),
+        ("one digit short", "11112222333"),
+        ("one digit long", "1111222233334"),
+        ("empty", ""),
+        ("a single digit", "1"),
+        ("twelve characters, one of them a letter", "11112222333a"),
+        ("twelve digits with a leading space", " 11112222333"),
+        ("twelve digits with a trailing newline", "111122223333\n"),
+        ("digits grouped with separators", "1111-2222-3333"),
+        ("an ARN naming an account", "arn:aws:iam::111122223333:root"),
+        ("twelve digits in another script", "١١١١٢٢٢٢٣٣٣٣"),
+    ];
+
+    for (case, receiver) in refused_rows {
+        let refused = create_data_grant(
+            &router,
+            json!({
+                "Name": format!("grant for {case}"),
+                "GrantDistributionScope": "NONE",
+                "ReceiverPrincipal": receiver,
+                "SourceDataSetId": data_set_id,
+                "EndsAt": instant_text(midnight_secs(END_LEAD_DAYS + 7)),
+            }),
+        )
+        .await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case}: expected 400 for ReceiverPrincipal={receiver:?}, got {} body {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error.as_deref(),
+            Some("ValidationException"),
+            "case {case}: expected ValidationException for ReceiverPrincipal={receiver:?}, \
+             got {:?}",
+            refused.error
+        );
+        let stated = message(&refused);
+        let expected = not_an_account_id_message("ReceiverPrincipal", receiver);
+        assert_eq!(
+            stated, expected,
+            "case {case}: expected {expected:?}, got {stated:?}"
+        );
+    }
+
+    // No grant was created by any of them.
+    let stored = stored_grants(&engine);
+    assert_eq!(
+        stored, 0,
+        "case refused receivers: expected no stored grant, got {stored}"
+    );
+
+    // Twelve digits ARE admitted, whatever account they name, so the refusals above are
+    // about the value's form and not about the member.
+    for (case, receiver) in [
+        ("another account", "111122223333"),
+        ("the all-zero account", "000000000000"),
+        ("the caller's own account", ACCOUNT),
+        ("the largest twelve-digit account", "999999999999"),
+    ] {
+        let created = create_data_grant(
+            &router,
+            json!({
+                "Name": format!("grant for {case}"),
+                "GrantDistributionScope": "NONE",
+                "ReceiverPrincipal": receiver,
+                "SourceDataSetId": data_set_id,
+                "EndsAt": instant_text(midnight_secs(END_LEAD_DAYS + 7)),
+            }),
+        )
+        .await;
+        assert_eq!(
+            created.status, 201,
+            "case {case}: expected 201 for ReceiverPrincipal={receiver:?}, got {} body {:?}",
+            created.status, created.body
+        );
+        assert_eq!(
+            created.member("ReceiverPrincipal"),
+            &json!(receiver),
+            "case {case}: expected the receiver the request named, got {:?}",
+            created.member("ReceiverPrincipal")
+        );
+    }
+}
+
+/// RULE (the value half): the refusal quotes the value the request sent, and a value a
+/// caller sized is quoted under the ceiling the framework's own walk holds an echo to —
+/// a prefix of it plus the byte count of the whole — so a message cannot be sized by the
+/// request.
+#[tokio::test]
+async fn a_long_receiver_is_quoted_under_the_shared_ceiling() {
+    let router = emulator();
+    let data_set_id = create_data_set(&router, "grant-long-receiver", "r", "S3_SNAPSHOT", None)
+        .await
+        .string("Id");
+
+    let receiver = "9".repeat(4_096);
+    let refused = create_data_grant(
+        &router,
+        json!({
+            "Name": "grant for a very long receiver",
+            "GrantDistributionScope": "NONE",
+            "ReceiverPrincipal": receiver,
+            "SourceDataSetId": data_set_id,
+        }),
+    )
+    .await;
+    assert_eq!(
+        refused.status, 400,
+        "case a 4096-byte receiver: expected 400, got {} body {:?}",
+        refused.status, refused.body
+    );
+    let stated = message(&refused);
+    assert!(
+        stated.len() < receiver.len(),
+        "case a 4096-byte receiver: expected the message not to carry the whole value, got \
+         {} bytes",
+        stated.len()
+    );
+    assert!(
+        stated.contains(&format!("... [{} bytes]", receiver.len())),
+        "case a 4096-byte receiver: expected the elision to name the submitted size, got \
+         {stated:?}"
+    );
+    assert!(
+        stated.starts_with(PARAMETERS_PREFIX)
+            && stated.ends_with("fails to match the AWS Account Id pattern."),
+        "case a 4096-byte receiver: expected the same sentence as any other refused \
+         receiver, got {stated:?}"
+    );
+}
+

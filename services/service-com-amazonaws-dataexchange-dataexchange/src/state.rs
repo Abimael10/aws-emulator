@@ -1263,6 +1263,106 @@ pub fn parameter_not_in_value_set(parameter: &str, admitted: &[&str]) -> Validat
     invalid_request(parameter_not_in_value_set_message(parameter, admitted))
 }
 
+/// `CreateDataGrant`'s account-id parameter, spelled as the MODEL spells the member —
+/// which is how a refusal of it names it, unlike the lowerCamel member path the
+/// framework's own boundary walk states.
+pub const RECEIVER_PRINCIPAL_PARAMETER: &str = "ReceiverPrincipal";
+
+/// The largest a refusal of this service quotes a submitted value at, in bytes: the
+/// ceiling the framework's own constraint walk holds an echoed value to, so a message
+/// this service words cannot be sized by the request either.
+const MAX_ECHOED_VALUE_BYTES: usize = 256;
+
+/// The whole `Message` refusing a parameter the model constrains to an AWS account id
+/// that carries something else: the fixed parameter-fault opening, the parameter named
+/// as the model spells it, and the value the request sent.
+///
+/// The expression itself is NOT quoted: what the parameter admits is an account id, and
+/// that is what the sentence says it failed to be.
+pub fn not_an_account_id_message(parameter: &str, value: &str) -> String {
+    // The value is the caller's, so it is quoted under the ceiling the framework's own
+    // constraint walk elides an echoed value to — this refusal states the sentence that
+    // walk would otherwise have stated — and the CHECK above is made against the value as
+    // sent, never against this rendering.
+    let echoed = ::service_common::validation::quoted_echo_up_to(value, MAX_ECHOED_VALUE_BYTES);
+    parameters_not_valid_message(&[format!(
+        "{parameter:?} with value \"{echoed}\" fails to match the AWS Account Id pattern."
+    )])
+}
+
+/// The modelled 400 for a parameter the model constrains to an AWS account id carrying
+/// anything else; the `Message` is [`not_an_account_id_message`].
+pub fn parameter_not_an_account_id(parameter: &str, value: &str) -> ValidationException {
+    invalid_request(not_an_account_id_message(parameter, value))
+}
+
+/// How many whole UTC days after the current one the earliest end a data grant may name
+/// falls on.
+///
+/// The model declares no temporal bound on `EndsAt`, so the bound is the service's own
+/// recorded behaviour: access has to stay open through the whole of the day after the
+/// current UTC date, which puts the earliest admitted end at the midnight that opens the
+/// day after that.
+const DATA_GRANT_END_LEAD_DAYS: u64 = 2;
+
+/// The name the service states a data grant's end bound under. The wire member is
+/// `EndsAt`; `endDate` is what the refusal calls the same parameter.
+const DATA_GRANT_END_PARAMETER: &str = "endDate";
+
+/// How the bound's calendar date is written: ISO 8601's `YYYY-MM-DD`.
+const ISO_CALENDAR_DATE: &str = "%Y-%m-%d";
+
+/// The calendar date the earliest end a data grant may name falls on, as of `now`: the
+/// UTC date of `now` plus [`DATA_GRANT_END_LEAD_DAYS`] days.
+///
+/// Read off the clock on every call, so the bound moves with the date rather than being
+/// any one run's value. `None` only for an instant no calendar date covers, which no
+/// system clock produces.
+fn earliest_data_grant_end_date(now: DateTime) -> Option<::chrono::NaiveDate> {
+    ::chrono::DateTime::from_timestamp(now.secs(), 0)?
+        .date_naive()
+        .checked_add_days(::chrono::Days::new(DATA_GRANT_END_LEAD_DAYS))
+}
+
+/// The whole `Message` refusing a data grant whose end falls before the bound: the fixed
+/// parameter-fault opening, the parameter as the service names it, and the bound as the
+/// instant that opens `earliest`.
+///
+/// The time of day is fixed text because the bound IS a midnight; the only variable part
+/// is the calendar date, which comes from the clock.
+pub fn data_grant_end_too_soon_message(earliest: ::chrono::NaiveDate) -> String {
+    parameters_not_valid_message(&[format!(
+        "{DATA_GRANT_END_PARAMETER:?} must be greater than or equal to \"{}T00:00:00.000Z\".",
+        earliest.format(ISO_CALENDAR_DATE)
+    )])
+}
+
+/// Judge the end a data grant request names against the bound the service publishes for
+/// it: an end at or after the midnight that opens [`earliest_data_grant_end_date`] is
+/// admitted, as is a request that names no end at all — the member is optional, and an
+/// absent one is open-ended rather than an end before the bound.
+///
+/// `Err` carries the modelled 400, whose `Message` is
+/// [`data_grant_end_too_soon_message`].
+pub fn check_data_grant_end(
+    ends_at: Option<DateTime>,
+    now: DateTime,
+) -> Result<(), ValidationException> {
+    let Some(ends_at) = ends_at else {
+        return Ok(());
+    };
+    // An unrepresentable clock reading states no bound rather than refusing every end:
+    // the refusal has to name the bound it applied, and there would be none to name.
+    let Some(earliest) = earliest_data_grant_end_date(now) else {
+        return Ok(());
+    };
+    let bound = earliest.and_time(::chrono::NaiveTime::MIN).and_utc();
+    if ends_at.as_secs_f64() < bound.timestamp() as f64 {
+        return Err(invalid_request(data_grant_end_too_soon_message(earliest)));
+    }
+    Ok(())
+}
+
 /// Whether the request carried `name` as a query parameter at all - whatever value
 /// it gave it.
 ///

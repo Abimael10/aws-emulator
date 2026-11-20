@@ -72,19 +72,6 @@ static CREATE_DATA_GRANT_M_GRANT_DISTRIBUTION_SCOPE_TRAITS: ::std::sync::LazyLoc
     m
 });
 
-/// `CreateDataGrantRequest$ReceiverPrincipal`'s constraint traits: the `@pattern` of
-/// `ReceiverPrincipal` (`smithy_query(query="shape", shape="ReceiverPrincipal")`).
-#[allow(non_upper_case_globals)]
-static CREATE_DATA_GRANT_M_RECEIVER_PRINCIPAL_TRAITS: ::std::sync::LazyLock<
-    ::aws_smithy_schema::TraitMap,
-> = ::std::sync::LazyLock::new(|| {
-    let mut m = ::aws_smithy_schema::TraitMap::new();
-    m.insert(::std::boxed::Box::new(
-        ::aws_smithy_schema_server::constraints::PatternTrait::new(r"^\d{12}$"),
-    ));
-    m
-});
-
 /// `CreateDataGrantRequest$SourceDataSetId`'s constraint traits: the `@pattern` of `Id`
 /// (`smithy_query(query="shape", shape="Id")`).
 #[allow(non_upper_case_globals)]
@@ -141,6 +128,15 @@ impl CreateDataGrantInput {
         )
         .with_traits(&CREATE_DATA_GRANT_M_GRANT_DISTRIBUTION_SCOPE_TRAITS);
 
+    /// `ReceiverPrincipal` carries NO constraint trait, for the reason `MaxResults`
+    /// carries `skip_validation` on this service's list inputs: the modelled `@pattern`
+    /// (`^\d{12}$`) is checked by the handler instead
+    /// (`service_common::arn::is_account_id`, the shared reading of that form), because
+    /// this service states its own sentence for a value that is not an account id —
+    /// naming the member as the MODEL spells it and quoting the value — where the
+    /// framework's boundary walk would state the generic constraint clause over the
+    /// lowerCamel member path and the raw expression. The constraint is unchanged; only
+    /// who words its refusal is.
     pub const M_RECEIVER_PRINCIPAL: ::aws_smithy_schema::Schema =
         ::aws_smithy_schema::Schema::new_member(
             ::aws_smithy_schema::ShapeId::from_static(
@@ -151,8 +147,7 @@ impl CreateDataGrantInput {
             ::aws_smithy_schema::ShapeType::String,
             "ReceiverPrincipal",
             2,
-        )
-        .with_traits(&CREATE_DATA_GRANT_M_RECEIVER_PRINCIPAL_TRAITS);
+        );
 
     pub const M_SOURCE_DATA_SET_ID: ::aws_smithy_schema::Schema =
         ::aws_smithy_schema::Schema::new_member(

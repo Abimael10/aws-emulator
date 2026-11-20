@@ -32,6 +32,9 @@ md-5 = "0.10"
 # one evaluation of policy documents, which `StartJob` decides a data access source
 # bucket's grant to AWS Data Exchange with.
 service-common = { path = "../common" }
+# The calendar arithmetic behind the earliest end a data grant may name: the UTC date of
+# the clock's current instant plus two days, and that date as ISO 8601 writes one.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 # Amazon S3 client the source of an Amazon S3 data access is read through: `StartJob`
 # reads the source bucket's policy and its objects over the in-process callback into this
 # same emulator (no network client feature is enabled: the transport is the emulator's own).

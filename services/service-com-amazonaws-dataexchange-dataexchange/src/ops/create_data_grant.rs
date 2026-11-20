@@ -178,11 +178,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `Name` (`@length(1, 256)`), `GrantDistributionScope` (an enum),
-        // `ReceiverPrincipal` and `SourceDataSetId` (both `@pattern`) are bounded by
-        // the model, so the boundary validator has already refused anything outside
-        // them. What the model does NOT bound is how much caller-sized text the
-        // stored record may carry, so those bounds are enforced here.
+        // `Name` (`@length(1, 256)`), `GrantDistributionScope` (an enum) and
+        // `SourceDataSetId` (a `@pattern`) are bounded by the model, so the boundary
+        // validator has already refused anything outside them. Three faults of this
+        // request are this handler's: how much caller-sized text the stored record may
+        // carry, which the model does not bound; `ReceiverPrincipal`, whose refusal this
+        // service words itself (see the input shape's schema in `super::types`); and the
+        // end the grant may name, which the model bounds not at all.
+        //
+        // The modelled `@pattern` of the account-id parameter (`^\d{12}$`) is read through
+        // the one shared reading of that form, so this service cannot disagree with any
+        // other about what an account id is.
+        if !::service_common::arn::is_account_id(&input.receiver_principal) {
+            return Err(CreateDataGrantErrorModeled::ValidationException(
+                crate::state::parameter_not_an_account_id(
+                    crate::state::RECEIVER_PRINCIPAL_PARAMETER,
+                    &input.receiver_principal,
+                ),
+            )
+            .into());
+        }
         if let Err(message) = crate::state::bound_chars(
             "Description",
             input.description.as_deref().unwrap_or_default(),
@@ -196,12 +211,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // One reading of the clock answers both the bound the end is judged against and
+        // the instants the record carries, so a grant cannot be stamped at an instant its
+        // own guard was not applied at.
+        let created_at = crate::state::now();
+        if let Err(exception) = crate::state::check_data_grant_end(input.ends_at, created_at) {
+            return Err(CreateDataGrantErrorModeled::ValidationException(exception).into());
+        }
+
         let region = crate::state::request_region(ctx);
 
         // Persist first, then answer out of what was stored: the response is the
         // state a later read sees, not a second copy assembled from the request.
-        // Both guards are checked under the same lock the insert takes, and before
-        // any id is minted, so a refused create consumes nothing.
+        // The store's own two guards are checked under the same lock the insert takes,
+        // and before any id is minted, so a refused create consumes nothing — as does a
+        // request refused by the validation above, which reaches no store at all.
         let stored = {
             let mut store = state.lock();
             // The store is bounded, and the model declares the 402 for exactly this.
@@ -220,7 +244,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
             let id = crate::state::mint_id();
-            let created_at = crate::state::now();
             let record = crate::state::DataGrant {
                 arn: crate::state::data_grant_arn(&region, &id),
                 id: id.clone(),
