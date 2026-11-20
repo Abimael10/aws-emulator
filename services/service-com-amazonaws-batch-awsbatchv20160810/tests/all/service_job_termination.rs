@@ -473,9 +473,9 @@ async fn describe_service_job_reports_the_stored_record_member_for_member() {
         );
         assert_eq!(
             detail["startedAt"].as_i64(),
-            Some(seeded.started_at.unwrap_or_default()),
-            "case {case}: startedAt is modelled required, so an unstarted job reports 0, \
-             got {detail}"
+            seeded.started_at,
+            "case {case}: startedAt is the instant the run began, absent for a job nothing \
+             started, got {detail}"
         );
         assert_eq!(
             detail["isTerminated"].as_bool(),

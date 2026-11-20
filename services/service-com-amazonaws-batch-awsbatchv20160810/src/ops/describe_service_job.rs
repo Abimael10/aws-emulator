@@ -8,6 +8,13 @@
 //! the same instant answer identically. A `jobId` the service holds no service job for is a
 //! `ClientException`.
 //!
+//! `startedAt` is "the Unix timestamp (in milliseconds) for when the service job was
+//! started": the instant the run of the job's work began. The member is modelled `@required`
+//! AND `@clientOptional` (`smithy_query(query="operation",operation="DescribeServiceJob")`),
+//! so it does not have to be on the wire — a job nothing has started reports no `startedAt`
+//! at all, as it reports no `scheduledAt` and no `stoppedAt`, rather than an instant nothing
+//! ran at.
+//!
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -222,9 +229,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status_reason: job.status_reason.clone(),
             created_at: Some(job.created_at),
             scheduled_at: job.scheduled_at,
-            // Modelled as required, so it is always serialized; 0 until the job starts,
-            // which is when the service its work was dispatched to has it running.
-            started_at: job.started_at.unwrap_or_default(),
+            // "When the service job was started": the instant the run of this job's work
+            // began, and nothing at all for a job whose work nothing has started — the
+            // transition has not happened, so the member is absent, as `scheduledAt` and
+            // `stoppedAt` already are.
+            started_at: job.started_at,
             stopped_at: job.stopped_at,
             is_terminated: Some(job.is_terminated),
             share_identifier: job.share_identifier.clone(),

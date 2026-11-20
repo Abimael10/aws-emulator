@@ -11,6 +11,28 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-batch-awsbatchv20160810.json");
 
+/// One member schema of a hand-written structure of this service, at `index` in that
+/// structure's member list.
+///
+/// A shape whose serializer has to omit a `@required` + `@clientOptional` member carries
+/// its schema written out rather than derived (see `JobDetail` in
+/// `describe_jobs_types`, and `DescribeServiceJobOutput` in `describe_service_job_types`).
+/// Every shape of this service lives in the one namespace, so only the member's own shape
+/// id, wire name, kind and position differ, and that is all this takes.
+pub const fn member_schema(
+    shape_id: &'static str,
+    name: &'static str,
+    shape_type: ::aws_smithy_schema::ShapeType,
+    index: usize,
+) -> ::aws_smithy_schema::Schema {
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(shape_id, "com.amazonaws.batch", name),
+        shape_type,
+        name,
+        index,
+    )
+}
+
 #[smithy_macros::smithy(shape = "com.amazonaws.batch#ClientException")]
 #[derive(Debug, Clone, Default)]
 pub struct ClientException {

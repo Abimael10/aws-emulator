@@ -3,7 +3,8 @@
 //! @op DescribeJobs
 //! Reports one `JobDetail` per KNOWN job id, built from the persisted record: the job's
 //! name, its queue's ARN, the ARN of the job definition revision it resolved to, its
-//! status and `statusReason`, `createdAt`/`stoppedAt` in epoch milliseconds, the job
+//! status and `statusReason`, `createdAt` and the execution instants it has reached in
+//! epoch milliseconds, the job
 //! `attempts` the scheduler recorded, its
 //! parameters, tags and the effective container the definition and the submit overrides
 //! added up to. An id nothing stored is omitted silently, as AWS Batch does, rather than
@@ -40,13 +41,14 @@
 //! job's details "in the same form as the `DescribeJobs` API returns them".
 //!
 //! `JobDetail$startedAt` is "when the job transitioned from the `STARTING` state to the
-//! `RUNNING` state": the instant the run of the job's container began — read off the Amazon
-//! ECS task it runs as, or off the program this service performed for it. The member is
-//! `@required` (`smithy_query(query="shape",shape="JobDetail")`), so a value is serialized for
-//! every described job: one whose container never started reports the Long default, 0 — the
-//! same answer this service's other `@required` `startedAt` gives for a service job nothing
-//! has started yet (`DescribeServiceJob`) — and never an instant anything ran at. The crate's
-//! integration tests pin both halves.
+//! `RUNNING` state" and `stoppedAt` "when the job transitioned from the `RUNNING` state to a
+//! terminal state": each is the instant of ONE transition, read off the Amazon ECS task the
+//! job runs as or off the program this service performed for it. `startedAt` is modelled
+//! `@required` AND `@clientOptional` and `stoppedAt` plainly optional
+//! (`smithy_query(query="shape",shape="JobDetail")`), so neither has to be on the wire: a job
+//! the record holds no such transition for reports NEITHER — acceptance into the queue is then
+//! the only event that has happened, so `createdAt` is the only instant present — rather than
+//! an instant nothing ran at. The crate's integration tests pin both halves.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -227,10 +229,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     created_at: Some(job.created_at),
                     // "When the job transitioned from the `STARTING` state to the `RUNNING`
                     // state" (`JobDetail$startedAt`): the instant the task this job runs as
-                    // started its container ([`crate::state::ecs_task`]). The member is
-                    // `@required`, so a job whose container has not started reports the Long
-                    // default rather than an instant nothing ran at.
-                    started_at: job.started_at.unwrap_or_default(),
+                    // started its container ([`crate::state::ecs_task`]), and nothing at all
+                    // for a job whose container has not started — the transition has not
+                    // happened, so the member is absent, as it is for `stoppedAt` below.
+                    started_at: job.started_at,
                     retry_strategy: job.retry_strategy.clone(),
                     stopped_at: job.stopped_at,
                     // Materialised like the other collections of a described job — and like

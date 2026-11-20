@@ -17,23 +17,87 @@ pub struct DescribeJobsInput {
     pub jobs: Vec<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.batch#DescribeJobsResponse")]
+/// `DescribeJobsResponse`: "The list of jobs."
+///
+/// Written out rather than derived for one reason only — the derive's generated
+/// serializer for this shape writes each element against [`JobDetail`]'s own
+/// `SerializableStruct` impl, and that impl is hand-written here (see the note on
+/// [`JobDetail`]). The member set, its order, its `member_index` and its wire kind are
+/// the model's.
+///
+/// The derive's `DeserializableStruct` impl is deliberately not reproduced: this shape is
+/// an operation OUTPUT, which the server only ever serializes
+/// (`Operation::Output` requires `SerializableStruct`; only `Input` is deserialized).
 #[derive(Debug, Clone, Default)]
 pub struct DescribeJobsOutput {
     pub jobs: Option<Vec<JobDetail>>,
 }
 
-// `JobDetail` models `startedAt` @required — "the Unix timestamp (in milliseconds) for when
-// the job was started. More specifically, it's when the job transitioned from the STARTING
-// state to the RUNNING state" — and the recorded detail of a job that DID start carries it, so
-// a job that ran has to report it. A @required member must not be `Option<T>` here, so the
-// member is serialized for every described job and a job whose container never started reports
-// the Long default, 0 — exactly as this service's other @required `startedAt` does for a
-// service job nothing has started yet (`ServiceJobDetail$startedAt`, pinned by
-// `tests/all/service_job_submission.rs`). Nothing is invented by it: the instant a job that
-// started reports is the one its run began at, and 0 is what a @required Long with nothing to
-// report serializes as rather than an instant anything ran at.
-#[smithy_macros::smithy(shape = "com.amazonaws.batch#JobDetail")]
+#[allow(non_upper_case_globals)]
+impl DescribeJobsOutput {
+    const M_JOBS: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#DescribeJobsResponse$jobs",
+        "jobs",
+        ::aws_smithy_schema::ShapeType::List,
+        0,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.batch#DescribeJobsResponse",
+            "com.amazonaws.batch",
+            "DescribeJobsResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[&Self::M_JOBS],
+    );
+}
+
+pub static DESCRIBE_JOBS_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema = &DescribeJobsOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for DescribeJobsOutput {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(jobs) = self.jobs.as_ref() {
+            s.write_list(&Self::M_JOBS, &|items| {
+                for job in jobs.iter() {
+                    // A list of structures writes each element against the ELEMENT
+                    // shape's own schema, as the generator does.
+                    items.write_struct(&JobDetail::SCHEMA, job)?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// `JobDetail`: "An object that represents an Batch job."
+///
+/// Written out rather than derived, with its member schemas and its serializer spelled
+/// here. WHY: `startedAt` is modelled `@required` AND `@clientOptional`
+/// (`smithy_query(query="shape",shape="JobDetail")`) — Smithy's statement that the member
+/// is not always on the wire — and it is "the Unix timestamp (in milliseconds) for when
+/// the job was started. More specifically, it's when the job transitioned from the
+/// `STARTING` state to the `RUNNING` state". A job that has made no such transition has no
+/// such instant, and the difference is observable: the derive refuses an `Option<T>` field
+/// for a `@required` member and writes the member unconditionally, so a job that has only
+/// been accepted into a queue reported `startedAt` as the Long default, 0 — the epoch read
+/// as a start time, which makes the queue wait (`startedAt - createdAt`) hugely negative
+/// and the runtime (`stoppedAt - startedAt`) decades long. So the member is held as an
+/// `Option` here and written only once the record carries the instant the run began —
+/// exactly as `stoppedAt` (plainly optional) and as the `Batch Job State Change` detail
+/// rendered from the same record already do (`crate::state::job_state_change_detail`).
+///
+/// Everything else mirrors the derive exactly: the member order and `member_index` values,
+/// the shape ids, and the write call per member kind. Constraint traits are deliberately
+/// NOT carried: they are read only by the request-path validating walk, which validates an
+/// operation's `INPUT_SCHEMA`, and this shape appears in no operation input.
+///
+/// The derive's `DeserializableStruct` impl is deliberately not reproduced, for the reason
+/// given on [`DescribeJobsOutput`].
 #[derive(Debug, Clone, Default)]
 pub struct JobDetail {
     pub job_arn: Option<String>,
@@ -47,7 +111,10 @@ pub struct JobDetail {
     pub status_reason: Option<String>,
     pub created_at: Option<i64>,
     pub retry_strategy: Option<RetryStrategy>,
-    pub started_at: i64,
+    /// "When the job transitioned from the `STARTING` state to the `RUNNING` state": the
+    /// instant the run of this job's container began, or `None` for a job whose container
+    /// has not started one — which is how the member reaches the wire absent.
+    pub started_at: Option<i64>,
     pub stopped_at: Option<i64>,
     pub depends_on: Option<Vec<JobDependency>>,
     pub job_definition: String,
@@ -66,6 +133,361 @@ pub struct JobDetail {
     pub is_cancelled: Option<bool>,
     pub is_terminated: Option<bool>,
     pub consumable_resource_properties: Option<ConsumableResourceProperties>,
+}
+
+#[allow(non_upper_case_globals)]
+impl JobDetail {
+    // Associated member-schema consts, in the model's own member order.
+    // `tests/all/job_execution_timestamps.rs` pins the member set this shape reports
+    // against the model, so this hand-written block cannot drift from it silently.
+    const M_JOB_ARN: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#JobDetail$jobArn",
+        "jobArn",
+        ::aws_smithy_schema::ShapeType::String,
+        0,
+    );
+    const M_JOB_NAME: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#JobDetail$jobName",
+        "jobName",
+        ::aws_smithy_schema::ShapeType::String,
+        1,
+    );
+    const M_JOB_ID: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#JobDetail$jobId",
+        "jobId",
+        ::aws_smithy_schema::ShapeType::String,
+        2,
+    );
+    const M_JOB_QUEUE: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#JobDetail$jobQueue",
+        "jobQueue",
+        ::aws_smithy_schema::ShapeType::String,
+        3,
+    );
+    const M_STATUS: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#JobDetail$status",
+        "status",
+        ::aws_smithy_schema::ShapeType::String,
+        4,
+    );
+    const M_SHARE_IDENTIFIER: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#JobDetail$shareIdentifier",
+        "shareIdentifier",
+        ::aws_smithy_schema::ShapeType::String,
+        5,
+    );
+    const M_SCHEDULING_PRIORITY: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#JobDetail$schedulingPriority",
+        "schedulingPriority",
+        ::aws_smithy_schema::ShapeType::Integer,
+        6,
+    );
+    const M_ATTEMPTS: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#JobDetail$attempts",
+        "attempts",
+        ::aws_smithy_schema::ShapeType::List,
+        7,
+    );
+    const M_STATUS_REASON: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#JobDetail$statusReason",
+        "statusReason",
+        ::aws_smithy_schema::ShapeType::String,
+        8,
+    );
+    const M_CREATED_AT: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#JobDetail$createdAt",
+        "createdAt",
+        ::aws_smithy_schema::ShapeType::Long,
+        9,
+    );
+    const M_RETRY_STRATEGY: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#JobDetail$retryStrategy",
+        "retryStrategy",
+        ::aws_smithy_schema::ShapeType::Structure,
+        10,
+    );
+    /// THE reason this schema is hand-written: `@required` + `@clientOptional`, so the
+    /// member is written only for a job whose container started (see [`JobDetail`]).
+    const M_STARTED_AT: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#JobDetail$startedAt",
+        "startedAt",
+        ::aws_smithy_schema::ShapeType::Long,
+        11,
+    );
+    const M_STOPPED_AT: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#JobDetail$stoppedAt",
+        "stoppedAt",
+        ::aws_smithy_schema::ShapeType::Long,
+        12,
+    );
+    const M_DEPENDS_ON: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#JobDetail$dependsOn",
+        "dependsOn",
+        ::aws_smithy_schema::ShapeType::List,
+        13,
+    );
+    const M_JOB_DEFINITION: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#JobDetail$jobDefinition",
+        "jobDefinition",
+        ::aws_smithy_schema::ShapeType::String,
+        14,
+    );
+    const M_PARAMETERS: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#JobDetail$parameters",
+        "parameters",
+        ::aws_smithy_schema::ShapeType::Map,
+        15,
+    );
+    const M_CONTAINER: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#JobDetail$container",
+        "container",
+        ::aws_smithy_schema::ShapeType::Structure,
+        16,
+    );
+    const M_NODE_DETAILS: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#JobDetail$nodeDetails",
+        "nodeDetails",
+        ::aws_smithy_schema::ShapeType::Structure,
+        17,
+    );
+    const M_NODE_PROPERTIES: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#JobDetail$nodeProperties",
+        "nodeProperties",
+        ::aws_smithy_schema::ShapeType::Structure,
+        18,
+    );
+    const M_ARRAY_PROPERTIES: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#JobDetail$arrayProperties",
+        "arrayProperties",
+        ::aws_smithy_schema::ShapeType::Structure,
+        19,
+    );
+    const M_TIMEOUT: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#JobDetail$timeout",
+        "timeout",
+        ::aws_smithy_schema::ShapeType::Structure,
+        20,
+    );
+    const M_TAGS: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#JobDetail$tags",
+        "tags",
+        ::aws_smithy_schema::ShapeType::Map,
+        21,
+    );
+    const M_PROPAGATE_TAGS: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#JobDetail$propagateTags",
+        "propagateTags",
+        ::aws_smithy_schema::ShapeType::Boolean,
+        22,
+    );
+    const M_PLATFORM_CAPABILITIES: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#JobDetail$platformCapabilities",
+        "platformCapabilities",
+        ::aws_smithy_schema::ShapeType::List,
+        23,
+    );
+    const M_EKS_PROPERTIES: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#JobDetail$eksProperties",
+        "eksProperties",
+        ::aws_smithy_schema::ShapeType::Structure,
+        24,
+    );
+    const M_EKS_ATTEMPTS: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#JobDetail$eksAttempts",
+        "eksAttempts",
+        ::aws_smithy_schema::ShapeType::List,
+        25,
+    );
+    const M_ECS_PROPERTIES: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#JobDetail$ecsProperties",
+        "ecsProperties",
+        ::aws_smithy_schema::ShapeType::Structure,
+        26,
+    );
+    const M_IS_CANCELLED: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#JobDetail$isCancelled",
+        "isCancelled",
+        ::aws_smithy_schema::ShapeType::Boolean,
+        27,
+    );
+    const M_IS_TERMINATED: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#JobDetail$isTerminated",
+        "isTerminated",
+        ::aws_smithy_schema::ShapeType::Boolean,
+        28,
+    );
+    const M_CONSUMABLE_RESOURCE_PROPERTIES: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#JobDetail$consumableResourceProperties",
+        "consumableResourceProperties",
+        ::aws_smithy_schema::ShapeType::Structure,
+        29,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.batch#JobDetail",
+            "com.amazonaws.batch",
+            "JobDetail",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_JOB_ARN,
+            &Self::M_JOB_NAME,
+            &Self::M_JOB_ID,
+            &Self::M_JOB_QUEUE,
+            &Self::M_STATUS,
+            &Self::M_SHARE_IDENTIFIER,
+            &Self::M_SCHEDULING_PRIORITY,
+            &Self::M_ATTEMPTS,
+            &Self::M_STATUS_REASON,
+            &Self::M_CREATED_AT,
+            &Self::M_RETRY_STRATEGY,
+            &Self::M_STARTED_AT,
+            &Self::M_STOPPED_AT,
+            &Self::M_DEPENDS_ON,
+            &Self::M_JOB_DEFINITION,
+            &Self::M_PARAMETERS,
+            &Self::M_CONTAINER,
+            &Self::M_NODE_DETAILS,
+            &Self::M_NODE_PROPERTIES,
+            &Self::M_ARRAY_PROPERTIES,
+            &Self::M_TIMEOUT,
+            &Self::M_TAGS,
+            &Self::M_PROPAGATE_TAGS,
+            &Self::M_PLATFORM_CAPABILITIES,
+            &Self::M_EKS_PROPERTIES,
+            &Self::M_EKS_ATTEMPTS,
+            &Self::M_ECS_PROPERTIES,
+            &Self::M_IS_CANCELLED,
+            &Self::M_IS_TERMINATED,
+            &Self::M_CONSUMABLE_RESOURCE_PROPERTIES,
+        ],
+    );
+}
+
+pub static JOB_DETAIL_SCHEMA: &::aws_smithy_schema::Schema = &JobDetail::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for JobDetail {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.job_arn.as_ref() {
+            s.write_string(&Self::M_JOB_ARN, v.as_str())?;
+        }
+        s.write_string(&Self::M_JOB_NAME, self.job_name.as_str())?;
+        s.write_string(&Self::M_JOB_ID, self.job_id.as_str())?;
+        s.write_string(&Self::M_JOB_QUEUE, self.job_queue.as_str())?;
+        s.write_string(&Self::M_STATUS, self.status.as_str())?;
+        if let Some(v) = self.share_identifier.as_ref() {
+            s.write_string(&Self::M_SHARE_IDENTIFIER, v.as_str())?;
+        }
+        if let Some(v) = self.scheduling_priority {
+            s.write_integer(&Self::M_SCHEDULING_PRIORITY, v)?;
+        }
+        if let Some(v) = self.attempts.as_ref() {
+            s.write_list(&Self::M_ATTEMPTS, &|items| {
+                for attempt in v.iter() {
+                    items.write_struct(&AttemptDetail::SCHEMA, attempt)?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(v) = self.status_reason.as_ref() {
+            s.write_string(&Self::M_STATUS_REASON, v.as_str())?;
+        }
+        if let Some(v) = self.created_at {
+            s.write_long(&Self::M_CREATED_AT, v)?;
+        }
+        if let Some(v) = self.retry_strategy.as_ref() {
+            s.write_struct(&Self::M_RETRY_STRATEGY, v)?;
+        }
+        // The two execution instants: each is written only for the transition the record
+        // says the job made, so a job nothing has started reports neither.
+        if let Some(v) = self.started_at {
+            s.write_long(&Self::M_STARTED_AT, v)?;
+        }
+        if let Some(v) = self.stopped_at {
+            s.write_long(&Self::M_STOPPED_AT, v)?;
+        }
+        if let Some(v) = self.depends_on.as_ref() {
+            s.write_list(&Self::M_DEPENDS_ON, &|items| {
+                for dependency in v.iter() {
+                    items.write_struct(&JobDependency::SCHEMA, dependency)?;
+                }
+                Ok(())
+            })?;
+        }
+        s.write_string(&Self::M_JOB_DEFINITION, self.job_definition.as_str())?;
+        if let Some(v) = self.parameters.as_ref() {
+            s.write_map(&Self::M_PARAMETERS, &|entries| {
+                for (key, value) in v.iter() {
+                    entries.write_string(&Self::M_PARAMETERS, key.as_str())?;
+                    entries.write_string(&Self::M_PARAMETERS, value.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(v) = self.container.as_ref() {
+            s.write_struct(&Self::M_CONTAINER, v)?;
+        }
+        if let Some(v) = self.node_details.as_ref() {
+            s.write_struct(&Self::M_NODE_DETAILS, v)?;
+        }
+        if let Some(v) = self.node_properties.as_ref() {
+            s.write_struct(&Self::M_NODE_PROPERTIES, v)?;
+        }
+        if let Some(v) = self.array_properties.as_ref() {
+            s.write_struct(&Self::M_ARRAY_PROPERTIES, v)?;
+        }
+        if let Some(v) = self.timeout.as_ref() {
+            s.write_struct(&Self::M_TIMEOUT, v)?;
+        }
+        if let Some(v) = self.tags.as_ref() {
+            s.write_map(&Self::M_TAGS, &|entries| {
+                for (key, value) in v.iter() {
+                    entries.write_string(&Self::M_TAGS, key.as_str())?;
+                    entries.write_string(&Self::M_TAGS, value.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(v) = self.propagate_tags {
+            s.write_boolean(&Self::M_PROPAGATE_TAGS, v)?;
+        }
+        if let Some(v) = self.platform_capabilities.as_ref() {
+            s.write_list(&Self::M_PLATFORM_CAPABILITIES, &|items| {
+                for capability in v.iter() {
+                    items.write_string(&Self::M_PLATFORM_CAPABILITIES, capability.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(v) = self.eks_properties.as_ref() {
+            s.write_struct(&Self::M_EKS_PROPERTIES, v)?;
+        }
+        if let Some(v) = self.eks_attempts.as_ref() {
+            s.write_list(&Self::M_EKS_ATTEMPTS, &|items| {
+                for attempt in v.iter() {
+                    items.write_struct(&EksAttemptDetail::SCHEMA, attempt)?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(v) = self.ecs_properties.as_ref() {
+            s.write_struct(&Self::M_ECS_PROPERTIES, v)?;
+        }
+        if let Some(v) = self.is_cancelled {
+            s.write_boolean(&Self::M_IS_CANCELLED, v)?;
+        }
+        if let Some(v) = self.is_terminated {
+            s.write_boolean(&Self::M_IS_TERMINATED, v)?;
+        }
+        if let Some(v) = self.consumable_resource_properties.as_ref() {
+            s.write_struct(&Self::M_CONSUMABLE_RESOURCE_PROPERTIES, v)?;
+        }
+        Ok(())
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.batch#AttemptDetail")]

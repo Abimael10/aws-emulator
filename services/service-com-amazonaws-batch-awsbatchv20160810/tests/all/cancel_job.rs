@@ -192,17 +192,16 @@ async fn cancel_and_check_rule(batch: &Batch, case: &str, job_id: &str, reason: 
         "case {case}: a stored job carries createdAt, got {before}"
     );
     // `stoppedAt` is "when the job transitioned from the RUNNING state to a terminal
-    // state": a job cancelled before it ever ran made no such transition, so AWS reports
-    // none even once the job is FAILED — and `startedAt`, modelled `@required`, reports the
-    // Long default rather than an instant anything ran at.
+    // state" and `startedAt` the STARTING -> RUNNING transition: a job cancelled before it
+    // ever ran made neither, so AWS reports neither even once the job is FAILED.
     assert_eq!(
         after["stoppedAt"],
         Value::Null,
         "case {case}: a job cancelled before it ran reports no stoppedAt, got {after}"
     );
     assert_eq!(
-        after["startedAt"].as_i64(),
-        Some(0),
+        after["startedAt"],
+        Value::Null,
         "case {case}: nothing ran, so no startedAt is invented, got {after}"
     );
 }

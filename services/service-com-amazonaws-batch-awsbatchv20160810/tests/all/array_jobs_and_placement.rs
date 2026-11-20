@@ -170,17 +170,16 @@ async fn submit_ok(fixture: &Fixture, name: &str, extra: Value) -> String {
 /// record itself belongs to the PLACEMENT, not to a run, and what a placed job's attempt
 /// carries is pinned in `job_attempt_records.rs`.
 ///
-/// `JobDetail$startedAt` is modelled `@required`, so a value is serialized for every described
-/// job: a job nothing started reports the Long default, 0, where its ATTEMPT — whose own
-/// `startedAt` the model leaves optional — reports none at all.
+/// `JobDetail$startedAt` is the STARTING -> RUNNING transition, which such a job never
+/// made, so neither the job nor its ATTEMPT — whose own `startedAt` the model leaves
+/// plainly optional — reports one.
 ///
 /// `stoppedAt` is NOT one of them: it is when the job's work stopped, which a job the
 /// scheduler placed has — the task it ran as — whatever that task's container got to, so a
 /// placed job reports one and a job no placement took reports none.
 fn assert_nothing_ran(case: &str, detail: &Value) {
-    assert_eq!(
-        detail["startedAt"].as_i64(),
-        Some(0),
+    assert!(
+        detail["startedAt"].is_null(),
         "case {case}: a job nothing ran invents no startedAt, got {detail}"
     );
     let placed = detail["attempts"]
@@ -211,13 +210,16 @@ fn assert_nothing_ran(case: &str, detail: &Value) {
 /// the instant it stopped and the status it exited with, on the job's container and on the
 /// attempt the placement recorded for it.
 ///
-/// The instant it STARTED is read off the attempt, which is where the model leaves the member
-/// optional (`AttemptDetail$startedAt`); `JobDetail$startedAt` is @required, so this emulator
-/// withholds it rather than report a 0 for every job whose container never ran (see
-/// `ops::types`). What a placed job's attempt carries is pinned in `job_attempt_records.rs`;
+/// The instant it STARTED is reported by the job and by the attempt alike, each from the
+/// record of the run that began (`JobDetail$startedAt`, `AttemptDetail$startedAt`). What a
+/// placed job's attempt carries is pinned in `job_attempt_records.rs`;
 /// this is the part every placed job of this suite reports, whatever its queue's capacity
 /// looked like before the placement.
 fn assert_the_program_ran(case: &str, detail: &Value, exit_code: i64) {
+    assert!(
+        detail["startedAt"].as_i64().unwrap_or_default() > 0,
+        "case {case}: a job whose program ran reports when it started, got {detail}"
+    );
     assert!(
         detail["stoppedAt"].as_i64().unwrap_or_default() > 0,
         "case {case}: a job whose program ran reports when it stopped, got {detail}"

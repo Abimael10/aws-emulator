@@ -17,7 +17,29 @@ pub struct DescribeServiceJobInput {
     pub job_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.batch#DescribeServiceJobResponse")]
+/// `DescribeServiceJobResponse`: "The details of a service job."
+///
+/// Written out rather than derived, with its member schemas and its serializer spelled
+/// here. WHY: `startedAt` is modelled `@required` AND `@clientOptional`
+/// (`smithy_query(query="operation",operation="DescribeServiceJob")`) — Smithy's statement
+/// that the member is not always on the wire — and it is "the Unix timestamp (in
+/// milliseconds) for when the service job was started". A service job nothing has started
+/// has no such instant, and the difference is observable: the derive refuses an `Option<T>`
+/// field for a `@required` member and writes the member unconditionally, so a job that has
+/// only been queued reported `startedAt` as the Long default, 0 — the epoch read as a start
+/// time, which makes the queue wait (`startedAt - createdAt`) hugely negative. So the
+/// member is held as an `Option` here and written only once the record carries the instant
+/// the run began, exactly as `scheduledAt` and `stoppedAt` (both plainly optional) already
+/// are.
+///
+/// Everything else mirrors the derive exactly: the member order and `member_index` values,
+/// the shape ids, and the write call per member kind. Constraint traits are deliberately
+/// NOT carried: they are read only by the request-path validating walk, which validates an
+/// operation's `INPUT_SCHEMA`, and this shape appears in no operation input.
+///
+/// The derive's `DeserializableStruct` impl is deliberately not reproduced: this shape is
+/// an operation OUTPUT, which the server only ever serializes (`Operation::Output` requires
+/// `SerializableStruct`; only `Input` is deserialized).
 #[derive(Debug, Clone, Default)]
 pub struct DescribeServiceJobOutput {
     pub attempts: Option<Vec<ServiceJobAttemptDetail>>,
@@ -38,12 +60,298 @@ pub struct DescribeServiceJobOutput {
     pub quota_share_name: Option<String>,
     pub preemption_configuration: Option<ServiceJobPreemptionConfiguration>,
     pub preemption_summary: Option<ServiceJobPreemptionSummary>,
-    pub started_at: i64,
+    /// "When the service job was started": the instant the run of this job's work began,
+    /// or `None` for a job nothing has started one for — which is how the member reaches
+    /// the wire absent.
+    pub started_at: Option<i64>,
     pub status: String,
     pub status_reason: Option<String>,
     pub stopped_at: Option<i64>,
     pub tags: Option<std::collections::HashMap<String, String>>,
     pub timeout_config: Option<ServiceJobTimeout>,
+}
+
+#[allow(non_upper_case_globals)]
+impl DescribeServiceJobOutput {
+    // Associated member-schema consts, in the model's own member order.
+    // `tests/all/job_execution_timestamps.rs` pins the member set this shape reports
+    // against the model, so this hand-written block cannot drift from it silently.
+    const M_ATTEMPTS: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#DescribeServiceJobResponse$attempts",
+        "attempts",
+        ::aws_smithy_schema::ShapeType::List,
+        0,
+    );
+    const M_CAPACITY_USAGE: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#DescribeServiceJobResponse$capacityUsage",
+        "capacityUsage",
+        ::aws_smithy_schema::ShapeType::List,
+        1,
+    );
+    const M_CREATED_AT: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#DescribeServiceJobResponse$createdAt",
+        "createdAt",
+        ::aws_smithy_schema::ShapeType::Long,
+        2,
+    );
+    const M_IS_TERMINATED: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#DescribeServiceJobResponse$isTerminated",
+        "isTerminated",
+        ::aws_smithy_schema::ShapeType::Boolean,
+        3,
+    );
+    const M_JOB_ARN: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#DescribeServiceJobResponse$jobArn",
+        "jobArn",
+        ::aws_smithy_schema::ShapeType::String,
+        4,
+    );
+    const M_JOB_ID: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#DescribeServiceJobResponse$jobId",
+        "jobId",
+        ::aws_smithy_schema::ShapeType::String,
+        5,
+    );
+    const M_JOB_NAME: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#DescribeServiceJobResponse$jobName",
+        "jobName",
+        ::aws_smithy_schema::ShapeType::String,
+        6,
+    );
+    const M_JOB_QUEUE: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#DescribeServiceJobResponse$jobQueue",
+        "jobQueue",
+        ::aws_smithy_schema::ShapeType::String,
+        7,
+    );
+    const M_LATEST_ATTEMPT: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#DescribeServiceJobResponse$latestAttempt",
+        "latestAttempt",
+        ::aws_smithy_schema::ShapeType::Structure,
+        8,
+    );
+    const M_RETRY_STRATEGY: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#DescribeServiceJobResponse$retryStrategy",
+        "retryStrategy",
+        ::aws_smithy_schema::ShapeType::Structure,
+        9,
+    );
+    const M_SCHEDULED_AT: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#DescribeServiceJobResponse$scheduledAt",
+        "scheduledAt",
+        ::aws_smithy_schema::ShapeType::Long,
+        10,
+    );
+    const M_SCHEDULING_PRIORITY: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#DescribeServiceJobResponse$schedulingPriority",
+        "schedulingPriority",
+        ::aws_smithy_schema::ShapeType::Integer,
+        11,
+    );
+    const M_SERVICE_REQUEST_PAYLOAD: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#DescribeServiceJobResponse$serviceRequestPayload",
+        "serviceRequestPayload",
+        ::aws_smithy_schema::ShapeType::String,
+        12,
+    );
+    const M_SERVICE_JOB_TYPE: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#DescribeServiceJobResponse$serviceJobType",
+        "serviceJobType",
+        ::aws_smithy_schema::ShapeType::String,
+        13,
+    );
+    const M_SHARE_IDENTIFIER: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#DescribeServiceJobResponse$shareIdentifier",
+        "shareIdentifier",
+        ::aws_smithy_schema::ShapeType::String,
+        14,
+    );
+    const M_QUOTA_SHARE_NAME: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#DescribeServiceJobResponse$quotaShareName",
+        "quotaShareName",
+        ::aws_smithy_schema::ShapeType::String,
+        15,
+    );
+    const M_PREEMPTION_CONFIGURATION: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#DescribeServiceJobResponse$preemptionConfiguration",
+        "preemptionConfiguration",
+        ::aws_smithy_schema::ShapeType::Structure,
+        16,
+    );
+    const M_PREEMPTION_SUMMARY: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#DescribeServiceJobResponse$preemptionSummary",
+        "preemptionSummary",
+        ::aws_smithy_schema::ShapeType::Structure,
+        17,
+    );
+    /// THE reason this schema is hand-written: `@required` + `@clientOptional`, so the
+    /// member is written only for a job whose work started (see
+    /// [`DescribeServiceJobOutput`]).
+    const M_STARTED_AT: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#DescribeServiceJobResponse$startedAt",
+        "startedAt",
+        ::aws_smithy_schema::ShapeType::Long,
+        18,
+    );
+    const M_STATUS: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#DescribeServiceJobResponse$status",
+        "status",
+        ::aws_smithy_schema::ShapeType::String,
+        19,
+    );
+    const M_STATUS_REASON: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#DescribeServiceJobResponse$statusReason",
+        "statusReason",
+        ::aws_smithy_schema::ShapeType::String,
+        20,
+    );
+    const M_STOPPED_AT: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#DescribeServiceJobResponse$stoppedAt",
+        "stoppedAt",
+        ::aws_smithy_schema::ShapeType::Long,
+        21,
+    );
+    const M_TAGS: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#DescribeServiceJobResponse$tags",
+        "tags",
+        ::aws_smithy_schema::ShapeType::Map,
+        22,
+    );
+    const M_TIMEOUT_CONFIG: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.batch#DescribeServiceJobResponse$timeoutConfig",
+        "timeoutConfig",
+        ::aws_smithy_schema::ShapeType::Structure,
+        23,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.batch#DescribeServiceJobResponse",
+            "com.amazonaws.batch",
+            "DescribeServiceJobResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ATTEMPTS,
+            &Self::M_CAPACITY_USAGE,
+            &Self::M_CREATED_AT,
+            &Self::M_IS_TERMINATED,
+            &Self::M_JOB_ARN,
+            &Self::M_JOB_ID,
+            &Self::M_JOB_NAME,
+            &Self::M_JOB_QUEUE,
+            &Self::M_LATEST_ATTEMPT,
+            &Self::M_RETRY_STRATEGY,
+            &Self::M_SCHEDULED_AT,
+            &Self::M_SCHEDULING_PRIORITY,
+            &Self::M_SERVICE_REQUEST_PAYLOAD,
+            &Self::M_SERVICE_JOB_TYPE,
+            &Self::M_SHARE_IDENTIFIER,
+            &Self::M_QUOTA_SHARE_NAME,
+            &Self::M_PREEMPTION_CONFIGURATION,
+            &Self::M_PREEMPTION_SUMMARY,
+            &Self::M_STARTED_AT,
+            &Self::M_STATUS,
+            &Self::M_STATUS_REASON,
+            &Self::M_STOPPED_AT,
+            &Self::M_TAGS,
+            &Self::M_TIMEOUT_CONFIG,
+        ],
+    );
+}
+
+pub static DESCRIBE_SERVICE_JOB_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &DescribeServiceJobOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for DescribeServiceJobOutput {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.attempts.as_ref() {
+            s.write_list(&Self::M_ATTEMPTS, &|items| {
+                for attempt in v.iter() {
+                    // A list of structures writes each element against the ELEMENT
+                    // shape's own schema, as the generator does.
+                    items.write_struct(&ServiceJobAttemptDetail::SCHEMA, attempt)?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(v) = self.capacity_usage.as_ref() {
+            s.write_list(&Self::M_CAPACITY_USAGE, &|items| {
+                for usage in v.iter() {
+                    items.write_struct(&ServiceJobCapacityUsageDetail::SCHEMA, usage)?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(v) = self.created_at {
+            s.write_long(&Self::M_CREATED_AT, v)?;
+        }
+        if let Some(v) = self.is_terminated {
+            s.write_boolean(&Self::M_IS_TERMINATED, v)?;
+        }
+        if let Some(v) = self.job_arn.as_ref() {
+            s.write_string(&Self::M_JOB_ARN, v.as_str())?;
+        }
+        s.write_string(&Self::M_JOB_ID, self.job_id.as_str())?;
+        s.write_string(&Self::M_JOB_NAME, self.job_name.as_str())?;
+        s.write_string(&Self::M_JOB_QUEUE, self.job_queue.as_str())?;
+        if let Some(v) = self.latest_attempt.as_ref() {
+            s.write_struct(&Self::M_LATEST_ATTEMPT, v)?;
+        }
+        if let Some(v) = self.retry_strategy.as_ref() {
+            s.write_struct(&Self::M_RETRY_STRATEGY, v)?;
+        }
+        if let Some(v) = self.scheduled_at {
+            s.write_long(&Self::M_SCHEDULED_AT, v)?;
+        }
+        if let Some(v) = self.scheduling_priority {
+            s.write_integer(&Self::M_SCHEDULING_PRIORITY, v)?;
+        }
+        if let Some(v) = self.service_request_payload.as_ref() {
+            s.write_string(&Self::M_SERVICE_REQUEST_PAYLOAD, v.as_str())?;
+        }
+        s.write_string(&Self::M_SERVICE_JOB_TYPE, self.service_job_type.as_str())?;
+        if let Some(v) = self.share_identifier.as_ref() {
+            s.write_string(&Self::M_SHARE_IDENTIFIER, v.as_str())?;
+        }
+        if let Some(v) = self.quota_share_name.as_ref() {
+            s.write_string(&Self::M_QUOTA_SHARE_NAME, v.as_str())?;
+        }
+        if let Some(v) = self.preemption_configuration.as_ref() {
+            s.write_struct(&Self::M_PREEMPTION_CONFIGURATION, v)?;
+        }
+        if let Some(v) = self.preemption_summary.as_ref() {
+            s.write_struct(&Self::M_PREEMPTION_SUMMARY, v)?;
+        }
+        // The instants of this job's run: each is written only for the transition the
+        // record says the job made, so a job nothing has started reports neither.
+        if let Some(v) = self.started_at {
+            s.write_long(&Self::M_STARTED_AT, v)?;
+        }
+        s.write_string(&Self::M_STATUS, self.status.as_str())?;
+        if let Some(v) = self.status_reason.as_ref() {
+            s.write_string(&Self::M_STATUS_REASON, v.as_str())?;
+        }
+        if let Some(v) = self.stopped_at {
+            s.write_long(&Self::M_STOPPED_AT, v)?;
+        }
+        if let Some(v) = self.tags.as_ref() {
+            s.write_map(&Self::M_TAGS, &|entries| {
+                for (key, value) in v.iter() {
+                    entries.write_string(&Self::M_TAGS, key.as_str())?;
+                    entries.write_string(&Self::M_TAGS, value.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(v) = self.timeout_config.as_ref() {
+            s.write_struct(&Self::M_TIMEOUT_CONFIG, v)?;
+        }
+        Ok(())
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.batch#ServiceJobAttemptDetail")]

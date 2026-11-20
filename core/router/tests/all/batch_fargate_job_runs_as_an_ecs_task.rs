@@ -715,9 +715,9 @@ async fn a_placed_fargate_job_runs_as_a_task_of_its_compute_environments_cluster
         // the task it was placed as either way. A container whose program this emulator holds
         // none of still STARTED — its task reached `RUNNING` — so its job started too; what
         // that run produced no value for is the exit status, which is the member left absent.
-        // The start instant is read off the ATTEMPT here: `JobDetail$startedAt` is modelled
-        // `@required`, so the job reports the Long default rather than nothing when its
-        // container never started, which is the half `job_rests_in_runnable.rs` pins.
+        // The start instant is the STARTING -> RUNNING transition on both: a job whose
+        // container never started reports no `startedAt` at all, which is the half
+        // `job_rests_in_runnable.rs` pins.
         let started = !matches!(row.ends, Ends::CouldNotFetchTheImage);
         assert_eq!(
             attempt["startedAt"].as_i64().is_some(),

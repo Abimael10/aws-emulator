@@ -389,9 +389,10 @@ async fn submitting_a_service_job_persists_it_and_describe_reads_it_back() {
             "case {case}: expected a createdAt in epoch milliseconds, got {detail}"
         );
         // Nothing dispatched the job's work, so none of what a dispatch would produce is
-        // invented for it.
+        // invented for it — `startedAt` among them, because nothing started a run.
         for member in [
             "scheduledAt",
+            "startedAt",
             "stoppedAt",
             "statusReason",
             "attempts",
@@ -405,12 +406,6 @@ async fn submitting_a_service_job_persists_it_and_describe_reads_it_back() {
                  got {detail}"
             );
         }
-        assert_eq!(
-            detail["startedAt"].as_i64(),
-            Some(0),
-            "case {case}: startedAt is modelled required, so an unstarted job reports 0, \
-             got {detail}"
-        );
 
         // The optional members, each read back exactly as the row carried it — or absent.
         assert_eq!(
@@ -921,6 +916,7 @@ async fn a_submitted_service_job_moves_only_with_the_clock_and_never_because_of_
     // Nothing dispatched the work, so nothing a dispatch would produce is reported.
     for member in [
         "statusReason",
+        "startedAt",
         "stoppedAt",
         "scheduledAt",
         "attempts",
@@ -933,11 +929,6 @@ async fn a_submitted_service_job_moves_only_with_the_clock_and_never_because_of_
             "case poll to the end: {member} must not be invented, got {detail}"
         );
     }
-    assert_eq!(
-        detail["startedAt"].as_i64(),
-        Some(0),
-        "case poll to the end: the job never started, so startedAt stays 0, got {detail}"
-    );
 
     // Nor does more time passing move a waiting service job: it is read again until the
     // deadline, and every read must answer what the one before it did.

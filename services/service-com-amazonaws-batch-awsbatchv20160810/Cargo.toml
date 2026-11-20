@@ -77,6 +77,9 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs` from `tests/all/main.rs`, so a suite needs
+# no declaration of its own.
+automod = { workspace = true }
 # EventBridge and SQS are mounted beside Batch on one engine in the integration tests,
 # because Batch publishes a `Batch Job State Change` event onto the default event bus on
 # every job transition and a rule on that bus delivers it to an SQS queue: without them

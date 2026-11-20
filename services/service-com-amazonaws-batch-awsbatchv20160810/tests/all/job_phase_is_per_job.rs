@@ -156,14 +156,9 @@ async fn every_job_leaves_submitted_one_span_after_its_own_submit() {
              (due at {}), observed at {at}",
             created + span
         );
-        // `startedAt` is modelled `@required`, so it reports the Long default for a job
-        // nothing has started; the two optional members are absent altogether.
-        assert_eq!(
-            detail["startedAt"].as_i64(),
-            Some(0),
-            "case {case}: a job nothing placed invents no startedAt, got {detail}"
-        );
-        for member in ["stoppedAt", "statusReason"] {
+        // A job nothing has started made neither execution transition, so none of the
+        // three members below is reported for it.
+        for member in ["startedAt", "stoppedAt", "statusReason"] {
             assert_eq!(
                 detail[member],
                 Value::Null,
