@@ -515,6 +515,106 @@ pub fn evaluate(expression: &Expression<'_>) -> Result<Option<(Value, usize)>, R
     answered
 }
 
+/// Why `text` is not an expression of the language at all, or `None` when the engine
+/// PARSES it.
+///
+/// The seam for a caller that has to answer for an expression BEFORE anything is
+/// evaluated over it: a service whose API validates a submitted document reports an
+/// expression that does not parse as a defect of that document, which is a different
+/// answer from an expression that parsed and then failed over some data. Only the parse
+/// runs here — no context document is read, no variable is bound and nothing is
+/// evaluated — so an expression this answers `None` for is not thereby an expression
+/// [`evaluate`] will produce a value for.
+///
+/// It is held to the same ceilings the parse inside [`evaluate`] is, each before the
+/// work it bounds: the text's length and its groupings, the live-parse count, and the
+/// sized thread the recursive-descent parse runs on. The answer is the engine's own
+/// diagnostic sentence ([`parse_sentence`]).
+pub fn parse_failure(text: &str) -> Option<String> {
+    // The two ceilings this module puts ahead of a parse are the EMULATOR's, not the
+    // language's: a text they stop say nothing about whether the language admits it, so
+    // nothing is reported about such a text and the caller is told only what the parser
+    // itself found. (What those ceilings do decide is that the expression is not
+    // EVALUATED — [`evaluate`] refuses it there.)
+    if text.len() > MAX_EXPRESSION_BYTES {
+        return None;
+    }
+    let groupings = text
+        .bytes()
+        .filter(|byte| matches!(byte, b'(' | b'[' | b'{'))
+        .count();
+    if groupings > MAX_EXPRESSION_GROUPINGS {
+        return None;
+    }
+    let _live = LiveEvaluation::start()?;
+    ::std::thread::scope(|scope| {
+        let spawned = ::std::thread::Builder::new()
+            .stack_size(EVALUATION_STACK_BYTES)
+            .spawn_scoped(scope, || parsed(text));
+        match spawned {
+            Ok(thread) => thread.join().unwrap_or(None),
+            // A host that will not give the thread its stack shows nothing about the
+            // expression, so nothing is reported about it.
+            Err(_) => None,
+        }
+    })
+}
+
+/// The parse itself, on the thread [`parse_failure`] sized for it.
+///
+/// Inside [`::std::panic::catch_unwind`] for the reason the evaluation is: the arena's
+/// refusal of an over-ceiling allocation and the engine's own `unreachable!()` on some
+/// malformed expressions are unwinding panics, and a caller's expression must not be
+/// able to end the process. A panic shows nothing about whether the LANGUAGE admits the
+/// text — the arena's ceiling is this emulator's own — so nothing is reported for one.
+fn parsed(text: &str) -> Option<String> {
+    let answered = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+        let arena = ::bumpalo::Bump::new();
+        arena.set_allocation_limit(Some(MAX_EVALUATION_ARENA_BYTES));
+        ::jsonata_rs::JsonAta::new(text, &arena)
+            .err()
+            .map(|why| parse_sentence(&why))
+    }));
+    answered.unwrap_or(None)
+}
+
+/// The DIAGNOSTIC SENTENCE for an expression that does not parse, as the LANGUAGE words
+/// one: the message alone, with the error code and the offset it stopped at dropped.
+///
+/// The engine renders a parse failure as `<code> @ <offset>: <message>`, where the code
+/// classifies the failure and the offset is a position in the caller's own text. What a
+/// calling service states about a field of a submitted document is the sentence: it
+/// classifies the failure in its own vocabulary and locates it at its own pointer into
+/// that document, so neither the engine's code nor its offset is carried.
+///
+/// ONE class is NORMALISED, for the reason [`thrown_account`] normalises the engine's
+/// renderings of an evaluation's failures: a parse that stopped because the text ENDED
+/// before the expression was complete is a class the language has a sentence of its own
+/// for ([`ENDED_EARLY`]), while this engine words it as whichever token it was holding
+/// when the text ran out — the end token used where an operand was due, or a closing
+/// token it never reached. Both are the same thing to say to a caller: the expression
+/// ends too early.
+fn parse_sentence(why: &::jsonata_rs::Error) -> String {
+    let rendered = why.to_string().replace('`', "\"");
+    let message = match rendered.split_once(": ") {
+        Some((_classified, message)) => message,
+        None => rendered.as_str(),
+    };
+    if message.contains(END_TOKEN) || message.contains(RAN_OUT) {
+        return ENDED_EARLY.to_string();
+    }
+    message.to_string()
+}
+
+/// How the language words the parse of an expression whose text ENDED before the
+/// expression was complete.
+const ENDED_EARLY: &str = "Unexpected end of expression";
+
+/// The engine's two spellings of a parse that ran out of text: the end-of-input token it
+/// was holding, and the clause it writes where it was waiting for a closing token.
+const END_TOKEN: &str = "\"(end)\"";
+const RAN_OUT: &str = "end of expression";
+
 /// How deeply `value` nests, counted ITERATIVELY — over an explicit stack rather than
 /// by recursion — so reading a caller's document is not itself bounded by this
 /// thread's own stack.
@@ -929,6 +1029,86 @@ mod tests {
             Refused::TooLarge(_) => "TooLarge",
             Refused::Threw(_) => "Threw",
             Refused::NotEvaluated(_) => "NotEvaluated",
+        }
+    }
+
+    /// An expression that does not PARSE is reported by the engine's own diagnostic
+    /// sentence, and one that parses is reported as nothing — whether or not evaluating
+    /// it over some document would succeed.
+    ///
+    /// Rows vary along what is wrong with the text (an operator with no right-hand
+    /// side, an unclosed grouping, a text that is not the language at all) and, as the
+    /// counter-cases, along expressions that parse but read terms nothing binds.
+    #[test]
+    fn an_expression_that_does_not_parse_is_reported_by_its_own_diagnostic() {
+        // (case, the expression, the sentence it must be reported by)
+        let unparsed: [(&str, &str, &str); 4] = [
+            (
+                "an operator with no right-hand side",
+                "$states.input.value * ",
+                "Unexpected end of expression",
+            ),
+            (
+                "a grouping left open",
+                "$sum([1,2",
+                "Unexpected end of expression",
+            ),
+            (
+                "a string literal left unterminated",
+                "'abc",
+                "String literal must be terminated by a matching quote",
+            ),
+            (
+                "a name that is not the language",
+                "1 2",
+                "Syntax error \"2\"",
+            ),
+        ];
+        for (case, text, sentence) in unparsed {
+            let found = parse_failure(text);
+            assert_eq!(
+                found.as_deref(),
+                Some(sentence),
+                "case {case:?}: expected the diagnostic {sentence:?}, got {found:?}"
+            );
+        }
+
+        // (case, an expression the engine parses)
+        let parses: [(&str, &str); 4] = [
+            ("arithmetic over the context item", "$states.input.value * 2"),
+            ("a function call", "$sum([1,2,3])"),
+            ("a term nothing binds here", "$states.errorOutput.Error"),
+            // Parsing says nothing about what evaluating it comes to.
+            ("an expression that throws when evaluated", "'text' + 1"),
+        ];
+        for (case, text) in parses {
+            let found = parse_failure(text);
+            assert!(
+                found.is_none(),
+                "case {case:?}: the engine parses this, got {found:?}"
+            );
+        }
+
+        // A text one of THIS module's own ceilings stops short of the parse shows
+        // nothing about whether the language admits it, so nothing is reported for it
+        // — only [`evaluate`] refuses such a text, as its own table asserts.
+        let beyond: [(&str, String); 2] = [
+            (
+                "a text longer than this parses",
+                "1 + ".repeat(MAX_EXPRESSION_BYTES) + "1",
+            ),
+            (
+                "a text carrying more brackets than this parses",
+                format!("[{}]", "[".repeat(MAX_EXPRESSION_GROUPINGS)),
+            ),
+        ];
+        for (case, text) in beyond {
+            let found = parse_failure(&text);
+            assert!(
+                found.is_none(),
+                "case {case:?}: this module's own ceiling is no verdict on the language, got \
+                 {found:?}"
+            );
         }
     }
 

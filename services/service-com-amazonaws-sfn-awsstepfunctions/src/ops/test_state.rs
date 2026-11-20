@@ -3,11 +3,13 @@
 //! @op TestState
 //! IMPLEMENTED: runs ONE state by itself, with no state machine and no execution
 //! around it — the state's own data flow, `Choice` rules, `Wait` members and `Fail`
-//! members are evaluated through [`crate::state::asl`], and what the state produced
-//! (its `output`, the `nextState` it names, the `status` it ended in and, at
-//! `DEBUG`/`TRACE`, the document it carried after each filter) is what the call
-//! answers. Nothing is persisted: "you can test a state without creating a state
-//! machine or updating an existing state machine".
+//! members are evaluated through [`crate::state::asl`], a `Task` state's integration
+//! call is MADE as the role the request names (or answered by the request's `mock`),
+//! and what the state produced (its `output`, the `nextState` it names, the `status`
+//! it ended in and, at `DEBUG`/`TRACE`, the document it carried after each filter) is
+//! what the call answers. No state machine and no execution is persisted: "you can
+//! test a state without creating a state machine or updating an existing state
+//! machine".
 //!
 //! A request this operation cannot serve is refused with one of the operation's own
 //! modelled errors; it never answers 501.
@@ -397,20 +399,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `TestState` "accepts the definition of a single state and executes it. You
         // can test a state without creating a state machine or updating an existing
-        // state machine": the call names no resource, so it reads none of this
-        // service's state and leaves nothing behind — the answer is computed from the
-        // request alone, and two identical calls answer the same thing. `ctx` carries
-        // request metadata, and nothing here is scoped to the endpoint's region
-        // because no ARN of this service is read or minted; the engine the operation
-        // was constructed from is the store it does not touch.
-        let _ = (ctx, &self.engine);
+        // state machine": the call names no resource of THIS service, so it stores
+        // nothing of its own and no state machine or execution of it exists afterwards.
+        // What the state under test DOES is still done: a `Task` state's integration
+        // call is made, under the role the request named, so the resources that call
+        // acts on are the invoked service's own to change — which is the whole point of
+        // testing "an Amazon Web Services service integration request and response".
+        // The engine the operation was constructed from is where the role's own records
+        // are read from, and the endpoint's Region is the one those calls are made in.
 
         // `revealSecrets` "specifies whether or not to include secret information in
         // the test result. For HTTP Tasks, a secret includes the data that an
         // EventBridge connection adds to modify the HTTP request headers, query
-        // parameters, and body." No state tested here calls an HTTP Task and no
-        // EventBridge connection adds anything to one, so there is no secret for the
-        // member to include or omit from the answer either way. What the member DOES
+        // parameters, and body." Nothing of a connection's own is reported here either
+        // way. What the member DOES
         // decide is what the call asks IAM for: "if you set revealSecrets to true, you
         // must make sure that the IAM user that calls the TestState API has permission
         // for the states:RevealSecrets action ... without this permission, Step
@@ -658,13 +660,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // thread rather than on an async worker: a state whose evaluation spends the
         // work one interpretation may do (`asl::MAX_INTERPRET_WORK`) ends there instead
         // of holding a worker the runtime needs for health, timeouts and shutdown.
+        // `interpret` is what runs it there AND serves the integration call a `Task`
+        // state under test makes from this asynchronous call, exactly as it does for an
+        // execution's walk.
+        //
+        // The calls are made as the role the request named — "the TestState API assumes
+        // an IAM role which must contain the required IAM permissions for the resources
+        // your state is accessing" — which this service assumes first: a role it cannot
+        // assume fails the task rather than having its work done as nobody.
+        let region = crate::state::request_region(ctx.parts());
+        let role_arn = input.role_arn.clone().unwrap_or_default();
+        let unassumable = crate::state::task_authorization::unassumable_role(
+            ctx.callback(),
+            &region,
+            &role_arn,
+            // The state under test belongs to no state machine, so the assume presents
+            // none under the confused-deputy keys: there is no resource the credentials
+            // are being taken on for.
+            "",
+        )
+        .await;
+        let acting = crate::state::task_authorization::acting(
+            &self.engine,
+            &region,
+            &role_arn,
+            unassumable,
+            Some(ctx.credential_store()),
+        );
         let interpreted = {
             let name = name.to_string();
             let state = state.clone();
             let state_input = state_input.clone();
             let mock = mock.clone();
             let variables = variables.clone();
-            tokio::task::spawn_blocking(move || {
+            let definition_language = document.get("QueryLanguage").cloned();
+            crate::state::integration::interpret(ctx, &region, acting, move |tasks| {
                 asl::test_state(&asl::StateTest {
                     name: &name,
                     state: &state,
@@ -675,6 +705,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     mock: mock.as_ref(),
                     retries_taken,
                     variables: variables.as_ref(),
+                    definition_language: definition_language.as_ref(),
+                    tasks,
                 })
             })
             .await

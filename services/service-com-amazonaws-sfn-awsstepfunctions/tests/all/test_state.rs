@@ -25,8 +25,9 @@
 //!    (`CAUGHT_ERROR`) before it is reported as `FAILED`;
 //! 5. a request this operation cannot serve is refused with that reason's own modelled
 //!    error, never with a 501 and never with a fabricated run;
-//! 6. the call PERSISTS nothing: "you can test a state without creating a state
-//!    machine or updating an existing state machine".
+//! 6. the call creates no state machine and no execution: "you can test a state
+//!    without creating a state machine or updating an existing state machine" — what
+//!    the state under test DOES is still done, which rule 1's `Task` row covers.
 //!
 //! Each table below spans one class of those rules; the recorded `Pass`-state call
 //! this suite's issue was filed about is ONE row of the first one.
@@ -256,8 +257,12 @@ async fn test_state_answers_what_the_single_state_produced() {
             error: Some("FromInput"),
         },
         StateCase {
-            case: "a Task state's service integration is not run",
-            definition: r#"{"Type":"Task","Resource":"arn:aws:lambda:us-west-2:000000000000:function:f","End":true}"#,
+            // A `Resource` that names no work at all: the state's own integration
+            // call cannot even be formed, so nothing is run for it. A `Resource` that
+            // DOES name a call has that call made, which is what
+            // `test_state_definition_and_work` asserts.
+            case: "a Task state whose Resource names no call is not run",
+            definition: r#"{"Type":"Task","Resource":"sendMessage","End":true}"#,
             input: Some(r#"{"first_name":"Alejandro"}"#),
             status: "FAILED",
             output: None,

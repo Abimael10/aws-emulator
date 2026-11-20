@@ -43,6 +43,13 @@ pub const SCHEMA_VALIDATION_FAILED: &str = "SCHEMA_VALIDATION_FAILED";
 /// code it does not list is still a code the service reports.
 pub const UNSUPPORTED_JSONATA_EXPRESSION: &str = "UNSUPPORTED_JSONATA_EXPRESSION";
 
+/// `INVALID_JSONATA_EXPRESSION`: a field of a JSONata state carries text the language
+/// cannot PARSE at all, so no run of the definition could ever evaluate it. It is told
+/// from [`UNSUPPORTED_JSONATA_EXPRESSION`], which is an expression the language parses
+/// and this service does not accept there. The model's list of codes is not closed, so
+/// a code it does not list is still a code the service reports.
+pub const INVALID_JSONATA_EXPRESSION: &str = "INVALID_JSONATA_EXPRESSION";
+
 /// `MISSING_TRANSITION_TARGET`: "The value of \"Next\" field doesn't match a known
 /// state name" — reported for every transition target that names no declared state,
 /// `StartAt`'s included.
@@ -101,6 +108,16 @@ pub const DEFAULT_MAX_DIAGNOSTICS: usize = 100;
 /// spent: a definition's warnings can therefore never crowd out an error, which is
 /// what [`validate`] — and so what `CreateStateMachine` refuses — reads.
 pub const MAX_DIAGNOSTICS: usize = DEFAULT_MAX_DIAGNOSTICS + 1;
+
+/// How many of a definition's JSONata expressions ONE walk PARSES.
+///
+/// A definition is caller-sized and every field of a JSONata state may carry an
+/// expression, and each parse is recursive descent over a caller's text on a stack
+/// sized for it, so the work one request can ask for is fixed here rather than by the
+/// number of such fields the document declares. It is [`MAX_DIAGNOSTICS`], the most
+/// problems of one severity a walk reports at all: a walk that has spent it could
+/// report no further parse failure anyway.
+pub const MAX_PARSED_EXPRESSIONS: usize = MAX_DIAGNOSTICS;
 
 /// The most characters of a caller's own value one diagnostic echoes.
 ///
@@ -827,6 +844,11 @@ pub struct Diagnosis {
     /// ([`MAX_SCOPE_VISITS`]), spent by every state that analysis visits, in this
     /// definition and in every machine nested in it.
     scope_visits: usize,
+    /// What is LEFT of this diagnosis's expression-PARSE budget
+    /// ([`MAX_PARSED_EXPRESSIONS`]), spent by every field of a JSONata state whose
+    /// value is one whole expression, in this definition and in every machine nested
+    /// in it.
+    parses: usize,
     /// The order the DEFINITION writes its members in, which is the order the problems
     /// found in them are reported in ([`MemberOrder`]): the walk reads every object of
     /// the definition through it, so what it reports follows the submitted document
@@ -846,6 +868,7 @@ impl Default for Diagnosis {
             errors_only: false,
             first_error_only: false,
             scope_visits: MAX_SCOPE_VISITS,
+            parses: MAX_PARSED_EXPRESSIONS,
             order: MemberOrder::none(),
         }
     }
@@ -930,6 +953,25 @@ impl Diagnosis {
         match self.scope_visits.checked_sub(visits) {
             Some(left) => {
                 self.scope_visits = left;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Spend ONE expression of the parse budget, or report that it is spent.
+    ///
+    /// The budget is the ONE this diagnosis has for every machine it walks: a parse is
+    /// recursive descent over a caller's text on a stack sized for it
+    /// ([`super::super::jsonata::parse_diagnostic`]), so how many of them one request
+    /// can ask for is fixed here rather than by the number of expressions a
+    /// caller-sized definition declares. It is the per-severity diagnostic budget
+    /// ([`MAX_DIAGNOSTICS`]), so a walk can still report every parse failure it is
+    /// allowed to report.
+    pub(super) fn spend_parse(&mut self) -> bool {
+        match self.parses.checked_sub(1) {
+            Some(left) => {
+                self.parses = left;
                 true
             }
             None => false,
@@ -2330,6 +2372,19 @@ fn diagnose_jsonata_state(
             continue;
         }
         let shown = echoed(member);
+        // The expressions of this member are PARSED first: a field whose text the
+        // language cannot parse at all could never be evaluated, whatever data a run
+        // reaches it with, so it is a defect of the submitted definition rather than an
+        // outcome of running it. One diagnostic per FIELD, which is the granularity
+        // `location` documents, located at that field.
+        let unparsed = unparsed_fields(value, &nested_at(here, format_args!("/{shown}")), into);
+        for (field, why) in unparsed {
+            into.push(error(
+                INVALID_JSONATA_EXPRESSION,
+                at(here, &format!("/{shown}{field}")),
+                why,
+            ));
+        }
         for term in out_of_scope_terms(state_type, member) {
             // One diagnostic per FIELD that reads the term, which is the granularity
             // `location` documents (`/States/<StateName>/<FieldName>`): a member
@@ -2396,6 +2451,42 @@ fn diagnose_jsonata_rule(
             _ => {}
         }
     }
+}
+
+/// Every FIELD inside `value` whose text the language cannot PARSE as the expression it
+/// is written as: the path from the member that carries `value` down to that field — the
+/// empty path for a member that is itself such a field — paired with the parser's own
+/// diagnostic for it ([`super::super::jsonata::parse_diagnostic`]).
+///
+/// A field is one the language PARSES when its whole value is one expression; a value
+/// carrying anything else is the literal it is written as, so there is nothing to parse
+/// in it. The list is in the order the definition writes those fields, read off
+/// `into`'s order for the member at `member_at`, exactly as [`fields_reading`]'s is.
+///
+/// Each parse is spent from this walk's own budget ([`Diagnosis::spend_parse`]), so the
+/// parsing one request asks for is bounded however many such fields the definition
+/// declares.
+fn unparsed_fields(value: &Value, member_at: &str, into: &mut Diagnosis) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    let mut parses_left = true;
+    walk_fields(vec![(String::new(), value, false)], |path, text, _| {
+        if !parses_left {
+            return;
+        }
+        if !super::super::jsonata::is_expression(text) {
+            return;
+        }
+        if !into.spend_parse() {
+            parses_left = false;
+            return;
+        }
+        if let Some(why) = super::super::jsonata::parse_diagnostic(text) {
+            found.push((path.to_string(), why));
+        }
+    });
+    found.sort();
+    into.order().paths(member_at, &mut found);
+    found
 }
 
 /// Every FIELD inside `value` whose JSONata expression reads `term`: the path from the

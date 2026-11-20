@@ -305,7 +305,10 @@ async fn a_jsonata_state_is_evaluated_in_jsonata() {
                 "States": {
                     "Broken": {
                         "Type": "Pass",
-                        "Output": { "oops": "{% $states.input.n + %}" },
+                        // It PARSES — a definition whose expression does not is refused
+                        // at create time instead — and throws over the data it reads,
+                        // which is the query-evaluation failure this row is about.
+                        "Output": { "oops": "{% $states.input.n + 'text' %}" },
                         "End": true,
                     }
                 }

@@ -39,6 +39,24 @@ pub struct StateTest<'a> {
     /// keys are the variable names and values are the variable values": the scope the
     /// state's own expressions read, before its `Assign` writes to it.
     pub variables: Option<&'a Value>,
+    /// The `QueryLanguage` the submitted DEFINITION declares, as that definition wrote
+    /// it; `None` where it declares none.
+    ///
+    /// "The state machine's query language" is declared at the definition's top level
+    /// and INHERITED by every state it holds, which a state overrides for itself by
+    /// declaring its own — so a `stateName` naming one state of a full definition is
+    /// tested in the language that definition set, exactly as an execution of it would
+    /// run that state. A `definition` that IS the state carries the member at its own
+    /// top level, where it is the state's own.
+    pub definition_language: Option<&'a Value>,
+    /// What performs the integration call of a `Task` state under test
+    /// ([`super::super::integration::Tasks`]).
+    ///
+    /// `TestState` "can test ... an Amazon Web Services service integration request and
+    /// response", so a `Task` state with no `mock` standing in for its work has that
+    /// work DONE: the call is made through the same seam an execution's `Task` state
+    /// makes it through, as the role the request named.
+    pub tasks: &'a dyn Tasks,
 }
 
 /// Run the ONE state `test` names over its input and report what it produced.
@@ -93,6 +111,12 @@ pub fn test_state(test: &StateTest<'_>) -> Trial {
         Some(context) => context.clone(),
         None => test.context.value(&raw, test.start),
     };
+    // The language the state under test INHERITS: the one the submitted definition
+    // declares, which is what a state of it that declares none is written in.
+    let inherited = match declared_language(test.definition_language) {
+        Ok(declared) => declared.unwrap_or(JSONPATH),
+        Err(why) => return Trial::failed(inspection, runtime(why)),
+    };
     let mut interpreter = Interpreter {
         // `TestState` keeps no history of its own, so the allowance it runs under is a
         // whole execution's: what bounds the ONE state it tests is the work that state
@@ -122,10 +146,11 @@ pub fn test_state(test: &StateTest<'_>) -> Trial {
         // to an execution.
         settle: Duration::ZERO,
         base_context,
-        // `TestState` tests ONE state, with no execution around it: a state whose
-        // work is an invocation is tested through its `mock`, so nothing is called
-        // for this walk and there is nowhere for it to wait.
-        tasks: &super::super::integration::Unserved,
+        // `TestState` "can test ... an Amazon Web Services service integration request
+        // and response": the call a `Task` state under test makes is made through the
+        // same seam an execution's is, by whatever the operation handed this walk
+        // ([`StateTest::tasks`]), and a mocked state's work is the mock instead.
+        tasks: test.tasks,
         waiting: None,
         parked: None,
         // `TestState` tests one state, so there is no concurrent state around it to
@@ -159,10 +184,10 @@ pub fn test_state(test: &StateTest<'_>) -> Trial {
         // `TestState` redrives nothing: the step a redrive would continue from
         // belongs to an execution.
         failed_at: None,
-        // The state under test is written in the language it declares; there is no
-        // definition around it to inherit one from, so the other language's default
-        // stands in for the absent member.
-        language: JSONPATH,
+        // The state under test is written in the language it declares, and in the one
+        // the submitted definition declares where it declares none — which is what
+        // `QueryLanguage` at a definition's top level sets for every state it holds.
+        language: inherited,
         // "The set will include variables assigned in the state and variables set up
         // as test state input": the request's own set is what the state's expressions
         // read, and its `Assign` writes into it.
@@ -454,14 +479,121 @@ impl Interpreter<'_> {
                     self.fail_member(state, language, "Cause", "CausePath", effective, context)?;
                 Err(Failure { error, cause })
             }
+            // A `Task` state's own work is the integration call its `Resource` names,
+            // and `TestState` "can test ... an Amazon Web Services service integration
+            // request and response": the call is MADE, and the answer it comes back
+            // with is the state's result ([`Interpreter::tried_task`]).
+            "Task" => self.tried_task(state, language, after_parameters, effective, context),
             // Every remaining type's work is an invocation this process does not
-            // make: a service integration, an iteration over items, a set of
-            // branches. Without a mock to stand in for it, nothing ran — which is
-            // what the state fails with, rather than a synthesised result.
+            // make: an iteration over items, a set of branches. Without a mock to
+            // stand in for it, nothing ran — which is what the state fails with,
+            // rather than a synthesised result.
             other => Err(runtime(format!(
                 "a '{other}' state's own work is an invocation this emulator does not make, and \
                  the request names no mock to stand in for it, so nothing was run for it"
             ))),
+        }
+    }
+
+    /// The result the `Task` state under test's own work produced: its integration
+    /// call, made and answered.
+    ///
+    /// "Using this API, you can test the following: ... An Amazon Web Services service
+    /// integration request and response; An HTTP Task request and response" — so the
+    /// call is really made, through the SAME seam an execution's `Task` state makes it
+    /// through ([`super::super::integration::Tasks`]) and under the same bounds: the
+    /// state's own `TimeoutSeconds`, the role the request named (which decides whether
+    /// the call is made at all), and this trial's own work allowance.
+    ///
+    /// Three kinds of work are NOT done here, because each is answered from outside
+    /// the call that asked and `TestState` "only supports the following when a mock is
+    /// specified: Activity tasks, .sync or .waitForTaskToken service integration
+    /// patterns": an activity's work belongs to a worker that polls for it, a
+    /// run-a-job (`.sync`) task's outcome is the job's own end, and a callback
+    /// (`.waitForTaskToken`) task's is whoever holds the token. Without a mock standing
+    /// in for one of those outcomes, nothing ran — which is what such a state fails
+    /// with, rather than a synthesised result.
+    fn tried_task(
+        &mut self,
+        state: &Map<String, Value>,
+        language: &'static str,
+        request: &Value,
+        effective: &Value,
+        context: &Value,
+    ) -> Result<Option<Value>, Failure> {
+        let resource = task_resource(state);
+        if super::super::names_an_activity(resource) {
+            return Err(runtime(
+                "a 'Task' state whose work is an activity's is done by a worker polling for it, \
+                 which is an answer this call cannot wait for, and the request names no mock to \
+                 stand in for it, so nothing was run for it"
+                    .to_string(),
+            ));
+        }
+        let call = super::super::integration::read(resource)
+            .map_err(|why| runtime(format!("{SINGLE_STATE_LABEL}: {why}")))?;
+        if call.job.is_some() || call.callback {
+            return Err(runtime(format!(
+                "{} is answered from outside the call that started it \u{2014} by the job it \
+                 starts, or by whoever its task token went to \u{2014} which is an answer this \
+                 call cannot wait for, and the request names no mock to stand in for it, so \
+                 nothing was run for it",
+                call.described()
+            )));
+        }
+        // "TimeoutSeconds […] If the task runs longer than the specified seconds, this
+        // state fails with a States.Timeout error name": the member bounds the WAIT for
+        // the answer, read through the same reader the walk reads it with.
+        let within = self
+            .task_seconds(state, language, "TimeoutSeconds", effective, context)?
+            .map(Duration::from_secs);
+        // The call is made AS the role the request named, so what that role may do
+        // decides whether it is made AT ALL — reported before the request goes
+        // anywhere, exactly as it is for an execution's `Task` state.
+        if let Some(refused) = self.tasks.authorize(&call, request) {
+            return Err(super::reported(refused));
+        }
+        // And the trial's own work allowance: a run that has asked for more work than
+        // one interpretation may do makes no call.
+        if let Some(failure) = self.out_of_work() {
+            return Err(failure);
+        }
+        // What Step Functions adds to a PUBLICATION's entries is the attribution of
+        // the publication to the run that made it; this trial runs no execution, so
+        // the attribution it carries is the empty one this walk holds, and every other
+        // call is made with the document the state built, unchanged.
+        let attributed = super::super::integration::publication_request(
+            &call,
+            request,
+            &self.execution_arn,
+            self.state_machine_arn(),
+        );
+        let called = attributed.as_ref().unwrap_or(request);
+        let Some((answered, _began)) =
+            self.perform_call(&call, called, self.call_within(within), None)
+        else {
+            // Unreachable: only a turn that has SAMPLED nothing and may be walked again
+            // leaves a call in flight, and this trial walks one state once.
+            return Err(unwound());
+        };
+        // A publication the service SERVED but which rejected an entry did not do this
+        // task's work, so it is read as the failure it is before the answer becomes a
+        // result.
+        let answered = answered.and_then(|answer| {
+            match super::super::integration::rejected_entries(&call, &answer) {
+                Some(failed) => Err(failed),
+                None => Ok(answer),
+            }
+        });
+        match answered {
+            Ok(answer) => {
+                let result = super::super::integration::reported_result(&call, &answer);
+                // The result is a document the state carries, so it is measured
+                // against the ceiling every state's document is measured against.
+                measure_payload(&result, SINGLE_STATE_LABEL)?;
+                Ok(Some(result))
+            }
+            Err(failed) => Err(super::reported(failed)),
         }
     }
 

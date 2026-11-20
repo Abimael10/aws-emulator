@@ -251,6 +251,23 @@ fn inner(text: &str) -> &str {
     trimmed[OPEN.len()..trimmed.len() - CLOSE.len()].trim()
 }
 
+/// Why the definition field value `text` is not an expression of the language, or
+/// `None` when it parses — or is not one whole expression at all, which makes it the
+/// literal the field is written as rather than an expression to parse.
+///
+/// This is the half of the language a definition is VALIDATED against ([`super::asl`]):
+/// an expression that does not parse could never be evaluated, whatever data a run of
+/// the definition reaches that field with, so it is a defect in the submitted document
+/// rather than an outcome of running it. Only the parse happens here — nothing is
+/// bound and nothing is evaluated — and it is held to the seam's own ceilings
+/// ([`engine::parse_failure`]).
+pub fn parse_diagnostic(text: &str) -> Option<String> {
+    if !is_expression(text) {
+        return None;
+    }
+    engine::parse_failure(inner(text))
+}
+
 /// Evaluate the expression `text` carries, and report the value it produced.
 ///
 /// `Ok(None)` is an expression that resolved to NOTHING, which the language's own
