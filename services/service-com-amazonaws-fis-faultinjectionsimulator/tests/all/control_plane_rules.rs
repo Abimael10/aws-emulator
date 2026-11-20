@@ -985,6 +985,9 @@ fn an_experiment_runs_for_its_actions_durations_and_then_ends_at_the_status_they
             // resources, so the snapshot a tag-identified target would be resolved against
             // is the empty one.
             &TargetableResources::none(),
+            // The account's safety lever is holding nothing back, so this run is not
+            // cancelled before it begins.
+            None,
         );
         let expected_terminal = "completed";
         for (offset, expected) in [
@@ -1042,6 +1045,8 @@ fn an_experiment_runs_for_its_actions_durations_and_then_ends_at_the_status_they
             started,
             Some(failure.clone()),
             &TargetableResources::none(),
+            // See above: nothing is holding this run back either.
+            None,
         );
         denied.settle(
             started + TRANSITION_DELAY + TRANSITION_DELAY,

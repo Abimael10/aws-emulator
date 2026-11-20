@@ -17,8 +17,9 @@
 //! * engaging the lever TAKES EFFECT rather than landing at once — the lever reports the
 //!   modelled `engaging`, which no `SafetyLeverStatusInput` can ask for, until the clock
 //!   says it has — while disengaging it lands immediately;
-//! * engaging it stops the experiments that are running and keeps new ones from starting,
-//!   and disengaging it lets them start again;
+//! * engaging it stops the experiments that are running, while a start made after it is
+//!   engaged is ACCEPTED and the run it creates is cancelled instead of refused, and
+//!   disengaging it lets a run go ahead again;
 //! * an `id` that names no lever of this account answers `ResourceNotFoundException`
 //!   (HTTP 404), and a `status` outside the input enum `ValidationException` (HTTP 400) —
 //!   neither persisting anything;
@@ -743,18 +744,58 @@ async fn get_experiment(router: &MultiServiceRouter, id: &str) -> Value {
         .clone()
 }
 
+/// How long a case gives a condition it polls for: generous, because every wait here ends
+/// as soon as the condition holds ([`poll_lever_until`], [`poll_experiment_until`]).
+const POLL_BUDGET: Duration = Duration::from_secs(60);
+
+/// How often a poll looks again.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Poll `GetSafetyLever` until the lever reports `status`, or [`POLL_BUDGET`] runs out, and
+/// report it as last read.
+async fn poll_lever_until(router: &MultiServiceRouter, status: &str) -> Value {
+    let deadline = std::time::Instant::now() + POLL_BUDGET;
+    loop {
+        let answer = get_lever(router, LEVER_ID, REGION).await;
+        let reported = answer.member("safetyLever").clone();
+        if status_of(&reported) == status || std::time::Instant::now() >= deadline {
+            return reported;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Poll `GetExperiment` until the experiment reports `status`, or [`POLL_BUDGET`] runs out,
+/// and report it as last read.
+async fn poll_experiment_until(router: &MultiServiceRouter, id: &str, status: &str) -> Value {
+    let deadline = std::time::Instant::now() + POLL_BUDGET;
+    loop {
+        let experiment = get_experiment(router, id).await;
+        let reported = experiment["state"]["status"].as_str().unwrap_or_default();
+        if reported == status || std::time::Instant::now() >= deadline {
+            return experiment;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 #[tokio::test]
-async fn engaging_the_lever_stops_running_experiments_and_keeps_new_ones_from_starting() {
+async fn engaging_the_lever_stops_running_experiments_and_cancels_the_ones_started_under_it() {
     // The rows differ along the status the experiment is in when the lever is engaged: one
     // engaged while the experiment is still initiating, one after it started running.
-    for (case, wait_first) in [
+    for (case, run_first) in [
         ("engaged-while-initiating", false),
         ("engaged-while-running", true),
     ] {
         let router = emulator();
         let (template_id, experiment_id) = running_experiment(case, &router, case).await;
-        if wait_first {
-            tokio::time::sleep(PAST_TRANSITION).await;
+        if run_first {
+            let running = poll_experiment_until(&router, &experiment_id, "running").await;
+            assert_eq!(
+                running["state"]["status"].as_str().unwrap_or_default(),
+                "running",
+                "case {case:?}: expected the experiment to reach running, got {running:?}"
+            );
         }
 
         let engaged = update_lever(
@@ -786,36 +827,39 @@ async fn engaging_the_lever_stops_running_experiments_and_keeps_new_ones_from_st
             "case {case:?}: an experiment the lever stopped carries a reason, got {stopping:?}"
         );
 
-        // And no new experiment starts while the lever holds — already now, before the
-        // engage has taken full effect.
-        let refused =
-            start_experiment(&router, &format!("{case}-refused"), &template_id).await;
+        // And a start made while the lever holds is ACCEPTED — the lever is enforced on the
+        // run, which is cancelled rather than refused. What that cancellation reports is
+        // asserted in [`crate::safety_lever_cancels_the_run_it_held`].
+        let accepted =
+            start_experiment(&router, &format!("{case}-while-held"), &template_id).await;
         assert_eq!(
-            refused.status, 409,
-            "case {case:?}: expected HTTP 409 from a start while the lever holds, got {} with {:?}",
-            refused.status, refused.body
+            accepted.status, 200,
+            "case {case:?}: expected HTTP 200 from a start while the lever holds, got {} with {:?}",
+            accepted.status, accepted.body
         );
+        let held_run = accepted.member("experiment")["id"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: the accepted start reports an experiment id, got {:?}",
+                    accepted.body
+                )
+            })
+            .to_string();
+        let cancelled = poll_experiment_until(&router, &held_run, "cancelled").await;
         assert_eq!(
-            refused.error_code(),
-            "ConflictException",
-            "case {case:?}: expected ConflictException, got {:?}",
-            refused.body
+            cancelled["state"]["status"].as_str().unwrap_or_default(),
+            "cancelled",
+            "case {case:?}: the run started under the held lever is cancelled, got {cancelled:?}"
         );
 
-        tokio::time::sleep(PAST_TRANSITION).await;
-
-        let settled = lever(
-            case,
-            &get_lever(&router, LEVER_ID, REGION).await,
-            "safetyLever",
-            REGION,
-        );
+        let settled = poll_lever_until(&router, "engaged").await;
         assert_eq!(
             status_of(&settled),
             "engaged",
             "case {case:?}: the engage has taken effect, got {settled:?}"
         );
-        let stopped = get_experiment(&router, &experiment_id).await;
+        let stopped = poll_experiment_until(&router, &experiment_id, "stopped").await;
         assert_eq!(
             stopped["state"]["status"].as_str().unwrap_or_default(),
             "stopped",

@@ -49,6 +49,12 @@
 //! replays the experiment it already started or, when the request differs from the one it
 //! belongs to, answers `ConflictException` (HTTP 409).
 //!
+//! The account's SAFETY LEVER refuses nothing: a start made while it is engaged is
+//! ACCEPTED, and the run it creates is cancelled before it begins — the experiment settles
+//! to `cancelled` under the reason that names it and the lever, with every action of its
+//! plan cancelled having carried nothing out (see
+//! [`crate::state::cancelled_by_safety_lever_reason`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -273,18 +279,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartExperiment<E
             crate::state::TokenReplay::Fresh => {}
         }
 
-        // The account's safety lever keeps experiments from starting for as long as it is
-        // engaged, which is what FIS documents engaging it as doing — so a start is
-        // refused while it holds, and nothing is minted for it. Asked AFTER the
-        // idempotency replay above: a retry of a start this service already accepted
-        // reports that experiment rather than being refused for a lever engaged since.
-        let lever_status = store.settled_safety_lever(now).status;
-        if lever_status.holds_experiments() {
-            return Err(StartExperimentErrorModeled::ConflictException(
-                crate::state::safety_lever_engaged_refusal(lever_status),
-            )
-            .into());
-        }
+        // The account's safety lever does NOT refuse the start: FIS accepts it and CANCELS
+        // the run it creates, so the client is given an experiment id and an auditable
+        // `cancelled` experiment in place of an error. Asked AFTER the idempotency replay
+        // above: a retry of a start this service already accepted reports that experiment
+        // rather than being judged again against a lever engaged since.
+        let lever_cancels_the_run = store.settled_safety_lever(now).status.cancels_experiments();
 
         // The experiment is built from the PERSISTED template, so it carries what that
         // template holds and not what any request said.
@@ -368,6 +368,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartExperiment<E
         let id = store.mint_experiment_id();
         let arn = crate::state::experiment_arn(region, &id);
 
+        // What the engaged safety lever does to this run, now that the experiment has a
+        // name: it is cancelled before it begins, under the reason that names the
+        // experiment and the lever ([`crate::state::cancelled_by_safety_lever_reason`]).
+        let cancellation = lever_cancels_the_run
+            .then(|| crate::state::cancelled_by_safety_lever_reason(&id, region));
+
         // Whether those documents SHOW a role cannot perform an action's own API calls.
         // Decided after the quotas above, so a start this service refuses outright pays
         // nothing for it, and from the documents already read rather than from the store.
@@ -404,6 +410,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartExperiment<E
             now,
             permission_failure,
             resources,
+            cancellation,
         );
         let experiment = record.to_experiment();
         store.experiments.insert(id.clone(), record);

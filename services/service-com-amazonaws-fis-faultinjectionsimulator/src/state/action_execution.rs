@@ -130,7 +130,8 @@ pub enum ActionRunStatus {
     Completed,
     /// The action was under way when the experiment was stopped.
     Stopped,
-    /// The experiment was stopped before the action started.
+    /// The action never started: the experiment was stopped, or cancelled before its run
+    /// began, before the run reached it.
     Cancelled,
 }
 
@@ -205,8 +206,8 @@ impl ActionRun {
                     ActionRunStatus::Completed => ACTION_WAS_COMPLETED,
                     ActionRunStatus::Stopped => ACTION_WAS_STOPPED,
                     ActionRunStatus::Cancelled => {
-                        "The action was cancelled because the experiment was stopped before it \
-                         started"
+                        "The action was cancelled because the experiment's run ended before \
+                         it started"
                     }
                 }
                 .to_string(),
@@ -409,14 +410,29 @@ impl ExperimentRecord {
     /// Called by [`ExperimentRecord::settle`] with the experiment's own status already
     /// settled, so what it reads is where the run stands: a run that completed has carried
     /// every one of its actions out, one a stop ended early carried out only what it had
-    /// reached, and a run still going is somewhere between its actions' offsets.
+    /// reached, a run cancelled before it began carried none of them out, and a run still
+    /// going is somewhere between its actions' offsets.
     pub(super) fn settle_actions(&mut self, now: SystemTime) {
+        let cancelled = self.status == ExperimentStatus::Cancelled;
         let stopped = matches!(
             self.status,
             ExperimentStatus::Stopping | ExperimentStatus::Stopped | ExperimentStatus::Failed
         );
         let completed = self.status == ExperimentStatus::Completed;
         for run in self.action_runs.values_mut() {
+            if cancelled {
+                // The run was cancelled before it got going, so no action of it ever
+                // started: every one of them is cancelled, and the effect each would have
+                // had is dropped rather than left for a later drain to perform.
+                if matches!(
+                    run.status,
+                    ActionRunStatus::Pending | ActionRunStatus::Running
+                ) {
+                    run.status = ActionRunStatus::Cancelled;
+                    run.effect_carried_out = true;
+                }
+                continue;
+            }
             if stopped {
                 // The stop reached the action before the clock did: an action under way was
                 // stopped with the experiment, and one that had not started never will.

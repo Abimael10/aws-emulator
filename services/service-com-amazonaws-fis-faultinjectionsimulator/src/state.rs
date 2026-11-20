@@ -119,9 +119,10 @@
 //! ([`action_arn`]). Engaging it is what FIS documents as stopping the experiments that are
 //! running and keeping new ones from starting, so an engage stops them
 //! ([`ComAmazonawsFisFaultinjectionsimulatorState::stop_experiments_for_safety_lever`])
-//! and `StartExperiment` is refused for as long as the lever holds. The lever also owes
-//! the clock a transition of its own, `engaging` -> `engaged`, materialised the same way
-//! an experiment's is.
+//! and, for as long as the lever holds, a `StartExperiment` is ACCEPTED while the run it
+//! creates is cancelled before it begins ([`cancelled_by_safety_lever_reason`]). The lever
+//! also owes the clock a transition of its own, `engaging` -> `engaged`, materialised the
+//! same way an experiment's is.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{Duration, SystemTime};
@@ -681,13 +682,13 @@ pub const INITIAL_SAFETY_LEVER_REASON: &str = "Initial default status";
 ///
 /// `ExperimentStatus` is modelled
 /// `pending | initiating | running | completed | stopping | stopped | failed | cancelled`.
-/// Six of the eight are reachable here: an experiment is minted `initiating`, becomes
+/// Seven of the eight are reachable here: an experiment is minted `initiating`, becomes
 /// `running` when the clock says so, and then either `completed` (its actions ran to the
 /// end of the run) or `failed` (an action could not be run under the experiment's
-/// execution role); a `StopExperiment` moves it `stopping` -> `stopped` instead. `pending`
-/// is the status FIS reports before it has accepted the run, and `cancelled` reports a run
-/// cancelled by something other than a stop request, neither of which this emulator
-/// produces.
+/// execution role); a `StopExperiment` moves it `stopping` -> `stopped` instead, and a run
+/// the account's safety lever cancelled before it began ends `cancelled` without ever
+/// running ([`ExperimentOutcome::Cancelled`]). `pending` is the status FIS reports before
+/// it has accepted the run, which this emulator does not produce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExperimentStatus {
     /// The experiment has been accepted and is starting up.
@@ -702,6 +703,9 @@ pub enum ExperimentStatus {
     Completed,
     /// The experiment's actions could not be carried out. Terminal.
     Failed,
+    /// The experiment was cancelled before its run began, so none of its actions ran.
+    /// Terminal.
+    Cancelled,
 }
 
 impl ExperimentStatus {
@@ -714,12 +718,16 @@ impl ExperimentStatus {
             Self::Stopped => "stopped",
             Self::Completed => "completed",
             Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
         }
     }
 
     /// True when no further transition can leave this status.
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Stopped | Self::Completed | Self::Failed)
+        matches!(
+            self,
+            Self::Stopped | Self::Completed | Self::Failed | Self::Cancelled
+        )
     }
 
     /// True while the experiment still occupies one of the account's active-experiment
@@ -731,7 +739,7 @@ impl ExperimentStatus {
 }
 
 /// What the end of an experiment's run is: the terminal status its actions earn once the
-/// run span elapses.
+/// run span elapses, or the cancellation that ends it before the run begins.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExperimentOutcome {
     /// Every action of the experiment ran to the end of the run, so it ends `completed`.
@@ -739,6 +747,12 @@ pub enum ExperimentOutcome {
     /// An action could not be run at all, so the run ends in the modelled `failed` state
     /// carrying this failure.
     Failed(ExperimentFailure),
+    /// The run was CANCELLED before it began, which is what the account's safety lever does
+    /// to an experiment started while it is engaged: the experiment never becomes
+    /// `running`, it ends `cancelled` under this `state.reason` and every action of its plan
+    /// is cancelled having carried nothing out (see
+    /// [`cancelled_by_safety_lever_reason`]).
+    Cancelled(String),
 }
 
 /// Why an experiment's run ended `failed`: the `ExperimentState$reason` it reports and the
@@ -1647,6 +1661,13 @@ impl ExperimentRecord {
     /// `resources` is the snapshot of the other services' stores this run's tag-identified
     /// targets resolve against ([`TargetableResources::read`]), read by the caller for the
     /// same reason the IAM store is: those stores are reachable there.
+    ///
+    /// `cancellation` is the `state.reason` of a run that is cancelled before it begins —
+    /// `Some` exactly when the account's safety lever was holding experiments back as the
+    /// start was accepted ([`cancelled_by_safety_lever_reason`]). Such a run never becomes
+    /// `running`: the clock takes it straight to `cancelled` and nothing of it is carried
+    /// out, so what its actions would have taken and what the role could not have done
+    /// decide nothing about it.
     #[allow(clippy::too_many_arguments)]
     pub fn from_template(
         id: String,
@@ -1657,6 +1678,7 @@ impl ExperimentRecord {
         now: SystemTime,
         failure: Option<ExperimentFailure>,
         resources: &TargetableResources,
+        cancellation: Option<String>,
     ) -> Self {
         let targets = experiment_targets(&template.targets);
         // Resolution happens ONCE, here, where the experiment is started.
@@ -1675,23 +1697,36 @@ impl ExperimentRecord {
         );
         // An empty resolution is decided BEFORE any action runs, so it is the failure such
         // a run ends in; `failure` is what the start showed about the actions it carries
-        // out, and under `skip-all` there are none for it to be about.
-        let (run_span, outcome) = run_plan(
-            &plan.carried_out,
-            plan.empty_target_failure.clone().or(failure),
-        );
+        // out, and under `skip-all` there are none for it to be about. A run cancelled
+        // before it begins ends in that cancellation whatever either of them says: it is
+        // one transition span long and nothing of it is carried out.
+        let (run_span, outcome) = match cancellation {
+            Some(reason) => (TRANSITION_DELAY, ExperimentOutcome::Cancelled(reason)),
+            None => run_plan(
+                &plan.carried_out,
+                plan.empty_target_failure.clone().or(failure),
+            ),
+        };
         // The actions the run carries out, laid out across the window the experiment is
         // `running` for. A run that does not get going at all — one the start already showed
         // a failure for — carries nothing out, so it is given no action runs and claims no
         // action progress.
+        //
+        // A CANCELLED run is laid out like one that gets going, so every action of its plan
+        // reports its own state: the cancellation falls due at the instant the run would
+        // have reached its first action, and the settle that materialises it cancels every
+        // action and drops the effect each one would have had
+        // ([`action_execution::settle_actions`]), so nothing is ever carried out for it.
         let action_runs = match &outcome {
-            ExperimentOutcome::Completed => action_execution::plan_action_runs(
-                &plan.carried_out,
-                &targets,
-                &resolved_targets,
-                now + TRANSITION_DELAY,
-                run_span,
-            ),
+            ExperimentOutcome::Completed | ExperimentOutcome::Cancelled(_) => {
+                action_execution::plan_action_runs(
+                    &plan.carried_out,
+                    &targets,
+                    &resolved_targets,
+                    now + TRANSITION_DELAY,
+                    run_span,
+                )
+            }
             ExperimentOutcome::Failed(_) => BTreeMap::new(),
         };
         let mut record = Self {
@@ -1956,6 +1991,12 @@ impl ExperimentRecord {
                 return;
             }
             match self.status {
+                // A run that was CANCELLED before it began never gets going: the
+                // cancellation is the end the clock owes it in place of the move to
+                // `running`, so this one span takes it straight to `cancelled`.
+                ExperimentStatus::Initiating if self.cancelled_before_running() => {
+                    self.end_run(due);
+                }
                 ExperimentStatus::Initiating => {
                     self.status = ExperimentStatus::Running;
                     self.reason = RUNNING_REASON.to_string();
@@ -1973,23 +2014,7 @@ impl ExperimentRecord {
                     self.transition_due = Some(due.checked_add(self.run_span).unwrap_or(due));
                     self.log_state_change(due);
                 }
-                ExperimentStatus::Running => {
-                    match &self.outcome {
-                        ExperimentOutcome::Completed => {
-                            self.status = ExperimentStatus::Completed;
-                            self.reason = COMPLETED_REASON.to_string();
-                        }
-                        ExperimentOutcome::Failed(failure) => {
-                            self.status = ExperimentStatus::Failed;
-                            self.reason = failure.reason.clone();
-                        }
-                    }
-                    // The experiment ended when the transition fell due, not when somebody
-                    // happened to look.
-                    self.end_time = Some(due);
-                    self.transition_due = None;
-                    self.log_state_change(due);
-                }
+                ExperimentStatus::Running => self.end_run(due),
                 ExperimentStatus::Stopping => {
                     self.status = ExperimentStatus::Stopped;
                     self.end_time = Some(due);
@@ -1998,12 +2023,49 @@ impl ExperimentRecord {
                 }
                 ExperimentStatus::Stopped
                 | ExperimentStatus::Completed
-                | ExperimentStatus::Failed => self.transition_due = None,
+                | ExperimentStatus::Failed
+                | ExperimentStatus::Cancelled => self.transition_due = None,
             }
         }
         // The status above is where the run now stands, so the actions are reconciled with
         // it: a run that has ended carried out what it reached and nothing after it.
         self.settle_actions(now);
+    }
+
+    /// Whether this run was CANCELLED before it began, so it never becomes `running` and
+    /// carries nothing out — see [`ExperimentOutcome::Cancelled`].
+    pub fn cancelled_before_running(&self) -> bool {
+        matches!(self.outcome, ExperimentOutcome::Cancelled(_))
+    }
+
+    /// The END of this run, as of the instant `due` it fell due at: the terminal status the
+    /// run's [`outcome`](Self::outcome) earns, the `state.reason` that goes with it, and the
+    /// `endTime` of the run.
+    ///
+    /// The ONE place a run ends, whichever status it ended FROM: a run whose span elapsed
+    /// and one the account's safety lever cancelled before it ever got going reach their
+    /// terminal status here, so what a reader is told about the end of a run cannot depend
+    /// on which transition materialised it.
+    fn end_run(&mut self, due: SystemTime) {
+        match &self.outcome {
+            ExperimentOutcome::Completed => {
+                self.status = ExperimentStatus::Completed;
+                self.reason = COMPLETED_REASON.to_string();
+            }
+            ExperimentOutcome::Failed(failure) => {
+                self.status = ExperimentStatus::Failed;
+                self.reason = failure.reason.clone();
+            }
+            ExperimentOutcome::Cancelled(reason) => {
+                self.status = ExperimentStatus::Cancelled;
+                self.reason = reason.clone();
+            }
+        }
+        // The experiment ended when the transition fell due, not when somebody happened to
+        // look.
+        self.end_time = Some(due);
+        self.transition_due = None;
+        self.log_state_change(due);
     }
 
     /// Start the move to `stopped`, due [`TRANSITION_DELAY`] from `now`.
@@ -2196,9 +2258,10 @@ impl SafetyLeverStatusKind {
         }
     }
 
-    /// True while the lever holds experiments back — engaged, and already from the moment
-    /// the engage is accepted.
-    pub fn holds_experiments(self) -> bool {
+    /// True while the lever is holding experiments back — engaged, and already from the
+    /// moment the engage is accepted. A run started while it holds is CANCELLED rather than
+    /// refused, see [`cancelled_by_safety_lever_reason`].
+    pub fn cancels_experiments(self) -> bool {
         !matches!(self, Self::Disengaged)
     }
 }
@@ -2333,21 +2396,20 @@ pub fn safety_lever_status_refusal(status: &str) -> Option<ValidationException> 
     Some(invalid_input(invalid_safety_lever_status_message(status)))
 }
 
-/// The `ConflictException` payload for a `StartExperiment` that arrives while the
-/// account's safety lever is engaged — "the request could not be processed because of a
-/// conflict".
+/// The `state.reason` of an experiment the account's safety lever CANCELLED: the experiment
+/// it names and the ARN of the lever that cancelled it.
 ///
 /// Engaging the lever is documented as stopping the experiments that are running and
-/// preventing new ones from starting, so a start is refused for as long as it holds
-/// ([`SafetyLeverStatusKind::holds_experiments`]). The refusal names the status the lever
-/// is in, so a caller can tell an engage that is still taking effect from a settled one.
-pub fn safety_lever_engaged_refusal(status: SafetyLeverStatusKind) -> ConflictException {
-    ConflictException {
-        message: Some(format!(
-            "The safety lever is {} in this account. No experiment can be started.",
-            status.as_wire()
-        )),
-    }
+/// keeping new ones from starting, and what FIS does to a start that arrives while it holds
+/// is to accept it and cancel the run it created — the client gets an experiment id and an
+/// auditable `cancelled` experiment rather than a refusal. The sentence states that cause
+/// with the two values that identify it: the experiment, and the lever
+/// ([`safety_lever_arn`], which names this account and the Region the start was made in).
+pub fn cancelled_by_safety_lever_reason(experiment_id: &str, region: &str) -> String {
+    clipped_reason(format!(
+        "Experiment {experiment_id} has been cancelled by the safety lever '{}'.",
+        safety_lever_arn(region, SAFETY_LEVER_ID)
+    ))
 }
 
 /// Which resource an idempotency token created, so a token a client reuses across two
@@ -2733,6 +2795,12 @@ impl ComAmazonawsFisFaultinjectionsimulatorState {
             // whatever its stop conditions say, so the stop this sweep requests is the one
             // the record ends under.
             record.settle_clock(now);
+            // A run the lever already cancelled before it began is on its way to
+            // `cancelled` under the lever's own reason, so the sweep leaves it that end
+            // rather than re-ending it as a stop.
+            if record.cancelled_before_running() {
+                continue;
+            }
             record.request_stop_for(now, STOPPED_BY_SAFETY_LEVER);
         }
     }
