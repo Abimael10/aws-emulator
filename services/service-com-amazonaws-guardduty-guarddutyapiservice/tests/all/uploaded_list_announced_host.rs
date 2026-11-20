@@ -37,8 +37,8 @@ const BUCKET: &str = "gd-uploaded-lists";
 /// just a last segment has to survive the read-back.
 const KEY: &str = "lists/2026/trusted.txt";
 
-/// One uploaded-list family: the route segment its sub-resource hangs off, the `Format`
-/// value a create needs and the `jsonName` of the id the create reports. The `Format`
+/// One uploaded-list family: the route segment its sub-resource hangs off, the `jsonName`
+/// of the id the create reports and the `Format` value a create needs. The `Format`
 /// values are members of `IpSetFormat`, `ThreatIntelSetFormat`, `ThreatEntitySetFormat`
 /// and `TrustedEntitySetFormat`
 /// (`smithy_query(shape="IpSetFormat,ThreatIntelSetFormat,ThreatEntitySetFormat,TrustedEntitySetFormat")`).

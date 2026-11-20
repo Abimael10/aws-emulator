@@ -392,6 +392,48 @@ async fn an_identifier_scoped_instance_report_refuses_an_instance_nothing_create
 /// is refused by, and the value that refusal names.
 const NEPTUNE_SERVERLESS_CEILING: f64 = 128.0;
 
+/// The floor of that same configurable range, the other bound a refusal of a capacity
+/// outside it states.
+const NEPTUNE_SERVERLESS_FLOOR: f64 = 0.0;
+
+/// The increment every capacity value is specified in: "You can specify ACU values in
+/// half-step increments, such as 8, 8.5, 9, and so on"
+/// (`smithy_query(query="shape",shape="ServerlessV2ScalingConfiguration")`, member
+/// `MinCapacity`), which the Neptune model states in the same words for its own capacity
+/// units.
+const NEPTUNE_SERVERLESS_STEP: f64 = 0.5;
+
+/// The whole sentence the Neptune control plane refuses the capacity pair `(min, max)` with,
+/// spelled out HERE rather than taken from the code under test, for a pair whose floor is no
+/// higher than its ceiling.
+///
+/// A capacity outside the range a Neptune Serverless cluster is configured in is refused
+/// naming that value and that range — this engine's wording, as distinct from the Aurora
+/// one, which names the ACU ceiling, the engine version imposing it and the Aurora
+/// Serverless v2 requirements page. A capacity off the half-step grid states the value and
+/// the increment. The members are read in the order the request carries them, the floor
+/// before the ceiling, so a pair breaking two clauses is refused by the first.
+fn neptune_capacity_refusal(min: &str, max: &str) -> String {
+    for value in [min, max] {
+        let value = value.parse::<f64>().unwrap_or_default();
+        if value > NEPTUNE_SERVERLESS_CEILING || value < NEPTUNE_SERVERLESS_FLOOR {
+            return format!(
+                "Serverless v2 capacity value {value:?} is not valid. The valid scaling \
+                 range for this cluster is {NEPTUNE_SERVERLESS_FLOOR:?} to \
+                 {NEPTUNE_SERVERLESS_CEILING:?}. To change the cluster's scaling range, use \
+                 the ModifyDBCluster call."
+            );
+        }
+        if (value / NEPTUNE_SERVERLESS_STEP).fract() != 0.0 {
+            return format!(
+                "Serverless v2 capacity value {value:?} is not valid. It must be a multiple \
+                 of {NEPTUNE_SERVERLESS_STEP:?}."
+            );
+        }
+    }
+    panic!("the pair ({min}, {max}) is inside every clause, so nothing refuses it")
+}
+
 /// The scaling configurations a cluster create is spanned over: `(case, min, max)`, with
 /// whether the configuration is one the Neptune engine serves.
 ///
@@ -408,6 +450,12 @@ const SCALING_ROWS: &[(&str, &str, &str, bool)] = &[
     ("a half capacity unit floor", "0.5", "8.0", true),
     ("one capacity unit, floor and ceiling alike", "1.0", "1.0", true),
     ("a ceiling past the published maximum", "1.0", "128.5", false),
+    (
+        "a ceiling at the Aurora maximum, past this engine's",
+        "1.0",
+        "256.0",
+        false,
+    ),
     ("a capacity off the half-step grid", "1.2", "8.0", false),
     ("a floor above the ceiling", "8.0", "4.0", false),
     ("a floor above the ceiling, at the bounds", "128.0", "0.5", false),
@@ -491,24 +539,15 @@ async fn a_neptune_serverless_cluster_is_created_inside_the_published_capacity_r
                      {SERVERLESS_V2_FLOOR_ABOVE_CEILING_MESSAGE:?}, got {message:?} in {body}"
                 );
             } else {
-                // A capacity ABOVE the ceiling is refused by the engine VERSION that
-                // imposes it, naming that ceiling; one off the half-step grid states the
-                // value and the increment.
-                let above_ceiling = [min, max].iter().any(|value| {
-                    value.parse::<f64>().unwrap_or_default() > NEPTUNE_SERVERLESS_CEILING
-                });
-                let expected = if above_ceiling {
-                    format!(
-                        "Invalid scaling configuration. The capacity values greater than \
-                         {NEPTUNE_SERVERLESS_CEILING:?} ACUs are not supported by the \
-                         current engine version"
-                    )
-                } else {
-                    "Serverless v2 capacity value".to_string()
-                };
-                assert!(
-                    message.contains(&expected),
-                    "case {case:?}: expected a refusal saying {expected:?}, got {message:?}"
+                // Every other refusal of a Neptune Serverless capacity is worded by the
+                // clause the value broke: a value outside the range the CLUSTER is
+                // configured in states that value, the range and the call that changes it,
+                // and one off the half-step grid states the value and the increment.
+                let expected = neptune_capacity_refusal(min, max);
+                assert_eq!(
+                    message, expected,
+                    "case {case:?}: expected the refusal {expected:?}, got {message:?} in \
+                     {body}"
                 );
             }
             continue;

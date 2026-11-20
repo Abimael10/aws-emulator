@@ -424,9 +424,10 @@ pub const SERVERLESS_V2_FLOOR_ABOVE_CEILING_MESSAGE: &str =
 /// floor and a ceiling outside the range are refused with the same sentence shape. The two
 /// capacities are written as the doubles the member takes (`256.0`, not `256`).
 ///
-/// This is the refusal for a capacity BELOW what the cluster scales down to; one ABOVE the
-/// ceiling its engine version reaches is worded by that version
-/// ([`serverless_v2_capacity_above_engine_ceiling_message`]).
+/// This is the refusal every cluster engine but Aurora answers a capacity outside its
+/// scaling range with, and the one an Aurora cluster answers a capacity BELOW what it scales
+/// down to with; an Aurora capacity ABOVE the ceiling its engine version reaches is worded by
+/// that version ([`serverless_v2_capacity_above_engine_ceiling_message`]).
 pub fn serverless_v2_capacity_out_of_range_message(value: f64, min: f64, max: f64) -> String {
     format!(
         "Serverless v2 capacity value {value:?} is not valid. The valid scaling range for \
@@ -441,8 +442,13 @@ pub fn serverless_v2_capacity_out_of_range_message(value: f64, min: f64, max: f6
 const SERVERLESS_V2_REQUIREMENTS_DOC: &str = "https://docs.aws.amazon.com/AmazonRDS/latest/\
                                               AuroraUserGuide/aurora-serverless-v2.requirements.html";
 
-/// What a capacity value ABOVE the ceiling the cluster's engine version reaches is refused
-/// with.
+/// What an AURORA capacity value ABOVE the ceiling the cluster's engine version reaches is
+/// refused with.
+///
+/// This wording is the Aurora control plane's: it points the caller at the Aurora Serverless
+/// v2 requirements, the page where the per-version ACU ceilings are published. The other
+/// cluster engines this front door serves state the cluster's own scaling range instead
+/// ([`serverless_v2_capacity_out_of_range_message`]), whichever end of it the value missed.
 ///
 /// The ceiling is a property of the engine VERSION — `ServerlessV2FeaturesSupport` reports
 /// the limits that "differ between Aurora engine versions" — so the service states the
@@ -500,21 +506,23 @@ const SERVERLESS_V2_PUBLISHED_CAPACITY: (f64, f64) = (0.0, 256.0);
 /// one the configuration itself is refused for — whether a `db.serverless` DB instance can
 /// then be created in that cluster is that create's own answer.
 ///
-/// `engine_version` is the version the cluster will be RUNNING, which the refusal of a
-/// capacity above the ceiling names ("the current engine version"); `None` where this call
-/// resolved no version to name, and then that refusal falls back to the range sentence
-/// rather than naming a version the service does not know.
+/// `running` is the engine and the version the cluster will be RUNNING — the version is what
+/// the Aurora refusal of a capacity above the ceiling names ("the current engine version"),
+/// and the engine is what decides which wording that refusal takes; `None` where this call
+/// resolved no version to name, and then that refusal falls back to the range sentence rather
+/// than naming a version the service does not know.
 ///
 /// A capacity value is checked against that range
-/// ([`serverless_v2_capacity_above_engine_ceiling_message`] above the ceiling the version
-/// reaches, [`serverless_v2_capacity_out_of_range_message`] below the floor it scales to)
+/// ([`serverless_v2_capacity_above_engine_ceiling_message`] for an Aurora capacity above the
+/// ceiling the version reaches, [`serverless_v2_capacity_out_of_range_message`] for every
+/// other capacity outside the range)
 /// and against the half-step
 /// increments the member documents ("You can specify ACU values in half-step increments,
 /// such as 8, 8.5, 9, and so on"), and the pair against each other (the floor cannot exceed
 /// the ceiling).
 pub fn check_serverless_v2_scaling(
     capacity: Option<(f64, f64)>,
-    engine_version: Option<&str>,
+    running: Option<(&str, &str)>,
     min_capacity: Option<f64>,
     max_capacity: Option<f64>,
     seconds_until_auto_pause: Option<i32>,
@@ -523,9 +531,13 @@ pub fn check_serverless_v2_scaling(
     for value in [min_capacity, max_capacity] {
         let Some(value) = value else { continue };
         if value > max_acu {
-            // The ceiling belongs to the engine version, so the refusal names that version
-            // where this call resolved one.
-            return Err(ServerlessV2Rejection::Value(match engine_version {
+            // On Aurora the ceiling belongs to the engine version, so the refusal names that
+            // version where this call resolved one; every other cluster engine states the
+            // range the cluster scales in, the same sentence a capacity below the floor gets.
+            let aurora_version = running
+                .filter(|(engine, _)| super::is_aurora(engine))
+                .map(|(_, version)| version);
+            return Err(ServerlessV2Rejection::Value(match aurora_version {
                 Some(version) => {
                     serverless_v2_capacity_above_engine_ceiling_message(max_acu, version)
                 }

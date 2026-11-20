@@ -657,12 +657,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .flatten();
             crate::state::check_serverless_v2_scaling(
                 resolved.and_then(|entry| entry.profile.serverless_v2_scaling_range()),
-                // The version the cluster will be running, as the catalogue spells it where
-                // it carries the version at all — a request may name a MAJOR version, and
-                // what imposes the ceiling is the build behind it.
+                // The engine and the version the cluster will be running, as the catalogue
+                // spells the version where it carries it at all — a request may name a
+                // MAJOR version, and what imposes the ceiling is the build behind it. The
+                // engine is what decides how a capacity above that ceiling is worded.
                 resolved
-                    .map(|entry| entry.engine_version)
-                    .or(effective_version.as_deref()),
+                    .map(|entry| (entry.engine, entry.engine_version))
+                    .or_else(|| {
+                        effective_version
+                            .as_deref()
+                            .map(|version| (engine.as_str(), version))
+                    }),
                 asked.min_capacity,
                 asked.max_capacity,
                 asked.seconds_until_auto_pause,
