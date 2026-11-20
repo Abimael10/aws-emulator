@@ -107,6 +107,10 @@ pub fn domain_security_group_ids(
 
 /// An AWS SDK client for EC2 over the in-process callback into this same emulator.
 ///
+/// `pub(super)` so the OTHER question this crate puts to EC2 — whether the account holds the
+/// EBS volume a HyperPod node attachment names ([`super::ec2_volumes`]) — is asked over the
+/// same one client construction rather than a second copy of it.
+///
 /// `region` is the request's own signing region, so the network is resolved in the Region the
 /// caller addressed. The endpoint URL is only the address the callback's transport routes on
 /// IN PROCESS: no socket is opened, no name is resolved and nothing leaves this process. The
@@ -122,7 +126,7 @@ pub fn domain_security_group_ids(
 /// There is nothing to retry, time out or watch for a stalled stream on an in-process
 /// transport, and each of those would need a sleep implementation this client is not given;
 /// the identity is likewise used directly rather than cached.
-fn ec2(
+pub(super) fn ec2(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
 ) -> Option<::aws_sdk_ec2::Client> {

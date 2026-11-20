@@ -374,8 +374,8 @@ async fn deleting_a_trial_that_does_not_exist_is_refused_and_releases_nothing() 
 #[tokio::test]
 async fn deleting_a_trial_its_components_still_make_up_is_refused_until_they_are_gone() {
     // Rows differ along how many components make up the trial and along the spelling the
-    // delete is written in — the count the refusal reports is read off the membership
-    // index, so it varies with the row.
+    // delete is written in — the refusal is the SAME sentence for every one of them,
+    // because it states the condition and publishes no count of what blocks it.
     let cases: Vec<(&str, &str, &str, Vec<&str>)> = vec![
         ("one-component", "trial-one", "trial-one", vec!["comp-left"]),
         (
@@ -423,14 +423,17 @@ async fn deleting_a_trial_its_components_still_make_up_is_refused_until_they_are
         );
         let reported = message(&refused);
         let named = trial_arn("us-east-1", stored);
-        assert!(
-            reported.contains(&named),
-            "case {case}: expected the message to name {named}, got {reported:?}"
+        assert_eq!(
+            reported,
+            format!("Trial '{named}' has trial components and cannot be deleted."),
+            "case {case}: the refusal names the trial's ARN and states the condition, got \
+             {reported:?}"
         );
+        // However many components block the delete, the sentence is the same: the count is
+        // state this refusal does not publish.
         assert!(
-            reported.contains(&format!("{} trial component(s)", components.len())),
-            "case {case}: expected the message to report {} component(s), got {reported:?}",
-            components.len()
+            !reported.contains(&format!("{} trial component", components.len())),
+            "case {case}: expected no count of the components in {reported:?}"
         );
 
         // The refusal changed nothing: the trial and every membership are still there.

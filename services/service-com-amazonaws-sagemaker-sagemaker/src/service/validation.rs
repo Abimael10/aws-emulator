@@ -18,8 +18,9 @@
 //!    (`smithy_query(query="shape",shape="S3Uri")`: `^(https|s3)://([^/]+)/?(.*)$`) as
 //!    `(https|s3)://([^/]+)/?(.*)`. The pair is dropped from the RENDERING only — the
 //!    check still runs the model's own expression ([`unanchored`]).
-//! 2. **An enum value set is listed in the order the SERVICE declares the enum**, which
-//!    is not always the order the public model lists (see [`MODEL_APPROVAL_STATUS`]).
+//! 2. **An enum value set is listed as the SERVICE declares the enum**, which is not
+//!    always the order the public model lists (see [`MODEL_APPROVAL_STATUS`]), nor always
+//!    the members it declares (see [`SEARCH_RESOURCE_TYPES`]).
 //! 3. **A value outside the TRAINING instance types is told the CONDITION it failed**
 //!    rather than handed that value set
 //!    ([`SUPPORTED_INSTANCE_TYPE_REQUIREMENT`]).
@@ -71,6 +72,53 @@ const MAP_VALUE_REQUIREMENT: &str = "Map value must satisfy constraint: ";
 /// this constant has to be updated with the model. Key the reorder on the shape id
 /// instead the moment the framework carries one on `Violation`.
 const MODEL_APPROVAL_STATUS: [&str; 3] = ["PendingManualApproval", "Approved", "Rejected"];
+
+/// The value set the service declares for the SEARCH surface's resource type, which is
+/// both LARGER than the public model's `ResourceType` enum and listed in an order that
+/// enum does not list.
+///
+/// `smithy_query(query="shape",shape="ResourceType")` declares 20 values; a recorded
+/// refusal of a `Resource` outside the enum lists the 25 below, the model's 20 plus the
+/// five Studio and hosting resources the search index also holds (`App`,
+/// `InferenceComponent`, `Domain`, `EndpointConfig`, `UserProfile`). The set and its order
+/// are therefore a property of the ENUM SHAPE as the SERVICE declares it — not of one
+/// request and not of one operation: every member targeting `ResourceType` (`Search`'s
+/// and `GetSearchSuggestions`' `Resource`) is told the same set, the same way.
+///
+/// FRAGILITY, stated rather than hidden, and on the same terms as [`MODEL_APPROVAL_STATUS`]:
+/// a runtime [`Violation`] carries the value set but not the shape it came from, so
+/// [`declared_order`] recognises this enum by the MEMBERS the model declares for it — read
+/// from the generated `RESOURCE_TYPE_VALUES`, so the recognition follows the model — and
+/// a `ResourceType` that gains or loses a member stops being recognised until this list is
+/// updated with it. What the service ACCEPTS is the model's own enum, which is what the
+/// request walk checks; only the listing a refusal carries is the service's own.
+const SEARCH_RESOURCE_TYPES: [&str; 25] = [
+    "App",
+    "Pipeline",
+    "ModelPackageGroup",
+    "TrainingJob",
+    "InferenceComponent",
+    "HubContent",
+    "Domain",
+    "ExperimentTrialComponent",
+    "FeatureMetadata",
+    "FeatureGroup",
+    "Model",
+    "HyperParameterTuningJob",
+    "Endpoint",
+    "PipelineVersion",
+    "PipelineExecution",
+    "EndpointConfig",
+    "ModelCard",
+    "Project",
+    "ExperimentTrial",
+    "Image",
+    "Job",
+    "ImageVersion",
+    "ModelPackage",
+    "Experiment",
+    "UserProfile",
+];
 
 /// What a member whose value must be one of the TRAINING instance types is told it failed:
 /// the CONDITION the value did not meet, in place of the value set that would meet it.
@@ -167,7 +215,7 @@ fn as_stated(violation: &Violation) -> Violation {
 }
 
 /// A violated constraint as this service renders it: a `@pattern` without its
-/// whole-value anchors, an enum value set in the service's declared order, and every
+/// whole-value anchors, an enum value set as the service declares the enum, and every
 /// other class exactly as the framework renders it.
 fn as_rendered(kind: &ViolationKind) -> ViolationKind {
     match kind {
@@ -356,24 +404,31 @@ fn envelope_of(clause: &str) -> String {
     format!("1 validation error detected: {clause}")
 }
 
-/// `values` in the order the service declares the enum they came from.
+/// `values` in the order — and with the members — the service declares the enum they came
+/// from.
 ///
 /// (The unanchored `@pattern` rendering this module used to carry three local helpers for
 /// is GONE: that rule is AWS's rather than this service's, and
 /// [`service_common::validation::unanchored`] is its one home.)
 ///
 /// A value set is identified by the values it holds (a runtime [`Violation`] carries the
-/// set, not the shape it came from), so the one enum this service declares in an order
-/// the public model does not list is recognised by its own value set. Every other value
-/// set is already in its declared order and is passed through.
+/// set, not the shape it came from), so each enum this service declares differently from
+/// the public model — in another order ([`MODEL_APPROVAL_STATUS`]), or over more values
+/// ([`SEARCH_RESOURCE_TYPES`]) — is recognised by the model's own value set for it. Every
+/// other value set is already as the service declares it and is passed through.
 fn declared_order(values: &[String]) -> Vec<String> {
     if is_set_of(values, &MODEL_APPROVAL_STATUS) {
-        return MODEL_APPROVAL_STATUS
-            .iter()
-            .map(|value| (*value).to_string())
-            .collect();
+        return as_listed(&MODEL_APPROVAL_STATUS);
+    }
+    if is_set_of(values, crate::ops::types::RESOURCE_TYPE_VALUES) {
+        return as_listed(&SEARCH_RESOURCE_TYPES);
     }
     values.to_vec()
+}
+
+/// A value set this module states itself, as a clause lists it.
+fn as_listed(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_string()).collect()
 }
 
 /// Whether `values` holds exactly the values `expected` does, in any order.
@@ -447,7 +502,21 @@ mod tests {
     #[test]
     fn an_enum_value_set_is_listed_in_the_services_declared_order() {
         // (case, the set as the model declares it, the set as the service lists it)
-        let rows: [(&str, &[&str], &[&str]); 7] = [
+        let rows: [(&str, &[&str], &[&str]); 9] = [
+            // Source: `smithy_query(query="shape",shape="ResourceType")`, read through the
+            // generated constant — the service lists five more values, in its own order.
+            (
+                "ResourceType, as the public model declares it",
+                crate::ops::types::RESOURCE_TYPE_VALUES,
+                &SEARCH_RESOURCE_TYPES,
+            ),
+            // One value short of the recognised set: the rule stops applying, which is the
+            // signal `SEARCH_RESOURCE_TYPES` has to be updated with the model.
+            (
+                "the modelled resource types short of a member",
+                &crate::ops::types::RESOURCE_TYPE_VALUES[1..],
+                &crate::ops::types::RESOURCE_TYPE_VALUES[1..],
+            ),
             (
                 "ModelApprovalStatus, in the model's declaration order",
                 &["Approved", "Rejected", "PendingManualApproval"],

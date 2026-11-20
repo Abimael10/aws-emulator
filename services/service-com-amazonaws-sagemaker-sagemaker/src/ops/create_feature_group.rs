@@ -372,6 +372,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// `FeatureType` enum (`FEATURE_TYPE_VALUES`).
 const EVENT_TIME_FEATURE_TYPES: &[&str] = &["Fractional", "String"];
 
+/// What an `EventTime` feature's type has to be, as the FeatureStore states the
+/// requirement: each of [`EVENT_TIME_FEATURE_TYPES`] with the instant it carries —
+/// "Fractional: EventTime feature values must be a Unix timestamp in seconds. String:
+/// EventTime feature values must be an ISO-8601 string" (`EventTimeFeatureName`'s doc).
+///
+/// The requirement is a property of the EVENT-TIME FEATURE rather than of one request, so
+/// it is stated once here and carries nothing from the request.
+const EVENT_TIME_TYPE_REQUIREMENT: &str =
+    "Fractional(Unix timestamp in seconds) or String (ISO-8601 format) type";
+
 /// The `ThroughputMode` that bills against stated capacity, as the model's
 /// `ThroughputMode` enum spells it (`THROUGHPUT_MODE_VALUES`).
 const THROUGHPUT_MODE_PROVISIONED: &str = "Provisioned";
@@ -459,14 +469,16 @@ fn validate_schema(input: &CreateFeatureGroupInput) -> Result<(), CreateFeatureG
         )));
     };
     // "An EventTime can be a String or Fractional" (`EventTimeFeatureName`): an
-    // `Integral` event-time feature carries no instant the FeatureStore would read.
+    // `Integral` event-time feature carries no instant the FeatureStore would read. The
+    // sentence is the FeatureStore's own for this rule — its `Validation Error: ` prefix,
+    // the event-time feature's name and the type the request gave it, then the two types
+    // it may have with what each one means — so only the name and the supplied type come
+    // from the request.
     if !EVENT_TIME_FEATURE_TYPES.contains(&event_time.feature_type.as_str()) {
         return Err(crate::scaffolded::Scaffolded::validation(format!(
-            "EventTimeFeatureName: the feature '{}' is {}; an EventTime feature must be \
-             one of {}.",
-            event_time.feature_name,
-            event_time.feature_type,
-            EVENT_TIME_FEATURE_TYPES.join(", ")
+            "Validation Error: invalid event time {} feature type provided {}. Event time \
+             type should be either {}",
+            event_time.feature_name, event_time.feature_type, EVENT_TIME_TYPE_REQUIREMENT
         )));
     }
 

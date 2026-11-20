@@ -3,8 +3,10 @@
 //! @op DescribeClusterNode
 //! IMPLEMENTED: replays one node of the cluster `ClusterName` names (by name or ARN),
 //! picked by `NodeId` or `NodeLogicalId`, materialising the `Pending` -> `Running`
-//! transition the clock already owes it, and refuses an absent cluster or node with the
-//! modelled `ResourceNotFound`. This is the ONLY file to touch for this operation.
+//! transition the clock already owes it, and refuses a node reference that resolves to no
+//! node with the node lookup's own sentence under the modelled `ResourceNotFound` when the
+//! account holds no such cluster and the 400 `ValidationException` when it does.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -161,13 +163,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
-        // Both unknown-identifier cases are the modelled `ResourceNotFound`, worded with
-        // the node lookup's own fixed sentences: the cluster's and the node's differ, so a
-        // caller tells "no such cluster" from "that cluster has no such node" by the text,
-        // and neither leaks an identifier the request did not carry.
+        // What this reader resolves is the NODE REFERENCE the request carries: the
+        // `ClusterName` says which cluster's nodes to resolve it against, and `NodeId` /
+        // `NodeLogicalId` which node of them. A reference that resolves to no node is
+        // refused with the node lookup's own fixed sentence — the reference is what could
+        // not be resolved, so that sentence covers both halves of it — and the CODE says
+        // which half: a cluster this account does not hold is a missing RESOURCE, the
+        // operation's modelled `ResourceNotFound`, while a cluster that IS held and has no
+        // such node leaves only the node half of the reference wrong, and that half is a
+        // request PARAMETER this operation validates (the selector rules above are
+        // enforced the same way), so it fails the 400 `ValidationException`.
+        //
+        // The recorded node-volume flow is what fixes both halves: a read of an unknown
+        // node whose cluster the account does not hold either answers the modelled
+        // not-found with THIS sentence, not the cluster's own, and one whose cluster is
+        // held answers the validation failure. So the cluster sentence
+        // ([`crate::state::CLUSTER_NOT_FOUND`]) belongs to the operations that resolve the
+        // cluster ITSELF rather than a reference into it.
         let Some(cluster) = store.cluster_by_name_or_arn_mut(&input.cluster_name) else {
             return Err(DescribeClusterNodeErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(crate::state::CLUSTER_NOT_FOUND.to_string()),
+                message: Some(crate::state::CLUSTER_NODE_NOT_FOUND.to_string()),
             })
             .into());
         };
@@ -178,10 +193,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             _ => None,
         };
         let Some(node) = node else {
-            return Err(DescribeClusterNodeErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(crate::state::CLUSTER_NODE_NOT_FOUND.to_string()),
-            })
-            .into());
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::CLUSTER_NODE_NOT_FOUND,
+            ));
         };
         // The one write a reporting operation may make: both transitions were due
         // whether or not anybody described the node.

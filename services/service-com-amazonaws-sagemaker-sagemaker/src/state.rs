@@ -1165,6 +1165,11 @@ pub use domain::*;
 pub mod domain_network;
 pub use domain_network::*;
 
+/// The EBS VOLUME a HyperPod node attachment names, resolved against the service that owns
+/// it: see `state/ec2_volumes.rs`.
+pub mod ec2_volumes;
+pub use ec2_volumes::*;
+
 /// The Studio USER PROFILE slice — the profile `CreateUserProfile` writes and
 /// `DescribeUserProfile` replays, which is also the owner a Studio app hangs off: see
 /// `state/user_profile.rs`.
@@ -3567,6 +3572,20 @@ pub fn trial_does_not_exist(region: &str, trial_name: &str) -> String {
     does_not_exist(TRIAL_ENTITY, &resource_arn(region, TRIAL_KIND, trial_name))
 }
 
+/// How SageMaker refuses the delete of a trial that trial components are still part of:
+/// the entity label, the trial's own ARN in SINGLE QUOTES, and the condition that blocks
+/// the delete, as ONE fixed sentence.
+///
+/// The resolved ARN is the only variable part. The sentence states the CONDITION and not
+/// how much of it there is: the number of components that make the trial up is state this
+/// refusal does not publish, so the message reads the same whether one component or fifty
+/// block the delete, and a consumer matching it never has to parse a count out of it. The
+/// caller clears the condition with `DeleteTrialComponent` / `DisassociateTrialComponent`,
+/// over the components `ListTrialComponents` reports for the trial.
+pub fn trial_has_components(arn: &str) -> String {
+    format!("{TRIAL_ENTITY} '{arn}' has trial components and cannot be deleted.")
+}
+
 /// How every operation that cannot resolve the trial component a request names states it:
 /// the [`does_not_exist`] sentence over the component's ARN, resolved from the requested
 /// `TrialComponentName` against the Region the request signed for.
@@ -3854,32 +3873,78 @@ pub fn tuning_job_not_found(name: &str) -> String {
 ///
 /// A FIXED sentence carrying NOTHING from the request: the recorded refusals of those
 /// operations state the condition and no identifier, so no refusal leaks an ARN the caller
-/// never supplied or a name it can only match against its own input. The sentence is the
-/// whole message — the class of the failure travels in the error CODE, so no name of a
-/// condition or type is prefixed onto it. Stated once here so every one of them words the
-/// same fact the same way. The operations whose subject IS the cluster name it instead
-/// ([`cluster_not_found`]).
+/// never supplied or a name it can only match against its own input. Stated once here so
+/// every one of them words the same fact the same way. The operations whose subject IS the
+/// cluster name it instead ([`cluster_not_found`]).
+///
+/// A control-plane operation answers this sentence as the WHOLE message, since the class
+/// of the failure travels in the error code. The operations whose cluster lookup happens
+/// inside the cluster's orchestration component relay that component's own refusal, which
+/// carries the raising class in front of the same sentence
+/// ([`orchestrated_cluster_not_found`]).
 pub const CLUSTER_NOT_FOUND: &str = "Specified cluster not found";
 
-/// How SageMaker words a HyperPod cluster this account does not hold, for the operations
-/// that address the cluster ITSELF: the identifier the request carried, unquoted, inside
-/// the recorded sentence — which ends with no period.
+/// The class the cluster's orchestration component raises when it cannot resolve the
+/// cluster a request addresses, as that component names it.
 ///
-/// `ClusterName` is a `ClusterNameOrArn`, so the identifier is whichever form arrived,
-/// echoed rather than resolved: a cluster's ARN carries the minted cluster id rather than
-/// its name, so resolving the name of a cluster that does not exist would report an
-/// identifier nobody supplied, and a caller reading the refusal matches it against what it
-/// sent. Stated once here so the cluster readers, the delete and the node-inventory and
+/// A relayed refusal is the inner failure verbatim — `<class>: <sentence>` — so the class
+/// is part of the MESSAGE a caller matches, beside the modelled error code the operation
+/// answers with.
+const CLUSTER_NOT_EXISTS_CLASS: &str = "ClusterNotExistsException";
+
+/// How an operation that resolves the cluster INSIDE its orchestration component states a
+/// cluster this account does not hold: that component's refusal relayed verbatim — the
+/// raising class of [`CLUSTER_NOT_EXISTS_CLASS`], then `: `, then [`CLUSTER_NOT_FOUND`].
+///
+/// The EBS volume attachment of a node is served by the cluster's EKS orchestration (the
+/// Amazon EBS CSI driver manages the volume's lifecycle, `smithy_query(query="doc",
+/// shape="AttachClusterNodeVolume")`), which is where the `ClusterArn` is resolved, so the
+/// message that reaches the caller is the one that component raised rather than a sentence
+/// this service worded itself. Stated once here so every operation served that way relays
+/// the same fact the same way.
+pub fn orchestrated_cluster_not_found() -> String {
+    format!("{CLUSTER_NOT_EXISTS_CLASS}: {CLUSTER_NOT_FOUND}")
+}
+
+/// How SageMaker words a HyperPod cluster this account does not hold, for the operations
+/// that address the cluster ITSELF.
+///
+/// `ClusterName` is a `ClusterNameOrArn`, and WHICH of the two forms arrived decides which
+/// lookup answered, so it decides the sentence too:
+///
+/// * a NAME is resolved in the control plane's own cluster directory, which states the
+///   identifier the request carried, unquoted, with no trailing period \u2014 echoed rather
+///   than resolved, because a cluster's ARN carries the minted cluster id rather than its
+///   name, so resolving the name of a cluster that does not exist would report an
+///   identifier nobody supplied;
+/// * an ARN is resolved in the cluster's orchestration component, the same lookup the
+///   ARN-only operations use, and that component's refusal is relayed verbatim
+///   ([`orchestrated_cluster_not_found`]) \u2014 it names no identifier at all, so no refusal
+///   echoes an ARN back either.
+///
+/// Both halves are the RECORDED wording for the form they answer: the name half is what the
+/// node-scaling path answers for a `ClusterName` nothing was created under, and the ARN half
+/// is what the `DescribeCluster` CONTROL of the volume-attachment flow answers for the
+/// well-formed cluster ARN that flow made up — the same ARN its attach is refused the
+/// relayed sentence for, read back through the cluster's own reader. The two are told apart
+/// by the FORM alone, which is why one function decides both.
+///
+/// Stated once here so the cluster readers, the delete and the node-inventory and
 /// node-batch operations cannot word the same fact differently.
 pub fn cluster_not_found(identifier: &str) -> String {
+    if identifier.starts_with(ARN_PREFIX) {
+        return orchestrated_cluster_not_found();
+    }
     format!("Cluster with name {identifier} not found")
 }
 
-/// How the HyperPod node lookup words a node the named cluster does not own.
+/// How the HyperPod node lookup words a node reference that names no node of the cluster.
 ///
-/// Fixed text, and DIFFERENT from [`CLUSTER_NOT_FOUND`]: the two
-/// unknown-identifier cases of one request — the cluster, and the node inside it — are
-/// what a caller tells apart by the refusal text, since both carry the same code.
+/// Fixed text, and DIFFERENT from [`CLUSTER_NOT_FOUND`]: the two unknown-identifier cases
+/// of one request \u2014 the cluster the request addresses, and the node it names inside it \u2014
+/// are what a caller tells apart by the refusal, and they carry different codes too (a
+/// node reference is a request PARAMETER, so it fails the 400 `ValidationException`, where
+/// the cluster is the resource addressed and gets the modelled not-found).
 pub const CLUSTER_NODE_NOT_FOUND: &str = "Specified cluster node not found";
 
 /// The one `<Entity> with arn <arn> could not be found` sentence — how the HyperPod

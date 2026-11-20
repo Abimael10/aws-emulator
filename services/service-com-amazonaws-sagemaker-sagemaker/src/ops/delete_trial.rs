@@ -163,18 +163,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // filter selects on a trial no reader can describe. The operation models no error
         // for a precondition the caller can satisfy itself (with `DeleteTrialComponent`,
         // or `DisassociateTrialComponent` for a component that is part of other trials
-        // too), so this is the 400 `ValidationException`, and its fixed text is that
-        // documented sentence. The ARN and the count are read off the stored record and
-        // the membership index, so the refusal carries nothing fixed here but the sentence.
-        // The index is queried by the SAME folded key the record is addressed by, so the
+        // too), so this is the 400 `ValidationException`, worded by the one sentence this
+        // service states the condition with ([`crate::state::trial_has_components`]): the
+        // trial's stored ARN and the condition, and no count of the components that block
+        // it — HOW MANY there are is state the refusal does not publish. The membership
+        // index is queried by the SAME folded key the record is addressed by, so the
         // precondition and the lookup can never disagree about which trial is meant.
-        let components = store.trial_component_keys_in_trial(&key).len();
-        if components > 0 {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Unable to delete trial {arn} because it has {components} trial \
-                 component(s) associated with it. All trial components that make up the \
-                 trial must be deleted first."
-            )));
+        if !store.trial_component_keys_in_trial(&key).is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::trial_has_components(&arn),
+            ));
         }
 
         // No component makes up the trial any more, so the record itself is all there is to

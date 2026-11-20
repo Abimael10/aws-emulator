@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AttachClusterNodeVolume
-//! IMPLEMENTED: resolves the `ClusterArn` against `crate::state` — a cluster this account
-//! does not hold is the modelled `ResourceNotFound`, one that is not `InService` fails the
+//! IMPLEMENTED: resolves the `VolumeId` against the service that OWNS an EBS volume (Amazon
+//! EC2, over the in-process hop), refusing an identifier it answered the account holds no
+//! volume for with the 400 `ValidationException` its documented precondition on the volume
+//! gets; then resolves the `ClusterArn` against `crate::state` — a cluster this account
+//! does not hold is the modelled `ResourceNotFound`, carrying the refusal the cluster's
+//! orchestration component raised, and one that is not `InService` fails the
 //! documented precondition with a 400 `ValidationException`
-//! — then resolves the node by `NodeId` inside that cluster, refusing a node it does not
-//! own with the modelled `ResourceNotFound`, and attaches the volume, answering the
+//! — then resolves the node by `NodeId` inside that cluster, refusing a `NodeId` that
+//! names no node of that cluster as the bad request PARAMETER it is (400
+//! `ValidationException`), and attaches the volume, answering the
 //! attachment it already holds when the same volume is attached again. The
 //! already-attached-elsewhere check is scoped to the cluster the `ClusterArn` names,
 //! which is the only cluster this request addresses: this emulator models no EBS volume
-//! inventory outside a HyperPod cluster's nodes. This is the ONLY
+//! inventory of its own — EC2 holds the account's volumes. This is the ONLY
 //! file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -165,18 +170,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
+        // The VOLUME is resolved FIRST, and not here: an EBS volume is Amazon EC2's
+        // resource, and `VolumeId` is "the unique identifier of YOUR EBS volume to attach",
+        // so whether the account holds one under that identifier is a fact only the owning
+        // service can state ([`crate::state::volume_not_held_by_ec2`]). An identifier EC2
+        // answered it holds no volume for fails this operation's documented precondition on
+        // the volume — a request parameter, so the 400 `ValidationException` — and relays
+        // what EC2 answered: the HyperPod plane's own opening, EC2's error code and EC2's
+        // own sentence. BEFORE the cluster, because the recorded flows are only both served
+        // this way round: a request naming a volume the account does not hold is answered
+        // the volume refusal even though its `ClusterArn` names no cluster either, while the
+        // cluster refusal below is what a request naming a volume EC2 DOES hold gets. The
+        // hop is made before the store is locked, because it awaits; EC2 not answering
+        // establishes nothing and refuses nothing.
+        let region = crate::state::request_region(ctx);
+        if let Some(refusal) =
+            crate::state::volume_not_held_by_ec2(ctx, &region, &input.volume_id).await
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(refusal));
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        // The `ClusterArn` says WHERE to attach, and it is resolved before anything else.
-        // A cluster this account does not hold is the modelled `ResourceNotFound` — the
-        // same class as the node below, since both are resources the request addresses —
-        // and carries the cluster lookup's own fixed sentence, which states the condition
-        // and NOTHING from the request, not even the name of the condition itself: the
-        // class of the failure travels in the error code. The two sentences differ, so a
-        // caller tells an unknown cluster from an unknown node by the text.
+        // The `ClusterArn` says WHERE to attach, and it is resolved next.
+        // The cluster is the one RESOURCE this request addresses by ARN, so a cluster this
+        // account does not hold is the operation's modelled `ResourceNotFound`. The volume
+        // attachment itself is served by the cluster's EKS orchestration (the EBS CSI
+        // driver manages the volume's lifecycle), which is where the ARN is resolved, so
+        // the message is that component's refusal relayed verbatim — the class it raised
+        // in front of its sentence ([`crate::state::orchestrated_cluster_not_found`]) —
+        // and carries nothing from the request. The node's own refusal below states a
+        // different sentence under a different code, so a caller tells an unknown cluster
+        // from an unknown node by either one.
         let Some(cluster) = store.cluster_by_arn_mut(&input.cluster_arn) else {
             return Err(AttachClusterNodeVolumeErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(crate::state::CLUSTER_NOT_FOUND.to_string()),
+                message: Some(crate::state::orchestrated_cluster_not_found()),
             })
             .into());
         };
@@ -219,13 +247,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
 
         let Some(node) = cluster.node_by_instance_id_mut(&input.node_id) else {
-            // The node is a resource the cluster owns, so a node the cluster does not
-            // have is the modelled `ResourceNotFound`, worded with the node lookup's own
-            // fixed sentence rather than with the cluster ARN and the node id.
-            return Err(AttachClusterNodeVolumeErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(crate::state::CLUSTER_NODE_NOT_FOUND.to_string()),
-            })
-            .into());
+            // The cluster resolved, so what is left is a `NodeId` that names no node of
+            // it: a value of a request PARAMETER this operation validates against the
+            // cluster it was given, not a resource the request addresses — the modelled
+            // `ResourceNotFound` ("Resource being access is not found.") is answered for
+            // the `ClusterArn` above. A parameter this service understood and will not
+            // accept is the 400 `ValidationException`, so the two failures carry different
+            // codes and a caller never retries a cluster-missing path for a bad node id.
+            // The sentence is the node lookup's own fixed one.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::CLUSTER_NODE_NOT_FOUND,
+            ));
         };
         // A volume another node of this cluster holds is not available for this one, and
         // the operation models no error for that.

@@ -735,9 +735,11 @@ fn cluster_readers(cluster: &str) -> Vec<(&'static str, Value)> {
 }
 
 /// RULE: every operation that cannot resolve the HyperPod cluster its `ClusterName` names
-/// refuses it with the modelled `ResourceNotFound` and the message
-/// `Cluster with name <ClusterName> not found` — the identifier the request carried,
-/// unquoted and with no trailing period.
+/// refuses it with the modelled `ResourceNotFound`, worded by the lookup the identifier's
+/// FORM selects: a NAME is answered `Cluster with name <ClusterName> not found` — the
+/// identifier the request carried, unquoted and with no trailing period — and an ARN is
+/// answered the refusal the cluster's orchestration component raised, its class in front of
+/// its own fixed sentence.
 #[tokio::test]
 async fn an_unknown_cluster_is_refused_naming_the_requested_identifier() {
     let region = "us-east-1";
@@ -760,10 +762,10 @@ async fn an_unknown_cluster_is_refused_naming_the_requested_identifier() {
             "stored-clusters".to_string(),
         ),
         (
-            // This row pins the crate's documented choice for a form the recorded units do
-            // not cover (they send a `ClusterName`): the identifier is ECHOED, because a
-            // cluster's ARN carries the minted cluster id rather than its name, so nothing
-            // could be resolved for a cluster that does not exist.
+            // The ARN form is resolved by the cluster's orchestration component — an ARN
+            // carries the minted cluster id that component knows the cluster by — so the
+            // refusal is that component's own, relayed with the class it raised and
+            // naming no identifier.
             "an ARN whose id nothing holds",
             sagemaker_arn(region, "cluster", "0123456789ab"),
         ),
@@ -773,7 +775,11 @@ async fn an_unknown_cluster_is_refused_naming_the_requested_identifier() {
         for (operation, body) in cluster_readers(&identifier) {
             let case = format!("{case}/{operation}");
             let (status, refused) = emulator.call_in(region, operation, &body).await;
-            let expected = format!("Cluster with name {identifier} not found");
+            let expected = if identifier.starts_with("arn:") {
+                "ClusterNotExistsException: Specified cluster not found".to_string()
+            } else {
+                format!("Cluster with name {identifier} not found")
+            };
             assert_refusal(&case, status, &refused, "ResourceNotFound", &expected);
             assert!(
                 !message(&refused).ends_with('.'),

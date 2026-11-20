@@ -55,9 +55,14 @@ const NONE_EXIST: &str = "All provided nodes do not exist. Please check the inpu
      again.";
 
 /// How SageMaker words a cluster this account does not hold, for an operation that
-/// addresses the cluster itself: the identifier the request carried, and no trailing
-/// period.
+/// addresses the cluster itself: the identifier the request carried when that identifier
+/// is a NAME, and the refusal the cluster's orchestration component raised — its class,
+/// then its own fixed sentence — when it is an ARN, which is the form that component
+/// resolves.
 fn cluster_not_found(identifier: &str) -> String {
+    if identifier.starts_with("arn:") {
+        return "ClusterNotExistsException: Specified cluster not found".to_string();
+    }
     format!("Cluster with name {identifier} not found")
 }
 

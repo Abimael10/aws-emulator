@@ -1344,22 +1344,29 @@ async fn batch_add_cluster_nodes_adds_what_it_can_and_reports_what_it_cannot() {
     }
 }
 
-/// RULE: the HyperPod node lookup states each unknown identifier of a request with its
-/// OWN fixed sentence — one for a cluster this account does not hold, a DIFFERENT one for
-/// a node that cluster does not own — and neither sentence carries anything from the
-/// request, so a caller tells the two conditions apart by the text alone and no refusal
-/// reports an identifier it was never sent.
+/// RULE: the HyperPod node operations state each unknown identifier of a request with its
+/// OWN fixed sentence — one for the cluster a request ADDRESSES and does not resolve, a
+/// DIFFERENT one for a node reference that resolves to no node — and neither sentence
+/// carries anything from the request, so a caller tells the two conditions apart by the
+/// text and the code alone and no refusal reports an identifier it was never sent. Where
+/// the cluster lookup happens inside the cluster's orchestration component, the cluster
+/// sentence is relayed behind the class that component raised, which is part of the message
+/// too.
 #[tokio::test]
 async fn an_unknown_cluster_and_an_unknown_node_carry_their_own_fixed_refusals() {
     // The two sentences are the whole point of the rule, so the fixture starts by pinning
-    // them: each is the condition and nothing else — no identifier from the request and no
-    // name of a condition or type, since the class of the failure travels in the error code
-    // — and they differ, because a caller that cannot tell them apart learns nothing from
-    // either.
+    // them: each is the condition and nothing else — no identifier from the request — and
+    // they differ, because a caller that cannot tell them apart learns nothing from
+    // either. The relayed form is the same sentence behind the raising class.
     assert_eq!(
         (sm::CLUSTER_NOT_FOUND, sm::CLUSTER_NODE_NOT_FOUND),
         ("Specified cluster not found", "Specified cluster node not found"),
         "each refusal is AWS's fixed sentence alone"
+    );
+    assert_eq!(
+        sm::orchestrated_cluster_not_found(),
+        "ClusterNotExistsException: Specified cluster not found",
+        "a relayed cluster lookup carries the raising class in front of the sentence"
     );
     assert_ne!(
         sm::CLUSTER_NOT_FOUND, sm::CLUSTER_NODE_NOT_FOUND,
@@ -1378,13 +1385,18 @@ async fn an_unknown_cluster_and_an_unknown_node_carry_their_own_fixed_refusals()
     // addressed (name or ARN), which selector picks the node (`NodeId` or
     // `NodeLogicalId`) and the length of the unknown node id — `ClusterNodeId` is
     // `^i-[a-f0-9]{8}(?:[a-f0-9]{9})?$`, so both the 8- and the 17-digit forms are tested.
-    let rows: Vec<(&str, &str, Value, &str, &str)> = vec![
+    // The node READER resolves the whole node reference, so a reference that resolves to no
+    // node carries the node sentence whichever half of it is wrong, under the modelled
+    // not-found when the cluster is the missing resource and under the 400
+    // `ValidationException` when only the node half is. The ATTACH resolves the cluster it
+    // acts in ITSELF, so an unknown one there is the relayed cluster refusal.
+    let rows: Vec<(&str, &str, Value, &str, String)> = vec![
         (
             "attach: a short node id the cluster does not own",
             "AttachClusterNodeVolume",
             json!({"ClusterArn": cluster_arn, "NodeId": "i-00000000", "VolumeId": volume}),
-            "ResourceNotFound",
-            sm::CLUSTER_NODE_NOT_FOUND,
+            "ValidationException",
+            sm::CLUSTER_NODE_NOT_FOUND.to_string(),
         ),
         (
             "attach: a long node id the cluster does not own",
@@ -1394,50 +1406,50 @@ async fn an_unknown_cluster_and_an_unknown_node_carry_their_own_fixed_refusals()
                 "NodeId": "i-0000000000000000f",
                 "VolumeId": volume,
             }),
-            "ResourceNotFound",
-            sm::CLUSTER_NODE_NOT_FOUND,
+            "ValidationException",
+            sm::CLUSTER_NODE_NOT_FOUND.to_string(),
         ),
         (
             "attach: a cluster this account does not hold",
             "AttachClusterNodeVolume",
             json!({"ClusterArn": absent_arn, "NodeId": node, "VolumeId": volume}),
             "ResourceNotFound",
-            sm::CLUSTER_NOT_FOUND,
+            sm::orchestrated_cluster_not_found(),
         ),
         (
             "describe: an unknown node of a cluster addressed by name",
             "DescribeClusterNode",
             json!({"ClusterName": "hyperpod-a", "NodeId": "i-00000000"}),
-            "ResourceNotFound",
-            sm::CLUSTER_NODE_NOT_FOUND,
+            "ValidationException",
+            sm::CLUSTER_NODE_NOT_FOUND.to_string(),
         ),
         (
             "describe: an unknown node of a cluster addressed by ARN",
             "DescribeClusterNode",
             json!({"ClusterName": cluster_arn, "NodeId": "i-0000000000000000f"}),
-            "ResourceNotFound",
-            sm::CLUSTER_NODE_NOT_FOUND,
+            "ValidationException",
+            sm::CLUSTER_NODE_NOT_FOUND.to_string(),
         ),
         (
             "describe: an unknown node picked by its logical id",
             "DescribeClusterNode",
             json!({"ClusterName": "hyperpod-a", "NodeLogicalId": "no-such-node"}),
-            "ResourceNotFound",
-            sm::CLUSTER_NODE_NOT_FOUND,
+            "ValidationException",
+            sm::CLUSTER_NODE_NOT_FOUND.to_string(),
         ),
         (
             "describe: a cluster name this account does not hold",
             "DescribeClusterNode",
             json!({"ClusterName": "no-such-cluster", "NodeId": node}),
             "ResourceNotFound",
-            sm::CLUSTER_NOT_FOUND,
+            sm::CLUSTER_NODE_NOT_FOUND.to_string(),
         ),
         (
             "describe: a cluster ARN this account does not hold",
             "DescribeClusterNode",
             json!({"ClusterName": absent_arn, "NodeId": node}),
             "ResourceNotFound",
-            sm::CLUSTER_NOT_FOUND,
+            sm::CLUSTER_NODE_NOT_FOUND.to_string(),
         ),
     ];
 
@@ -1514,23 +1526,31 @@ async fn attaching_a_volume_answers_one_attachment_per_volume() {
     }
 
     // A volume this node already holds keeps its device name — attaching twice does not
-    // hand it a second one — and the clock has settled it to attached.
-    tokio::time::sleep(PAST_SETTLE_DUE).await;
-    let again = emulator
-        .ok(
-            "AttachClusterNodeVolume",
-            &json!({"ClusterArn": cluster_arn, "NodeId": node, "VolumeId": volumes[0]}),
-        )
-        .await;
+    // hand it a second one — and the clock settles it to attached. The settled reading is
+    // POLLED for rather than waited out: the same attach answers the attachment the node
+    // already holds, so looking again is what shows the status the clock owes it.
+    let deadline = std::time::Instant::now() + TERMINAL_DEADLINE;
+    let again = loop {
+        let answered = emulator
+            .ok(
+                "AttachClusterNodeVolume",
+                &json!({"ClusterArn": cluster_arn, "NodeId": node, "VolumeId": volumes[0]}),
+            )
+            .await;
+        if str_field(&answered, "Status") == sm::VOLUME_STATUS_ATTACHED {
+            break answered;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case re-attach: the attachment never settled to {}, last {answered}",
+            sm::VOLUME_STATUS_ATTACHED
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    };
     assert_eq!(
         str_field(&again, "DeviceName"),
         sm::VOLUME_DEVICE_NAMES[0],
         "case re-attach: the device name is the one the first attach gave, got {again}"
-    );
-    assert_eq!(
-        str_field(&again, "Status"),
-        sm::VOLUME_STATUS_ATTACHED,
-        "case re-attach: once the clock is past due the attachment is attached, got {again}"
     );
 
     // A volume another node of the cluster holds is not available for this one.
@@ -1546,7 +1566,7 @@ async fn attaching_a_volume_answers_one_attachment_per_volume() {
         "case volume held elsewhere: expected 400 ValidationException, got {status} {parsed}"
     );
 
-    // A node the cluster does not own is the modelled not-found...
+    // A `NodeId` the cluster does not own is a bad request parameter...
     let (status, parsed) = emulator
         .call(
             "AttachClusterNodeVolume",
@@ -1559,8 +1579,8 @@ async fn attaching_a_volume_answers_one_attachment_per_volume() {
         .await;
     assert_eq!(
         (status, error_code(&parsed).as_str()),
-        (400, "ResourceNotFound"),
-        "case absent node: expected 400 ResourceNotFound, got {status} {parsed}"
+        (400, "ValidationException"),
+        "case absent node: expected 400 ValidationException, got {status} {parsed}"
     );
 
     // ... and a cluster the clock has not settled yet fails the documented `InService`

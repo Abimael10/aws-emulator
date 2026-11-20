@@ -15,8 +15,9 @@
 //! 2. the AI benchmarking family says `<Entity> '<identifier>' not found.`, quoting the
 //!    identifier the REQUEST carried; a CREATE resolving a reference of that family adds
 //!    ` for this account`, and a DELETE relays the inner service's rendering of it;
-//! 3. the cluster reader and delete say `Cluster with name <identifier> not found` — no
-//!    quoting, no closing period;
+//! 3. the cluster reader and delete say `Cluster with name <identifier> not found` for a
+//!    NAME — no quoting, no closing period — and relay the orchestration component's own
+//!    `<class>: <sentence>` for an ARN;
 //! 4. the model-group policy read and delete say
 //!    `Cannot find resource policy for: <group arn>` — a bare ARN, no closing period.
 //!
@@ -599,9 +600,12 @@ async fn a_missing_ai_resource_is_relayed_with_the_inner_service_tail() {
 }
 
 /// RULE: the operations whose subject IS a HyperPod cluster refuse an identifier the
-/// account holds no cluster under with the modelled `ResourceNotFound` (HTTP 400) whose
-/// message names that identifier as the request carried it — unquoted, and with no closing
-/// period.
+/// account holds no cluster under with the modelled `ResourceNotFound` (HTTP 400), worded
+/// by the lookup the identifier's FORM selects: a `ClusterName` that is a name is resolved
+/// in the control plane's directory, which names that identifier as the request carried it
+/// — unquoted, and with no closing period — while one that is an ARN is resolved in the
+/// cluster's orchestration component, whose refusal is relayed verbatim: its class, then
+/// its own fixed sentence, naming no identifier at all.
 #[tokio::test]
 async fn a_missing_cluster_is_reported_by_the_identifier_the_request_carried() {
     // Rows differ along the operation (read, delete), the identifier's form (a bare name,
@@ -655,10 +659,17 @@ async fn a_missing_cluster_is_reported_by_the_identifier_the_request_carried() {
             (400, "ResourceNotFound"),
             "case {case:?}: expected 400 ResourceNotFound, got {status} with {refused:?}"
         );
+        // The ARN form is the orchestration component's lookup, so its refusal is that
+        // component's relayed sentence rather than the identifier echoed.
+        let expected = if identifier.starts_with("arn:") {
+            "ClusterNotExistsException: Specified cluster not found".to_string()
+        } else {
+            format!("Cluster with name {identifier} not found")
+        };
         assert_eq!(
             message(&refused),
-            format!("Cluster with name {identifier} not found"),
-            "case {case:?}: expected the identifier as sent, got {:?}",
+            expected,
+            "case {case:?}: expected {expected:?}, got {:?}",
             message(&refused)
         );
     }
