@@ -2943,3 +2943,282 @@ async fn every_reported_date_carries_millisecond_precision() {
         );
     }
 }
+
+// ---- a report narrowed to a replication task the account does not hold --------------
+//
+// RULE: a report of replication tasks whose `Filters` select no task raises the one error
+// the report models — `ResourceNotFoundFault`, HTTP 400 — instead of answering a
+// successful page with an empty list, so a client confirming a teardown learns from the
+// refusal that the task it deleted is gone and can tell "this task does not exist" from
+// "this task exists but matched no other filter". An UNFILTERED report still answers with
+// what the account holds, which may be nothing.
+//
+// The rows span what the rule generalises over: which documented filter name narrows the
+// report, how many values one filter carries, how many filters a request carries, and why
+// the task the request names is absent — never created, just deleted, or the ARN a
+// reclaimed identifier left behind.
+
+/// The error code and the fixed message `DescribeReplicationTasks` answers `Filters` that
+/// select no replication task with.
+const NO_TASK_MATCHES: (&str, &str) = (
+    "ResourceNotFoundFault",
+    "No ReplicationTasks found matching provided filters",
+);
+
+/// Assert that the report narrowed by `filters` is refused as a replication task DMS
+/// could not find, rather than answered with a page.
+async fn assert_no_task_matches(emulator: &Emulator, case: &str, filters: Value) {
+    let (status, response) = emulator
+        .call("DescribeReplicationTasks", &json!({ "Filters": filters }))
+        .await;
+    assert_eq!(
+        (status, error_code(&response), text(&response, "/message")),
+        (
+            400,
+            NO_TASK_MATCHES.0.to_string(),
+            NO_TASK_MATCHES.1.to_string()
+        ),
+        "case {case:?}: expected 400 {} {:?}, got {status} {response}",
+        NO_TASK_MATCHES.0,
+        NO_TASK_MATCHES.1
+    );
+}
+
+/// Every replication task ARN the report narrowed by `filters` answers with.
+async fn tasks_matching(emulator: &Emulator, case: &str, filters: Value) -> Vec<String> {
+    let reported = emulator
+        .ok(
+            case,
+            "DescribeReplicationTasks",
+            &json!({ "Filters": filters }),
+        )
+        .await;
+    column(&reported, "/ReplicationTasks", "ReplicationTaskArn")
+}
+
+/// The replication tasks an unfiltered report answers with, which is what the account
+/// holds — an empty list included.
+async fn every_task(emulator: &Emulator, case: &str) -> Vec<String> {
+    let reported = emulator
+        .ok(case, "DescribeReplicationTasks", &json!({}))
+        .await;
+    column(&reported, "/ReplicationTasks", "ReplicationTaskArn")
+}
+
+#[tokio::test]
+async fn a_report_narrowed_to_a_task_the_account_does_not_hold_is_refused() {
+    let case = "a task the account does not hold";
+    let emulator = Emulator::new();
+
+    // ---- an account holding no replication task at all -----------------------------
+    let held = every_task(&emulator, case).await;
+    assert!(
+        held.is_empty(),
+        "case {case:?}: expected an unfiltered report of an empty account to answer with no \
+         task, got {held:?}"
+    );
+    let unknown_task = format!("arn:aws:dms:{REGION}:{ACCOUNT}:task:NOSUCHTASK00000000000000AA");
+    for (row, filters) in [
+        (
+            "an ARN nothing minted, in an empty account",
+            json!([{ "Name": "replication-task-arn", "Values": [unknown_task] }]),
+        ),
+        (
+            "an identifier no task carries, in an empty account",
+            json!([{ "Name": "replication-task-id", "Values": ["no-such-task"] }]),
+        ),
+    ] {
+        assert_no_task_matches(&emulator, row, filters).await;
+    }
+
+    // ---- one task the account DOES hold --------------------------------------------
+    let created_instance = emulator
+        .ok(
+            case,
+            "CreateReplicationInstance",
+            &json!({
+                "ReplicationInstanceIdentifier": "absent-task-rep",
+                "ReplicationInstanceClass": "dms.t3.medium",
+            }),
+        )
+        .await;
+    let instance_arn = text(&created_instance, "/ReplicationInstance/ReplicationInstanceArn");
+    poll_until_instance_available(&emulator, case, &instance_arn).await;
+    let source_arn = emulator
+        .endpoint("absent-task-src", "source", "mysql")
+        .await;
+    let target_arn = emulator
+        .endpoint("absent-task-tgt", "target", "postgres")
+        .await;
+    let identifier = "absent-task";
+    let created = emulator
+        .ok(
+            case,
+            "CreateReplicationTask",
+            &json!({
+                "ReplicationTaskIdentifier": identifier,
+                "SourceEndpointArn": source_arn,
+                "TargetEndpointArn": target_arn,
+                "ReplicationInstanceArn": instance_arn,
+                "MigrationType": "cdc",
+                "TableMappings": table_mappings(),
+            }),
+        )
+        .await;
+    let task_arn = text(&created, "/ReplicationTask/ReplicationTaskArn");
+
+    // One row per documented filter name carrying a value the task does not answer,
+    // plus a multi-value filter none of whose values match and a pair of filters each
+    // of which matches on its own.
+    let absent: Vec<(&str, Value)> = vec![
+        (
+            "an ARN nothing minted",
+            json!([{ "Name": "replication-task-arn", "Values": [format!("{task_arn}X")] }]),
+        ),
+        (
+            "an identifier no task carries",
+            json!([{ "Name": "replication-task-id", "Values": ["no-such-task"] }]),
+        ),
+        (
+            "a migration type no task runs",
+            json!([{ "Name": "migration-type", "Values": ["full-load"] }]),
+        ),
+        (
+            "an endpoint no task names",
+            json!([{
+                "Name": "endpoint-arn",
+                "Values": [format!("arn:aws:dms:{REGION}:{ACCOUNT}:endpoint:NOSUCHENDPOINT0000000AA")],
+            }]),
+        ),
+        (
+            "an instance no task runs on",
+            json!([{
+                "Name": "replication-instance-arn",
+                "Values": [format!("arn:aws:dms:{REGION}:{ACCOUNT}:rep:NOSUCHINSTANCE000000000AA")],
+            }]),
+        ),
+        (
+            "several values, none of which match",
+            json!([{ "Name": "replication-task-id", "Values": ["no-such-task", "nor-this"] }]),
+        ),
+        (
+            "two filters that cannot both match",
+            json!([
+                { "Name": "replication-task-id", "Values": [identifier] },
+                { "Name": "migration-type", "Values": ["full-load"] },
+            ]),
+        ),
+    ];
+    for (row, filters) in absent {
+        assert_no_task_matches(&emulator, row, filters).await;
+    }
+
+    // A filter that DOES select the task still answers, so the refusal follows the
+    // result set and not the presence of filters.
+    let present: Vec<(&str, Value)> = vec![
+        (
+            "the task's own ARN",
+            json!([{ "Name": "replication-task-arn", "Values": [task_arn] }]),
+        ),
+        (
+            "the task's own identifier",
+            json!([{ "Name": "replication-task-id", "Values": [identifier] }]),
+        ),
+        (
+            "the migration type the task runs",
+            json!([{ "Name": "migration-type", "Values": ["cdc"] }]),
+        ),
+        (
+            "the source endpoint the task names",
+            json!([{ "Name": "endpoint-arn", "Values": [source_arn] }]),
+        ),
+        (
+            "the target endpoint the task names",
+            json!([{ "Name": "endpoint-arn", "Values": [target_arn] }]),
+        ),
+        (
+            "the instance the task runs on",
+            json!([{ "Name": "replication-instance-arn", "Values": [instance_arn] }]),
+        ),
+        (
+            "one value that selects the task beside one that selects nothing",
+            json!([{ "Name": "replication-task-id", "Values": ["no-such-task", identifier] }]),
+        ),
+    ];
+    for (row, filters) in present {
+        assert_eq!(
+            tasks_matching(&emulator, row, filters).await,
+            vec![task_arn.clone()],
+            "case {row:?}: expected the report to answer with the task the filter selects"
+        );
+    }
+
+    // ---- the teardown a client confirms through this report -------------------------
+    emulator
+        .ok(
+            case,
+            "DeleteReplicationTask",
+            &json!({ "ReplicationTaskArn": task_arn }),
+        )
+        .await;
+    let gone = poll_until_task_is_gone(&emulator, case, &task_arn).await;
+    assert_eq!(
+        (error_code(&gone), text(&gone, "/message")),
+        (
+            NO_TASK_MATCHES.0.to_string(),
+            NO_TASK_MATCHES.1.to_string()
+        ),
+        "case {case:?}: expected the deleted task's ARN to be refused as a task DMS could \
+         not find, got {gone}"
+    );
+    assert_no_task_matches(
+        &emulator,
+        "the identifier a deleted task carried",
+        json!([{ "Name": "replication-task-id", "Values": [identifier] }]),
+    )
+    .await;
+    let held = every_task(&emulator, case).await;
+    assert!(
+        held.is_empty(),
+        "case {case:?}: expected the unfiltered report to answer with no task once the \
+         deleted one is gone, got {held:?}"
+    );
+
+    // ---- the ARN a reclaimed identifier left behind ---------------------------------
+    let reclaimed = emulator
+        .ok(
+            case,
+            "CreateReplicationTask",
+            &json!({
+                "ReplicationTaskIdentifier": identifier,
+                "SourceEndpointArn": source_arn,
+                "TargetEndpointArn": target_arn,
+                "ReplicationInstanceArn": instance_arn,
+                "MigrationType": "full-load",
+                "TableMappings": table_mappings(),
+            }),
+        )
+        .await;
+    let reclaimed_arn = text(&reclaimed, "/ReplicationTask/ReplicationTaskArn");
+    assert_ne!(
+        reclaimed_arn, task_arn,
+        "case {case:?}: expected a task created under a freed identifier to carry an ARN of \
+         its own"
+    );
+    assert_eq!(
+        tasks_matching(
+            &emulator,
+            "the reclaimed identifier",
+            json!([{ "Name": "replication-task-id", "Values": [identifier] }]),
+        )
+        .await,
+        vec![reclaimed_arn.clone()],
+        "case {case:?}: expected the freed identifier to select the task that holds it now"
+    );
+    assert_no_task_matches(
+        &emulator,
+        "the ARN a reclaimed identifier left behind",
+        json!([{ "Name": "replication-task-arn", "Values": [task_arn] }]),
+    )
+    .await;
+}
