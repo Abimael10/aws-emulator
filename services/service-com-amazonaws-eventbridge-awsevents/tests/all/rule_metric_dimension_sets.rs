@@ -7,7 +7,8 @@
 //! The RULE asserted here: EventBridge publishes a rule's routing counters
 //! (`MatchedEvents`, `TriggeredRules`) under the rule's whole identity —
 //! `EventBusName` together with `RuleName` — and its handover counters
-//! (`Invocations`, `SuccessfulInvocationAttempts`, `FailedInvocations`) under that
+//! (`Invocations`, `InvocationAttempts`, `SuccessfulInvocationAttempts`,
+//! `FailedInvocations`) under that
 //! identity AND under `RuleName` on its own; every other dimension set a client
 //! may name — the bus with no rule, the rule name alone for a routing counter,
 //! another rule's name — is a series the counter is not published under, so a
@@ -32,8 +33,8 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{
     DEFAULT_EVENT_BUS_NAME, EVENT_BUS_NAME_DIMENSION, FAILED_INVOCATIONS_METRIC,
-    INVOCATIONS_METRIC, MATCHED_EVENTS_METRIC, METRIC_NAMESPACE, RULE_NAME_DIMENSION,
-    SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC, TRIGGERED_RULES_METRIC,
+    INVOCATIONS_METRIC, INVOCATION_ATTEMPTS_METRIC, MATCHED_EVENTS_METRIC, METRIC_NAMESPACE,
+    RULE_NAME_DIMENSION, SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC, TRIGGERED_RULES_METRIC,
 };
 
 use crate::target_dispatch::{
@@ -165,13 +166,15 @@ fn rows() -> Vec<Row> {
 ///
 /// A LITERAL table, stated here rather than asked of the service: an expectation
 /// computed from the code under test would move with a regression instead of
-/// catching it. The counters are the five this crate names; the two routing ones
+/// catching it. The counters are the six this crate names; the two routing ones
 /// come first.
-fn counters(matched: f64) -> [(&'static str, f64, bool); 5] {
+fn counters(matched: f64) -> [(&'static str, f64, bool); 6] {
     [
         (MATCHED_EVENTS_METRIC, matched, false),
         (TRIGGERED_RULES_METRIC, matched, false),
         (INVOCATIONS_METRIC, matched, true),
+        // One attempt per handover, each of which the queue accepted.
+        (INVOCATION_ATTEMPTS_METRIC, matched, true),
         (SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC, matched, true),
         // The queue accepted every handover, so nothing failed permanently and
         // this counter has no series for this rule at all.
@@ -434,6 +437,7 @@ async fn each_counter_is_served_under_its_own_dimension_sets() {
                 MATCHED_EVENTS_METRIC,
                 TRIGGERED_RULES_METRIC,
                 INVOCATIONS_METRIC,
+                INVOCATION_ATTEMPTS_METRIC,
                 SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC,
             ],
         );

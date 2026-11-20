@@ -37,8 +37,9 @@ use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{
     ComAmazonawsEventbridgeAwseventsState, InvocationOutcome, DEFAULT_EVENT_BUS_NAME,
     EVENT_BUS_NAME_DIMENSION, FAILED_INVOCATIONS_METRIC, INVOCATIONS_METRIC,
-    INVOCATIONS_SENT_TO_DLQ_METRIC, MATCHED_EVENTS_METRIC, METRIC_NAMESPACE, RULE_NAME_DIMENSION,
-    SERVICE_PRINCIPAL, SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC, TRIGGERED_RULES_METRIC,
+    INVOCATIONS_SENT_TO_DLQ_METRIC, INVOCATION_ATTEMPTS_METRIC, MATCHED_EVENTS_METRIC,
+    METRIC_NAMESPACE, RULE_NAME_DIMENSION, SERVICE_PRINCIPAL,
+    SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC, TRIGGERED_RULES_METRIC,
 };
 use service_com_amazonaws_eventbridge_awsevents::EmulatedService;
 use service_com_amazonaws_kinesis_kinesis_20131202::state::{
@@ -1118,10 +1119,11 @@ pub(crate) fn bus_dimensions(bus: &str) -> Value {
 pub(crate) const ROUTING_COUNTERS: [&str; 2] = [MATCHED_EVENTS_METRIC, TRIGGERED_RULES_METRIC];
 
 /// The AWS/Events counters EventBridge publishes under the rule's whole identity
-/// AND under the rule name on its own: the four that count what became of a
+/// AND under the rule name on its own: the five that count what became of a
 /// handover. Stated here for the same reason as [`ROUTING_COUNTERS`].
-pub(crate) const HANDOVER_COUNTERS: [&str; 4] = [
+pub(crate) const HANDOVER_COUNTERS: [&str; 5] = [
     INVOCATIONS_METRIC,
+    INVOCATION_ATTEMPTS_METRIC,
     SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC,
     FAILED_INVOCATIONS_METRIC,
     INVOCATIONS_SENT_TO_DLQ_METRIC,
@@ -1448,6 +1450,9 @@ async fn a_delivery_the_targets_role_bars_is_dead_lettered_and_counted() {
                         "guarded",
                         &[
                             INVOCATIONS_METRIC,
+                            // The one attempt that delivery made, which is
+                            // counted whatever the attempt came to.
+                            INVOCATION_ATTEMPTS_METRIC,
                             SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC,
                             MATCHED_EVENTS_METRIC,
                             TRIGGERED_RULES_METRIC,
@@ -1538,6 +1543,9 @@ async fn a_delivery_the_targets_role_bars_is_dead_lettered_and_counted() {
                         "guarded",
                         &[
                             FAILED_INVOCATIONS_METRIC,
+                            // The attempt itself, which this refused handover made
+                            // like any other.
+                            INVOCATION_ATTEMPTS_METRIC,
                             // The event went to the target's dead-letter queue, which is
                             // the second thing this refusal is counted as: parked rather
                             // than lost.

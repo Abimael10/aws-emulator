@@ -156,6 +156,12 @@ const INVOCABLE_VERBS: [::http::Method; 8] = [
 /// stating fewer than those three names no request to make: nothing says which api, which
 /// stage or which verb it would be. The verb has to be one of [`INVOCABLE_VERBS`], and the
 /// api id and the stage have to be single segments.
+///
+/// Every part of the ARN that is interpolated into the path this request is made at — the api
+/// id, the stage, and each segment of the resource path — has to NAME A SEGMENT of it
+/// ([`names_a_segment`]), so an ARN that would climb out of the stage it spells, or end the
+/// path rather than continue it, names no request either: the request this delivery makes is
+/// the one the stage serves, not another path of whatever is serving it.
 pub(super) fn addressed_stage(arn: &str) -> Option<Stage> {
     let parsed = ::service_common::arn::parse(arn)?;
     if parsed.vendor != EXECUTE_API_ARN_NAMESPACE {
@@ -166,7 +172,12 @@ pub(super) fn addressed_stage(arn: &str) -> Option<Stage> {
     let stage = segments.next()?;
     let method = segments.next()?;
     let path = segments.next().unwrap_or_default();
-    if api_id.is_empty() || stage.is_empty() {
+    // The api id and the stage are each one segment of that path, held to the same rule its
+    // own segments are.
+    if !names_a_segment(api_id) || !names_a_segment(stage) {
+        return None;
+    }
+    if !addresses_inside_the_stage(path) {
         return None;
     }
     let verb = ::http::Method::from_bytes(method.as_bytes()).ok()?;
@@ -184,6 +195,37 @@ pub(super) fn addressed_stage(arn: &str) -> Option<Stage> {
     })
 }
 
+/// Whether the resource path `path` of an invoke ARN names a place inside the stage it
+/// follows.
+///
+/// A path of the stage is a sequence of real segments ([`names_a_segment`]). An EMPTY path is
+/// the stage's own root, which is a place inside it.
+fn addresses_inside_the_stage(path: &str) -> bool {
+    if path.is_empty() {
+        return true;
+    }
+    path.split('/').all(names_a_segment)
+}
+
+/// Whether `segment` names ONE segment of the path this request is made at.
+///
+/// A segment is a real segment: an EMPTY one, a `.` or a `..` names no place of its own — the
+/// first two name the place they are in and the third the one above it, so a path carrying
+/// them does not address what it spells — and neither does one carrying a query or fragment
+/// mark, an escape or a backslash, which would end the path rather than continue it. The `*`
+/// an ARN's path may carry is a wildcard the target's values fill
+/// ([`crate::state::invocation::filled_path`]) and a segment like any other here.
+///
+/// Every part of an invoke ARN that reaches the URL goes through this: the api id, the stage
+/// and each segment of the resource path, so no one of them can take the request out of the
+/// place the ARN names while another is held to it.
+fn names_a_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && !segment.contains(['?', '#', '%', '\\'])
+}
+
 /// Invoke a REST API stage target: the ARN's own request at that stage's invoke URL,
 /// carrying the event, retried within the target's `RetryPolicy`.
 ///
@@ -195,7 +237,7 @@ pub(super) async fn invoke_rest_api_stage(
     region: &str,
     handover: &Handover<'_>,
     body: &str,
-    retries: &mut Option<Retries>,
+    spent: &mut Spent,
     budget: &mut DeliveryBudget,
 ) -> crate::state::InvocationOutcome {
     let target = handover.target;
@@ -240,6 +282,10 @@ pub(super) async fn invoke_rest_api_stage(
             break;
         }
         attempted += 1;
+        // Reported as the attempt is MADE, so the rule's attempt counter counts the
+        // attempts this delivery really made whatever it ends as
+        // ([`super::count_invocation`]).
+        spent.attempts = attempted;
         let started = ::std::time::Instant::now();
         let attempt = attempt_stage(
             callback,
@@ -258,7 +304,7 @@ pub(super) async fn invoke_rest_api_stage(
             if endpoint_refused(*status) {
                 let message = stage_status_failure(&stage, &uri, *status, request_id);
                 // Retry accounting is reported only for a delivery that was RETRIED.
-                *retries = (attempted > 1).then(|| Retries {
+                spent.retries = (attempted > 1).then(|| Retries {
                     attempts: attempted - 1,
                     exhausted: None,
                 });
@@ -317,7 +363,7 @@ pub(super) async fn invoke_rest_api_stage(
             ),
         ),
     };
-    *retries = Some(Retries {
+    spent.retries = Some(Retries {
         attempts: (attempted - 1).max(0),
         exhausted,
     });
@@ -628,6 +674,57 @@ mod tests {
                 "arn:aws:execute-api:eu-west-1:000000000000:/live/POST/orders",
                 None,
             ),
+            (
+                // The path has to name a place INSIDE the stage: one climbing out of it
+                // addresses a path the stage does not serve, so the ARN names no request.
+                "a resource path climbing out of the stage",
+                "arn:aws:execute-api:eu-west-1:000000000000:a1b2c3d4e5/live/POST/../../admin",
+                None,
+            ),
+            (
+                "a resource path naming the place it is in",
+                "arn:aws:execute-api:eu-west-1:000000000000:a1b2c3d4e5/live/POST/orders/./17",
+                None,
+            ),
+            (
+                "a resource path carrying an empty segment",
+                "arn:aws:execute-api:eu-west-1:000000000000:a1b2c3d4e5/live/POST/orders//17",
+                None,
+            ),
+            (
+                // A query mark ends the path rather than continuing it, so such a path is
+                // not a place in the stage either — and neither is an escaped delimiter.
+                "a resource path carrying a query mark",
+                "arn:aws:execute-api:eu-west-1:000000000000:a1b2c3d4e5/live/POST/orders?x=1",
+                None,
+            ),
+            (
+                "a resource path carrying an escape",
+                "arn:aws:execute-api:eu-west-1:000000000000:a1b2c3d4e5/live/POST/%2e%2e/admin",
+                None,
+            ),
+            (
+                "a stage carrying a query mark",
+                "arn:aws:execute-api:eu-west-1:000000000000:a1b2c3d4e5/live?x=1/POST/orders",
+                None,
+            ),
+            (
+                // The api id and the stage are segments of that path too, so neither may be
+                // one that names the place above it.
+                "a stage that is the place above the api",
+                "arn:aws:execute-api:eu-west-1:000000000000:a1b2c3d4e5/../POST/orders",
+                None,
+            ),
+            (
+                "an api id that is the place above the prefix",
+                "arn:aws:execute-api:eu-west-1:000000000000:../live/POST/orders",
+                None,
+            ),
+            (
+                "a stage naming the place it is in",
+                "arn:aws:execute-api:eu-west-1:000000000000:a1b2c3d4e5/./POST/orders",
+                None,
+            ),
         ];
         for (case, arn, expected) in rows {
             let addressed = addressed_stage(arn);
@@ -673,6 +770,32 @@ mod tests {
                 "orders/*",
                 &["w-1", "spare"],
                 "/live/orders/w-1",
+            ),
+            (
+                // A value fills the ONE place its wildcard holds, so a path separator in it
+                // travels as part of that place rather than opening another segment.
+                "a value carrying a path separator",
+                "orders/*",
+                &["17/items"],
+                "/live/orders/17%2Fitems",
+            ),
+            (
+                "a value climbing out of the stage",
+                "orders/*",
+                &["../../admin"],
+                "/live/orders/..%2F..%2Fadmin",
+            ),
+            (
+                "a value carrying an escaped separator",
+                "orders/*",
+                &["%2f..%2fadmin"],
+                "/live/orders/%252f..%252fadmin",
+            ),
+            (
+                "a value carrying the query and fragment marks",
+                "orders/*",
+                &["17?x=1#f"],
+                "/live/orders/17%3Fx=1%23f",
             ),
         ];
         for (case, path, values, expected) in rows {

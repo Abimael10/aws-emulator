@@ -2080,10 +2080,11 @@ pub(crate) async fn deliver(
         return Handed::BudgetSpent;
     }
 
-    // What a RETRIED invocation spent, filled in by the invocation that retries
-    // (see [`invoke_api_destination`]) and read by the dead-letter message
-    // below; `None` for an invocation nothing retried.
-    let mut retries: Option<Retries> = None;
+    // What this delivery's invocation SPENT, filled in by the invocation that
+    // makes the attempts (see [`invoke_api_destination`]): how many it made,
+    // which is what the attempts are counted from, and the retry accounting the
+    // dead-letter message below reports.
+    let mut spent = Spent::default();
     // A role EventBridge cannot assume fails the delivery first of all; a role it
     // can assume is asked next whether the policies in force on it allow the
     // target's own API call, which is a question about THAT call and so is asked
@@ -2124,7 +2125,7 @@ pub(crate) async fn deliver(
                     }
                     match kind
                         .invoke(
-                            callback, clients, stores, region, handover, body, &mut retries,
+                            callback, clients, stores, region, handover, body, &mut spent,
                             budget, sends,
                         )
                         .await
@@ -2156,13 +2157,19 @@ pub(crate) async fn deliver(
         handover,
         body,
         &outcome,
-        retries.as_ref(),
+        spent.retries.as_ref(),
     )
     .await;
     // Every handover that reached the target's API is counted on the rule's own
     // invocation metrics, whichever way it went — a rule that is delivering is
     // as observable as one that is failing.
-    count_invocation(stores.cloudwatch, handover, &outcome, dead_lettered);
+    count_invocation(
+        stores.cloudwatch,
+        handover,
+        &outcome,
+        spent.attempts,
+        dead_lettered,
+    );
     Handed::Outcome(outcome)
 }
 
@@ -3146,7 +3153,7 @@ impl TargetKind {
         region: &str,
         handover: &Handover<'_>,
         body: &str,
-        retries: &mut Option<Retries>,
+        spent: &mut Spent,
         budget: &mut DeliveryBudget,
         sends: &mut QueueSends,
     ) -> Option<crate::state::InvocationOutcome> {
@@ -3279,7 +3286,7 @@ impl TargetKind {
                 // name is resolved and nothing outside this process can be
                 // reached, so the endpoint's host, scheme and address range
                 // decide nothing but which emulated service claims it.
-                invoke_api_destination(callback, handover, body, retries, budget).await
+                invoke_api_destination(callback, handover, body, spent, budget).await
             }
             // A Glue workflow is reached through the store of the Glue service
             // in this SAME engine rather than through a client: the ingress
@@ -3328,7 +3335,7 @@ impl TargetKind {
                     self.action(),
                     handover,
                     body,
-                    retries,
+                    spent,
                 )
                 .await
             }
@@ -3386,7 +3393,7 @@ impl TargetKind {
                     region,
                     handover,
                     body,
-                    retries,
+                    spent,
                     budget,
                 )
                 .await
@@ -3597,6 +3604,26 @@ const TARGET_ACCESS_DENIED_CODES: [&str; 9] = [
     "KMSAccessDeniedException",
     "KMS.AccessDeniedException",
 ];
+
+/// What ONE delivery's invocation SPENT, reported by the invocation that spent
+/// it.
+///
+/// The attempts are recorded where they are MADE, whatever each attempt came to,
+/// rather than inferred from what the delivery ended as: a delivery accepted on
+/// its third attempt spent three attempts, and that is what the rule's attempt
+/// counter counts ([`count_invocation`]). The retry accounting is a separate fact
+/// about the attempts that FAILED, which only the dead-letter message reports
+/// ([`Retries`]).
+#[derive(Default)]
+struct Spent {
+    /// How many attempts the invocation made. `0` where the invocation reports
+    /// none of its own, which is every target kind whose handover is the ONE call
+    /// it makes — the kinds retried here are the ones that report this.
+    attempts: i32,
+    /// What a RETRIED invocation spent, as the dead-letter message reports it, or
+    /// `None` where there is no retry accounting to report for it.
+    retries: Option<Retries>,
+}
 
 /// What a RETRIED invocation spent, as the dead-letter message reports it.
 struct Retries {
@@ -4358,6 +4385,17 @@ async fn dead_letter(
 /// handover that was NOT ATTEMPTED is counted on neither — nothing was invoked,
 /// and a gap in this emulator is not a failure AWS reports.
 ///
+/// Every handover that WAS attempted also counts on the rule's
+/// `InvocationAttempts`, once per attempt it made: "the number of times
+/// EventBridge attempted invoking a target" is the attempt series' total, so an
+/// attempt counts there whatever it came to — the one the target accepted as well
+/// as the ones it did not. `attempts_made` is what the invocation REPORTED
+/// spending ([`Spent`]), which is how a delivery retried three times counts three
+/// attempts whether the third was accepted or dead-lettered; a kind that reports
+/// none made the one call its handover is. That is what lets a client read "the
+/// event was handed over" off a delivery that neither failed nor was
+/// dead-lettered, which the failure counters hold no series at all for.
+///
 /// A refused handover whose event was WRITTEN to the target's dead-letter queue
 /// (`dead_lettered`, what [`dead_letter_refusal`] answers) is counted on the
 /// rule's `InvocationsSentToDlq` as well: the two are separate facts about one
@@ -4368,6 +4406,7 @@ async fn dead_letter(
 /// The decision is EventBridge's; where the metric LIVES and how it is appended
 /// is CloudWatch's, so the write itself is [`crate::state::count_invocation`] /
 /// [`crate::state::count_failed_invocation`] /
+/// [`crate::state::count_invocation_attempts`] /
 /// [`crate::state::count_invocation_sent_to_dlq`] over the CloudWatch store in
 /// this same engine. `None` is a deployment with no CloudWatch mounted, which is
 /// nothing to count on.
@@ -4375,6 +4414,7 @@ fn count_invocation(
     cloudwatch: Option<&::engine::ServiceState<crate::state::CloudWatchState>>,
     handover: &Handover<'_>,
     outcome: &crate::state::InvocationOutcome,
+    attempts_made: i32,
     dead_lettered: bool,
 ) {
     let Some(cloudwatch) = cloudwatch else {
@@ -4390,6 +4430,19 @@ fn count_invocation(
         }
         crate::state::InvocationOutcome::NotAttempted(_) => {}
     }
+    // The attempts this handover made: the ones its invocation reported, and at
+    // least the one every handover EventBridge decided is — a kind whose handover
+    // is a single call reports no count of its own, and a delivery refused before
+    // the target's API was reached is still the one attempt its
+    // `FailedInvocations` datapoint is about. A handover whose invocation was
+    // never attempted counts nothing. What range the number may take is held in
+    // one place, where the datapoints are appended
+    // ([`crate::state::count_invocation_attempts`]).
+    let attempts = match outcome {
+        crate::state::InvocationOutcome::NotAttempted(_) => 0,
+        _ => attempts_made.max(1),
+    };
+    crate::state::count_invocation_attempts(&mut cloudwatch.lock(), bus, rule, attempts);
     if dead_lettered {
         crate::state::count_invocation_sent_to_dlq(&mut cloudwatch.lock(), bus, rule);
     }

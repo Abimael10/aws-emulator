@@ -28,7 +28,8 @@
 //! handover is counted on the
 //! rule's own `Invocations` and `SuccessfulInvocationAttempts`, or on its
 //! `FailedInvocations`, in the CloudWatch store
-//! ([`count_invocation`], [`count_failed_invocation`]) — both reached through the
+//! ([`count_invocation`], [`count_failed_invocation`]), beside the attempts that
+//! handover made ([`count_invocation_attempts`]) — all reached through the
 //! same shared engine this service's store lives in, so there is one copy of each
 //! fact.
 //!
@@ -4976,3 +4977,10 @@ pub mod enum_value_set;
 
 mod replays;
 pub use replays::*;
+
+/// The attempts a rule's target invocation MADE, and the counter they are
+/// published on — the attempt-series total beside
+/// [`SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC`], which is the part of it the target
+/// accepted.
+mod invocation_attempts;
+pub use invocation_attempts::*;

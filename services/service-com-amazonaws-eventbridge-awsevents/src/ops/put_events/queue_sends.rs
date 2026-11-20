@@ -287,7 +287,11 @@ pub(crate) async fn flush(
                     None,
                 )
                 .await;
-                count_invocation(stores.cloudwatch, &handover, &outcome, dead_lettered);
+                // The send is ONE attempt and nothing retries it: the retries a
+                // target's `RetryPolicy` bounds are made by an api-destination
+                // invocation, which is not a queue delivery
+                // ([`crate::state::retry_bounds`]).
+                count_invocation(stores.cloudwatch, &handover, &outcome, 1, dead_lettered);
                 invocations.push(crate::state::TargetInvocation {
                     event_id: message.event_id.clone(),
                     rule: message.rule.clone(),

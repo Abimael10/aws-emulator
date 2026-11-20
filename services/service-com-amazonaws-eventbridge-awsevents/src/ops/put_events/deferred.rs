@@ -103,12 +103,12 @@ async fn perform(
     // ([`crate::state::api_destination_pacing::MAX_DEFERRED_INVOCATIONS`]) — each of them one
     // delivery to one target, which is the unit a per-request budget bounds a fan-out in.
     let mut budget = DeliveryBudget::new();
-    let mut retries: Option<Retries> = None;
+    let mut spent = Spent::default();
     let outcome = invoke_api_destination(
         callback,
         &handover,
         &invocation.body,
-        &mut retries,
+        &mut spent,
         &mut budget,
     )
     .await;
@@ -120,13 +120,14 @@ async fn perform(
         &handover,
         &invocation.body,
         &outcome,
-        retries.as_ref(),
+        spent.retries.as_ref(),
     )
     .await;
     count_invocation(
         stores.cloudwatch.as_ref(),
         &handover,
         &outcome,
+        spent.attempts,
         dead_lettered,
     );
     let mut store = stores.events.lock();

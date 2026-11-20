@@ -336,6 +336,12 @@ fn names_a_place(value: &str) -> bool {
 /// is left as it stands, because nothing says what it stands for, and a value
 /// with no wildcard left to fill is not appended to the path.
 ///
+/// A value fills the ONE place its wildcard holds, so it travels as one path
+/// segment: the characters that would take the request somewhere else — the path
+/// separator, the query and fragment marks, the escape itself and anything a URI
+/// may not carry — are percent-encoded ([`PATH_VALUE`]), which is what keeps a
+/// supplied value from addressing a path the target does not name.
+///
 /// Both target kinds the member serves fill their wildcards here — a
 /// destination's stored `InvocationEndpoint` and the resource path of a REST
 /// API stage target's ARN — so one value fills one wildcard the same way
@@ -355,13 +361,41 @@ pub fn filled_path(endpoint: &str, values: &[String]) -> String {
         // A segment that is not the last is followed by a wildcard.
         if segments.peek().is_some() {
             match values.next() {
-                Some(value) => filled.push_str(value),
+                Some(value) => {
+                    filled.extend(::percent_encoding::utf8_percent_encode(value, PATH_VALUE));
+                }
                 None => filled.push('*'),
             }
         }
     }
     format!("{filled}{rest}")
 }
+
+/// The characters a supplied PATH value is encoded away from: the delimiters that
+/// would move the request out of the place its wildcard names — the path
+/// separator, the query and fragment marks, and the escape itself, so an escaped
+/// delimiter cannot arrive as one — plus the ones RFC 3986 does not admit in a
+/// URI at all.
+///
+/// Encoding the escape means a value that already carries one travels encoded
+/// twice (`%2f` as `%252f`). That is deliberate and not AWS's literal
+/// substitution: a value is one place of the path, and a value that could carry
+/// its own escapes could address a path the target does not name.
+const PATH_VALUE: &::percent_encoding::AsciiSet = &::percent_encoding::CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'/')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'\\')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
 
 /// `uri` with `parameters` on its query string, appended to whatever query the
 /// endpoint already carried.

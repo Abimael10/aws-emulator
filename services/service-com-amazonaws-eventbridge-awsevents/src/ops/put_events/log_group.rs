@@ -45,8 +45,8 @@ use super::*;
 /// A write the group would not take is reported in EventBridge's OWN vocabulary
 /// ([`rejected_write`]), never in the shape name or the sentence CloudWatch Logs
 /// answered it with, and one the group has not taken YET is retried first
-/// ([`crate::state::retry_bounds`]) — the retries the dead letter accounts for in
-/// `retries`.
+/// ([`crate::state::retry_bounds`]) — the attempts and the retries the delivery
+/// made, reported in `spent`.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn deliver_log_event(
     callback: &smithy_server_runtime::EmbeddedEmulator,
@@ -56,7 +56,7 @@ pub(super) async fn deliver_log_event(
     action: &str,
     handover: &Handover<'_>,
     body: &str,
-    retries: &mut Option<Retries>,
+    spent: &mut Spent,
 ) -> crate::state::InvocationOutcome {
     let Some(group) = crate::state::log_group_target::log_group_name(arn) else {
         return crate::state::InvocationOutcome::NotAttempted(
@@ -151,6 +151,10 @@ pub(super) async fn deliver_log_event(
         // One yield per attempt, so a retried delivery stays interruptible.
         ::tokio::task::yield_now().await;
         attempted += 1;
+        // Reported as the attempt is MADE, so the rule's attempt counter counts
+        // the attempts this delivery really made whatever it ends as
+        // ([`super::count_invocation`]).
+        spent.attempts = attempted;
         let answered = client
             .put_log_events()
             .log_group_name(group)
@@ -179,7 +183,7 @@ pub(super) async fn deliver_log_event(
             // behind, so the delivery fails on this attempt. Retry accounting is
             // reported only for a delivery that was RETRIED: a refusal on the
             // first attempt retried nothing.
-            *retries = (attempted > 1).then(|| Retries {
+            spent.retries = (attempted > 1).then(|| Retries {
                 attempts: attempted - 1,
                 exhausted: None,
             });
@@ -207,7 +211,7 @@ pub(super) async fn deliver_log_event(
             break;
         }
     }
-    *retries = Some(Retries {
+    spent.retries = Some(Retries {
         attempts: (attempted - 1).max(0),
         exhausted,
     });

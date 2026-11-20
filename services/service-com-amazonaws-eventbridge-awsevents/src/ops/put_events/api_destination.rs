@@ -55,7 +55,7 @@ pub(super) async fn invoke_api_destination(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     handover: &Handover<'_>,
     body: &str,
-    retries: &mut Option<Retries>,
+    spent: &mut Spent,
     budget: &mut DeliveryBudget,
 ) -> crate::state::InvocationOutcome {
     let target = handover.target;
@@ -131,6 +131,10 @@ pub(super) async fn invoke_api_destination(
             break;
         }
         attempted += 1;
+        // Reported as the attempt is MADE, so what the rule's attempt counter
+        // counts is the attempts this delivery really made whatever it ends as
+        // ([`super::count_invocation`]).
+        spent.attempts = attempted;
         let started = ::std::time::Instant::now();
         let attempt =
             attempt_api_destination(&transport, destination, parameters.as_ref(), body).await;
@@ -144,7 +148,7 @@ pub(super) async fn invoke_api_destination(
                     crate::state::retry_bounds::api_destination_status_failure(*status, payload);
                 // Retry accounting is reported only for a delivery that was
                 // RETRIED: a refusal on the first attempt retried nothing.
-                *retries = (attempted > 1).then(|| Retries {
+                spent.retries = (attempted > 1).then(|| Retries {
                     attempts: attempted - 1,
                     exhausted: None,
                 });
@@ -201,7 +205,7 @@ pub(super) async fn invoke_api_destination(
             attempted,
         ),
     };
-    *retries = Some(Retries {
+    spent.retries = Some(Retries {
         attempts: (attempted - 1).max(0),
         exhausted,
     });

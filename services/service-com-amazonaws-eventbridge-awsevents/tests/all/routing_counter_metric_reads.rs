@@ -40,9 +40,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{
-    EVENT_BUS_NAME_DIMENSION, INVOCATIONS_METRIC, MATCHED_EVENTS_METRIC, METRIC_NAMESPACE,
-    METRIC_UNIT_COUNT, RULE_NAME_DIMENSION, SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC,
-    TRIGGERED_RULES_METRIC,
+    EVENT_BUS_NAME_DIMENSION, INVOCATIONS_METRIC, INVOCATION_ATTEMPTS_METRIC,
+    MATCHED_EVENTS_METRIC, METRIC_NAMESPACE, METRIC_UNIT_COUNT, RULE_NAME_DIMENSION,
+    SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC, TRIGGERED_RULES_METRIC,
 };
 
 use crate::target_dispatch::{
@@ -391,6 +391,7 @@ async fn assert_reads(emulator: &Emulator, row: &Row, pass: u32, matched: f64) {
     let mut metrics = ROUTING_METRICS.to_vec();
     if row.targeted {
         metrics.push(INVOCATIONS_METRIC);
+        metrics.push(INVOCATION_ATTEMPTS_METRIC);
         metrics.push(SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC);
     }
     let expected = rule_series(row.bus, MATCHING_RULE, &metrics);

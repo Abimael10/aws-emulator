@@ -9,7 +9,8 @@
 //! datapoint of value 1 for that delivery — `Invocations` AND
 //! `SuccessfulInvocationAttempts` when the target's API call was made and
 //! accepted, `FailedInvocations` when the invocation was permanently refused
-//! (the same refusal that sends the event to the target's dead-letter queue), and
+//! (the same refusal that sends the event to the target's dead-letter queue),
+//! `InvocationAttempts` for the attempt either of them was the outcome of, and
 //! `InvocationsSentToDlq` for the event that refusal parked there —
 //! and attributes it to that one rule, so a sibling rule on the same bus, matched
 //! by the same event, is counted only for its own deliveries. A handover counter
@@ -32,8 +33,9 @@
 use serde_json::json;
 use service_com_amazonaws_eventbridge_awsevents::state::{
     DEFAULT_EVENT_BUS_NAME, FAILED_INVOCATIONS_METRIC, INVOCATIONS_METRIC,
-    INVOCATIONS_SENT_TO_DLQ_METRIC, MATCHED_EVENTS_METRIC, NO_PERMISSIONS, SERVICE_PRINCIPAL,
-    SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC, TRIGGERED_RULES_METRIC,
+    INVOCATIONS_SENT_TO_DLQ_METRIC, INVOCATION_ATTEMPTS_METRIC, MATCHED_EVENTS_METRIC,
+    NO_PERMISSIONS, SERVICE_PRINCIPAL, SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC,
+    TRIGGERED_RULES_METRIC,
 };
 
 use crate::target_dispatch::{
@@ -417,6 +419,10 @@ async fn each_delivery_is_counted_on_its_own_rules_invocation_metric() {
             (FAILED_INVOCATIONS_METRIC, REFUSED_RULE, expected),
             (INVOCATIONS_METRIC, REFUSED_RULE, 0.0),
             (SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC, REFUSED_RULE, 0.0),
+            // Each rule ATTEMPTED every handover — one attempt each, with no
+            // retry — so both count the attempts whatever came of them.
+            (INVOCATION_ATTEMPTS_METRIC, DELIVERING_RULE, expected),
+            (INVOCATION_ATTEMPTS_METRIC, REFUSED_RULE, expected),
             // Every refused delivery of this row went to the target's dead-letter queue,
             // which the refused rule counts once each; the delivering rule parked nothing.
             (INVOCATIONS_SENT_TO_DLQ_METRIC, REFUSED_RULE, expected),
@@ -451,6 +457,7 @@ async fn each_delivery_is_counted_on_its_own_rules_invocation_metric() {
             DELIVERING_RULE,
             &[
                 INVOCATIONS_METRIC,
+                INVOCATION_ATTEMPTS_METRIC,
                 SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC,
                 MATCHED_EVENTS_METRIC,
                 TRIGGERED_RULES_METRIC,
@@ -461,6 +468,7 @@ async fn each_delivery_is_counted_on_its_own_rules_invocation_metric() {
             REFUSED_RULE,
             &[
                 FAILED_INVOCATIONS_METRIC,
+                INVOCATION_ATTEMPTS_METRIC,
                 INVOCATIONS_SENT_TO_DLQ_METRIC,
                 MATCHED_EVENTS_METRIC,
                 TRIGGERED_RULES_METRIC,

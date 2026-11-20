@@ -27,7 +27,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{
-    DEFAULT_EVENT_BUS_NAME, INVOCATIONS_METRIC, MATCHED_EVENTS_METRIC,
+    DEFAULT_EVENT_BUS_NAME, INVOCATIONS_METRIC, INVOCATION_ATTEMPTS_METRIC, MATCHED_EVENTS_METRIC,
     SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC, TRIGGERED_RULES_METRIC,
 };
 
@@ -273,7 +273,11 @@ async fn every_pattern_match_is_counted_on_the_matched_rules_own_metrics() {
             0
         };
         let expected_invocations = if row.targeted { expected } else { 0.0 };
-        for metric in [INVOCATIONS_METRIC, SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC] {
+        for metric in [
+            INVOCATIONS_METRIC,
+            INVOCATION_ATTEMPTS_METRIC,
+            SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC,
+        ] {
             for (dimensioned, dimensions) in [
                 (
                     "the bus and the rule",
@@ -304,6 +308,7 @@ async fn every_pattern_match_is_counted_on_the_matched_rules_own_metrics() {
         let mut metrics = MATCH_METRICS.to_vec();
         if row.targeted {
             metrics.push(INVOCATIONS_METRIC);
+            metrics.push(INVOCATION_ATTEMPTS_METRIC);
             metrics.push(SUCCESSFUL_INVOCATION_ATTEMPTS_METRIC);
         }
         assert_eq!(
