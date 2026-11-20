@@ -155,28 +155,25 @@ fn cluster_id_requests(cluster_id: Option<&str>) -> Vec<(&'static str, Value)> {
     ]
 }
 
-/// The instance group id the policy rows below name.
-///
-/// The automatic-scaling policy pair ACTS on an instance group — "the instance group to
-/// which the automatic scaling policy is applied" — and reaches a cluster as the scope that
-/// group is looked up in, so a `ClusterId` that resolves no cluster is refused in terms of
-/// the cluster, and this id is blamed only once a cluster resolved and carries no such group
-/// ([`unresolvable_target_sentence`]).
+/// An instance group id no cluster of the account carries, for the rows whose refusal is
+/// about the cluster id's SHAPE — which is settled before any id is looked up, so what
+/// this value resolves to cannot matter there.
 const POLICY_GROUP_ID: &str = "ig-ABCDEFGHIJKLM";
 
 /// The sentence an operation answers a `ClusterId` of the identifier class it resolves no
 /// cluster for: the cluster-id sentence, quoting the id the request sent — the same one on
-/// every operation that resolves a cluster, the automatic-scaling policy pair included,
-/// because the value that did not resolve is the cluster id.
+/// every operation that resolves a cluster, the automatic-scaling policy pair included once
+/// the group it names is a group this account holds (`tests/all/auto_scaling_policy.rs`
+/// owns that order).
 fn unresolvable_target_sentence(cluster_id: &str) -> String {
     format!("Cluster id '{cluster_id}' is not valid.")
 }
 
 /// One request per operation that resolves a `ClusterId` but models NO client error, so
 /// both its refusals travel the request-validation envelope and only the SENTENCE tells
-/// them apart: the policy family. Each names `cluster_id`.
-fn no_client_error_requests(cluster_id: &str) -> Vec<(&'static str, Value)> {
-    let group = POLICY_GROUP_ID;
+/// them apart: the policy family. Each names `cluster_id`, and the instance-group member
+/// of the policy pair names `group`.
+fn no_client_error_requests(cluster_id: &str, group: &str) -> Vec<(&'static str, Value)> {
     vec![
         (
             "GetManagedScalingPolicy",
@@ -205,6 +202,20 @@ fn no_client_error_requests(cluster_id: &str) -> Vec<(&'static str, Value)> {
             }),
         ),
     ]
+}
+
+/// The id of an instance group the cluster `cluster_id` carries, read back through
+/// `ListInstanceGroups` so nothing of the service's state is reached into.
+async fn a_group_of(emr: &Emr, cluster_id: &str) -> String {
+    let listed = emr
+        .ok("ListInstanceGroups", json!({ "ClusterId": cluster_id }))
+        .await;
+    at(&listed, &["InstanceGroups"])
+        .as_array()
+        .and_then(|groups| groups.first())
+        .and_then(|group| group["Id"].as_str())
+        .unwrap_or_else(|| panic!("the launched cluster must carry a group, got {listed}"))
+        .to_string()
 }
 
 /// One request per operation that resolves a `ClusterId` through a surface that words an
@@ -246,7 +257,7 @@ async fn a_cluster_id_outside_the_identifier_class_is_refused_on_its_shape() {
     for malformed in MALFORMED_CLUSTER_IDS {
         let requests = cluster_id_requests(Some(malformed))
             .into_iter()
-            .chain(no_client_error_requests(malformed))
+            .chain(no_client_error_requests(malformed, POLICY_GROUP_ID))
             .chain(other_surface_requests(malformed));
         for (operation, body) in requests {
             let case = format!("{operation} with cluster id {malformed:?}");
@@ -270,7 +281,10 @@ async fn a_cluster_id_outside_the_identifier_class_is_refused_on_its_shape() {
     // The same operations answer the OTHER sentence for an id of that class they resolve
     // no target for, so the shape refusal is not the only thing either family says — each
     // naming the resource that operation could not reach.
-    for (operation, body) in no_client_error_requests(UNRESOLVABLE_CLUSTER_IDS[0]) {
+    // The group the policy pair names is one the LIVE cluster carries, so the cluster id
+    // is the only value of the request that resolves to nothing.
+    let live_group = a_group_of(&emr, &live).await;
+    for (operation, body) in no_client_error_requests(UNRESOLVABLE_CLUSTER_IDS[0], &live_group) {
         let case = format!("{operation} with an unresolvable cluster id");
         let (status, payload) = emr.call(operation, body).await;
         assert_refused(&case, status, &payload, REQUEST_VALIDATION);

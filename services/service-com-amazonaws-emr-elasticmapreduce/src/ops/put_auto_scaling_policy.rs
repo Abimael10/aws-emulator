@@ -185,23 +185,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // The TARGET of this call is the instance group ("the instance group to which the
         // automatic scaling policy is applied", `InstanceGroupId` doc) and the cluster is
-        // the scope the group is looked up in, so each of the two is refused in terms of the
-        // value that did not resolve: a `ClusterId` this account holds no cluster for is
-        // refused as the CLUSTER, the sentence every cluster-scoped operation of this
-        // service answers an unresolved cluster id with, and only a cluster that DID resolve
-        // and carries no such group is refused in terms of the group.
-        let Some(cluster) = store.cluster_mut(&input.cluster_id, now) else {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                crate::state::unknown_cluster_message(&input.cluster_id),
-            ));
+        // the scope that group is looked up in. Which of the two an unresolvable pair is
+        // refused in terms of is the rule BOTH automatic-scaling operations follow, stated
+        // once in `crate::state` so the attach and the detach cannot word it differently.
+        let target = match store.auto_scaling_target_mut(
+            &input.cluster_id,
+            &input.instance_group_id,
+            now,
+        ) {
+            Ok(target) => target,
+            Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
         };
-        let cluster_arn = cluster.arn.clone();
-
-        let Some(group) = cluster.group_mut(&input.instance_group_id) else {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                crate::state::unknown_instance_group_message(&input.instance_group_id),
-            ));
-        };
+        let cluster_arn = target.cluster_arn;
+        let group = target.group;
 
         // "Creates or updates an automatic scaling policy for a core instance group or
         // task instance group" (this operation's doc): the role of a group IS its type,

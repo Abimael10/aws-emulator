@@ -128,6 +128,12 @@ pub use modification_refusals::*;
 mod instance_fleet_modification;
 pub use instance_fleet_modification::*;
 
+/// The TARGET of the automatic-scaling policy pair — the instance group a request names,
+/// the cluster that scopes it, and which of the two an unresolvable pair is refused in
+/// terms of — split out and re-exported the same way.
+mod auto_scaling_target;
+pub use auto_scaling_target::*;
+
 /// The members Amazon EMR fills in for a launch that left them out — the effective
 /// configuration every read of a cluster or of its instance fleets reports — split out
 /// and re-exported the same way.
@@ -1044,9 +1050,11 @@ pub fn unknown_persistent_app_ui_message(persistent_app_ui_id: &str) -> String {
 /// Recorded behavior for the text: Amazon EMR names the resource — an instance group —
 /// then the id the request sent, quoted, through the same tail
 /// [`unknown_cluster_message`] uses. It is the sentence the automatic-scaling policy
-/// operations answer for a group a RESOLVED cluster does not carry; a `ClusterId` that
-/// resolves no cluster at all is refused in terms of the cluster instead
-/// ([`unknown_cluster_message`]), as it is on every other cluster-scoped operation.
+/// operations answer for a group id no cluster of this account carries a group under, and
+/// for a group a resolved cluster does not carry; only a group id that DOES name a group
+/// of this account, sent with a `ClusterId` that resolves no cluster, is refused in terms
+/// of the cluster instead ([`unknown_cluster_message`], and see
+/// [`ComAmazonawsEmrElasticmapreduceState::auto_scaling_target_mut`] for the order).
 pub fn unknown_instance_group_message(instance_group_id: &str) -> String {
     format!("Instance group id {}", not_valid_message(instance_group_id))
 }

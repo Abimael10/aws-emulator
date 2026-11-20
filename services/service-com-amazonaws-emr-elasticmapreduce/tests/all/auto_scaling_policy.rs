@@ -877,19 +877,22 @@ async fn put_auto_scaling_policy_refuses_what_it_cannot_store() {
     }
 }
 
-/// THE RULE on the WORDING of those refusals: each of the two values a request carries is
-/// refused in terms of ITSELF — a `ClusterId` the account holds no cluster for is refused
-/// with the cluster-id sentence every cluster-scoped operation of this service answers an
-/// unresolved cluster id with, and only a cluster that DID resolve while carrying no such
-/// group is refused with the instance-group sentence, which quotes the `InstanceGroupId`
-/// exactly as the request sent it. Either way HTTP 400 `ValidationException`, and the two
-/// sentences differ, so a caller is told which of the two values it has to fix.
+/// THE RULE on the WORDING of those refusals: the instance group the request names is the
+/// reference resolved FIRST, across the groups this account holds, and the refusal names
+/// whichever of the two values did not resolve — an `InstanceGroupId` no cluster of the
+/// account carries a group under is refused with the instance-group sentence whatever the
+/// `ClusterId` beside it resolves to, while a group id that DOES name a group of the
+/// account, sent with a `ClusterId` the account holds no cluster for, is refused with the
+/// cluster-id sentence every cluster-scoped operation of this service answers an unresolved
+/// cluster id with. Either way HTTP 400 `ValidationException`, and the two sentences differ,
+/// so a caller is told which of the two values it has to fix.
 ///
-/// The rows span what the rule generalises over: both operations, both ways the target
-/// fails to resolve (no such cluster at all, and a live cluster carrying no such group),
-/// every form of unusable cluster id and every form of unusable group id — including, for
-/// the no-such-cluster leg, a group id the LIVE cluster really does carry, which is the
-/// case that shows the cluster id is what that refusal is about.
+/// The rows span what the rule generalises over: both operations, every way the target
+/// fails to resolve (no such group anywhere, beside a live cluster and beside a cluster the
+/// account holds none of; and a group of this account under a cluster id that resolves
+/// nothing), and every form of unusable cluster id and of unusable group id.
+/// `tests/all/auto_scaling_policy_target_precedence.rs` carries the cross-cluster rows the
+/// single cluster here cannot state.
 #[tokio::test]
 async fn an_unreachable_policy_target_is_worded_as_the_value_that_did_not_resolve() {
     let emr = Emr::new();
@@ -912,31 +915,32 @@ async fn an_unreachable_policy_target_is_worded_as_the_value_that_did_not_resolv
     );
 
     // `(the case, the cluster id, the group id, the sentence the refusal must be)`: a
-    // cluster the account holds none of, named beside each form of group id and beside a
-    // group the live cluster carries — refused as the CLUSTER; and the live cluster named
-    // beside each form of group id it carries none of — refused as the GROUP.
+    // cluster the account holds none of, named beside the group the live cluster really
+    // carries — refused as the CLUSTER, since the group is the reference that resolved; and
+    // each form of group id no cluster carries a group under, named beside the live cluster
+    // and beside a cluster the account holds none of — refused as the GROUP either way.
     let mut targets: Vec<(String, String, String, String)> = Vec::new();
     for unknown_cluster in UNKNOWN_CLUSTER_IDS {
-        for group in UNKNOWN_GROUP_IDS
-            .iter()
-            .map(|group| (*group).to_string())
-            .chain([core_id.clone()])
-        {
-            targets.push((
-                format!("cluster {unknown_cluster:?} with group {group:?}"),
-                (*unknown_cluster).to_string(),
-                group,
-                format!("Cluster id '{unknown_cluster}' is not valid."),
-            ));
-        }
+        targets.push((
+            format!("cluster {unknown_cluster:?} with the live cluster's core group"),
+            (*unknown_cluster).to_string(),
+            core_id.clone(),
+            format!("Cluster id '{unknown_cluster}' is not valid."),
+        ));
     }
     for unknown_group in UNKNOWN_GROUP_IDS {
-        targets.push((
-            format!("the live cluster with group {unknown_group:?}"),
-            cluster_id.clone(),
-            (*unknown_group).to_string(),
-            format!("Instance group id '{unknown_group}' is not valid."),
-        ));
+        for cluster in UNKNOWN_CLUSTER_IDS
+            .iter()
+            .map(|cluster| (*cluster).to_string())
+            .chain([cluster_id.clone()])
+        {
+            targets.push((
+                format!("cluster {cluster:?} with group {unknown_group:?}"),
+                cluster,
+                (*unknown_group).to_string(),
+                format!("Instance group id '{unknown_group}' is not valid."),
+            ));
+        }
     }
 
     for (label, cluster, group, expected) in &targets {
