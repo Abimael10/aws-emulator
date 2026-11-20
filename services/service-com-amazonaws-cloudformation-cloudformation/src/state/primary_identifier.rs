@@ -234,6 +234,11 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         "AWS::BedrockAgentCore::CodeInterpreter" => "CodeInterpreterId",
         "AWS::BedrockAgentCore::Browser" => "BrowserId",
         "AWS::BedrockAgentCore::Gateway" => "GatewayId",
+        // A gateway TARGET is identified by the PAIR every call on one binds: the gateway
+        // and the target id, which is the id this type publishes.
+        crate::state::provisioner::BEDROCK_AGENTCORE_GATEWAY_TARGET => {
+            crate::state::provisioner::bedrock_agentcore_gateways::GATEWAY_TARGET_ID_ATTRIBUTE
+        }
         // A secret is identified by its ARN, which that type publishes as `Id`.
         "AWS::SecretsManager::Secret" => "Id",
         // The types whose own service assigns an opaque id: an experiment template, a

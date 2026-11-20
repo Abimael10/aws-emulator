@@ -618,16 +618,16 @@ fn output_cases() -> Vec<OutputCase> {
         },
         OutputCase {
             // The AgentCore deployment case: a memory whose identifier the OWNING SERVICE
-            // assigns, so the rule is the documented form.
+            // assigns, so the rule is the documented form — and the memory is really
+            // created there (`state::provisioner::bedrock_agentcore`), so the declaration
+            // carries the `Name` and the `EventExpiryDuration` `CreateMemory` requires.
             //
             // The `AWS::BedrockAgentCore::WorkloadIdentity` resource this row used to
             // declare beside it moved to
             // `core/router/tests/all/cloudformation_provisions_agentcore_workload_identities.rs`
-            // when that type gained a provisioner, for the same reason the
-            // `AWS::Transfer::Server` case above did: a stack that declares it now CALLS
-            // the AgentCore control plane, which only a router with both services mounted
-            // can serve — and that suite asserts the published name and ARN against the
-            // identity the service really created, which is stronger than a form check.
+            // when that type gained a provisioner, and the provisioning half of THIS row —
+            // the memory read back through `GetMemory` by the id the stack published — is
+            // `core/router/tests/all/cloudformation_provisions_agentcore_resources.rs`.
             case: "an agentcore memory: the id its service assigns",
             stack_name: "agentcore-memory",
             template: concat!(
@@ -635,6 +635,7 @@ fn output_cases() -> Vec<OutputCase> {
                 "  Memory:\n",
                 "    Type: AWS::BedrockAgentCore::Memory\n",
                 "    Properties:\n",
+                "      Name: probeMemory\n",
                 "      EventExpiryDuration: 30\n",
                 "Outputs:\n",
                 "  MemoryId:\n",
@@ -676,14 +677,30 @@ fn output_cases() -> Vec<OutputCase> {
         OutputCase {
             // The same rule two types along, where each identifier's documented ALPHABET
             // differs: a runtime label carries no `-` and a gateway's is lower case only.
+            // Both resources are really created in the AgentCore control plane, so each
+            // declaration carries what its own create requires — a runtime's container
+            // artifact and network mode, a gateway's authorizer type — and the execution
+            // role the runtime RUNS AS is one the same stack creates in IAM, because that
+            // service resolves it before it stores the runtime.
             case: "an agentcore runtime and gateway: each id in its own documented form",
             stack_name: "AgentCoreRuntime",
             template: r#"{"Resources":{
+                   "AgentRole":{"Type":"AWS::IAM::Role",
+                     "Properties":{"RoleName":"probe-agentcore-role",
+                       "AssumeRolePolicyDocument":{"Version":"2012-10-17","Statement":[
+                         {"Effect":"Allow",
+                          "Principal":{"Service":"bedrock-agentcore.amazonaws.com"},
+                          "Action":"sts:AssumeRole"}]}}},
                    "Runtime":{"Type":"AWS::BedrockAgentCore::Runtime",
                      "Properties":{"AgentRuntimeName":"probe_runtime",
-                       "RoleArn":"arn:aws:iam::000000000000:role/AgentRole"}},
+                       "RoleArn":{"Fn::GetAtt":["AgentRole","Arn"]},
+                       "AgentRuntimeArtifact":{"ContainerConfiguration":{
+                         "ContainerUri":"public.ecr.aws/probe/agent:latest"}},
+                       "NetworkConfiguration":{"NetworkMode":"PUBLIC"}}},
                    "Gateway":{"Type":"AWS::BedrockAgentCore::Gateway",
-                     "Properties":{"Name":"Probe-Gateway","RoleArn":"arn:aws:iam::000000000000:role/GatewayRole"}}},
+                     "Properties":{"Name":"Probe-Gateway",
+                       "RoleArn":{"Fn::GetAtt":["AgentRole","Arn"]},
+                       "AuthorizerType":"AWS_IAM"}}},
                  "Outputs":{
                    "RuntimeId":{"Value":{"Fn::GetAtt":["Runtime","AgentRuntimeId"]}},
                    "RuntimeArn":{"Value":{"Fn::GetAtt":["Runtime","AgentRuntimeArn"]}},

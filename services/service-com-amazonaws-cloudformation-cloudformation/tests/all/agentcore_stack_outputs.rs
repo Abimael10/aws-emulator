@@ -11,12 +11,18 @@
 //! nothing here can compute is reported with its key and NO value instead of an invented
 //! one.
 //!
+//! Every resource these rows declare is really created in the Amazon Bedrock AgentCore
+//! control plane the stack calls (`state::provisioner::bedrock_agentcore_gateways`), which
+//! MINTS each identifier the stack then publishes — so each declaration carries the
+//! properties that service's own create requires, and what the outputs carry is what it
+//! answered. The provisioning half of the rule, read back through that service's own wire,
+//! is `core/router/tests/all/cloudformation_provisions_agentcore_resources.rs`.
+//!
 //! What the rows span: both sandbox types (`AWS::BedrockAgentCore::CodeInterpreter` and
 //! `AWS::BedrockAgentCore::Browser`), `Ref` and each `Fn::GetAtt` attribute, both template
-//! spellings, a name the identifier's alphabet admits as it is and one it does not, a
-//! named and an unnamed resource, and an attribute nothing publishes. The forms asserted
-//! are the ones the AgentCore control plane's own model fixes —
-//! `smithy_query(query="operation",
+//! spellings, both sandbox network modes, a named and an unnamed resource, two resources of
+//! one type in one stack, and an attribute nothing publishes. The forms asserted are the ones
+//! the AgentCore control plane's own model fixes — `smithy_query(query="operation",
 //! operation="CreateCodeInterpreter,CreateBrowser,CreateAgentRuntime")` on
 //! `services/service-com-amazonaws-bedrockagentcorecontrol-amazonbedrockagentcorecontrol`
 //! — never a literal taken from one recorded stack.
@@ -36,7 +42,7 @@ use service_com_amazonaws_cloudformation_cloudformation::state::status;
 /// form `CodeInterpreterId` and `BrowserId` share with `AgentRuntimeId`, and
 /// `is_agentcore_arn` — so this suite holds no second copy of them. What it adds is the
 /// LABEL check those predicates cannot express: that the label is the name the template
-/// declared, reduced to the identifier's alphabet.
+/// declared, which is the name the control plane created the sandbox under.
 fn label_of(value: &str) -> Option<&str> {
     agentcore_id_parts(value).map(|(label, _)| label)
 }
@@ -48,14 +54,14 @@ fn id_in_arn(value: &str) -> Option<&str> {
 
 /// What one declared output of an AgentCore stack must carry.
 enum Expect {
-    /// Exactly this text.
-    Exact(String),
     /// A modelled identifier whose label is EXACTLY this one — the name the template
-    /// declared, reduced to the identifier's alphabet — and whose suffix no row can spell.
+    /// declared — and whose suffix no row can spell, because the owning service mints it.
     Id(&'static str),
-    /// A modelled identifier whose label BEGINS with this, for a resource the template
-    /// does not name: CloudFormation generates `<stack>-<logical id>-<unique id>`, whose
-    /// `-` the alphabet does not admit and whose digest no row can spell.
+    /// A modelled identifier whose label BEGINS with this, for a resource the template does
+    /// not name: CloudFormation generates `<stack>-<logical id>-<unique id>`, whose `-` the
+    /// name member's alphabet does not admit, so the resource is created under that name
+    /// reduced to it — a label no row can spell past its stem, and a digest it cannot spell
+    /// at all.
     IdLabelled(&'static str),
     /// An AgentCore ARN whose resource portion is `<segment>/<a modelled id labelled
     /// with this>`.
@@ -72,7 +78,6 @@ impl Expect {
     /// Whether `value` satisfies this expectation, and the English of what was required.
     fn check(&self, value: Option<&str>) -> (bool, String) {
         match self {
-            Self::Exact(text) => (value == Some(text.as_str()), format!("exactly {text:?}")),
             Self::Id(label) => (
                 value.is_some_and(|actual| {
                     is_agentcore_runtime_id(actual) && label_of(actual) == Some(*label)
@@ -121,6 +126,10 @@ fn cases() -> Vec<Case> {
             // ARN segment is the one a CUSTOMER-created sandbox carries (the bare
             // `code-interpreter`/`browser` segment is the service's built-in
             // `aws.codeinterpreter.v1` / `aws.browser.v1`, which no template declares).
+            //
+            // `NetworkConfiguration` is `@required` on both creates, and each type's own
+            // default network mode is the one declared here (`SANDBOX` for a code
+            // interpreter, `PUBLIC` for a browser).
             case: "a named code interpreter and browser: id, arn and Ref",
             stack_name: "agentcore-sandboxes",
             template: concat!(
@@ -129,11 +138,16 @@ fn cases() -> Vec<Case> {
                 "    Type: AWS::BedrockAgentCore::CodeInterpreter\n",
                 "    Properties:\n",
                 "      Name: probeInterpreter\n",
+                "      NetworkConfiguration:\n",
+                "        NetworkMode: SANDBOX\n",
                 "  Browser:\n",
                 "    Type: AWS::BedrockAgentCore::Browser\n",
                 "    Properties:\n",
-                // A `_` IS inside the label alphabet, so it survives as it is.
+                // A `_` IS inside the sandbox name's alphabet
+                // (`SandboxName`: `^[a-zA-Z][a-zA-Z0-9_]{0,47}$`).
                 "      Name: probe_browser\n",
+                "      NetworkConfiguration:\n",
+                "        NetworkMode: PUBLIC\n",
                 "Outputs:\n",
                 "  InterpreterId:\n",
                 "    Value: !GetAtt Interpreter.CodeInterpreterId\n",
@@ -170,87 +184,74 @@ fn cases() -> Vec<Case> {
             ],
         },
         Case {
-            // The JSON spelling with long-form intrinsics, and the OTHER half of the
-            // naming rule: `AWS::BedrockAgentCore::Runtime` takes its name from
-            // `AgentRuntimeName` — the member `CreateAgentRuntime` takes — which is
-            // neither the conventional `RuntimeName` nor plain `Name`, so a stack that
-            // names its runtime that way must still get an id labelled with that name.
-            case: "json, long-form GetAtt: a runtime named by AgentRuntimeName",
-            stack_name: "agentcore-runtime",
+            // The JSON spelling with long-form intrinsics, and the whole of the property
+            // document reaching the owning create: a sandbox declared with a description
+            // and an execution role beside its network configuration still publishes the
+            // identifier and the ARN that service minted.
+            case: "json, long-form GetAtt: a fully configured code interpreter",
+            stack_name: "agentcore-json-sandbox",
             template: r#"{"Resources":{
-                 "Runtime":{"Type":"AWS::BedrockAgentCore::Runtime",
-                   "Properties":{"AgentRuntimeName":"probeRuntime"}}},
+                 "Interpreter":{"Type":"AWS::BedrockAgentCore::CodeInterpreter",
+                   "Properties":{"Name":"jsonInterpreter",
+                     "Description":"declared in the JSON spelling",
+                     "ExecutionRoleArn":"arn:aws:iam::000000000000:role/SandboxRole",
+                     "NetworkConfiguration":{"NetworkMode":"SANDBOX"}}}},
                "Outputs":{
-                 "RuntimeId":{"Value":{"Fn::GetAtt":["Runtime","AgentRuntimeId"]}},
-                 "RuntimeArn":{"Value":{"Fn::GetAtt":["Runtime","AgentRuntimeArn"]}},
-                 "RuntimeVersion":{"Value":{"Fn::GetAtt":["Runtime","AgentRuntimeVersion"]}}}}"#,
+                 "InterpreterId":{"Value":{"Fn::GetAtt":["Interpreter","CodeInterpreterId"]}},
+                 "InterpreterArn":{"Value":{"Fn::GetAtt":["Interpreter","CodeInterpreterArn"]}}}}"#,
             expected: vec![
-                ("RuntimeId", Expect::Id("probeRuntime")),
+                ("InterpreterId", Expect::Id("jsonInterpreter")),
                 (
-                    "RuntimeArn",
+                    "InterpreterArn",
                     Expect::Arn {
-                        segment: "runtime",
-                        label: "probeRuntime",
+                        segment: "code-interpreter-custom",
+                        label: "jsonInterpreter",
                     },
                 ),
-                // `CreateAgentRuntime` answers an `agentRuntimeVersion` matching
-                // `^([1-9][0-9]{0,4})$`; a create publishes the first version.
-                ("RuntimeVersion", Expect::Exact("1".to_string())),
             ],
         },
         Case {
-            // A declared name the identifier's alphabet does NOT admit, and one that does
-            // not start with a letter either: the label keeps only what the pattern
-            // admits and takes a leading letter, so the identifier is one the model allows
-            // rather than one it forbids.
-            case: "a declared name outside the identifier's alphabet",
-            stack_name: "agentcore-awkward-name",
-            template: concat!(
-                "Resources:\n",
-                "  Interpreter:\n",
-                "    Type: AWS::BedrockAgentCore::CodeInterpreter\n",
-                "    Properties:\n",
-                "      Name: 9probe..interp-2.\n",
-                "Outputs:\n",
-                "  InterpreterId:\n",
-                "    Value: !GetAtt Interpreter.CodeInterpreterId\n",
-            ),
-            expected: vec![("InterpreterId", Expect::Id("c9probeinterp2"))],
-        },
-        Case {
-            // An UNNAMED sandbox still resolves: it takes CloudFormation's generated
-            // `<stack name>-<logical id>-<unique id>` name, whose `-` the alphabet does
-            // not admit, so the label is that name reduced — never reported as no value,
-            // and never an identifier the model forbids.
-            case: "an unnamed browser still publishes a modelled arn",
+            // An UNNAMED sandbox still resolves: the type's name member admits no `-`, so
+            // the resource is created under CloudFormation's generated
+            // `<stack name>-<logical id>-<unique id>` name REDUCED to that alphabet, and the
+            // identifier the control plane mints carries that label — never reported as no
+            // value, and never a name the owning model forbids.
+            case: "an unnamed code interpreter still publishes a modelled arn",
             stack_name: "agentcore-unnamed",
             template: concat!(
                 "Resources:\n",
                 "  Anon:\n",
-                "    Type: AWS::BedrockAgentCore::Browser\n",
+                "    Type: AWS::BedrockAgentCore::CodeInterpreter\n",
+                "    Properties:\n",
+                "      NetworkConfiguration:\n",
+                "        NetworkMode: SANDBOX\n",
                 "Outputs:\n",
-                "  BrowserId:\n",
-                "    Value: !GetAtt Anon.BrowserId\n",
-                "  BrowserRef:\n",
+                "  InterpreterId:\n",
+                "    Value: !GetAtt Anon.CodeInterpreterId\n",
+                "  InterpreterRef:\n",
                 "    Value: !Ref Anon\n",
             ),
             expected: vec![
-                ("BrowserId", Expect::IdLabelled("agentcoreunnamedAnon")),
-                ("BrowserRef", Expect::IdLabelled("agentcoreunnamedAnon")),
+                ("InterpreterId", Expect::IdLabelled("agentcoreunnamedAnon")),
+                ("InterpreterRef", Expect::IdLabelled("agentcoreunnamedAnon")),
             ],
         },
         Case {
-            // The complement, which keeps the rule honest: an attribute NOTHING here can
-            // compute is reported with its key and no value. A sandbox's RUNNING state is
-            // one — nothing here provisioned a sandbox to be in a state.
-            case: "an attribute nothing can compute carries no value",
+            // The complement, which keeps the rule honest: an attribute NOTHING here
+            // publishes is reported with its key and no value. A sandbox's RUNNING state
+            // is one — `Status` is no property of either type's return values.
+            case: "an attribute nothing publishes carries no value",
             stack_name: "agentcore-unknowable",
             template: concat!(
                 "Resources:\n",
                 "  Interpreter:\n",
                 "    Type: AWS::BedrockAgentCore::CodeInterpreter\n",
                 "    Properties:\n",
-                "      Name: probeInterpreter\n",
+                // A name of its own: one code interpreter per name, so a row cannot
+                // re-declare the name an earlier row's stack already holds.
+                "      Name: silentInterpreter\n",
+                "      NetworkConfiguration:\n",
+                "        NetworkMode: SANDBOX\n",
                 "Outputs:\n",
                 "  InterpreterId:\n",
                 "    Value: !GetAtt Interpreter.CodeInterpreterId\n",
@@ -258,7 +259,7 @@ fn cases() -> Vec<Case> {
                 "    Value: !GetAtt Interpreter.Status\n",
             ),
             expected: vec![
-                ("InterpreterId", Expect::Id("probeInterpreter")),
+                ("InterpreterId", Expect::Id("silentInterpreter")),
                 ("Status", Expect::NoValue),
             ],
         },
@@ -310,8 +311,8 @@ async fn an_agentcore_stacks_declared_outputs_carry_their_resolved_values() {
 }
 
 /// Two sandboxes of one type in one stack get DIFFERENT identifiers, and a second read of
-/// the same stack reports the SAME ones: an identifier is derived from the resource, not
-/// drawn fresh per read.
+/// the same stack reports the SAME ones: an identifier belongs to the resource the owning
+/// service created, not to the read.
 #[tokio::test]
 async fn agentcore_sandbox_identifiers_are_unique_per_resource_and_stable_across_reads() {
     let router = router();
@@ -319,8 +320,16 @@ async fn agentcore_sandbox_identifiers_are_unique_per_resource_and_stable_across
         "Resources:\n",
         "  First:\n",
         "    Type: AWS::BedrockAgentCore::CodeInterpreter\n",
+        "    Properties:\n",
+        "      Name: firstInterpreter\n",
+        "      NetworkConfiguration:\n",
+        "        NetworkMode: SANDBOX\n",
         "  Second:\n",
         "    Type: AWS::BedrockAgentCore::CodeInterpreter\n",
+        "    Properties:\n",
+        "      Name: secondInterpreter\n",
+        "      NetworkConfiguration:\n",
+        "        NetworkMode: SANDBOX\n",
         "Outputs:\n",
         "  FirstId:\n",
         "    Value: !GetAtt First.CodeInterpreterId\n",

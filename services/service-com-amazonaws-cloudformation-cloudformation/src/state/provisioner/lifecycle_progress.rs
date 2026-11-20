@@ -258,6 +258,13 @@ impl Provisioner {
             Self::OpenSearchServerlessVpcEndpoint => {
                 vpc_endpoint_readiness(ctx, region, physical_resource_id).await
             }
+            // `CreateApplication` answers the application `CREATING` — Application Insights is
+            // still onboarding the resources of the group it was created over, and the
+            // components a configuration is applied to are not there in it — so the resource is
+            // held open until that service reports the onboarding finished.
+            Self::ApplicationInsightsApplication => {
+                application_readiness(ctx, region, physical_resource_id, declared).await
+            }
             // `AuthorizeClientVpnIngress` answers the rule `authorizing` — in which it grants
             // no client access to the network yet — and Amazon EC2 reports it `active` once
             // it does, so the resource's creation is finished once that service reports it
@@ -265,12 +272,23 @@ impl Provisioner {
             Self::Ec2ClientVpnAuthorizationRule => {
                 client_vpn_authorization_rule_readiness(ctx, region, declared).await
             }
-            // `CreateApplication` answers the application `CREATING` — Application Insights is
-            // still onboarding the resources of the group it was created over, and the
-            // components a configuration is applied to are not there in it — so the resource is
-            // held open until that service reports the onboarding finished.
-            Self::ApplicationInsightsApplication => {
-                application_readiness(ctx, region, physical_resource_id, declared).await
+            // Each of these Amazon Bedrock AgentCore creates answers `202 Accepted` with the
+            // resource in the transient status its own family documents — a runtime, a
+            // gateway and a target `CREATING`, a memory `CREATING` on its way to `ACTIVE` —
+            // and in none of them does the resource serve anything, so each is held open
+            // until that control plane reports it up. (The two SANDBOX types are not here:
+            // either create answers the sandbox `READY`.)
+            Self::BedrockAgentCoreRuntime => {
+                agentcore_runtime_readiness(ctx, region, physical_resource_id).await
+            }
+            Self::BedrockAgentCoreMemory => {
+                agentcore_memory_readiness(ctx, region, physical_resource_id).await
+            }
+            Self::BedrockAgentCoreGateway => {
+                agentcore_gateway_readiness(ctx, region, physical_resource_id).await
+            }
+            Self::BedrockAgentCoreGatewayTarget => {
+                agentcore_gateway_target_readiness(ctx, region, physical_resource_id).await
             }
             _ => Ok(Readiness::Ready),
         }
@@ -525,6 +543,27 @@ impl Provisioner {
             // holds it.
             Self::MskConfiguration => {
                 msk_configuration_removal(ctx, region, physical_resource_id).await
+            }
+            // Every Amazon Bedrock AgentCore delete answers `202 Accepted` with the resource
+            // in a `DELETING` status — that control plane takes a deleted resource away
+            // asynchronously, so its own reads still resolve the identifier while it does —
+            // and the deletion is finished once it no longer holds the resource. Which is
+            // what keeps a stack from deleting the gateway a target it just deleted is still
+            // served by.
+            Self::BedrockAgentCoreRuntime => {
+                agentcore_runtime_removal(ctx, region, physical_resource_id).await
+            }
+            Self::BedrockAgentCoreMemory => {
+                agentcore_memory_removal(ctx, region, physical_resource_id).await
+            }
+            Self::BedrockAgentCoreGateway => {
+                agentcore_gateway_removal(ctx, region, physical_resource_id).await
+            }
+            Self::BedrockAgentCoreGatewayTarget => {
+                agentcore_gateway_target_removal(ctx, region, physical_resource_id).await
+            }
+            Self::BedrockAgentCoreSandbox(sandbox) => {
+                agentcore_sandbox_removal(ctx, region, sandbox, physical_resource_id).await
             }
             _ => Ok(Removal::Gone),
         }

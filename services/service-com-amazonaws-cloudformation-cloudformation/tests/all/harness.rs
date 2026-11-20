@@ -226,6 +226,15 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
             Arc::clone(&engine),
         ),
     );
+    // The Amazon Bedrock AgentCore control plane, for the `AWS::BedrockAgentCore::*` types a
+    // stack really creates there — a sandbox, a runtime, a memory, a gateway and one of its
+    // targets — so a suite that deploys one reads the resource back through that service's
+    // own wire, by the identifier the stack publishes.
+    router.register_service(
+        service_com_amazonaws_bedrockagentcorecontrol_amazonbedrockagentcorecontrol::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
     // Amazon EC2 Auto Scaling, for the `AWS::AutoScaling::AutoScalingGroup` a stack really
     // creates there, so a suite that deploys a fleet reads the group — its zones, its ARN and
     // the launch template it launches from — back through that service's own wire.

@@ -104,18 +104,55 @@ pub(crate) const BEDROCK_DATA_SOURCE_ID_ATTRIBUTE: &str = "DataSourceId";
 /// again by [`crate::state::provisioner`] from the data source that service answered — the one
 /// place both parts are really known.
 pub(crate) fn bedrock_data_source_identity(knowledge_base_id: &str, data_source_id: &str) -> String {
-    [knowledge_base_id, data_source_id].join(COMPOSITE_IDENTITY_SEPARATOR)
+    composite_identity_pair(knowledge_base_id, data_source_id)
 }
 
 /// The two parts of such an identity, where `identity` is one
 /// ([`bedrock_data_source_identity`]); `None` for a value that is not.
 pub(crate) fn bedrock_data_source_identity_parts(identity: &str) -> Option<(&str, &str)> {
+    composite_identity_pair_parts(identity)
+}
+
+/// The physical resource id of an `AWS::BedrockAgentCore::GatewayTarget`: the PAIR that
+/// type's primary identifier is — the gateway the target is served by and the `targetId` the
+/// Amazon Bedrock AgentCore control plane minted, which are exactly the two labels
+/// `GetGatewayTarget`, `UpdateGatewayTarget` and `DeleteGatewayTarget` each address one by —
+/// joined with [`COMPOSITE_IDENTITY_SEPARATOR`], which is what the type's `Ref` returns.
+///
+/// Not a row of [`composite_identity_properties`]: that one builds an identity out of the
+/// values a declaration STATES, and the second part of this one is the id that control plane
+/// assigns, which no declaration carries. So the identity is built here as a stand-in and
+/// again by [`crate::state::provisioner`] from the target that service answered — the one
+/// place both parts are really known.
+pub(crate) fn agentcore_gateway_target_identity(gateway_id: &str, target_id: &str) -> String {
+    composite_identity_pair(gateway_id, target_id)
+}
+
+/// The two parts of such an identity, where `identity` is one
+/// ([`agentcore_gateway_target_identity`]); `None` for a value that is not, which is what
+/// keeps a call from being addressed with a value of another shape.
+pub(crate) fn agentcore_gateway_target_identity_parts(identity: &str) -> Option<(&str, &str)> {
+    composite_identity_pair_parts(identity)
+}
+
+/// The physical resource id a type whose primary identifier is a PAIR is known by: the two
+/// values the owning service's own API addresses one resource by, joined with
+/// [`COMPOSITE_IDENTITY_SEPARATOR`], which is what such a type's `Ref` returns.
+///
+/// The ONE join of such an identity, which every per-type function above delegates to, so the
+/// readings of that separator cannot diverge — the pair counterpart of
+/// [`composite_identity_triple`], and the one place a value that is not such a pair is told
+/// apart from one that is ([`composite_identity_pair_parts`]).
+pub(crate) fn composite_identity_pair(first: &str, second: &str) -> String {
+    [first, second].join(COMPOSITE_IDENTITY_SEPARATOR)
+}
+
+/// The two parts of such an identity ([`composite_identity_pair`]); `None` for a value that is
+/// not one, which is what keeps a call from being addressed with a value of another shape.
+pub(crate) fn composite_identity_pair_parts(identity: &str) -> Option<(&str, &str)> {
     let mut parts = identity.split(COMPOSITE_IDENTITY_SEPARATOR);
-    let (knowledge_base_id, data_source_id) = (parts.next()?, parts.next()?);
-    parts
-        .next()
-        .is_none()
-        .then_some((knowledge_base_id, data_source_id))
+    let (first, second) = (parts.next()?, parts.next()?);
+    parts.next().is_none().then_some((first, second))
 }
 
 /// The salt the flow-id stand-in is derived under, and how many characters it carries: a

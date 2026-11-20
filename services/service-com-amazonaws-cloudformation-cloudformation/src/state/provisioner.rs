@@ -1188,6 +1188,43 @@ pub(super) enum Provisioner {
     /// removes. The name IS the identity's handle — every call on one takes it — so it is
     /// the physical id the naming rules already compute for the type.
     BedrockAgentCoreWorkloadIdentity,
+    /// `AWS::BedrockAgentCore::Runtime`: an agent runtime of the same control plane, which
+    /// `CreateAgentRuntime` creates under the name the template states, `UpdateAgentRuntime`
+    /// changes — publishing a new `agentRuntimeVersion` for it — and `DeleteAgentRuntime`
+    /// removes. That service MINTS the `agentRuntimeId` the type publishes, the handle every
+    /// runtime API and the data plane's own invoke take, so it is read off that create's own
+    /// answer and is the identity a `Ref` resolves to.
+    BedrockAgentCoreRuntime,
+    /// `AWS::BedrockAgentCore::Memory`: a memory of the same control plane, which
+    /// `CreateMemory` creates under the name the template states and `DeleteMemory` removes.
+    /// That service MINTS the `memoryId` the type publishes — the handle `GetMemory` and
+    /// every event and record API take — so it is read off that create's own answer.
+    ///
+    /// The type has no [`Self::update`] arm: `UpdateMemory` takes its `memoryStrategies` as a
+    /// MODIFY document (the strategies to add, to change and to delete) rather than as the
+    /// list a declaration states, so a changed declaration of this type is reported as NOT
+    /// applied rather than as a success that sent a document the template does not describe.
+    BedrockAgentCoreMemory,
+    /// `AWS::BedrockAgentCore::Gateway`: a gateway of the same control plane, which
+    /// `CreateGateway` creates under the name the template states, `UpdateGateway` changes
+    /// and `DeleteGateway` removes. That service MINTS the `gatewayId` the type publishes —
+    /// the handle every call on a gateway and on its targets takes — so it is read off that
+    /// create's own answer.
+    BedrockAgentCoreGateway,
+    /// `AWS::BedrockAgentCore::GatewayTarget`: one TARGET of such a gateway, which
+    /// `CreateGatewayTarget` creates on the gateway the declaration names,
+    /// `UpdateGatewayTarget` changes and `DeleteGatewayTarget` removes. That service MINTS
+    /// the `targetId` — ten alphanumerics, which no name CloudFormation decides could satisfy
+    /// — and every call on a target binds the gateway BESIDE it, so this resource's physical
+    /// id is the two joined ([`super::template::agentcore_gateway_target_identity`]).
+    BedrockAgentCoreGatewayTarget,
+    /// `AWS::BedrockAgentCore::CodeInterpreter` and `AWS::BedrockAgentCore::Browser`: the two
+    /// SANDBOX types of the same control plane, which `CreateCodeInterpreter` /
+    /// `CreateBrowser` create under the name the template states and the matching deletes
+    /// remove. That service MINTS the `codeInterpreterId` / `browserId` the type publishes
+    /// and builds the ARN that carries it, so both are read off the create's own answer. Each
+    /// value names which of the two it is, so the one set of arms serves both.
+    BedrockAgentCoreSandbox(bedrock_agentcore_gateways::Sandbox),
     /// `AWS::Braket::SpendingLimit`: a spending limit of Amazon Braket's own control plane,
     /// which `CreateSpendingLimit` makes for the quantum device the template names,
     /// `UpdateSpendingLimit` changes and `DeleteSpendingLimit` removes. That service MINTS
@@ -1630,10 +1667,12 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         )),
         EC2_CLIENT_VPN_ENDPOINT => Some(Provisioner::Ec2ClientVpnEndpoint),
         EC2_CLIENT_VPN_AUTHORIZATION_RULE => Some(Provisioner::Ec2ClientVpnAuthorizationRule),
-        _ => None,
+        // The Amazon Bedrock AgentCore family's entries are catalogued beside that family's
+        // own type names and arms ([`type_registry`]), so adding one of its types is a change
+        // to that file alone; every other type answers `None` and is left declared-only.
+        _ => agentcore_provisioner_for(resource_type),
     }
 }
-
 impl Provisioner {
     /// Create one resource in the service that owns it, and report back what that service
     /// decided about it ([`Created`]): the attributes it reported (an ARN it minted, say),
@@ -2373,6 +2412,26 @@ impl Provisioner {
             // declaration asks for.
             Self::BedrockAgentCoreWorkloadIdentity => {
                 create_workload_identity(ctx, region, resource, propagated).await
+            }
+            // Every other `AWS::BedrockAgentCore::*` type publishes `Tags` and its create
+            // takes a tag MAP of its own, so each resource a stack creates carries the tags
+            // CloudFormation gives it beside the ones the declaration asks for. A gateway
+            // TARGET is the exception: `CreateGatewayTarget` takes no `tags` member and the
+            // type publishes no `Tags` property, so no tag is propagated to one.
+            Self::BedrockAgentCoreRuntime => {
+                create_agentcore_runtime(ctx, region, resource, propagated).await
+            }
+            Self::BedrockAgentCoreMemory => {
+                create_agentcore_memory(ctx, region, resource, propagated).await
+            }
+            Self::BedrockAgentCoreGateway => {
+                create_agentcore_gateway(ctx, region, resource, propagated).await
+            }
+            Self::BedrockAgentCoreGatewayTarget => {
+                create_agentcore_gateway_target(ctx, region, resource).await
+            }
+            Self::BedrockAgentCoreSandbox(sandbox) => {
+                create_agentcore_sandbox(ctx, region, sandbox, resource, propagated).await
             }
             // `AWS::Braket::SpendingLimit` publishes `Tags` as a MAP, which is the shape
             // `CreateSpendingLimit`'s own `tags` member takes, so a spending limit a stack
@@ -3389,6 +3448,24 @@ impl Provisioner {
             Self::BedrockAgentCoreWorkloadIdentity => {
                 delete_workload_identity(ctx, region, physical_resource_id).await
             }
+            // Each delete addresses the resource by the identifier that control plane minted
+            // for it, which is this resource's physical id — a gateway target by the gateway
+            // and the target id that id joins.
+            Self::BedrockAgentCoreRuntime => {
+                delete_agentcore_runtime(ctx, region, physical_resource_id).await
+            }
+            Self::BedrockAgentCoreMemory => {
+                delete_agentcore_memory(ctx, region, physical_resource_id).await
+            }
+            Self::BedrockAgentCoreGateway => {
+                delete_agentcore_gateway(ctx, region, physical_resource_id).await
+            }
+            Self::BedrockAgentCoreGatewayTarget => {
+                delete_agentcore_gateway_target(ctx, region, physical_resource_id).await
+            }
+            Self::BedrockAgentCoreSandbox(sandbox) => {
+                delete_agentcore_sandbox(ctx, region, sandbox, physical_resource_id).await
+            }
             // The delete addresses the alarm by the name it was created under, which is this
             // resource's physical id.
             Self::CloudWatchAlarm => {
@@ -3735,6 +3812,20 @@ mod reported_configuration;
 /// types' own NAMES live here, beside the arms that provision them, and the naming rules and
 /// the return-value catalogue key their entries for them by those names.
 pub(in crate::state) mod emr_resources;
+/// The catalogue entries of the Amazon Bedrock AgentCore family, beside that family's own
+/// resource-type NAMES. Visible to the rest of this service's state for the reason
+/// [`emr_resources`]' are: the registry of recognised types, the return-value catalogue and
+/// the primary-identifier table each key an entry by one of those names.
+pub(in crate::state) mod type_registry;
+pub(in crate::state) use type_registry::*;
+/// The Amazon Bedrock AgentCore arms: the agent runtime's and the memory's, plus the readers
+/// every arm of that family shares. Visible to the rest of this service's state because this
+/// family's own resource-type names live beside those arms.
+pub(in crate::state) mod bedrock_agentcore;
+/// The same family's gateway, gateway-target and sandbox arms.
+pub(in crate::state) mod bedrock_agentcore_gateways;
+use bedrock_agentcore::*;
+use bedrock_agentcore_gateways::*;
 use codepipeline_webhooks::*;
 use memorydb_groups::*;
 use elasticache_caches::*;

@@ -11344,6 +11344,7 @@ dependencies = [
  "service-com-amazonaws-autoscaling-autoscaling-2011-01-01",
  "service-com-amazonaws-bcmdashboards-awsbcmdashboardsservice",
  "service-com-amazonaws-bedrockagent-amazonbedrockagentbuildtimelambda",
+ "service-com-amazonaws-bedrockagentcorecontrol-amazonbedrockagentcorecontrol",
  "service-com-amazonaws-cloudfront-cloudfront2020-05-31",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
  "service-com-amazonaws-cloudwatchlogs-logs-20140328",

@@ -368,6 +368,11 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         "AWS::BedrockAgentCore::CodeInterpreter" => &["CodeInterpreterArn", "CodeInterpreterId"],
         "AWS::BedrockAgentCore::Browser" => &["BrowserArn", "BrowserId"],
         "AWS::BedrockAgentCore::Gateway" => &["GatewayArn", "GatewayId"],
+        // A gateway TARGET publishes the id the control plane minted for it beside the ARN of
+        // the gateway it is served by, both read off that create's own answer.
+        crate::state::provisioner::BEDROCK_AGENTCORE_GATEWAY_TARGET => {
+            crate::state::provisioner::bedrock_agentcore_gateways::GATEWAY_TARGET_ATTRIBUTE_NAMES
+        }
         "AWS::BedrockAgentCore::WorkloadIdentity" => &["Name", "WorkloadIdentityArn"],
         "AWS::RUM::AppMonitor" => &["Id"],
         "AWS::CloudWatch::Alarm" => &["Arn"],
@@ -884,6 +889,17 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // addresses a flow by, so neither the id nor the ARN can be computed from the
         // template.
         || resource_type == BEDROCK_FLOW
+        // The six Amazon Bedrock AgentCore types a stack really creates are six more: none of
+        // their creates takes an identifier, and each answers the one that control plane
+        // minted — an `agentRuntimeId` and a `memoryId` of the form `<name>-<10 characters>`,
+        // a `gatewayId` of the same form lower-cased, a `targetId` of exactly ten
+        // alphanumerics, and a `codeInterpreterId` / `browserId` — which is what every later
+        // call on the resource takes and what that type's `Ref` returns, a target's beside the
+        // gateway it is served by ([`agentcore_gateway_target_identity`]). The suffix each of
+        // those identifiers carries is that service's, so no naming rule could compute one.
+        // (An `AWS::BedrockAgentCore::WorkloadIdentity` is NOT one of them: "Ref returns the
+        // name", which the declaration states and the identity is created under.)
+        || agentcore_identity_is_assigned(resource_type)
         // An Amazon Bedrock SESSION is one more: `CreateSession` takes no identifier for the
         // session — the declaration states the encryption key, the metadata and the tags — and
         // answers the `sessionId` the Bedrock Agent runtime drew for it (a uuid) with the
@@ -1177,6 +1193,24 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // ([`crate::state::provisioner`]'s job-definition arms), and the ARN computed here is
         // the stand-in a declaration is resolved against until then.
         || resource_type == BATCH_JOB_DEFINITION
+}
+
+/// Whether `resource_type` is one of the six Amazon Bedrock AgentCore types whose identity is
+/// the one that control plane MINTED, which is what
+/// [`identity_is_service_assigned`] names them for.
+///
+/// One reading of the six, so the question has one answer: the registry of provisioned types
+/// keys its entries by the same names ([`crate::state::provisioner`]).
+fn agentcore_identity_is_assigned(resource_type: &str) -> bool {
+    matches!(
+        resource_type,
+        crate::state::provisioner::BEDROCK_AGENTCORE_RUNTIME
+            | crate::state::provisioner::BEDROCK_AGENTCORE_MEMORY
+            | crate::state::provisioner::BEDROCK_AGENTCORE_GATEWAY
+            | crate::state::provisioner::BEDROCK_AGENTCORE_GATEWAY_TARGET
+            | crate::state::provisioner::BEDROCK_AGENTCORE_CODE_INTERPRETER
+            | crate::state::provisioner::BEDROCK_AGENTCORE_BROWSER
+    )
 }
 
 /// The separator CloudFormation joins the parts of a COMPOSITE physical resource id with.

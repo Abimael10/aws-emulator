@@ -326,11 +326,13 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     // The SESSION of the Bedrock Agent RUNTIME plane, whose `CreateSession` a stack's
     // deployment mints one through (`super::provisioner`).
     BEDROCK_SESSION,
-    // Amazon Bedrock AgentCore — the six types this emulator carries the published return
-    // values of (`super::template::IMPLEMENTED_RESOURCE_TYPES`).
+    // Amazon Bedrock AgentCore — the seven types this emulator carries the published return
+    // values of (`super::template::IMPLEMENTED_RESOURCE_TYPES`). Every one of them is really
+    // created in that control plane (`super::provisioner`).
     "AWS::BedrockAgentCore::Browser",
     "AWS::BedrockAgentCore::CodeInterpreter",
     "AWS::BedrockAgentCore::Gateway",
+    crate::state::provisioner::BEDROCK_AGENTCORE_GATEWAY_TARGET,
     "AWS::BedrockAgentCore::Memory",
     "AWS::BedrockAgentCore::Runtime",
     "AWS::BedrockAgentCore::WorkloadIdentity",

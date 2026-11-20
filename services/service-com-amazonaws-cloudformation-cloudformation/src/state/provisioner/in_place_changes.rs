@@ -302,6 +302,25 @@ impl Provisioner {
                     .await
                     .map(Some)
             }
+            // `UpdateAgentRuntime`, `UpdateGateway` and `UpdateGatewayTarget` each take the
+            // whole declared configuration of the resource by the identifier that control
+            // plane minted for it, so a changed declaration is applied to that resource
+            // rather than replacing it. Neither sandbox type has an arm: that service
+            // publishes no update of a code interpreter or a browser, and the memory family's
+            // own update takes a MODIFY document rather than the declaration
+            // ([`Self::BedrockAgentCoreMemory`]) — a change either type cannot carry is
+            // reported as not applied.
+            Self::BedrockAgentCoreRuntime => {
+                update_agentcore_runtime(ctx, region, resource, declared).await
+            }
+            Self::BedrockAgentCoreGateway => {
+                update_agentcore_gateway(ctx, region, resource, declared)
+                    .await
+                    .map(Some)
+            }
+            Self::BedrockAgentCoreGatewayTarget => {
+                update_agentcore_gateway_target(ctx, region, resource, declared).await
+            }
             // Each of the three AWS Config puts is documented to create OR update the
             // resource it names, so the call that created the recorder, the channel or the
             // rule is the call that applies a changed declaration to it — under the name

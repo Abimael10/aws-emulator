@@ -5,6 +5,11 @@
 
 use super::*;
 
+// The Amazon Bedrock AgentCore GATEWAY TARGET's property and attribute names, which live
+// beside the arms that provision that type, so this catalogue and those arms cannot name the
+// same member differently.
+use crate::state::provisioner::bedrock_agentcore_gateways as agentcore_targets;
+
 /// What `Ref` returns for a resource of this type, and what `Fn::GetAtt` reads off it.
 ///
 /// Source: the "Return values" section the AWS CloudFormation resource and property type
@@ -1588,10 +1593,16 @@ pub(crate) fn return_values(
         // `BrowserArn` the two sandbox types — and whose create responses publish
         // the members a CloudFormation resource of that type returns. `Ref` returns the
         // resource's own identifier (the type's primary identifier) and `Fn::GetAtt` reads
-        // the identifier and the ARN, each in the form the model's pattern fixes; the
-        // members those responses carry that describe a resource's RUNNING state (a
-        // status, a timestamp, a failure reason, a gateway's URL) are not carried, because
-        // nothing here provisioned a resource to be in a state.
+        // the identifier and the ARN, each in the form the model's pattern fixes.
+        //
+        // Every identifier here is a STAND-IN: that control plane MINTS the id each of its
+        // creates answers, so what a declaration is resolved against until the create has
+        // answered is computed here, and `crate::state::provisioning` then re-points it — and
+        // the attributes built around it — at what the create really answered
+        // ([`crate::state::provisioner::Provisioner::BedrockAgentCoreRuntime`] and the arms
+        // beside it). The members those responses carry that describe a resource's RUNNING
+        // state (a status, a timestamp, a failure reason, a gateway's URL) are no property of
+        // the type and are not carried.
         //
         // "Ref returns the memory id"; Fn::GetAtt: MemoryId, MemoryArn.
         "AWS::BedrockAgentCore::Memory" => {
@@ -1690,6 +1701,45 @@ pub(crate) fn return_values(
             attributes.insert("GatewayId".to_string(), id.clone());
             attributes.insert("GatewayArn".to_string(), arn);
             (id, attributes)
+        }
+        // One TARGET of such a gateway. "Ref returns" the type's primary identifier, which is
+        // the PAIR every call on a target binds — the gateway and the `targetId` the control
+        // plane minted ([`agentcore_gateway_target_identity`]) — and Fn::GetAtt reads that id
+        // and the ARN of the gateway the target is served by. A `TargetId` is exactly ten
+        // alphanumerics (`^[0-9a-zA-Z]{10}$`) and carries no label at all, so the id here is a
+        // STAND-IN derived under its own salt, exactly as a data source's below is, and
+        // `super::provisioning` re-points it and the identity built around it at what the
+        // create really answered
+        // ([`crate::state::provisioner::Provisioner::BedrockAgentCoreGatewayTarget`]). The
+        // gateway half is the declaration's own, resolved through the template's intrinsics,
+        // so a `Ref` to a gateway of the same stack carries the id that service minted for it
+        // by the time the create is made.
+        crate::state::provisioner::BEDROCK_AGENTCORE_GATEWAY_TARGET => {
+            let target_id = service_assigned_label(
+                AGENTCORE_TARGET_ID_SALT,
+                name,
+                AGENTCORE_TARGET_ID_DIGITS,
+            );
+            let gateway_id = properties
+                .get(agentcore_targets::GATEWAY_TARGET_GATEWAY_PROPERTY)
+                .and_then(|value| text(value, scope, 0, budget))
+                .unwrap_or_default();
+            attributes.insert(
+                agentcore_targets::GATEWAY_TARGET_ID_ATTRIBUTE.to_string(),
+                target_id.clone(),
+            );
+            attributes.insert(
+                agentcore_targets::GATEWAY_TARGET_GATEWAY_ARN_ATTRIBUTE.to_string(),
+                ::emulator_server::emulator_arn(
+                    AGENTCORE_ARN_SERVICE,
+                    region,
+                    &format!("gateway/{gateway_id}"),
+                ),
+            );
+            (
+                agentcore_gateway_target_identity(&gateway_id, &target_id),
+                attributes,
+            )
         }
         // Amazon Bedrock's own control plane: the guardrail an `AWS::Bedrock::Guardrail`
         // declares. "Ref returns the guardrail ARN" (the type's primary identifier);

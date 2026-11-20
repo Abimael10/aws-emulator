@@ -600,6 +600,23 @@ impl Provisioner {
             Self::BedrockAgentCoreWorkloadIdentity => {
                 describe_workload_identity(ctx, region, physical_resource_id).await
             }
+            // The same control plane's own reads of the rest of its family, each by the
+            // identifier it minted for the resource.
+            Self::BedrockAgentCoreRuntime => {
+                describe_agentcore_runtime(ctx, region, physical_resource_id).await
+            }
+            Self::BedrockAgentCoreMemory => {
+                describe_agentcore_memory(ctx, region, physical_resource_id).await
+            }
+            Self::BedrockAgentCoreGateway => {
+                describe_agentcore_gateway(ctx, region, physical_resource_id).await
+            }
+            Self::BedrockAgentCoreGatewayTarget => {
+                describe_agentcore_gateway_target(ctx, region, physical_resource_id).await
+            }
+            Self::BedrockAgentCoreSandbox(sandbox) => {
+                describe_agentcore_sandbox(ctx, region, sandbox, physical_resource_id).await
+            }
             // Amazon Braket publishes no read of ONE spending limit, so the limit is read
             // out of the account's own listing, by the ARN that service minted for it.
             Self::BraketSpendingLimit => {

@@ -221,6 +221,12 @@ service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = t
 # refused and the stack fails — and the id the stack publishes is read back through that
 # service's own wire.
 service-com-amazonaws-bedrockagent-amazonbedrockagentbuildtimelambda = { workspace = true }
+# The Amazon Bedrock AgentCore control plane, for the `AWS::BedrockAgentCore::*` types a stack
+# really creates there (`state::provisioner::bedrock_agentcore` and
+# `state::provisioner::bedrock_agentcore_gateways`): a suite that deploys one must have its
+# owning service mounted beside CloudFormation, or the create is refused and the stack fails —
+# and the identifier the stack publishes is read back through that service's own wire.
+service-com-amazonaws-bedrockagentcorecontrol-amazonbedrockagentcorecontrol = { workspace = true }
 # Amazon ECR, for the `AWS::ECR::Repository` a stack really creates there
 # (`state::provisioner`): a suite that deploys one must have its owning service mounted
 # beside CloudFormation, or the create is refused and the stack fails.

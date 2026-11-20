@@ -457,6 +457,13 @@ const AGENTCORE_LABEL_CHARS: usize = 48;
 /// `AgentRuntimeArn`).
 const AGENTCORE_ARN_SERVICE: &str = "bedrock-agentcore";
 
+/// The salt the stand-in for a gateway TARGET's id is derived under, and how many characters
+/// it carries: a `TargetId` is `^[0-9a-zA-Z]{10}$`, so the stand-in is exactly ten
+/// alphanumeric characters and carries no label at all — unlike every other identifier of
+/// this family, which is a label plus [`AGENTCORE_ID_SUFFIX_CHARS`].
+const AGENTCORE_TARGET_ID_SALT: &str = "bedrock-agentcore/gateway-target";
+const AGENTCORE_TARGET_ID_DIGITS: usize = 10;
+
 /// The version an AgentCore Runtime carries when it is first created.
 ///
 /// `CreateAgentRuntime` answers an `agentRuntimeVersion` (`^([1-9][0-9]{0,4})$`,
@@ -3013,6 +3020,7 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::BedrockAgentCore::Browser",
     "AWS::BedrockAgentCore::CodeInterpreter",
     "AWS::BedrockAgentCore::Gateway",
+    crate::state::provisioner::BEDROCK_AGENTCORE_GATEWAY_TARGET,
     "AWS::BedrockAgentCore::Memory",
     "AWS::BedrockAgentCore::Runtime",
     "AWS::BedrockAgentCore::WorkloadIdentity",
