@@ -214,7 +214,9 @@ impl AnalysedConfiguration {
             deletion_protection: record.deletion_protection,
             auto_minor_version_upgrade: record.auto_minor_version_upgrade,
             monitoring_interval: record.monitoring_interval,
-            performance_insights_enabled: record.performance_insights_enabled,
+            // A cluster no request configured Performance Insights on is a cluster
+            // Performance Insights is off for, which is what the check reads.
+            performance_insights_enabled: record.performance_insights_enabled.unwrap_or(false),
         }
     }
 }

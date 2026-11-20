@@ -165,8 +165,12 @@ pub struct DbClusterRecord {
     pub monitoring_role_arn: Option<String>,
     /// `DatabaseInsightsMode`.
     pub database_insights_mode: String,
-    /// `PerformanceInsightsEnabled`.
-    pub performance_insights_enabled: bool,
+    /// `PerformanceInsightsEnabled`: whether Performance Insights is on for this cluster,
+    /// as a request configured it. `None` for a cluster no request ever configured
+    /// Performance Insights on: the member is a `BooleanOptional` the model gives no
+    /// default, so a cluster that carries no setting for it reports none rather than a
+    /// value nothing asked for.
+    pub performance_insights_enabled: Option<bool>,
     /// `PerformanceInsightsKMSKeyId`.
     pub performance_insights_kms_key_id: Option<String>,
     /// `PerformanceInsightsRetentionPeriod`.
@@ -887,7 +891,13 @@ impl DbClusterRecord {
             monitoring_interval: Some(self.monitoring_interval),
             monitoring_role_arn: self.monitoring_role_arn.clone(),
             database_insights_mode: Some(self.database_insights_mode.clone()),
-            performance_insights_enabled: Some(self.performance_insights_enabled),
+            // `PerformanceInsightsEnabled`, `PerformanceInsightsKMSKeyId` and
+            // `PerformanceInsightsRetentionPeriod` are optional members the model gives no
+            // default, so each is reported only once a request has configured it and is
+            // left out of the envelope for a cluster that carries no Performance Insights
+            // setting at all — a member with a value nothing asked for would read as
+            // configuration the request never made.
+            performance_insights_enabled: self.performance_insights_enabled,
             performance_insights_kms_key_id: self.performance_insights_kms_key_id.clone(),
             performance_insights_retention_period: self.performance_insights_retention_period,
             serverless_v2_scaling_configuration: self.serverless_v2_scaling.clone(),

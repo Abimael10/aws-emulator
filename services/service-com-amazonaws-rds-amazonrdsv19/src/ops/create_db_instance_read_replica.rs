@@ -1420,7 +1420,9 @@ fn resolve_source_cluster(
         domain: cluster.domain.clone(),
         ca_certificate_identifier: cluster.ca_certificate_identifier.clone(),
         monitoring_interval: cluster.monitoring_interval,
-        performance_insights_enabled: cluster.performance_insights_enabled,
+        // A cluster no request configured Performance Insights on is a cluster Performance
+        // Insights is off for, so a replica of it starts with it off.
+        performance_insights_enabled: cluster.performance_insights_enabled.unwrap_or(false),
         performance_insights_kms_key_id: cluster.performance_insights_kms_key_id.clone(),
         performance_insights_retention_period: cluster.performance_insights_retention_period,
         iam_database_authentication_enabled: cluster.iam_database_authentication_enabled,

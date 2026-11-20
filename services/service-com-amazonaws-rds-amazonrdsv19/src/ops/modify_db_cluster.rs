@@ -970,7 +970,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if let Some(value) = input.enable_performance_insights {
             changed = true;
-            record.performance_insights_enabled = value;
+            record.performance_insights_enabled = Some(value);
         }
         if let Some(value) = input.performance_insights_kms_key_id {
             changed = true;

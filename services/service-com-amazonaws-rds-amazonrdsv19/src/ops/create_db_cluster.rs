@@ -1267,7 +1267,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or(crate::state::DEFAULT_MONITORING_INTERVAL),
             monitoring_role_arn: input.monitoring_role_arn,
             database_insights_mode,
-            performance_insights_enabled: input.enable_performance_insights.unwrap_or(false),
+            // `EnablePerformanceInsights` is a `BooleanOptional` with no documented
+            // default, so a request that names none leaves the cluster with no Performance
+            // Insights setting at all rather than an explicit `false`.
+            performance_insights_enabled: input.enable_performance_insights,
             performance_insights_kms_key_id: input.performance_insights_kms_key_id,
             performance_insights_retention_period: input.performance_insights_retention_period,
             serverless_v2_scaling,
@@ -1466,7 +1469,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         (record.identifier.clone(), configuration)
                     });
                 let monitoring = ::service_common::db_data_sources::MonitoringConfiguration {
-                    performance_insights_enabled: record.performance_insights_enabled,
+                    performance_insights_enabled: record
+                        .performance_insights_enabled
+                        .unwrap_or(false),
                     database_insights_mode: Some(record.database_insights_mode.clone()),
                 };
                 let cluster_arn = record.arn();

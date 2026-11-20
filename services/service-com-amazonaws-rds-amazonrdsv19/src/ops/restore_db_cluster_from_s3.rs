@@ -968,7 +968,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             monitoring_interval: crate::state::DEFAULT_MONITORING_INTERVAL,
             monitoring_role_arn: None,
             database_insights_mode: crate::state::DEFAULT_DATABASE_INSIGHTS_MODE.to_string(),
-            performance_insights_enabled: false,
+            performance_insights_enabled: None,
             performance_insights_kms_key_id: None,
             performance_insights_retention_period: None,
             serverless_v2_scaling: input.serverless_v2_scaling_configuration.as_ref().map(
@@ -1091,7 +1091,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let db_cluster = store.cluster_to_wire(&record);
                 let engine = record.engine.clone();
                 let monitoring = ::service_common::db_data_sources::MonitoringConfiguration {
-                    performance_insights_enabled: record.performance_insights_enabled,
+                    performance_insights_enabled: record
+                        .performance_insights_enabled
+                        .unwrap_or(false),
                     database_insights_mode: Some(record.database_insights_mode.clone()),
                 };
                 let cluster_arn = record.arn();
