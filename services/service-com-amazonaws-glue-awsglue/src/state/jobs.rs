@@ -130,6 +130,55 @@ pub fn admits_flex_execution_class(command: &JobCommand, glue_version: &str) -> 
 /// The first Glue major version that takes [`DEFAULT_TIMEOUT_MINUTES_FROM_GLUE_5`].
 pub(super) const FIRST_GLUE_MAJOR_VERSION_WITH_SHORT_DEFAULT_TIMEOUT: u32 = 5;
 
+/// The one `GlueVersion` that is not a version at all: the literal the member's `@pattern`
+/// admits beside a dotted version (`GlueVersionString`, `^((\w+\.)+\w+|auto)$`), with which
+/// a definition leaves the version the job runs on to the service.
+pub const AUTO_GLUE_VERSION: &str = "auto";
+
+/// The Glue versions a job definition may name — the versions of the Glue engine this
+/// service runs a job on, which is a published, DISCRETE set and not every string the
+/// member's `@pattern` happens to admit ("for more information about the available Glue
+/// versions and corresponding Spark and Python versions, see Glue version in the developer
+/// guide", `CreateJob$GlueVersion`).
+///
+/// Each of the earlier entries is a version the MODEL's own documentation names: 0.9
+/// ([`super::DEFAULT_ML_TRANSFORM_GLUE_VERSION`]), 1.0 and 2.0 ("for Glue version 1.0 or
+/// earlier jobs, using the standard worker type …", "for Glue version 2.0+ jobs, you cannot
+/// specify a Maximum capacity", `CreateJob$MaxCapacity`), 3.0 ("only jobs with Glue version
+/// 3.0 and above … may set ExecutionClass to FLEX", `CreateJob$ExecutionClass`), 4.0 ("Ray
+/// jobs should set GlueVersion to 4.0 or greater", `CreateJob$GlueVersion`), 5.0 ("480
+/// minutes for Glue version 5.0 and later", `Job$Timeout`) and 5.1 ("jobs that are created
+/// without specifying a Glue version default to Glue 5.1", `CreateJob$GlueVersion`).
+///
+/// The LAST entry is the version the service itself fills a definition in with
+/// ([`DEFAULT_GLUE_VERSION`]) — which is RECORDED rather than documented: the reads of a job
+/// created without a version, and of a run of it, report that version, so it is a version
+/// the service runs and a definition that names it explicitly asks for the engine the
+/// service would have given it anyway. A definition read back and resubmitted unchanged
+/// therefore stays admissible, which is why the constant is read here rather than restated.
+pub const SUPPORTED_GLUE_VERSIONS: [&str; 8] = [
+    "0.9",
+    "1.0",
+    "2.0",
+    "3.0",
+    "4.0",
+    "5.0",
+    "5.1",
+    DEFAULT_GLUE_VERSION,
+];
+
+/// Whether `glue_version` is one a job definition may name: a version the service runs
+/// ([`SUPPORTED_GLUE_VERSIONS`]), or the literal that leaves the choice to the service
+/// ([`AUTO_GLUE_VERSION`]).
+///
+/// The member's `@pattern` admits any dotted word (`4.9.9`, `9.9`), so the FORM being right
+/// does not make the version one the service has: a value outside this set names an engine
+/// nothing runs, which the write refuses
+/// ([`messages::glue_version_invalid`]).
+pub fn is_supported_glue_version(glue_version: &str) -> bool {
+    glue_version == AUTO_GLUE_VERSION || SUPPORTED_GLUE_VERSIONS.contains(&glue_version)
+}
+
 /// The `JobCommand` a submitted job definition is STORED with: the one submitted, with the
 /// members the SERVICE fills in present on it.
 ///

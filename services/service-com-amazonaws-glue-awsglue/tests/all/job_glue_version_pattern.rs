@@ -2,41 +2,47 @@
 
 //! The `GlueVersion` a job definition may carry, and the refusal of one outside it.
 //!
-//! The rule under test: a `GlueVersion` is admitted exactly when it matches the form the
-//! service states for that member — a dotted version, or the literal `auto` — and a value
-//! outside that form is refused at the request boundary with HTTP 400, naming the member in
-//! the service's own lowerCamel spelling and quoting the form it had to satisfy. The form is
-//! the `@pattern` of `GlueVersionString`, the shape `CreateJob$GlueVersion` and
-//! `JobUpdate$GlueVersion` target
-//! (`smithy_query(query="shape",shape="GlueVersionString")`): `^((\w+\.)+\w+|auto)$`, with
-//! `@length` 1..255. The refusal quotes that expression WITHOUT the anchoring pair the model
-//! wraps it in, which is the rendering this service's constraint refusals are recorded
-//! stating and the one `service_common::validation::unanchored` owns.
+//! Two rules are pinned here, each over a table of inputs:
 //!
-//! The rows differ along what the rule generalises over: how many dotted components a
-//! version has, whether it is the literal `auto`, and the ways a value can miss the form
-//! (no dot at all, a trailing dot, a word that only starts like `auto`, and the wrong case
-//! of it). The recorded case — a create sending the dotless `4` — is one refused row.
+//! * a `GlueVersion` outside the FORM the member admits is refused at the request boundary
+//!   with HTTP 400, naming the member in the service's own lowerCamel spelling and quoting
+//!   the form it had to satisfy. The form is the `@pattern` of `GlueVersionString`, the shape
+//!   `CreateJob$GlueVersion` and `JobUpdate$GlueVersion` target
+//!   (`smithy_query(query="shape",shape="GlueVersionString")`): `^((\w+\.)+\w+|auto)$`, with
+//!   `@length` 1..255. The refusal quotes that expression exactly as the model writes it,
+//!   anchoring pair included, which is the expression this service publishes for that shape.
+//! * a `GlueVersion` of that form which names no version the service RUNS is refused by the
+//!   operation itself, with its modelled `InvalidInputException` naming the version asked
+//!   for: the form admits any dotted word, while the versions of the Glue engine are a
+//!   published, discrete set.
+//!
+//! The rows differ along what the rules generalise over: how many dotted components a
+//! version has, whether it is the literal `auto`, which published version it is, and the
+//! ways a value can miss the form (no dot at all, a trailing dot, a word that only starts
+//! like `auto`, and the wrong case of it). The recorded cases — a create sending the dotless
+//! `4`, and one sending a two-component version the service does not run — are one refused
+//! row each.
 //!
 //! Every call goes over the wire through the shared [`crate::wire`] harness, so what is
 //! asserted is HTTP behaviour and not a direct call into a handler.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_glue_awsglue::state::DEFAULT_GLUE_VERSION;
 
 use crate::wire::{call, emulator, error_code, ok};
 
 /// The role ARN every job definition below is created with.
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/sim2real-glue-job-role";
 
-/// The form a `GlueVersion` has to satisfy, as the member's `@pattern` spells it. A
-/// refusal quotes it without the anchoring pair ([`stated_glue_version_pattern`]), which is
+/// The form a `GlueVersion` has to satisfy, as the member's `@pattern` spells it. A refusal
+/// quotes exactly this text — the expression this service publishes for the shape — which is
 /// what the expectation below compares against.
 const GLUE_VERSION_PATTERN: &str = r"^((\w+\.)+\w+|auto)$";
 
-/// [`GLUE_VERSION_PATTERN`] as a refusal quotes it: the expression the service advertises,
-/// which is the model's text without the whole-value anchoring pair.
-fn stated_glue_version_pattern() -> String {
-    ::service_common::validation::unanchored(GLUE_VERSION_PATTERN)
+/// The requirement clause a `GlueVersion` outside [`GLUE_VERSION_PATTERN`] breaks, as a
+/// constraint clause states it.
+fn stated_glue_version_requirement() -> String {
+    format!("Member must satisfy regular expression pattern: {GLUE_VERSION_PATTERN}")
 }
 
 /// A `CreateJob` body carrying `glue_version`.
@@ -71,13 +77,16 @@ fn message_of(body: &Value) -> String {
     format!("<no message in {body}>")
 }
 
-/// A `GlueVersion` of the form the member admits is stored and read back — dotted versions
-/// of two and three components, and the literal `auto`.
+/// A `GlueVersion` of the form the member admits AND of a version the service runs is stored
+/// and read back — published versions, the version the service fills a definition in with,
+/// and the literal `auto`.
 #[tokio::test]
 async fn a_glue_version_of_the_admitted_form_round_trips() {
-    // Values inside `^((\w+\.)+\w+|auto)$`, including one the issue did not cite (`auto`)
-    // and one with three components.
-    let admitted = ["4.0", "5.0", "3.9.1", "auto"];
+    // Versions inside `^((\w+\.)+\w+|auto)$` that the service runs, including three the
+    // issue did not cite (`auto`, the earliest published version, and the version a
+    // definition naming none is given — so a definition read back and resubmitted unchanged
+    // is still admitted).
+    let admitted = ["4.0", "5.0", "5.1", "0.9", DEFAULT_GLUE_VERSION, "auto"];
 
     for (index, version) in admitted.iter().enumerate() {
         let router = emulator();
@@ -136,15 +145,71 @@ async fn a_glue_version_outside_the_admitted_form_is_refused() {
                 error_code(&answer)
             );
             assert!(
-                message.contains(&stated_glue_version_pattern()),
+                message.contains(&stated_glue_version_requirement()),
                 "case {version:?} / {operation}: the refusal must quote the form the value had \
                  to satisfy, {}, got {message:?}",
-                stated_glue_version_pattern()
+                stated_glue_version_requirement()
             );
         }
 
         // The refused create stored nothing, and the refused update left the stored
         // definition's version where the create put it.
+        let (status, answer) = call(&router, "GetJob", &json!({ "JobName": name })).await;
+        assert_eq!(
+            status, 400,
+            "case {version:?}: a refused create must store no job definition, got {status} \
+             with {answer}"
+        );
+        let stored = ok(&router, "GetJob", &json!({ "JobName": "stored" })).await;
+        assert_eq!(
+            stored["Job"]["GlueVersion"],
+            json!("4.0"),
+            "case {version:?}: a refused update must leave the stored version alone, got \
+             {stored}"
+        );
+    }
+}
+
+/// A `GlueVersion` of the admitted form that names no version the service runs is refused by
+/// the operation itself — its modelled `InvalidInputException`, naming the version asked for
+/// — on both writes that take a job definition, and nothing is stored.
+#[tokio::test]
+async fn a_glue_version_the_service_does_not_run_is_refused_by_the_operation() {
+    // Values inside `^((\w+\.)+\w+|auto)$` that name no version of the engine: one past the
+    // published versions (the recorded case), one BETWEEN two of them, a three-component
+    // one, and a dotted word that is no version at all.
+    let unavailable = ["9.9", "3.5", "3.9.1", "spark.three"];
+
+    for (index, version) in unavailable.iter().enumerate() {
+        let router = emulator();
+        let name = format!("unavailable-{index}");
+        ok(&router, "CreateJob", &create_body("stored", "4.0")).await;
+
+        let requests: Vec<(&str, Value)> = vec![
+            ("CreateJob", create_body(&name, version)),
+            ("UpdateJob", update_body("stored", version)),
+        ];
+
+        for (operation, body) in &requests {
+            let (status, answer) = call(&router, operation, body).await;
+            assert_eq!(
+                status, 400,
+                "case {version:?} / {operation}: expected 400, got {status} with {answer}"
+            );
+            assert!(
+                error_code(&answer).ends_with("InvalidInputException"),
+                "case {version:?} / {operation}: expected InvalidInputException, got {} in \
+                 {answer}",
+                error_code(&answer)
+            );
+            assert_eq!(
+                message_of(&answer),
+                format!("Glue version: {version} is invalid"),
+                "case {version:?} / {operation}: unexpected wording"
+            );
+        }
+
+        // Nothing was stored, and the stored definition keeps the version its create set.
         let (status, answer) = call(&router, "GetJob", &json!({ "JobName": name })).await;
         assert_eq!(
             status, 400,

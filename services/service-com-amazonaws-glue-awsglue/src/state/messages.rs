@@ -861,13 +861,16 @@ pub fn federated_source_unreachable(database_name: &str, source: &str) -> String
     )
 }
 
-/// A `CreateTable` whose `OpenTableFormatInput` names an open table format with no
-/// input of its own. The member carries exactly one format
-/// (`OpenTableFormatInput$IcebergInput`), so a value carrying none asks for no table.
-/// NOT recorded: what is pinned is the behaviour — 400 with the operation's modelled
-/// `InvalidInputException` — and a sentence naming the member that has to be there.
-pub const OPEN_TABLE_FORMAT_REQUIRES_ICEBERG: &str =
-    "OpenTableFormatInput must specify IcebergInput.";
+/// A `CreateTable` whose `OpenTableFormatInput` names an open table format with no input of
+/// its own, submitted with a `TableInput` that does define the table. The member carries
+/// exactly one format (`OpenTableFormatInput$IcebergInput`), so a value carrying none asks
+/// for a table in no format; a create that defines no table either is the refusal above
+/// ([`MISSING_ICEBERG_CREATE_INPUT`]).
+///
+/// NOT recorded for this branch, so it is worded by the SAME rule as the recorded one it
+/// sits beside: the create names the nested input it was handed none of. Only the input
+/// differs — this branch runs out one level higher up, at the format itself.
+pub const OPEN_TABLE_FORMAT_REQUIRES_ICEBERG: &str = "IcebergInput cannot be equal to null";
 
 /// A `CreateTable` of an open-table-format table that names no location for it. An
 /// Iceberg table's metadata is written under the table's own location, so a create
@@ -878,13 +881,13 @@ pub const ICEBERG_TABLE_REQUIRES_LOCATION: &str =
     "An Iceberg table requires a location, in TableInput.StorageDescriptor.Location \
          or in IcebergInput.CreateIcebergTableInput.Location.";
 
-/// A `CreateTable` of an open-table-format table that carries neither a `TableInput`
-/// nor the Iceberg input that would define one. NOT recorded: what is pinned is the
-/// behaviour — 400 with the operation's modelled `InvalidInputException` — and a
-/// sentence naming the members the table definition may come from.
-pub const ICEBERG_TABLE_REQUIRES_DEFINITION: &str =
-    "An Iceberg table requires a TableInput, or an \
-         IcebergInput.CreateIcebergTableInput defining the table.";
+/// A `CreateTable` that carries no input defining the table it asks for: no `TableInput`,
+/// and no `CreateIcebergTableInput` under its `OpenTableFormatInput` to define one.
+///
+/// RECORDED constant, and the whole message: a create naming no definition falls through
+/// to the open-table-format path, and the refusal names the nested input THAT path needs
+/// and nothing of the request — so one wording answers every such create.
+pub const MISSING_ICEBERG_CREATE_INPUT: &str = "CreateIcebergTableInput cannot be equal to null";
 
 /// `UpdateTable` whose `VersionId` is not the version the table is currently under —
 /// one a later write has replaced, or one the table never had.
@@ -901,6 +904,29 @@ pub const TABLE_UPDATE_CONCURRENT_MODIFICATION: &str =
 /// than the miss every other job lookup reports ([`JOB_NOT_FOUND`]), which is why the
 /// start does not share that sentence.
 pub const JOB_METADATA_MISSING: &str = "Failed to start job run due to missing metadata.";
+
+/// A write that takes a JOB DEFINITION (`CreateJob`, `UpdateJob`) whose definition carries
+/// no value for a member the job cannot run without — the command it runs, or the role it
+/// runs under.
+///
+/// RECORDED template: fixed text plus ONE variable part, the member the definition left out,
+/// spelled as the model spells that member of the definition (`JobUpdate$Command`,
+/// `JobUpdate$Role`) rather than as the wire path it travelled under. The members are judged
+/// in the order the definition declares them to be needed — the command before the role — so
+/// a definition missing both is refused about the command.
+pub fn job_definition_member_null(member: &str) -> String {
+    format!("{member} should not be null.")
+}
+
+/// A write that takes a JOB DEFINITION (`CreateJob`, `UpdateJob`) whose `GlueVersion` is of
+/// the form the member admits but names no version the service runs
+/// ([`super::is_supported_glue_version`]).
+///
+/// RECORDED template: fixed text plus ONE variable part, the version the definition named,
+/// echoed exactly as sent — so a client reading the refusal sees which version it asked for.
+pub fn glue_version_invalid(glue_version: &str) -> String {
+    format!("Glue version: {glue_version} is invalid")
+}
 
 /// A tag write whose `ResourceArn` names a Region other than the one the endpoint
 /// serving the request is in (`TagResource`). Recorded constant: the refusal states

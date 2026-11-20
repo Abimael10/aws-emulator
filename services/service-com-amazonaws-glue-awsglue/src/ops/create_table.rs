@@ -199,27 +199,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // An open-table-format create names exactly one format
-        // (`OpenTableFormatInput$IcebergInput`), so a value naming none asks for no table
-        // at all.
-        let iceberg_input = match input.open_table_format_input.as_ref() {
-            None => None,
-            Some(open_table_format) => match open_table_format.iceberg_input.as_ref() {
-                Some(iceberg_input) => Some(iceberg_input),
-                None => {
-                    return Err(CreateTableErrorModeled::InvalidInputException(
-                        InvalidInputException {
-                            message: Some(
-                                crate::state::messages::OPEN_TABLE_FORMAT_REQUIRES_ICEBERG
-                                    .to_string(),
-                            ),
-                            from_federation_source: None,
-                        },
-                    )
-                    .into())
-                }
-            },
-        };
+        // The open-table-format input this create carries, and the one format it names
+        // (`OpenTableFormatInput$IcebergInput`).
+        let open_table_format = input.open_table_format_input.as_ref();
+        let iceberg_input = open_table_format.and_then(|format| format.iceberg_input.as_ref());
 
         // A transactional create needs a transaction log this slice does not keep, so
         // accepting the member and dropping it would answer 200 for work nothing did.
@@ -232,30 +215,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The table definition to store: the submitted `TableInput`, else — for an Iceberg
         // create that carries none — the one its `CreateIcebergTableInput` describes,
         // under the `Name` the request addressed the table by.
-        let iceberg_definition = iceberg_input.and_then(|iceberg| {
-            iceberg
-                .create_iceberg_table_input
-                .as_ref()
-                .zip(input.name.as_deref())
-                .map(|(create, name)| crate::state::iceberg_table_definition(name, create))
-        });
-        let mut definition = match input.table_input.clone().or(iceberg_definition) {
-            Some(definition) => definition,
-            None => {
-                return Err(CreateTableErrorModeled::InvalidInputException(
-                    InvalidInputException {
-                        message: Some(if iceberg_input.is_some() {
-                            crate::state::messages::ICEBERG_TABLE_REQUIRES_DEFINITION.to_string()
-                        } else {
-                            "TableInput is required unless OpenTableFormatInput is supplied"
-                                .to_string()
-                        }),
-                        from_federation_source: None,
-                    },
-                )
-                .into())
-            }
+        let iceberg_create =
+            iceberg_input.and_then(|iceberg| iceberg.create_iceberg_table_input.as_ref());
+        // A definition the Iceberg create input describes is stored under the request's own
+        // `Name` (`CreateTableRequest$Name`, which carries no `@required`), so a create that
+        // describes a table and names none has no name to store it under: that is the
+        // catalog's own refusal of a table name it was given none of, not a missing input.
+        if iceberg_create.is_some() && input.table_input.is_none() && input.name.is_none() {
+            return Err(CreateTableErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::service::TABLE_NAME_NULL_OR_EMPTY.to_string()),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+        let iceberg_definition = iceberg_create
+            .zip(input.name.as_deref())
+            .map(|(create, name)| crate::state::iceberg_table_definition(name, create));
+        // A create carrying NEITHER names no table at all: with no `TableInput` to define
+        // one, the definition could only come from the open-table-format path's own create
+        // input, so the refusal names that input.
+        let Some(mut definition) = input.table_input.clone().or(iceberg_definition) else {
+            return Err(CreateTableErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(
+                        crate::state::messages::MISSING_ICEBERG_CREATE_INPUT.to_string(),
+                    ),
+                    from_federation_source: None,
+                },
+            )
+            .into());
         };
+
+        // An open-table-format create names exactly one format, so a definition submitted
+        // under a format input that names none asks for a table in no format at all.
+        if open_table_format.is_some() && iceberg_input.is_none() {
+            return Err(CreateTableErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(
+                        crate::state::messages::OPEN_TABLE_FORMAT_REQUIRES_ICEBERG.to_string(),
+                    ),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
 
         // A Glue view (`TableInput$ViewDefinition`) is a different kind of catalog
         // entity: its dialect representations, version token and refresh state are a

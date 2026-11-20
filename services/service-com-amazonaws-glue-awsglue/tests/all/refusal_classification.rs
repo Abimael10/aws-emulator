@@ -53,7 +53,8 @@ const RUN_ID_PATTERN: &str =
 
 /// `GlueVersionString`'s modelled `@pattern`, as the model writes it
 /// (`smithy_query(query="shape",shape="GlueVersionString")`) — a second member, in another
-/// shape, whose refusal the same rule covers.
+/// shape, whose expression this service publishes AS DECLARED, so a clause about it quotes
+/// the anchoring pair too.
 const GLUE_VERSION_PATTERN: &str = r"^((\w+\.)+\w+|auto)$";
 
 /// `FormTypeName`'s modelled `@pattern`, as the model writes it
@@ -64,8 +65,8 @@ const FORM_TYPE_NAME_PATTERN: &str = r"^[A-Z]\w*$";
 /// The IAM role a column statistics settings create names.
 const ROLE: &str = "arn:aws:iam::000000000000:role/glue-column-stats-role";
 
-/// A `@pattern` as a constraint clause quotes it: the expression the service advertises,
-/// which is the model's text without the whole-value anchoring pair.
+/// A `@pattern` of a shape this service publishes WITHOUT the whole-value anchoring pair, as
+/// a constraint clause quotes it: the expression the service advertises for that shape.
 fn stated_pattern(pattern: &str) -> String {
     ::service_common::validation::unanchored(pattern)
 }
@@ -255,16 +256,17 @@ async fn a_constraint_clause_names_the_api_request_path_and_quotes_the_whole_val
 // The expression a @pattern clause quotes
 // ---------------------------------------------------------------------------
 
-/// A value outside its member's `@pattern` is refused in the same envelope, and the
-/// expression is quoted WITHOUT the anchoring pair the model wraps it in — the text AWS
-/// publishes for that member.
+/// A value outside its member's `@pattern` is refused in the same envelope, quoting the
+/// expression this service PUBLISHES for the member's shape: without the anchoring pair the
+/// model wraps it in for the shapes published that way, and exactly as the model writes it
+/// — anchors included — for the shapes published as declared.
 ///
 /// The rows differ along which member and which expression: an identifier that has to be a
-/// UUID, and the version string of a job definition, whose expression carries a top-level
-/// alternation. Each is driven with several values that miss the expression in different
-/// ways.
+/// UUID, published without the pair, and the version string of a job definition, published
+/// as declared and carrying a top-level alternation. Each is driven with several values that
+/// miss the expression in different ways.
 #[tokio::test]
-async fn a_pattern_clause_quotes_the_expression_without_its_anchors() {
+async fn a_pattern_clause_quotes_the_expression_the_service_publishes() {
     let router = emulator();
 
     // (case, the id the request carries). Each value misses `UUIDv4`'s expression in its
@@ -308,8 +310,8 @@ async fn a_pattern_clause_quotes_the_expression_without_its_anchors() {
         );
     }
 
-    // The same rule on another member, whose expression alternates at the top level: the
-    // pair is dropped and nothing else of the expression changes.
+    // The same rule on another member, whose expression the service publishes as the model
+    // declares it: the clause quotes that text, anchoring pair and all.
     for (case, version) in [
         ("no dot at all", "4"),
         ("a trailing dot", "4."),
@@ -334,8 +336,7 @@ async fn a_pattern_clause_quotes_the_expression_without_its_anchors() {
                 version,
                 "glueVersion",
                 &format!(
-                    "Member must satisfy regular expression pattern: {}",
-                    stated_pattern(GLUE_VERSION_PATTERN)
+                    "Member must satisfy regular expression pattern: {GLUE_VERSION_PATTERN}"
                 ),
             ),
         );

@@ -167,6 +167,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the `JobMode`/`WorkerType`/`ExecutionClass` enums are refused at the boundary —
         // so the checks here are the ones the MODEL cannot express.
 
+        // "The `JobCommand` that runs this job (required)": the submitted definition
+        // replaces the stored one whole, so a definition naming no command at all names
+        // nothing to run. It is judged BEFORE the role below, which is the order the
+        // definition's members are judged in, so a definition missing both names the
+        // command. The command's NAME is another matter — `JobCommand$Name` is an
+        // optional `GenericString` with no enum, length or pattern, and the names it
+        // documents per job kind do not close the set an update admits — so the submitted
+        // command is stored as sent, exactly as a create stores it.
+        let Some(command) = update.command.as_ref() else {
+            return Err(invalid_input(
+                crate::state::messages::job_definition_member_null("Command"),
+            ));
+        };
+        let command_name = command.name.as_deref().unwrap_or_default();
+
         // "The name or Amazon Resource Name (ARN) of the IAM role associated with this
         // job (required)": the submitted definition replaces the stored one whole, so a
         // definition naming no role, or a blank one, names no role at all.
@@ -176,20 +191,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .is_none_or(|role| role.trim().is_empty())
         {
             return Err(invalid_input(
-                "JobUpdate.Role is required and cannot be blank".to_string(),
+                crate::state::messages::job_definition_member_null("Role"),
             ));
         }
 
-        // "The `JobCommand` that runs this job (required)": the submitted definition
-        // replaces the stored one whole, so a definition naming no command at all names
-        // nothing to run. The command's NAME is another matter — `JobCommand$Name` is an
-        // optional `GenericString` with no enum, length or pattern, and the names it
-        // documents per job kind do not close the set an update admits — so the submitted
-        // command is stored as sent, exactly as a create stores it.
-        let Some(command) = update.command.as_ref() else {
-            return Err(invalid_input("JobUpdate.Command is required".to_string()));
-        };
-        let command_name = command.name.as_deref().unwrap_or_default();
+        // "In Spark jobs, `GlueVersion` determines the versions of Apache Spark and Python
+        // that Glue available in a job": the member's `@pattern` admits any dotted word, so
+        // a well-formed value may still name an engine version the service does not run,
+        // which is no job it could start. An update naming none keeps the stored version
+        // ("the Glue version retains the value from the existing job definition"), which was
+        // judged the same way when it was written.
+        if let Some(glue_version) = update.glue_version.as_deref() {
+            if !crate::state::is_supported_glue_version(glue_version) {
+                return Err(invalid_input(
+                    crate::state::messages::glue_version_invalid(glue_version),
+                ));
+            }
+        }
 
         // "Jobs must have timeout values less than 7 days or 10080 minutes. Otherwise,
         // the jobs will throw an exception."

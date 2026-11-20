@@ -243,17 +243,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 /// framework's own wording.
 ///
 /// The envelope is AWS's own and belongs to the shared renderer
-/// (`service_common::validation_message::aws_validation_refusal`): HTTP 400
+/// (`service_common::validation_message::aws_validation_refusal_with`): HTTP 400
 /// `ValidationException`, whose lowercase `message` carries
 /// `N validation error(s) detected: Value '<value>' at '<member path>' failed to satisfy
-/// constraint: <requirement>`, with a `@pattern` requirement quoted WITHOUT the anchoring
-/// pair the model wraps it in, which is the text AWS publishes for it. Two things this
-/// service adds, both in [`as_glue_clause`]: the MEMBER PATH, because Glue states the path
-/// of its own request model ([`api_request_path`]), which spells the member carrying a
-/// resource definition for the resource it carries; and the ORDER an enumerated type's
-/// admissible value set is listed in, which is the order the layer in front of this service
-/// enumerates its own table of those values. Everything else — which refusals are restated,
-/// the code, the envelope, the clause order and every other requirement — stays the shared
+/// constraint: <requirement>`. Three things this service adds: the MEMBER PATH and the
+/// ORDER an enumerated type's admissible value set is listed in, both in
+/// [`as_glue_clause`] — the path because Glue states the path of its own request model
+/// ([`api_request_path`]), which spells the member carrying a resource definition for the
+/// resource it carries, and the order because it is the one the layer in front of this
+/// service enumerates its own table of those values in — and how a `@pattern` requirement
+/// is QUOTED ([`glue_stated_pattern`]). Everything else — which refusals are restated, the
+/// code, the envelope, the clause order and every other requirement — stays the shared
 /// renderer's and the framework's, so two Glue refusal paths cannot drift apart.
 ///
 /// Both paths that answer a boundary refusal in this service go through here: this
@@ -263,7 +263,44 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 /// the request — so a clause stated through `override_refusal` carries the framework's own
 /// elision of a value past its echo ceiling.
 fn glue_constraint_refusal(refusal: &Refusal) -> Option<Refused> {
-    ::service_common::validation_message::aws_validation_refusal(&as_glue_states_it(refusal))
+    ::service_common::validation_message::aws_validation_refusal_with(
+        &as_glue_states_it(refusal),
+        glue_stated_pattern,
+    )
+}
+
+/// `GlueVersionString`'s own expression, as the model declares it
+/// (`smithy_query(query="shape",shape="GlueVersionString")`): the shape
+/// `CreateJob$GlueVersion` and `JobUpdate$GlueVersion` target. Named here because this
+/// service PUBLISHES it exactly as declared ([`PUBLISHED_AS_DECLARED`]).
+const GLUE_VERSION_PATTERN: &str = r"^((\w+\.)+\w+|auto)$";
+
+/// The expressions this service publishes as the model writes them, anchoring pair
+/// included, keyed by the EXPRESSION — what is published belongs to the SHAPE, so it holds
+/// for every member targeting it, in any operation.
+///
+/// Reference data about those shapes rather than something readable off the text: both
+/// forms are spelled `^…$` in the model, and this API's refusals are recorded quoting some
+/// of its expressions as declared and the rest without that pair.
+const PUBLISHED_AS_DECLARED: [&str; 1] = [GLUE_VERSION_PATTERN];
+
+/// One `@pattern` requirement as a clause of this service quotes the expression a value had
+/// to satisfy: the expression this service publishes for the member's shape.
+///
+/// The rule and both renderings are the shared home's
+/// (`service_common::validation::unanchored_unless_published_as_declared`), so nothing of
+/// how an expression is requoted lives here: this file supplies only which of its own
+/// expressions are published as the model declares them ([`PUBLISHED_AS_DECLARED`]). An
+/// expression that is not one of those keeps the anchoring pair when what the pair encloses
+/// carries an anchor of its OWN — an alternation of anchored branches is already a
+/// whole-value expression, so dropping the pair would state a requirement of neither branch
+/// — and loses it otherwise, which is what every other expression of this model does. The
+/// CHECK always runs the model's pattern as written; only the quoting is decided here.
+fn glue_stated_pattern(pattern: &str) -> String {
+    ::service_common::validation::unanchored_unless_published_as_declared(
+        pattern,
+        &PUBLISHED_AS_DECLARED,
+    )
 }
 
 /// [`glue_constraint_refusal`] for a caller holding the operation's INPUT SHAPE as well as
@@ -287,15 +324,17 @@ fn glue_constraint_refusal_of(
 /// quote no value ([`JSON_ENVELOPE_OPERATIONS`]).
 ///
 /// The drop is the shared renderer's own
-/// (`service_common::validation_message::aws_validation_refusal_withholding`), so a clause
-/// that states no value reads exactly like one that does minus that half.
+/// (`service_common::validation_message::aws_validation_refusal_withholding_with`), so a
+/// clause that states no value reads exactly like one that does minus that half, and the
+/// `@pattern` rendering is the same [`glue_stated_pattern`] every other path here states.
 fn glue_constraint_refusal_withholding(
     input_schema: &'static ::aws_smithy_schema::Schema,
     violations: &[Violation],
 ) -> Option<Refused> {
     let stated = in_floating_point_form(input_schema, violations);
-    ::service_common::validation_message::aws_validation_refusal_withholding(
+    ::service_common::validation_message::aws_validation_refusal_withholding_with(
         &as_glue_states_it(&Refusal::Invalid(stated)),
+        glue_stated_pattern,
         |_| true,
     )
 }
@@ -422,7 +461,12 @@ const DATABASE_NAME_NULL_OR_EMPTY: &str = "Database name cannot be equal to null
 
 /// The same for a table's own name member (`TableInput$Name`, and the `Name` a table read
 /// or write addresses). RECORDED constant, and the whole message.
-const TABLE_NAME_NULL_OR_EMPTY: &str = "Table name cannot be equal to null or empty";
+///
+/// `pub(crate)` because one path to this check is not the boundary's: a `CreateTable` that
+/// describes its table through the open-table-format input alone is stored under the
+/// request's own `Name`, and a create that describes one and names none is the same refusal,
+/// stated by the handler that read it (`crate::ops::create_table`).
+pub(crate) const TABLE_NAME_NULL_OR_EMPTY: &str = "Table name cannot be equal to null or empty";
 
 /// The sentence the catalog refuses a `DatabaseName` — the member that addresses the
 /// database a table operation works IN, rather than a database's own name — supplied as

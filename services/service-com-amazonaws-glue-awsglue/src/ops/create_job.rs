@@ -284,15 +284,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The name or Amazon Resource Name (ARN) of the IAM role associated with this
         // job": `RoleString` carries no length constraint, so a blank role reaches here
-        // and names no role at all.
+        // and names no role at all — stated the way a job definition's missing member is
+        // stated ([`crate::state::messages::job_definition_member_null`]).
         if input.role.trim().is_empty() {
             return Err(CreateJobErrorModeled::InvalidInputException(
                 InvalidInputException {
-                    message: Some("Role is required and cannot be blank".to_string()),
+                    message: Some(crate::state::messages::job_definition_member_null("Role")),
                     from_federation_source: None,
                 },
             )
             .into());
+        }
+
+        // "In Spark jobs, `GlueVersion` determines the versions of Apache Spark and Python
+        // that Glue available in a job": the member's `@pattern` admits any dotted word, so
+        // a well-formed value may still name an engine version the service does not run,
+        // which is no job it could start.
+        if let Some(glue_version) = input.glue_version.as_deref() {
+            if !crate::state::is_supported_glue_version(glue_version) {
+                return Err(CreateJobErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(crate::state::messages::glue_version_invalid(glue_version)),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            }
         }
 
         // `JobCommand$Name` is an OPTIONAL `GenericString` with no enum, length or pattern:
