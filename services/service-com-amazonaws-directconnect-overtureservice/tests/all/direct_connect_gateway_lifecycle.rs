@@ -919,37 +919,55 @@ async fn a_delete_that_names_no_stored_association_is_refused() {
         );
     }
 
-    // And a describe that CARRIES one of the selectors this listing is published for,
-    // over a store holding no association, is an empty page rather than a refusal —
-    // whatever that selector holds, since a selector is a filter: the last two rows
-    // carry a value that names no association at all.
-    for body in [
-        json!({"directConnectGatewayId": &gateway_id}),
-        json!({"virtualGatewayId": "vgw-0123456789abcdef0"}),
-        json!({"associatedGatewayId": "tgw-0f1e2d3c4b5a69780"}),
-        json!({"associationId": "00000000-0000-4000-8000-000000000000"}),
-        json!({"directConnectGatewayId": ""}),
-        json!({"associationId": "   "}),
-    ] {
-        let stored = associations(&dx, "an empty store", body.clone()).await;
-        assert!(
-            stored.is_empty(),
-            "case {body:?}: expected an empty page, got {stored:?}"
-        );
-    }
+    // What this listing does with a selector, and with none, is the next test's
+    // subject: `a_listing_of_associations_that_selects_by_nothing_is_refused_whatever_else_it_carries`.
+}
 
-    // A describe carrying NONE of them asks for no listing this operation publishes
-    // ("You must specify one of the following: A Direct Connect gateway … A virtual
-    // private gateway … A transit gateway …"), so it is refused — whatever else the
-    // request carries.
-    for (case, body) in [
-        ("no selector at all", json!({})),
-        ("a page size and no selector", json!({"maxResults": 10})),
+// ---------------------------------------------------------------------------
+// Rule: an operation published only in forms that each name a selector refuses a
+// request carrying none of them, with the sentence it states for that refusal — a
+// windowing member is not a selector, so it never makes such a request answerable,
+// and a selector that IS carried only filters, whatever its value names.
+// ---------------------------------------------------------------------------
+
+/// The sentence `DescribeDirectConnectGatewayAssociations` states for a request
+/// that selects by nothing. FIXED text: no member, value or identifier of the
+/// request appears in it.
+const SELECTOR_REQUIRED: &str =
+    "Either Direct Connect Gateway ID or Associated Gateway ID or Association ID must be set";
+
+#[tokio::test]
+async fn a_listing_of_associations_that_selects_by_nothing_is_refused_whatever_else_it_carries() {
+    let dx = Emulator::new();
+    let gateway_id = gateway(&dx, "selector-required").await;
+
+    // (case, the request body). Every row carries NO selector and differs in which
+    // windowing members it carries and what they hold — including each bound of
+    // `maxResults` ("If MaxResults is given a value larger than 100, only 100
+    // results are returned") and one value past it.
+    let refused: Vec<(&str, Value)> = vec![
+        ("no member at all", json!({})),
+        ("the smallest page", json!({"maxResults": 1})),
         (
-            "a pagination token and no selector",
+            "the largest page the member documents",
+            json!({"maxResults": MAX_RESULT_SET_SIZE}),
+        ),
+        (
+            "one past the largest page the member documents",
+            json!({"maxResults": MAX_RESULT_SET_SIZE + 1}),
+        ),
+        ("a page size of zero", json!({"maxResults": 0})),
+        (
+            "a pagination token",
             json!({"nextToken": "00000000-0000-4000-8000-000000000000"}),
         ),
-    ] {
+        (
+            "a page size and a pagination token",
+            json!({"maxResults": 7, "nextToken": "not-a-token"}),
+        ),
+    ];
+
+    for (case, body) in &refused {
         let (status, response) = dx
             .call("DescribeDirectConnectGatewayAssociations", body.clone())
             .await;
@@ -957,15 +975,78 @@ async fn a_delete_that_names_no_stored_association_is_refused() {
             status, 400,
             "case {case:?}: expected a refusal, got {status} with {response}"
         );
+        assert!(
+            error_code(&response).contains("DirectConnectClientException"),
+            "case {case:?}: expected DirectConnectClientException, got {:?}",
+            error_code(&response)
+        );
         assert_eq!(
             error_message(&response),
-            "Either Direct Connect Gateway ID or Associated Gateway ID or Association ID must \
-             be set",
+            SELECTOR_REQUIRED,
             "case {case:?}: expected the sentence this listing states, got {response}"
         );
     }
 
-    // A pagination token naming nothing in the selected set IS a refusal.
+    // And a request that DOES carry one selector is served, under every window the
+    // refused rows carried: a selector is a filter, so a value naming no association
+    // is an empty page and not a client fault.
+    let selected: Vec<(&str, Value)> = vec![
+        (
+            "the stored Direct Connect gateway",
+            json!({"directConnectGatewayId": &gateway_id}),
+        ),
+        (
+            "a Direct Connect gateway id naming nothing",
+            json!({"directConnectGatewayId": "00000000-0000-4000-8000-000000000000"}),
+        ),
+        (
+            "an associated virtual private gateway",
+            json!({"associatedGatewayId": "vgw-0123456789abcdef0"}),
+        ),
+        (
+            "an associated transit gateway",
+            json!({"associatedGatewayId": "tgw-0f1e2d3c4b5a69780"}),
+        ),
+        (
+            "the older spelling of the associated gateway",
+            json!({"virtualGatewayId": "vgw-0123456789abcdef0"}),
+        ),
+        (
+            "an association id",
+            json!({"associationId": "00000000-0000-4000-8000-000000000000"}),
+        ),
+        (
+            "a selector holding nothing at all",
+            json!({"directConnectGatewayId": ""}),
+        ),
+        (
+            "a selector holding only space",
+            json!({"associationId": "   "}),
+        ),
+    ];
+
+    for (selector_case, selector) in &selected {
+        for window in [
+            json!({}),
+            json!({"maxResults": 1}),
+            json!({"maxResults": MAX_RESULT_SET_SIZE + 1}),
+        ] {
+            let mut body = selector.as_object().cloned().unwrap_or_default();
+            for (member, value) in window.as_object().into_iter().flatten() {
+                body.insert(member.clone(), value.clone());
+            }
+            let case = format!("{selector_case} windowed by {window}");
+            let page = associations(&dx, &case, Value::Object(body)).await;
+            assert!(
+                page.is_empty(),
+                "case {case:?}: expected an empty page over a store holding no association, got \
+                 {page:?}"
+            );
+        }
+    }
+
+    // A `nextToken` is not a selector either way: beside one it names a page of the
+    // selected set, so a token naming nothing in that set is the caller's error.
     let (status, response) = dx
         .call(
             "DescribeDirectConnectGatewayAssociations",
@@ -977,7 +1058,137 @@ async fn a_delete_that_names_no_stored_association_is_refused() {
         .await;
     assert_eq!(
         status, 400,
-        "case \"a pagination token naming nothing\": expected a refusal, got {status} with \
-         {response}"
+        "case \"a pagination token naming nothing in the selected set\": expected a refusal, got \
+         {status} with {response}"
     );
+    assert!(
+        error_code(&response).contains("DirectConnectClientException"),
+        "case \"a pagination token naming nothing in the selected set\": expected \
+         DirectConnectClientException, got {:?}",
+        error_code(&response)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Rule: the resource a create is refused ABOUT is the first identifier it resolves,
+// and this create resolves the gateway to associate — the account's own resource,
+// held by the service that owns gateways — before the Direct Connect gateway the
+// association would be made on. So a gateway the account does not hold is reported
+// as the missing one, named by the kind its identifier says it is and by the account
+// that would own it, whether or not the Direct Connect gateway exists either and
+// whichever member of the pair named it.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_association_is_refused_about_the_gateway_to_associate_before_the_direct_connect_gateway()
+{
+    let dx = Emulator::new();
+    let stored_gateway = gateway(&dx, "resolution-order").await;
+    // A Direct Connect gateway id the store holds no gateway under, so a row naming
+    // it would be refused about the Direct Connect gateway if the order were the
+    // other way round.
+    let no_such_direct_connect_gateway = "00000000-0000-4000-8000-000000000000";
+    // The account the gateway would belong to comes from the emulator, never from a
+    // recorded response.
+    let owner = engine::emulator_account_id();
+
+    // (case, the request body, the gateway the refusal is about, the noun that
+    // gateway's kind is named by)
+    let rows: Vec<(String, Value, &str, &str)> = vec![
+        (
+            "a virtual private gateway as gatewayId, beside a Direct Connect gateway that \
+             exists"
+                .to_string(),
+            json!({
+                "directConnectGatewayId": &stored_gateway,
+                "gatewayId": "vgw-0123456789abcdef0",
+            }),
+            "vgw-0123456789abcdef0",
+            "VirtualGateway",
+        ),
+        (
+            "a virtual private gateway as virtualGatewayId, beside a Direct Connect gateway \
+             that does not exist"
+                .to_string(),
+            json!({
+                "directConnectGatewayId": no_such_direct_connect_gateway,
+                "virtualGatewayId": "vgw-0f1e2d3c4b5a69780",
+            }),
+            "vgw-0f1e2d3c4b5a69780",
+            "VirtualGateway",
+        ),
+        (
+            "both spellings naming the same virtual private gateway".to_string(),
+            json!({
+                "directConnectGatewayId": &stored_gateway,
+                "gatewayId": "vgw-00112233445566778",
+                "virtualGatewayId": "vgw-00112233445566778",
+            }),
+            "vgw-00112233445566778",
+            "VirtualGateway",
+        ),
+        (
+            "a virtual private gateway named with surrounding space".to_string(),
+            json!({
+                "directConnectGatewayId": &stored_gateway,
+                "gatewayId": "  vgw-0aabbccddeeff0011  ",
+            }),
+            "vgw-0aabbccddeeff0011",
+            "VirtualGateway",
+        ),
+        (
+            "a transit gateway with the prefixes such an association advertises".to_string(),
+            json!({
+                "directConnectGatewayId": &stored_gateway,
+                "gatewayId": "tgw-0f1e2d3c4b5a69780",
+                "addAllowedPrefixesToDirectConnectGateway": [{"cidr": "10.0.0.0/16"}],
+            }),
+            "tgw-0f1e2d3c4b5a69780",
+            "TransitGateway",
+        ),
+        (
+            "a transit gateway with no prefixes and a Direct Connect gateway that does not \
+             exist: the gateway to associate is still what is reported"
+                .to_string(),
+            json!({
+                "directConnectGatewayId": no_such_direct_connect_gateway,
+                "virtualGatewayId": "tgw-00112233445566778",
+            }),
+            "tgw-00112233445566778",
+            "TransitGateway",
+        ),
+    ];
+
+    for (case, body, named, noun) in &rows {
+        let (status, response) = dx
+            .call("CreateDirectConnectGatewayAssociation", body.clone())
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected a refusal, got {status} with {response}"
+        );
+        assert!(
+            error_code(&response).contains("DirectConnectClientException"),
+            "case {case:?}: expected DirectConnectClientException, got {:?}",
+            error_code(&response)
+        );
+        assert_eq!(
+            error_message(&response),
+            format!("The {noun} {named} for owner {owner} does not exist"),
+            "case {case:?}: expected the refusal to be about the gateway to associate, got \
+             {response}"
+        );
+        // A refused create stores nothing, for either Direct Connect gateway the rows
+        // name.
+        for selector in [
+            json!({"directConnectGatewayId": &stored_gateway}),
+            json!({"directConnectGatewayId": no_such_direct_connect_gateway}),
+        ] {
+            let page = associations(&dx, case, selector).await;
+            assert!(
+                page.is_empty(),
+                "case {case:?}: a refused create must store no association, got {page:?}"
+            );
+        }
+    }
 }
