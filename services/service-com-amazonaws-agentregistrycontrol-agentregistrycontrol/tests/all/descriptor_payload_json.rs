@@ -1073,3 +1073,345 @@ async fn an_edit_to_an_mcp_server_payload_a_schema_version_accepts_is_applied() 
         );
     }
 }
+
+/// The `reason` a field-validation refusal of this service carries
+/// (`smithy_query(query="shape", shape="ValidationException")`: `reason` ->
+/// `ValidationExceptionReason`, whose modelled default is `FieldValidationFailed`).
+const FIELD_VALIDATION_FAILED: &str = "FieldValidationFailed";
+
+/// An MCP server payload that is a JSON document no supported MCP server schema version
+/// accepts: an object carrying none of the members a server definition is told by. Used by
+/// the rows below whose subject is what ELSE the request carries, so the payload is the one
+/// thing about them that is off schema.
+const OFF_SCHEMA_SERVER: &str = r#"{"x": 1}"#;
+
+/// A client token of `ClientToken`'s shape (`smithy_query(query="operation",
+/// operation="CreateRegistryRecord")`: `@length 33..256`,
+/// `^[a-zA-Z0-9](-*[a-zA-Z0-9]){0,256}$`), derived from a case label so each row presents
+/// its own.
+fn token(seed: &str) -> String {
+    let alphanumeric: String = seed
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect();
+    let padded = format!("{alphanumeric}{}", "0".repeat(40));
+    padded[..40].to_string()
+}
+
+/// One create whose MCP server descriptor carries content no supported version accepts: the
+/// case, the record type the request names and the descriptor set, plus the members the
+/// request carries BEYOND its name, its record type and its descriptors.
+struct OffSchemaCreate {
+    case: &'static str,
+    record_type: &'static str,
+    descriptors: Value,
+    beyond: Value,
+}
+
+/// The creates an off-schema MCP server payload can arrive in. Every row carries the SAME
+/// off-schema server content and differs along what else the request holds — a second
+/// descriptor of the typed set beside the server one, the tools nested under the server
+/// descriptor, a stated `dataSchemaVersion`, the optional members of the create
+/// (`displayName`, `description`, `recordVersion`, `tags`, `customMetadata`), an idempotency
+/// token, and a `recordType` other than the one the server descriptor belongs to — because
+/// what is matched against the MCP server schema versions is the content of
+/// `descriptors.mcpServer.data`, whatever else accompanies it.
+fn off_schema_creates() -> Vec<OffSchemaCreate> {
+    vec![
+        OffSchemaCreate {
+            case: "the server payload on its own",
+            record_type: "MCP",
+            descriptors: json!({ "mcpServer": { "data": OFF_SCHEMA_SERVER } }),
+            beyond: json!({}),
+        },
+        OffSchemaCreate {
+            case: "a server payload beside the tools the server exposes",
+            record_type: "MCP",
+            descriptors: json!({
+                "mcpServer": {
+                    "data": OFF_SCHEMA_SERVER,
+                    "additionalData": { "tools": { "data": "[{\"name\":\"search\"}]" } }
+                }
+            }),
+            beyond: json!({}),
+        },
+        OffSchemaCreate {
+            case: "a server payload stating a schema version of its own",
+            record_type: "MCP",
+            descriptors: json!({
+                "mcpServer": { "data": OFF_SCHEMA_SERVER, "dataSchemaVersion": "2025-09-29" }
+            }),
+            beyond: json!({}),
+        },
+        OffSchemaCreate {
+            case: "a server payload beside a custom descriptor that is JSON",
+            record_type: "MCP",
+            descriptors: json!({
+                "mcpServer": { "data": OFF_SCHEMA_SERVER },
+                "custom": { "data": "{\"anything\":true}" }
+            }),
+            beyond: json!({}),
+        },
+        OffSchemaCreate {
+            case: "a server payload beside an agent card that is JSON",
+            record_type: "MCP",
+            descriptors: json!({
+                "mcpServer": { "data": OFF_SCHEMA_SERVER },
+                "a2aAgentCard": { "data": "{\"name\":\"checkout\"}" }
+            }),
+            beyond: json!({}),
+        },
+        OffSchemaCreate {
+            case: "a create with every optional member of its own filled in",
+            record_type: "MCP",
+            descriptors: json!({ "mcpServer": { "data": OFF_SCHEMA_SERVER } }),
+            beyond: json!({
+                "displayName": "Checkout tools",
+                "description": "the tools a checkout exposes",
+                "recordVersion": "2.0.1",
+                "tags": { "team": "checkout" },
+                "customMetadata": { "owner": "checkout-team" }
+            }),
+        },
+        OffSchemaCreate {
+            case: "a create presenting an idempotency token",
+            record_type: "MCP",
+            descriptors: json!({ "mcpServer": { "data": OFF_SCHEMA_SERVER } }),
+            beyond: json!({ "clientToken": token("an-off-schema-create-with-a-token") }),
+        },
+        OffSchemaCreate {
+            case: "a server payload under a record type of another descriptor",
+            record_type: "CUSTOM",
+            descriptors: json!({
+                "mcpServer": { "data": OFF_SCHEMA_SERVER },
+                "custom": { "data": "{\"anything\":true}" }
+            }),
+            beyond: json!({}),
+        },
+    ]
+}
+
+/// The body of one row's create: its own name, its record type, its descriptors and whatever
+/// else the row carries.
+fn off_schema_body(row: &OffSchemaCreate) -> Value {
+    let mut body = json!({
+        "name": name_from("env", row.case),
+        "recordType": row.record_type,
+        "descriptors": row.descriptors.clone(),
+    });
+    let members = body.as_object_mut().expect("a create body is an object");
+    for (member, value) in row
+        .beyond
+        .as_object()
+        .expect("the members beyond the three are an object")
+    {
+        members.insert(member.clone(), value.clone());
+    }
+    body
+}
+
+/// Every record the registry holds, whatever its name: the listing with no filters, so a
+/// record a refused create left behind is seen wherever it sits.
+async fn all_records(router: &MultiServiceRouter, registry: &str) -> Vec<Value> {
+    let listed = list_records(router, registry, json!({})).await;
+    assert_eq!(
+        listed.status, 200,
+        "ListRegistryRecords must answer 200, got {} {:?}",
+        listed.status, listed.body
+    );
+    listed.body["registryRecords"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn an_off_schema_mcp_server_create_is_refused_whatever_else_the_request_carries() {
+    let router = router();
+    let registry_id = ready_registry(&router, "off schema envelopes").await;
+
+    for row in off_schema_creates() {
+        let case = row.case;
+        let refused = create_record(&router, &registry_id, off_schema_body(&row)).await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: a payload no supported MCP server schema version accepts is the \
+             modelled 400, got {} {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_code.as_deref(),
+            Some(VALIDATION_EXCEPTION),
+            "case {case:?}: expected error code {VALIDATION_EXCEPTION}, got {:?}",
+            refused.error_code
+        );
+        assert_eq!(
+            refused.message(),
+            MCP_SERVER_VERSION_MISMATCH,
+            "case {case:?}: expected the refusal to be worded {MCP_SERVER_VERSION_MISMATCH:?}, \
+             got {:?}",
+            refused.message()
+        );
+        assert_eq!(
+            refused.str_field("reason"),
+            FIELD_VALIDATION_FAILED,
+            "case {case:?}: expected reason {FIELD_VALIDATION_FAILED}, got {:?}",
+            refused.body
+        );
+
+        // The refusal wrote nothing ANYWHERE in the registry, not merely nothing under the
+        // name the row asked for.
+        let held = all_records(&router, &registry_id).await;
+        assert!(
+            held.is_empty(),
+            "case {case:?}: a refused create leaves the registry empty, got {held:?}"
+        );
+    }
+
+    // And the listing that stayed empty above does report what IS written: one create a
+    // supported version accepts, and the registry holds exactly that record.
+    let accepted = create_record(
+        &router,
+        &registry_id,
+        json!({
+            "name": name_from("env", "the control create"),
+            "recordType": "MCP",
+            "descriptors": { "mcpServer": { "data": MCP_SERVER_DEFINITION } },
+        }),
+    )
+    .await;
+    assert_eq!(
+        accepted.status, 202,
+        "a payload a supported version accepts is accepted, got {} {:?}",
+        accepted.status, accepted.body
+    );
+    let held = all_records(&router, &registry_id).await;
+    assert_eq!(
+        held.len(),
+        1,
+        "the registry holds the one record the accepted create wrote, got {held:?}"
+    );
+    assert_eq!(
+        held[0]["name"],
+        Value::from(name_from("env", "the control create")),
+        "the record the registry holds is the accepted one, got {:?}",
+        held[0]
+    );
+    let record_id = id_of(accepted.str_field("recordArn")).to_string();
+    record_reaching(
+        &router,
+        "the control create",
+        &registry_id,
+        &record_id,
+        "DRAFT",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_refused_off_schema_create_leaves_its_idempotency_token_unbound() {
+    let router = router();
+    let registry_id = ready_registry(&router, "off schema tokens").await;
+    let mut last_accepted: Option<(&str, String)> = None;
+
+    for (case, payload) in off_schema_server_payloads() {
+        let record_name = name_from("tok", case);
+        let client_token = token(case);
+        let refused_body = json!({
+            "name": record_name,
+            "recordType": "MCP",
+            "descriptors": { "mcpServer": { "data": payload } },
+            "clientToken": client_token,
+        });
+
+        // The refusal is the request's, so presenting it twice under one token is refused
+        // twice: nothing of the first call was remembered for the token to answer with.
+        for attempt in ["the first presentation", "the same request again"] {
+            let refused = create_record(&router, &registry_id, refused_body.clone()).await;
+            assert_eq!(
+                refused.status, 400,
+                "case {case:?}, {attempt}: a payload no supported MCP server schema version \
+                 accepts is the modelled 400, got {} {:?}",
+                refused.status, refused.body
+            );
+            assert_eq!(
+                refused.error_code.as_deref(),
+                Some(VALIDATION_EXCEPTION),
+                "case {case:?}, {attempt}: expected error code {VALIDATION_EXCEPTION}, got {:?}",
+                refused.error_code
+            );
+            assert_eq!(
+                refused.message(),
+                MCP_SERVER_VERSION_MISMATCH,
+                "case {case:?}, {attempt}: expected the refusal to be worded \
+                 {MCP_SERVER_VERSION_MISMATCH:?}, got {:?}",
+                refused.message()
+            );
+        }
+
+        // The token the refused create presented was never bound to it, so the SAME token
+        // carrying other parameters is a create of its own rather than a token conflict.
+        let accepted_body = json!({
+            "name": record_name,
+            "recordType": "MCP",
+            "descriptors": { "mcpServer": { "data": MCP_SERVER_DEFINITION } },
+            "clientToken": client_token,
+        });
+        let accepted = create_record(&router, &registry_id, accepted_body.clone()).await;
+        assert_eq!(
+            accepted.status, 202,
+            "case {case:?}: the token of a refused create is free for a payload a supported \
+             version accepts, got {} {:?}",
+            accepted.status, accepted.body
+        );
+        let record_arn = accepted.str_field("recordArn").to_string();
+
+        // The token IS bound by the create that was accepted: its replay answers with that
+        // same record rather than writing a second one.
+        let replayed = create_record(&router, &registry_id, accepted_body).await;
+        assert_eq!(
+            (replayed.status, replayed.str_field("recordArn")),
+            (202, record_arn.as_str()),
+            "case {case:?}: a replay of the accepted create answers with the record it wrote, \
+             got {} {:?}",
+            replayed.status,
+            replayed.body
+        );
+
+        // So the name carries exactly one record: the accepted one, and nothing the refusals
+        // left behind.
+        let listed = list_records(
+            &router,
+            &registry_id,
+            json!({ "filters": [{ "name": "name", "values": [record_name.clone()] }] }),
+        )
+        .await;
+        let named = listed.body["registryRecords"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            named.len(),
+            1,
+            "case {case:?}: the name carries only the accepted record, got {named:?}"
+        );
+        assert_eq!(
+            named[0]["recordArn"],
+            Value::from(record_arn.clone()),
+            "case {case:?}: the record the name carries is the accepted one, got {:?}",
+            named[0]
+        );
+        last_accepted = Some((case, id_of(&record_arn).to_string()));
+    }
+
+    // The record the last accepted create wrote settles and serves the payload a supported
+    // version accepted, so the accept side of the rule is a write and not just a status.
+    let (case, record_id) = last_accepted.expect("the table has rows");
+    let settled = record_reaching(&router, case, &registry_id, &record_id, "DRAFT").await;
+    assert_eq!(
+        settled.body["descriptors"]["mcpServer"]["data"],
+        Value::from(MCP_SERVER_DEFINITION),
+        "case {case:?}: the accepted payload is what a later read serves, got {:?}",
+        settled.body["descriptors"]
+    );
+}
