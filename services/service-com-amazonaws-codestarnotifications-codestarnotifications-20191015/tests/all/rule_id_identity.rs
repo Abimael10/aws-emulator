@@ -14,12 +14,17 @@
 //! ORed within one name and ANDed across names, or by page size — decides only WHICH
 //! rules are named, never the identity reported for one that is.
 //!
+//! The last suite drives that same relation as the INVARIANT it is, over populations and
+//! narrowings drawn by a seeded generator rather than written out as rows.
+//!
 //! The harness (`Emulator`, `string`, ...) is the one `notification_rule_lifecycle`
 //! already builds: one shared engine behind the same `MultiServiceRouter` dispatch the
 //! emulator serves production requests with.
 
 use std::collections::{BTreeSet, HashSet};
 
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use serde_json::{json, Value};
 
 use crate::notification_rule_lifecycle::{string, Emulator};
@@ -774,6 +779,294 @@ async fn narrowing_a_listing_never_changes_the_identity_it_reports() {
                     "case {case:?}: {id:?} is an identity this account was never issued"
                 );
             }
+        }
+    }
+}
+
+// --- generated populations ------------------------------------------------------------
+//
+// The identity relation above is an INVARIANT, so it holds for any account content and
+// any way of narrowing a listing — not only for the rows written out by hand. One seeded
+// PRNG draws what a store holds (how many rules, and each one's resource, event types,
+// targets, detail type and status) and how it is listed (which filter names, how many
+// values per name, what page size). Every assertion names the seed it was driven with, so
+// a failing case reports the draw that produced it and is replayed by seeding the
+// generator with that value.
+
+/// The resources a generated rule fires for: one ARN per service this notification
+/// service supports (`crate::state::SUPPORTED_RESOURCE_SERVICES` — codebuild, codecommit,
+/// codedeploy and codepipeline).
+const GENERATED_RESOURCES: [&str; 4] = [
+    NARROW_REPOSITORY,
+    NARROW_PROJECT,
+    NARROW_PIPELINE,
+    "arn:aws:codedeploy:us-east-1:123456789012:application:GeneratedApp",
+];
+
+/// The event types a generated rule is wired to: ids out of the catalog `ListEventTypes`
+/// publishes (`crate::state::EVENT_TYPE_CATALOG`), one per service above.
+const GENERATED_EVENT_TYPE_IDS: [&str; 4] = [
+    NARROW_PULL_REQUEST,
+    NARROW_BUILD_FAILED,
+    NARROW_APPROVAL,
+    NARROW_DEPLOYMENT,
+];
+
+/// The target addresses a generated rule may be subscribed to: two topics and one chat
+/// configuration, so both `TargetType` kinds are drawn.
+const GENERATED_TARGET_ADDRESSES: [&str; 3] = [NARROW_TOPIC_X, NARROW_TOPIC_Y, NARROW_SLACK];
+
+/// How many populations the invariant is driven over, how large one may get and how many
+/// narrowings each is listed under: BOUNDED, so the suite stays a few hundred in-process
+/// calls.
+const GENERATED_POPULATIONS: usize = 8;
+const GENERATED_RULES_PER_POPULATION: std::ops::RangeInclusive<usize> = 1..=5;
+const GENERATED_NARROWINGS: usize = 4;
+
+/// The page sizes a generated listing is read at: the modelled minimum, a size that
+/// splits a population over pages, the modelled maximum, and no `MaxResults` at all.
+const GENERATED_PAGE_SIZES: [Option<u32>; 4] = [Some(1), Some(2), Some(100), None];
+
+/// One generated rule: the create request it was sent as, and the attribute values a
+/// narrowing can select it by.
+struct GeneratedRule {
+    request: Value,
+    resource: &'static str,
+    event_type_ids: Vec<&'static str>,
+    target_addresses: Vec<&'static str>,
+}
+
+/// Draw one rule under the name the caller gives it: a resource, one or two event types
+/// out of the published catalog, zero to two targets, and either detail type and status.
+fn generate_rule(rng: &mut StdRng, name: &str) -> GeneratedRule {
+    let resource = GENERATED_RESOURCES[rng.random_range(0..GENERATED_RESOURCES.len())];
+    let mut event_type_ids: Vec<&'static str> = Vec::new();
+    for _ in 0..rng.random_range(1..=2) {
+        let drawn = GENERATED_EVENT_TYPE_IDS[rng.random_range(0..GENERATED_EVENT_TYPE_IDS.len())];
+        if !event_type_ids.contains(&drawn) {
+            event_type_ids.push(drawn);
+        }
+    }
+    let mut target_addresses: Vec<&'static str> = Vec::new();
+    for _ in 0..rng.random_range(0..=2) {
+        let drawn =
+            GENERATED_TARGET_ADDRESSES[rng.random_range(0..GENERATED_TARGET_ADDRESSES.len())];
+        if !target_addresses.contains(&drawn) {
+            target_addresses.push(drawn);
+        }
+    }
+    let request = json!({
+        "Name": name,
+        "Resource": resource,
+        "DetailType": if rng.random_bool(0.5) { "BASIC" } else { "FULL" },
+        "Status": if rng.random_bool(0.5) { "ENABLED" } else { "DISABLED" },
+        "EventTypeIds": event_type_ids,
+        "Targets": target_addresses
+            .iter()
+            .map(|address| json!({
+                "TargetType": narrow_target_type(address),
+                "TargetAddress": address,
+            }))
+            .collect::<Vec<Value>>(),
+    });
+    GeneratedRule {
+        request,
+        resource,
+        event_type_ids,
+        target_addresses,
+    }
+}
+
+/// A drawn narrowing: how it is reported, the `Filters` entries it sends, and the ARN of
+/// the rule it was built from — the one rule it must name, because every value it ORs for
+/// a filter name includes that rule's own value for that name.
+struct GeneratedNarrowing {
+    label: String,
+    filters: Vec<Value>,
+    anchor_arn: String,
+}
+
+/// Draw a narrowing of `population`: a random subset of the filter names the enum lists,
+/// each carrying one anchor rule's own value and, half the time, a second value ORed
+/// beside it.
+fn generate_narrowing(
+    rng: &mut StdRng,
+    population: &[(GeneratedRule, String)],
+    created_by: &str,
+) -> GeneratedNarrowing {
+    let (anchor, anchor_arn) = &population[rng.random_range(0..population.len())];
+    let mut filters: Vec<Value> = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
+    for name in FILTER_NAMES {
+        if !rng.random_bool(0.5) {
+            continue;
+        }
+        let mut values: Vec<String> = match name {
+            "RESOURCE" => vec![anchor.resource.to_string()],
+            "EVENT_TYPE_ID" => vec![anchor.event_type_ids
+                [rng.random_range(0..anchor.event_type_ids.len())]
+            .to_string()],
+            "CREATED_BY" => vec![created_by.to_string()],
+            // A rule with no target carries no address a listing can select it by.
+            "TARGET_ADDRESS" if !anchor.target_addresses.is_empty() => {
+                vec![anchor.target_addresses
+                    [rng.random_range(0..anchor.target_addresses.len())]
+                .to_string()]
+            }
+            _ => continue,
+        };
+        if rng.random_bool(0.5) {
+            // A second value for the same name: the OR `Filters` documents within one
+            // name, which can only widen what the narrowing selects.
+            let extra = match name {
+                "RESOURCE" => GENERATED_RESOURCES[rng.random_range(0..GENERATED_RESOURCES.len())],
+                "EVENT_TYPE_ID" => {
+                    GENERATED_EVENT_TYPE_IDS[rng.random_range(0..GENERATED_EVENT_TYPE_IDS.len())]
+                }
+                "CREATED_BY" => UNMATCHED_PRINCIPAL,
+                _ => GENERATED_TARGET_ADDRESSES
+                    [rng.random_range(0..GENERATED_TARGET_ADDRESSES.len())],
+            };
+            if !values.iter().any(|value| value == extra) {
+                values.push(extra.to_string());
+            }
+        }
+        parts.push(format!("{name}={values:?}"));
+        filters.extend(
+            values
+                .into_iter()
+                .map(|value| json!({ "Name": name, "Value": value })),
+        );
+    }
+    GeneratedNarrowing {
+        label: if parts.is_empty() {
+            "no filter".to_string()
+        } else {
+            parts.join(" AND ")
+        },
+        filters,
+        anchor_arn: anchor_arn.clone(),
+    }
+}
+
+/// RULE (as an invariant, over generated input): the identity a listing reports for a
+/// rule is that rule's OWN drawn identifier — a canonical version-4 UUID, byte-for-byte
+/// the resource segment of that entry's `Arn`, issued to one rule of one store and to no
+/// other — whatever the store holds and however the listing is narrowed, and reading the
+/// same listing again reports it unchanged.
+#[tokio::test]
+async fn a_generated_population_reports_each_rules_own_identity_under_any_narrowing() {
+    // Drawn per run and carried into every assertion message below, so a failure names
+    // the draw that produced it and the run is reproducible by pinning this value.
+    let seed: u64 = rand::rng().random();
+    let mut rng = StdRng::seed_from_u64(seed);
+    // Across every independently generated store: an identifier is drawn per rule, so no
+    // two rules anywhere are issued the same one.
+    let mut issued_anywhere: HashSet<String> = HashSet::new();
+
+    for population_index in 0..GENERATED_POPULATIONS {
+        // A fresh store per population, so two stores answering generated creates have
+        // to mint no identifier in common either.
+        let emulator = Emulator::new();
+        let size = rng.random_range(GENERATED_RULES_PER_POPULATION);
+        let mut population: Vec<(GeneratedRule, String)> = Vec::with_capacity(size);
+        for rule_index in 0..size {
+            let case = format!("seed {seed}, population {population_index}, rule {rule_index}");
+            let generated = generate_rule(
+                &mut rng,
+                &format!("generated-{population_index}-{rule_index}"),
+            );
+            let created = emulator
+                .ok(&case, "/createNotificationRule", &generated.request)
+                .await;
+            let arn = string(&created, "Arn");
+            let id = id_of_arn(&case, &arn).to_string();
+            assert_canonical_rule_id(&case, &id);
+            assert!(
+                issued_anywhere.insert(id.clone()),
+                "case {case:?}: {id:?} was already issued to another rule, so the identity is \
+                 not drawn per rule"
+            );
+            population.push((generated, arn));
+        }
+
+        let case = format!("seed {seed}, population {population_index}");
+        // `CreatedBy` is the caller's own principal, recorded by the service rather than
+        // sent, so the CREATED_BY narrowings filter on what the store holds.
+        let described = emulator
+            .ok(
+                &case,
+                "/describeNotificationRule",
+                &json!({ "Arn": population[0].1 }),
+            )
+            .await;
+        let created_by = string(&described, "CreatedBy");
+        assert!(
+            !created_by.is_empty(),
+            "case {case:?}: the store must record the caller as CreatedBy, got {described}"
+        );
+
+        let minted: Vec<(String, String)> = population
+            .iter()
+            .map(|(_, arn)| (id_of_arn(&case, arn).to_string(), arn.clone()))
+            .collect();
+        let issued_here: HashSet<String> = minted.iter().map(|(id, _)| id.clone()).collect();
+
+        let listed = list_pairs(&emulator, &case, &json!({}), None).await;
+        assert_eq!(
+            listed, minted,
+            "case {case:?}: an unfiltered listing must name the whole population under the \
+             identities it was minted, got {listed:?}"
+        );
+
+        for narrowing_index in 0..GENERATED_NARROWINGS {
+            let narrowing = generate_narrowing(&mut rng, &population, &created_by);
+            let max_results = GENERATED_PAGE_SIZES[rng.random_range(0..GENERATED_PAGE_SIZES.len())];
+            let case = format!(
+                "seed {seed}, population {population_index}, narrowing {narrowing_index} \
+                 ({}) at MaxResults={max_results:?}",
+                narrowing.label
+            );
+            let body = if narrowing.filters.is_empty() {
+                json!({})
+            } else {
+                json!({ "Filters": narrowing.filters })
+            };
+
+            let pairs = list_pairs(&emulator, &case, &body, max_results).await;
+            for (id, arn) in &pairs {
+                assert_eq!(
+                    id.as_str(),
+                    id_of_arn(&case, arn),
+                    "case {case:?}: the summary's Id must be its own ARN's resource segment, \
+                     got {id:?} for {arn:?}"
+                );
+                assert_canonical_rule_id(&case, id);
+                assert!(
+                    issued_here.contains(id),
+                    "case {case:?}: {id:?} is an identity this store never issued"
+                );
+            }
+            let distinct: HashSet<&String> = pairs.iter().map(|(id, _)| id).collect();
+            assert_eq!(
+                distinct.len(),
+                pairs.len(),
+                "case {case:?}: no rule may be named twice in one listing, got {pairs:?}"
+            );
+            assert!(
+                pairs
+                    .iter()
+                    .any(|(_, arn)| arn == &narrowing.anchor_arn),
+                "case {case:?}: the rule every one of these filters carries a value of must be \
+                 named, got {pairs:?}"
+            );
+            // A listing is a read: the next caller is told the same identities.
+            let again = list_pairs(&emulator, &case, &body, max_results).await;
+            assert_eq!(
+                again, pairs,
+                "case {case:?}: reading the listing again must report the same identities, \
+                 got {again:?}"
+            );
         }
     }
 }

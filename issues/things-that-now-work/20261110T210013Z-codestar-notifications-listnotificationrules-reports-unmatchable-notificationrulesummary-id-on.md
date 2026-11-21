@@ -12,6 +12,39 @@ Issue-Commit: 7753983c6e495ec3612695b1336bf4936fc7b7fd
 
 # codestar-notifications ListNotificationRules reports unmatchable NotificationRuleSummary Id on every page
 
+## Resolution (all three causes declined: a per-run, service-generated resource id)
+
+The emulator's behaviour is correct and all THREE causes are DECLINED, not implemented.
+They are one difference on one member: `NotificationRuleSummary.Id` carries the identifier
+this service drew for that rule in THIS run, while the recording holds the identifier AWS
+drew in the recording run. The minting the report blames was already rewritten before this
+checkout: `crate::state::new_rule_id` draws a canonical hyphenated lowercase version-4
+UUID (36 characters, inside the only constraint the model places on `NotificationRuleId`,
+`@length` 1..40, which carries no `@pattern`), `crate::state::notification_rule_arn`
+embeds that exact value as the ARN's `notificationrule/<id>` segment, and
+`src/ops/list_notification_rules.rs` reports the stored id verbatim beside the stored ARN
+on every page, filtered or not. The two values therefore differ only in their draw: same
+modelled type, same length, same form, same provenance, stable across reads, unique per
+rule. Replaying the fixture twice reports two different pairs of uuids with an identical
+verdict, which is what a per-run identifier looks like.
+
+The remedy the report implies — serve the recording's uuid, or derive the identifier from
+the request — is NOT applied: a rule identifier is minted once per rule and recurs in no
+later run, and an identifier taken from the recording would also have to differ from the
+resource segment of the ARN the emulator minted, which this very report requires to stay
+byte-for-byte identical. The replay keys
+`codestar-notifications|ListNotificationRules|2xx->2xx|$.NotificationRules[Arn="...notificationrule/<uuid>"].Id`
+therefore stay failing by construction, under each run's own uuids.
+
+What this resolution adds instead is a property-based pin of the rule, beside the tables
+`tests/all/rule_id_identity.rs` and `tests/all/rule_id_correlation.rs` already carry: over
+populations and listing narrowings drawn by a seeded generator (rule count, resource, event
+types, targets, detail type, status; which filter names, how many values each ORs, which
+page size), every entry of every listing reports that rule's own drawn identifier — a
+canonical version-4 UUID, byte-for-byte the resource segment of that entry's own `Arn`,
+issued to one rule of one store and to no other — and reading the listing again reports it
+unchanged.
+
 > _Note: this issue was identified against the code base at commit `7753983c6e495ec3612695b1336bf4936fc7b7fd`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

@@ -33,6 +33,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The seeded generator the property-based identity suite draws its rule populations and
+# listing narrowings from.
+rand = "0.9"
 # Percent-encoding for the `@httpLabel` / `@httpQuery` values a test puts on the request
 # line (an ARN's `:` and `/` have to travel escaped).
 percent-encoding = "2"
