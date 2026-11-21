@@ -92,7 +92,7 @@ pub mod video_source;
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
@@ -160,10 +160,32 @@ pub const CONTENT_MODERATION_FEATURE: &str = "CONTENT_MODERATION";
 /// `CreateProject` provisions nothing — a project is a container for datasets and model
 /// versions, both of which are created by their own operations — and its response
 /// carries no status, so the project is already created by the time any reader can ask
-/// about it. The other two `ProjectStatus` values (`smithy_query(query="shape",
-/// shape="ProjectStatus")`: CREATING | CREATED | DELETING) belong to transitions no
-/// operation of this slice starts.
+/// about it. `CREATING`, the third value the model has (`smithy_query(query="shape",
+/// shape="ProjectStatus")`: CREATING | CREATED | DELETING), belongs to a transition no
+/// operation of this service starts.
 pub const PROJECT_STATUS_CREATED: &str = "CREATED";
+
+/// The `ProjectStatus` a project carries from the call that asked for its deletion until
+/// the clock has taken it out of this store.
+///
+/// Deleting a project "is an asynchronous operation. To check if the project is deleted,
+/// call DescribeProjects. The project is deleted when the project no longer appears in the
+/// response" (`smithy_query(query="operation",operation="DeleteProject")`), so a project
+/// whose deletion has been asked for is still one of the account's and reports this status
+/// while it goes.
+pub const PROJECT_STATUS_DELETING: &str = "DELETING";
+
+/// How long after the call that asked for it a project's deletion is complete — the span
+/// after which the project is no longer one of the account's and so is reported by nothing.
+///
+/// The delete answers while the deletion is still going, which is what makes the `Status`
+/// it answers with worth reporting, so the span is never zero: a caller that describes the
+/// project straight after deleting it still sees it, in [`PROJECT_STATUS_DELETING`]. AWS
+/// takes as long as it takes; this emulator owes the transition at a span of its own
+/// choosing, the same one a video analysis of this service completes in
+/// ([`video_jobs::COMPLETION_SPAN`]). The instant it falls due is STORED rather than waited
+/// for: nothing sleeps.
+pub const PROJECT_DELETION_SPAN: Duration = Duration::from_secs(3);
 
 /// How many collections this store will hold, and how many faces one collection will
 /// hold, before a create or an index is refused with the modelled
@@ -406,8 +428,12 @@ pub struct Project {
     /// names it by.
     pub arn: String,
     pub creation_timestamp: SystemTime,
-    /// The project's `ProjectStatus`; see [`PROJECT_STATUS_CREATED`].
-    pub status: String,
+    /// When the deletion `DeleteProject` started is complete — the instant from which this
+    /// project is no longer one of the account's — and `None` while no call has asked for
+    /// one. The instant is STORED rather than waited for: nothing sleeps, and both the
+    /// status this project reports and whether it still exists at all are computed from the
+    /// clock whenever they are asked for. See [`PROJECT_DELETION_SPAN`].
+    pub deleting_until: Option<SystemTime>,
     /// The `CustomizationFeature` the project is customized for: what the create
     /// named, or [`DEFAULT_CUSTOMIZATION_FEATURE`] when it named none.
     pub feature: String,
@@ -484,12 +510,45 @@ impl Project {
             name,
             arn,
             creation_timestamp,
-            status: PROJECT_STATUS_CREATED.to_string(),
+            deleting_until: None,
             feature,
             auto_update,
             tags,
             versions: BTreeMap::new(),
             policies: BTreeMap::new(),
+        }
+    }
+
+    /// Record that the deletion of this project started at `now`, due to be complete one
+    /// [`PROJECT_DELETION_SPAN`] later.
+    ///
+    /// A project already being deleted keeps the instant the first call owed it: asking for
+    /// a deletion that is already under way does not postpone it.
+    pub fn start_deletion(&mut self, now: SystemTime) {
+        self.deleting_until
+            .get_or_insert(now + PROJECT_DELETION_SPAN);
+    }
+
+    /// Whether a deletion of this project has been asked for.
+    pub fn is_deleting(&self) -> bool {
+        self.deleting_until.is_some()
+    }
+
+    /// Whether the clock has completed this project's deletion by `now`: from that instant
+    /// the project is one the account no longer has, so no reader reports it and no ARN
+    /// resolves to it.
+    pub fn is_deleted_at(&self, now: SystemTime) -> bool {
+        self.deleting_until.is_some_and(|until| now >= until)
+    }
+
+    /// This project's `ProjectStatus`: deleting once a call has asked for its deletion,
+    /// and created otherwise. A project the clock has finished deleting is reported by
+    /// nothing, so no reader sees a status past that instant.
+    pub fn status(&self) -> &'static str {
+        if self.is_deleting() {
+            PROJECT_STATUS_DELETING
+        } else {
+            PROJECT_STATUS_CREATED
         }
     }
 
@@ -502,7 +561,7 @@ impl Project {
         ProjectDescription {
             project_arn: Some(self.arn.clone()),
             creation_timestamp: Some(::aws_smithy_types::DateTime::from(self.creation_timestamp)),
-            status: Some(self.status.clone()),
+            status: Some(self.status().to_string()),
             datasets: Some(Vec::new()),
             feature: Some(self.feature.clone()),
             auto_update: self.auto_update.clone(),
@@ -518,11 +577,16 @@ pub struct ComAmazonawsRekognitionRekognitionserviceState {
     /// `BTreeMap` so `ListCollections` order, and therefore its pagination, is
     /// deterministic. Bounded by [`MAX_COLLECTIONS`].
     pub collections: BTreeMap<String, Collection>,
-    /// Every live project, keyed by its `ProjectName` — the name a project is created
-    /// under and the one `DescribeProjects` filters by, unique per account because a
-    /// create that repeats one is refused. A `BTreeMap` for the same reason as
-    /// `collections`: `DescribeProjects`' order, and therefore its pagination, is
+    /// Every project this account still has, keyed by its `ProjectName` — the name a
+    /// project is created under and the one `DescribeProjects` filters by, unique per
+    /// account because a create that repeats one is refused. A `BTreeMap` for the same
+    /// reason as `collections`: `DescribeProjects`' order, and therefore its pagination, is
     /// deterministic. Bounded by [`MAX_PROJECTS`].
+    ///
+    /// A project whose deletion the clock has completed is no longer one of them, whether
+    /// or not it has been dropped from the map yet, so a project of this map is reached
+    /// through [`Self::live_projects`] or dropped by
+    /// [`Self::forget_deleted_projects`] rather than read straight out of it.
     pub projects: BTreeMap<String, Project>,
     /// What each idempotency token this service has seen committed, so a retried
     /// request completes only once and a token reused for a different request is
@@ -549,6 +613,35 @@ pub struct ComAmazonawsRekognitionRekognitionserviceState {
 }
 
 impl ComAmazonawsRekognitionRekognitionserviceState {
+    /// Every project this account still has at `now`: the projects of the store the clock
+    /// has not finished deleting.
+    ///
+    /// Deleting a project is asynchronous, so a deletion asked for becomes a deletion done
+    /// at an instant the clock decides ([`PROJECT_DELETION_SPAN`]) and not at a call. One
+    /// filter therefore answers for every reader of this store: a project past that instant
+    /// is gone whether or not a later call has dropped its record.
+    pub fn live_projects_at(&self, now: SystemTime) -> impl Iterator<Item = &Project> {
+        self.projects
+            .values()
+            .filter(move |project| !project.is_deleted_at(now))
+    }
+
+    /// Every project this account still has as of this instant; see
+    /// [`Self::live_projects_at`].
+    pub fn live_projects(&self) -> impl Iterator<Item = &Project> {
+        self.live_projects_at(SystemTime::now())
+    }
+
+    /// Drop the record of every project whose deletion the clock has completed by `now`.
+    ///
+    /// The removal is owed by the clock alone — it was due at the same instant whether or
+    /// not anybody called — so a reader may materialise it, and that is what frees the
+    /// project's name and its room in the store for a later create.
+    pub fn forget_deleted_projects(&mut self, now: SystemTime) {
+        self.projects
+            .retain(|_, project| !project.is_deleted_at(now));
+    }
+
     /// The tag set of the resource `resource_arn` names, in either form of its ARN (see
     /// [`arn_names`]), or `None` when no live resource of this store carries that ARN.
     ///
@@ -564,27 +657,27 @@ impl ComAmazonawsRekognitionRekognitionserviceState {
         {
             return Some(&collection.tags);
         }
-        self.projects
-            .values()
-            .find(|project| arn_names(&project.arn, resource_arn))
-            .map(|project| &project.tags)
+        self.project_by_arn(resource_arn).map(|project| &project.tags)
     }
 
     /// The project `project_arn` names, in either form of its ARN (see [`arn_names`]), or
-    /// `None` when this store holds no such project.
+    /// `None` when this account has no such project.
     ///
     /// Every operation ON a project names it by ARN while the store keys a project by its
-    /// name, so the resolution lives here once rather than in each of those handlers.
+    /// name, so the resolution lives here once rather than in each of those handlers — and
+    /// so does the one rule about which projects an ARN may resolve to, the live ones of
+    /// [`Self::live_projects`].
     pub fn project_by_arn(&self, project_arn: &str) -> Option<&Project> {
-        self.projects
-            .values()
+        self.live_projects()
             .find(|project| arn_names(&project.arn, project_arn))
     }
 
     /// The same resolution, for the operations that CHANGE the project.
     pub fn project_by_arn_mut(&mut self, project_arn: &str) -> Option<&mut Project> {
+        let now = SystemTime::now();
         self.projects
             .values_mut()
+            .filter(|project| !project.is_deleted_at(now))
             .find(|project| arn_names(&project.arn, project_arn))
     }
 
@@ -597,8 +690,10 @@ impl ComAmazonawsRekognitionRekognitionserviceState {
         {
             return Some(&mut collection.tags);
         }
+        let now = SystemTime::now();
         self.projects
             .values_mut()
+            .filter(|project| !project.is_deleted_at(now))
             .find(|project| arn_names(&project.arn, resource_arn))
             .map(|project| &mut project.tags)
     }

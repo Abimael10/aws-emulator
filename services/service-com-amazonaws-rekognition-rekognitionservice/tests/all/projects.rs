@@ -14,17 +14,25 @@
 //! service assigned — answers with that ARN, and refuses a second create under a live
 //! project's name without changing it; `DescribeProjects` reports exactly the records the
 //! store holds, filtered by the names and features the request asks for, in creation
-//! order, one `MaxResults`-sized page at a time.
+//! order, one `MaxResults`-sized page at a time; and `DeleteProject` STARTS the removal of
+//! the project its ARN names — answering the status it now carries, keeping it a project of
+//! the account until the clock finishes the removal, and refusing an ARN that names no live
+//! project of the account or a project that still manages a model version.
 //!
 //! Each test asserts that rule over a TABLE whose rows differ along what it generalises
 //! over: the project name's form and length (both published `ProjectName` bounds), the
 //! feature (named and defaulted), whether auto-update was asked for, the number of tags,
-//! the region the call is signed in — which is where the ARN's region comes from — and
-//! the page size (both published `ProjectsPageSize` bounds and one past each).
+//! the region the call is signed in — which is where the ARN's region comes from — the
+//! page size (both published `ProjectsPageSize` bounds and one past each), how an ARN fails
+//! to name a live project, how many model versions a project still manages, and where the
+//! instant a reader asks about falls against the one the clock owes a deletion at.
 //!
 //! What is NOT asserted here: the tags a create attaches, which the tagging suite asserts
 //! through the operations that report and change them; the rows below still create
 //! projects with and without tags, so the create path is exercised either way.
+
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_rekognition_rekognitionservice::state;
@@ -33,6 +41,9 @@ use smithy_server_runtime::MultiServiceRouter;
 // The router harness, the dispatch helpers and the reduced reply all come from the
 // collection-lifecycle suite rather than being built a second time here.
 use crate::face_collections::{call, call_in, harness, Reply};
+// The harness that hands the engine back, the policy document and the record of a model
+// version come from the project-policy suite, which already owns them.
+use crate::project_policies::{harness_with_engine, policy_document, put_policy, record_model_version};
 
 /// `ProjectName` is `len 1..255, pattern ^[a-zA-Z0-9_.\-]+$`
 /// (`smithy_query(query="operation",operation="CreateProject")`).
@@ -742,5 +753,559 @@ async fn the_project_store_refuses_to_grow_past_its_capacity() {
         0,
         "the project a refused create named must not exist, got {:?}",
         absent.body
+    );
+}
+
+// --- deleting a project -------------------------------------------------------------
+
+/// The `ProjectStatus` values a project of this store is reported in
+/// (`smithy_query(query="shape",shape="ProjectStatus")`: CREATING | CREATED | DELETING \u2014
+/// `CREATING` belongs to a transition no operation of this service starts).
+const STATUS_CREATED: &str = "CREATED";
+const STATUS_DELETING: &str = "DELETING";
+
+/// How long a poll for the clock to finish a deletion keeps looking, and how often it looks
+/// again.
+///
+/// The deadline is far longer than any span the service could owe the transition at, so a
+/// slow or loaded host still passes; the loop stops as soon as the project is gone, so it
+/// waits for the CONDITION and never for a fixed time.
+const DELETION_DEADLINE: Duration = Duration::from_secs(120);
+const LOOK_AGAIN: Duration = Duration::from_millis(25);
+
+/// `DeleteProject` for `project_arn`.
+async fn delete_project(router: &MultiServiceRouter, project_arn: &str) -> Reply {
+    call(router, "DeleteProject", json!({ "ProjectArn": project_arn })).await
+}
+
+/// The description `DescribeProjects` reports for the project named `project_name`, read
+/// with the filters that keep the answer to that one project, or `None` when the project is
+/// not one the account has.
+async fn description_of(
+    router: &MultiServiceRouter,
+    project_name: &str,
+    feature: &str,
+) -> Option<Value> {
+    let reply = describe_projects(router, Some(&[project_name]), Some(&[feature])).await;
+    assert_eq!(
+        reply.status, 200,
+        "case {project_name:?}: describing projects must succeed, got {:?}",
+        reply.body
+    );
+    reply.list("ProjectDescriptions").first().cloned()
+}
+
+/// Look again until `DescribeProjects` no longer reports `project_name`, and answer whether
+/// it went before [`DELETION_DEADLINE`] passed.
+///
+/// "The project is deleted when the project no longer appears in the response" is the only
+/// thing a caller may read the completion of a deletion off, so this is the wire read the
+/// test repeats; the instant the deletion falls due belongs to the service.
+async fn wait_until_gone(
+    router: &MultiServiceRouter,
+    project_name: &str,
+    feature: &str,
+) -> bool {
+    let deadline = Instant::now() + DELETION_DEADLINE;
+    loop {
+        if description_of(router, project_name, feature).await.is_none() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(LOOK_AGAIN);
+    }
+}
+
+/// Take the model version named `version_name` off the project named `project_name`, the way
+/// the operation that deletes one would.
+///
+/// `DeleteProjectVersion` is an unimplemented 501 of its own, so this drops the record it
+/// would drop; everything the rule under test does with the project then happens over the
+/// wire.
+fn forget_model_version(
+    engine: &std::sync::Arc<engine::InMemoryEngine>,
+    project_name: &str,
+    version_name: &str,
+) {
+    let store = state::service_state(&**engine).expect("this service's store");
+    let mut store = store.lock();
+    let project = store
+        .projects
+        .get_mut(project_name)
+        .unwrap_or_else(|| panic!("the project {project_name} the test created"));
+    assert!(
+        project.versions.remove(version_name).is_some(),
+        "case {project_name}/{version_name}: the version the test recorded must be there"
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_project_starts_a_removal_the_clock_finishes() {
+    let router = harness();
+
+    // Rows differ along what the rule generalises over: the name's form and length
+    // (including both published `ProjectName` bounds), whether the request named a
+    // `Feature`, whether it asked for auto-update, the number of tags the project carries,
+    // and the region the calls are signed in.
+    let cases: Vec<ProjectCase> = vec![
+        ProjectCase {
+            project_name: "delete-me".to_string(),
+            feature: None,
+            auto_update: None,
+            tags: vec![],
+            region: "us-east-1",
+        },
+        ProjectCase {
+            project_name: "Team.Delete_2026-Q1".to_string(),
+            feature: Some(CUSTOM_LABELS),
+            auto_update: None,
+            tags: vec![("env", "test"), ("owner", "qa")],
+            region: "eu-west-1",
+        },
+        ProjectCase {
+            project_name: "d".to_string(),
+            feature: Some(CONTENT_MODERATION),
+            auto_update: Some(AUTO_UPDATE_ENABLED),
+            tags: vec![("only", "one")],
+            region: "us-west-2",
+        },
+        ProjectCase {
+            project_name: "z".repeat(PROJECT_NAME_MAX),
+            feature: Some(CONTENT_MODERATION),
+            auto_update: Some(AUTO_UPDATE_DISABLED),
+            tags: vec![],
+            region: "ap-southeast-3",
+        },
+    ];
+
+    // Every project is created first, and every delete is asked for before any of them is
+    // waited on, so the spans the clock owes them run together.
+    let mut arns: Vec<String> = Vec::new();
+    for case in &cases {
+        let name = case.project_name.as_str();
+        let created = create_project_in(&router, case.region, case.request()).await;
+        assert_eq!(
+            created.status, 200,
+            "case {name:?}: creating a project must succeed, got {:?}",
+            created.body
+        );
+        arns.push(
+            created
+                .string("ProjectArn")
+                .unwrap_or_else(|| panic!("case {name:?}: a ProjectArn must come back")),
+        );
+    }
+
+    for (case, arn) in cases.iter().zip(&arns) {
+        let name = case.project_name.as_str();
+        let feature = case.effective_feature();
+
+        let deleted = delete_project(&router, arn).await;
+        assert_eq!(
+            deleted.status, 200,
+            "case {name:?}: deleting a project must succeed, got {:?}",
+            deleted.body
+        );
+        assert_eq!(
+            deleted.string("Status").as_deref(),
+            Some(STATUS_DELETING),
+            "case {name:?}: the delete must answer the status the project now carries, \
+             got {:?}",
+            deleted.body
+        );
+
+        // The delete answers while the removal is still going, so the project is still one
+        // of the account's and a reader reports it under the same status.
+        let described = description_of(&router, name, feature)
+            .await
+            .unwrap_or_else(|| panic!("case {name:?}: the project must still be described"));
+        assert_eq!(
+            member(&described, "ProjectArn").as_deref(),
+            Some(arn.as_str()),
+            "case {name:?}: the described project must still carry its own ARN, \
+             got {described:?}"
+        );
+        assert_eq!(
+            member(&described, "Status").as_deref(),
+            Some(STATUS_DELETING),
+            "case {name:?}: a project being deleted is reported DELETING, got {described:?}"
+        );
+
+        // Asking again while it goes reports the same status and starts no second removal.
+        let again = delete_project(&router, arn).await;
+        assert_eq!(
+            (again.status, again.string("Status")),
+            (200, Some(STATUS_DELETING.to_string())),
+            "case {name:?}: a repeated delete must answer the same status, got {:?}",
+            again.body
+        );
+
+        // The name is still taken while the project it names is going.
+        let collided = create_project_in(&router, case.region, case.request()).await;
+        assert_eq!(
+            (collided.status, collided.error_code().as_str()),
+            (400, "ResourceInUseException"),
+            "case {name:?}: the name of a project that is still going must stay taken, \
+             got {:?}",
+            collided.body
+        );
+    }
+
+    for (case, arn) in cases.iter().zip(&arns) {
+        let name = case.project_name.as_str();
+        let feature = case.effective_feature();
+
+        assert!(
+            wait_until_gone(&router, name, feature).await,
+            "case {name:?}: the clock must finish the deletion within {DELETION_DEADLINE:?}"
+        );
+
+        // An ARN of a project the account no longer has names nothing: not to delete again,
+        // and not as a resource carrying tags.
+        let refused = delete_project(&router, arn).await;
+        assert_eq!(
+            (refused.status, refused.error_code().as_str()),
+            (400, "ResourceNotFoundException"),
+            "case {name:?}: deleting a project that is gone must be refused, got {:?}",
+            refused.body
+        );
+        assert_eq!(
+            refused.string("Message").as_deref(),
+            Some(format!("Project {arn} does not exist").as_str()),
+            "case {name:?}: expected the wording this operation answers an ARN that names no \
+             project with, got {:?}",
+            refused.body
+        );
+        let tags = call(
+            &router,
+            "ListTagsForResource",
+            json!({ "ResourceArn": arn }),
+        )
+        .await;
+        assert_eq!(
+            (tags.status, tags.error_code().as_str()),
+            (400, "ResourceNotFoundException"),
+            "case {name:?}: the tags of a project that is gone belong to nothing, got {:?}",
+            tags.body
+        );
+
+        // The name is free again, and the create that takes it is a NEW project: its own
+        // ARN, created rather than deleting.
+        let recreated = create_project_in(&router, case.region, case.request()).await;
+        assert_eq!(
+            recreated.status, 200,
+            "case {name:?}: the name of a project that is gone must be free, got {:?}",
+            recreated.body
+        );
+        let fresh_arn = recreated
+            .string("ProjectArn")
+            .unwrap_or_else(|| panic!("case {name:?}: a ProjectArn must come back"));
+        assert_ne!(
+            &fresh_arn, arn,
+            "case {name:?}: a project created again must carry an ARN of its own"
+        );
+        let described = description_of(&router, name, feature)
+            .await
+            .unwrap_or_else(|| panic!("case {name:?}: the project created again"));
+        assert_eq!(
+            (
+                member(&described, "ProjectArn").as_deref(),
+                member(&described, "Status").as_deref()
+            ),
+            (Some(fresh_arn.as_str()), Some(STATUS_CREATED)),
+            "case {name:?}: the project created again is a created project, got {described:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_arn_that_names_no_live_project_names_nothing_to_delete() {
+    let router = harness();
+
+    let live_name = "still-here";
+    let live_arn = create_project(&router, live_name, CUSTOM_LABELS).await;
+    let account = engine::emulator_account_id();
+
+    // Rows differ along HOW the ARN fails to name a live project of this account: the
+    // project name, the region, the account id and the instant segment the ARN carries are
+    // each part of its identity, so an ARN that differs in any one of them names another
+    // resource. Every row satisfies `ProjectArn`'s own pattern
+    // (`^arn:[a-z\d-]+:rekognition:[a-z\d-]+:\d{12}:project\/[a-zA-Z0-9_.\-]{1,255}\/[0-9]+$`),
+    // so each reaches the handler.
+    let mut cases: Vec<(&str, String)> = vec![
+        (
+            "a project name no create used",
+            format!("arn:aws:rekognition:us-east-1:{account}:project/never-created/1762000000000"),
+        ),
+        (
+            "the live name in another region",
+            live_arn.replace("us-east-1", "eu-west-1"),
+        ),
+        (
+            "the live name under another account",
+            live_arn.replace(account, "210987654321"),
+        ),
+        (
+            "a project name that only differs in case",
+            live_arn.replace(live_name, "Still-Here"),
+        ),
+    ];
+    // The ARN's last segment is the project's creation instant, so the same name at another
+    // instant is another project.
+    let other_instant = format!(
+        "arn:aws:rekognition:us-east-1:{account}:project/{live_name}/{}",
+        arn_version(&live_arn).expect("a numeric version segment") + 1
+    );
+    cases.push(("the live name at another instant", other_instant));
+
+    for (case, arn) in &cases {
+        let reply = delete_project(&router, arn).await;
+        assert_eq!(
+            (reply.status, reply.error_code().as_str()),
+            (400, "ResourceNotFoundException"),
+            "case {case:?}: {arn} names no project to delete, got {:?}",
+            reply.body
+        );
+        assert_eq!(
+            reply.string("Message").as_deref(),
+            Some(format!("Project {arn} does not exist").as_str()),
+            "case {case:?}: expected the wording this operation answers an ARN that names no \
+             project with, got {:?}",
+            reply.body
+        );
+    }
+
+    // A refused delete starts nothing: the project that does exist is untouched, and still
+    // created rather than deleting.
+    let described = description_of(&router, live_name, CUSTOM_LABELS)
+        .await
+        .expect("the project the test created");
+    assert_eq!(
+        (
+            member(&described, "ProjectArn").as_deref(),
+            member(&described, "Status").as_deref()
+        ),
+        (Some(live_arn.as_str()), Some(STATUS_CREATED)),
+        "a refused delete must leave the live project exactly as it was, got {described:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_project_that_still_manages_a_model_version_refuses_to_be_deleted() {
+    let (router, engine) = harness_with_engine();
+
+    // Rows differ along how many model versions the project still manages: none, one and
+    // several. "To delete a project you must first delete all models or adapters associated
+    // with the project", so only the first row may be deleted.
+    let cases: Vec<(&str, &str, Vec<&str>)> = vec![
+        ("no model version", "project-without-versions", vec![]),
+        ("one model version", "project-with-one-version", vec!["v1"]),
+        (
+            "several model versions",
+            "project-with-three-versions",
+            vec!["v1", "v2", "release.2026-01"],
+        ),
+    ];
+
+    for (case, project_name, versions) in &cases {
+        let arn = create_project(&router, project_name, CUSTOM_LABELS).await;
+        for version in versions {
+            record_model_version(&engine, project_name, version);
+        }
+
+        let reply = delete_project(&router, &arn).await;
+        if versions.is_empty() {
+            assert_eq!(
+                (reply.status, reply.string("Status")),
+                (200, Some(STATUS_DELETING.to_string())),
+                "case {case:?}: a project managing no model version must be deleted, got {:?}",
+                reply.body
+            );
+            continue;
+        }
+        assert_eq!(
+            (reply.status, reply.error_code().as_str()),
+            (400, "ResourceInUseException"),
+            "case {case:?}: a project that still manages a model version must refuse the \
+             delete, got {:?}",
+            reply.body
+        );
+        assert_eq!(
+            reply.string("Message").as_deref(),
+            Some(
+                format!(
+                    "The project cannot be deleted. Please delete all models and adapters \
+                     associated with the project {project_name} and try again."
+                )
+                .as_str()
+            ),
+            "case {case:?}: expected the refusal to state the precondition, got {:?}",
+            reply.body
+        );
+
+        // The refused delete started nothing: the project is still created, not going.
+        let described = description_of(&router, project_name, CUSTOM_LABELS)
+            .await
+            .unwrap_or_else(|| panic!("case {case:?}: the project must still be described"));
+        assert_eq!(
+            member(&described, "Status").as_deref(),
+            Some(STATUS_CREATED),
+            "case {case:?}: a refused delete must leave the project created, got {described:?}"
+        );
+
+        // With its last model version gone the same project deletes, so what the refusal was
+        // about is the versions and nothing else.
+        for version in versions {
+            forget_model_version(&engine, project_name, version);
+        }
+        let deleted = delete_project(&router, &arn).await;
+        assert_eq!(
+            (deleted.status, deleted.string("Status")),
+            (200, Some(STATUS_DELETING.to_string())),
+            "case {case:?}: with no model version left the delete must succeed, got {:?}",
+            deleted.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_project_policies_of_a_deleted_project_go_with_it() {
+    let (router, engine) = harness_with_engine();
+
+    // A policy grants on a model version of the project, so the project holds one while the
+    // policies are attached; the version is then taken off, the way its own operation would,
+    // leaving a project whose only children are its policies.
+    let project_name = "policy-holder";
+    let project_arn = create_project(&router, project_name, CUSTOM_LABELS).await;
+    let version_arn = record_model_version(&engine, project_name, "v1");
+    let document = policy_document(&[version_arn.as_str()]);
+    for policy_name in ["first-policy", "second-policy"] {
+        let attached = put_policy(&router, &project_arn, policy_name, &document, None).await;
+        assert_eq!(
+            attached.status, 200,
+            "case {policy_name:?}: attaching the policy must succeed, got {:?}",
+            attached.body
+        );
+    }
+    forget_model_version(&engine, project_name, "v1");
+
+    let deleted = delete_project(&router, &project_arn).await;
+    assert_eq!(
+        (deleted.status, deleted.string("Status")),
+        (200, Some(STATUS_DELETING.to_string())),
+        "a project whose only children are policies must be deleted, got {:?}",
+        deleted.body
+    );
+
+    // While the project is still going its policies are still its own.
+    let listed = call(
+        &router,
+        "ListProjectPolicies",
+        json!({ "ProjectArn": project_arn }),
+    )
+    .await;
+    assert_eq!(
+        listed.list("ProjectPolicies").len(),
+        2,
+        "a project that is still going still holds its policies, got {:?}",
+        listed.body
+    );
+
+    assert!(
+        wait_until_gone(&router, project_name, CUSTOM_LABELS).await,
+        "the clock must finish the deletion within {DELETION_DEADLINE:?}"
+    );
+
+    // Deleting a project "will also delete any ProjectPolicies associated with that
+    // project": the ARN holds no policies because it holds no project.
+    let orphaned = call(
+        &router,
+        "ListProjectPolicies",
+        json!({ "ProjectArn": project_arn }),
+    )
+    .await;
+    assert_eq!(
+        (orphaned.status, orphaned.error_code().as_str()),
+        (400, "ResourceNotFoundException"),
+        "the policies of a project that is gone belong to nothing, got {:?}",
+        orphaned.body
+    );
+
+    // And a project created again under the same name starts with none of them.
+    let fresh_arn = create_project(&router, project_name, CUSTOM_LABELS).await;
+    let fresh = call(
+        &router,
+        "ListProjectPolicies",
+        json!({ "ProjectArn": fresh_arn }),
+    )
+    .await;
+    assert_eq!(
+        (fresh.status, fresh.list("ProjectPolicies").len()),
+        (200, 0),
+        "a project created again holds no policy of the project that went, got {:?}",
+        fresh.body
+    );
+}
+
+#[test]
+fn the_clock_alone_decides_when_a_deleted_project_is_gone() {
+    let created_at = SystemTime::now();
+    let region = "us-east-1";
+    let project_name = "clock-project";
+    let mut project = state::Project::new(
+        project_name.to_string(),
+        state::project_arn(region, project_name, created_at),
+        CUSTOM_LABELS.to_string(),
+        None,
+        BTreeMap::new(),
+        created_at,
+    );
+
+    assert_eq!(
+        project.status(),
+        STATUS_CREATED,
+        "a project nobody deleted is created"
+    );
+    assert!(
+        !project.is_deleted_at(created_at + Duration::from_secs(3_600)),
+        "a project nobody deleted never goes, however long the clock runs"
+    );
+
+    let asked_at = created_at;
+    project.start_deletion(asked_at);
+    assert_eq!(
+        project.status(),
+        STATUS_DELETING,
+        "a project whose deletion was asked for is deleting"
+    );
+
+    // Rows differ along where the instant a reader asks about falls against the one the
+    // clock owes the removal at: the call itself, inside the span, the instant it falls due
+    // (the first at which the project is gone) and well past it.
+    let span = state::PROJECT_DELETION_SPAN;
+    for (case, offset, gone) in [
+        ("the instant of the call", Duration::ZERO, false),
+        ("one millisecond in", Duration::from_millis(1), false),
+        ("just before it falls due", span - Duration::from_millis(1), false),
+        ("the instant it falls due", span, true),
+        ("a second past it", span + Duration::from_secs(1), true),
+        ("an hour past it", span + Duration::from_secs(3_600), true),
+    ] {
+        assert_eq!(
+            project.is_deleted_at(asked_at + offset),
+            gone,
+            "case {case:?}: expected gone={gone} at {offset:?} after the call, got {:?}",
+            project.deleting_until
+        );
+    }
+
+    // Asking again does not postpone the removal: the instant is the first call's.
+    let mut asked_twice = project.clone();
+    asked_twice.start_deletion(asked_at + Duration::from_secs(1));
+    assert_eq!(
+        asked_twice.deleting_until, project.deleting_until,
+        "a repeated delete must not postpone the removal"
     );
 }

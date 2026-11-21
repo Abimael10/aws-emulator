@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteProject
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteProject`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteProject::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes one of this account's Rekognition projects.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +152,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteProject` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteProjectErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteProject"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteProjectErrorModeled::InternalServerError(
+                crate::state::modeled_error::store_unavailable(),
+            )
+        })?;
+        let mut state = state.lock();
+
+        // A deletion asked for earlier becomes a deletion done at the instant the clock
+        // owes it, so the record of a project past that instant is dropped here before
+        // anything is looked up: the ARN of a project this account no longer has names
+        // nothing, and the name and the room that project held are free again.
+        let now = ::std::time::SystemTime::now();
+        state.forget_deleted_projects(now);
+
+        // The project is named by ARN, and an ARN that is not one of this account's live
+        // projects names no project to delete.
+        let project = state
+            .project_by_arn_mut(&input.project_arn)
+            .ok_or_else(|| {
+                DeleteProjectErrorModeled::ResourceNotFoundException(
+                    crate::state::modeled_error::project_arn_not_found(&input.project_arn),
+                )
+            })?;
+
+        // The documented precondition: "to delete a project you must first delete all
+        // models or adapters associated with the project". A project that still manages one
+        // is in use, so the delete is refused and the project is left exactly as it was.
+        // The condition is read off the project's own record, so it holds for whichever
+        // operation ends up recording a version.
+        if !project.versions.is_empty() {
+            return Err(DeleteProjectErrorModeled::ResourceInUseException(
+                crate::state::modeled_error::project_has_associated_versions(&project.name),
+            )
+            .into());
+        }
+
+        // Deleting a project "is an asynchronous operation", so what this call does is START
+        // the deletion: the project is recorded as going, and the clock takes it out of the
+        // account one `PROJECT_DELETION_SPAN` later — "the project is deleted when the
+        // project no longer appears in the DescribeProjects response". Its project policies
+        // go with it, since they are held on the record that goes.
+        project.start_deletion(now);
+
+        // What the caller is told is the status the project now carries: it is on its way
+        // out, and a `DescribeProjects` that still reports it reports the same status.
+        Ok(DeleteProjectOutput {
+            status: Some(project.status().to_string()),
+        })
     }
 }

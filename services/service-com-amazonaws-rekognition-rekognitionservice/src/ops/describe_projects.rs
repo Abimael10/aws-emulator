@@ -167,7 +167,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::modeled_error::store_unavailable(),
             )
         })?;
-        let state = state.lock();
+        let mut state = state.lock();
+
+        // "The project is deleted when the project no longer appears in the response"
+        // (`DeleteProject`), and when that happens is owed by the clock alone: the deletion
+        // was due at its instant whether or not anybody called. This reader therefore
+        // materialises the removals the clock has already made due before it reports
+        // anything, which changes nothing a caller could otherwise have seen.
+        state.forget_deleted_projects(::std::time::SystemTime::now());
 
         // A token this list did not mint names no position in it.
         let start_at = match input.next_token.as_deref() {

@@ -174,12 +174,26 @@ pub fn invalid_pagination_token() -> InvalidPaginationTokenException {
 }
 
 /// A resource ARN no live resource of this store carries, as the tagging operations word
-/// it: the request's own ARN between two pieces of fixed text. One wording for every
-/// operation that is given a resource by ARN — the three tagging ones and the operations on
-/// a project, which name it by `ProjectArn` — since they all resolve the resource the same
-/// way and all report the same thing: the ARN you named is not one of this account's.
+/// it: the request's own ARN between two pieces of fixed text. One wording for the
+/// operations that are given a resource by ARN and resolve it the same way — the three
+/// tagging ones and the ones that work on a project's policies — since they all report the
+/// same thing: the ARN you named is not one of this account's. The operation that works on
+/// the PROJECT as a resource words the same class differently
+/// ([`project_arn_not_found`]), the way a recorded refusal of it does.
 pub fn resource_arn_not_found(resource_arn: &str) -> ResourceNotFoundException {
     ResourceNotFoundException::with_message(format!("The resource {resource_arn} does not exist"))
+}
+
+/// A `ProjectArn` naming no project this account has, as `DeleteProject` words it: the
+/// request's own ARN between two pieces of fixed text, naming the KIND of resource that is
+/// missing.
+///
+/// It is the `Message` a recorded AWS refusal of a delete of a project that is already gone
+/// carries verbatim, which is why this path words the class its own way rather than with the
+/// sentence the tagging operations answer ([`resource_arn_not_found`]) — the same split as
+/// the two wordings of a collection that does not exist above.
+pub fn project_arn_not_found(project_arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException::with_message(format!("Project {project_arn} does not exist"))
 }
 
 /// A submitted image in which a comparison found no face to work on; see
@@ -350,5 +364,23 @@ pub fn project_policy_revision_is_not_latest(
 pub fn project_policy_already_exists(policy_name: &str) -> ResourceAlreadyExistsException {
     ResourceAlreadyExistsException::with_message(format!(
         "The project policy: {policy_name} already exists"
+    ))
+}
+
+/// The fixed text a project that still manages model versions is refused the DELETE of
+/// with, with the project's own name taken from the store.
+///
+/// The precondition is documented on the operation itself: "to delete a project you must
+/// first delete all models or adapters associated with the project"
+/// (`smithy_query(query="operation",operation="DeleteProject")`), and
+/// `ResourceInUseException` — "the specified resource is already being used" — is the class
+/// the operation declares for it. No refusal of this condition is recorded, so the sentence
+/// is this service's own statement of the precondition rather than one taken from an
+/// exchange; it is worded the way this service words the other refusal a caller has to go
+/// and do something about first ([`project_policy_revision_is_not_latest`]).
+pub fn project_has_associated_versions(project_name: &str) -> ResourceInUseException {
+    ResourceInUseException::with_message(format!(
+        "The project cannot be deleted. Please delete all models and adapters associated with \
+         the project {project_name} and try again."
     ))
 }

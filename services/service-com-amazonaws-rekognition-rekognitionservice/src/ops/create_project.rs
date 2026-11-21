@@ -196,6 +196,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = state.lock();
 
+        // A project whose deletion the clock has completed is one this account no longer
+        // has, so its record goes before the name and the room it held are judged: the name
+        // is free to be created again and the project no longer counts against the store's
+        // capacity.
+        let creation_timestamp = ::std::time::SystemTime::now();
+        state.forget_deleted_projects(creation_timestamp);
+
         // A project name is the account's identity for the project, so a second create
         // under a live project's name is a collision rather than an update: it must not
         // replace the project the name already names, nor mint a second ARN for it.
@@ -223,7 +230,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = crate::state::request_region(ctx.parts());
-        let creation_timestamp = ::std::time::SystemTime::now();
         let arn = crate::state::project_arn(&region, &input.project_name, creation_timestamp);
         let project = crate::state::Project::new(
             input.project_name.clone(),
