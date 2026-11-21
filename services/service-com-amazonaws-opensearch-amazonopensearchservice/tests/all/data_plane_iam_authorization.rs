@@ -45,6 +45,17 @@ use super::published_domain_address::{
     session_arn,
 };
 
+/// The same boundary read from the other direction: an access policy NARROWED so it no
+/// longer covers one principal's request — the statement dropped, or its `Principal`,
+/// `Action` or `Resource` element narrowed past the request — refuses that identical request
+/// and stores nothing, and restoring the document serves it again.
+///
+/// The `#[path]` is what points this child at its own directory: this suite is itself
+/// reached through a `#[path]` from `tests/all.rs`, so a bare `mod` would resolve to a
+/// SIBLING suite.
+#[path = "data_plane_iam_authorization/narrowed_access_policy_withholds_a_dropped_principal.rs"]
+mod narrowed_access_policy_withholds_a_dropped_principal;
+
 /// The session name every seeded credential of this suite carries.
 const SESSION: &str = "iam-session";
 
