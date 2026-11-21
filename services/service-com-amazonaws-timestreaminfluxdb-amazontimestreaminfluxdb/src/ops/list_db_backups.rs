@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDbBackups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDbBackups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDbBackups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +149,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDbBackups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDbBackupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDbBackups"))
+        use crate::state as st;
+        use ::std::ops::Bound;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(ListDbBackupsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the service state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let region = st::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // `maxResults` is modelled `range 1..100`, so the framework has already refused
+        // anything outside it; an omitted value pages at that modelled maximum.
+        let page_size = usize::try_from(input.max_results.unwrap_or(st::MAX_RESULTS_DEFAULT))
+            .unwrap_or(st::MAX_RESULTS_DEFAULT as usize)
+            .max(1);
+
+        let mut state = state.lock();
+        // Reporting only: settling applies the status change the clock already made due,
+        // which was owed at the same instant whether or not anybody listed.
+        for record in state.db_backups.values_mut() {
+            record.settle(now);
+        }
+
+        // `dbResourceId` NARROWS the listing to the backups taken from the DB instance or
+        // DB cluster it names, and an omitted one "returns all backups in the account and
+        // region" (see the member's documentation above) — so the listing is scoped to the
+        // Region the call is made in either way. Both are filters over the stored records
+        // rather than lookups of the resource they name: an id no stored backup was taken
+        // from matches none of them, which is an empty page rather than a miss.
+        let of_resource = input.db_resource_id.as_deref();
+        // The token is the id the previous page ended on, so a page resumes strictly
+        // after it: every stored backup the filters keep is yielded exactly once even if
+        // the backup the token names was deleted between pages.
+        let lower = match input.next_token.as_deref() {
+            Some(token) => Bound::Excluded(token.to_string()),
+            None => Bound::Unbounded,
+        };
+        let mut remaining = state
+            .db_backups
+            .range((lower, Bound::Unbounded))
+            .filter(|(_, record)| {
+                record.region == region
+                    && of_resource.is_none_or(|resource| record.db_resource_id == resource)
+            });
+        let items: Vec<DbBackupSummary> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(|(_, record)| record.to_summary())
+            .collect();
+        // A token comes back only when a further page exists, and it names the last id
+        // on THIS page so the next request resumes after it.
+        let next_token = remaining
+            .next()
+            .and_then(|_| items.last().map(|item| item.id.clone()));
+
+        Ok(ListDbBackupsOutput { items, next_token })
     }
 }

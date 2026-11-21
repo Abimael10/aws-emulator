@@ -21,6 +21,10 @@
 //!   stored name is refused `ConflictException`, the same name in another Region is a new
 //!   backup, and a create naming a DB resource this account holds none of is refused
 //!   `ResourceNotFoundException` and stores nothing.
+//! * `ListDbBackups` REPORTS the backups the account holds in the Region the call is made
+//!   in, each as the summary projection of its own stored record, narrowed to the DB
+//!   resource `dbResourceId` names when the request names one, yielding every such record
+//!   exactly once across pages of at most `maxResults` items.
 //!
 //! The rows span what the rules generalise over: which family the source belongs to (DB
 //! instance or DB cluster), the engine that resource runs and whether its parameter group
@@ -1068,6 +1072,450 @@ fn every_backup_status_and_type_this_service_reports_is_a_modelled_value() {
             DB_BACKUP_STATUS_VALUES.contains(status),
             "case {status:?}: every status this suite waits on must be a member of the \
              modelled DbBackupStatus enum {DB_BACKUP_STATUS_VALUES:?}"
+        );
+    }
+}
+
+// `ListDbBackups`: the paginated REPORT of the stored backup records.
+//
+// RULE: a listing reports the backups the account holds in the Region the call is made in,
+// each as the summary projection of its own stored record, narrowed to the DB instance or
+// DB cluster `dbResourceId` names when the request names one; it yields every such record
+// exactly once across pages of at most `maxResults` items, and answers a `nextToken` only
+// while a further page remains.
+
+/// Every member of `DbBackupSummary`, from
+/// `smithy_query(query="shape", shape="DbBackupSummary")`. A listed summary must report
+/// the stored record's own value for each one, so each is checked against `GetDbBackup`.
+const BACKUP_SUMMARY_MEMBERS: &[&str] = &[
+    "arn",
+    "createdAt",
+    "dbResourceId",
+    "deploymentType",
+    "engineType",
+    "expiresAfter",
+    "id",
+    "kmsKeyId",
+    "name",
+    "status",
+    "type",
+];
+
+/// The `DbBackupSummary` members every stored backup reports: the two the model marks
+/// `@required` (`id`, `arn`) plus the ones this service always stores a value for.
+const ALWAYS_REPORTED_BACKUP_SUMMARY_MEMBERS: &[&str] = &[
+    "arn",
+    "createdAt",
+    "dbResourceId",
+    "engineType",
+    "id",
+    "name",
+    "status",
+    "type",
+];
+
+/// A generous bound on the pages a listing of this suite's backups takes: a paging loop
+/// that never terminates fails here instead of running until the harness gives up.
+const MAX_PAGES: usize = 64;
+
+/// An id the modelled `DbResourceId` pattern allows (`^[a-zA-Z0-9]+$`, length 3..64) that
+/// nothing in the store minted, so no stored backup was taken from it.
+const UNMINTED_RESOURCE_ID: &str = "zzz";
+
+/// One DB instance and one DB cluster to take backups of, created in [`REGION`], so a
+/// listing spans a backup of each source family.
+async fn two_sources(router: &MultiServiceRouter, case: &str) -> Vec<String> {
+    let instance = ok(
+        case,
+        call_in(
+            router,
+            REGION,
+            "CreateDbInstance",
+            minimal_instance("listed-source"),
+        )
+        .await,
+    );
+    let cluster = ok(
+        case,
+        call_in(
+            router,
+            REGION,
+            "CreateDbCluster",
+            minimal_cluster("listed-cluster"),
+        )
+        .await,
+    );
+    vec![
+        string_member(case, &instance, "id"),
+        string_member(case, &cluster, "dbClusterId"),
+    ]
+}
+
+/// Drain every page of `ListDbBackups` for `request`, the way a paginating client does:
+/// each answer's `nextToken` resumes the next call, and no page carries more items than
+/// the `maxResults` asked for. Hands back the items in page order.
+async fn listed_backups(
+    router: &MultiServiceRouter,
+    region: &str,
+    case: &str,
+    request: &Value,
+    max_results: Option<i64>,
+) -> Vec<Value> {
+    let mut items: Vec<Value> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut pages = 0usize;
+    loop {
+        pages += 1;
+        assert!(
+            pages <= MAX_PAGES,
+            "case {case:?}: paging did not terminate after {pages} pages, saw {} items",
+            items.len()
+        );
+        let mut body = request.clone();
+        if let Some(limit) = max_results {
+            body["maxResults"] = json!(limit);
+        }
+        if let Some(token) = &token {
+            body["nextToken"] = json!(token);
+        }
+        let page = ok(case, call_in(router, region, "ListDbBackups", body).await);
+        let listed = page["items"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: expected an `items` list, got {page}"))
+            .clone();
+        if let Some(limit) = max_results {
+            assert!(
+                listed.len() as i64 <= limit,
+                "case {case:?}: a page of {} items exceeds maxResults {limit}",
+                listed.len()
+            );
+        }
+        items.extend(listed);
+        match page.get("nextToken").and_then(Value::as_str) {
+            Some(next) => {
+                assert!(
+                    page["items"]
+                        .as_array()
+                        .is_some_and(|items| !items.is_empty()),
+                    "case {case:?}: an empty page must not hand back a nextToken: {page}"
+                );
+                token = Some(next.to_string());
+            }
+            None => break,
+        }
+    }
+    items
+}
+
+/// The `id` of every item of a listing.
+fn listed_ids(case: &str, listed: &[Value]) -> Vec<String> {
+    listed
+        .iter()
+        .map(|item| string_member(case, item, "id"))
+        .collect()
+}
+
+#[tokio::test]
+async fn paging_yields_every_stored_backup_exactly_once() {
+    // (backups taken, maxResults): `MaxResults` is modelled range 1..100, and an omitted
+    // one pages at that maximum. The backups alternate between the two source families,
+    // so a page spans a backup of each.
+    let cases: [(usize, Option<i64>); 6] = [
+        (0, None),
+        (1, None),
+        (2, Some(1)),
+        (5, Some(2)),
+        (3, Some(100)),
+        (7, Some(3)),
+    ];
+    for (count, max_results) in cases {
+        let case = format!("{count} backups at maxResults {max_results:?}");
+        let router = backup_router();
+        let sources = two_sources(&router, &case).await;
+        let mut expected: Vec<String> = Vec::new();
+        for index in 0..count {
+            let created = ok(
+                &case,
+                call_in(
+                    &router,
+                    REGION,
+                    "CreateDbBackup",
+                    json!({
+                        "name": format!("paged-{index}"),
+                        "dbResourceId": &sources[index % sources.len()],
+                    }),
+                )
+                .await,
+            );
+            expected.push(string_member(&case, &created, "id"));
+        }
+        expected.sort();
+
+        let listed = listed_backups(&router, REGION, &case, &json!({}), max_results).await;
+        for item in &listed {
+            for member in ALWAYS_REPORTED_BACKUP_SUMMARY_MEMBERS {
+                assert!(
+                    item.get(member).is_some(),
+                    "case {case:?}: the summary omits {member}: {item}"
+                );
+            }
+        }
+        let mut seen = listed_ids(&case, &listed);
+        let yielded = seen.len();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(
+            yielded,
+            seen.len(),
+            "case {case:?}: paging repeated a backup, got {listed:?}"
+        );
+        assert_eq!(
+            seen, expected,
+            "case {case:?}: paging must yield exactly the stored backups, got {listed:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_listing_narrows_to_the_db_resource_it_names() {
+    let setup = "backups of two sources";
+    let router = backup_router();
+    let sources = two_sources(&router, setup).await;
+    // Three backups of the first source and two of the second, so a filter that reported
+    // the whole store, or only one record, would differ from the expected set.
+    let mut taken: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (index, which) in [0usize, 0, 0, 1, 1].into_iter().enumerate() {
+        let resource = sources[which].clone();
+        let created = ok(
+            setup,
+            call_in(
+                &router,
+                REGION,
+                "CreateDbBackup",
+                json!({
+                    "name": format!("filtered-{index}"),
+                    "dbResourceId": &resource,
+                }),
+            )
+            .await,
+        );
+        taken
+            .entry(resource)
+            .or_default()
+            .push(string_member(setup, &created, "id"));
+    }
+    let mut every_backup: Vec<String> = taken.values().flatten().cloned().collect();
+    every_backup.sort();
+
+    // (what the request asks for, the backups it must report).
+    let mut rows: Vec<(String, Option<String>, Vec<String>)> =
+        vec![("no filter at all".to_string(), None, every_backup)];
+    for (resource, ids) in &taken {
+        let mut ids = ids.clone();
+        ids.sort();
+        rows.push((
+            format!("the backups of source {resource}"),
+            Some(resource.clone()),
+            ids,
+        ));
+    }
+    rows.push((
+        "a DB resource nothing was backed up from".to_string(),
+        Some(UNMINTED_RESOURCE_ID.to_string()),
+        Vec::new(),
+    ));
+
+    for (label, filter, expected) in rows {
+        // The filter holds page by page as well as in one answer.
+        for max_results in [None, Some(1), Some(2)] {
+            let case = format!("{label} at maxResults {max_results:?}");
+            let mut request = json!({});
+            if let Some(filter) = &filter {
+                request["dbResourceId"] = json!(filter);
+            }
+            let listed = listed_backups(&router, REGION, &case, &request, max_results).await;
+            let mut seen = listed_ids(&case, &listed);
+            seen.sort();
+            assert_eq!(
+                seen, expected,
+                "case {case:?}: expected {expected:?}, got {listed:?}"
+            );
+            if let Some(filter) = &filter {
+                for item in &listed {
+                    assert_eq!(
+                        item["dbResourceId"].as_str(),
+                        Some(filter.as_str()),
+                        "case {case:?}: every reported backup must be one of that \
+                         resource's, got {item}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn every_listed_summary_agrees_with_the_stored_record() {
+    let case = "listed summaries";
+    let router = backup_router();
+    // A source carrying a KMS key beside one that carries none, so the summary member
+    // that is reported only for an encrypted resource is covered either way.
+    let mut encrypted = minimal_instance("summary-source");
+    encrypted["kmsKeyId"] = json!(format!(
+        "arn:aws:kms:{REGION}:{ACCOUNT}:key/0123456789abcdef"
+    ));
+    let instance = ok(
+        case,
+        call_in(&router, REGION, "CreateDbInstance", encrypted).await,
+    );
+    let plain = ok(
+        case,
+        call_in(
+            &router,
+            REGION,
+            "CreateDbInstance",
+            minimal_instance("summary-plain"),
+        )
+        .await,
+    );
+    let cluster = ok(
+        case,
+        call_in(
+            &router,
+            REGION,
+            "CreateDbCluster",
+            minimal_cluster("summary-cluster"),
+        )
+        .await,
+    );
+    // (the backup's name, the resource it is taken from, the retention asked for): the
+    // rows span the source family, whether the source is encrypted, and the retention at
+    // both published bounds of the modelled `RetentionDays` range and absent.
+    let rows = [
+        (
+            "summary-encrypted",
+            string_member(case, &instance, "id"),
+            Some(RETENTION_DAYS_RANGE.0),
+        ),
+        (
+            "summary-plain",
+            string_member(case, &plain, "id"),
+            None,
+        ),
+        (
+            "summary-cluster",
+            string_member(case, &cluster, "dbClusterId"),
+            Some(RETENTION_DAYS_RANGE.1),
+        ),
+    ];
+    for (name, resource, retention) in &rows {
+        let mut body = json!({ "name": name, "dbResourceId": resource });
+        if let Some(days) = retention {
+            body["retentionDays"] = json!(days);
+        }
+        ok(case, call_in(&router, REGION, "CreateDbBackup", body).await);
+    }
+
+    let listed = listed_backups(&router, REGION, case, &json!({}), None).await;
+    assert_eq!(
+        listed.len(),
+        rows.len(),
+        "case {case:?}: expected one summary per stored backup, got {listed:?}"
+    );
+    for item in &listed {
+        let id = string_member(case, item, "id");
+        assert!(
+            is_modelled_db_backup_id(&id),
+            "case {case:?}: a listed id must satisfy the modelled DbBackupId constraint, \
+             got {id:?}"
+        );
+        let record = ok(
+            case,
+            call_in(&router, REGION, "GetDbBackup", json!({ "identifier": &id })).await,
+        );
+        for member in BACKUP_SUMMARY_MEMBERS {
+            // The status excepted: the CLOCK settles it, so two reads of one record may
+            // straddle that settle. It is asserted on its own below.
+            if *member == "status" {
+                continue;
+            }
+            assert_eq!(
+                item.get(member),
+                record.get(member),
+                "case {case:?} member {member:?}: the summary must report the stored \
+                 record's value, got {:?} against {:?}",
+                item.get(member),
+                record.get(member)
+            );
+        }
+        let status = item["status"].as_str().unwrap_or_default();
+        assert!(
+            LIVE_BACKUP_STATUSES.contains(&status),
+            "case {case:?}: a listed backup reports a live status, got {status:?}"
+        );
+    }
+
+    // Poll the way a client does: look again one probe interval later until every backup
+    // the store holds reports the status the clock owed it, or the generous deadline
+    // above passes. A listing reads the same records the reader does, so the settle shows
+    // in the listing too.
+    let started = Instant::now();
+    loop {
+        let listed = listed_backups(&router, REGION, case, &json!({}), None).await;
+        let statuses: Vec<&str> = listed
+            .iter()
+            .map(|item| item["status"].as_str().unwrap_or_default())
+            .collect();
+        if statuses.iter().all(|status| *status == "COMPLETED") {
+            break;
+        }
+        assert!(
+            started.elapsed() < SETTLE_DEADLINE,
+            "case {case:?}: the clock-owed settle to COMPLETED never reached the \
+             listing, last statuses {statuses:?}"
+        );
+        tokio::time::sleep(PROBE_INTERVAL).await;
+    }
+}
+
+#[tokio::test]
+async fn a_listing_reports_only_the_backups_of_the_region_it_is_made_in() {
+    let setup = "a backup in each of two Regions";
+    let router = backup_router();
+    let mut expected: BTreeMap<&str, String> = BTreeMap::new();
+    for region in [REGION, OTHER_REGION] {
+        let source = ok(
+            setup,
+            call_in(
+                &router,
+                region,
+                "CreateDbInstance",
+                minimal_instance("regional-source"),
+            )
+            .await,
+        );
+        let source_id = string_member(setup, &source, "id");
+        let created = ok(
+            setup,
+            call_in(
+                &router,
+                region,
+                "CreateDbBackup",
+                json!({ "name": "regional-backup", "dbResourceId": &source_id }),
+            )
+            .await,
+        );
+        expected.insert(region, string_member(setup, &created, "id"));
+    }
+
+    for region in [REGION, OTHER_REGION] {
+        let case = format!("a listing in {region}");
+        let listed = listed_backups(&router, region, &case, &json!({}), None).await;
+        assert_eq!(
+            listed_ids(&case, &listed),
+            vec![expected[region].clone()],
+            "case {case:?}: a listing reports the backups of its own Region only, got \
+             {listed:?}"
         );
     }
 }

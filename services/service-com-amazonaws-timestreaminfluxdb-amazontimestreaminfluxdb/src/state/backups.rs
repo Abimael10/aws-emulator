@@ -227,6 +227,27 @@ impl DbBackup {
             self.settles_at = None;
         }
     }
+
+    /// Project this stored record into the `DbBackupSummary` the list operation reports.
+    ///
+    /// Every member of that shape is a member of this record; the summary is the subset
+    /// of [`Self::to_get_output`], so one backup never reports two different values for
+    /// the same member.
+    pub fn to_summary(&self) -> crate::ops::types::DbBackupSummary {
+        crate::ops::types::DbBackupSummary {
+            id: self.id.clone(),
+            name: Some(self.name.clone()),
+            arn: self.arn.clone(),
+            status: Some(self.status.clone()),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            expires_after: self.expires_after.clone(),
+            db_resource_id: Some(self.db_resource_id.clone()),
+            r#type: Some(self.backup_type.clone()),
+            engine_type: Some(self.snapshot.engine_type.clone()),
+            deployment_type: self.snapshot.deployment_type.clone(),
+            kms_key_id: self.snapshot.kms_key_id.clone(),
+        }
+    }
 }
 
 /// The DB-backup operations whose output shape is the same full record.

@@ -1214,7 +1214,7 @@ async fn the_operations_outside_this_slice_still_answer_501() {
         // `GetDbCluster` and `ListDbClusters` are implemented beside `CreateDbCluster`;
         // the cluster operations still scaffolded are these.
         ("ListDbInstancesForCluster", json!({ "dbClusterId": "abc" })),
-        ("ListDbBackups", json!({})),
+        ("RebootDbCluster", json!({ "dbClusterId": "abc" })),
     ] {
         let (status, answer) = call(&router, operation, body).await;
         assert_eq!(
