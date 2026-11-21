@@ -8,6 +8,8 @@
 //! a caller-supplied `channelRoleArn` must name together with which refusal that member
 //! draws and in which order its rules are judged, the part of a `.`-based `@pattern` the
 //! request boundary's walk cannot apply (`channelName`'s among them),
+//! which stored Slack channel configuration a `(teamId, channelId)` pair names and how a
+//! pair the account holds none for is refused,
 //! whether a Slack workspace is registered
 //! to the account, the Slack workspaces the Support Center
 //! console has authorized, the organization membership an
@@ -280,6 +282,14 @@ pub struct ComAmazonawsSupportappSupportappState {
     /// Every stored Slack channel configuration, keyed by `(teamId, channelId)` —
     /// the pair that identifies a channel configuration in this API. A `BTreeMap`,
     /// so list order, and therefore pagination, is deterministic.
+    ///
+    /// A handler that names ONE configuration reaches it through the accessors that own
+    /// that identity rule — [`ComAmazonawsSupportappSupportappState::channel_configuration`],
+    /// [`ComAmazonawsSupportappSupportappState::channel_configuration_is_stored`],
+    /// [`ComAmazonawsSupportappSupportappState::remove_channel_configuration`] and
+    /// [`ComAmazonawsSupportappSupportappState::store_channel_configuration`] — rather
+    /// than building the key itself; the map stays reachable for the operations that read
+    /// it WHOLE (the listing, and the workspace delete's cascade).
     pub slack_channel_configurations: BTreeMap<(String, String), SlackChannelConfig>,
     /// The account alias `PutAccountAlias` wrote, which `GetAccountAlias` reports
     /// and `DeleteAccountAlias` clears. `None` until one is put: the account has no
@@ -336,6 +346,76 @@ impl ComAmazonawsSupportappSupportappState {
     /// is registered.
     pub fn workspace_is_registered(&self, team_id: &str) -> bool {
         self.slack_workspace_configurations.contains_key(team_id)
+    }
+
+    /// The key [`Self::slack_channel_configurations`] holds one configuration under.
+    ///
+    /// The identity rule itself, owned where the map is owned: a Slack channel
+    /// configuration is identified by its whole `(teamId, channelId)` pair, so the pair
+    /// is built here and nowhere else — the accessors below are the only readers and
+    /// writers of that map a handler calls, so no two handlers can come to disagree
+    /// about how a configuration is keyed.
+    fn channel_configuration_key(team_id: &str, channel_id: &str) -> (String, String) {
+        (team_id.to_string(), channel_id.to_string())
+    }
+
+    /// Whether this account holds a Slack channel configuration for the pair
+    /// `(team_id, channel_id)` names.
+    ///
+    /// The presence half of the identity rule, for the create path: configuring a
+    /// channel this account already holds a configuration for is the conflict
+    /// [`slack_channel_configuration_exists`] words, not a second configuration and not
+    /// an overwrite.
+    pub fn channel_configuration_is_stored(&self, team_id: &str, channel_id: &str) -> bool {
+        self.slack_channel_configurations
+            .contains_key(&Self::channel_configuration_key(team_id, channel_id))
+    }
+
+    /// The stored Slack channel configuration the pair `(team_id, channel_id)` names, or
+    /// the message a pair this account holds no configuration for is refused with.
+    ///
+    /// The lookup-and-miss rule, owned here so every operation that acts on an EXISTING
+    /// configuration draws the same answer from it: a pair the account holds nothing for
+    /// is the modelled `ResourceNotFoundException`, worded by
+    /// [`slack_channel_configuration_not_found`]. A caller lifts that message into its
+    /// own operation's modelled error and adds nothing of its own.
+    pub fn channel_configuration(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+    ) -> Result<&SlackChannelConfig, String> {
+        self.slack_channel_configurations
+            .get(&Self::channel_configuration_key(team_id, channel_id))
+            .ok_or_else(|| slack_channel_configuration_not_found(team_id, channel_id))
+    }
+
+    /// Take the Slack channel configuration the pair `(team_id, channel_id)` names out of
+    /// this account's store, or report the miss exactly as [`Self::channel_configuration`]
+    /// reports it.
+    ///
+    /// The same rule as the read above, for the operation that REMOVES what it looked up:
+    /// one map touch, so a delete cannot find a configuration a read would miss, and a
+    /// pair the account holds nothing for draws the one miss message.
+    pub fn remove_channel_configuration(
+        &mut self,
+        team_id: &str,
+        channel_id: &str,
+    ) -> Result<SlackChannelConfig, String> {
+        self.slack_channel_configurations
+            .remove(&Self::channel_configuration_key(team_id, channel_id))
+            .ok_or_else(|| slack_channel_configuration_not_found(team_id, channel_id))
+    }
+
+    /// Store `configuration` under the pair it carries, replacing whatever this account
+    /// held for that pair.
+    ///
+    /// The write side of the identity rule: a record is keyed by its OWN `teamId` and
+    /// `channelId`, so a create and an update of the same channel reach the same entry
+    /// and a stored record can never be filed under a pair it does not name.
+    pub fn store_channel_configuration(&mut self, configuration: SlackChannelConfig) {
+        let key =
+            Self::channel_configuration_key(&configuration.team_id, &configuration.channel_id);
+        self.slack_channel_configurations.insert(key, configuration);
     }
 
     /// Why a request that ADDS a Slack channel configuration to the workspace `team_id`

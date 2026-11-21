@@ -188,17 +188,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is reported as absent rather than behind an account-level precondition: a
         // pair this account holds nothing for is the modelled
         // `ResourceNotFoundException`, which is also what a repeated delete answers.
-        let key = (input.team_id.clone(), input.channel_id.clone());
-        if store.slack_channel_configurations.remove(&key).is_none() {
+        // WHICH configuration the pair names, and how a miss is worded, is the state
+        // module's rule
+        // ([`crate::state::ComAmazonawsSupportappSupportappState::remove_channel_configuration`]);
+        // this handler only lifts the answer it gives into this operation's error enum.
+        if let Err(message) =
+            store.remove_channel_configuration(&input.team_id, &input.channel_id)
+        {
             return Err(
                 DeleteSlackChannelConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(
-                            crate::state::slack_channel_configuration_not_found(
-                                &input.team_id,
-                                &input.channel_id,
-                            ),
-                        ),
+                        message: Some(message),
                     },
                 )
                 .into(),

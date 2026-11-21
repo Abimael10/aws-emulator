@@ -312,11 +312,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let key = (input.team_id.clone(), input.channel_id.clone());
         // A channel configuration is identified by its `(teamId, channelId)` pair:
         // configuring a channel that is already configured is a conflict, not a
-        // second configuration and not an overwrite.
-        if store.slack_channel_configurations.contains_key(&key) {
+        // second configuration and not an overwrite. The pair's presence is the state
+        // module's rule
+        // ([`crate::state::ComAmazonawsSupportappSupportappState::channel_configuration_is_stored`]),
+        // the same one the update and the delete paths look a configuration up with.
+        if store.channel_configuration_is_stored(&input.team_id, &input.channel_id) {
             return Err(CreateSlackChannelConfigurationErrorModeled::ConflictException(
                 ConflictException {
                     message: Some(crate::state::slack_channel_configuration_exists(
@@ -349,21 +351,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        store.slack_channel_configurations.insert(
-            key,
-            crate::state::SlackChannelConfig {
-                team_id: input.team_id,
-                channel_id: input.channel_id,
-                channel_name: input.channel_name,
-                notify_on_create_or_reopen_case: Some(flags.notify_on_create_or_reopen_case),
-                notify_on_add_correspondence_to_case: Some(
-                    flags.notify_on_add_correspondence_to_case,
-                ),
-                notify_on_resolve_case: Some(flags.notify_on_resolve_case),
-                notify_on_case_severity: input.notify_on_case_severity,
-                channel_role_arn: input.channel_role_arn,
-            },
-        );
+        store.store_channel_configuration(crate::state::SlackChannelConfig {
+            team_id: input.team_id,
+            channel_id: input.channel_id,
+            channel_name: input.channel_name,
+            notify_on_create_or_reopen_case: Some(flags.notify_on_create_or_reopen_case),
+            notify_on_add_correspondence_to_case: Some(flags.notify_on_add_correspondence_to_case),
+            notify_on_resolve_case: Some(flags.notify_on_resolve_case),
+            notify_on_case_severity: input.notify_on_case_severity,
+            channel_role_arn: input.channel_role_arn,
+        });
 
         Ok(CreateSlackChannelConfigurationOutput {})
     }
