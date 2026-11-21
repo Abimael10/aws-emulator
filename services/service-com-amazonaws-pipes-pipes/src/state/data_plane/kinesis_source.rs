@@ -35,6 +35,13 @@ const LIST_SHARDS_ACTION: &str = "kinesis:ListShards";
 const GET_SHARD_ITERATOR_ACTION: &str = "kinesis:GetShardIterator";
 pub(super) const GET_RECORDS_ACTION: &str = "kinesis:GetRecords";
 
+/// The calls this module makes on the stream BESIDE the one that takes the records: the stage
+/// lists the stream's shards and takes an iterator into the one it reads. Kept beside the
+/// actions themselves, so this module's own calls and the set
+/// [`super::source_read_call`] answers cannot drift apart.
+pub(super) const SOURCE_STAGE_OTHER_CALLS: &[&str] =
+    &[GET_SHARD_ITERATOR_ACTION, LIST_SHARDS_ACTION];
+
 /// The `eventSource` a Kinesis record envelope reports, and the `eventName` each record
 /// carries.
 pub(super) const KINESIS_EVENT_SOURCE: &str = "aws:kinesis";

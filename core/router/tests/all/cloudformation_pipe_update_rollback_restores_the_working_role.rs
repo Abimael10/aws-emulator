@@ -27,9 +27,10 @@
 //! `services/service-com-amazonaws-pipes-pipes/tests/all/pipe_bring_up.rs` is the table of what
 //! that service reports.
 //!
-//! The rows differ along what the rule generalises over: HOW the new role withholds the call
-//! that takes the source's records — policies stating nothing about it, a grant naming another
-//! queue, an explicit `Deny` over a wildcard allow — each of which leaves the same report.
+//! The rows differ along what the rule generalises over: HOW the new role withholds the calls
+//! its source stage makes on the pipe's source — policies stating nothing about that source, a
+//! grant naming another queue, an explicit `Deny` over a wildcard allow — each of which leaves
+//! the same report.
 //!
 //! Every wait here looks again until the condition it needs holds, on a generous deadline;
 //! nothing is asserted about elapsed time.
@@ -451,16 +452,19 @@ impl Row {
     }
 }
 
-/// The rows, differing in how the role the update switches to withholds the call that takes the
-/// source's records.
+/// The rows, differing in how the role the update switches to withholds the calls its source
+/// stage makes on the pipe's source. Each withholds EVERY one of them: a role left any one of
+/// them is a role the pipe still comes up under, with the withheld call failing its executions
+/// instead (`crate::cloudformation_deployed_pipe_delivery`'s delivery table has that control),
+/// so only a role that leaves it none is an update that cannot stabilise.
 const ROWS: &[Row] = &[
     Row {
-        case: "a role that states nothing at all about taking the source's records",
+        case: "a role that states nothing at all about the pipe's source",
         prefix: "pipe-update-unstated",
         withheld: |_| {
             json!([{
                 "Effect": "Allow",
-                "Action": ["sqs:SendMessage", "sqs:GetQueueAttributes"],
+                "Action": ["sqs:SendMessage"],
                 "Resource": "*",
             }])
         },
@@ -477,14 +481,18 @@ const ROWS: &[Row] = &[
         },
     },
     Row {
-        case: "a role whose wildcard allow is overridden by a deny on the source receive",
+        case: "a role whose wildcard allow is overridden by a deny on every source call",
         prefix: "pipe-update-deny",
         withheld: |row| {
             json!([
                 { "Effect": "Allow", "Action": ["sqs:*"], "Resource": "*" },
                 {
                     "Effect": "Deny",
-                    "Action": ["sqs:ReceiveMessage"],
+                    "Action": [
+                        "sqs:ReceiveMessage",
+                        "sqs:DeleteMessage",
+                        "sqs:GetQueueAttributes",
+                    ],
                     "Resource": Row::queue_arn(&row.source()),
                 },
             ])

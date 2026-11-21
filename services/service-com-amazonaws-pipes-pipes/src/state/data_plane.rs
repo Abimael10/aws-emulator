@@ -3868,8 +3868,20 @@ const SQS_SERVICE_NAME: &str = "SQS";
 const DYNAMODB_SERVICE_NAME: &str = "DynamoDB";
 const KINESIS_SERVICE_NAME: &str = "Kinesis";
 
+/// The calls the source stage of an Amazon SQS source makes ON THE SOURCE beside the one that
+/// takes the records: it deletes a record it has moved, and it reads the queue's own
+/// attributes ([`source_free_again`]).
+const SQS_SOURCE_STAGE_OTHER_CALLS: &[&str] =
+    &[DELETE_MESSAGE_ACTION, GET_QUEUE_ATTRIBUTES_ACTION];
+
+/// The same for a DynamoDB table stream: the stage lists the stream's shards and takes an
+/// iterator into the one it reads.
+const DYNAMODB_SOURCE_STAGE_OTHER_CALLS: &[&str] =
+    &[GET_SHARD_ITERATOR_ACTION, DESCRIBE_STREAM_ACTION];
+
 /// The call that TAKES THE RECORDS from a pipe's source, in both readings of it: the one IAM
-/// evaluates, and the one a sentence about the pipe names.
+/// evaluates, and the one a sentence about the pipe names — beside the OTHER calls the same
+/// stage makes on that source.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct SourceRead {
     /// The IAM action the policies in force on the pipe's execution role are evaluated
@@ -3880,6 +3892,11 @@ pub(super) struct SourceRead {
     pub api: &'static str,
     /// The service that API action is called on, as that service names itself.
     pub service: &'static str,
+    /// The other calls the source stage makes on that same source, each authorized where it
+    /// is MADE ([`LiveRecord::refusal`]) exactly as this one is. What the LIFECYCLE asks of
+    /// them is narrower ([`super::bring_up`]): a role that may make none of them either is
+    /// one under which the pipe could not reach its source at all.
+    pub others: &'static [&'static str],
 }
 
 /// The call that takes the records of a source of the kind `source` names — the one call the
@@ -3887,9 +3904,10 @@ pub(super) struct SourceRead {
 /// no records from at all.
 ///
 /// The source stage makes other calls beside it (it reads a queue's attributes, it lists a
-/// stream's shards), and each is authorized where it is made ([`LiveRecord::refusal`]); this is
-/// the single call whose refusal means the pipe could never poll, which is what the lifecycle
-/// asks about before it reports a pipe up ([`super::bring_up`]).
+/// stream's shards), and each is authorized where it is made ([`LiveRecord::refusal`]); those
+/// travel with this one ([`SourceRead::others`]), because what the lifecycle asks before it
+/// reports a pipe up ([`super::bring_up`]) is whether the pipe's role leaves it ANY call on
+/// that source.
 ///
 /// ONE table, answering every reading of that call at once — the action IAM is asked about and
 /// the words a pipe's `StateReason` names it by — so a source kind cannot be half-registered:
@@ -3897,14 +3915,22 @@ pub(super) struct SourceRead {
 /// it does not is neither.
 pub(super) fn source_read_call(source: &str) -> Option<SourceRead> {
     let parsed = ::service_common::arn::parse(source)?;
-    let (action, service) = match parsed.vendor {
-        SQS_NAMESPACE => (RECEIVE_MESSAGE_ACTION, SQS_SERVICE_NAME),
-        DYNAMODB_NAMESPACE if parsed.resource.contains(STREAM_SEGMENT) => {
-            (GET_RECORDS_ACTION, DYNAMODB_SERVICE_NAME)
-        }
-        KINESIS_NAMESPACE if parsed.resource_type() == KINESIS_STREAM_RESOURCE => {
-            (kinesis_source::GET_RECORDS_ACTION, KINESIS_SERVICE_NAME)
-        }
+    let (action, service, others) = match parsed.vendor {
+        SQS_NAMESPACE => (
+            RECEIVE_MESSAGE_ACTION,
+            SQS_SERVICE_NAME,
+            SQS_SOURCE_STAGE_OTHER_CALLS,
+        ),
+        DYNAMODB_NAMESPACE if parsed.resource.contains(STREAM_SEGMENT) => (
+            GET_RECORDS_ACTION,
+            DYNAMODB_SERVICE_NAME,
+            DYNAMODB_SOURCE_STAGE_OTHER_CALLS,
+        ),
+        KINESIS_NAMESPACE if parsed.resource_type() == KINESIS_STREAM_RESOURCE => (
+            kinesis_source::GET_RECORDS_ACTION,
+            KINESIS_SERVICE_NAME,
+            kinesis_source::SOURCE_STAGE_OTHER_CALLS,
+        ),
         _ => return None,
     };
     // Every action above is written in its own service's namespace, so the API action is the
@@ -3916,6 +3942,7 @@ pub(super) fn source_read_call(source: &str) -> Option<SourceRead> {
         action,
         api,
         service,
+        others,
     })
 }
 

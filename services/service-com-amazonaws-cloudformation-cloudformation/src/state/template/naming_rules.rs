@@ -202,6 +202,13 @@ pub(super) fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // Amazon SQS `CreateQueue.QueueName`: "A queue name can have up to 80 characters"
         // (Amazon SQS API reference) — SQS's model carries no `@length` for it.
         SQS_QUEUE => rules(80, Characters::AsGenerated),
+        // Amazon EventBridge Pipes `CreatePipe.Name`: `PipeName`, `@length(min: 1, max: 64)`
+        // with pattern `^[\.\-_A-Za-z0-9]+$` (that service's own Smithy model), which a
+        // generated name is already inside — letters, digits and the hyphen are all admitted —
+        // but may be longer than. A pipe's name is also this type's physical id ("Ref returns
+        // the pipe name"), so a declaration that names no pipe is created under the generated
+        // name and that name has to be one `CreatePipe` takes.
+        PIPES_PIPE => rules(64, Characters::AsGenerated),
         // Amazon MemoryDB `CreateParameterGroup.ParameterGroupName` and
         // `CreateSubnetGroup.SubnetGroupName`: that service's model carries no `@length` for
         // either, and its own rule for a resource name — the one its refusal states — is at

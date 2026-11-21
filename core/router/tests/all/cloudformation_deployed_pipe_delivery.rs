@@ -8,16 +8,17 @@
 //! has created it and EventBridge Pipes reports it `RUNNING`, that pipe polls the source its
 //! declaration named and delivers to the target it named with no client action at all; and
 //! every call it makes on the way is authorized against the execution role the declaration
-//! gave it, so a pipe whose role may not DELIVER does not deliver: nothing reaches its target
-//! and the record stays on its source queue.**
+//! gave it, so a pipe whose role withholds a call that MOVES the record does not move it:
+//! nothing reaches its target and the record stays on its source queue.**
 //!
-//! RULE 2 (the rollback table): **a pipe that could not POLL its source at all is a pipe
-//! EventBridge Pipes cannot create — it settles in `CREATE_FAILED` with the reason
+//! RULE 2 (the rollback table): **a pipe that could not REACH its source at all — a role that
+//! leaves it no call on that source whatsoever — is a pipe EventBridge Pipes cannot create: it
+//! settles in `CREATE_FAILED` with the reason
 //! (`services/service-com-amazonaws-pipes-pipes/tests/all/pipe_bring_up.rs` has that rule's
 //! own table) — so the resource that declared it FAILS and the stack it is in is rolled back
-//! rather than reported created.** That is the difference between the two tables: the target
-//! side is one execution of a running pipe failing, and the source side is a pipe that never
-//! runs.
+//! rather than reported created.** That is the difference between the two tables: a role that
+//! withholds SOME of the calls a pipe's stages make is one execution of a running pipe
+//! failing, and one that withholds every call on the source is a pipe that never runs.
 //!
 //! Four crates have to agree for either to hold — CloudFormation makes the provisioning calls,
 //! EventBridge Pipes runs the pipe, IAM holds the roles the pipe acts as, and Amazon SQS
@@ -28,10 +29,11 @@
 //!
 //! Every row deploys ONE stack declaring two pipes side by side: one whose execution role
 //! admits every call its stages make, and one whose role is the row's. The rows of each table
-//! differ along what its rule generalises over — HOW the role withholds the call (no statement
-//! about the action at all, a statement naming another queue, an explicit `Deny` over a
-//! wildcard allow). The record a withheld pipe cannot move is counted as the queue still
-//! HOLDING it, which covers both a record never taken and one taken and not delivered.
+//! differ along what its rule generalises over — WHICH call the role withholds and HOW it
+//! withholds it (no statement about the action at all, a statement naming another queue, an
+//! explicit `Deny` over a wildcard allow). The record a withheld pipe cannot move is counted
+//! as the queue still HOLDING it, which covers both a record never taken and one taken and
+//! not delivered.
 //!
 //! Every expected value is computed here from what the row declares, never read back out of
 //! the answer being checked.
@@ -453,8 +455,10 @@ impl Row {
     }
 }
 
-/// The rows whose withheld pipe CAN be brought up: its role may take the source's records,
-/// and what it may not do is DELIVER them. They differ in how the delivery is withheld.
+/// The rows whose withheld pipe CAN be brought up: its role leaves it at least one of the
+/// calls its source stage makes, and what it may not do is MOVE the record — take it from the
+/// source, or deliver it to the target. They differ in WHICH of those calls is withheld and
+/// how.
 const DELIVERY_ROWS: &[Row] = &[
     Row {
         case: "a role that may poll its source but not deliver to its target",
@@ -499,40 +503,22 @@ const DELIVERY_ROWS: &[Row] = &[
             ])
         },
     },
-];
-
-/// The rows whose withheld pipe could not POLL its source at all, so its creation cannot be
-/// completed and the stack that declared it is rolled back. They differ in how the poll is
-/// withheld — the same three ways the delivery table withholds a delivery.
-const ROLLBACK_ROWS: &[Row] = &[
     Row {
-        case: "a role that states nothing at all about polling its source",
-        prefix: "pipe-withheld-unstated",
+        // The SOURCE side withheld in part: the role may look at the queue (and write the
+        // target), and the one call it may not make is the one that TAKES a record.
+        case: "a role that may look at its source but not take its records",
+        prefix: "pipe-withheld-receive",
         withheld: |_| {
             json!([{
                 "Effect": "Allow",
-                "Action": ["sqs:SendMessage", "sqs:GetQueueAttributes"],
+                "Action": ["sqs:GetQueueAttributes", "sqs:DeleteMessage", "sqs:SendMessage"],
                 "Resource": "*",
             }])
         },
     },
     Row {
-        case: "a role whose poll grant names ANOTHER queue than its source",
-        prefix: "pipe-withheld-other",
-        withheld: |row| {
-            json!([{
-                "Effect": "Allow",
-                "Action": ["sqs:*"],
-                "Resource": [
-                    Row::queue_arn(&row.open_source()),
-                    Row::queue_arn(&row.withheld_target()),
-                ],
-            }])
-        },
-    },
-    Row {
         case: "a role whose wildcard grant is overridden by a deny on the source receive",
-        prefix: "pipe-withheld-deny",
+        prefix: "pipe-withheld-receive-deny",
         withheld: |row| {
             json!([
                 { "Effect": "Allow", "Action": ["sqs:*"], "Resource": "*" },
@@ -546,10 +532,61 @@ const ROLLBACK_ROWS: &[Row] = &[
     },
 ];
 
+/// The rows whose withheld pipe could not REACH its source at all — its role leaves it no
+/// call on that source whatsoever — so its creation cannot be completed and the stack that
+/// declared it is rolled back. They differ in how every one of those calls is withheld — the
+/// same three ways the delivery table withholds a call.
+const ROLLBACK_ROWS: &[Row] = &[
+    Row {
+        case: "a role that states nothing at all about its source",
+        prefix: "pipe-withheld-unstated",
+        withheld: |_| {
+            json!([{
+                "Effect": "Allow",
+                "Action": ["sqs:SendMessage"],
+                "Resource": "*",
+            }])
+        },
+    },
+    Row {
+        case: "a role whose every source grant names ANOTHER queue than its source",
+        prefix: "pipe-withheld-other",
+        withheld: |row| {
+            json!([{
+                "Effect": "Allow",
+                "Action": ["sqs:*"],
+                "Resource": [
+                    Row::queue_arn(&row.open_source()),
+                    Row::queue_arn(&row.withheld_target()),
+                ],
+            }])
+        },
+    },
+    Row {
+        case: "a role whose wildcard grant is overridden by a deny on every source call",
+        prefix: "pipe-withheld-deny",
+        withheld: |row| {
+            json!([
+                { "Effect": "Allow", "Action": ["sqs:*"], "Resource": "*" },
+                {
+                    "Effect": "Deny",
+                    "Action": [
+                        "sqs:ReceiveMessage",
+                        "sqs:DeleteMessage",
+                        "sqs:GetQueueAttributes",
+                    ],
+                    "Resource": Row::queue_arn(&row.withheld_source()),
+                },
+            ])
+        },
+    },
+];
+
 /// RULE 1, every row: the stack creates both pipes, EventBridge Pipes reports both `RUNNING`,
 /// the pipe whose role admits every call delivers its record to its target with no client
-/// action, and the sibling whose role withholds the DELIVERY delivers nothing — its record is
-/// still its source queue's.
+/// action, and the sibling whose role withholds one of the calls that MOVE the record — the
+/// take from the source or the delivery to the target — delivers nothing: its record is still
+/// its source queue's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_deployed_pipe_delivers_only_what_its_execution_role_allows() {
     let router = build_router();
@@ -646,13 +683,13 @@ async fn a_deployed_pipe_delivers_only_what_its_execution_role_allows() {
     }
 }
 
-/// RULE 2, every row: a pipe whose execution role may not take its SOURCE's records could
-/// never poll it, so EventBridge Pipes cannot complete that pipe's creation — the resource
+/// RULE 2, every row: a pipe whose execution role may make NO call at all on its SOURCE could
+/// never reach it, so EventBridge Pipes cannot complete that pipe's creation — the resource
 /// that declared it fails, and the stack reaches `ROLLBACK_COMPLETE` naming that resource
 /// instead of reporting a deployment that did not happen. The rollback takes the pipe back
 /// out, so EventBridge Pipes holds no pipe under that name afterwards.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_stack_whose_pipe_cannot_poll_its_source_is_rolled_back() {
+async fn a_stack_whose_pipe_cannot_reach_its_source_is_rolled_back() {
     let router = build_router();
 
     for row in ROLLBACK_ROWS {

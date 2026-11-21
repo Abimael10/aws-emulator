@@ -15,10 +15,17 @@
 //!
 //! 1. its EXECUTION ROLE, which every stage acts as ([`super::execution_role`]): a role
 //!    whose trust document withholds the assume is one no stage could act as, and a role
-//!    whose policies withhold the call that TAKES the records from the source is one the
-//!    source stage could never poll under;
+//!    whose policies withhold EVERY call the source stage makes on the source is one under
+//!    which that stage could neither read the source nor even look at it;
 //! 2. the SOURCE itself: a `Source` naming a resource the service that owns it does not
 //!    hold is a source with nothing to poll.
+//!
+//! What a role withholds only in PART is no part of that: a role that may make some of the
+//! source stage's calls and not others leaves the pipe to come up, and each withheld call
+//! then fails the executions that make it — a pipe that may look at its source and not take
+//! its records comes up `RUNNING` and moves nothing, its records left where they are. Only
+//! a role under which NONE of those calls can be made is a source the pipe could not reach
+//! at all, which is the same as a source that is not there.
 //!
 //! Both of those are read off the ACCOUNT's records and the owner of the source, which is
 //! why they are asked with no store locked ([`refusal`]). The third thing decided here is
@@ -31,8 +38,8 @@
 //! that may not write to it, a target that is not there — is one EXECUTION of a RUNNING
 //! pipe failing, counted as such ([`super::metrics`]) with the records left on the source
 //! for the next attempt; that is what lets a pipe deliver the record it withheld as soon as
-//! the grant it was missing is in force. Only what the SOURCE stage cannot start without
-//! decides whether the pipe comes up at all.
+//! the grant it was missing is in force. Only what the source stage could not reach its
+//! source at all without decides whether the pipe comes up.
 //!
 //! Nothing is refused on evidence this emulator does not have: a source of a kind no owner
 //! here is asked, a source of another account, an owner that did not answer, and (through
@@ -92,14 +99,20 @@ pub async fn refusal<Eng: Send + Sync + 'static>(
     absent_source_refusal(ctx, source).await
 }
 
-/// Why the role `role_arn` could not take the records of `source`, or `None` when the
-/// policies in force on it show nothing of the kind.
+/// Why the role `role_arn` could not reach `source` AT ALL, or `None` when the policies in
+/// force on it leave it at least one of the calls its source stage makes on that source.
 ///
-/// The call asked about is the one that TAKES the records for that kind of source
-/// ([`super::data_plane::source_read_call`]) — a source whose records this emulator polls
-/// through no call of its own is a question that is not asked.
+/// The calls asked about are the one that TAKES the records for that kind of source and the
+/// other calls the same stage makes on it ([`super::data_plane::source_read_call`]) — a
+/// source whose records this emulator polls through no call of its own is a question that is
+/// not asked. The answer is a refusal only when EVERY one of them is withheld: a role that
+/// may make none of them names a source the pipe can neither read nor even look at, which is
+/// the same as a source that is not there. A role that withholds only SOME of them leaves
+/// the pipe to come up, and each withheld call then fails the executions that make it, with
+/// the records left on the source — the way a withheld TARGET call already behaves (see the
+/// module docs).
 ///
-/// What the pipe REPORTS for it is that call and nothing else
+/// What the pipe REPORTS for it is the record-taking call and nothing else
 /// ([`super::execution_role::source_read_failure_reason`]): the decision's own sentence says
 /// which document withheld the grant, which is for the poller's log rather than for the state
 /// a pipe rests in.
@@ -113,6 +126,13 @@ fn source_read_refusal<Eng: Send + Sync + 'static>(
     // Held for the length of this one decision, and no call leaves the process while it is.
     let held = iam.lock();
     super::execution_role::call_refusal(role_arn, read.action, source, &held)?;
+    // One call it may still make is one source-stage call that is not withheld, so the pipe
+    // comes up: what it may not do is the running pipe's to fail.
+    if read.others.iter().any(|action| {
+        super::execution_role::call_refusal(role_arn, action, source, &held).is_none()
+    }) {
+        return None;
+    }
     Some(super::execution_role::source_read_failure_reason(
         read.api, read.service,
     ))

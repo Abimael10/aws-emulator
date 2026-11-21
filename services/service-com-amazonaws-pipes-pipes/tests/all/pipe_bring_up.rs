@@ -5,20 +5,22 @@
 //! reused rather than copied).
 //!
 //! The RULE asserted over the tables below: a lifecycle call that puts a pipe on its way to
-//! a healthy state completes only if the pipe could POLL ITS SOURCE — the source has to be a
-//! resource the service that owns it holds, and the pipe's execution role has to be one this
-//! service can assume AND one whose policies allow the call that TAKES that source's records
-//! — so a pipe that could not settles in the terminal failure state of the move that was in
-//! flight (`CREATE_FAILED` for the creation, `START_FAILED` for the start, `UPDATE_FAILED`
-//! for the reconfiguration), carrying a non-empty `StateReason` that says which, and it runs
-//! nothing: nothing is consumed, nothing is delivered and it publishes no counter at all.
+//! a healthy state completes only if the pipe could REACH ITS SOURCE — the source has to be
+//! a resource the service that owns it holds, and the pipe's execution role has to be one
+//! this service can assume AND one whose policies leave it at least one of the calls its
+//! source stage makes on that source — so a pipe that could not settles in the terminal
+//! failure state of the move that was in flight (`CREATE_FAILED` for the creation,
+//! `START_FAILED` for the start, `UPDATE_FAILED` for the reconfiguration), carrying a
+//! non-empty `StateReason` that says which, and it runs nothing: nothing is consumed,
+//! nothing is delivered and it publishes no counter at all.
 //!
-//! The TARGET side is the other half of the same rule and is deliberately NOT part of it: a
-//! pipe whose role may not write to its target comes UP and fails each execution at the
-//! target stage (`tests/all/pipe_metrics.rs`, `tests/all/pipe_source_checkout.rs`), which is
-//! what lets it deliver the record it withheld as soon as that grant is in force. The last
-//! two rows of the create table are that control, held here beside the refusals so the
-//! asymmetry is asserted and not assumed.
+//! A role that withholds only SOME of those calls is deliberately NOT part of it, and
+//! neither is the TARGET side: a pipe whose role may look at its source and not take its
+//! records, or may not write to its target, comes UP and fails each execution at the stage
+//! whose call is withheld (`tests/all/pipe_metrics.rs`,
+//! `tests/all/pipe_source_checkout.rs`), which is what lets it move the record it withheld
+//! as soon as that grant is in force. The last three rows of the create table are that
+//! control, held here beside the refusals so the asymmetry is asserted and not assumed.
 //!
 //! `tests/all/pipe_unassumable_role.rs` is the trust document's own table — the first thing
 //! this rule reads — and carries the rows that generalise over what a trust document says.
@@ -245,18 +247,20 @@ struct Prepared<'row> {
     marker: Option<String>,
 }
 
-/// RULE: `CreatePipe` completes only if the pipe it creates could poll its source — the
-/// source is a resource its owner holds, and the role the pipe acts as may make the call that
-/// takes that source's records — and a creation that could not settles in `CREATE_FAILED`
-/// with a `StateReason` saying which, having consumed nothing, delivered nothing and
-/// published nothing.
+/// RULE: `CreatePipe` completes only if the pipe it creates could reach its source — the
+/// source is a resource its owner holds, and the role the pipe acts as may make at least one
+/// of the calls its source stage makes on that source — and a creation that could not settles
+/// in `CREATE_FAILED` with a `StateReason` saying which, having consumed nothing, delivered
+/// nothing and published nothing.
 ///
-/// The rows differ along what the rule generalises over: WHY the pipe could not poll (its
-/// source was deleted, its source was never created, its role's policies state nothing about
-/// the source read, they allow it on another queue only, they deny it), HOW a policy names
-/// the call it allows (exactly, by wildcard), and which `DesiredState` the creation asked for
-/// — plus the two controls that fix the rule's edge: a role that may read the source and not
-/// write the target brings the pipe UP, because the target is the data plane's to fail.
+/// The rows differ along what the rule generalises over: WHY the pipe could not reach its
+/// source (it was deleted, it was never created, its role's policies state nothing about it,
+/// they state every call on another queue only, they deny every one of them), HOW a policy
+/// names the call it allows (exactly, by wildcard), and which `DesiredState` the creation
+/// asked for — plus the three controls that fix the rule's edge: a role that may reach the
+/// source and not take its records, and one that may take them and not write the target,
+/// each bring the pipe UP, because what a running pipe may not do is the data plane's to
+/// fail.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_pipe_brings_up_only_a_pipe_that_could_poll_its_source() {
     let rows = [
@@ -286,8 +290,8 @@ async fn create_pipe_brings_up_only_a_pipe_that_could_poll_its_source() {
             delivers: false,
         },
         Row {
-            // The policies in force on the role say nothing about taking the source's
-            // records, which withholds that call.
+            // The policies in force on the role say nothing about the source at all, which
+            // withholds every call its source stage would make on it.
             case: "role-stating-nothing-about-the-source-read",
             held_source: true,
             created_source: true,
@@ -299,7 +303,8 @@ async fn create_pipe_brings_up_only_a_pipe_that_could_poll_its_source() {
             delivers: false,
         },
         Row {
-            // The read allowed on another queue, which does not reach this one.
+            // Every source call allowed on another queue, which reaches none of them on
+            // this one.
             case: "role-reading-another-queue-only",
             held_source: true,
             created_source: true,
@@ -307,7 +312,11 @@ async fn create_pipe_brings_up_only_a_pipe_that_could_poll_its_source() {
                 json!([
                     {
                         "Effect": "Allow",
-                        "Action": ["sqs:ReceiveMessage", "sqs:DeleteMessage"],
+                        "Action": [
+                            "sqs:ReceiveMessage",
+                            "sqs:DeleteMessage",
+                            "sqs:GetQueueAttributes",
+                        ],
                         "Resource": format!("{source}-elsewhere"),
                     },
                     { "Effect": "Allow", "Action": "sqs:SendMessage", "Resource": target },
@@ -320,9 +329,36 @@ async fn create_pipe_brings_up_only_a_pipe_that_could_poll_its_source() {
             delivers: false,
         },
         Row {
-            // Allowed everything and then denied the one call: IAM's deny wins, so the
-            // pipe could never take a record.
-            case: "role-denied-the-source-read",
+            // Allowed everything and then denied every call the source stage makes on the
+            // source: IAM's deny wins, so the pipe could not reach that source at all.
+            case: "role-denied-every-source-call",
+            held_source: true,
+            created_source: true,
+            policy: |source, _target| {
+                json!([
+                    { "Effect": "Allow", "Action": "sqs:*", "Resource": "*" },
+                    {
+                        "Effect": "Deny",
+                        "Action": [
+                            "sqs:ReceiveMessage",
+                            "sqs:DeleteMessage",
+                            "sqs:GetQueueAttributes",
+                        ],
+                        "Resource": source,
+                    },
+                ])
+            },
+            desired_state: None,
+            settles_in: CREATE_FAILED,
+            reason_mentions: &[RECEIVE_MESSAGE_ON_SQS],
+            names_source: false,
+            delivers: false,
+        },
+        Row {
+            // CONTROL: the same wildcard grant with only the RECORD-TAKING call denied. The
+            // pipe may still look at its source, so it is brought up — and it moves nothing,
+            // because the call it needs to take a record is the one it may not make.
+            case: "role-denied-only-the-source-read",
             held_source: true,
             created_source: true,
             policy: |source, _target| {
@@ -332,8 +368,8 @@ async fn create_pipe_brings_up_only_a_pipe_that_could_poll_its_source() {
                 ])
             },
             desired_state: None,
-            settles_in: CREATE_FAILED,
-            reason_mentions: &[RECEIVE_MESSAGE_ON_SQS],
+            settles_in: RUNNING,
+            reason_mentions: &[],
             names_source: false,
             delivers: false,
         },
@@ -516,9 +552,10 @@ async fn create_pipe_brings_up_only_a_pipe_that_could_poll_its_source() {
 enum Break {
     /// Its source queue is deleted, so its `Source` names nothing.
     SourceDeleted,
-    /// The policies of the role it HOLDS are rewritten to withhold the source read.
+    /// The policies of the role it HOLDS are rewritten to leave it no call on its source at
+    /// all.
     SourceReadWithdrawn,
-    /// It is re-roled onto another role that may not take the source's records.
+    /// It is re-roled onto another role that may make no call on its source.
     AnotherRole,
 }
 
@@ -850,6 +887,11 @@ struct Sentence {
     /// The IAM action that call is authorized under, which is what a row that DENIES it
     /// names in its policy.
     iam_action: &'static str,
+    /// The IAM actions of the OTHER calls the same source stage makes on that source, which a
+    /// row that denies the call above denies beside it: a role left any one of them is a role
+    /// under which the pipe still comes up ([`crate::pipe_bring_up`]'s create table has that
+    /// control), so a row about the FAILURE's own sentence withholds the whole set.
+    other_actions: &'static [&'static str],
     /// The name of the API action, and the service it is called on, that the pipe has to
     /// report as the call it does not have permission to make.
     api_action: &'static str,
@@ -858,19 +900,27 @@ struct Sentence {
     settles_in: &'static str,
 }
 
-/// RULE: a pipe whose execution role is not granted the call that TAKES THE RECORDS from its
-/// source cannot be brought up, and what it reports as the reason is that call and nothing
-/// else — the name of the API action and the service it is made to, for the kind of resource
-/// the pipe's `Source` names — in the fixed wording of that failure class
+/// The other calls each kind of source's own stage makes on the source, beside the one that
+/// takes its records. Source: the calls the pipes data plane makes on each source kind — a
+/// queue's delete and attributes read, a stream's shard listing and iterator.
+const QUEUE_OTHER_CALLS: &[&str] = &["sqs:DeleteMessage", "sqs:GetQueueAttributes"];
+const DYNAMODB_STREAM_OTHER_CALLS: &[&str] =
+    &["dynamodb:GetShardIterator", "dynamodb:DescribeStream"];
+const KINESIS_STREAM_OTHER_CALLS: &[&str] = &["kinesis:GetShardIterator", "kinesis:ListShards"];
+
+/// RULE: a pipe whose execution role is granted NONE of the calls its source stage makes on
+/// its source cannot be brought up, and what it reports as the reason is the call that TAKES
+/// THE RECORDS and nothing else — the name of the API action and the service it is made to, for
+/// the kind of resource the pipe's `Source` names — in the fixed wording of that failure class
 /// ([`withheld_source_read_reason`]), whichever lifecycle call was in flight and however the
-/// grant came to be missing.
+/// grants came to be missing.
 ///
 /// The rows differ along what the rule generalises over: the KIND of source (an Amazon SQS
 /// queue, a DynamoDB stream, a Kinesis data stream), which decides the call that is named;
 /// WHICH lifecycle call was in flight (a creation, a reconfiguration, a start), which decides
-/// the terminal state; and HOW the grant is missing (policies stating nothing about it, an
-/// explicit deny, a grant withdrawn from a live role), which changes nothing about the
-/// sentence.
+/// the terminal state; and HOW the grants are missing (policies stating nothing about the
+/// source, an explicit deny over a wildcard allow, grants withdrawn from a live role), which
+/// changes nothing about the sentence.
 ///
 /// The two tables above assert where such a move LANDS and that the pipe then runs nothing;
 /// this one asserts the exact text, which is what a client reading a deployment's failure is
@@ -883,6 +933,7 @@ async fn the_reason_a_withheld_source_read_leaves_names_that_call() {
             source: SourceKind::Queue,
             withheld: Withheld::Creation,
             iam_action: "sqs:ReceiveMessage",
+            other_actions: QUEUE_OTHER_CALLS,
             api_action: "ReceiveMessage",
             service: "SQS",
             settles_in: CREATE_FAILED,
@@ -892,6 +943,7 @@ async fn the_reason_a_withheld_source_read_leaves_names_that_call() {
             source: SourceKind::Queue,
             withheld: Withheld::Reconfiguration,
             iam_action: "sqs:ReceiveMessage",
+            other_actions: QUEUE_OTHER_CALLS,
             api_action: "ReceiveMessage",
             service: "SQS",
             settles_in: UPDATE_FAILED,
@@ -901,6 +953,7 @@ async fn the_reason_a_withheld_source_read_leaves_names_that_call() {
             source: SourceKind::Queue,
             withheld: Withheld::Start,
             iam_action: "sqs:ReceiveMessage",
+            other_actions: QUEUE_OTHER_CALLS,
             api_action: "ReceiveMessage",
             service: "SQS",
             settles_in: START_FAILED,
@@ -910,6 +963,7 @@ async fn the_reason_a_withheld_source_read_leaves_names_that_call() {
             source: SourceKind::DynamoDbStream,
             withheld: Withheld::Creation,
             iam_action: "dynamodb:GetRecords",
+            other_actions: DYNAMODB_STREAM_OTHER_CALLS,
             api_action: "GetRecords",
             service: "DynamoDB",
             settles_in: CREATE_FAILED,
@@ -919,6 +973,7 @@ async fn the_reason_a_withheld_source_read_leaves_names_that_call() {
             source: SourceKind::DynamoDbStream,
             withheld: Withheld::Reconfiguration,
             iam_action: "dynamodb:GetRecords",
+            other_actions: DYNAMODB_STREAM_OTHER_CALLS,
             api_action: "GetRecords",
             service: "DynamoDB",
             settles_in: UPDATE_FAILED,
@@ -928,6 +983,7 @@ async fn the_reason_a_withheld_source_read_leaves_names_that_call() {
             source: SourceKind::KinesisStream,
             withheld: Withheld::Creation,
             iam_action: "kinesis:GetRecords",
+            other_actions: KINESIS_STREAM_OTHER_CALLS,
             api_action: "GetRecords",
             service: "Kinesis",
             settles_in: CREATE_FAILED,
@@ -1006,6 +1062,11 @@ async fn the_reason_a_withheld_source_read_leaves_names_that_call() {
         match row.withheld {
             Withheld::Creation => {}
             Withheld::Reconfiguration => {
+                // Every call that stage makes on the source, denied over a wildcard allow: a
+                // role left ANY of them is a role the pipe still comes up under, so the move
+                // this row is about withholds the whole set.
+                let mut denied_actions = vec![row.iam_action];
+                denied_actions.extend_from_slice(row.other_actions);
                 let denied = given_role_stating(
                     &router,
                     &format!("{case}-role-b"),
@@ -1014,7 +1075,7 @@ async fn the_reason_a_withheld_source_read_leaves_names_that_call() {
                         { "Effect": "Allow", "Action": "*", "Resource": "*" },
                         {
                             "Effect": "Deny",
-                            "Action": row.iam_action,
+                            "Action": denied_actions,
                             "Resource": source_arn.clone(),
                         },
                     ]),
