@@ -77,13 +77,12 @@ fn invalid_recurrence_message(recurrence: &str) -> String {
     format!("Given recurrence string: {recurrence} is invalid")
 }
 
-/// The whole message a put whose `TimeZone` is not an IANA name is refused with.
-fn invalid_time_zone_message(time_zone: &str) -> String {
-    format!(
-        "The TimeZone value {time_zone} is not valid: it must be a canonical name of the \
-         IANA time zone database"
-    )
-}
+/// The whole message a put whose `TimeZone` is not an IANA name is refused with: entirely
+/// fixed text, with no part of the request in it — the rejected zone name is not quoted
+/// back, so every unknown zone reads the same.
+const INVALID_TIME_ZONE_MESSAGE: &str =
+    "Time zone specified does not conform to standardized time zones found in IANA Time Zone \
+     Database";
 
 /// The whole message a put whose sizes the group could not hold is refused with: the
 /// sentence every writer of a group's three sizes states.
@@ -94,12 +93,18 @@ fn desired_capacity_message(desired_capacity: i32, min_size: i32, max_size: i32)
     )
 }
 
-/// The whole message `PutScheduledUpdateGroupAction` and `DescribeScheduledActions` refuse a
-/// group the account does not hold with: the absent-group prefix this service opens every
-/// such refusal with, and the detail form these operations serve — the group named, unquoted.
+/// The whole message `DescribeScheduledActions` refuses a group the account does not hold
+/// with: the absent-group prefix this service opens every such refusal with, and the detail
+/// form that read serves — the group named, unquoted.
 fn absent_group_message(name: &str) -> String {
     format!("AutoScalingGroup name not found - AutoScalingGroup {name} not found")
 }
+
+/// The whole message `PutScheduledUpdateGroupAction` refuses such a group with: the same
+/// prefix with the detail field left unfilled, so it travels as the literal token `null` —
+/// the refusal's subject is the group the request named, which is the detail form this
+/// WRITE serves.
+const ABSENT_GROUP_WITHOUT_DETAIL: &str = "AutoScalingGroup name not found - null";
 
 /// A router carrying Amazon EC2 Auto Scaling on one engine whose Amazon EC2 store already
 /// holds the launch templates these groups launch from.
@@ -675,7 +680,7 @@ async fn a_definition_that_cannot_be_scheduled_is_refused_and_stores_nothing() {
                 ("TimeZone", "Mars/Olympus_Mons"),
                 ("DesiredCapacity", "1"),
             ],
-            invalid_time_zone_message("Mars/Olympus_Mons"),
+            INVALID_TIME_ZONE_MESSAGE.to_string(),
         ),
         (
             "a time zone named by its abbreviation rather than canonically",
@@ -685,7 +690,7 @@ async fn a_definition_that_cannot_be_scheduled_is_refused_and_stores_nothing() {
                 ("TimeZone", "PST"),
                 ("DesiredCapacity", "1"),
             ],
-            invalid_time_zone_message("PST"),
+            INVALID_TIME_ZONE_MESSAGE.to_string(),
         ),
         (
             "a desired capacity above the bounds the action leaves the group with",
@@ -729,7 +734,7 @@ async fn a_definition_that_cannot_be_scheduled_is_refused_and_stores_nothing() {
                 ("StartTime", "2030-06-01T12:00:00Z"),
                 ("DesiredCapacity", "1"),
             ],
-            absent_group_message(absent),
+            ABSENT_GROUP_WITHOUT_DETAIL.to_string(),
         ),
     ];
 
@@ -940,7 +945,7 @@ async fn a_read_selects_by_group_name_and_window_and_pages_its_answer() {
             "a token this service never issued",
             vec![p("NextToken", "not-a-token")],
             "InvalidNextToken",
-            "The token 'not-a-token' was invalid".to_string(),
+            "The token 'not-a-token' is invalid".to_string(),
         ),
         (
             "a group the account does not hold",

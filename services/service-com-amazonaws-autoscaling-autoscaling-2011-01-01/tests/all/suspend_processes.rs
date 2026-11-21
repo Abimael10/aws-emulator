@@ -300,8 +300,9 @@ struct RefusalCase {
     case: &'static str,
     group: &'static str,
     named: Vec<&'static str>,
-    /// `None` when the message is the one every group-scoped write answers an unheld group
-    /// with; otherwise the process the message quotes.
+    /// `None` when the message is the absent-group sentence THIS operation serves — the
+    /// detail states that no such group exists, naming it; otherwise the process the
+    /// message quotes.
     unknown_process: Option<&'static str>,
 }
 
@@ -373,7 +374,10 @@ async fn an_unsuspendable_request_is_refused_and_writes_nothing() {
                  are :[{}]",
                 catalog.join(", ")
             ),
-            None => "AutoScalingGroup name not found - null".to_string(),
+            None => format!(
+                "AutoScalingGroup name not found - no such group: {}",
+                case.group
+            ),
         };
         assert!(
             xml_unescape(&body).contains(&expected_message),

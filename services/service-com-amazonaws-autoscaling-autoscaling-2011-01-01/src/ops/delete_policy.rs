@@ -176,6 +176,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let policy_name = input.policy_name.clone();
         let named_group = input.auto_scaling_group_name.clone();
 
+        // What the request carries is read BEFORE the store: a policy named by its NAME is
+        // resolved inside a group, so a request that names no group names no one policy and
+        // is refused for the member it leaves out rather than for a policy nothing answers
+        // to — a delete-if-exists caller that read a not-found here would believe the
+        // policy gone.
+        if execution::group_required_for_policy_name(named_group.as_deref(), &policy_name) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                execution::GROUP_REQUIRED_FOR_POLICY_NAME_MESSAGE.to_string(),
+            ));
+        }
+
         // Which policy the request names, resolved before anything is removed.
         let key = {
             let mut state = store.lock();
@@ -190,15 +201,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
             match execution::resolve_policy(&state, named_group.as_deref(), &policy_name) {
-                Ok(key) => key,
-                Err(execution::PolicyLookupFailure::NotFound) => {
+                Some(key) => key,
+                None => {
                     return Err(crate::scaffolded::Scaffolded::validation_error(
                         execution::absent_policy_message(&policy_name),
-                    ))
-                }
-                Err(execution::PolicyLookupFailure::Ambiguous) => {
-                    return Err(crate::scaffolded::Scaffolded::validation_error(
-                        execution::ambiguous_policy_message(&policy_name),
                     ))
                 }
             }

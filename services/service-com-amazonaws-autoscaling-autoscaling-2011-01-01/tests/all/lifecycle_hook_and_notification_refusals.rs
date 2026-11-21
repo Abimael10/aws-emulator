@@ -77,8 +77,8 @@ fn absent_group_named(name: &str) -> String {
 ///
 /// Three forms, one per group of reads: the modelled `InvalidNextToken` stating the token
 /// in the past tense, the same error stating it in the present tense
-/// (`DescribeNotificationConfigurations`), and the service-common `ValidationError`
-/// naming the member and the value submitted for it.
+/// (`DescribeNotificationConfigurations`, `DescribeScheduledActions`), and the
+/// service-common `ValidationError` naming the member and the value submitted for it.
 #[derive(Debug, Clone, Copy)]
 enum TokenRefusal {
     PastTense,
@@ -737,13 +737,27 @@ async fn an_unusable_next_token_is_refused_in_the_refusal_the_read_serves() {
 
     // The paginated reads of this service, with the members each one needs beside the
     // token and the refusal it serves.
-    let reads: [PaginatedRead<'_>; 7] = [
+    let reads: [PaginatedRead<'_>; 9] = [
         (
             "DescribeNotificationConfigurations",
             vec![],
             TokenRefusal::PresentTense,
         ),
-        ("DescribeAutoScalingGroups", vec![], TokenRefusal::PastTense),
+        (
+            "DescribeScheduledActions",
+            vec![],
+            TokenRefusal::PresentTense,
+        ),
+        (
+            "DescribeAutoScalingInstances",
+            vec![],
+            TokenRefusal::PresentTense,
+        ),
+        (
+            "DescribeAutoScalingGroups",
+            vec![],
+            TokenRefusal::PastTense,
+        ),
         (
             "DescribeScalingActivities",
             vec![],

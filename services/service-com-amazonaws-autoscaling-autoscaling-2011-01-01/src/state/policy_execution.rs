@@ -236,18 +236,57 @@ pub fn absent_policy_message(policy_name: &str) -> String {
     format!("Policy {policy_name} not found")
 }
 
-/// The refusal of a plain policy NAME that more than one Auto Scaling group holds a policy
-/// of, with no `AutoScalingGroupName` to tell them apart.
+/// The refusal of a request that names a policy by its NAME and carries no
+/// `AutoScalingGroupName` beside it.
 ///
-/// A policy name is unique within a group rather than within the account, so such a request
-/// names no one policy; the sentence says which member resolves it. The name is its only
-/// variable part.
+/// A policy name is unique within a group rather than within the account — the member is
+/// "the name or ARN of the policy" (`ExecutePolicyType$PolicyName`) while the group is
+/// optional — so a bare name names no one policy until the group is given, and the request
+/// is refused for the member it is MISSING rather than reported as a policy nothing answers
+/// to. Entirely fixed text: neither the name asked for nor the group that was left out
+/// appears in it, so the sentence reads the same for every such request.
+pub const GROUP_REQUIRED_FOR_POLICY_NAME_MESSAGE: &str =
+    "The AutoScaling Group name is required when specifying a policy by its name";
+
+/// The ARN namespace of a scaling policy, the vendor field of the ARNs this service mints
+/// for one ([`super::scaling_policies::policy_arn`]).
+const POLICY_ARN_VENDOR: &str = "autoscaling";
+
+/// The resource TYPE of that ARN, the first field of its resource half
+/// (`scalingPolicy:{id}:autoScalingGroupName/{group}:policyName/{policy}`).
+const POLICY_ARN_RESOURCE_TYPE: &str = "scalingPolicy";
+
+/// Whether `policy_name_or_arn` names the policy by its ARN rather than by its NAME.
+///
+/// "The name or ARN of the policy" admits either spelling, and only the ARN form carries
+/// the group inside it, so this is what decides whether an `AutoScalingGroupName` is still
+/// needed to resolve the value ([`group_required_for_policy_name`]). An ARN is read with
+/// this repository's one caller-supplied-ARN parse, and it has to be an ARN of a scaling
+/// POLICY: a value that is not a well-formed resource ARN of this service, and one that
+/// names another of its resources (a group, a scheduled action), carries no policy to
+/// resolve and is read as a name.
 #[must_use]
-pub fn ambiguous_policy_message(policy_name: &str) -> String {
-    format!(
-        "Policy name {policy_name} is used by more than one Auto Scaling group. Specify \
-         AutoScalingGroupName to name the policy to execute."
-    )
+pub fn names_policy_by_arn(policy_name_or_arn: &str) -> bool {
+    ::service_common::arn::is_resource_arn_of(policy_name_or_arn, POLICY_ARN_VENDOR)
+        && ::service_common::arn::resource_type(policy_name_or_arn)
+            == Some(POLICY_ARN_RESOURCE_TYPE)
+}
+
+/// Whether a request naming ONE policy still needs its `AutoScalingGroupName` to resolve
+/// it: the value is a policy NAME and the request carries no group.
+///
+/// Asked BEFORE the policy is looked up, by every operation that acts on one policy the
+/// request names (`ExecutePolicy`, `DeletePolicy`), so a well-formed-but-incomplete request
+/// is refused for the member it leaves out
+/// ([`GROUP_REQUIRED_FOR_POLICY_NAME_MESSAGE`]) rather than reported as a resource that does
+/// not exist. A group stated as whitespace alone states none.
+#[must_use]
+pub fn group_required_for_policy_name(
+    group_name: Option<&str>,
+    policy_name_or_arn: &str,
+) -> bool {
+    !names_policy_by_arn(policy_name_or_arn)
+        && group_name.is_none_or(|group| group.trim().is_empty())
 }
 
 /// The refusal of a member, or of the operation itself, for a policy whose type does not
@@ -339,50 +378,35 @@ impl PolicyExecutionRefusal {
     }
 }
 
-/// Why a policy NAME resolved to no one policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PolicyLookupFailure {
-    /// Nothing in the account answers to it.
-    NotFound,
-    /// Several groups hold a policy of that name and the request named no group.
-    Ambiguous,
-}
-
 /// The policy a request names: "The name or ARN of the policy"
-/// (`ExecutePolicyType$PolicyName`), resolved against what the store holds.
+/// (`ExecutePolicyType$PolicyName`), resolved against what the store holds; `None` when
+/// nothing the request may reach answers to it.
 ///
 /// An ARN names the policy outright, wherever it lives. A plain NAME is unique only within
-/// a group, so it is resolved inside the group the request names; a request that names no
-/// group resolves such a name when exactly ONE group holds a policy of it, and is otherwise
-/// told which member tells them apart. A group the request names that holds no policy of
-/// that name resolves nothing, whatever other groups hold.
+/// a group, so it is resolved inside the group the request names — which such a request
+/// always carries, because a bare name with no group is refused for the missing member
+/// before the lookup ([`group_required_for_policy_name`]). A group the request names that
+/// holds no policy of that name resolves nothing, whatever other groups hold.
 pub fn resolve_policy(
     state: &AutoScalingState,
     group_name: Option<&str>,
     policy_name_or_arn: &str,
-) -> Result<PolicyKey, PolicyLookupFailure> {
+) -> Option<PolicyKey> {
     let in_group = |key: &PolicyKey| {
         group_name.is_none_or(|group| key.auto_scaling_group_name == group)
     };
-    let by_arn = state
+    state
         .scaling_policies
         .iter()
         .find(|(key, policy)| in_group(key) && policy.policy_arn == policy_name_or_arn)
-        .map(|(key, _)| key.clone());
-    if let Some(key) = by_arn {
-        return Ok(key);
-    }
-    let mut by_name: Vec<PolicyKey> = state
-        .scaling_policies
-        .keys()
-        .filter(|key| in_group(key) && key.policy_name == policy_name_or_arn)
-        .cloned()
-        .collect();
-    match by_name.len() {
-        0 => Err(PolicyLookupFailure::NotFound),
-        1 => by_name.pop().ok_or(PolicyLookupFailure::NotFound),
-        _ => Err(PolicyLookupFailure::Ambiguous),
-    }
+        .map(|(key, _)| key.clone())
+        .or_else(|| {
+            state
+                .scaling_policies
+                .keys()
+                .find(|key| in_group(key) && key.policy_name == policy_name_or_arn)
+                .cloned()
+        })
 }
 
 impl AutoScalingState {

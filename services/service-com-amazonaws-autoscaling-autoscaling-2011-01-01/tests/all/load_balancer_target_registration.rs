@@ -800,10 +800,10 @@ async fn an_attach_of_an_absent_group_is_refused() {
             code, "ValidationError",
             "case {name:?}: expected the ValidationError code, got {code:?} {message:?}"
         );
-        // The absent-group refusal this service's group-scoped mutations answer with: the
-        // fixed sentence plus the name the request asked for.
-        let expected =
-            format!("AutoScalingGroup name not found - AutoScalingGroup {name} not found");
+        // The absent-group refusal this operation answers with: the fixed sentence whose
+        // detail field is left unfilled, so it travels as the literal token `null` and no
+        // part of the request appears in it.
+        let expected = "AutoScalingGroup name not found - null";
         assert_eq!(
             message, expected,
             "case {name:?}: expected the message {expected:?}, got {message:?}"

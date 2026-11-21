@@ -79,13 +79,11 @@ fn invalid_recurrence_message(recurrence: &str) -> String {
     format!("Given recurrence string: {recurrence} is invalid")
 }
 
-/// The whole message an action whose `TimeZone` is not an IANA name is refused with.
-fn invalid_time_zone_message(time_zone: &str) -> String {
-    format!(
-        "The TimeZone value {time_zone} is not valid: it must be a canonical name of the \
-         IANA time zone database"
-    )
-}
+/// The whole message an action whose `TimeZone` is not an IANA name is refused with:
+/// entirely fixed text, with no part of the request in it.
+const INVALID_TIME_ZONE_MESSAGE: &str =
+    "Time zone specified does not conform to standardized time zones found in IANA Time Zone \
+     Database";
 
 /// The whole message an action whose sizes the group could not hold is refused with: the
 /// sentence every writer of a group's three sizes states.
@@ -106,11 +104,11 @@ fn size_past_ceiling_message(size: i32) -> String {
 }
 
 /// The whole message a call naming a group the account does not hold is refused with: the
-/// absent-group prefix this service opens every such refusal with, and the detail form these
-/// operations serve — the group named, unquoted.
-fn absent_group_message(name: &str) -> String {
-    format!("AutoScalingGroup name not found - AutoScalingGroup {name} not found")
-}
+/// absent-group prefix this service opens every such refusal with, and the detail form this
+/// write serves — the detail field left unfilled, so it travels as the literal token `null`
+/// and no part of the request appears in it. The same sentence the single put of a scheduled
+/// action serves.
+const ABSENT_GROUP_MESSAGE: &str = "AutoScalingGroup name not found - null";
 
 /// The whole message a call stating more than [`MAX_SCHEDULED_ACTIONS_PER_CALL`] actions is
 /// refused with: the sentence a list member past the bound it has to satisfy is refused with,
@@ -615,7 +613,7 @@ async fn an_action_that_cannot_be_scheduled_is_reported_on_its_own() {
                 ("MinSize", "1"),
             ],
             "ValidationError",
-            invalid_time_zone_message("Mars/Olympus_Mons"),
+            INVALID_TIME_ZONE_MESSAGE.to_string(),
         ),
         (
             "a size past the ceiling a group is held to",
@@ -735,7 +733,7 @@ async fn a_call_naming_no_stored_group_is_refused_for_the_group() {
         }
         assert_eq!(
             (status, code.as_str(), message.as_str()),
-            (400, "ValidationError", absent_group_message(absent).as_str()),
+            (400, "ValidationError", ABSENT_GROUP_MESSAGE),
             "a call against the absent group {absent:?} must be refused for the group, got \
              {status} {code:?} {message:?}"
         );

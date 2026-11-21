@@ -207,13 +207,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::too_many_target_groups_message(),
             ));
         }
+        let now = ::std::time::SystemTime::now();
+        // The GROUP the request names is resolved FIRST: the attachment is a change to that
+        // group, so a name no group answers to is refused for the group — with the wording
+        // this service's group-scoped mutations answer with, its detail field left unfilled,
+        // as the attach of a traffic source states it — before anything the request says
+        // about the target groups is read. Resolved through
+        // [`crate::state::holds_group`], which releases the lock, so the resolution below
+        // reaches the other service's store with no guard of this one held.
+        if !crate::state::holds_group(&*self.engine, &name, now) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL,
+            ));
+        }
         // Every ARN has to RESOLVE to a target group of the Region and account this request
         // is addressed to: a target group is identified within one Region, and the group is
         // in the Region the request is signed for, so an ARN of anywhere else — and one
         // Elastic Load Balancing v2 holds no target group under at all — names nothing this
-        // endpoint could register an instance in. Checked on the INPUT, before the group is
-        // looked up or touched, so the attachment the group would then claim can never be
-        // one that cannot resolve.
+        // endpoint could register an instance in. Checked on the INPUT, with this service's
+        // lock RELEASED, so no request holds two stores at once, and before the group is
+        // touched, so the attachment the group would then claim can never be one that cannot
+        // resolve.
         let region = crate::state::request_region(ctx.parts());
         if crate::state::elbv2_targets::first_unresolvable_target_group(
             &*self.engine,
@@ -227,14 +241,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        let now = ::std::time::SystemTime::now();
         {
             let mut state = state.lock();
             state.materialize_due(&*self.engine, now);
 
             let Some(group) = state.groups.get_mut(&name) else {
                 return Err(crate::scaffolded::Scaffolded::validation_error(
-                    crate::state::absent_group_message(&name),
+                    crate::state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL,
                 ));
             };
 

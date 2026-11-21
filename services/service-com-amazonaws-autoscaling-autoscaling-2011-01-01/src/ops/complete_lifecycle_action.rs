@@ -176,14 +176,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.materialize_due(&*self.engine, now);
 
-        // The action belongs to a group, so a name no group answers to is refused in the
-        // detail form every door of this service serves for one.
-        if !state.groups.contains_key(&group_name) {
-            return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::absent_group_message_as_no_such_group(&group_name),
-            ));
-        }
-
+        // The call is addressed at the lifecycle ACTION the request names, so the action is
+        // what is looked for: a group the account does not hold holds no active action
+        // either, so such a call is refused for the action it addressed rather than for the
+        // group ([`crate::state::LifecycleActionRefusal`]), which is what a callback holding
+        // a stale token has to act on.
         let key = crate::state::LifecycleActionKey {
             group_name: &group_name,
             hook_name: &hook_name,

@@ -416,7 +416,10 @@ async fn an_unresumable_request_is_refused_and_writes_nothing() {
                  are :[{}].",
                 catalog.join(", ")
             ),
-            None => "AutoScalingGroup name not found - null".to_string(),
+            None => format!(
+                "AutoScalingGroup name not found - no such group: {}",
+                case.group
+            ),
         };
         assert!(
             xml_unescape(&body).contains(&expected_message),

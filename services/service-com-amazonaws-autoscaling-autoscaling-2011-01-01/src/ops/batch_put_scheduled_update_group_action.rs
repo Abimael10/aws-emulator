@@ -212,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &group_name,
                     "refused: no such group",
                 );
-                return Err(absent_group(&group_name));
+                return Err(absent_group());
             }
 
             let mut written: Vec<String> = Vec::with_capacity(requested.len());
@@ -237,7 +237,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     Ok(Some(_stored)) => written.push(format!("{group_name}/{action_name}")),
                     // The group was resolved under this same lock, so the writer found it
                     // too; a name it no longer answers to is refused as any unknown name is.
-                    Ok(None) => return Err(absent_group(&group_name)),
+                    Ok(None) => return Err(absent_group()),
                     // One action the call could not store: the caller is told which action
                     // and why, and the actions beside it are still written — each action of
                     // this request is a resource of its own.
@@ -265,7 +265,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// The refusal a request naming a group the account does not hold is answered with: the
 /// `ValidationError` Amazon EC2 Auto Scaling answers such a request with, carrying this
-/// service's absent-group sentence for the name the request asked for.
-fn absent_group(group_name: &str) -> BatchPutScheduledUpdateGroupActionError {
-    crate::scaffolded::Scaffolded::validation_error(crate::state::absent_group_message(group_name))
+/// service's absent-group sentence with its detail field left unfilled — the refusal's
+/// subject is the GROUP the call named, which is the detail form the single put of a
+/// scheduled action serves too ([`crate::state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL`]).
+fn absent_group() -> BatchPutScheduledUpdateGroupActionError {
+    crate::scaffolded::Scaffolded::validation_error(
+        crate::state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL,
+    )
 }

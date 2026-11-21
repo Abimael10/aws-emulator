@@ -1006,7 +1006,8 @@ async fn an_unsatisfiable_request_is_refused() {
             absent_group: Some("asg-absent"),
             status: 400,
             code: "ValidationError",
-            message: "AutoScalingGroup name not found - null".to_string(),
+            message: "AutoScalingGroup name not found - No such Auto Scaling group: asg-absent"
+                .to_string(),
         },
         Refusal {
             // The group is resolved before any member of the request is checked, so a
@@ -1018,7 +1019,8 @@ async fn an_unsatisfiable_request_is_refused() {
             absent_group: Some("asg-absent"),
             status: 400,
             code: "ValidationError",
-            message: "AutoScalingGroup name not found - null".to_string(),
+            message: "AutoScalingGroup name not found - No such Auto Scaling group: asg-absent"
+                .to_string(),
         },
         Refusal {
             case: "a read naming no stored group",

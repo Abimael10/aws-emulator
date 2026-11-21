@@ -179,14 +179,12 @@ impl ScheduledActionPut {
                 recurrence.to_string(),
             ));
         }
-        if let Some(time_zone) = self
+        if self
             .time_zone
             .as_deref()
-            .filter(|time_zone| super::recurrence::time_zone(Some(time_zone)).is_none())
+            .is_some_and(|time_zone| super::recurrence::time_zone(Some(time_zone)).is_none())
         {
-            return Err(ScheduledActionRefusal::InvalidTimeZone(
-                time_zone.to_string(),
-            ));
+            return Err(ScheduledActionRefusal::InvalidTimeZone);
         }
         Ok(())
     }
@@ -345,9 +343,10 @@ pub enum ScheduledActionRefusal {
     /// The `Recurrence` is not the crontab expression the member documents; carries what the
     /// request stated.
     InvalidRecurrence(String),
-    /// The `TimeZone` is not a canonical IANA time zone name; carries what the request
-    /// stated.
-    InvalidTimeZone(String),
+    /// The `TimeZone` is not a canonical IANA time zone name. Carries nothing: the
+    /// refusal states the rule rather than the value that broke it
+    /// ([`INVALID_TIME_ZONE_MESSAGE`]).
+    InvalidTimeZone,
     /// The group already holds [`MAX_SCHEDULED_ACTIONS_PER_GROUP`] actions and this request
     /// names one more.
     LimitExceeded,
@@ -384,7 +383,7 @@ impl ScheduledActionRefusal {
             ),
             Self::EndNotAfterStart => END_TIME_MESSAGE.to_string(),
             Self::InvalidRecurrence(recurrence) => invalid_recurrence_message(recurrence),
-            Self::InvalidTimeZone(time_zone) => invalid_time_zone_message(time_zone),
+            Self::InvalidTimeZone => INVALID_TIME_ZONE_MESSAGE.to_string(),
             Self::LimitExceeded => too_many_scheduled_actions_message(),
         }
     }
@@ -435,15 +434,15 @@ pub fn invalid_recurrence_message(recurrence: &str) -> String {
     format!("Given recurrence string: {recurrence} is invalid")
 }
 
-/// The same sentence for a `TimeZone` the IANA database does not name, which states what the
-/// caller has to choose from the way the member's own documentation does.
-#[must_use]
-pub fn invalid_time_zone_message(time_zone: &str) -> String {
-    format!(
-        "The TimeZone value {time_zone} is not valid: it must be a canonical name of the \
-         IANA time zone database"
-    )
-}
+/// The sentence a put whose `TimeZone` names no zone of the IANA database is refused with:
+/// the service states the catalogue the value had to come from — "the canonical names of the
+/// IANA time zones, derived from the IANA Time Zone Database"
+/// (`PutScheduledUpdateGroupActionType$TimeZone`) — and NOTHING of the request. Entirely
+/// fixed text: the rejected zone name is not interpolated, so the refusal reads the same
+/// whichever unknown zone was asked for.
+pub const INVALID_TIME_ZONE_MESSAGE: &str =
+    "Time zone specified does not conform to standardized time zones found in IANA Time Zone \
+     Database";
 
 /// The sentence a put that would take a group past [`MAX_SCHEDULED_ACTIONS_PER_GROUP`] is
 /// refused with, in the same shape this service states its other per-group ceilings in: the

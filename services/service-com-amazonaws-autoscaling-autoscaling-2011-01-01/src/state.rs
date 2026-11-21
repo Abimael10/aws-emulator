@@ -208,11 +208,11 @@ pub mod recurrence;
 pub mod scheduled_actions;
 
 pub use scheduled_actions::{
-    invalid_recurrence_message, invalid_time_zone_message, scheduled_action_arn,
+    invalid_recurrence_message, scheduled_action_arn,
     too_many_scheduled_actions_in_one_call_message, too_many_scheduled_actions_message,
     ScheduledActionPut, ScheduledActionRefusal, ScheduledActions, StoredScheduledAction,
-    END_TIME_MESSAGE, MAX_SCHEDULED_ACTIONS_PER_CALL, MAX_SCHEDULED_ACTIONS_PER_GROUP,
-    SIZE_REQUIRED_MESSAGE,
+    END_TIME_MESSAGE, INVALID_TIME_ZONE_MESSAGE, MAX_SCHEDULED_ACTIONS_PER_CALL,
+    MAX_SCHEDULED_ACTIONS_PER_GROUP, SIZE_REQUIRED_MESSAGE,
 };
 
 /// Performing one of those policies — `ExecutePolicy` — which policy a request names, the
@@ -222,7 +222,6 @@ pub mod policy_execution;
 
 pub use policy_execution::{
     MetricBreach, PolicyExecution, PolicyExecutionRefusal, PolicyExecutionRequest,
-    PolicyLookupFailure,
 };
 
 /// The Amazon SNS notification configurations of a group: the named collection
@@ -3817,6 +3816,29 @@ pub fn settle_every_group_load_balancers<Eng: Send + Sync + 'static>(engine: &En
     }
 }
 
+/// Whether the account holds an Auto Scaling group of `name`, resolved under a lock this
+/// call takes and RELEASES.
+///
+/// THE ONE way an operation resolves the group it changes BEFORE it reads the resources its
+/// other members name: those resources belong to another service, and reaching that
+/// service's store with this one's guard held would have one request holding two stores. So
+/// the attach family asks this first, refuses a name no group answers to in its own
+/// absent-group sentence, and only then resolves what it was asked to attach — a group
+/// deleted between the two is caught by the write's own lookup, which is the same race any
+/// two calls of one group run.
+pub fn holds_group<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    name: &str,
+    now: ::std::time::SystemTime,
+) -> bool {
+    let Some(store) = service_state(engine) else {
+        return false;
+    };
+    let mut state = store.lock();
+    state.materialize_due(engine, now);
+    state.groups.contains_key(name)
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.
@@ -4269,8 +4291,10 @@ pub fn absent_group_message_as_not_findable(name: &str) -> String {
     format!("{ABSENT_GROUP_PREFIX}Could not find Auto Scaling group named '{name}'")
 }
 
-/// The refusal `PutScalingPolicy` answers a group the account does not hold with: ONE
-/// sentence about the group, naming it, and NOT built on [`ABSENT_GROUP_PREFIX`] at all.
+/// The refusal `PutScalingPolicy` and the two writers of a group's metrics collection
+/// (`EnableMetricsCollection`, `DisableMetricsCollection`) answer a group the account does
+/// not hold with: ONE sentence about the group, naming it, and NOT built on
+/// [`ABSENT_GROUP_PREFIX`] at all.
 ///
 /// Separate from the forms above because this refusal is the whole message rather than a
 /// detail behind that prefix: the name is its only variable part, and the rest,
@@ -4285,6 +4309,40 @@ pub fn absent_group_message_as_group_not_found(name: &str) -> String {
 /// detail may stand unfilled here — a refusal about an INSTANCE names that instance
 /// ([`instance_managed_by_no_group_message`]) rather than leaving a slot of its own empty.
 pub const ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL: &str = "AutoScalingGroup name not found - null";
+
+/// The absent-group refusal whose detail states that no group of that name exists, spelled
+/// the way `SuspendProcesses` spells it — the same detail as
+/// [`absent_group_message_as_no_such_group`] in the lower-case, abbreviated form that
+/// operation's own refusal states.
+///
+/// Separate from the forms above because the detail is each operation's own: the name is the
+/// only part taken from the request, and the rest, punctuation included, is fixed text.
+pub fn absent_group_message_as_lower_case_no_such_group(name: &str) -> String {
+    format!("{ABSENT_GROUP_PREFIX}no such group: {name}")
+}
+
+/// The fixed text the absent-group refusals of a few operations open with INSTEAD: the
+/// resource word with no `name` after it, so the opening is about the GROUP that was not
+/// found rather than about the name it was asked for.
+const ABSENT_GROUP_SUBJECT_PREFIX: &str = "AutoScalingGroup not found - ";
+
+/// That opening with the detail that no such group exists — the form `LaunchInstances`
+/// serves.
+///
+/// The name is the only part taken from the request; the rest, punctuation included, is
+/// fixed text.
+pub fn absent_group_message_as_subject_without_such_group(name: &str) -> String {
+    format!("{ABSENT_GROUP_SUBJECT_PREFIX}No such Auto Scaling group: {name}")
+}
+
+/// That opening with the detail naming the resource as two words and then the name asked
+/// for — the form the write that creates or updates a group's tags serves.
+///
+/// The name is the only part taken from the request; the rest, punctuation included, is
+/// fixed text.
+pub fn absent_group_message_as_subject_naming_group(name: &str) -> String {
+    format!("{ABSENT_GROUP_SUBJECT_PREFIX}AutoScaling Group {name} not found")
+}
 
 /// The sentence a rollback of a refresh that carries no desired configuration is
 /// refused with: the first of the situations the error class names, and the whole of
@@ -4400,12 +4458,13 @@ pub fn invalid_next_token_message(token: &str) -> String {
 }
 
 /// The same sentence in the PRESENT tense, the form `DescribeNotificationConfigurations`
-/// serves: the sentence is about the token the caller is holding now.
+/// and `DescribeScheduledActions` serve: the sentence is about the token the caller is
+/// holding now.
 ///
 /// Separate from [`invalid_next_token_message`] because the sentence is each read's own —
-/// the reads above answer the past-tense form and `DescribePolicies` names the member by
-/// its role ([`invalid_pagination_token_message`]) — so one read's wording is not the
-/// others' to change.
+/// the reads that answer the past-tense form state it as recorded for them, and
+/// `DescribePolicies` names the member by its role ([`invalid_pagination_token_message`]) —
+/// so one read's wording is not the others' to change.
 pub fn invalid_next_token_message_in_present_tense(token: &str) -> String {
     format!("The token '{token}' is invalid")
 }

@@ -631,7 +631,7 @@ async fn the_account_read_refuses_a_token_that_names_no_page() {
         let message = xml_unescape(&tag_value(&body, "Message"));
         assert_eq!(
             message,
-            format!("The token '{token}' was invalid"),
+            format!("The token '{token}' is invalid"),
             "case {case:?}: expected the refusal to quote the token the caller sent, got \
              {message:?}"
         );

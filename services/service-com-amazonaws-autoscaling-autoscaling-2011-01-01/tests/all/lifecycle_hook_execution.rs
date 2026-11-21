@@ -583,6 +583,10 @@ enum Addressed {
     AbsentInstance,
     /// A token no action of the group is held under.
     UnknownToken,
+    /// A group the account does not hold at all, addressed by a token another group's hold
+    /// does carry: such a group holds no active action either, so the callback is refused
+    /// for the ACTION it addressed rather than for the group.
+    AbsentGroup,
     /// Neither identifier.
     Nothing,
 }
@@ -591,7 +595,8 @@ enum Addressed {
 /// correct — and naming the hook as well exactly when the instance it named IS waiting at a
 /// hook of the group.
 ///
-/// The rows differ along which half of the address matched nothing, and each row is driven
+/// The rows differ along which half of the address matched nothing — including a group the
+/// account does not hold, which holds no active action either — and each row is driven
 /// through BOTH doors that take the address (`CompleteLifecycleAction` and
 /// `RecordLifecycleActionHeartbeat`), which refuse it identically.
 #[tokio::test]
@@ -601,6 +606,7 @@ async fn a_callback_naming_no_held_action_says_which_half_matched_nothing() {
         ("an action already consumed", Addressed::ConsumedAction),
         ("an instance the group does not hold", Addressed::AbsentInstance),
         ("a token no action is held under", Addressed::UnknownToken),
+        ("a group the account does not hold", Addressed::AbsentGroup),
         ("neither the token nor the instance", Addressed::Nothing),
     ];
 
@@ -658,9 +664,16 @@ async fn a_callback_naming_no_held_action_says_which_half_matched_nothing() {
                 vec![("LifecycleActionToken", unknown_token)],
                 format!("No active Lifecycle Action found with token {unknown_token}"),
             ),
+            // The token this row sends IS one this service minted — for the group that
+            // holds it — so the refusal can only be about the group the call named holding
+            // no action under it.
+            Addressed::AbsentGroup => (
+                vec![("LifecycleActionToken", token.as_str())],
+                format!("No active Lifecycle Action found with token {token}"),
+            ),
             Addressed::Nothing => (
                 Vec::new(),
-                "Either the lifecycle action token or the instance ID must be specified."
+                "No Lifecycle Action found because no token or instance ID is provided"
                     .to_string(),
             ),
         };
@@ -671,10 +684,17 @@ async fn a_callback_naming_no_held_action_says_which_half_matched_nothing() {
         } else {
             hook
         };
+        // The group the call names: one the account does not hold for the row that is about
+        // the group, and the group that holds the action otherwise.
+        let named_group = if *addressed == Addressed::AbsentGroup {
+            "asg-no-such-group"
+        } else {
+            group.as_str()
+        };
 
         for door in ["CompleteLifecycleAction", "RecordLifecycleActionHeartbeat"] {
             let mut params: Vec<(&str, &str)> = vec![
-                ("AutoScalingGroupName", group.as_str()),
+                ("AutoScalingGroupName", named_group),
                 ("LifecycleHookName", named_hook),
             ];
             params.extend_from_slice(&addressing);

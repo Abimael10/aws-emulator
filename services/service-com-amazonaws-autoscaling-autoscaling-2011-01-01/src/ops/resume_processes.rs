@@ -183,12 +183,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // convergence below reaches the whole store again.
         let (converge, desired_capacity) = {
             // A resumption belongs to a group, so a name no group answers to is refused
-            // with the wording this service's group-scoped WRITE paths answer with: the
-            // detail field after the dash is left unfilled, so no part of the request
-            // appears in it.
+            // with the detail THIS operation's own refusal states: that no such group
+            // exists, naming it — the same detail its sibling that suspends the processes
+            // states ([`crate::state::absent_group_message_as_lower_case_no_such_group`]).
             let Some(group) = state.groups.get_mut(&group_name) else {
                 return Err(crate::scaffolded::Scaffolded::validation_error(
-                    crate::state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL,
+                    crate::state::absent_group_message_as_lower_case_no_such_group(&group_name),
                 ));
             };
             // A process outside this service's own catalog names no process to resume,

@@ -187,12 +187,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state.materialize_due(&*self.engine, now);
 
             // Metrics collection belongs to a group, so a name no group answers to is
-            // refused with the wording this service's group-scoped WRITE paths answer
-            // with: the detail field after the dash is left unfilled, so no part of the
-            // request appears in it.
+            // refused with the sentence THIS operation's own refusal states — one sentence
+            // about the group, naming it
+            // ([`crate::state::absent_group_message_as_group_not_found`]) — the same one
+            // the call that starts the collection serves.
             let Some(group) = state.groups.get_mut(&group_name) else {
                 return Err(crate::scaffolded::Scaffolded::validation_error(
-                    crate::state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL,
+                    crate::state::absent_group_message_as_group_not_found(&group_name),
                 ));
             };
 

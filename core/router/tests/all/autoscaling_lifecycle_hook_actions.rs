@@ -1179,7 +1179,7 @@ async fn only_a_held_action_is_announced_and_only_its_token_completes_it() {
                 ("LifecycleActionResult", CONTINUE.to_string()),
             ],
             code: "ValidationError",
-            message: "Either the lifecycle action token or the instance ID must be specified."
+            message: "No Lifecycle Action found because no token or instance ID is provided"
                 .to_string(),
         },
         Refusal {

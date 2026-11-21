@@ -195,9 +195,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut state = state.lock();
             state.materialize_due(&*self.engine, now);
 
+            // A name no group answers to is refused with the wording this service's
+            // group-scoped mutations of a group's attachments answer with, its detail field
+            // left unfilled — the same sentence the attach of a traffic source states.
             let Some(group) = state.groups.get_mut(&name) else {
                 return Err(crate::scaffolded::Scaffolded::validation_error(
-                    crate::state::absent_group_message(&name),
+                    crate::state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL,
                 ));
             };
 

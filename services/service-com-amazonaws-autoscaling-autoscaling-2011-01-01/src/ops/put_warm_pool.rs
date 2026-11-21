@@ -185,15 +185,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.materialize_due(&*self.engine, now);
 
-        // A warm pool belongs to a group, so a name no group answers to is refused with
-        // the wording this service's group-scoped WRITE paths answer with: the detail
-        // field after the dash is left unfilled, so no part of the request appears in it.
-        // The group is resolved FIRST, before any member of the request is checked, so a
-        // name no group answers to is refused for that rather than for what the request
-        // carried.
+        // A warm pool belongs to a group, so a name no group answers to is refused with the
+        // detail THIS operation's own refusal states: that no such group exists, naming it
+        // (the same detail form the warm pool's own READ serves,
+        // [`crate::state::absent_group_message_as_no_such_group`]). The group is resolved
+        // FIRST, before any member of the request is checked, so a name no group answers to
+        // is refused for that rather than for what the request carried.
         if !state.groups.contains_key(&group_name) {
             return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL,
+                crate::state::absent_group_message_as_no_such_group(&group_name),
             ));
         }
         // The sizes a warm pool is bounded by are RELATIVE to the group's own capacity, so

@@ -643,7 +643,7 @@ async fn a_launch_outside_the_groups_configuration_is_refused() {
             params: Vec::new(),
             group: Some("asg-absent"),
             capacity: 1,
-            expected: "AutoScalingGroup name not found - AutoScalingGroup asg-absent not found"
+            expected: "AutoScalingGroup not found - No such Auto Scaling group: asg-absent"
                 .to_string(),
         },
         Refusal {

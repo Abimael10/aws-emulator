@@ -254,7 +254,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &group_name,
                 "refused: no such group",
             );
-            return Err(absent_group(&group_name));
+            return Err(absent_group());
         }
         let stored = state
             .put_scheduled_action(&group_name, &action_name, put, now)
@@ -278,7 +278,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The group was resolved above, so the writer found it too; a name it no longer
         // answers to is refused as any unknown name is.
         if stored.is_none() {
-            return Err(absent_group(&group_name));
+            return Err(absent_group());
         }
 
         crate::state::audit(
@@ -293,7 +293,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// The refusal a request naming a group the account does not hold is answered with: the
 /// `ValidationError` Amazon EC2 Auto Scaling answers such a request with, carrying this
-/// service's absent-group sentence for the name the request asked for.
-fn absent_group(group_name: &str) -> PutScheduledUpdateGroupActionError {
-    crate::scaffolded::Scaffolded::validation_error(crate::state::absent_group_message(group_name))
+/// service's absent-group sentence with its detail field left unfilled — the refusal's
+/// subject is the GROUP the request named, which is what this operation's own recorded
+/// refusal states ([`crate::state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL`]).
+fn absent_group() -> PutScheduledUpdateGroupActionError {
+    crate::scaffolded::Scaffolded::validation_error(
+        crate::state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL,
+    )
 }

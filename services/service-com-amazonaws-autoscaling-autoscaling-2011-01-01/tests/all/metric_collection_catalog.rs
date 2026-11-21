@@ -784,8 +784,8 @@ async fn a_metrics_request_outside_the_published_catalog_is_refused_and_writes_n
         );
     }
 
-    // A group the account does not hold, through both writers: the refusal every
-    // group-scoped write of this service answers with.
+    // A group the account does not hold, through both writers: the sentence these two
+    // operations state for one — one sentence about the group, naming it.
     for toggle in [Toggle::Enable, Toggle::Disable] {
         let named = ["GroupMinSize".to_string()];
         let (status, body) = match toggle {
@@ -798,7 +798,7 @@ async fn a_metrics_request_outside_the_published_catalog_is_refused_and_writes_n
              {status}: {body}"
         );
         assert!(
-            xml_unescape(&body).contains("AutoScalingGroup name not found - null"),
+            xml_unescape(&body).contains("Group no-such-group not found"),
             "case {toggle:?} on a group the account does not hold: expected the \
              absent-group refusal, got {body}"
         );

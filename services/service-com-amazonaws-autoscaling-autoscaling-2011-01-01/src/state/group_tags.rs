@@ -204,8 +204,11 @@ impl TagWriteRefusal {
                  {GROUP_RESOURCE_TYPE}"
             ),
             // A group the account does not hold carries no tags, so the write is refused
-            // with this service's absent-group refusal, naming the group asked for.
-            Self::AbsentGroup(name) => super::absent_group_message(name),
+            // with this service's absent-group refusal in the wording BOTH writers of a
+            // group's tags state it in: the opening is about the group that was not found,
+            // and the detail names the resource as two words and then the name asked for
+            // ([`super::absent_group_message_as_subject_naming_group`]).
+            Self::AbsentGroup(name) => super::absent_group_message_as_subject_naming_group(name),
         }
     }
 }

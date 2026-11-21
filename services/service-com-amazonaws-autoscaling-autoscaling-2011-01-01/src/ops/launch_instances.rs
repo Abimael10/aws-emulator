@@ -295,8 +295,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.materialize_due(&*self.engine, now);
 
         let Some(group) = state.groups.get(&name) else {
+            // The opening THIS operation's own refusal states is about the group that was
+            // not found rather than about the name asked for, and its detail states that no
+            // such group exists
+            // ([`crate::state::absent_group_message_as_subject_without_such_group`]).
             return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::absent_group_message(&name),
+                crate::state::absent_group_message_as_subject_without_such_group(&name),
             ));
         };
         let group_zones = group.availability_zones.clone();

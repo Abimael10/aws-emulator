@@ -199,7 +199,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => {
                     return Err(DescribeScheduledActionsErrorModeled::InvalidNextToken(
                         InvalidNextToken {
-                            message: Some(crate::state::invalid_next_token_message(&token)),
+                            // The sentence THIS read serves, which states the token the
+                            // caller is holding in the present tense
+                            // ([`crate::state::invalid_next_token_message_in_present_tense`]).
+                            message: Some(
+                                crate::state::invalid_next_token_message_in_present_tense(
+                                    &token,
+                                ),
+                            ),
                         },
                     )
                     .into())
@@ -257,7 +264,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if offset > 0 && offset >= matching.len() {
             return Err(DescribeScheduledActionsErrorModeled::InvalidNextToken(
                 InvalidNextToken {
-                    message: Some(crate::state::invalid_next_token_message(&token)),
+                    message: Some(crate::state::invalid_next_token_message_in_present_tense(
+                        &token,
+                    )),
                 },
             )
             .into());

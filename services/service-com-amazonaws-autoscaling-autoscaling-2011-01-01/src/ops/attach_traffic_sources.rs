@@ -203,9 +203,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::too_many_target_groups_message(),
             ));
         }
+        let now = ::std::time::SystemTime::now();
+        // The GROUP the request names is resolved FIRST: the attachment is a change to that
+        // group, so a name no group answers to is refused for the group, before anything the
+        // request says about the traffic sources is read. A name no group answers to is
+        // refused with the wording this service's group-scoped mutations answer with, its
+        // detail field left unfilled. Resolved through [`crate::state::holds_group`], which
+        // releases the lock, so the resolution below reaches the other service's store with
+        // no guard of this one held.
+        if !crate::state::holds_group(&*self.engine, &name, now) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL,
+            ));
+        }
         // Every identifier that names an Elastic Load Balancing v2 TARGET GROUP has to
-        // resolve to one, for the reason the module docs state. Checked on the INPUT, before
-        // the group is looked up or touched.
+        // resolve to one, for the reason the module docs state. Checked on the INPUT, with
+        // this service's lock RELEASED, so no request holds two stores at once.
         let region = crate::state::request_region(ctx.parts());
         let target_groups: Vec<&str> = requested
             .iter()
@@ -229,14 +242,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        let now = ::std::time::SystemTime::now();
         {
             let mut state = state.lock();
             state.materialize_due(&*self.engine, now);
 
             let Some(group) = state.groups.get_mut(&name) else {
                 return Err(crate::scaffolded::Scaffolded::validation_error(
-                    crate::state::absent_group_message(&name),
+                    crate::state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL,
                 ));
             };
 

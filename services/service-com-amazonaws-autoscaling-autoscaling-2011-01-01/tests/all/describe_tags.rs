@@ -1144,7 +1144,7 @@ const WRITE_REFUSALS: &[WriteRefusal] = &[
             ("Tags.member.1.Key", "env"),
             ("Tags.member.1.Value", "prod"),
         ],
-        message: "AutoScalingGroup name not found - AutoScalingGroup absent-group not found",
+        message: "AutoScalingGroup not found - AutoScaling Group absent-group not found",
     },
     WriteRefusal {
         case: "a tag naming no resource at all",
@@ -1177,7 +1177,7 @@ const WRITE_REFUSALS: &[WriteRefusal] = &[
             ("Tags.member.2.Key", "env"),
             ("Tags.member.2.Value", "prod"),
         ],
-        message: "AutoScalingGroup name not found - AutoScalingGroup absent-group not found",
+        message: "AutoScalingGroup not found - AutoScaling Group absent-group not found",
     },
 ];
 
@@ -1193,6 +1193,7 @@ async fn a_tag_write_is_applied_as_a_whole_or_refused() {
     for operation in ["CreateOrUpdateTags", "DeleteTags"] {
         for refusal in WRITE_REFUSALS {
             let case = format!("{operation}: {}", refusal.case);
+            let expected = refusal.message;
             let (status, body) = query(&router, operation, refusal.params).await;
             assert_eq!(
                 status, 400,
@@ -1205,9 +1206,8 @@ async fn a_tag_write_is_applied_as_a_whole_or_refused() {
             );
             let message = crate::support::xml_unescape(&tag_value(&body, "Message"));
             assert_eq!(
-                message, refusal.message,
-                "case {case:?}: expected the message {:?}, got {message:?}",
-                refusal.message
+                message, expected,
+                "case {case:?}: expected the message {expected:?}, got {message:?}"
             );
             assert_eq!(
                 described_tags_of_account(&case, &router).await,

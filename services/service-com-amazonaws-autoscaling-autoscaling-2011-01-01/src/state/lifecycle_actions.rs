@@ -405,11 +405,12 @@ impl LifecycleActionRefusal {
 /// The message a call that names neither identifier is refused with.
 ///
 /// The model makes both `LifecycleActionToken` and `InstanceId` optional while the action a
-/// callback is about is one or the other, so the sentence states what the request has to
-/// carry and quotes nothing of what it did: it is the same sentence whatever was sent.
+/// callback is about is one or the other, so the sentence states that no action was found
+/// BECAUSE the call named neither, and quotes nothing of what it did send: it is the same
+/// sentence whatever was sent.
 #[must_use]
 pub fn not_addressed_message() -> String {
-    "Either the lifecycle action token or the instance ID must be specified.".to_string()
+    "No Lifecycle Action found because no token or instance ID is provided".to_string()
 }
 
 /// The message a call naming a token no action of the group is held under is refused with:

@@ -17,9 +17,10 @@
 //! 2. The group then CONVERGES on that capacity the way it does for every other change of
 //!    its size: it launches the account's own Amazon EC2 instances to match, and the
 //!    scaling activity it records names the policy that asked for the change.
-//! 3. "The name or ARN of the policy" (`ExecutePolicyType$PolicyName`): either spelling
-//!    names the same policy, and a name nothing answers to — or a group the account does
-//!    not hold — is refused with HTTP 400 `ValidationError`, leaving the group as it was.
+//! 3. "The name or ARN of the policy" (`ExecutePolicyType$PolicyName`): an ARN names the
+//!    policy on its own and a NAME names it inside the group the request names beside it,
+//!    and a name nothing answers to — or a group the account does not hold — is refused
+//!    with HTTP 400 `ValidationError`, leaving the group as it was.
 //! 4. The two cooldowns the model states: `HonorCooldown` makes a `SimpleScaling` policy
 //!    "wait for the cooldown period to complete before executing the policy", so an
 //!    execution asked for while the group is still inside a cooldown is REFUSED with the
@@ -570,8 +571,10 @@ struct NamingCase<'a> {
     by_arn: bool,
 }
 
-/// Rule 3: "The name or ARN of the policy" — either spelling names the same policy, with
-/// or without the group beside it.
+/// Rule 3: "The name or ARN of the policy" — an ARN names the policy on its own, and a
+/// NAME names it inside the group the request names beside it. (A bare name with no group
+/// resolves no policy and is refused for the missing group; that refusal is asserted in
+/// `refusal_sentences_and_validation_precedence.rs`.)
 #[tokio::test]
 async fn a_policy_is_named_by_name_or_by_arn() {
     let cases = [
@@ -589,11 +592,6 @@ async fn a_policy_is_named_by_name_or_by_arn() {
             case: "by ARN alone",
             names_group: false,
             by_arn: true,
-        },
-        NamingCase {
-            case: "by name alone, which only one group holds",
-            names_group: false,
-            by_arn: false,
         },
     ];
 
