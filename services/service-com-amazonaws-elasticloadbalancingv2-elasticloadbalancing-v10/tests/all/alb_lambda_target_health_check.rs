@@ -37,6 +37,13 @@
 //! inside a budget generous enough that a loaded host does not decide the outcome. The two
 //! members that time a check are left as long as the model admits for the same reason: how
 //! fast this host runs the function must not decide whether its answer arrives in time.
+//!
+//! Each of those looks is at the very condition the row then asserts, and each placed instant
+//! is one every reader of it reads as past: the wait for a run's records is a wait for the
+//! RECORDS rather than for the stream they are delivered to ([`logged_run_of`]), and the
+//! instant a check is owed at is placed at the earliest the clock has ([`make_checks_due`]).
+//! A look that lands part-way through a delivery, and a checking pass that takes longer than
+//! some margin before `now`, therefore decide nothing.
 
 use std::io::Write as _;
 use std::sync::Arc;
@@ -72,6 +79,17 @@ const INTERVAL_SECONDS: &str = "300";
 /// the rows are about the invocation, what it hands the function and what its answer decides —
 /// so it is given all the room the member has rather than the least that fits a cadence.
 const TIMEOUT_SECONDS: &str = "120";
+
+/// How many consecutive checks each verdict those groups report takes: the FEWEST either
+/// threshold member admits ("the range is 2-10"), carried by `HealthyThresholdCount` and
+/// `UnhealthyThresholdCount` alike.
+///
+/// Configured rather than left at the default because every one of those checks is a real run
+/// of the function: the rule under test is what a check INVOKES, what it hands the function and
+/// what its answer decides, and not how many consecutive checks a verdict takes, so a row is
+/// proven by the fewest runs the model admits and nothing is gained by making this host perform
+/// more of them.
+const THRESHOLD: &str = "2";
 
 /// The marker the handler prints the event under, which is what a log record of the run is
 /// found by.
@@ -374,25 +392,43 @@ fn rows() -> Vec<Row> {
 /// instant and NOTHING else: which check is then made, whether it invokes anything at all, and
 /// what its answer decides stay the service's own, so no part of the rule under test is
 /// written here.
+///
+/// The instant placed is the EARLIEST the clock has, not a span before this call: a pass that
+/// is already under way reads what it owes against the instant it OPENED at, which is earlier
+/// than this call, so anything placed a span before `now` is a FUTURE instant for that pass —
+/// its check would then count toward no verdict, and whether that happens would be decided by
+/// whether one pass takes longer than that span on this host. An instant no reader can read as
+/// future takes the host's speed out of it.
 fn make_checks_due(engine: &Arc<engine::InMemoryEngine>) {
     let state = engine.state::<ElbState>();
     let mut store = state.lock();
-    let past = SystemTime::now() - Duration::from_secs(1);
     for group in store.target_groups.values_mut() {
         for target in group.targets.values_mut() {
-            target.checks_due_at = past;
+            target.checks_due_at = SystemTime::UNIX_EPOCH;
         }
     }
 }
 
-/// Look at `DescribeLogStreams` until CloudWatch Logs answers 200 with at least one stream of
-/// `group`, and answer the streams it reported — or panic once the budget is spent.
+/// Look at `group` until CloudWatch Logs holds a stream of it whose records carry the run of
+/// the health check's invocation, and answer the streams `DescribeLogStreams` reported — or
+/// panic once the budget is spent.
 ///
 /// The wait is for the CONDITION, not for a span: every look first places the instant the next
 /// check of each registration is owed at ([`make_checks_due`]) and then asks whether the
 /// records of the run that check makes have reached the group, so what this waits for is the
-/// group holding a stream rather than a cadence passing on the wall clock.
-async fn streams_of(
+/// group holding those records rather than a cadence passing on the wall clock.
+///
+/// The condition is the RECORDS, which is what the row goes on to assert, and not merely a
+/// stream to read them from: a run's log is delivered by opening the group, opening the stream
+/// and then putting the records, so a look that stopped at the stream existing could land
+/// between the second call and the third and read a stream holding nothing of the run —
+/// whether it does depends on how fast this host interleaves the delivery with the look, which
+/// is exactly what must not decide a row. A look reads those records TOLERANTLY
+/// ([`records_of`]): an answer that is not 200 leaves the look unsatisfied, to be taken again,
+/// rather than ending a wait this exists to make patient. What the row then asserts on is read
+/// through [`messages_of`], which holds that answer to 200 — a verdict taken once the wait is
+/// over, where no delivery is in flight.
+async fn logged_run_of(
     router: &MultiServiceRouter,
     engine: &Arc<engine::InMemoryEngine>,
     case: &str,
@@ -412,17 +448,44 @@ async fn streams_of(
                 .as_array()
                 .cloned()
                 .unwrap_or_default();
-            if !streams.is_empty() {
+            let mut held = false;
+            for stream in &streams {
+                let name = stream["logStreamName"].as_str().unwrap_or_default();
+                held |= records_of(router, group, name)
+                    .await
+                    .iter()
+                    .any(|message| message.contains(MARKER));
+            }
+            if held {
                 return streams;
             }
         }
         assert!(
             Instant::now() < deadline,
-            "case {case:?}: DescribeLogStreams of {group:?} never answered 200 with a stream of \
-             the health check's invocation, last answer {status} {answered}"
+            "case {case:?}: no stream of {group:?} ever held a record of the health check's \
+             invocation, last DescribeLogStreams answer {status} {answered}"
         );
         tokio::time::sleep(LOOK_AGAIN).await;
     }
+}
+
+/// Every message the stream `stream` of `group` holds, and NOTHING at all for an answer that is
+/// not 200: the read ONE look of a wait takes ([`logged_run_of`]).
+///
+/// Tolerant on purpose, and only here: a look is taken while a run's log is being delivered, so
+/// an answer other than 200 leaves that look unsatisfied and the next one asks again. The read
+/// whose answer the suite asserts on is [`messages_of`].
+async fn records_of(router: &MultiServiceRouter, group: &str, stream: &str) -> Vec<String> {
+    let (status, answered) = logs(
+        router,
+        "GetLogEvents",
+        &json!({ "logGroupName": group, "logStreamName": stream }),
+    )
+    .await;
+    if status != 200 {
+        return Vec::new();
+    }
+    reported_messages(&answered)
 }
 
 /// Look at `DescribeTargetHealth` until the registration of `target_group` reports `health`, or
@@ -462,7 +525,8 @@ async fn until_health(
     }
 }
 
-/// Every message the stream `stream` of `group` holds, as `GetLogEvents` reports them.
+/// Every message the stream `stream` of `group` holds, as `GetLogEvents` reports them — which
+/// it must answer 200 with.
 async fn messages_of(
     router: &MultiServiceRouter,
     case: &str,
@@ -480,6 +544,12 @@ async fn messages_of(
         "case {case:?}: GetLogEvents of {group:?}/{stream:?} must answer 200, got {status} \
          {answered}"
     );
+    reported_messages(&answered)
+}
+
+/// The messages one `GetLogEvents` answer reports, in the order it reports them — the one
+/// reading of that answer both the tolerant and the asserting read above share.
+fn reported_messages(answered: &Value) -> Vec<String> {
     answered["events"]
         .as_array()
         .cloned()
@@ -510,6 +580,8 @@ async fn a_lambda_target_groups_health_check_invokes_the_function_and_its_run_is
         form.push(p("HealthCheckEnabled", &row.health_checks.to_string()));
         form.push(p("HealthCheckIntervalSeconds", INTERVAL_SECONDS));
         form.push(p("HealthCheckTimeoutSeconds", TIMEOUT_SECONDS));
+        form.push(p("HealthyThresholdCount", THRESHOLD));
+        form.push(p("UnhealthyThresholdCount", THRESHOLD));
         if let Some(path) = row.path {
             form.push(p("HealthCheckPath", path));
         }
@@ -573,6 +645,10 @@ async fn a_lambda_target_groups_health_check_invokes_the_function_and_its_run_is
     }
     // The settling span the clock owes the load balancer and every registration, placed rather
     // than slept for, so what a read reports is the verdict the checks reached.
+    // A span before `now` is enough HERE, unlike the instant a check is owed at
+    // ([`make_checks_due`]): what these two instants decide is read by `DescribeTargetHealth`
+    // and `DescribeLoadBalancers` against a `now` each takes for itself, which is later than
+    // this call, so no reader can read either of them as future.
     settle(&engine, &lb_arn, SystemTime::now() - Duration::from_secs(1));
 
     for row in rows() {
@@ -628,7 +704,7 @@ async fn a_lambda_target_groups_health_check_invokes_the_function_and_its_run_is
 
         // The group CloudWatch Logs now holds, because the health check's invocation RAN the
         // function and the run's records were delivered to it.
-        let streams = streams_of(&router, &engine, row.case, &group).await;
+        let streams = logged_run_of(&router, &engine, row.case, &group).await;
         for stream in &streams {
             let name = stream["logStreamName"].as_str().unwrap_or_default();
             assert!(
@@ -685,7 +761,8 @@ async fn a_lambda_target_groups_health_check_invokes_the_function_and_its_run_is
         );
 
         // What the function was HANDED, read back where only a run can have put it: the records
-        // of that run in its own log group.
+        // of that run in its own log group. Delivered records stay delivered, so this read of
+        // them is the wait's own condition asserted once the wait is over.
         let mut printed: Vec<String> = Vec::new();
         for stream in &streams {
             let name = stream["logStreamName"].as_str().unwrap_or_default();
