@@ -156,7 +156,7 @@ async fn cluster_with_authentication(
 ) -> String {
     let mut body = json!({
         "clusterName": name,
-        "kafkaVersion": "3.6.0",
+        "kafkaVersion": "3.9.x",
         "numberOfBrokerNodes": 3,
         "brokerNodeGroupInfo": {
             "instanceType": "kafka.m5.large",

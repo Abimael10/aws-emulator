@@ -124,7 +124,7 @@ fn cluster_rows() -> Vec<ClusterRequest> {
             brokers: 7,
             subnets: vec!["subnet-aaaa1111", "subnet-bbbb2222", "subnet-cccc3333"],
             instance_type: "kafka.m7g.xlarge",
-            kafka_version: "2.8.1",
+            kafka_version: "3.8.x",
             ..ClusterRequest::named("nodes-seven-brokers")
         },
         // The other end of the range, over two subnets so the wrap is uneven.

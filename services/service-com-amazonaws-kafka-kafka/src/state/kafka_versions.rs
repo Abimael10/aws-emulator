@@ -488,34 +488,46 @@ pub const KAFKA_VERSION_MEMBER: &str = "kafkaVersion";
 /// [`is_broker_instance_type`]).
 const EXPRESS_INSTANCE_TYPE_PREFIX: &str = "express.";
 
+/// The broker category of the standard instance families (`kafka.m5.*`,
+/// `kafka.m7g.*`, `kafka.t3.small`), as Amazon MSK words it in the version
+/// refusal below.
+pub const BROKER_CATEGORY_STANDARD: &str = "Standard";
+
+/// The broker category of the Express instance family
+/// ([`EXPRESS_INSTANCE_TYPE_PREFIX`]), as Amazon MSK words it in the version
+/// refusal below.
+pub const BROKER_CATEGORY_EXPRESS: &str = "Express";
+
 /// The category of brokers `instance_type` names, as Amazon MSK words it in the
 /// version refusal below: the two categories a provisioned cluster's brokers
 /// come in, each with its own set of Apache Kafka versions, so the refusal says
 /// which one the request asked for rather than assuming either.
-fn broker_instance_category(instance_type: &str) -> &'static str {
+pub fn broker_instance_category(instance_type: &str) -> &'static str {
     match instance_type.starts_with(EXPRESS_INSTANCE_TYPE_PREFIX) {
-        true => "Express",
-        false => "Standard",
+        true => BROKER_CATEGORY_EXPRESS,
+        false => BROKER_CATEGORY_STANDARD,
     }
 }
 
-/// The versions Amazon MSK offers for a NEW cluster, in the order it names them
-/// in when it refuses a version a create may not name
-/// ([`create_kafka_version_violation`]).
+/// One broker category's offering: the versions Amazon MSK takes for a NEW
+/// cluster whose brokers come from that category, in the order it names them in
+/// when it refuses a version a create may not name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NewClusterOffering {
+    /// The category, as [`broker_instance_category`] reports it.
+    category: &'static str,
+    /// The versions a create of that category may name.
+    versions: &'static [&'static str],
+}
+
+/// The Apache Kafka versions Amazon MSK takes for a NEW cluster, in the order it
+/// names them in when it refuses one it does not take.
 ///
-/// This is NARROWER than the versions the catalog publishes, and narrower than
-/// the ones it publishes an `ACTIVE` row for: a version stays in the published
-/// catalog — and stays an upgrade target for the clusters already on it — after
-/// the service has stopped taking it for a cluster that does not exist yet. So
-/// this is a THIRD fact about a version, beside its membership of the catalog and
-/// the lifecycle status the catalog publishes it under, and it is recorded
-/// separately rather than derived from either.
-///
-/// Source: the valid-value list the service itself renders in that refusal.
-///
-/// Only versions the catalog publishes are named ([`new_cluster_kafka_versions`]),
-/// so this list can never offer a version no reader of this service knows.
-const KAFKA_VERSIONS_FOR_A_NEW_CLUSTER: &[&str] = &[
+/// Recorded ONCE and referenced by every category that is offered exactly it
+/// ([`KAFKA_VERSIONS_FOR_A_NEW_CLUSTER`]), so two categories offering the same
+/// versions say so rather than keeping two copies that can diverge by typo. A
+/// category MSK offers something else gets its own sequence beside this one.
+const KAFKA_VERSIONS_EVERY_CATEGORY_IS_OFFERED: &[&str] = &[
     "3.8.x",
     "3.8.x.kraft",
     "3.9.x",
@@ -524,51 +536,110 @@ const KAFKA_VERSIONS_FOR_A_NEW_CLUSTER: &[&str] = &[
     "4.1.x.kraft",
 ];
 
-/// The versions a create may name, as the refusal below lists them: the recorded
-/// sequence above, narrowed to the versions the catalog really publishes.
+/// The versions Amazon MSK offers for a NEW cluster, PER BROKER CATEGORY, in the
+/// order it names them in when it refuses a version a create may not name
+/// ([`create_kafka_version_violation`]).
 ///
-/// Derived once, like [`catalogued_kafka_versions`]: both factors are constants.
-pub fn new_cluster_kafka_versions() -> &'static [&'static str] {
-    static OFFERED: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
-        KAFKA_VERSIONS_FOR_A_NEW_CLUSTER
-            .iter()
-            .filter(|version| kafka_version_index(version).is_some())
-            .copied()
-            .collect()
-    });
-    &OFFERED
+/// A category's offering is NARROWER than the versions the catalog publishes, and
+/// narrower than the ones it publishes an `ACTIVE` row for: a version stays in the
+/// published catalog — and stays an upgrade target for the clusters already on it
+/// — after the service has stopped taking it for a cluster that does not exist
+/// yet. So this is a THIRD fact about a version, beside its membership of the
+/// catalog and the lifecycle status the catalog publishes it under, and it is
+/// recorded separately rather than derived from either. It is recorded per
+/// category because each category is a different broker build, so each has an
+/// offering of its own.
+///
+/// Source: the valid-value list the service itself renders in that refusal, for
+/// each category it renders one for. Both categories are recorded as offering the
+/// same sequence, which is why they share it.
+///
+/// Only versions the catalog publishes are named
+/// ([`new_cluster_kafka_versions`]), so a category can never offer a version no
+/// reader of this service knows.
+const KAFKA_VERSIONS_FOR_A_NEW_CLUSTER: &[NewClusterOffering] = &[
+    NewClusterOffering {
+        category: BROKER_CATEGORY_STANDARD,
+        versions: KAFKA_VERSIONS_EVERY_CATEGORY_IS_OFFERED,
+    },
+    NewClusterOffering {
+        category: BROKER_CATEGORY_EXPRESS,
+        versions: KAFKA_VERSIONS_EVERY_CATEGORY_IS_OFFERED,
+    },
+];
+
+/// The versions a create whose brokers are of `instance_type`'s category may
+/// name, as the refusal below lists them: that category's recorded sequence,
+/// narrowed to the versions the catalog really publishes.
+///
+/// This is BOTH the admission gate of a provisioned create and the valid-value
+/// list its refusal carries, so the set a client is told to retry with is exactly
+/// the set the next create is admitted on.
+///
+/// Derived once per category, like [`catalogued_kafka_versions`]: both factors
+/// are constants.
+pub fn new_cluster_kafka_versions(instance_type: &str) -> &'static [&'static str] {
+    static OFFERED: std::sync::LazyLock<Vec<(&'static str, Vec<&'static str>)>> =
+        std::sync::LazyLock::new(|| {
+            KAFKA_VERSIONS_FOR_A_NEW_CLUSTER
+                .iter()
+                .map(|offering| {
+                    (
+                        offering.category,
+                        offering
+                            .versions
+                            .iter()
+                            .filter(|version| kafka_version_index(version).is_some())
+                            .copied()
+                            .collect(),
+                    )
+                })
+                .collect()
+        });
+    let category = broker_instance_category(instance_type);
+    let offering = OFFERED
+        .iter()
+        .find(|(offered_for, _)| *offered_for == category);
+    // Every category [`broker_instance_category`] can report has a row above, so a
+    // miss is a table that lost one rather than a request the service may answer:
+    // caught here in a debug build instead of becoming a refusal that offers
+    // nothing.
+    debug_assert!(
+        offering.is_some(),
+        "every broker category must have an offering recorded"
+    );
+    offering.map_or(&[], |(_, versions)| versions.as_slice())
 }
 
 /// Why a provisioned create naming Apache Kafka version `kafka_version` for
 /// brokers of `instance_type` describes no cluster the service could run, or
-/// `None` when the service knows that version.
+/// `None` when the service takes that version for a new cluster of those
+/// brokers' category.
 ///
-/// Amazon MSK runs a cluster on a version of its OWN catalog — the one
-/// `ListKafkaVersions` serves ([`KAFKA_VERSION_CATALOG`]) — so a value the
-/// catalog does not publish at all names no broker software, and the create is
-/// refused from the REQUEST alone, before anything the request names is
+/// Amazon MSK runs a new cluster's brokers on a version it still OFFERS that
+/// broker category ([`new_cluster_kafka_versions`]) — a narrower set than the
+/// catalog `ListKafkaVersions` publishes, which goes on publishing a version, and
+/// going on offering it as an upgrade target, after MSK has stopped building new
+/// clusters on it. So a value outside that category's offering names no cluster
+/// this service would build, whether the catalog publishes it or not, and the
+/// create is refused from the REQUEST alone, before anything the request names is
 /// resolved against this account's network or registry.
 ///
 /// The sentence is the service's: the broker category the request asked for
 /// ([`broker_instance_category`]), the version it named, and the versions MSK
-/// takes for a NEW cluster ([`new_cluster_kafka_versions`]) — the actionable half
-/// of the refusal, which is why it names that set rather than every version the
-/// catalog publishes.
-///
-/// A version the catalog publishes but does not take for a new cluster is
-/// ADMITTED here: a cluster running one is exactly what the version-update surface
-/// moves a cluster away from ([`compatible_target_versions`]), and this emulator
-/// has no other way to hold such a cluster, so the catalog's membership is the
-/// gate and the new-cluster set is what the refusal recommends.
+/// takes for a NEW cluster of that category — the actionable half of the refusal,
+/// and the very set this gate admits, so a client retrying with a version the
+/// refusal named is not refused a second time.
 pub fn create_kafka_version_violation(kafka_version: &str, instance_type: &str) -> Option<String> {
-    if kafka_version_index(kafka_version).is_some() {
+    let offered = new_cluster_kafka_versions(instance_type);
+    if offered.contains(&kafka_version) {
         return None;
     }
     Some(format!(
         "{} instance types are not supported for Kafka version {kafka_version}. \
          Valid values: [{}]",
         broker_instance_category(instance_type),
-        new_cluster_kafka_versions().join(", ")
+        offered.join(", ")
     ))
 }
 

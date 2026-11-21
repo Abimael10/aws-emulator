@@ -105,7 +105,7 @@ fn v2_provisioned_body(name: &str, instance_type: &str, brokers: i64, subnets: &
     json!({
         "clusterName": name,
         "provisioned": {
-            "kafkaVersion": "3.6.0",
+            "kafkaVersion": "3.9.x",
             "numberOfBrokerNodes": brokers,
             "brokerNodeGroupInfo": {
                 "instanceType": instance_type,

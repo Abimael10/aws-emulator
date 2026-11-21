@@ -55,7 +55,7 @@ async fn describe_reports_exactly_what_was_created() {
         ClusterRequest::named("defaults-everywhere"),
         ClusterRequest {
             brokers: 1,
-            kafka_version: "2.8.1",
+            kafka_version: "3.8.x",
             subnets: vec!["subnet-a"],
             ..ClusterRequest::named("single-broker")
         },
@@ -539,7 +539,7 @@ async fn a_repeated_cluster_name_conflicts() {
             ClusterRequest::named("twice-reconfigured"),
             ClusterRequest {
                 brokers: 1,
-                kafka_version: "2.8.1",
+                kafka_version: "3.8.x",
                 instance_type: "kafka.t3.small",
                 subnets: vec!["subnet-z"],
                 client_broker: Some("TLS"),

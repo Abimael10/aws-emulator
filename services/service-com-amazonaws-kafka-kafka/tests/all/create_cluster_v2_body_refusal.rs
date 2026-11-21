@@ -218,7 +218,7 @@ async fn a_body_naming_both_cluster_types_is_refused_on_the_selection() {
             "a provisioned create",
             json!({
                 "clusterName": "one-kind-provisioned",
-                "provisioned": provisioned("3.6.0", 2),
+                "provisioned": provisioned("3.9.x", 2),
             }),
         ),
         (
@@ -244,7 +244,7 @@ async fn the_body_refusal_precedes_the_registry() {
     let emulator = Emulator::new();
     let taken = "taken-by-a-provisioned-cluster";
     let created = emulator
-        .create_cluster_v2(json!({ "clusterName": taken, "provisioned": provisioned("3.6.0", 2) }))
+        .create_cluster_v2(json!({ "clusterName": taken, "provisioned": provisioned("3.9.x", 2) }))
         .await;
     assert_eq!(
         created.status, 200,
@@ -255,7 +255,7 @@ async fn the_body_refusal_precedes_the_registry() {
 
     // One kind under the taken name: the registry decides, and it is a conflict.
     let reply = emulator
-        .create_cluster_v2(json!({ "clusterName": taken, "provisioned": provisioned("3.6.0", 2) }))
+        .create_cluster_v2(json!({ "clusterName": taken, "provisioned": provisioned("3.9.x", 2) }))
         .await;
     assert_name_already_exists(
         &reply,

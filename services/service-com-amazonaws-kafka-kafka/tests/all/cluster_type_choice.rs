@@ -35,7 +35,7 @@ const ONE_CLUSTER_TYPE_MESSAGE: &str = "Invalid request body";
 /// A `provisioned` block asking for `brokers` brokers.
 fn provisioned(brokers: u64) -> Value {
     json!({
-        "kafkaVersion": "3.6.0",
+        "kafkaVersion": "3.9.x",
         "numberOfBrokerNodes": brokers,
         "brokerNodeGroupInfo": {
             "instanceType": "kafka.m5.large",

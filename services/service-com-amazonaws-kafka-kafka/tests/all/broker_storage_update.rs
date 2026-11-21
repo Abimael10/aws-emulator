@@ -65,7 +65,7 @@ fn create_body(name: &str, brokers: i64, volume_size: Option<i64>) -> Value {
     }
     json!({
         "clusterName": name,
-        "kafkaVersion": "3.6.0",
+        "kafkaVersion": "3.9.x",
         "numberOfBrokerNodes": brokers,
         "brokerNodeGroupInfo": broker_group,
     })

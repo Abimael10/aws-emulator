@@ -243,35 +243,25 @@ fn the_catalog_is_published_in_ascending_release_order() {
 /// version the STORED cluster runs and whose `targetVersions` are the upgrades the
 /// catalog permits from it.
 ///
-/// Rows: the oldest catalogued version, a deprecated four-component version, the
-/// `.tiered` spelling, the version at the active boundary, a four-component patch
-/// of it, the `.x` versions below and at the release the KRaft crossing is offered
-/// at, a KRaft source, the newest offered KRaft
-/// version and the version the catalog publishes both an offered and a deprecated
-/// row for. The expected lists are written out from the catalog documented in
-/// `src/state.rs`.
+/// Rows: the two `.x` ZooKeeper-mode versions a create admits (the one below and
+/// the one at the release the KRaft crossing is offered at, which is terminal on
+/// its line), and every KRaft source a create admits, up to the newest one — which
+/// has a target the catalog publishes two rows for. The expected lists are written
+/// out from the catalog documented in `src/state.rs`.
 ///
-/// Every row's source version is one the catalog PUBLISHES, because that is what a
-/// create admits: a cluster cannot be stored on a version the service does not
-/// name (`create_cluster`'s version gate), so the reader is never asked about one.
+/// Every row's source version is one a CREATE ADMITS — the set MSK still offers a
+/// new cluster of this broker category — because that is the only way a cluster
+/// gets into the registry. The sources it does not admit, the deprecated versions
+/// included, are covered by the published matrix below
+/// (`the_matrix_covers_every_catalogued_source_version`), which answers about every
+/// catalogued source without a cluster.
 #[tokio::test]
 async fn compatible_targets_are_the_upgrades_the_catalog_permits() {
     let emulator = Emulator::new();
 
     let rows: Vec<(&'static str, Vec<String>)> = vec![
-        // Older than every offered version, and on the ZooKeeper line: every
-        // offered version of that line is reachable, and no KRaft one is.
-        ("1.1.1", versions(&["3.6.0", "3.7.x", "3.8.x", "3.9.x"])),
-        ("2.4.1.1", versions(&["3.6.0", "3.7.x", "3.8.x", "3.9.x"])),
-        ("2.8.1", versions(&["3.6.0", "3.7.x", "3.8.x", "3.9.x"])),
-        // The tiered-storage spelling is that same build, so it climbs the same
-        // ladder.
-        ("2.8.2.tiered", versions(&["3.6.0", "3.7.x", "3.8.x", "3.9.x"])),
-        ("3.6.0", versions(&["3.7.x", "3.8.x", "3.9.x"])),
-        ("3.6.0.1", versions(&["3.7.x", "3.8.x", "3.9.x"])),
-        // A release that HAS a KRaft version but is not the release the crossing
-        // is offered at: the ladder stays on the ZooKeeper line.
-        ("3.7.x", versions(&["3.8.x", "3.9.x"])),
+        // A ZooKeeper-mode source below the release the KRaft crossing is offered
+        // at: the ladder stays on the ZooKeeper line.
         ("3.8.x", versions(&["3.9.x"])),
         // The final offered ZooKeeper-mode release: the crossing to KRaft, and
         // nothing else, because there is no newer ZooKeeper-mode version.
@@ -279,22 +269,17 @@ async fn compatible_targets_are_the_upgrades_the_catalog_permits() {
         // A KRaft source climbs the KRaft line only — there is no way back to
         // ZooKeeper mode.
         (
-            "3.7.x.kraft",
-            versions(&[
-                "3.8.x.kraft",
-                "3.9.x.kraft",
-                "4.0.x.kraft",
-                "4.1.x.kraft",
-                "4.2.x.kraft",
-            ]),
+            "3.8.x.kraft",
+            versions(&["3.9.x.kraft", "4.0.x.kraft", "4.1.x.kraft", "4.2.x.kraft"]),
         ),
         (
             "3.9.x.kraft",
             versions(&["4.0.x.kraft", "4.1.x.kraft", "4.2.x.kraft"]),
         ),
+        ("4.0.x.kraft", versions(&["4.1.x.kraft", "4.2.x.kraft"])),
+        // The newest KRaft version a create admits: its one target is the version
+        // the catalog publishes both an offered and a deprecated row for.
         ("4.1.x.kraft", versions(&["4.2.x.kraft"])),
-        // The newest KRaft version the catalog publishes: nothing to upgrade to.
-        ("4.2.x.kraft", Vec::new()),
     ];
 
     for (index, (version, expected)) in rows.iter().enumerate() {
@@ -493,9 +478,10 @@ async fn an_unknown_or_malformed_cluster_arn_is_refused() {
 #[tokio::test]
 async fn reporting_compatible_versions_changes_nothing() {
     let emulator = Emulator::new();
-    // Rows: a source in the middle of the ladder and one at its top, so the
-    // invariant is checked both with and without targets to report.
-    for (index, version) in ["3.4.0", "3.9.x"].iter().enumerate() {
+    // Rows: a source in the middle of the ladder and one at the top of its own
+    // line, so the invariant is checked with a long target list and with a
+    // one-entry one.
+    for (index, version) in ["3.8.x.kraft", "3.9.x"].iter().enumerate() {
         let request = cluster_on(&format!("stable-{index}"), version);
         let arn = emulator.create_ok(&request).await;
         let before = emulator.describe(&arn).await;

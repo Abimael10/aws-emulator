@@ -58,9 +58,11 @@ const VPC_RESOLVER: &str = "10.44.0.2";
 /// (Amazon VPC User Guide, "DHCP option sets").
 const INTERNAL_DOMAIN: &str = "us-west-2.compute.internal";
 
-/// The cluster every row dials, and the Apache Kafka version and broker type it runs.
+/// The cluster every row dials, and the Apache Kafka version and broker type it
+/// runs: a version Amazon MSK still takes for a NEW cluster, since the create has
+/// to be admitted.
 const CLUSTER: &str = "xsvc-msk-invpc-cluster";
-const KAFKA_VERSION: &str = "3.6.0";
+const KAFKA_VERSION: &str = "3.9.x";
 const INSTANCE_TYPE: &str = "kafka.m5.large";
 
 /// The stack, the execution role and the function that carry the probe.

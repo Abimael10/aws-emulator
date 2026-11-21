@@ -167,9 +167,10 @@ async fn a_version_published_under_two_statuses_is_served_on_both_rows() {
 /// version set is de-duplicated, so a version the catalog publishes an `ACTIVE`
 /// row for is offered exactly once wherever the service answers about versions —
 /// the upgrade matrix's target lists, the valid-value list a refusal carries — and
-/// a create naming it is accepted. The matrix's SOURCES are the catalog's rows
-/// instead: that answer publishes the table rather than answering about one
-/// version, so a version published twice is a source twice.
+/// the create gate judges it by the version too, admitting exactly the versions
+/// that refusal lists. The matrix's SOURCES are the catalog's rows instead: that
+/// answer publishes the table rather than answering about one version, so a
+/// version published twice is a source twice.
 #[tokio::test]
 async fn a_second_row_changes_no_answer_about_the_version() {
     let emulator = Emulator::new();
@@ -257,8 +258,11 @@ async fn a_second_row_changes_no_answer_about_the_version() {
         );
     }
 
-    // And a create naming a version the catalog publishes on two rows, one of them
-    // `ACTIVE`, is accepted: the gate reads the version, not the last row.
+    // And a version the catalog publishes on two rows, one of them `ACTIVE`, is
+    // answered about by the VERSION rather than by its last row: the one the
+    // refusal lists is admitted by the create gate, and the one it does not list is
+    // still offered as an upgrade target, which a version read as deprecated never
+    // is.
     for version in ["3.9.x", "4.2.x.kraft"] {
         let statuses = published_statuses(&catalog, version);
         assert!(
@@ -272,10 +276,39 @@ async fn a_second_row_changes_no_answer_about_the_version() {
                 ..ClusterRequest::named(&format!("two-row-{}", version.replace('.', "-")))
             })
             .await;
-        assert_eq!(
-            created.status, 200,
-            "case version={version:?}: a create naming an offered version must succeed, got {} {}",
-            created.status, created.body
+        match listed.contains(&version) {
+            true => assert_eq!(
+                created.status, 200,
+                "case version={version:?}: a create naming a version the refusal lists must \
+                 succeed, got {} {}",
+                created.status, created.body
+            ),
+            false => assert_eq!(
+                (created.status, created.error_code()),
+                (400, "BadRequestException"),
+                "case version={version:?}: a create naming a version the refusal does not list \
+                 must be refused, got {} {}",
+                created.status,
+                created.body
+            ),
+        }
+        // Whichever of the two it is, the service still OFFERS the version: the
+        // matrix names it as a target reachable from some source it publishes.
+        let offered_as_target = matrix
+            .at("/compatibleKafkaVersions")
+            .as_array()
+            .unwrap_or_else(|| panic!("expected a compatibleKafkaVersions list, got {}", matrix.body))
+            .iter()
+            .any(|entry| {
+                entry["targetVersions"]
+                    .as_array()
+                    .is_some_and(|targets| targets.iter().any(|target| target == version))
+            });
+        assert!(
+            offered_as_target,
+            "case version={version:?}: a version with an {ACTIVE} row must be offered as an \
+             upgrade target, got {}",
+            matrix.body
         );
     }
 

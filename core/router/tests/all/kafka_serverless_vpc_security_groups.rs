@@ -506,7 +506,9 @@ fn provisioned_body(name: &str, row: &BrokerGroupRow, subnets: &[String]) -> Val
         broker_group["securityGroups"] = json!(groups);
     }
     let provisioned = json!({
-        "kafkaVersion": "3.6.0",
+        // A version Amazon MSK still takes for a NEW cluster, since the create has
+        // to be admitted before the attachment this row is about is stored.
+        "kafkaVersion": "3.9.x",
         "numberOfBrokerNodes": subnets.len(),
         "brokerNodeGroupInfo": broker_group,
     });

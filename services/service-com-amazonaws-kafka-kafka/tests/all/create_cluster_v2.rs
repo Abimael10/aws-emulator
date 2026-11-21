@@ -141,7 +141,7 @@ fn provisioned_rows() -> Vec<ClusterRequest> {
         ClusterRequest::named("v2-defaults"),
         ClusterRequest {
             brokers: 1,
-            kafka_version: "2.8.1",
+            kafka_version: "3.8.x",
             subnets: vec!["subnet-a"],
             ..ClusterRequest::named("v2-one-broker")
         },

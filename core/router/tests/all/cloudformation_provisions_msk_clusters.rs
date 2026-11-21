@@ -205,7 +205,7 @@ const ROWS: &[Row] = &[
                         "Type": "AWS::MSK::Cluster",
                         "Properties": {
                             "ClusterName": "orders-stream",
-                            "KafkaVersion": "3.6.0",
+                            "KafkaVersion": "3.9.x",
                             "NumberOfBrokerNodes": 2,
                             "BrokerNodeGroupInfo": {
                                 "InstanceType": "kafka.t3.small",
@@ -231,7 +231,7 @@ const ROWS: &[Row] = &[
         expected_name: "orders-stream",
         expected_brokers: Some(2),
         expected_instance_type: Some("kafka.t3.small"),
-        expected_kafka_version: Some("3.6.0"),
+        expected_kafka_version: Some("3.9.x"),
         expected_volume_size: None,
         expected_subnets: &[],
         expected_security_groups: &[],
@@ -253,7 +253,7 @@ const ROWS: &[Row] = &[
                 "    Type: AWS::MSK::Cluster",
                 "    Properties:",
                 "      ClusterName: events-stream",
-                "      KafkaVersion: 3.5.1",
+                "      KafkaVersion: 3.8.x",
                 "      NumberOfBrokerNodes: 3",
                 "      EnhancedMonitoring: PER_BROKER",
                 "      StorageMode: LOCAL",
@@ -280,7 +280,7 @@ const ROWS: &[Row] = &[
         expected_name: "events-stream",
         expected_brokers: Some(3),
         expected_instance_type: Some("kafka.m5.large"),
-        expected_kafka_version: Some("3.5.1"),
+        expected_kafka_version: Some("3.8.x"),
         expected_volume_size: Some(200),
         expected_subnets: &[],
         expected_security_groups: &[],
@@ -301,7 +301,7 @@ const ROWS: &[Row] = &[
                         "Type": "AWS::MSK::Cluster",
                         "Properties": {
                             "ClusterName": "single-broker",
-                            "KafkaVersion": "2.8.1",
+                            "KafkaVersion": "3.9.x.kraft",
                             "NumberOfBrokerNodes": 1,
                             "CurrentVersion": "K3AEGXETSR30VB",
                             "BrokerNodeGroupInfo": {
@@ -328,7 +328,7 @@ const ROWS: &[Row] = &[
         expected_name: "single-broker",
         expected_brokers: Some(1),
         expected_instance_type: Some("kafka.t3.small"),
-        expected_kafka_version: Some("2.8.1"),
+        expected_kafka_version: Some("3.9.x.kraft"),
         expected_volume_size: None,
         expected_subnets: &[],
         expected_security_groups: &[],
@@ -756,7 +756,7 @@ async fn a_second_cluster_of_one_name_fails_the_stack() {
                 "Type": "AWS::MSK::Cluster",
                 "Properties": {
                     "ClusterName": "contended-name",
-                    "KafkaVersion": "3.6.0",
+                    "KafkaVersion": "3.9.x",
                     "NumberOfBrokerNodes": 2,
                     "BrokerNodeGroupInfo": {
                         "InstanceType": "kafka.t3.small",

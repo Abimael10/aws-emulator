@@ -5,12 +5,14 @@
 //!
 //! Four rules, each asserted over a TABLE rather than one recorded request:
 //!
-//! 1. A provisioned create runs its brokers on a version of the service's OWN
-//!    catalog — the one `ListKafkaVersions` serves — so a `KafkaVersion` that
-//!    catalog does not publish is refused `BadRequestException` (400) naming
-//!    `kafkaVersion`, and no cluster is registered. The sentence names the broker
-//!    category the request asked for and the versions MSK offers for a new
-//!    cluster.
+//! 1. A provisioned create runs its brokers on a version Amazon MSK still offers
+//!    a NEW cluster of the broker category the request's instance type names, so
+//!    any other `KafkaVersion` — a value the catalog does not publish at all, and
+//!    a published one MSK has retired for new clusters alike — is refused
+//!    `BadRequestException` (400) naming `kafkaVersion`, and no cluster is
+//!    registered. The sentence names the broker category the request asked for and
+//!    exactly the versions that category is offered, so the set it recommends is
+//!    the set the next create is admitted on.
 //! 2. `CreateClusterV2` names exactly one cluster type, and the two ways to get
 //!    that wrong are two DIFFERENT refusals: naming neither is answered about the
 //!    `clusterType` parameter with the sentence that says a cluster type is
@@ -44,7 +46,10 @@ use service_com_amazonaws_kafka_kafka::state::{
     KAFKA_VERSION_ACTIVE, KAFKA_VERSION_CATALOG, REPLICATOR_ACTIVATION_DELAY,
 };
 
-use crate::kafka_harness::{pct, ClusterRequest, Emulator, Reply, ACCOUNT, REGION};
+use crate::kafka_harness::{
+    pct, unsupported_broker_version_message, v2_provisioned_body, ClusterRequest, Emulator, Reply,
+    ACCOUNT, REGION,
+};
 
 /// The IAM role every replicator below is created with.
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/service-role/MskReplicatorRole";
@@ -115,30 +120,16 @@ fn offered_versions() -> Vec<&'static str> {
 }
 
 /// The sentence MSK refuses `version` for brokers of `category` with: its fixed
-/// text, the version the request named, and the versions a create may name.
+/// text, the version the request named, and the versions a create may name, which
+/// this suite writes out above rather than reading from the service. The sentence
+/// is assembled by the shared harness helper, so this suite and the offering suite
+/// beside it pin ONE wording.
 fn unsupported_version_message(category: &str, version: &str) -> String {
-    format!(
-        "{category} instance types are not supported for Kafka version {version}. \
-         Valid values: [{}]",
-        NEW_CLUSTER_VERSIONS.join(", ")
-    )
+    unsupported_broker_version_message(category, version, NEW_CLUSTER_VERSIONS)
 }
 
-/// A `CreateClusterV2` body whose `Provisioned` block asks for `version` on brokers
-/// of `instance_type`.
-fn v2_provisioned_body(name: &str, version: &str, instance_type: &str) -> Value {
-    json!({
-        "clusterName": name,
-        "provisioned": {
-            "kafkaVersion": version,
-            "numberOfBrokerNodes": 2,
-            "brokerNodeGroupInfo": {
-                "instanceType": instance_type,
-                "clientSubnets": ["subnet-aaaaaaaaaaaaaaaaa", "subnet-bbbbbbbbbbbbbbbbb"],
-            },
-        },
-    })
-}
+// The v2 provisioned body a row submits comes from the shared harness
+// (`crate::kafka_harness::v2_provisioned_body`), for the same reason.
 
 /// A `CreateClusterV2` body whose `Serverless` block names `configurations` VPC
 /// configurations of one subnet each, with the SASL/IAM client authentication a
@@ -171,10 +162,11 @@ async fn listed_names(emulator: &Emulator) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// RULE: a provisioned create's `KafkaVersion` is one the service's catalog
-/// publishes; any other value is refused HTTP 400 `BadRequestException` naming
-/// `kafkaVersion`, with MSK's sentence for the broker category the request asked
-/// for, and registers no cluster.
+/// RULE: a provisioned create's `KafkaVersion` is one the service still offers a
+/// NEW cluster of the broker category the request's instance type names; any other
+/// value — including a version the catalog publishes but MSK has retired for new
+/// clusters — is refused HTTP 400 `BadRequestException` naming `kafkaVersion`,
+/// with MSK's sentence for that broker category, and registers no cluster.
 #[tokio::test]
 async fn a_provisioned_create_refuses_a_version_the_catalog_does_not_publish() {
     let emulator = Emulator::new();
@@ -194,9 +186,10 @@ async fn a_provisioned_create_refuses_a_version_the_catalog_does_not_publish() {
     // The rows differ along the FORM of the rejected value — a release newer than
     // every catalogued one, an older-looking one, a two-component version, a
     // variant spelling of a catalogued release, a `.x` minor the catalog does not
-    // publish and a value that is no version at all — and along the broker
-    // category, which the sentence names: `kafka.*` instance types are the
-    // standard ones, `express.*` the Express ones.
+    // publish, a value that is no version at all, and three versions the catalog
+    // DOES publish as offered but MSK no longer builds a new cluster on — and
+    // along the broker category, which the sentence names: `kafka.*` instance
+    // types are the standard ones, `express.*` the Express ones.
     let versions = [
         "9.9.9",
         "0.0.1",
@@ -204,6 +197,9 @@ async fn a_provisioned_create_refuses_a_version_the_catalog_does_not_publish() {
         "3.6.0.kraft",
         "3.5.x",
         "not-a-version",
+        "3.6.0",
+        "3.7.x",
+        "3.7.x.kraft",
     ];
     let categories = [
         ("Standard", "kafka.m5.large"),
@@ -243,28 +239,30 @@ async fn a_provisioned_create_refuses_a_version_the_catalog_does_not_publish() {
         "a refused create must register no cluster, got {listed:?}"
     );
 
-    // The other side of the rule: every version the catalog PUBLISHES is admitted
-    // — an offered one, a deprecated one (a cluster running it is what an upgrade
-    // moves away from), the `.tiered` spelling, a `.x` minor and a `.kraft` line —
-    // and the cluster reports the version it was created with.
-    let accepted: Vec<&str> = vec!["3.6.0", "2.8.1", "2.8.2.tiered", "3.9.x", "3.9.x.kraft"];
-    for (index, version) in accepted.iter().enumerate() {
-        let case = format!("a create on the catalogued version {version:?}");
-        let arn = emulator
-            .create_ok(&ClusterRequest {
-                kafka_version: version,
-                ..ClusterRequest::named(&format!("good-version-{index}"))
-            })
-            .await;
-        let described = emulator.describe(&arn).await;
-        assert_eq!(
-            described
-                .at("/clusterInfo/currentBrokerSoftwareInfo/kafkaVersion")
-                .as_str(),
-            Some(*version),
-            "case {case}: the cluster must report the version it was created with, got {}",
-            described.body
-        );
+    // The other side of the rule: every version the refusal recommends is
+    // ADMITTED, for brokers of EITHER category — the two `.x` ZooKeeper-mode ones,
+    // their `.kraft` lines and the newer KRaft-only releases — and the cluster
+    // reports the version it was created with.
+    for (index, version) in NEW_CLUSTER_VERSIONS.iter().enumerate() {
+        for (category, instance_type) in &categories {
+            let case = format!("a create on the offered version {version:?} for {category}");
+            let arn = emulator
+                .create_ok(&ClusterRequest {
+                    kafka_version: version,
+                    instance_type,
+                    ..ClusterRequest::named(&format!("good-version-{index}-{category}"))
+                })
+                .await;
+            let described = emulator.describe(&arn).await;
+            assert_eq!(
+                described
+                    .at("/clusterInfo/currentBrokerSoftwareInfo/kafkaVersion")
+                    .as_str(),
+                Some(*version),
+                "case {case}: the cluster must report the version it was created with, got {}",
+                described.body
+            );
+        }
     }
 }
 
@@ -330,7 +328,7 @@ async fn the_two_cluster_type_refusals_are_distinct() {
     for (case, body) in [
         (
             "a provisioned create",
-            v2_provisioned_body("one-kind-provisioned", "3.6.0", "kafka.m5.large"),
+            v2_provisioned_body("one-kind-provisioned", "3.9.x", "kafka.m5.large"),
         ),
         (
             "a serverless create",

@@ -28,9 +28,10 @@
 //! what another service reports.
 //!
 //! `KafkaVersion` names the broker software the cluster runs, which is one of the
-//! versions this service's own catalog publishes
-//! ([`crate::state::create_kafka_version_violation`]), so a value that catalog
-//! does not name is a `BadRequestException` too — as is a
+//! versions this service still offers a NEW cluster of the broker category the
+//! request's instance type names
+//! ([`crate::state::create_kafka_version_violation`]), so a value outside that
+//! offering is a `BadRequestException` too — as is a
 //! `BrokerNodeGroupInfo$InstanceType` outside the broker types the service offers
 //! ([`crate::state::create_instance_type_violation`]); both are answered from the
 //! request alone, before the network it asks for is resolved.
@@ -235,10 +236,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The Apache Kafka version is the broker software the cluster would run,
-        // so a version this service's catalog does not publish describes no
-        // cluster it could run — refused from the request alone, and BEFORE the
-        // subnets below are resolved, because a request that names no version MSK
-        // has is answered about that version whatever its placement says.
+        // so a version the service does not offer a new cluster of this broker
+        // category describes no cluster it would build — refused from the request
+        // alone, and BEFORE the subnets below are resolved, because a request that
+        // names a version MSK does not build on is answered about that version
+        // whatever its placement says.
         if let Some(reason) = crate::state::create_kafka_version_violation(
             &input.kafka_version,
             &input.broker_node_group_info.instance_type,

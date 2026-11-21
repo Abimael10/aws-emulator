@@ -242,19 +242,19 @@ fn version_key(version: &str) -> (Vec<u32>, String) {
 #[tokio::test]
 async fn an_update_lands_the_target_version_once_the_clock_owes_it() {
     // The rows differ along what the rule generalises over: the spelling of the
-    // target (three numeric components, a `.x` minor, a `.kraft` version), the
-    // size of the move (one minor, the whole ladder), the build line it stays on
-    // (ZooKeeper, KRaft) and the one cross-line move there is (the KRaft
-    // migration), and the support status of the source (a deprecated version is a
-    // valid source to move AWAY from).
+    // target (a `.x` minor, a `.kraft` version), the size of the move (one minor,
+    // the whole ladder), the build line it stays on (ZooKeeper, KRaft) and the one
+    // cross-line move there is (the KRaft migration). Every source is a version a
+    // CREATE admits, because that is the only way a cluster reaches the registry;
+    // the ladder off a version MSK no longer builds a new cluster on is published
+    // by the matrix instead (`compatible_kafka_versions`).
     let rows: &[(&str, &'static str, &str)] = &[
-        ("minor-bump", "3.6.0", "3.7.x"),
-        ("x-minor-target", "3.6.0", "3.9.x"),
+        ("minor-bump", "3.8.x", "3.9.x"),
         ("kraft-migration", "3.9.x", "3.9.x.kraft"),
-        ("kraft-ladder", "3.7.x.kraft", "4.1.x.kraft"),
-        ("from-deprecated", "2.6.0", "3.6.0"),
-        ("from-tiered", "2.8.2.tiered", "3.6.0"),
-        ("whole-ladder", "1.1.1", "3.9.x"),
+        ("kraft-next", "3.8.x.kraft", "3.9.x.kraft"),
+        ("kraft-ladder", "3.8.x.kraft", "4.1.x.kraft"),
+        ("kraft-step", "4.0.x.kraft", "4.1.x.kraft"),
+        ("whole-ladder", "3.9.x.kraft", "4.2.x.kraft"),
     ];
 
     let emulator = Emulator::new();
@@ -462,36 +462,37 @@ async fn an_update_lands_the_target_version_once_the_clock_owes_it() {
 /// exactly as it was.
 #[tokio::test]
 async fn only_a_target_the_service_offers_is_accepted() {
-    // The rows differ along what the rule generalises over: the source's support
-    // status and build line, and every way a target can fail to be an offered
-    // update — the version the cluster already runs, an older one, a newer one the
-    // service has deprecated, one it does not list at all, an abbreviated or
-    // differently cased spelling, an empty value, and a version on another build
-    // line (a KRaft version of another release, the KRaft version of the source's
-    // own release at a release the crossing is not offered at, and the way back to
-    // ZooKeeper mode, none of which MSK offers).
+    // The rows differ along what the rule generalises over: the source's build
+    // line, and every way a target can fail to be an offered update — the version
+    // the cluster already runs, an older one, a deprecated one, one the service
+    // does not list at all, an abbreviated or differently cased spelling, an empty
+    // value, and a version on another build line (a KRaft version of another
+    // release, the KRaft version of the source's own release at a release the
+    // crossing is not offered at, and the way back to ZooKeeper mode, none of
+    // which MSK offers). Every source is a version a CREATE admits, since that is
+    // the only way a cluster reaches the registry.
     let rows: &[(&str, &'static str, &str)] = &[
-        // Offered: the next minor, a far newer minor, the top of the ZooKeeper
-        // ladder, the KRaft migration at the release MSK offers it at, and the top
-        // of the KRaft ladder.
-        ("next-minor", "3.6.0", "3.7.x"),
-        ("far-minor", "2.8.1", "3.7.x"),
+        // Offered: the next minor on the ZooKeeper ladder, the KRaft migration at
+        // the release MSK offers it at, a step and a far jump along the KRaft
+        // ladder, and its top.
         ("ladder-top", "3.8.x", "3.9.x"),
         ("kraft-migration", "3.9.x", "3.9.x.kraft"),
+        ("kraft-next", "3.8.x.kraft", "3.9.x.kraft"),
+        ("kraft-far", "3.8.x.kraft", "4.1.x.kraft"),
         ("kraft-ladder-top", "4.1.x.kraft", "4.2.x.kraft"),
         // Not offered.
-        ("same-version", "3.4.0", "3.4.0"),
-        ("one-patch-back", "3.3.2", "3.3.1"),
-        ("far-downgrade", "3.6.0", "2.8.1"),
-        ("newer-but-deprecated", "2.6.0", "2.7.0"),
+        ("same-version", "3.9.x", "3.9.x"),
+        ("one-minor-back", "3.9.x", "3.8.x"),
+        ("far-downgrade", "3.9.x", "2.8.1"),
+        ("deprecated-target", "3.8.x", "3.5.1"),
         ("kraft-before-the-crossing", "3.8.x", "3.8.x.kraft"),
         ("kraft-of-another-release", "3.8.x", "3.9.x.kraft"),
         ("back-to-zookeeper", "3.9.x.kraft", "3.9.x"),
-        ("uncatalogued", "3.4.0", "9.9.9"),
-        ("abbreviated", "3.4.0", "3.5"),
-        ("other-case", "3.6.0", "3.9.X"),
-        ("empty", "3.4.0", ""),
-        ("not-a-version", "3.4.0", "latest"),
+        ("uncatalogued", "3.9.x", "9.9.9"),
+        ("abbreviated", "3.9.x", "3.5"),
+        ("other-case", "3.9.x", "3.9.X"),
+        ("empty", "3.9.x", ""),
+        ("not-a-version", "3.9.x", "latest"),
     ];
 
     let emulator = Emulator::new();
@@ -571,7 +572,7 @@ async fn only_a_target_the_service_offers_is_accepted() {
 #[tokio::test]
 async fn the_cluster_is_resolved_before_the_body() {
     let emulator = Emulator::new();
-    let (present, version) = active_cluster(&emulator, "resolution", "3.4.0").await;
+    let (present, version) = active_cluster(&emulator, "resolution", "3.8.x").await;
     // A cluster of the same shape in another region: well formed, and still not
     // this endpoint's.
     let elsewhere = emulator
@@ -597,11 +598,11 @@ async fn the_cluster_is_resolved_before_the_body() {
     let bodies: &[(&str, Value)] = &[
         (
             "valid-body",
-            json!({ "currentVersion": version, "targetKafkaVersion": "3.6.0" }),
+            json!({ "currentVersion": version, "targetKafkaVersion": "3.9.x" }),
         ),
         (
             "stale-version",
-            json!({ "currentVersion": "K0000000000000", "targetKafkaVersion": "3.6.0" }),
+            json!({ "currentVersion": "K0000000000000", "targetKafkaVersion": "3.9.x" }),
         ),
         (
             "unoffered-target",
@@ -686,7 +687,7 @@ async fn the_cluster_is_resolved_before_the_body() {
 #[tokio::test]
 async fn a_stale_version_or_an_unupdatable_cluster_is_refused() {
     let emulator = Emulator::new();
-    let (arn, version) = active_cluster(&emulator, "guards", "3.4.0").await;
+    let (arn, version) = active_cluster(&emulator, "guards", "3.8.x").await;
 
     // Rows: every way the quoted version can fail to be the cluster's own — a
     // token no cluster is at, an empty one, the right token in the wrong case,
@@ -698,7 +699,7 @@ async fn a_stale_version_or_an_unupdatable_cluster_is_refused() {
         format!("{version}X"),
     ];
     for stale in &stale_rows {
-        let reply = update_to(&emulator, &arn, stale, "3.6.0").await;
+        let reply = update_to(&emulator, &arn, stale, "3.9.x").await;
         assert_eq!(
             (reply.status, reply.error_code()),
             (400, "BadRequestException"),
@@ -727,7 +728,7 @@ async fn a_stale_version_or_an_unupdatable_cluster_is_refused() {
     // A cluster still being provisioned has no settled software to update.
     let creating = emulator
         .create_ok(&ClusterRequest {
-            kafka_version: "3.4.0",
+            kafka_version: "3.8.x",
             ..ClusterRequest::named("still-creating")
         })
         .await;
@@ -738,14 +739,14 @@ async fn a_stale_version_or_an_unupdatable_cluster_is_refused() {
         .as_str()
         .unwrap_or_default()
         .to_string();
-    let reply = update_to(&emulator, &creating, &creating_version, "3.6.0").await;
+    let reply = update_to(&emulator, &creating, &creating_version, "3.9.x").await;
     // The refusal is about the STATE the cluster is in, which the service words in
     // one sentence naming the states a change is accepted from.
     assert_cluster_state_refusal(&reply, "creating");
     sleep_past_activation();
     assert_eq!(
         reported_kafka_version(&emulator, &creating).await,
-        "3.4.0",
+        "3.8.x",
         "case creating: a refused update must install nothing"
     );
 
@@ -755,7 +756,7 @@ async fn a_stale_version_or_an_unupdatable_cluster_is_refused() {
         .create_serverless_ok("serverless-version", &[vec!["subnet-a", "subnet-b"]], Some(true))
         .await;
     sleep_past_activation();
-    let reply = update_to(&emulator, &serverless, "K0000000000000", "3.6.0").await;
+    let reply = update_to(&emulator, &serverless, "K0000000000000", "3.9.x").await;
     assert_eq!(
         (reply.status, reply.error_code()),
         (400, "BadRequestException"),
@@ -811,7 +812,7 @@ async fn a_named_configuration_is_applied_with_the_new_version() {
 
     for (index, (case, arn_override, revision, accepted)) in rows.iter().enumerate() {
         let (cluster, version) =
-            active_cluster(&emulator, &format!("config-row-{index}"), "3.4.0").await;
+            active_cluster(&emulator, &format!("config-row-{index}"), "3.8.x").await;
         let configuration_arn = if arn_override.is_empty() {
             configuration.as_str()
         } else {
@@ -822,7 +823,7 @@ async fn a_named_configuration_is_applied_with_the_new_version() {
             &cluster,
             json!({
                 "currentVersion": version,
-                "targetKafkaVersion": "3.6.0",
+                "targetKafkaVersion": "3.9.x",
                 "configurationInfo": { "arn": configuration_arn, "revision": revision },
             }),
         )
@@ -847,7 +848,7 @@ async fn a_named_configuration_is_applied_with_the_new_version() {
                 after
                     .at("/clusterInfo/currentBrokerSoftwareInfo/kafkaVersion")
                     .as_str(),
-                Some("3.4.0"),
+                Some("3.8.x"),
                 "case {case}: a refused update must install nothing, got {}",
                 after.at("/clusterInfo/currentBrokerSoftwareInfo")
             );
@@ -903,7 +904,7 @@ async fn a_named_configuration_is_applied_with_the_new_version() {
                     .at("/clusterInfo/currentBrokerSoftwareInfo/configurationRevision")
                     .as_i64(),
             ),
-            (Some("3.6.0"), Some(configuration_arn), Some(*revision)),
+            (Some("3.9.x"), Some(configuration_arn), Some(*revision)),
             "case {case}: expected the version and the configuration to land together, got {}",
             after.at("/clusterInfo/currentBrokerSoftwareInfo")
         );
@@ -911,13 +912,13 @@ async fn a_named_configuration_is_applied_with_the_new_version() {
 
     // And an update that names no configuration leaves the one the cluster is
     // running alone: it is applied ON the new version, not withdrawn by it.
-    let (cluster, version) = active_cluster(&emulator, "config-kept", "3.4.0").await;
+    let (cluster, version) = active_cluster(&emulator, "config-kept", "3.8.x").await;
     let first = update_version(
         &emulator,
         &cluster,
         json!({
             "currentVersion": version,
-            "targetKafkaVersion": "3.6.0",
+            "targetKafkaVersion": "3.9.x",
             "configurationInfo": { "arn": configuration.as_str(), "revision": 2 },
         }),
     )
@@ -935,7 +936,7 @@ async fn a_named_configuration_is_applied_with_the_new_version() {
         .as_str()
         .unwrap_or_default()
         .to_string();
-    let second = update_to(&emulator, &cluster, &version, "3.7.x").await;
+    let second = update_to(&emulator, &cluster, &version, "3.9.x.kraft").await;
     assert_eq!(
         second.status, 200,
         "case config-kept: expected the second update to be accepted, got {} {}",
@@ -955,7 +956,7 @@ async fn a_named_configuration_is_applied_with_the_new_version() {
                 .at("/clusterInfo/currentBrokerSoftwareInfo/configurationRevision")
                 .as_i64(),
         ),
-        (Some("3.7.x"), Some(configuration.as_str()), Some(2)),
+        (Some("3.9.x.kraft"), Some(configuration.as_str()), Some(2)),
         "case config-kept: an update naming no configuration must keep the stored one, got {}",
         after.at("/clusterInfo/currentBrokerSoftwareInfo")
     );

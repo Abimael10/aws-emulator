@@ -198,7 +198,7 @@ async fn a_cluster_arn_ends_in_the_segment_of_its_own_cluster_type() {
             region: REGION,
             subnets: vec![vec!["subnet-a", "subnet-b", "subnet-c"]],
             brokers: 3,
-            kafka_version: "3.6.0",
+            kafka_version: "3.9.x",
             over_v2: false,
         },
         Row {
@@ -221,7 +221,7 @@ async fn a_cluster_arn_ends_in_the_segment_of_its_own_cluster_type() {
             region: REGION,
             subnets: vec![vec!["subnet-a"]],
             brokers: 1,
-            kafka_version: "2.8.1",
+            kafka_version: "3.8.x",
             over_v2: true,
         },
         Row {
@@ -241,7 +241,7 @@ async fn a_cluster_arn_ends_in_the_segment_of_its_own_cluster_type() {
             region: "eu-central-1",
             subnets: vec![vec!["subnet-a", "subnet-b"]],
             brokers: 2,
-            kafka_version: "3.6.0",
+            kafka_version: "3.9.x",
             over_v2: true,
         },
     ];

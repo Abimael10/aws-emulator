@@ -7,11 +7,12 @@
 //!
 //! RULE: the status a client folds out of the published catalog for a version is
 //! the status the service HONOURS for that version. A version that folds to
-//! `ACTIVE` is one the service offers — it is named among the versions its
-//! unsupported-version refusal reports as valid, a create naming it is accepted,
-//! and the upgrade matrix may offer it as a target — and a version that folds to
-//! `DEPRECATED` is none of those. So a client that enumerates the catalog to pick
-//! a version, which is what the operation is for, picks one the service accepts.
+//! `ACTIVE` is one the service still offers — the upgrade matrix may offer it as a
+//! target, and the versions its unsupported-version refusal reports as valid are
+//! drawn from that set — and a version that folds to `DEPRECATED` is neither. The
+//! versions a CREATE may name are the narrower set that refusal lists, since MSK
+//! retires a version for new clusters while still offering it to the clusters
+//! already on it, and the refusal's list is exactly what a create is admitted on.
 //!
 //! Every reading here comes off the WIRE: the fold is computed from the published
 //! page and the offered set from the refusal the service renders, so neither side
@@ -241,14 +242,28 @@ async fn the_status_a_client_folds_out_of_the_catalog_is_the_status_the_service_
         );
     }
 
-    // And the whole point of the read: a create naming a version the fold reads as
-    // ACTIVE is accepted, and the cluster it mints reports that version back.
+    // And the whole point of the read: a create naming a version the refusal lists
+    // is accepted and the cluster it mints reports that version back, while a
+    // version the fold reads as ACTIVE that the refusal does NOT list is refused in
+    // that same sentence — the set the refusal advertises is the set the gate
+    // admits.
     for version in &active {
         let created = create_provisioned(&emulator, &cluster_name(version), version).await;
+        if !offered.iter().any(|offered| offered == version) {
+            assert_eq!(
+                (created.status, created.error_code()),
+                (400, "BadRequestException"),
+                "case version={version:?}: a create naming a version the refusal does not list \
+                 must be refused, got {} {}",
+                created.status,
+                created.body
+            );
+            continue;
+        }
         assert_eq!(
             created.status, 200,
-            "case version={version:?}: a create naming a version the fold reads as {ACTIVE:?} \
-             must be accepted, got {} {}",
+            "case version={version:?}: a create naming a version the refusal lists must be \
+             accepted, got {} {}",
             created.status, created.body
         );
         let arn = created
@@ -284,8 +299,9 @@ async fn the_status_a_client_folds_out_of_the_catalog_is_the_status_the_service_
 
 /// RULE, the other half of the same read: a version the fold reads as `DEPRECATED`
 /// is offered for nothing — it is named among neither the valid values the refusal
-/// reports nor the targets the matrix offers — while the service still KNOWS it, so
-/// a cluster already running it is described and moved off it rather than refused.
+/// reports nor the targets the matrix offers, and a create naming it is refused —
+/// while the service still KNOWS it, so the matrix goes on publishing it as an
+/// upgrade SOURCE, which is how a cluster already running it is moved off it.
 ///
 /// The rows differ along the spelling of the deprecated version (a three-component
 /// release, a four-component one, the storage-variant line), and name versions the
@@ -319,8 +335,10 @@ async fn a_version_the_fold_reads_as_deprecated_is_offered_for_nothing() {
         );
     }
 
-    // The service still knows such a version: a cluster created on one is held and
-    // described, which is what the version-update surface moves a cluster off.
+    // The service still knows such a version: the matrix publishes it as an upgrade
+    // SOURCE, which is what the version-update surface moves a cluster off, while a
+    // create naming it is refused.
+    let sources = matrix_sources(&emulator).await;
     for version in ["2.3.1", "2.4.1.1", "2.8.2.tiered"] {
         let status = folded_status(&folded, version);
         assert_eq!(
@@ -328,31 +346,45 @@ async fn a_version_the_fold_reads_as_deprecated_is_offered_for_nothing() {
             Some(DEPRECATED),
             "case version={version:?}: this row needs a deprecated version, got {status:?}"
         );
+        assert!(
+            sources.iter().any(|source| source == version),
+            "case version={version:?}: the matrix must still publish it as an upgrade source, \
+             got {sources:?}"
+        );
         let created = create_provisioned(&emulator, &cluster_name(version), version).await;
         assert_eq!(
-            created.status, 200,
-            "case version={version:?}: a cluster on a version the catalog still publishes must \
-             be held, got {} {}",
-            created.status, created.body
-        );
-        let arn = created
-            .at("/clusterArn")
-            .as_str()
-            .unwrap_or_else(|| panic!("case version={version:?}: expected a clusterArn, got {}", created.body))
-            .to_string();
-        let reported = emulator
-            .describe_v2(&arn)
-            .await
-            .at("/clusterInfo/provisioned/currentBrokerSoftwareInfo/kafkaVersion")
-            .as_str()
-            .map(str::to_string);
-        assert_eq!(
-            reported.as_deref(),
-            Some(version),
-            "case version={version:?}: the cluster must report the version it was created on, \
-             got {reported:?}"
+            (created.status, created.error_code()),
+            (400, "BadRequestException"),
+            "case version={version:?}: a create naming a version MSK no longer builds a new \
+             cluster on must be refused, got {} {}",
+            created.status,
+            created.body
         );
     }
+}
+
+/// Every version the upgrade matrix publishes as a SOURCE, in published order.
+async fn matrix_sources(emulator: &Emulator) -> Vec<String> {
+    let matrix = emulator
+        .call("GET", "/v1/compatible-kafka-versions", None)
+        .await;
+    assert_eq!(
+        matrix.status, 200,
+        "GetCompatibleKafkaVersions must succeed, got {} {}",
+        matrix.status, matrix.body
+    );
+    matrix
+        .at("/compatibleKafkaVersions")
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a compatibleKafkaVersions list, got {}", matrix.body))
+        .iter()
+        .map(|entry| {
+            entry["sourceVersion"]
+                .as_str()
+                .unwrap_or_else(|| panic!("an entry without a sourceVersion: {entry}"))
+                .to_string()
+        })
+        .collect()
 }
 
 /// RULE: every row the listing publishes carries one of the two statuses the model

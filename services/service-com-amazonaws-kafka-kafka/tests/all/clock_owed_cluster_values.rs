@@ -40,10 +40,11 @@ use crate::kafka_harness::{
     pct, sleep_past_activation, sleep_past_update, ClusterRequest, Emulator, Reply,
 };
 
-/// The Apache Kafka version the harness's `CreateCluster` row asks for, which every
-/// version row below moves AWAY from. Asserted against the created cluster rather
-/// than trusted, so this suite cannot drift from the harness.
-const SOURCE_VERSION: &str = "3.6.0";
+/// The Apache Kafka version every cluster below is created at, which the version
+/// rows then move AWAY from: a version the service takes for a NEW cluster whose
+/// own upgrade ladder is several steps long. Asserted against the created cluster
+/// rather than trusted, so this suite cannot drift from the service.
+const SOURCE_VERSION: &str = "3.8.x.kraft";
 
 /// The topic whose partitions the placement probe reads back. Created on every
 /// cluster of the table BEFORE its update, so what the probe observes is the
@@ -62,6 +63,7 @@ async fn create_cluster(
     let request = ClusterRequest {
         brokers,
         subnets,
+        kafka_version: SOURCE_VERSION,
         ..ClusterRequest::named(name)
     };
     emulator.create_ok(&request).await
@@ -479,12 +481,12 @@ async fn a_due_broker_count_update_is_what_the_next_topic_call_reads() {
 #[tokio::test]
 async fn a_due_version_update_is_what_the_next_compatible_versions_read_reports() {
     let emulator = Emulator::new();
-    // The rows are moves the service's OWN ladder offers from the version the
-    // harness creates a cluster at: `compatible_target_versions` derives it from
+    // The rows are moves the service's OWN ladder offers from the version this
+    // suite creates a cluster at: `compatible_target_versions` derives it from
     // `KAFKA_VERSION_CATALOG`, so a row can never ask for a move the service does
     // not serve. One step along the line, two, and three.
     let offered = compatible_target_versions(SOURCE_VERSION);
-    let targets = ["3.7.x", "3.8.x", "3.9.x"];
+    let targets = ["3.9.x.kraft", "4.0.x.kraft", "4.1.x.kraft"];
     for target in &targets {
         assert!(
             offered.iter().any(|version| version == target),

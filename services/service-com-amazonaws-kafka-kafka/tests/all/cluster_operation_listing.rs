@@ -98,13 +98,13 @@ fn connectivity_update() -> Update {
     }
 }
 
-/// An Apache Kafka version upgrade. `3.7.x` is the next ACTIVE version above
-/// the `3.6.0` every cluster this harness creates runs, so it is a target the
+/// An Apache Kafka version upgrade. `3.9.x.kraft` is the KRaft version of the
+/// `3.9.x` release every cluster this harness creates runs, so it is a target the
 /// service accepts.
 fn kafka_version_update() -> Update {
     Update {
         path: "version",
-        body: json!({ "targetKafkaVersion": "3.7.x" }),
+        body: json!({ "targetKafkaVersion": "3.9.x.kraft" }),
         operation_type: "UPDATE_CLUSTER_KAFKA_VERSION",
     }
 }

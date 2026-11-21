@@ -83,7 +83,7 @@ async fn a_v2_create_of_either_kind_keeps_the_subnets_it_was_given() {
             .create_cluster_v2(json!({
                 "clusterName": name,
                 "provisioned": {
-                    "kafkaVersion": "3.6.0",
+                    "kafkaVersion": "3.9.x",
                     "numberOfBrokerNodes": 2,
                     "brokerNodeGroupInfo": {
                         "instanceType": "kafka.m5.large",
@@ -202,7 +202,7 @@ async fn a_create_may_name_at_most_the_placement_ceiling_of_subnets() {
                 "/v1/clusters",
                 json!({
                     "clusterName": format!("ceiling-v1-{count}"),
-                    "kafkaVersion": "3.6.0",
+                    "kafkaVersion": "3.9.x",
                     "numberOfBrokerNodes": 2,
                     "brokerNodeGroupInfo": {
                         "instanceType": "kafka.m5.large",
@@ -217,7 +217,7 @@ async fn a_create_may_name_at_most_the_placement_ceiling_of_subnets() {
                 json!({
                     "clusterName": format!("ceiling-v2-{count}"),
                     "provisioned": {
-                        "kafkaVersion": "3.6.0",
+                        "kafkaVersion": "3.9.x",
                         "numberOfBrokerNodes": 2,
                         "brokerNodeGroupInfo": {
                             "instanceType": "kafka.m5.large",

@@ -43,8 +43,10 @@ const REGION: &str = "us-west-2";
 /// The EC2 API version a client sends in an ec2Query body.
 const EC2_API_VERSION: &str = "2016-11-15";
 
-/// The Apache Kafka version and broker type every create below asks for.
-const KAFKA_VERSION: &str = "3.6.0";
+/// The Apache Kafka version and broker type every create below asks for: a
+/// version Amazon MSK still takes for a NEW cluster, since each create has to be
+/// admitted.
+const KAFKA_VERSION: &str = "3.9.x";
 const INSTANCE_TYPE: &str = "kafka.m5.large";
 
 /// The largest number of broker nodes one cluster may hold, from the `range` on

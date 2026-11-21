@@ -237,7 +237,7 @@ async fn a_cluster_update_refuses_an_unissued_revision_the_same_way() {
 
     let cluster = emulator
         .create_ok(&ClusterRequest {
-            kafka_version: "3.4.0",
+            kafka_version: "3.8.x",
             ..ClusterRequest::named("revision-reference")
         })
         .await;
@@ -256,7 +256,7 @@ async fn a_cluster_update_refuses_an_unissued_revision_the_same_way() {
                 &format!("/v1/clusters/{}/version", pct(&cluster)),
                 Some(json!({
                     "currentVersion": current_version,
-                    "targetKafkaVersion": "3.6.0",
+                    "targetKafkaVersion": "3.9.x",
                     "configurationInfo": { "arn": configuration, "revision": revision },
                 })),
             )
@@ -273,7 +273,7 @@ async fn a_cluster_update_refuses_an_unissued_revision_the_same_way() {
             after
                 .at("/clusterInfo/currentBrokerSoftwareInfo/kafkaVersion")
                 .as_str(),
-            Some("3.4.0"),
+            Some("3.8.x"),
             "case cluster-update/{case}: a refused update must install nothing, got {}",
             after.at("/clusterInfo/currentBrokerSoftwareInfo")
         );

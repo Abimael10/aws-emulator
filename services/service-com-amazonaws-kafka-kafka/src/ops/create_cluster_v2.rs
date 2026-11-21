@@ -18,7 +18,8 @@
 //! request left unset, while naming both states that only one of the two may be given.
 //!
 //! A provisioned body also names the broker software its cluster would run, so
-//! its `KafkaVersion` is admitted against the catalog this service publishes
+//! its `KafkaVersion` is admitted against the versions this service offers a NEW
+//! cluster of the broker category the body's instance type names
 //! ([`crate::state::create_kafka_version_violation`]) and its
 //! `BrokerNodeGroupInfo$InstanceType` against the broker types the service offers
 //! ([`crate::state::create_instance_type_violation`]) before anything is minted.
@@ -510,9 +511,10 @@ impl ClusterBody {
         match self {
             Self::Provisioned(request) => {
                 // The Apache Kafka version is the broker software the cluster
-                // would run, so a version this service's catalog does not publish
-                // describes no cluster it could run. Answered from the request
-                // alone, and before the subnets are resolved.
+                // would run, so a version the service does not offer a new cluster
+                // of this broker category describes no cluster it would build.
+                // Answered from the request alone, and before the subnets are
+                // resolved.
                 if let Some(reason) = crate::state::create_kafka_version_violation(
                     &request.kafka_version,
                     &request.broker_node_group_info.instance_type,

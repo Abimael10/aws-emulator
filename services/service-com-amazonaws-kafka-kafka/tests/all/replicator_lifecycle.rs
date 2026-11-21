@@ -976,7 +976,7 @@ async fn clusters_the_emulator_does_not_hold_are_still_accepted() {
             "/v1/clusters",
             Some(json!({
                 "clusterName": "really-here",
-                "kafkaVersion": "3.6.0",
+                "kafkaVersion": "3.9.x",
                 "numberOfBrokerNodes": 1,
                 "brokerNodeGroupInfo": {
                     "instanceType": "kafka.m5.large",

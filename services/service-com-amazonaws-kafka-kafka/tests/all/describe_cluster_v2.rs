@@ -48,7 +48,7 @@ async fn describe_v2_reports_the_stored_cluster_in_the_v2_shape() {
         ClusterRequest::named("v2-defaults"),
         ClusterRequest {
             brokers: 1,
-            kafka_version: "2.8.1",
+            kafka_version: "3.8.x",
             subnets: vec!["subnet-a"],
             ..ClusterRequest::named("v2-single-broker")
         },

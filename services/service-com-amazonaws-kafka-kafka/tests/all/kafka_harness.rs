@@ -1032,6 +1032,45 @@ pub fn pct(value: &str) -> String {
     encoded
 }
 
+/// A `CreateClusterV2` body whose `Provisioned` block asks for `version` on
+/// brokers of `instance_type`: the minimal provisioned body, shared so the suites
+/// that submit one cannot drift from each other in its shape.
+pub fn v2_provisioned_body(name: &str, version: &str, instance_type: &str) -> Value {
+    json!({
+        "clusterName": name,
+        "provisioned": {
+            "kafkaVersion": version,
+            "numberOfBrokerNodes": 2,
+            "brokerNodeGroupInfo": {
+                "instanceType": instance_type,
+                "clientSubnets": ["subnet-aaaaaaaaaaaaaaaaa", "subnet-bbbbbbbbbbbbbbbbb"],
+            },
+        },
+    })
+}
+
+/// The sentence Amazon MSK refuses `version` for brokers of `category` with: its
+/// fixed text, the version the request named and the versions that category IS
+/// offered for a new cluster, in the order they are named.
+///
+/// Written out here rather than read from the service's own helper, so the wording
+/// is pinned by the suites instead of by the code under test, and shared so two
+/// suites cannot pin two different sentences. `offered` is whatever sequence of
+/// version strings the suite is asserting against — a list it wrote out, or one it
+/// read off the wire.
+pub fn unsupported_broker_version_message<S: AsRef<str>>(
+    category: &str,
+    version: &str,
+    offered: &[S],
+) -> String {
+    let offered: Vec<&str> = offered.iter().map(AsRef::as_ref).collect();
+    format!(
+        "{category} instance types are not supported for Kafka version {version}. \
+         Valid values: [{}]",
+        offered.join(", ")
+    )
+}
+
 /// One row of a `CreateCluster` table: the required members plus whichever
 /// optional ones the row exercises. `None` means "the request omits it", which is
 /// how a row tests a documented default.
@@ -1065,10 +1104,14 @@ pub struct ClusterRequest {
 impl ClusterRequest {
     /// A minimal request: only the four required members, so every optional
     /// member's documented default applies.
+    ///
+    /// The version is one Amazon MSK still takes for a NEW cluster, since every
+    /// row built from this one has to be admitted; a suite whose rule is about the
+    /// version names its own.
     pub fn named(name: &str) -> Self {
         Self {
             name: name.to_string(),
-            kafka_version: "3.6.0",
+            kafka_version: "3.9.x",
             brokers: 3,
             instance_type: "kafka.m5.large",
             subnets: vec!["subnet-a", "subnet-b", "subnet-c"],

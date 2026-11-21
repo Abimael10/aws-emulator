@@ -387,7 +387,7 @@ async fn every_other_timestamp_member_is_an_iso8601_date_time() {
             .call(
                 "PUT",
                 &format!("/v1/clusters/{}/version", pct(&cluster_arn)),
-                Some(json!({ "currentVersion": version, "targetKafkaVersion": "3.7.x" })),
+                Some(json!({ "currentVersion": version, "targetKafkaVersion": "3.9.x.kraft" })),
             )
             .await,
     );

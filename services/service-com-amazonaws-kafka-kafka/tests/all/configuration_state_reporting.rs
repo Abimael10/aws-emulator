@@ -466,7 +466,7 @@ async fn an_optional_description_is_omitted_exactly_when_there_is_none() {
         .await;
     let mut body = json!({
         "clusterName": "uses-a-described-configuration",
-        "kafkaVersion": "3.6.0",
+        "kafkaVersion": "3.9.x",
         "numberOfBrokerNodes": 3,
         "brokerNodeGroupInfo": {
             "instanceType": "kafka.m5.large",
