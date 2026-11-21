@@ -291,7 +291,8 @@ async fn an_index_settings_put_writes_the_dynamic_settings_and_the_get_reports_t
         index.body
     );
 
-    // `flat_settings` reports the same settings under the dotted names they HAVE.
+    // `flat_settings` reports the same settings under the FULL dotted names they have —
+    // the `index.` prefix included, rather than nested in the sections that name spells.
     let flat = rest(
         &emulator,
         DEFAULT_ACCESS_KEY_ID,
@@ -302,7 +303,7 @@ async fn an_index_settings_put_writes_the_dynamic_settings_and_the_get_reports_t
     )
     .await;
     assert_eq!(
-        flat.body[INDEX]["settings"]["index"]["search.slowlog.threshold.query.warn"],
+        flat.body[INDEX]["settings"]["index.search.slowlog.threshold.query.warn"],
         json!("500ms"),
         "case \"flat_settings\": expected the dotted name, got {:?}",
         flat.body
@@ -574,6 +575,242 @@ async fn a_setting_name_deeper_than_the_maximum_is_refused_in_either_spelling() 
     assert!(
         settings.get("a").is_none(),
         "case \"a refused name\": expected nothing of it to be stored, got {settings:?}"
+    );
+}
+
+/// One row of the REPORTING-FORM table: how one setting is written, the full name the
+/// cluster knows it by, the sections that name spells out, and the text every report carries
+/// for it.
+struct Form {
+    case: &'static str,
+    /// The body of the `PUT` that writes the setting.
+    body: Value,
+    /// The FULL dotted name — the `index.` prefix included — a flat report keys it by.
+    flat_name: &'static str,
+    /// The same name as the path a nested report nests it at, below the `settings` member.
+    nested_path: &'static [&'static str],
+    /// The value every report carries for it: the TEXT the engine holds a setting as.
+    value: &'static str,
+}
+
+/// The reporting-form table. The rows differ along what the rule generalises over: the JSON
+/// type the body writes the value as (a boolean, a number, a string), how deep the setting's
+/// own name nests, and which spelling the body names it in (nested sections, a dotted name
+/// inside the `index` section, a whole dotted name with the prefix, and a bare name).
+fn forms() -> Vec<Form> {
+    vec![
+        Form {
+            case: "a write block written as a JSON boolean",
+            body: json!({ "index": { "blocks.write": true } }),
+            flat_name: "index.blocks.write",
+            nested_path: &["index", "blocks", "write"],
+            value: "true",
+        },
+        Form {
+            case: "a read-only block written false in nested sections",
+            body: json!({ "index": { "blocks": { "read_only": false } } }),
+            flat_name: "index.blocks.read_only",
+            nested_path: &["index", "blocks", "read_only"],
+            value: "false",
+        },
+        Form {
+            case: "the automatic refresh disabled",
+            body: json!({ "index": { "refresh_interval": "-1" } }),
+            flat_name: "index.refresh_interval",
+            nested_path: &["index", "refresh_interval"],
+            value: "-1",
+        },
+        Form {
+            case: "a replica count written as a JSON number",
+            body: json!({ "number_of_replicas": 0 }),
+            flat_name: "index.number_of_replicas",
+            nested_path: &["index", "number_of_replicas"],
+            value: "0",
+        },
+        Form {
+            case: "a slow-log threshold named by its whole dotted name",
+            body: json!({ "index.search.slowlog.threshold.query.warn": "500ms" }),
+            flat_name: "index.search.slowlog.threshold.query.warn",
+            nested_path: &["index", "search", "slowlog", "threshold", "query", "warn"],
+            value: "500ms",
+        },
+    ]
+}
+
+/// The value `body` carries at `path`, or `None` where it carries none.
+fn at<'a>(body: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    path.iter()
+        .try_fold(body, |held, name| held.get(*name))
+        .filter(|held| !held.is_null())
+}
+
+/// The `settings` member a read of `index` reports, over the route `path` addresses with the
+/// query string `query`.
+async fn settings_of(
+    emulator: &Emulator,
+    host: &str,
+    path: &str,
+    query: &str,
+    index: &str,
+    case: &str,
+) -> Value {
+    let answer = rest(
+        emulator,
+        DEFAULT_ACCESS_KEY_ID,
+        host,
+        "GET",
+        &format!("{path}{query}"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case}: expected GET {path}{query} to answer 200, got {} with {:?}",
+        answer.status, answer.body
+    );
+    answer.body[index]["settings"].clone()
+}
+
+/// RULE: a settings read reports every setting the index holds under the FULL name the
+/// cluster knows it by — `index.` followed by the setting's own name — expanded into the
+/// sections that name spells out, or, for a request asking for `flat_settings=true`, under
+/// the whole dotted name itself; and every value is the TEXT the setting is held as,
+/// whatever JSON type the write carried.
+///
+/// Asserted over the whole table, in both forms, on every route that reports an index's
+/// settings: the index's own settings API, the same API addressed to the cluster, the
+/// narrowed read, and the whole-index read.
+#[tokio::test]
+async fn a_settings_read_reports_every_setting_under_its_full_name_flat_or_expanded() {
+    let emulator = Emulator::new();
+    created_domain(&emulator, "settings-forms").await;
+    let host = endpoint_of(&emulator, "settings-forms");
+    let created = rest(
+        &emulator,
+        DEFAULT_ACCESS_KEY_ID,
+        &host,
+        "PUT",
+        &format!("/{INDEX}"),
+        Some(json!({ "settings": { "number_of_shards": 1 } })),
+    )
+    .await;
+    assert_eq!(
+        created.status, 200,
+        "case PUT /{INDEX}: expected 200, got {} with {:?}",
+        created.status, created.body
+    );
+
+    for form in forms() {
+        let Form {
+            case,
+            body,
+            flat_name,
+            nested_path,
+            value,
+        } = form;
+        let written = rest(
+            &emulator,
+            DEFAULT_ACCESS_KEY_ID,
+            &host,
+            "PUT",
+            &format!("/{INDEX}/_settings"),
+            Some(body),
+        )
+        .await;
+        assert_eq!(
+            (written.status, written.body["acknowledged"].as_bool()),
+            (200, Some(true)),
+            "case {case}: expected the update to be acknowledged, got {} with {:?}",
+            written.status,
+            written.body
+        );
+
+        // The FLAT form: the whole dotted name as one key, directly under `settings`, with
+        // no `index` section left for a client to walk.
+        for (route, path) in [
+            ("the index's settings", format!("/{INDEX}/_settings")),
+            ("the cluster-wide settings", "/_settings".to_string()),
+            ("the whole-index read", format!("/{INDEX}")),
+            (
+                "the narrowed read",
+                format!("/{INDEX}/_settings/{flat_name}"),
+            ),
+        ] {
+            let case = format!("{case}, flat, {route}");
+            let flat = settings_of(
+                &emulator,
+                &host,
+                &path,
+                "?flat_settings=true",
+                INDEX,
+                &case,
+            )
+            .await;
+            assert_eq!(
+                at(&flat, &[flat_name]).and_then(Value::as_str),
+                Some(value),
+                "case {case}: expected {flat_name} to be {value:?}, got {flat:?}"
+            );
+            assert!(
+                at(&flat, &["index"]).is_none(),
+                "case {case}: a flat report carries no index section, got {flat:?}"
+            );
+        }
+
+        // The NESTED form — the default, and what `flat_settings=false` asks for — spells
+        // the same name out as the sections it names, and carries the same text.
+        for query in ["", "?flat_settings=false"] {
+            let case = format!("{case}, nested{query}");
+            let nested = settings_of(
+                &emulator,
+                &host,
+                &format!("/{INDEX}/_settings"),
+                query,
+                INDEX,
+                &case,
+            )
+            .await;
+            assert_eq!(
+                at(&nested, nested_path).and_then(Value::as_str),
+                Some(value),
+                "case {case}: expected {nested_path:?} to be {value:?}, got {nested:?}"
+            );
+            assert!(
+                at(&nested, &[flat_name]).is_none(),
+                "case {case}: a nested report carries no dotted key, got {nested:?}"
+            );
+        }
+    }
+
+    // Every setting the report carries is named that way, including the members the cluster
+    // fills in itself and the ones the create wrote.
+    let flat = settings_of(
+        &emulator,
+        &host,
+        &format!("/{INDEX}/_settings"),
+        "?flat_settings=true",
+        INDEX,
+        "the whole flat report",
+    )
+    .await;
+    assert_eq!(
+        (
+            at(&flat, &["index.provided_name"]).and_then(Value::as_str),
+            at(&flat, &["index.number_of_shards"]).and_then(Value::as_str),
+            at(&flat, &["index.uuid"]).is_some(),
+        ),
+        (Some(INDEX), Some("1"), true),
+        "case \"the whole flat report\": expected every name prefixed, got {flat:?}"
+    );
+    let names: Vec<String> = flat
+        .as_object()
+        .unwrap_or_else(|| panic!("case \"the whole flat report\": expected an object"))
+        .keys()
+        .cloned()
+        .collect();
+    assert!(
+        names.iter().all(|name| name.starts_with("index.")),
+        "case \"the whole flat report\": every setting is named index.<setting>, got {names:?}"
     );
 }
 

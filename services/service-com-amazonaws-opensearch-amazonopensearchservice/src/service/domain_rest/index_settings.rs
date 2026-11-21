@@ -97,7 +97,7 @@ pub(super) fn index_settings_request(
 }
 
 /// The settings each index the request names holds, as the engine reports them: one entry
-/// per index, each carrying its settings under the `index` section they are named below.
+/// per index, each carrying the `settings` member [`settings_view`] projects.
 fn reported(
     domain: &Domain,
     request: &Request<'_>,
@@ -116,20 +116,23 @@ fn reported(
         answer.insert(
             name.to_string(),
             json!({
-                state::SCHEMA_SETTINGS: {
-                    state::SETTINGS_INDEX_SECTION:
-                        settings_view(domain, index, request, filter),
-                }
+                state::SCHEMA_SETTINGS: settings_view(domain, index, request, filter),
             }),
         );
     }
     ok(&Value::Object(answer))
 }
 
-/// One index's settings as a report carries them: the settings it holds, plus the two
-/// members the cluster fills in itself, in the EXPANDED sections their dotted names name —
-/// or flat for a request asking for `flat_settings`, which is the one reporting rule the
-/// cluster's own settings are reported by ([`reported_settings`]).
+/// One index's settings as a report carries them — the WHOLE `settings` member: the
+/// settings the index holds, plus the two members the cluster fills in itself, each under
+/// the FULL name it has (`index.` and the name below that section), reported in the
+/// EXPANDED sections that name names — or under the dotted name itself for a request asking
+/// for `flat_settings`, which is the one reporting rule the cluster's own settings are
+/// reported by ([`reported_settings`]).
+///
+/// So a flat report names `index.refresh_interval` and a nested one carries
+/// `{"index": {"refresh_interval": …}}`: both spell the same setting, and the flat form is
+/// the whole dotted path rather than the path below the section.
 ///
 /// `filter` narrows the report to the names it admits. A setting is named either bare or
 /// with the `index.` prefix its full name carries, so a filter is matched against both
@@ -146,7 +149,7 @@ pub(super) fn settings_view(
     // setting name may, and what is stored was bounded when it was written — so a section
     // that somehow reached that depth is reported as it is held rather than not at all.
     if flatten_settings(&held, &mut String::new(), &mut flattened).is_err() {
-        return Value::Object(held);
+        return json!({ state::SETTINGS_INDEX_SECTION: Value::Object(held) });
     }
     let mut settings: Vec<(&str, Value)> = flattened
         .iter()
@@ -169,7 +172,15 @@ pub(super) fn settings_view(
             })
         });
     }
-    reported_settings(settings, request)
+    // Every index setting's canonical name is `index.<setting>`
+    // ([`state::SETTINGS_INDEX_SECTION`]), so that is the name a report gives it: the
+    // section the nested form nests it in, and the first segment of the dotted name the
+    // flat form answers with.
+    let named: Vec<(String, Value)> = settings
+        .into_iter()
+        .map(|(name, value)| (format!("{}.{name}", state::SETTINGS_INDEX_SECTION), value))
+        .collect();
+    reported_settings(named, request)
 }
 
 /// Apply the settings update the request's body asks for, to every index the path names.

@@ -825,8 +825,8 @@ async fn an_index_reports_and_updates_its_own_settings_and_mappings() {
         filtered.body
     );
 
-    // The FLAT form reports each setting under the dotted name it HAS, rather than nested
-    // in the sections that name spells out.
+    // The FLAT form reports each setting under the full dotted name it HAS — the `index.`
+    // prefix included — rather than nested in the sections that name spells out.
     let flat = rest(
         &emulator,
         DEFAULT_ACCESS_KEY_ID,
@@ -839,9 +839,8 @@ async fn an_index_reports_and_updates_its_own_settings_and_mappings() {
     assert_eq!(
         (
             flat.status,
-            flat.body["shaped"]["settings"]["index"]["search.slowlog.threshold.query.warn"]
-                .as_str(),
-            flat.body["shaped"]["settings"]["index"]["refresh_interval"].as_str(),
+            flat.body["shaped"]["settings"]["index.search.slowlog.threshold.query.warn"].as_str(),
+            flat.body["shaped"]["settings"]["index.refresh_interval"].as_str(),
         ),
         (200, Some("2s"), Some("30s")),
         "case \"GET /shaped/_settings?flat_settings=true\": expected the dotted names, got {} \

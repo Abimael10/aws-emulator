@@ -51,3 +51,27 @@ Cause 3 — expected: the scenario completes (1-node RESTART_SEARCH_PROCESS refu
 3. GET https://<endpoint>/<index>/_settings?flat_settings=true and read the key "index.refresh_interval" — it is absent (Cause 1); the nested value is a JSON string here but booleans/numbers appear for blocks/shards (Cause 2).
 4. PUT {"index":{"blocks.write":true}} on another index, then re-read with flat_settings=true: expect "index.blocks.write":"true".
 5. For Cause 3: create a 1-data-node domain, call StartDomainMaintenance(Action=RESTART_SEARCH_PROCESS, NodeId=<a Data NodeId>), then UpdateDomainConfig to 3 data nodes and retry StartDomainMaintenance until it is accepted — it never is within the budget.
+
+## Resolution
+
+Cause 1 of 3: FIXED. A settings read now reports every setting under the FULL name the
+cluster knows it by — `index.` followed by the setting's own name — so `flat_settings=true`
+answers one map keyed by the whole dotted name and the default answers the sections that
+name spells out. The projection is one function
+(`src/service/domain_rest/index_settings.rs::settings_view`), so the index settings API, the
+same API addressed to the cluster, the narrowed read and the whole-index read all report the
+same names.
+
+Cause 2 of 3: FIXED before this change — the settings projection already coerces every value
+to the text the engine holds it as (`as_text`), which the replay confirms (`'1'`, `'0'`,
+`'true'`). It is now pinned beside Cause 1 by the new table in
+`tests/all/index_settings_api.rs`, whose rows write a boolean, a number and a string.
+
+Cause 3 of 3: DECLINED — a per-run timing value, as the already-resolved
+`20261030T083920Z-opensearch-a-createdomain-updatedomainconfig-sequence-never-reaches-an.md`
+(the same replay key) sets out: the check spends its own 30 s poll interval per transition
+against a 60 s budget, which any non-zero processing span costs. The requirement half is
+implemented — the settle is materialised and projected by the SAME read, so the first read
+past a span publishes the idle domain — and the whole sequence this check never reached
+(node census, maintenance refused on one data node, scale-out, maintenance accepted and
+listed) is pinned by `tests/all/successive_domain_transitions.rs`.

@@ -2628,18 +2628,19 @@ fn flatten_settings(
 /// segments than a setting name may ([`state::INDEX_SCHEMA_MAX_DEPTH`], the bound the write
 /// path holds a name to): the expansion a report performs is therefore nested by a constant
 /// at most, whatever name the store was found holding.
-fn reported_settings<'a>(
-    held: impl IntoIterator<Item = (&'a str, Value)>,
+fn reported_settings(
+    held: impl IntoIterator<Item = (String, Value)>,
     request: &Request<'_>,
 ) -> Value {
     let flat = request.parameter("flat_settings").as_deref() == Some("true");
     let mut reported = Map::new();
     for (name, value) in held {
-        let segments: Vec<&str> = name.split('.').collect();
-        if flat || segments.len() == 1 || segments.len() > state::INDEX_SCHEMA_MAX_DEPTH {
-            reported.insert(name.to_string(), value);
+        let depth = name.split('.').count();
+        if flat || depth == 1 || depth > state::INDEX_SCHEMA_MAX_DEPTH {
+            reported.insert(name, value);
             continue;
         }
+        let segments: Vec<&str> = name.split('.').collect();
         let mut at = Some(&mut reported);
         for segment in &segments[..segments.len() - 1] {
             at = at.and_then(|held| {
@@ -2653,7 +2654,7 @@ fn reported_settings<'a>(
                 at.insert(segments[segments.len() - 1].to_string(), value);
             }
             None => {
-                reported.insert(name.to_string(), value);
+                reported.insert(name.clone(), value);
             }
         }
     }
@@ -2664,7 +2665,7 @@ fn reported_settings<'a>(
 /// ([`reported_settings`]).
 fn reported_text_settings(held: &BTreeMap<String, String>, request: &Request<'_>) -> Value {
     reported_settings(
-        held.iter().map(|(name, value)| (name.as_str(), json!(value))),
+        held.iter().map(|(name, value)| (name.clone(), json!(value))),
         request,
     )
 }
@@ -3124,11 +3125,9 @@ fn read_index(domain: &Domain, request: &Request<'_>, index_name: &str) -> RtRes
             "aliases": aliases::reported(index),
             "mappings": mappings,
             // The index's settings as its own settings API reports them, so two reads of
-            // one index cannot report its configuration differently.
-            "settings": {
-                state::SETTINGS_INDEX_SECTION:
-                    index_settings::settings_view(domain, index, request, None),
-            },
+            // one index cannot report its configuration differently — including the form
+            // `flat_settings` asks for.
+            "settings": index_settings::settings_view(domain, index, request, None),
         }
     }))
 }
