@@ -659,23 +659,37 @@ impl StoredAcceleratorAttributes {
 /// empty while they are on. Disabled flow logs constrain neither member. Checked over
 /// the configuration the update would LEAVE BEHIND rather than over the request's
 /// members, so a call that only flips the flag is judged against the bucket and prefix
-/// already stored. Returns the message to put on an `InvalidArgumentException`.
+/// already stored. Returns the message to put on an `InvalidArgumentException`: the
+/// fixed sentence the service states for the member that names nothing, with no part of
+/// the request interpolated into it.
 pub fn validate_flow_logs(attributes: &StoredAcceleratorAttributes) -> Result<(), String> {
     if !attributes.flow_logs_enabled {
         return Ok(());
     }
-    for (member, value) in [
-        ("FlowLogsS3Bucket", &attributes.flow_logs_s3_bucket),
-        ("FlowLogsS3Prefix", &attributes.flow_logs_s3_prefix),
+    for (message, value) in [
+        (FLOW_LOGS_BUCKET_EMPTY_MESSAGE, &attributes.flow_logs_s3_bucket),
+        (FLOW_LOGS_PREFIX_EMPTY_MESSAGE, &attributes.flow_logs_s3_prefix),
     ] {
         if value.as_deref().unwrap_or_default().is_empty() {
-            return Err(format!(
-                "{member} must be specified when FlowLogsEnabled is true."
-            ));
+            return Err(message.to_string());
         }
     }
     Ok(())
 }
+
+/// The refusal for flow logs turned on with no bucket to write them to
+/// (`AcceleratorAttributes$FlowLogsS3Bucket`). Fixed text: the service names the
+/// destination that is missing, never the request's own members or values.
+pub const FLOW_LOGS_BUCKET_EMPTY_MESSAGE: &str = "Flow logs s3 bucket should not be empty.";
+
+/// The refusal for flow logs turned on with no prefix under the bucket
+/// (`AcceleratorAttributes$FlowLogsS3Prefix`), which the service words for the prefix as
+/// [`FLOW_LOGS_BUCKET_EMPTY_MESSAGE`] is worded for the bucket — the same sentence with the
+/// part of the destination it names in place, both being the one destination the attributes
+/// must state. The bucket's sentence is the one observed from the service; this one follows
+/// its wording for the other half of the same destination, so an observation of the prefix
+/// refusal is the authority over it.
+pub const FLOW_LOGS_PREFIX_EMPTY_MESSAGE: &str = "Flow logs s3 prefix should not be empty.";
 
 /// Per-service state for com-amazonaws-globalaccelerator-globalaccelerator-v20180706. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]

@@ -170,21 +170,34 @@ async fn enabling_flow_logs_without_a_destination_is_refused_and_changes_nothing
     // "If the value is true, FlowLogsS3Bucket and FlowLogsS3Prefix must be specified"
     // (`UpdateAcceleratorAttributes$FlowLogsEnabled`), so every row below leaves one of
     // the two unset — including the empty string, which names no bucket and no prefix.
-    let rows: [(&str, Value, &str); 5] = [
+    //
+    // The third column is the WHOLE message the refusal must carry: a sentence of fixed
+    // text naming the missing destination, with nothing from the request interpolated
+    // into it — so a row varying the other member's value, or the accelerator it is
+    // called on, must not change a character of it.
+    let bucket_missing = "Flow logs s3 bucket should not be empty.";
+    let prefix_missing = "Flow logs s3 prefix should not be empty.";
+    let rows: [(&str, Value, &str); 7] = [
         (
             "flag alone",
             json!({ "FlowLogsEnabled": true }),
-            "FlowLogsS3Bucket",
+            bucket_missing,
         ),
         (
             "bucket, no prefix",
             json!({ "FlowLogsEnabled": true, "FlowLogsS3Bucket": "flow-logs-bucket" }),
-            "FlowLogsS3Prefix",
+            prefix_missing,
         ),
         (
             "prefix, no bucket",
             json!({ "FlowLogsEnabled": true, "FlowLogsS3Prefix": "prefix/" }),
-            "FlowLogsS3Bucket",
+            bucket_missing,
+        ),
+        (
+            // A longer prefix: the message is fixed text, so it is the same sentence.
+            "another prefix, no bucket",
+            json!({ "FlowLogsEnabled": true, "FlowLogsS3Prefix": "logs/2026/01/" }),
+            bucket_missing,
         ),
         (
             "empty bucket",
@@ -193,7 +206,7 @@ async fn enabling_flow_logs_without_a_destination_is_refused_and_changes_nothing
                 "FlowLogsS3Bucket": "",
                 "FlowLogsS3Prefix": "prefix/",
             }),
-            "FlowLogsS3Bucket",
+            bucket_missing,
         ),
         (
             "empty prefix",
@@ -202,11 +215,21 @@ async fn enabling_flow_logs_without_a_destination_is_refused_and_changes_nothing
                 "FlowLogsS3Bucket": "flow-logs-bucket",
                 "FlowLogsS3Prefix": "",
             }),
-            "FlowLogsS3Prefix",
+            prefix_missing,
+        ),
+        (
+            // Both missing: the bucket is the destination, so it is named first.
+            "both empty",
+            json!({
+                "FlowLogsEnabled": true,
+                "FlowLogsS3Bucket": "",
+                "FlowLogsS3Prefix": "",
+            }),
+            bucket_missing,
         ),
     ];
 
-    for (case, members, missing) in rows {
+    for (case, members, expected_message) in rows {
         // An accelerator name takes only alphanumerics, periods and hyphens
         // (`CreateAccelerator$Name`), so the row's label is slugified into one.
         let slug: String = case
@@ -226,9 +249,8 @@ async fn enabling_flow_logs_without_a_destination_is_refused_and_changes_nothing
         );
         let message = error_message(&body);
         assert_eq!(
-            message,
-            format!("{missing} must be specified when FlowLogsEnabled is true."),
-            "case {case}: expected the refusal to name {missing}, got {message:?}"
+            message, expected_message,
+            "case {case}: expected the refusal to read {expected_message:?}, got {message:?}"
         );
 
         // A refused update leaves the configuration exactly as it was.
@@ -372,6 +394,86 @@ async fn attributes_of_an_accelerator_the_store_does_not_hold_are_refused() {
         attributes(false, None, None),
         "case live: expected the remaining accelerator to still report its attributes"
     );
+}
+
+#[tokio::test]
+async fn a_destination_is_mutable_while_flow_logs_are_off_and_then_enables_them() {
+    let router = emulator();
+
+    // The destination is constrained only while flow logs are ON, so while they are off
+    // any bucket and prefix — the empty string included — is accepted, and the call that
+    // turns them on over a stored destination is accepted too. One row per destination
+    // shape, so the rule is not a property of one bucket name.
+    let rows: [(&str, &str, &str); 6] = [
+        ("plain", "flow-logs-bucket", "prefix/"),
+        ("dotted bucket", "logs.example.bucket", "a/b/c/"),
+        // The doc's own example prefix (`UpdateAcceleratorAttributes$FlowLogsS3Prefix`).
+        ("slash prefix", "another-bucket", "/"),
+        ("no bucket", "", "prefix/"),
+        ("no prefix", "a-bucket", ""),
+        ("neither", "", ""),
+    ];
+
+    for (index, (case, bucket, prefix)) in rows.into_iter().enumerate() {
+        let arn = arn_of(
+            &create_accelerator(
+                &router,
+                &format!("attr-off-{index}"),
+                &format!("tok-off-{index}"),
+            )
+            .await,
+        );
+
+        let (status, body) = update(
+            &router,
+            &arn,
+            &json!({ "FlowLogsS3Bucket": bucket, "FlowLogsS3Prefix": prefix }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: expected setting a destination while off to be accepted, got {status} with {body}"
+        );
+        assert_eq!(
+            observed(&describe(&router, &arn).await),
+            attributes(false, Some(bucket), Some(prefix)),
+            "case {case}: expected the stored destination with flow logs still off"
+        );
+
+        // Turning them on: accepted exactly when the stored destination names both a
+        // bucket and a prefix.
+        let (status, body) = update(&router, &arn, &json!({ "FlowLogsEnabled": true })).await;
+        // The sentence names the part of the destination that is empty — the bucket first,
+        // it being the destination the prefix sits under.
+        let expected_message = if bucket.is_empty() {
+            Some("Flow logs s3 bucket should not be empty.")
+        } else if prefix.is_empty() {
+            Some("Flow logs s3 prefix should not be empty.")
+        } else {
+            None
+        };
+        if let Some(expected_message) = expected_message {
+            assert_eq!(
+                status, 400,
+                "case {case}: expected turning flow logs on with no destination to be refused, got {status} with {body}"
+            );
+            let message = error_message(&body);
+            assert_eq!(
+                message, expected_message,
+                "case {case}: expected the refusal to read {expected_message:?}, got {message:?}"
+            );
+            continue;
+        }
+        assert_eq!(
+            status, 200,
+            "case {case}: expected turning flow logs on over the stored destination to be accepted, got {status} with {body}"
+        );
+        assert_eq!(
+            observed(&describe(&router, &arn).await),
+            attributes(true, Some(bucket), Some(prefix)),
+            "case {case}: expected flow logs on with the stored destination"
+        );
+    }
 }
 
 #[tokio::test]
