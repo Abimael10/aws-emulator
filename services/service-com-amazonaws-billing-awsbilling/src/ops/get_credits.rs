@@ -219,12 +219,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // owned by the account specified in accountId." Both branches are keyed on
         // WHO IS CALLING, never on the account the request asks about: the flag
         // aggregates for a caller that pays the family's bill, whichever member of
-        // it `accountId` names, and is inert for any other caller.
-        let whole_family = input.payer_account_flag.unwrap_or(false)
-            && state.is_billing_family_management_account(crate::state::caller_account_id());
+        // it `accountId` names, and is inert for any other caller. The widening
+        // reaches the FAMILY — the accounts whose bills that caller pays — and no
+        // further, so a credit owned by an account outside it is reported to
+        // nobody.
+        let family_payer = input
+            .payer_account_flag
+            .unwrap_or(false)
+            .then(crate::state::caller_account_id)
+            .filter(|caller| state.is_billing_family_management_account(caller));
 
         let credits = state
-            .credits_for_period(&input.account_id, whole_family, start_secs, end_secs)
+            .credits_for_period(&input.account_id, family_payer, start_secs, end_secs)
             .iter()
             .map(credit_data)
             .collect();

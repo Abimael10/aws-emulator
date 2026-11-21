@@ -1305,24 +1305,32 @@ impl ComAmazonawsBillingAwsbillingState {
 
     /// The credits `GetCredits` reports, in `creditId` order.
     ///
-    /// `account_id` selects the owning account. `whole_family` widens the
-    /// selection to every account of the consolidated billing family this store
-    /// holds credits for — the decision to widen belongs to the caller, which
-    /// consults [`Self::is_billing_family_management_account`]. Both bounds of
-    /// the requested period are inclusive, on [`epoch_secs`]' scale, and a
-    /// credit is reported when its own life overlaps it.
+    /// `account_id` selects the owning account. `family_payer` widens the
+    /// selection: `Some(payer)` reports the credits of every account whose bill
+    /// `payer` pays — its own, and those of the MEMBERS of the consolidated
+    /// billing family it is the management account of — through
+    /// [`Self::history_covers_billed_account`], the family traversal every
+    /// billing history in this service reads by, so a credit owned by an
+    /// account OUTSIDE the family belongs to no answer. The decision to widen
+    /// belongs to the caller, which consults
+    /// [`Self::is_billing_family_management_account`]. Both bounds of the
+    /// requested period are inclusive, on [`epoch_secs`]' scale, and a credit is
+    /// reported when its own life overlaps it.
     ///
     /// A pure read: it answers from the store and changes nothing in it.
     pub fn credits_for_period(
         &self,
         account_id: &str,
-        whole_family: bool,
+        family_payer: Option<&str>,
         start_secs: f64,
         end_secs: f64,
     ) -> Vec<Credit> {
         self.credits
             .values()
-            .filter(|credit| whole_family || credit.account_id == account_id)
+            .filter(|credit| match family_payer {
+                Some(payer) => self.history_covers_billed_account(payer, &credit.account_id),
+                None => credit.account_id == account_id,
+            })
             .filter(|credit| credit.overlaps_period(start_secs, end_secs))
             .cloned()
             .collect()

@@ -4,14 +4,15 @@
 //!
 //! Every assertion here is about the RULE the operation follows: it REPORTS the
 //! credits persisted in `ComAmazonawsBillingAwsbillingState::credits` — those owned
-//! by the account named in `accountId`, or every account of the consolidated billing
-//! family when the caller is the management account and sets `payerAccountFlag`,
-//! narrowed to the credits whose own life overlaps the requested period — and it
-//! changes nothing.
+//! by the account named in `accountId`, or those owned by the accounts of the
+//! consolidated billing family the caller pays for when the caller is that family's
+//! management account and sets `payerAccountFlag`, narrowed to the credits whose own
+//! life overlaps the requested period — and it changes nothing.
 //! The tables span the class of inputs the rule generalises over (credit id length,
 //! currency, which optional members are recorded, list sizes, every value of each
-//! modeled enum, period placement, the account asked about, and the documented
-//! bounds on `accountId`/`startDate`/`endDate`), not one recorded request.
+//! modeled enum, period placement, the account asked about, who the family's members
+//! are, and the documented bounds on `accountId`/`startDate`/`endDate`), not one
+//! recorded request.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -563,6 +564,10 @@ struct FamilyCase {
     /// always `caller_account_id()` (= [`ACCOUNT_ID`]), so any other value here is a
     /// caller that does NOT pay for the family.
     payer_account_id: &'static str,
+    /// The MEMBERS the store holds for the consolidated billing family, beside
+    /// [`ACCOUNT_ID`], which a default store already records as the family's
+    /// management account. An account absent from here is outside the family.
+    family_members: &'static [&'static str],
     /// The account the request asks about.
     account_id: &'static str,
     /// `payerAccountFlag`, absent when the row omits the member.
@@ -571,10 +576,12 @@ struct FamilyCase {
     expected: Vec<&'static str>,
 }
 
-/// `payerAccountFlag` is keyed on the CALLER, not on the account the request asks
-/// about: when the caller pays the consolidated billing family's bill, the flag
-/// aggregates the whole family whichever account `accountId` names, and when it does
-/// not, the flag changes nothing.
+/// `payerAccountFlag` is keyed on the CALLER and widens to the CONSOLIDATED BILLING
+/// FAMILY: when the caller pays the family's bill, the flag aggregates the credits of
+/// the accounts of that family — the caller's own and its members' — whichever
+/// account `accountId` names; when the caller pays for nobody, or when the flag is
+/// false or omitted, only the credits owned by `accountId` are reported. A credit
+/// owned by an account the store holds no family record for is reported to nobody.
 ///
 /// From `GetCreditsRequest$payerAccountFlag`: "When true and the caller is the
 /// management account, the response aggregates credits across the entire consolidated
@@ -586,6 +593,7 @@ async fn payer_account_flag_aggregates_the_whole_billing_family_for_the_paying_c
         FamilyCase {
             case: "paying caller, own account, flag omitted",
             payer_account_id: ACCOUNT_ID,
+            family_members: &[LINKED_ACCOUNT_ID],
             account_id: ACCOUNT_ID,
             flag: None,
             expected: vec!["21"],
@@ -593,6 +601,7 @@ async fn payer_account_flag_aggregates_the_whole_billing_family_for_the_paying_c
         FamilyCase {
             case: "paying caller, own account, flag false",
             payer_account_id: ACCOUNT_ID,
+            family_members: &[LINKED_ACCOUNT_ID],
             account_id: ACCOUNT_ID,
             flag: Some(false),
             expected: vec!["21"],
@@ -600,13 +609,15 @@ async fn payer_account_flag_aggregates_the_whole_billing_family_for_the_paying_c
         FamilyCase {
             case: "paying caller, own account, flag true",
             payer_account_id: ACCOUNT_ID,
+            family_members: &[LINKED_ACCOUNT_ID],
             account_id: ACCOUNT_ID,
             flag: Some(true),
-            expected: vec!["21", "22", "23"],
+            expected: vec!["21", "22"],
         },
         FamilyCase {
             case: "paying caller, a member account, flag omitted",
             payer_account_id: ACCOUNT_ID,
+            family_members: &[LINKED_ACCOUNT_ID],
             account_id: LINKED_ACCOUNT_ID,
             flag: None,
             expected: vec!["22"],
@@ -614,6 +625,7 @@ async fn payer_account_flag_aggregates_the_whole_billing_family_for_the_paying_c
         FamilyCase {
             case: "paying caller, a member account, flag false",
             payer_account_id: ACCOUNT_ID,
+            family_members: &[LINKED_ACCOUNT_ID],
             account_id: LINKED_ACCOUNT_ID,
             flag: Some(false),
             expected: vec!["22"],
@@ -621,20 +633,47 @@ async fn payer_account_flag_aggregates_the_whole_billing_family_for_the_paying_c
         FamilyCase {
             case: "paying caller, a member account, flag true",
             payer_account_id: ACCOUNT_ID,
+            family_members: &[LINKED_ACCOUNT_ID],
             account_id: LINKED_ACCOUNT_ID,
+            flag: Some(true),
+            expected: vec!["21", "22"],
+        },
+        FamilyCase {
+            case: "paying caller of a family of the caller alone, flag true",
+            payer_account_id: ACCOUNT_ID,
+            family_members: &[],
+            account_id: ACCOUNT_ID,
+            flag: Some(true),
+            expected: vec!["21"],
+        },
+        FamilyCase {
+            case: "paying caller, every seeded account a family member, flag true",
+            payer_account_id: ACCOUNT_ID,
+            family_members: &[LINKED_ACCOUNT_ID, UNKNOWN_ACCOUNT_ID],
+            account_id: ACCOUNT_ID,
             flag: Some(true),
             expected: vec!["21", "22", "23"],
         },
         FamilyCase {
-            case: "paying caller, a third account, flag true",
+            case: "paying caller, an account outside the family, flag true",
             payer_account_id: ACCOUNT_ID,
+            family_members: &[LINKED_ACCOUNT_ID],
             account_id: UNKNOWN_ACCOUNT_ID,
             flag: Some(true),
-            expected: vec!["21", "22", "23"],
+            expected: vec!["21", "22"],
+        },
+        FamilyCase {
+            case: "paying caller, an account outside the family, flag omitted",
+            payer_account_id: ACCOUNT_ID,
+            family_members: &[LINKED_ACCOUNT_ID],
+            account_id: UNKNOWN_ACCOUNT_ID,
+            flag: None,
+            expected: vec!["23"],
         },
         FamilyCase {
             case: "non-paying caller, own account, flag omitted",
             payer_account_id: LINKED_ACCOUNT_ID,
+            family_members: &[LINKED_ACCOUNT_ID],
             account_id: ACCOUNT_ID,
             flag: None,
             expected: vec!["21"],
@@ -642,6 +681,7 @@ async fn payer_account_flag_aggregates_the_whole_billing_family_for_the_paying_c
         FamilyCase {
             case: "non-paying caller cannot aggregate its own account",
             payer_account_id: LINKED_ACCOUNT_ID,
+            family_members: &[LINKED_ACCOUNT_ID],
             account_id: ACCOUNT_ID,
             flag: Some(true),
             expected: vec!["21"],
@@ -649,6 +689,7 @@ async fn payer_account_flag_aggregates_the_whole_billing_family_for_the_paying_c
         FamilyCase {
             case: "non-paying caller cannot aggregate another account",
             payer_account_id: LINKED_ACCOUNT_ID,
+            family_members: &[LINKED_ACCOUNT_ID],
             account_id: LINKED_ACCOUNT_ID,
             flag: Some(true),
             expected: vec!["22"],
@@ -656,6 +697,7 @@ async fn payer_account_flag_aggregates_the_whole_billing_family_for_the_paying_c
         FamilyCase {
             case: "caller of a family paid by a third account, flag true",
             payer_account_id: UNKNOWN_ACCOUNT_ID,
+            family_members: &[LINKED_ACCOUNT_ID, UNKNOWN_ACCOUNT_ID],
             account_id: UNKNOWN_ACCOUNT_ID,
             flag: Some(true),
             expected: vec!["23"],
@@ -665,6 +707,7 @@ async fn payer_account_flag_aggregates_the_whole_billing_family_for_the_paying_c
     for FamilyCase {
         case,
         payer_account_id,
+        family_members,
         account_id,
         flag,
         expected,
@@ -683,6 +726,11 @@ async fn payer_account_flag_aggregates_the_whole_billing_family_for_the_paying_c
             let store = engine.state::<ComAmazonawsBillingAwsbillingState>();
             let mut store = store.lock();
             store.billing_family_management_account_id = payer_account_id.to_string();
+            for member in family_members {
+                store
+                    .consolidated_billing_family
+                    .insert((*member).to_string(), format!("member {member}"));
+            }
         }
 
         let mut body = request(account_id, 60);
