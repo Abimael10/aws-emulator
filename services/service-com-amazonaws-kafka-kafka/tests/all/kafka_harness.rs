@@ -1264,6 +1264,82 @@ pub fn sleep_past_channel_activation() {
     std::thread::sleep(CHANNEL_ACTIVATION_DELAY + Duration::from_millis(250));
 }
 
+/// How long [`poll_until_channel_active`] and [`poll_until_operation_complete`]
+/// wait for the value the clock owes a channel or its cluster operation before a
+/// suite calls it a failure: far longer than any span this service owes a
+/// transition, so the deadline says nothing about how fast the host runs.
+pub const CHANNEL_SETTLED_DEADLINE: Duration = Duration::from_secs(60);
+
+/// The cadence an unsettled channel or operation is re-read at — a probing
+/// interval, not a bound on the transition.
+pub const CHANNEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Poll `DescribeChannel` until the channel reports `ACTIVE`, and hand that read
+/// back.
+///
+/// Waits for the CONDITION rather than for a span: a channel leaves `CREATING`
+/// and leaves the `UPDATING` an accepted destination change parks it in on a
+/// clock, so the loop looks again until the record reports the terminal status or
+/// [`CHANNEL_SETTLED_DEADLINE`] passes. The shared counterpart of
+/// [`sleep_past_channel_activation`]; `std::thread::sleep` between probes because
+/// the workspace's tokio carries no timer feature and nothing else has to make
+/// progress here.
+pub async fn poll_until_channel_active(
+    emulator: &Emulator,
+    cluster_arn: &str,
+    channel_arn: &str,
+    case: &str,
+) -> Reply {
+    let deadline = Instant::now() + CHANNEL_SETTLED_DEADLINE;
+    loop {
+        let described = emulator.describe_channel(cluster_arn, channel_arn).await;
+        assert_eq!(
+            described.status, 200,
+            "case {case}: expected DescribeChannel to answer, got {} {}",
+            described.status, described.body
+        );
+        if described.at("/status").as_str() == Some("ACTIVE") {
+            return described;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case}: the channel never reported ACTIVE, last read {}",
+            described.body
+        );
+        std::thread::sleep(CHANNEL_POLL_INTERVAL);
+    }
+}
+
+/// Poll `DescribeClusterOperation` until the operation `arn` names reports the
+/// state a finished one is in, and hand that read back.
+///
+/// The counterpart of [`poll_until_channel_active`] for the cluster operation a
+/// channel lifecycle call hands its caller: the work behind it finishes when the
+/// clock owes the channel transition it carries out, so the loop looks again
+/// rather than waiting a fixed time.
+pub async fn poll_until_operation_complete(emulator: &Emulator, arn: &str, case: &str) -> Reply {
+    let deadline = Instant::now() + CHANNEL_SETTLED_DEADLINE;
+    loop {
+        let reply = emulator
+            .call("GET", &format!("/v1/operations/{}", pct(arn)), None)
+            .await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case}: expected the operation ARN to resolve, got {} {}",
+            reply.status, reply.body
+        );
+        if reply.at("/clusterOperationInfo/operationState").as_str() == Some("UPDATE_COMPLETE") {
+            return reply;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case}: the operation never reported UPDATE_COMPLETE, last read {}",
+            reply.body
+        );
+        std::thread::sleep(CHANNEL_POLL_INTERVAL);
+    }
+}
+
 /// One row of a `CreateConfiguration` table: the member values one request
 /// carries, as every configuration suite of this crate writes its rows.
 ///

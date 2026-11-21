@@ -1841,17 +1841,23 @@ impl ComAmazonawsKafkaKafkaState {
 
     /// Accept a destination change on the channel `channel_arn` names under
     /// `cluster_arn`, as an endpoint for `region` sees it, handing back the
-    /// record as the caller must now see it: the new
-    /// `DataFreshnessInSeconds` written onto the destination it was created with,
-    /// the channel still `ACTIVE`, and the update's own cluster operation filed as
-    /// finished — the change is applied by this call
-    /// ([`Channel::begin_update`]), so the operation that carries it ended at the
-    /// same instant and the two cannot disagree about whether the work is done.
+    /// record as the caller must now see it: the new `DataFreshnessInSeconds`
+    /// written onto the destination it was created with, the channel `UPDATING`,
+    /// and the update's own cluster operation filed as ending at the instant the
+    /// clock owes that channel its return to `ACTIVE` — the operation and the
+    /// channel settle together, so the two cannot disagree about whether the work
+    /// is done ([`Channel::begin_update`]).
     ///
     /// Answers `None` when this region holds no such channel under that cluster,
     /// resolved exactly as every channel reader resolves it. The STATUS gate is
     /// the caller's: this is the write path, and it is reached only for a channel
     /// the handler has already found updatable.
+    ///
+    /// The ONE path a channel's destination change comes through, which is what
+    /// serializes two concurrent ones the way [`Self::start_topic_update`] does:
+    /// a caller holds this registry while it resolves the channel and applies the
+    /// change, so the second of two overlapping updates meets the `UPDATING`
+    /// record the first left behind rather than the state both started from.
     pub fn begin_channel_update(
         &mut self,
         region: &str,
@@ -1862,12 +1868,15 @@ impl ComAmazonawsKafkaKafkaState {
     ) -> Option<&Channel> {
         self.settled_channel_in(region, cluster_arn, channel_arn, now)?;
         let channel = self.channels.get_mut(channel_arn)?;
-        let operation_arn = channel.begin_update(data_freshness_in_seconds).to_string();
+        let operation_arn = channel
+            .begin_update(now, data_freshness_in_seconds)
+            .to_string();
+        let end_due = channel.active_due;
         self.file_channel_operation(
             channel_arn,
             operation_arn,
             OPERATION_TYPE_UPDATE_CHANNEL,
-            now,
+            end_due,
             now,
         );
         self.channels.get(channel_arn)

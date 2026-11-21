@@ -12,9 +12,10 @@
 //!
 //! Each suite here is one of those sequences, step by step: after every write the
 //! transient value is read back, the span is waited out ONCE, and the terminal
-//! value is asserted on the next read. Nothing here polls: the spans are the
-//! service's own published constants, so a suite cannot drift from the service, and
-//! a step that needed a second span would fail here.
+//! value is asserted on the next read. The spans are the service's own published
+//! constants, so a suite cannot drift from the service, and a step that needed a
+//! second span would fail here; where a step waits for its resource to converge it
+//! waits for the CONDITION under a generous deadline, never for a fixed time.
 //!
 //! The suites differ along the resource family whose state machine they walk (VPC
 //! connection, replicator, channel, cluster operation) rather than repeating one
@@ -31,8 +32,8 @@ use service_com_amazonaws_kafka_kafka::state::{
 };
 
 use crate::kafka_harness::{
-    given_iam_role_trusting, pct, sleep_past_activation, sleep_past_channel_activation,
-    sleep_past_configuration_deletion, sleep_past_update,
+    given_iam_role_trusting, pct, poll_until_channel_active, sleep_past_activation,
+    sleep_past_channel_activation, sleep_past_configuration_deletion, sleep_past_update,
     sleep_past_vpc_connection_activation, sleep_past_vpc_connection_rejection, trust_policy_for,
     ClusterRequest, ConnectionRequest, Emulator, Reply, ACCOUNT,
 };
@@ -678,10 +679,10 @@ fn channel_body(name: &str, topic_arn: &str, freshness: i64) -> Value {
 
 /// RULE, for the channel family: a created channel reaches `ACTIVE` within one
 /// channel span and the create's own cluster operation finishes at that same
-/// instant, an accepted `UpdateChannel` carries the new destination on the FIRST
-/// read after it with the channel still `ACTIVE` (its operation already complete),
-/// and a deleted channel disappears — each on the FIRST read after its own span,
-/// with the
+/// instant, an accepted `UpdateChannel` carries the new destination from the FIRST
+/// read after it while holding the channel in `UPDATING` under the operation it
+/// handed back, with both settling together one update span later, and a deleted
+/// channel disappears — each on the FIRST read after its own span, with the
 /// wrong-state refusal on the same path.
 #[tokio::test]
 async fn the_channel_sequence_settles_at_every_step() {
@@ -795,8 +796,9 @@ async fn the_channel_sequence_settles_at_every_step() {
         listed.body
     );
 
-    // Step 2: the destination change, which the accepting call applies, so the
-    // client's next read already carries it.
+    // Step 2: the destination change, which the accepting call stores and an
+    // in-flight cluster operation carries out, so the client's next read already
+    // carries the value while the channel is still `UPDATING`.
     let updated = emulator
         .call(
             "PUT",
@@ -820,16 +822,33 @@ async fn the_channel_sequence_settles_at_every_step() {
             reported.at("/status").as_str(),
             reported.at("/s3DestinationConfiguration/dataFreshnessInSeconds").as_i64(),
         ),
-        (Some("ACTIVE"), Some(900)),
-        "the first read after the update must report ACTIVE with the new destination, \
+        (Some("UPDATING"), Some(900)),
+        "the first read after the update must report UPDATING with the new destination, \
          got {}",
         reported.body
     );
     assert_operation_state(
         &emulator,
         &update_operation,
+        "UPDATE_IN_PROGRESS",
+        "the channel update inside its span",
+    )
+    .await;
+    let reported =
+        poll_until_channel_active(&emulator, &cluster, &channel, "the updated channel").await;
+    assert_eq!(
+        reported
+            .at("/s3DestinationConfiguration/dataFreshnessInSeconds")
+            .as_i64(),
+        Some(900),
+        "the settled channel must still report the destination the update asked for, got {}",
+        reported.body
+    );
+    assert_operation_state(
+        &emulator,
+        &update_operation,
         "UPDATE_COMPLETE",
-        "the channel update, which its own call applied",
+        "the channel update once its span is over",
     )
     .await;
 

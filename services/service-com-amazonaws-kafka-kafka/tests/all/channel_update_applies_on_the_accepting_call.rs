@@ -7,12 +7,13 @@
 //! RULE, asserted here over a table of inputs rather than for one request: an
 //! accepted `UpdateChannel` is applied by the CALL THAT ACCEPTS IT — the whole
 //! change is one stored buffering parameter, so the FIRST independent read after
-//! the call reports the submitted `DataFreshnessInSeconds` on a channel still in
-//! its terminal `ACTIVE` status, and the cluster operation the call answers
-//! reports its work complete on that same first read — while every other stored
-//! member of the channel comes back byte-identical, non-ASCII code points
-//! included: nothing in the model lets a destination change rewrite the channel's
-//! name, its tags, its storage prefix or its topic list.
+//! the call reports the submitted `DataFreshnessInSeconds`, under the cluster
+//! operation the call handed back, which holds the channel in `UPDATING` until the
+//! clock owes it its return to `ACTIVE` and reports its own work finished at that
+//! same instant — while every other stored member of the channel comes back
+//! byte-identical, non-ASCII code points included: nothing in the model lets a
+//! destination change rewrite the channel's name, its tags, its storage prefix or
+//! its topic list.
 //!
 //! The rows differ along what the rule generalises over: the script mix of the
 //! members the update must not touch (Japanese katakana with accented Latin and
@@ -35,7 +36,8 @@ use service_com_amazonaws_kafka_kafka::state::{
 };
 
 use crate::kafka_harness::{
-    pct, poll_until_active, ClusterRequest, Emulator, Reply, ACCOUNT, REGION,
+    pct, poll_until_active, poll_until_channel_active, ClusterRequest, Emulator, Reply, ACCOUNT,
+    REGION,
 };
 
 /// The role a channel assumes to write to its destination; any role ARN does.
@@ -215,30 +217,30 @@ fn preserved_members(reply: &Reply, destination: Destination) -> Value {
     })
 }
 
-/// Poll `DescribeChannel` until the channel reports `ACTIVE`, and hand that read
-/// back. Waits for the CONDITION, so it says nothing about how long the create's
-/// own span is.
-async fn poll_until_channel_active(
-    emulator: &Emulator,
-    cluster_arn: &str,
-    channel_arn: &str,
-    case: &str,
-) -> Reply {
+/// Poll one cluster-operation reader at `uri` until it reports the work the
+/// operation carries finished, and hand that read back. Waits for the CONDITION,
+/// so it says nothing about how long the update's own span is.
+async fn poll_until_operation_finished(emulator: &Emulator, uri: &str, case: &str) -> Reply {
     let deadline = Instant::now() + CONVERGENCE_DEADLINE;
     loop {
-        let described = emulator.describe_channel(cluster_arn, channel_arn).await;
+        let reply = emulator.call("GET", uri, None).await;
         assert_eq!(
-            described.status, 200,
-            "case {case}: expected DescribeChannel to answer, got {} {}",
-            described.status, described.body
+            reply.status, 200,
+            "case {case}: expected the reader to resolve the operation, got {} {}",
+            reply.status, reply.body
         );
-        if described.at("/status").as_str() == Some("ACTIVE") {
-            return described;
+        let state = reply
+            .at("/clusterOperationInfo/operationState")
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if FINISHED_OPERATION_STATES.contains(&state.as_str()) {
+            return reply;
         }
         assert!(
             Instant::now() < deadline,
-            "case {case}: the channel never reported ACTIVE, last read {}",
-            described.body
+            "case {case}: the operation never reported its work finished, last read {}",
+            reply.body
         );
         std::thread::sleep(POLL_INTERVAL);
     }
@@ -454,29 +456,33 @@ async fn an_accepted_update_is_observable_on_the_next_read_and_moves_nothing_els
             );
             operations.push(operation.clone());
 
-            // The FIRST read of the operation the caller was handed: the change is
-            // applied, so the work it carried is already finished.
+            // The FIRST independent read of the channel: the accepted value, the
+            // status of the operation still carrying it out, and nothing else
+            // moved.
+            let after = emulator.describe_channel(&cluster, &channel).await;
+            let observed = after.at("/status").as_str().unwrap_or_default().to_string();
+            assert_eq!(
+                after.at(row.destination.freshness_pointer()).as_i64(),
+                Some(*target),
+                "case {case}: expected {target} reported on the first read after the \
+                 update, got {}",
+                after.body
+            );
+            assert!(
+                ["UPDATING", "ACTIVE"].contains(&observed.as_str()),
+                "case {case}: expected the channel under its in-flight update or settled \
+                 again, got {observed:?} in {}",
+                after.body
+            );
+
+            // Each reader of the operation the caller was handed reports the work
+            // finished once the clock owes the channel its return to `ACTIVE`.
             for (reader, uri) in [
                 ("v1", format!("/v1/operations/{}", pct(&operation))),
                 ("v2", format!("/api/v2/operations/{}", pct(&operation))),
             ] {
-                let reply = emulator.call("GET", &uri, None).await;
-                assert_eq!(
-                    reply.status, 200,
-                    "case {case}: expected {reader} to resolve the operation, got {} {}",
-                    reply.status, reply.body
-                );
-                let state = reply
-                    .at("/clusterOperationInfo/operationState")
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string();
-                assert!(
-                    FINISHED_OPERATION_STATES.contains(&state.as_str()),
-                    "case {case}: expected {reader} to report the update finished on the first \
-                     read, got {state:?} in {}",
-                    reply.body
-                );
+                let case = format!("{case} ({reader})");
+                let reply = poll_until_operation_finished(&emulator, &uri, &case).await;
                 assert_eq!(
                     reply.at("/clusterOperationInfo/clusterArn").as_str(),
                     Some(cluster.as_str()),
@@ -485,17 +491,17 @@ async fn an_accepted_update_is_observable_on_the_next_read_and_moves_nothing_els
                 );
             }
 
-            // The FIRST independent read of the channel: the new value, a terminal
-            // status, and nothing else moved.
-            let after = emulator.describe_channel(&cluster, &channel).await;
+            // And the settled channel: the same value, the terminal status, and
+            // nothing else moved.
+            let after = poll_until_channel_active(&emulator, &cluster, &channel, &case).await;
             assert_eq!(
                 (
                     after.at("/status").as_str(),
                     after.at(row.destination.freshness_pointer()).as_i64(),
                 ),
                 (Some("ACTIVE"), Some(*target)),
-                "case {case}: expected an ACTIVE channel reporting {target} on the first read \
-                 after the update, got {}",
+                "case {case}: expected an ACTIVE channel reporting {target} once the update \
+                 had been carried out, got {}",
                 after.body
             );
             assert_eq!(
@@ -569,8 +575,9 @@ fn expected_tags(row: &Row) -> Value {
 
 /// RULE, for the sequence a client actually runs: every step of
 /// cluster -> topic -> channel -> destination change reaches its terminal,
-/// observable value, each step converging on the step before it, so a client that
-/// probes once per step reaches a verdict instead of running to its own deadline.
+/// observable value within the span the service owes it, each step converging on
+/// the step before it, so a client that polls for the condition reaches a verdict
+/// instead of running to its own deadline.
 #[tokio::test]
 async fn the_sequence_from_cluster_to_updated_channel_needs_one_probe_per_step() {
     let emulator = Emulator::new();
@@ -646,22 +653,17 @@ async fn the_sequence_from_cluster_to_updated_channel_needs_one_probe_per_step()
         .expect("UpdateChannel returned no operation ARN")
         .to_string();
 
-    // One probe of the operation and one of the channel is all this step costs:
-    // both answer the terminal value straight away.
-    let reported = emulator
-        .call("GET", &format!("/api/v2/operations/{}", pct(&operation)), None)
-        .await;
-    let state = reported
-        .at("/clusterOperationInfo/operationState")
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    assert!(
-        FINISHED_OPERATION_STATES.contains(&state.as_str()),
-        "expected the update's operation to be finished on the first probe, got {state:?} in {}",
-        reported.body
-    );
-    let after = emulator.describe_channel(&cluster, &channel).await;
+    // The operation the update handed back reports its work finished, and the
+    // channel reports the applied change on an otherwise unchanged record, once
+    // the span the service owes that change is out.
+    poll_until_operation_finished(
+        &emulator,
+        &format!("/api/v2/operations/{}", pct(&operation)),
+        "the sequence's update",
+    )
+    .await;
+    let after =
+        poll_until_channel_active(&emulator, &cluster, &channel, "the sequence's update").await;
     assert_eq!(
         (
             after.at("/status").as_str(),
@@ -670,7 +672,7 @@ async fn the_sequence_from_cluster_to_updated_channel_needs_one_probe_per_step()
             after.at(row.destination.label_pointer()).as_str(),
         ),
         (Some("ACTIVE"), Some(600), Some(row.name), Some(row.label)),
-        "expected the first probe after the update to report the applied change on an unchanged \
+        "expected the settled channel to report the applied change on an unchanged \
          channel, got {}",
         after.body
     );

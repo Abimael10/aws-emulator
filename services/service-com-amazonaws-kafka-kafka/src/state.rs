@@ -650,17 +650,34 @@ pub const CHANNEL_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
 /// before it leaves the registry.
 pub const CHANNEL_DELETION_DELAY: Duration = Duration::from_millis(500);
 
+/// How long after an accepted `UpdateChannel` the channel it changed leaves
+/// `UPDATING` for `ACTIVE` again.
+///
+/// CHOSEN, not documented, and the same span the rest of this service's
+/// clock-owed channel transitions take ([`CHANNEL_ACTIVATION_DELAY`],
+/// [`CHANNEL_DELETION_DELAY`]), which the project fixes at 250–750 ms:
+/// `UpdateChannel` answers a cluster-operation handle and echoes no destination
+/// member, so the change it accepts is carried out by an operation that is in
+/// flight for a span — long enough that a caller reading the channel straight
+/// afterwards still observes `UPDATING`, and with it the refusal an overlapping
+/// update gets ([`channel_not_updatable`]), while one that waits sees `ACTIVE`.
+pub const CHANNEL_UPDATE_DELAY: Duration = Duration::from_millis(500);
+
 /// The `ChannelStatus` values this emulator reports, spelled as the model's enum
 /// declares them. Named here so every channel operation reports the same
 /// spellings.
 ///
 /// (`FAILED`, `SUSPENDING` and `SUSPENDED`, the model's other values, belong to
-/// failures and to a suspend surface this emulator does not serve, and `UPDATING`
-/// to a destination change this service applies on the call that accepts it
-/// ([`Channel::begin_update`]) — so no stored channel is ever in one of them.)
+/// failures and to a suspend surface this emulator does not serve, so no stored
+/// channel is ever in one of them.)
 pub const CHANNEL_STATUS_CREATING: &str = "CREATING";
 /// The status of a channel whose delivery pipeline is up.
 pub const CHANNEL_STATUS_ACTIVE: &str = "ACTIVE";
+/// The status of a channel a destination change the service has accepted is still
+/// being applied to — what an accepted `UpdateChannel` leaves the channel in
+/// until the clock owes its cluster operation completion
+/// ([`Channel::begin_update`]).
+pub const CHANNEL_STATUS_UPDATING: &str = "UPDATING";
 /// The status of a channel whose deletion has been accepted but not completed.
 pub const CHANNEL_STATUS_DELETING: &str = "DELETING";
 
@@ -2041,8 +2058,10 @@ pub struct Channel {
     /// and the region segment of its own ARN.
     pub region: String,
     pub creation_time: SystemTime,
-    /// The instant the clock owes this channel its `CREATING` -> `ACTIVE`
-    /// transition. Stored, never slept on.
+    /// The instant the clock owes this channel its transition to `ACTIVE`: out of
+    /// `CREATING` for the create that minted it, and out of `UPDATING` for each
+    /// accepted destination change ([`Channel::begin_update`]). Stored, never
+    /// slept on.
     pub active_due: SystemTime,
     /// A `ChannelStatus` value.
     pub status: String,

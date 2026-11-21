@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateChannel
-//! Applies a destination change to a channel of the cluster named in the request path:
-//! the `DataFreshnessInSeconds` the update payload carries is written onto the
-//! destination the channel was created with BY THIS CALL, so the channel keeps its
-//! terminal `ACTIVE` status and the new value is what every independent reader
-//! reports from its first read, and the cluster operation carrying the change is
-//! filed as finished so the `ClusterOperationArn` this call answers names a record
-//! `DescribeClusterOperation`/`DescribeClusterOperationV2` resolve and report
-//! complete ([`crate::state::Channel::begin_update`] says why nothing is deferred).
+//! Accepts a destination change on a channel of the cluster named in the request
+//! path: the `DataFreshnessInSeconds` the update payload carries is written onto
+//! the destination the channel was created with, and the channel is parked in the
+//! non-terminal `UPDATING` status under the cluster operation this call answers,
+//! which the clock settles back to `ACTIVE`
+//! ([`crate::state::Channel::begin_update`]). The update is an ASYNCHRONOUS
+//! cluster operation — the model's output carries a `ClusterOperationArn` and
+//! echoes no destination member — so the `ClusterOperationArn` this call answers
+//! names a record `DescribeClusterOperation`/`DescribeClusterOperationV2` resolve
+//! and report in flight until the same instant the channel returns to `ACTIVE`,
+//! and a second update issued while the first is still in flight is refused
+//! rather than silently overwriting it.
 //!
 //! Nothing else about the channel moves: its name, its tags, its topic list and the
 //! rest of its destination configuration are the stored record's, byte for byte, both
@@ -30,7 +34,9 @@
 //! member documents ([`crate::state::is_data_freshness_in_range`]). The update must then
 //! name the destination kind the channel actually has ("Use only when the channel was
 //! created with an Amazon S3 destination"), and only an `ACTIVE` channel is updatable
-//! ([`crate::state::channel_not_updatable`]).
+//! ([`crate::state::channel_not_updatable`]) — which is what refuses an update that
+//! overlaps one already in flight, as well as one of a channel still being created or
+//! already on its way out.
 //!
 //! The operation is modelled `@idempotent`, so a repeat of an accepted update writes
 //! the same value again; it is nonetheless its own accepted change, so it files its
