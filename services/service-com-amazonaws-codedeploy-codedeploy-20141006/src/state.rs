@@ -84,6 +84,11 @@ pub mod service_role_permissions;
 /// service that OWNS them: the one place an `ecsServices` pair is loaded.
 pub mod ecs_services;
 
+/// The load balancer a deployment group routes its traffic through: the one place
+/// a group's `loadBalancerInfo` is asked whether it wires the deployments that
+/// group would run.
+pub mod load_balancer_gate;
+
 /// The SHA256 digest of a revision that carries its content inline: the one place
 /// that digest is computed, where such a revision is recorded.
 pub mod revision_digest;
@@ -858,6 +863,12 @@ pub const DEPLOYMENT_TYPE_IN_PLACE: &str = "IN_PLACE";
 /// (`smithy_query(query="shape",shape="DeploymentOption")`: WITH_TRAFFIC_CONTROL
 /// | WITHOUT_TRAFFIC_CONTROL) — see [`effective_deployment_style`].
 pub const DEPLOYMENT_OPTION_WITHOUT_TRAFFIC_CONTROL: &str = "WITHOUT_TRAFFIC_CONTROL";
+
+/// The `DeploymentOption` of a deployment group that routes its deployment
+/// traffic behind a load balancer — the other member of the pair above, and the
+/// one a group's load balancer configuration is required for
+/// ([`load_balancer_gate`]).
+pub const DEPLOYMENT_OPTION_WITH_TRAFFIC_CONTROL: &str = "WITH_TRAFFIC_CONTROL";
 
 /// The `OutdatedInstancesStrategy` a deployment group behaves by when the
 /// request left the member unset: the model's own documentation for it says "If

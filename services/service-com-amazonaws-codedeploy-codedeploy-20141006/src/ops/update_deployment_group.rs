@@ -498,7 +498,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 );
             };
-            if !application.deployment_groups.contains_key(&current_name) {
+            // The group being updated, resolved ONCE: the record every check below
+            // reads the group's current configuration from, and the one this update
+            // takes out of the store and puts back under its final name.
+            let Some(stored) = application.deployment_groups.get(&current_name) else {
                 return Err(
                     UpdateDeploymentGroupErrorModeled::DeploymentGroupDoesNotExistException(
                         DeploymentGroupDoesNotExistException {
@@ -508,7 +511,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         },
                     ),
                 );
-            }
+            };
             // The role the group would run as, now that the group being updated
             // has been resolved.
             if let Some(message) = role_trust_refusal {
@@ -517,6 +520,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         message: Some(message),
                     },
                 ));
+            }
+            // The load balancer the group would route its traffic through AFTER
+            // this update: the same precondition `CreateDeploymentGroup` applies
+            // ([`crate::state::load_balancer_gate`]), judged on the configuration
+            // the group would END UP with — the style and the load balancer this
+            // request names, or the ones the stored group keeps where it names
+            // none — so an update may not leave a group describing a traffic move
+            // it could never perform either. Ordered ahead of the `ecsServices`
+            // verdict for the reason the created group's is.
+            let style_after_update = match input.deployment_style.clone() {
+                Some(style) => crate::state::effective_deployment_style(Some(style)),
+                None => stored.deployment_style.clone(),
+            };
+            if let Some(message) = crate::state::load_balancer_gate::load_balancer_refusal(
+                &stored.compute_platform,
+                style_after_update.as_ref(),
+                input
+                    .load_balancer_info
+                    .as_ref()
+                    .or(stored.load_balancer_info.as_ref()),
+            ) {
+                return Err(
+                    UpdateDeploymentGroupErrorModeled::InvalidLoadBalancerInfoException(
+                        InvalidLoadBalancerInfoException {
+                            message: Some(message.to_string()),
+                        },
+                    ),
+                );
             }
             // And the Amazon ECS services the update names, resolved above against
             // the service that owns them: a pair that could not be loaded is

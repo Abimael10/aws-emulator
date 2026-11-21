@@ -430,6 +430,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let application_name = input.application_name;
         let deployment_group_name = input.deployment_group_name;
         let requested_config = input.deployment_config_name;
+        // The style the group would RUN BY, materialised here rather than at the
+        // write below, because the precondition its traffic option carries
+        // ([`crate::state::load_balancer_gate`]) is judged on the style the group
+        // HAS: a request that named neither member of the style is judged on the
+        // server-side default, exactly as a read of the stored group reports it.
+        let deployment_style = crate::state::effective_deployment_style(input.deployment_style);
 
         let outcome = crate::state::with_state(&*self.engine, |state| {
             // Resolving a NAMED configuration is a read of the configuration
@@ -477,6 +483,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         message: Some(message),
                     },
                 ));
+            }
+            // The load balancer the group would route its traffic through, now
+            // that the application whose compute platform decides whether it needs
+            // one has been resolved. Ordered AHEAD of the `ecsServices` verdict
+            // below: a group that names no load balancer at all is refused for
+            // that, whatever the pair it targets resolves to — the pair was
+            // resolved above, and this refusal simply does not consult it.
+            if let Some(message) = crate::state::load_balancer_gate::load_balancer_refusal(
+                &application.compute_platform,
+                deployment_style.as_ref(),
+                input.load_balancer_info.as_ref(),
+            ) {
+                return Err(
+                    CreateDeploymentGroupErrorModeled::InvalidLoadBalancerInfoException(
+                        InvalidLoadBalancerInfoException {
+                            message: Some(message.to_string()),
+                        },
+                    ),
+                );
             }
             // And the Amazon ECS services the group would target, resolved above
             // against the service that owns them: a pair that could not be loaded
@@ -610,7 +635,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 outdated_instances_strategy: crate::state::effective_outdated_instances_strategy(
                     input.outdated_instances_strategy,
                 ),
-                deployment_style: crate::state::effective_deployment_style(input.deployment_style),
+                deployment_style,
                 blue_green_deployment_configuration: input.blue_green_deployment_configuration,
                 load_balancer_info: input.load_balancer_info,
                 ec2_tag_set: input.ec2_tag_set,
