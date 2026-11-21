@@ -11,7 +11,10 @@
 //! zone, size, type, performance, encryption state and tags, EC2's own write and read paths
 //! act on it (`ec2:CreateTags`, `ec2:CreateSnapshot`), and `DeleteVolume` makes it disappear
 //! from there. A create WorkSpaces Instances refuses creates no volume at all, so the
-//! account's EBS inventory is untouched by a refusal.
+//! account's EBS inventory is untouched by a refusal — and so is one volume of it: a call
+//! this service refuses for a volume it holds leaves EC2's reading of that volume exactly as
+//! it was, still resolvable, in the same state and configuration, carrying the tags EC2
+//! holds and attached to nothing.
 //!
 //! This suite lives beside the router because the volume is EC2's: both services are mounted
 //! on ONE engine exactly as `core/router/src/lib.rs` mounts them, and nothing here reaches
@@ -680,5 +683,439 @@ async fn a_create_this_service_refuses_puts_no_volume_in_the_account() {
             "case {case:?}: a refused create must leave the account's volumes exactly as they \
              were"
         );
+    }
+}
+
+/// The status this service answers `ResourceNotFoundException` with over the wire: the one
+/// the owning crate's own wire suite pins from the recordings, NOT the 404 the error shape
+/// declares. Pinned here rather than read out of that crate, so this suite measures what
+/// goes over the wire against the recorded contract instead of against itself.
+const WSI_NOT_FOUND_STATUS: u16 = 400;
+
+/// The `awsJson` error codes a refused WorkSpaces Instances volume call carries.
+const RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// The request-independent sentence this service answers for an id that names no WorkSpace
+/// Instance it holds, and the one for an id that names no volume it holds: one wording per
+/// condition, naming neither the operation nor the value the request sent.
+const INSTANCE_NOT_FOUND_MESSAGE: &str = "Workspace instance is not found";
+const VOLUME_NOT_FOUND_MESSAGE: &str = "Workspace managed EBS volume is not found";
+
+/// A `WorkspaceInstanceId` that satisfies its modelled shape (`len 15..70`,
+/// `^wsinst-[0-9a-zA-Z]{8,63}$`) and names no WorkSpace Instance anybody created — written as
+/// a function so a row can name an id at a bound of that shape without a hand-counted
+/// literal.
+type UnknownInstance = fn() -> String;
+
+/// The shortest id the modelled pattern admits: the 8-character minimum suffix.
+fn shortest_unknown_instance() -> String {
+    format!("wsinst-{}", "a".repeat(8))
+}
+
+/// The longest id it admits: the 63-character maximum suffix, which is the modelled
+/// `len 15..70` maximum too.
+fn longest_unknown_instance() -> String {
+    format!("wsinst-{}", "z".repeat(63))
+}
+
+/// A mixed-case suffix, which the pattern's `[0-9a-zA-Z]` class admits.
+fn mixed_case_unknown_instance() -> String {
+    "wsinst-AbCdEf0123".to_string()
+}
+
+/// An all-digit suffix.
+fn all_digit_unknown_instance() -> String {
+    "wsinst-012345678".to_string()
+}
+
+/// The sentence each cross-field refusal carries. Both state the member and the constraint
+/// it violated and echo nothing the request sent, which is how every refusal of this service
+/// is worded.
+///
+/// `Device` is a REQUIRED member of `AssociateVolume` whose target `DeviceName` is modelled
+/// `len 0..32` (`smithy_query(query="operation",operation="AssociateVolume")`), so the empty
+/// string satisfies the constraint while naming no device path to attach at — the member the
+/// refusal faults. `SizeInGB` is the documented growth rule: "The target size must be greater
+/// than or equal to the current size of the volume" (`ModifyVolume$SizeInGB`).
+///
+/// Neither condition has a recorded AWS sentence of its own, so what is pinned here is the
+/// one wording this emulator states for it, in both places a client reads it (the top-level
+/// `Message` and the `FieldList` entry's) — what the rows assert about these two is the
+/// member faulted and that the two readings agree, not a sentence AWS was observed sending.
+const DEVICE_REQUIRED_MESSAGE: &str = "Device must name the device path to attach the volume at";
+const SIZE_NOT_SHRINKABLE_MESSAGE: &str =
+    "SizeInGB must be greater than or equal to the current size of the volume";
+
+/// One WorkSpaces Instances call that is refused, as the row spells it.
+enum Call {
+    /// `AssociateVolume`, naming an instance nobody created and a device path.
+    Attach {
+        instance: UnknownInstance,
+        device: &'static str,
+    },
+    /// `DisassociateVolume`, naming an instance nobody created.
+    Detach { instance: UnknownInstance },
+    /// `ModifyVolume` asking for a size strictly below the volume's own, which "The target
+    /// size must be greater than or equal to the current size of the volume"
+    /// (`ModifyVolume$SizeInGB`) refuses.
+    Shrink,
+    /// `DeleteVolume` of a well-formed `VolumeId` (`^vol-[0-9a-zA-Z]{1,63}$`) this service
+    /// never minted, sent while the live volume is held.
+    DeleteUnknown { volume_id: &'static str },
+}
+
+/// What a refusal must carry: the status and code it is answered with, the fixed sentence for
+/// its condition, the id a not-found names, and the member a validation failure faults.
+struct Expected {
+    status: u16,
+    code: &'static str,
+    message: &'static str,
+    resource_id: Option<String>,
+    field: Option<&'static str>,
+}
+
+/// The volume a row is sent against: the id EC2 minted for it, and a size strictly below its
+/// own for the row that asks to shrink it.
+struct LiveVolume {
+    id: String,
+    smaller_size: u32,
+}
+
+/// The call one row makes against `volume`: the operation, its body, and the refusal it must
+/// be answered with.
+fn refused_call(call: &Call, volume: &LiveVolume) -> (&'static str, Value, Expected) {
+    match call {
+        Call::Attach { instance, device } => {
+            let instance = instance();
+            let body = json!({
+                "WorkspaceInstanceId": &instance,
+                "VolumeId": &volume.id,
+                "Device": device,
+            });
+            if device.is_empty() {
+                // The empty `Device` names no device path at all, and the member is faulted
+                // before either id is resolved — so this row is refused for the member
+                // whatever the instance id it carries.
+                return (
+                    "AssociateVolume",
+                    body,
+                    Expected {
+                        status: 400,
+                        code: VALIDATION_EXCEPTION,
+                        message: DEVICE_REQUIRED_MESSAGE,
+                        resource_id: None,
+                        field: Some("Device"),
+                    },
+                );
+            }
+            (
+                "AssociateVolume",
+                body,
+                Expected {
+                    status: WSI_NOT_FOUND_STATUS,
+                    code: RESOURCE_NOT_FOUND,
+                    message: INSTANCE_NOT_FOUND_MESSAGE,
+                    resource_id: Some(instance),
+                    field: None,
+                },
+            )
+        }
+        Call::Detach { instance } => {
+            let instance = instance();
+            let body = json!({
+                "WorkspaceInstanceId": &instance,
+                "VolumeId": &volume.id,
+            });
+            (
+                "DisassociateVolume",
+                body,
+                Expected {
+                    status: WSI_NOT_FOUND_STATUS,
+                    code: RESOURCE_NOT_FOUND,
+                    message: INSTANCE_NOT_FOUND_MESSAGE,
+                    resource_id: Some(instance),
+                    field: None,
+                },
+            )
+        }
+        Call::Shrink => (
+            "ModifyVolume",
+            json!({ "VolumeId": &volume.id, "SizeInGB": volume.smaller_size }),
+            Expected {
+                status: 400,
+                code: VALIDATION_EXCEPTION,
+                message: SIZE_NOT_SHRINKABLE_MESSAGE,
+                resource_id: None,
+                field: Some("SizeInGB"),
+            },
+        ),
+        Call::DeleteUnknown { volume_id } => (
+            "DeleteVolume",
+            json!({ "VolumeId": volume_id }),
+            Expected {
+                status: WSI_NOT_FOUND_STATUS,
+                code: RESOURCE_NOT_FOUND,
+                message: VOLUME_NOT_FOUND_MESSAGE,
+                resource_id: Some((*volume_id).to_string()),
+                field: None,
+            },
+        ),
+    }
+}
+
+/// The rows: one per refusal class these operations answer, differing in the operation, in
+/// the kind of id or member the refusal is about, and in the spelling of the well-formed id
+/// nobody created.
+const REFUSALS: &[(&str, Call)] = &[
+    (
+        "an attach naming the shortest instance id nobody created",
+        Call::Attach {
+            instance: shortest_unknown_instance,
+            device: "/dev/sdf",
+        },
+    ),
+    (
+        "an attach naming the longest instance id nobody created",
+        Call::Attach {
+            instance: longest_unknown_instance,
+            device: "/dev/sdg",
+        },
+    ),
+    (
+        "an attach naming a mixed-case instance id nobody created",
+        Call::Attach {
+            instance: mixed_case_unknown_instance,
+            device: "/dev/sdh",
+        },
+    ),
+    (
+        "a detach naming an all-digit instance id nobody created",
+        Call::Detach {
+            instance: all_digit_unknown_instance,
+        },
+    ),
+    (
+        "an attach at a Device that names no device path",
+        Call::Attach {
+            instance: mixed_case_unknown_instance,
+            device: "",
+        },
+    ),
+    ("a modification asking to shrink the volume", Call::Shrink),
+    (
+        "a delete of a volume id this service never minted",
+        Call::DeleteUnknown {
+            volume_id: "vol-abc123XYZ",
+        },
+    ),
+];
+
+/// One create the refusals are asserted against.
+struct LiveRow {
+    case: &'static str,
+    /// The `CreateVolume` body.
+    body: fn() -> Value,
+    /// A size strictly below the one that body asks for, for the row that asks to shrink the
+    /// volume.
+    smaller_size: u32,
+}
+
+/// The volumes the refusals are asserted against: rows differing in the volume type, the
+/// size, the zone, the performance members the type takes, the encryption state and whether
+/// the create carried tags.
+const LIVE: &[LiveRow] = &[
+    LiveRow {
+        case: "a volume of the default type",
+        body: || json!({ "AvailabilityZone": "us-east-1a", "SizeInGB": 8 }),
+        smaller_size: 4,
+    },
+    LiveRow {
+        case: "a tagged gp3 volume with provisioned performance",
+        body: || {
+            json!({
+                "AvailabilityZone": "us-east-1b",
+                "SizeInGB": 20,
+                "VolumeType": "gp3",
+                "Iops": 4_000,
+                "Throughput": 250,
+                "TagSpecifications": [
+                    { "ResourceType": "volume", "Tags": [{ "Key": "team", "Value": "eu" }] },
+                ],
+            })
+        },
+        smaller_size: 19,
+    },
+    LiveRow {
+        case: "an encrypted io2 volume",
+        body: || {
+            json!({
+                "AvailabilityZone": "us-east-1c",
+                "SizeInGB": 500,
+                "VolumeType": "io2",
+                "Iops": 1_000,
+                "Encrypted": true,
+                "KmsKeyId": "alias/aws/ebs",
+            })
+        },
+        smaller_size: 499,
+    },
+];
+
+/// The `Message` a refusal carries.
+fn wsi_message(payload: &Value) -> String {
+    payload
+        .get("Message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The `ResourceId` a `ResourceNotFoundException` names.
+fn wsi_resource_id(payload: &Value) -> String {
+    payload
+        .get("ResourceId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The members a `ValidationException` faults, as its `FieldList` names them, each with the
+/// sentence that entry carries — one wording in both places a client reads it.
+fn wsi_faulted_members(payload: &Value) -> Vec<(String, String)> {
+    payload
+        .get("FieldList")
+        .and_then(Value::as_array)
+        .map(|fields| {
+            fields
+                .iter()
+                .filter_map(|field| {
+                    Some((
+                        field.get("Name").and_then(Value::as_str)?.to_string(),
+                        field.get("Message").and_then(Value::as_str)?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The instances the attachments Amazon EC2 reports on one volume block name — empty for a
+/// volume attached to nothing, which is every volume no attach has been served for.
+fn attached_instances(item: &str) -> Vec<String> {
+    let Some(set) = block_of(item, "attachmentSet") else {
+        return Vec::new();
+    };
+    items_of(set)
+        .into_iter()
+        .filter_map(|entry| opt_element(entry, "instanceId"))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_refused_volume_call_leaves_the_ebs_volume_exactly_as_ec2_reported_it() {
+    let router = emulator();
+
+    for row in LIVE {
+        let volume_case = row.case;
+        let volume = LiveVolume {
+            id: create_volume(&router, volume_case, (row.body)()).await,
+            smaller_size: row.smaller_size,
+        };
+        // The volume reaches `available` in the service that OWNS it, so each refusal below
+        // is measured against a settled volume rather than against one mid-transition.
+        settled_in(&router, volume_case, &volume.id, &[STATE_AVAILABLE]).await;
+
+        // The write the id exists for: an EC2 tag on the id this service just answered must
+        // be SERVED, because that id names a volume of the account rather than a record of
+        // this service alone. The tag also makes the "unchanged" comparison below
+        // non-trivial — there is something on the volume that only this call put there.
+        let check_tag = format!("check-{}", volume.id);
+        ec2_ok(
+            &router,
+            volume_case,
+            "CreateTags",
+            &[
+                ("ResourceId.1", volume.id.as_str()),
+                ("Tag.1.Key", "simparity-check"),
+                ("Tag.1.Value", check_tag.as_str()),
+            ],
+        )
+        .await;
+
+        // What EC2 reports for the volume before any refused call is made: the reading every
+        // row is compared against.
+        let before = described(&router, &volume.id)
+            .await
+            .unwrap_or_else(|| panic!("case {volume_case:?}: EC2 resolves no volume {}", volume.id));
+        assert_eq!(
+            volume_tags(&before).get("simparity-check").map(String::as_str),
+            Some(check_tag.as_str()),
+            "case {volume_case:?}: expected the tag EC2 wrote on {}, got {before}",
+            volume.id
+        );
+        assert_eq!(
+            attached_instances(&before),
+            Vec::<String>::new(),
+            "case {volume_case:?}: expected {} to be attached to nothing, got {before}",
+            volume.id
+        );
+        let held_before = held_volume_ids(&router, volume_case).await;
+
+        for (refusal_case, call) in REFUSALS {
+            let case = format!("{volume_case}, {refusal_case}");
+            let (operation, request, expected) = refused_call(call, &volume);
+            let (status, payload) = wsi(&router, operation, request).await;
+            assert_eq!(
+                (status, wsi_error_code(&payload).as_str()),
+                (expected.status, expected.code),
+                "case {case:?}: expected {operation} to be refused as {} with HTTP {}, got HTTP \
+                 {status} with {payload}",
+                expected.code,
+                expected.status
+            );
+            assert_eq!(
+                wsi_message(&payload),
+                expected.message,
+                "case {case:?}: expected the fixed sentence for this condition, got {payload}"
+            );
+            if let Some(resource_id) = expected.resource_id.as_deref() {
+                assert_eq!(
+                    wsi_resource_id(&payload),
+                    resource_id,
+                    "case {case:?}: expected the refusal to name the id it could not resolve, got \
+                     {payload}"
+                );
+            }
+            if let Some(field) = expected.field {
+                assert_eq!(
+                    wsi_faulted_members(&payload),
+                    vec![(field.to_string(), expected.message.to_string())],
+                    "case {case:?}: expected the refusal to fault {field} with the sentence it \
+                     states, got {payload}"
+                );
+            }
+
+            // The whole point: the call changed nothing about the volume in the service that
+            // holds it — it still resolves, in the same state, configuration and tags, and
+            // attached to nothing — and the account's inventory is the one it was.
+            let after = described(&router, &volume.id).await.unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: EC2 resolves no volume {} after a refused call",
+                    volume.id
+                )
+            });
+            assert_eq!(
+                after, before,
+                "case {case:?}: a refused call must leave EC2's reading of {} exactly as it was",
+                volume.id
+            );
+            let held_after = held_volume_ids(&router, &case).await;
+            assert_eq!(
+                held_after, held_before,
+                "case {case:?}: a refused call must leave the account's volumes exactly as they \
+                 were"
+            );
+        }
     }
 }
