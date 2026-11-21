@@ -25,14 +25,22 @@
 //! (string, integer, boolean and the identifier a rename stages) beside the settings that
 //! are applied at once, every published retention value and the shapes the member refuses,
 //! and the case forms a window can be written in.
+//!
+//! Nothing here waits a span of wall-clock for a change this service's clock owes: every
+//! wait is the one poll loop this test target shares (`lifecycle_poll_loops::poll_until`),
+//! which re-reads a REPORTING call on a monotonic deadline until the condition the case
+//! needs holds, so the verdict is the same on a loaded host as on an idle one. For the same
+//! reason the window a case needs OPEN is derived from the instant the service reads it
+//! rather than from a calendar day, and the window a case needs CLOSED names a weekday days
+//! away.
 
-use service_com_amazonaws_rds_amazonrdsv19::state::STATUS_TRANSITION_DELAY;
-use std::time::{Duration, SystemTime};
+use service_com_amazonaws_rds_amazonrdsv19::state::window_is_open;
+use std::time::SystemTime;
 
 use crate::db_instances::{
     call, emulator, expect_error, expect_ok, optional_text, subtrees, text, texts,
-    wait_for_settle,
 };
+use crate::lifecycle_poll_loops::{poll_until, read_instance};
 
 /// `[(name, value.to_string()), ..]` — the query parameters of one call.
 macro_rules! params {
@@ -40,14 +48,6 @@ macro_rules! params {
         [$(($name, $value.to_string())),*]
     };
 }
-
-/// How long a poll for a change the clock owes keeps looking before giving up: far longer
-/// than the span this service owes a transition in, so a loaded machine still gets there.
-/// Nothing is asserted about elapsed time — only that the condition holds in the end.
-const POLL_DEADLINE: Duration = Duration::from_secs(30);
-
-/// How often that poll looks again.
-const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// One row of the deferral table: a setting `ModifyDBInstance` takes, the value it is
 /// modified to, and the member the instance reports it under.
@@ -185,7 +185,10 @@ async fn an_instance(
         identifier,
         call(router, "CreateDBInstance", &settings).await,
     );
-    wait_for_settle();
+    // The create owes the instance `available`, which is the state a modification needs it
+    // in: it is READ until it reports that, the way a client's waiter does, rather than
+    // waited on for a span of wall-clock.
+    settled_instance(router, identifier, identifier).await;
 }
 
 /// The one `<DBInstance>` `DescribeDBInstances` reports for `identifier`.
@@ -203,13 +206,65 @@ async fn describe(
         )
         .await,
     );
-    let found = subtrees(&body, "DBInstance");
+    the_one_instance(case, &body)
+}
+
+/// The one `<DBInstance>` a report carries, whichever call answered it.
+fn the_one_instance(case: &str, body: &str) -> String {
+    let found = subtrees(body, "DBInstance");
     assert_eq!(
         found.len(),
         1,
         "case {case:?}: expected exactly one DBInstance, got {found:?}"
     );
     found.into_iter().next().expect("checked just above")
+}
+
+/// Read `identifier` through `DescribeDBInstances` again and again until the instance it
+/// reports satisfies `holds`, and answer that instance.
+///
+/// This is how every wait in this suite is made: `holds` is the CONDITION the case needs —
+/// a status this service's clock owes, a staged change applied, an export listed — and the
+/// loop is the shared one this test target polls every owed transition through
+/// ([`poll_until`]), bounded by a monotonic deadline that is generous beside the span a
+/// transition is owed in. `what` names the condition for the panic a deadline raises.
+async fn poll_instance(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    case: &str,
+    what: &str,
+    identifier: &str,
+    holds: impl Fn(&str) -> bool,
+) -> String {
+    let (body, _) = poll_until(
+        case,
+        what,
+        || read_instance(router, identifier),
+        |status, body| {
+            status == 200
+                && subtrees(body, "DBInstance")
+                    .first()
+                    .is_some_and(|instance| holds(instance))
+        },
+    )
+    .await;
+    the_one_instance(case, &body)
+}
+
+/// [`poll_instance`] for the state every transition this service owes an instance settles
+/// on: `available`, which is also the state a modification requires it to be in.
+async fn settled_instance(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    case: &str,
+    identifier: &str,
+) -> String {
+    poll_instance(
+        router,
+        case,
+        &format!("{identifier} reaching available"),
+        identifier,
+        |instance| optional_text(instance, "DBInstanceStatus").as_deref() == Some("available"),
+    )
+    .await
 }
 
 /// What `instance` reports as pending, or `None` when it reports no pending element at all.
@@ -268,9 +323,10 @@ async fn apply_immediately_disabled_stages_every_deferrable_setting_for_the_wind
             case.value
         );
         // A read of the instance says the same: the deferral is in state, not in the one
-        // answer.
-        wait_for_settle();
-        let read_back = describe(&router, case.case, case.identifier).await;
+        // answer. The read is made once the instance is settled, which it is read until —
+        // a deferred modification leaves the status alone, so the condition holds at once
+        // and nothing is waited out.
+        let read_back = settled_instance(&router, case.case, case.identifier).await;
         let live = optional_text(&read_back, case.reported_as);
         assert_eq!(
             live.as_deref(),
@@ -303,7 +359,7 @@ async fn apply_immediately_enabled_applies_the_request_and_what_was_pending() {
         )
         .await,
     );
-    wait_for_settle();
+    settled_instance(&router, "the staged change", "emu-apply-now").await;
     expect_ok(
         "apply with a class change",
         call(
@@ -317,8 +373,16 @@ async fn apply_immediately_enabled_applies_the_request_and_what_was_pending() {
         )
         .await,
     );
-    wait_for_settle();
-    let read_back = describe(&router, "both changes applied", "emu-apply-now").await;
+    // Both are owed "as soon as possible", which is an instant of its own: the instance is
+    // read until it has nothing pending any more rather than waited on for a fixed span.
+    let read_back = poll_instance(
+        &router,
+        "both changes applied",
+        "the instance applying the request and what was pending",
+        "emu-apply-now",
+        |instance| pending(instance).is_none(),
+    )
+    .await;
     for (member, expected) in [("AllocatedStorage", "40"), ("DBInstanceClass", "db.t3.small")] {
         let actual = optional_text(&read_back, member);
         assert_eq!(
@@ -414,47 +478,42 @@ async fn a_modification_asked_for_at_once_is_pending_until_the_instance_is_avail
         // call — so what is waited for there is the instance coming back from the reboot the
         // rename causes.
         let settled_identifier = if renaming { case.value } else { &identifier };
-        let deadline = SystemTime::now() + POLL_DEADLINE;
-        loop {
-            let read_back = describe(&router, case.case, settled_identifier).await;
-            let status = optional_text(&read_back, "DBInstanceStatus");
-            let settled = if renaming {
-                status.as_deref() == Some("available")
-            } else {
-                pending(&read_back).is_none()
-            };
-            if settled {
-                assert_eq!(
-                    status.as_deref(),
-                    Some("available"),
-                    "case {:?}: the instance must be available once nothing is pending, got \
-                     {read_back}",
-                    case.case
-                );
-                let live = optional_text(&read_back, case.reported_as);
-                // `DbInstancePort` reports the port of a CLUSTER MEMBER and zero for an
-                // instance that belongs to no DB cluster, which every instance here is, so
-                // the applied value is not observable on that member — what this row asserts
-                // is that the staged port stops being pending.
-                if case.reported_as != "DbInstancePort" {
-                    assert_eq!(
-                        live.as_deref(),
-                        Some(case.value),
-                        "case {:?}: expected {} applied to {:?}, got {live:?}",
-                        case.case,
-                        case.reported_as,
-                        case.value
-                    );
+        let read_back = poll_instance(
+            &router,
+            case.case,
+            "the change asked for at once being applied",
+            settled_identifier,
+            |instance| {
+                if renaming {
+                    optional_text(instance, "DBInstanceStatus").as_deref() == Some("available")
+                } else {
+                    pending(instance).is_none()
                 }
-                break;
-            }
-            assert!(
-                SystemTime::now() < deadline,
-                "case {:?}: the change asked for at once must be applied, last read \
-                 {read_back}",
-                case.case
+            },
+        )
+        .await;
+        let status = optional_text(&read_back, "DBInstanceStatus");
+        assert_eq!(
+            status.as_deref(),
+            Some("available"),
+            "case {:?}: the instance must be available once nothing is pending, got \
+             {read_back}",
+            case.case
+        );
+        let live = optional_text(&read_back, case.reported_as);
+        // `DbInstancePort` reports the port of a CLUSTER MEMBER and zero for an instance
+        // that belongs to no DB cluster, which every instance here is, so the applied value
+        // is not observable on that member — what this row asserts is that the staged port
+        // stops being pending.
+        if case.reported_as != "DbInstancePort" {
+            assert_eq!(
+                live.as_deref(),
+                Some(case.value),
+                "case {:?}: expected {} applied to {:?}, got {live:?}",
+                case.case,
+                case.reported_as,
+                case.value
             );
-            std::thread::sleep(POLL_INTERVAL);
         }
     }
 }
@@ -561,19 +620,15 @@ async fn poll_until_exports(
     case: &str,
     holds: impl Fn(&[String]) -> bool,
 ) -> Vec<String> {
-    let deadline = SystemTime::now() + POLL_DEADLINE;
-    loop {
-        let read_back = describe(router, case, "emu-log-exports").await;
-        let exports = texts_in(&read_back, "EnabledCloudwatchLogsExports");
-        if holds(&exports) {
-            return exports;
-        }
-        assert!(
-            SystemTime::now() < deadline,
-            "case {case:?}: the export configuration must be applied, last read {read_back}"
-        );
-        std::thread::sleep(POLL_INTERVAL);
-    }
+    let read_back = poll_instance(
+        router,
+        case,
+        "the export configuration being applied",
+        "emu-log-exports",
+        |instance| holds(&texts_in(instance, "EnabledCloudwatchLogsExports")),
+    )
+    .await;
+    texts_in(&read_back, "EnabledCloudwatchLogsExports")
 }
 
 #[tokio::test]
@@ -593,7 +648,7 @@ async fn a_reboot_applies_what_the_window_was_waiting_for() {
         )
         .await,
     );
-    wait_for_settle();
+    settled_instance(&router, "the staged change", "emu-defer-reboot").await;
     expect_ok(
         "reboot",
         call(
@@ -603,8 +658,9 @@ async fn a_reboot_applies_what_the_window_was_waiting_for() {
         )
         .await,
     );
-    wait_for_settle();
-    let read_back = describe(&router, "after the reboot", "emu-defer-reboot").await;
+    // The restart is a transition this service owes: the instance is read until it is back
+    // rather than waited on for a span of wall-clock.
+    let read_back = settled_instance(&router, "after the reboot", "emu-defer-reboot").await;
     let actual = optional_text(&read_back, "AllocatedStorage");
     assert_eq!(
         actual.as_deref(),
@@ -643,12 +699,25 @@ async fn the_maintenance_window_is_what_a_staged_change_waits_for() {
         )
         .await,
     );
-    wait_for_settle();
-    let read_back = describe(&router, "before the window", "emu-defer-window").await;
+    // The read is made once the instance is settled, which it is READ until: a deferred
+    // modification leaves the status alone, so this holds at once and nothing is waited out.
+    let read_back = settled_instance(&router, "before the window", "emu-defer-window").await;
     assert_eq!(
         optional_text(&read_back, "AllocatedStorage").as_deref(),
         Some("20"),
         "a change staged for a window days away stays pending, got {read_back}"
+    );
+    let staged = pending(&read_back).unwrap_or_else(|| {
+        panic!(
+            "a change staged for a window days away must still be reported as pending, got \
+             {read_back}"
+        )
+    });
+    let waiting = optional_text(&staged, "AllocatedStorage");
+    assert_eq!(
+        waiting.as_deref(),
+        Some("40"),
+        "the staged value waits for the window as AllocatedStorage, got {waiting:?}"
     );
     // Moving the window to one that has already started makes the staged change due: the
     // window CONTROLS when a pending change is applied, so the instance is read until it
@@ -665,23 +734,25 @@ async fn the_maintenance_window_is_what_a_staged_change_waits_for() {
         )
         .await,
     );
-    let deadline = SystemTime::now() + POLL_DEADLINE;
-    loop {
-        let read_back = describe(&router, "in the window", "emu-defer-window").await;
-        if optional_text(&read_back, "AllocatedStorage").as_deref() == Some("40") {
-            assert!(
-                pending(&read_back).is_none(),
-                "nothing stays pending once the window applied it, got {read_back}"
-            );
-            break;
-        }
-        assert!(
-            SystemTime::now() < deadline,
-            "the change staged for the window must be applied once that window has come \
-             round, last read {read_back}"
-        );
-        std::thread::sleep(POLL_INTERVAL);
-    }
+    let read_back = poll_instance(
+        &router,
+        "in the window",
+        "the change staged for the window being applied once that window has come round",
+        "emu-defer-window",
+        |instance| optional_text(instance, "AllocatedStorage").as_deref() == Some("40"),
+    )
+    .await;
+    let applied = optional_text(&read_back, "AllocatedStorage");
+    assert_eq!(
+        applied.as_deref(),
+        Some("40"),
+        "the change staged for the window must be applied once that window has come round, \
+         last read {read_back}"
+    );
+    assert!(
+        pending(&read_back).is_none(),
+        "nothing stays pending once the window applied it, got {read_back}"
+    );
 }
 
 #[tokio::test]
@@ -718,7 +789,16 @@ async fn a_setting_pending_modified_values_cannot_report_is_applied_at_once() {
             "case {case:?}: a setting the structure cannot report leaves nothing pending, \
              got {answered}"
         );
-        wait_for_settle();
+        // And a read of the instance says the same, once every transition this row's
+        // modification owed has settled — read until it holds, not waited out.
+        let read_back = settled_instance(&router, case, &identifier).await;
+        let reported = optional_text(&read_back, reported_as);
+        assert_eq!(
+            reported.as_deref(),
+            Some(*value),
+            "case {case:?}: expected a later read of {reported_as} to stay {value:?}, got \
+             {reported:?}"
+        );
     }
 }
 
@@ -874,34 +954,60 @@ pub(crate) fn window_days_ahead() -> String {
     format!("{day}:12:00-{day}:12:30")
 }
 
-/// A window that has ALREADY started: today's weekday at the start of the day, so its
-/// occurrence is behind the clock whenever the test runs.
+/// A window that is OPEN at the instant this service reads it — it has already started and
+/// has not yet ended: the span from two hours before now to two hours after it, in the
+/// `ddd:hh24:mi-ddd:hh24:mi` form the member documents (the span wraps the week's end on its
+/// own where now is near it, which is a form the member admits).
+///
+/// Derived from the INSTANT rather than from a calendar day, so no reading of the clock can
+/// fall outside it: a whole-day span is closed again in the minute after its last one and
+/// names yesterday's weekday once midnight has passed, and either would leave a change
+/// staged against this window waiting for a week.
 fn window_that_started() -> String {
-    let day = weekday_index(0);
-    format!("{day}:00:00-{day}:23:59")
+    let now = chrono::Utc::now();
+    let margin = chrono::Duration::hours(2);
+    format!(
+        "{}-{}",
+        window_point(now - margin),
+        window_point(now + margin)
+    )
+}
+
+/// One `ddd:hh24:mi` point of a window: the UTC weekday, hour and minute of `at`, read
+/// through the calendar of the `chrono` crate rather than by hand.
+fn window_point(at: chrono::DateTime<chrono::Utc>) -> String {
+    use chrono::Timelike;
+
+    format!("{}:{:02}:{:02}", weekday_name(at), at.hour(), at.minute())
 }
 
 /// The `ddd` day name `days` days after today in UTC, in the lower-case form the member
-/// documents, read through the calendar of the `chrono` crate rather than by hand.
+/// documents.
 fn weekday_index(days: i64) -> &'static str {
+    weekday_name(chrono::Utc::now() + chrono::Duration::days(days))
+}
+
+/// The `ddd` day name of `at` in UTC, in the lower-case form the member documents, read
+/// through the calendar of the `chrono` crate rather than by hand.
+fn weekday_name(at: chrono::DateTime<chrono::Utc>) -> &'static str {
     const DAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
-    let at = chrono::Utc::now() + chrono::Duration::days(days);
     DAYS[chrono::Datelike::weekday(&at).num_days_from_monday() as usize]
 }
 
-/// The window used above has to be one this service can read as a schedule, which is what
-/// the rest of this suite depends on; the span a transition is owed in is what every wait
-/// here is sized against.
+/// The windows used above have to be ones this service can read as a schedule, and each has
+/// to be what it is chosen FOR: the one a case moves a staged change into has to be OPEN at
+/// the instant the service reads it, and the one a change is staged against has to be
+/// CLOSED. Both are judged by the service's own reader of a window, so a fixture that would
+/// make a case pass or fail by the clock rather than by the behaviour fails here instead.
 #[test]
 fn the_fixtures_are_well_formed() {
-    assert!(
-        STATUS_TRANSITION_DELAY < POLL_DEADLINE,
-        "the poll deadline must be generous beside the span a transition is owed in"
-    );
-    for window in [window_days_ahead(), window_that_started()] {
+    for (what, window, open) in [
+        ("the window days away", window_days_ahead(), false),
+        ("the window that started", window_that_started(), true),
+    ] {
         let (start, end) = window
             .split_once('-')
-            .unwrap_or_else(|| panic!("window {window:?} must carry a start and an end"));
+            .unwrap_or_else(|| panic!("{what} {window:?} must carry a start and an end"));
         for half in [start, end] {
             assert_eq!(
                 half.split(':').count(),
@@ -909,5 +1015,10 @@ fn the_fixtures_are_well_formed() {
                 "window half {half:?} must be ddd:hh24:mi"
             );
         }
+        let actual = window_is_open(&window, SystemTime::now());
+        assert_eq!(
+            actual, open,
+            "{what} {window:?}: expected open = {open}, got {actual}"
+        );
     }
 }

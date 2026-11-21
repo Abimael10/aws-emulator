@@ -131,7 +131,13 @@ fn the_instance(case: &str, body: &str) -> String {
 }
 
 /// `DescribeDBInstances` for one instance, as the HTTP status and the body.
-async fn read_instance(router: &MultiServiceRouter, identifier: &str) -> (u16, String) {
+///
+/// `pub(crate)` so the sibling suites of this one test target poll an instance through
+/// [`poll_until`] on the same reporting call rather than keeping a second copy of it.
+pub(crate) async fn read_instance(
+    router: &MultiServiceRouter,
+    identifier: &str,
+) -> (u16, String) {
     call(
         router,
         "DescribeDBInstances",
