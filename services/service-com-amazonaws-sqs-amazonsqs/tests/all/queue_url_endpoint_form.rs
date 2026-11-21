@@ -22,6 +22,12 @@
 //! the ADDRESS the request arrived on (the service's own endpoint, another region's
 //! endpoint, loopback with an ephemeral port, a host name with a port and an IPv6 literal).
 //!
+//! A listing reports the same form on EVERY page of a `MaxResults`/`NextToken` walk, so the
+//! tables for the two paged listings (`ListQueues`, `ListDeadLetterSourceQueues`) span the
+//! page SIZE the caller asks for as well — one entry a page, a size that does not divide the
+//! count, the count itself, one past it and no size at all — and assert the rule over the
+//! whole walk rather than over one answer.
+//!
 //! The converse rule is tested here too, because it is the same `(account, QueueName)`
 //! pair read the other way round: **a value supplied where a `QueueUrl` is expected
 //! addresses the queue whose name is its last path segment, in the account the segment
@@ -39,6 +45,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_sqs_amazonsqs::state::{
     MAX_QUEUE_NAME_LENGTH, QUEUE_DOES_NOT_EXIST_MESSAGE,
 };
+use smithy_server_runtime::MultiServiceRouter;
 
 use super::support::{
     account, call_in, call_with_headers, create_in, create_ok_in, emulator, error_code,
@@ -1062,3 +1069,258 @@ const INVALID_ADDRESS_SHAPE: &str = "com.amazonaws.sqs#InvalidAddress";
 /// for that shape (`InvalidAddress`), beside the fault side a refusal the caller caused is
 /// reported under.
 const INVALID_ADDRESS_QUERY_REPORT: &str = "InvalidAddress;Sender";
+
+/// The addresses a PAGED listing is read through: the service's own regional endpoint host
+/// — a host of AWS's own, which a caller that resolves it is answered the service's
+/// regional endpoint for — then loopback with an ephemeral port, a host name with the
+/// emulator's own port, and an IPv6 literal, which are addresses only this emulator
+/// answers on.
+fn paged_addresses() -> Vec<String> {
+    vec![
+        host_in(REGION),
+        "127.0.0.1:40613".to_string(),
+        "localhost:9297".to_string(),
+        "[::1]:9297".to_string(),
+    ]
+}
+
+/// Which authority a call arriving on `address` must be answered with: its own, unless the
+/// address is a host AWS publishes an endpoint at — a caller that resolves those is told the
+/// service's own regional endpoint for the region the call was made in.
+fn answered_authority(address: &str) -> String {
+    match address.ends_with(".amazonaws.com") {
+        true => format!("{ENDPOINT_PREFIX}.{REGION}.amazonaws.com"),
+        false => address.to_string(),
+    }
+}
+
+/// How many pages a walk in this suite may take before it is a walk that does not end:
+/// every table here lists a handful of queues at a page size of at least one entry, so a
+/// walk longer than this is a cursor that stopped advancing rather than a longer listing.
+const PAGE_WALK_BOUND: usize = 16;
+
+/// Walk EVERY page of `operation` — the request built from `body`, asking for `page_size`
+/// entries a page when it names one — through the `NextToken` each reply carries, with
+/// every page read through `address`, and answer the pages in walk order as each page's
+/// `member` list.
+///
+/// A client that pages does exactly this, which is why the walk rather than one answer is
+/// what the rule is asserted over.
+async fn walked_pages(
+    router: &MultiServiceRouter,
+    address: &str,
+    operation: &str,
+    member: &str,
+    body: &Value,
+    page_size: Option<i64>,
+) -> Vec<Vec<String>> {
+    let mut pages: Vec<Vec<String>> = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut request = body.clone();
+        if let Some(size) = page_size {
+            request["MaxResults"] = json!(size);
+        }
+        if let Some(token) = &cursor {
+            request["NextToken"] = json!(token);
+        }
+        let reply = ok_on_host(router, address, REGION, operation, request).await;
+        pages.push(strings(&reply, member));
+        assert!(
+            pages.len() <= PAGE_WALK_BOUND,
+            "case {operation} on {address} at MaxResults {page_size:?}: the walk must end, \
+             got {} pages: {pages:?}",
+            pages.len()
+        );
+        cursor = reply
+            .get("NextToken")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        if cursor.is_none() {
+            return pages;
+        }
+    }
+}
+
+/// Assert that every url of every page of `pages` is a queue address on `authority`, and
+/// that the whole walk reported `names`' queues in that order, once each.
+fn assert_walked_urls(case: &str, authority: &str, names: &[String], pages: &[Vec<String>]) {
+    let expected: Vec<String> = names.iter().map(|name| url_on(authority, name)).collect();
+    let walked: Vec<String> = pages.concat();
+    assert_eq!(
+        walked, expected,
+        "case {case}: expected the walk to report {expected:?}, got {walked:?}"
+    );
+    // Component by component as well, so a row says WHICH part of an url diverged.
+    for (name, url) in names.iter().zip(walked.iter()) {
+        assert_url_form(case, authority, name, url);
+    }
+}
+
+/// Every page of a PAGED listing reports its urls on the endpoint the call reached: a page
+/// handed to a `MaxResults`/`NextToken` walk is rendered exactly as an unpaged answer is, so
+/// a client that accumulates pages never collects an address it cannot reach.
+///
+/// The table spans the page SIZE the caller asks for (one entry a page, so every boundary is
+/// a page; a size that does not divide the count; the count itself; one past it; and no size
+/// at all, which is the service's own page size), and the ADDRESS the call arrives on.
+#[tokio::test]
+async fn every_page_of_a_queue_listing_reports_urls_on_the_endpoint_the_call_reached() {
+    const PREFIX: &str = "paged-url-form-";
+    let router = emulator();
+    // Name-ordered, which is the order a listing of this service walks in.
+    let names: Vec<String> = ["alpha", "bravo", "charlie", "delta", "echo"]
+        .iter()
+        .map(|suffix| format!("{PREFIX}{suffix}"))
+        .collect();
+    for name in &names {
+        create_ok_in(&router, REGION, name, &json!({})).await;
+    }
+    // One queue outside the prefix, so each page is a slice of the FILTERED listing.
+    create_ok_in(&router, REGION, "paged-other-queue", &json!({})).await;
+
+    for address in paged_addresses() {
+        let authority = answered_authority(&address);
+        for page_size in [Some(1), Some(2), Some(5), Some(6), None] {
+            let pages = walked_pages(
+                &router,
+                &address,
+                "ListQueues",
+                "QueueUrls",
+                &json!({"QueueNamePrefix": PREFIX}),
+                page_size,
+            )
+            .await;
+            let case = format!("ListQueues on {address} at MaxResults {page_size:?}");
+            if let Some(size) = page_size {
+                for (index, page) in pages.iter().enumerate() {
+                    assert!(
+                        i64::try_from(page.len()).is_ok_and(|held| held <= size),
+                        "case {case}: page {index} must hold at most {size} urls, got {page:?}"
+                    );
+                }
+            }
+            // A page size of one entry is a walk of as many pages as there are queues, so
+            // the rows that page really do page.
+            if page_size == Some(1) {
+                assert!(
+                    pages.len() >= names.len(),
+                    "case {case}: expected a page per queue, got {} pages: {pages:?}",
+                    pages.len()
+                );
+            }
+            assert_walked_urls(&case, &authority, &names, &pages);
+        }
+    }
+}
+
+/// The same rule on the dead-letter source listing, which pages the same way: every source
+/// queue url of every page is an address on the endpoint the walk was read through, which is
+/// what redrive tooling feeds back into the queue-addressed operations.
+///
+/// The table spans the page SIZE (one entry a page, a size that does not divide the count,
+/// the count itself, and no size at all) and the ADDRESS the call arrives on.
+#[tokio::test]
+async fn every_page_of_a_dead_letter_source_listing_reports_urls_on_the_reached_endpoint() {
+    let router = emulator();
+    let dead_letter = "paged-dlq";
+    let dead_letter_url = create_ok_in(&router, REGION, dead_letter, &json!({})).await;
+    let target_arn = expected_arn_in(REGION, dead_letter);
+    let names: Vec<String> = ["one", "three", "two"]
+        .iter()
+        .map(|suffix| format!("paged-dlq-source-{suffix}"))
+        .collect();
+    for name in &names {
+        let policy = json!({"deadLetterTargetArn": &target_arn, "maxReceiveCount": "3"});
+        create_ok_in(
+            &router,
+            REGION,
+            name,
+            &json!({"RedrivePolicy": policy.to_string()}),
+        )
+        .await;
+    }
+    // The listing is name-ordered, and these names are already in that order.
+    let mut ordered = names.clone();
+    ordered.sort();
+    assert_eq!(
+        ordered, names,
+        "case the source names: expected the listing's own order, got {names:?}"
+    );
+
+    for address in paged_addresses() {
+        let authority = answered_authority(&address);
+        for page_size in [Some(1), Some(2), Some(3), None] {
+            let pages = walked_pages(
+                &router,
+                &address,
+                "ListDeadLetterSourceQueues",
+                "queueUrls",
+                &json!({"QueueUrl": &dead_letter_url}),
+                page_size,
+            )
+            .await;
+            let case =
+                format!("ListDeadLetterSourceQueues on {address} at MaxResults {page_size:?}");
+            if page_size == Some(1) {
+                assert!(
+                    pages.len() >= names.len(),
+                    "case {case}: expected a page per source queue, got {} pages: {pages:?}",
+                    pages.len()
+                );
+            }
+            assert_walked_urls(&case, &authority, &names, &pages);
+        }
+    }
+}
+
+/// A url taken off a PAGE is a working handle on the endpoint that reported it: the string a
+/// paging client is handed addresses the queue it names when it is sent straight back, which
+/// is the whole reason the page's authority has to be an endpoint this emulator answers on.
+#[tokio::test]
+async fn a_url_taken_off_a_page_addresses_its_queue_through_the_endpoint_that_reported_it() {
+    const PREFIX: &str = "paged-handle-";
+    let router = emulator();
+    let names: Vec<String> = ["alpha", "bravo", "charlie"]
+        .iter()
+        .map(|suffix| format!("{PREFIX}{suffix}"))
+        .collect();
+    for name in &names {
+        create_ok_in(&router, REGION, name, &json!({})).await;
+    }
+
+    for address in paged_addresses() {
+        let authority = answered_authority(&address);
+        // One queue a page, so every url below came off a page of its own — the later
+        // pages of the walk included.
+        let pages = walked_pages(
+            &router,
+            &address,
+            "ListQueues",
+            "QueueUrls",
+            &json!({"QueueNamePrefix": PREFIX}),
+            Some(1),
+        )
+        .await;
+        let case = format!("the paged walk on {address}");
+        assert_walked_urls(&case, &authority, &names, &pages);
+
+        for (name, url) in names.iter().zip(pages.concat().iter()) {
+            let reported = ok_on_host(
+                &router,
+                &address,
+                REGION,
+                "GetQueueAttributes",
+                json!({"QueueUrl": url, "AttributeNames": ["QueueArn"]}),
+            )
+            .await;
+            assert_eq!(
+                reported["Attributes"]["QueueArn"].as_str(),
+                Some(expected_arn_in(REGION, name).as_str()),
+                "case the url {url:?} off a page on {address}: expected the ARN of {name}, \
+                 got {reported}"
+            );
+        }
+    }
+}
+
