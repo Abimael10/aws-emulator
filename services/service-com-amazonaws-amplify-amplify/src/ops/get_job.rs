@@ -165,7 +165,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )),
             })
         })?;
-        let stored = branch.jobs.get_mut(&input.job_id).ok_or_else(|| {
+        // A `jobId` this branch does not hold is the modelled 404, answered before
+        // anything else so a read of an absent job writes nothing at all.
+        if !branch.jobs.contains_key(&input.job_id) {
+            return Err(GetJobErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message(
+                    crate::state::JOB_ENTITY,
+                    &input.job_id,
+                )),
+            })
+            .into());
+        }
+
+        // The ONLY write a read performs: what the clock already made due for this
+        // BRANCH — each of its jobs' status changes, the site a finished deployment
+        // publishes, and the output a settled job's steps report — every one of which was
+        // owed at that instant whether or not anybody called. Before it falls due this
+        // changes nothing, so two reads of a job that has not settled report the same
+        // record. The branch rather than the job alone, because the steps of a settled
+        // deployment report on the site that deployment published.
+        branch.settle();
+        let stored = branch.jobs.get(&input.job_id).ok_or_else(|| {
             GetJobErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::not_found_message(
                     crate::state::JOB_ENTITY,
@@ -173,12 +193,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )),
             })
         })?;
-
-        // The ONLY write a read performs: the status change the clock already made due
-        // for this job, which was owed at that instant whether or not anybody called.
-        // Before it falls due this changes nothing, so two reads of a job that has not
-        // settled report the same record.
-        stored.settle();
 
         Ok(GetJobOutput {
             job: stored.job.clone(),

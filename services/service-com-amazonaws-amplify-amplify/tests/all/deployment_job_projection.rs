@@ -30,6 +30,13 @@
 //! 4. A `BUCKET_PREFIX` source URL names a FOLDER of a bucket, so one that does not end
 //!    in the path separator is refused with the modelled 400 before any job exists, and
 //!    spends no job number.
+//! 5. A settled deployment reports the WHOLE sequence of steps its execution ran — the
+//!    deploy of the content, then, for one that published, the verification of the site —
+//!    and every URL those steps report (`logUrl`, `artifactsUrl`, each screenshot) is a
+//!    presigned address of THIS emulator that serves that step's own output.
+//! 6. `Branch$totalNumberOfJobs` counts the BUILDS a branch has run, and deploying content
+//!    runs none — while the deployment is still the branch's `activeJobId` and still in
+//!    its job listing.
 //!
 //! The harness (`Emulator`, `Reply`) is the one `app_branch_lifecycle` already drives;
 //! only the cases are new.
@@ -43,7 +50,7 @@ use service_com_amazonaws_amplify_amplify::ops::start_deployment::{
     MAX_DEPLOYMENT_ASSETS, PREFIX_WITHOUT_TRAILING_SEPARATOR,
 };
 
-use crate::app_branch_lifecycle::{list_member, string_member, Emulator, Reply};
+use crate::app_branch_lifecycle::{list_member, string_member, timestamp_member, Emulator, Reply};
 
 /// How wide the job-number field of a `jobArn` is.
 ///
@@ -758,6 +765,488 @@ async fn a_prefix_source_must_name_a_folder() {
             Some(PREFIX_WITHOUT_TRAILING_SEPARATOR),
             "case {case:?}: a source URL that names a folder is not refused for naming \
              none, got {reply:?}"
+        );
+    }
+}
+
+/// The step a settled deployment reports the deploy of its content on.
+///
+/// Recorded rather than modelled: `Step$stepName` is free text
+/// (`smithy_query(query="shape",shape="Step")`), and Amplify names the two steps of a
+/// hosting deployment `DEPLOY` and `VERIFY`.
+const DEPLOY_STEP: &str = "DEPLOY";
+
+/// The step a settled deployment reports the post-deploy verification on.
+const VERIFY_STEP: &str = "VERIFY";
+
+/// One response to following a URL a step published: the status, the media type and the
+/// bytes.
+struct Followed {
+    status: u16,
+    media_type: String,
+    body: bytes::Bytes,
+}
+
+/// Follow one URL a step reported, exactly as a client does: an unsigned `GET` of the
+/// address, with no credential of its own, since the address carries its own.
+async fn follow(emulator: &Emulator, method: &str, url: &str) -> Followed {
+    let request = http::Request::builder()
+        .method(method)
+        .uri(url)
+        .body(bytes::Bytes::new())
+        .expect("a published output URL is well formed");
+    let response = emulator.dispatch(request).await;
+    let status = response.status().as_u16();
+    let media_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    Followed {
+        status,
+        media_type,
+        body: response.into_body(),
+    }
+}
+
+/// The output the URL a step reported leads to, with the two properties every such URL
+/// has: it is an address of THIS emulator, presigned so it can be followed with no
+/// `Authorization` header, and the emulator answers it with the output's own bytes.
+async fn served_output(emulator: &Emulator, case: &str, member: &str, url: &str) -> Followed {
+    assert!(
+        url.starts_with(EMULATOR_BASE),
+        "case {case:?}: {member} must be published on the base this emulator publishes \
+         ({EMULATOR_BASE}), got {url:?}"
+    );
+    for field in PRESIGNING_QUERY_FIELDS {
+        assert!(
+            url.contains(field),
+            "case {case:?}: {member} must be presigned, and carries no {field}: got {url:?}"
+        );
+    }
+    let followed = follow(emulator, "GET", url).await;
+    assert_eq!(
+        followed.status, 200,
+        "case {case:?}: a GET of {member} ({url:?}) must be answered by this emulator, \
+         got HTTP {}",
+        followed.status
+    );
+    assert!(
+        !followed.body.is_empty(),
+        "case {case:?}: {member} must lead to the output it addresses, got an empty body"
+    );
+    followed
+}
+
+/// The URL a step reports for `member`, or `None` where the step reports none.
+fn step_url(step: &Value, member: &str) -> Option<String> {
+    step.get(member)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// The paths an output document lists as published, as a set.
+fn manifest_paths(document: &Value, case: &str) -> Vec<String> {
+    document
+        .get("files")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("case {case:?}: an artifact manifest lists the files it published, got {document:?}"))
+        .iter()
+        .map(|file| string_member(file, "path"))
+        .collect()
+}
+
+/// Rule 5: a settled deployment reports the WHOLE sequence of steps its execution ran,
+/// and every URL those steps report leads back to this emulator, where that step's own
+/// output is served.
+///
+/// A deployment that SUCCEEDED ran two steps — the deploy of the content, carrying the log
+/// of that execution and the artifact it published, then the verification of the published
+/// site, carrying its own artifact and one screenshot per device it visited the site as —
+/// and the two spans divide the job's execution without overlapping. One that did NOT
+/// succeed published nothing and verified nothing, so it reports the deploy step alone,
+/// with its log and the reason it carries.
+///
+/// The rows are `deployment_rows()`: the same table rules 1 to 3 are asserted over, which
+/// spans whether the content was reserved or named by URL, one archive or one upload per
+/// file, how many files it carries, and whether the deployment publishes anything at all.
+#[tokio::test]
+async fn a_settled_deployment_reports_every_step_it_ran_and_serves_each_step_output() {
+    let emulator = Emulator::new();
+    let app_id = emulator.app_id_of_new_app("deployment-steps").await;
+
+    // (case, branch, jobId, terminal status, the paths the deployment publishes)
+    let mut queued: Vec<(&'static str, String, String, &'static str, Vec<String>)> = Vec::new();
+    for (index, row) in deployment_rows().into_iter().enumerate() {
+        // One row per BRANCH: a branch serializes its deployments, and this rule is about
+        // the steps of one deployment's job.
+        let branch = format!("steps-{index}");
+        branch_arn_of_new_branch(&emulator, &app_id, &branch).await;
+
+        let start = match &row.reservation {
+            Some(request) => {
+                let reserved = create_deployment(&emulator, &app_id, &branch, request).await;
+                assert_eq!(
+                    reserved.status, 200,
+                    "case {:?}: expected HTTP 200 from CreateDeployment, got {reserved:?}",
+                    row.case
+                );
+                let job_id = string_member(&reserved.body, "jobId");
+                if let Some(entries) = row.archive {
+                    let url = string_member(&reserved.body, "zipUploadUrl");
+                    upload(&emulator, row.case, &url, &zip_of(entries)).await;
+                }
+                for file_name in row.files {
+                    let url = destination_for(&reserved, file_name, row.case);
+                    upload(
+                        &emulator,
+                        row.case,
+                        &url,
+                        format!("the bytes of {file_name}").as_bytes(),
+                    )
+                    .await;
+                }
+                json!({ "jobId": job_id })
+            }
+            None => row
+                .source
+                .clone()
+                .expect("a row deploys either a reservation or a source URL"),
+        };
+
+        let started = start_deployment(&emulator, &app_id, &branch, &start).await;
+        assert_eq!(
+            started.status, 200,
+            "case {:?}: expected HTTP 200 from StartDeployment, got {started:?}",
+            row.case
+        );
+        let job_id = string_member(&started.member("jobSummary"), "jobId");
+
+        // What this row's deployment publishes: the archive's entries, or the files its
+        // reservation named one at a time. A row that publishes nothing settles FAILED.
+        let mut published: Vec<String> = row
+            .archive
+            .unwrap_or_default()
+            .iter()
+            .chain(row.files.iter())
+            .map(|path| (*path).to_string())
+            .collect();
+        published.sort();
+        queued.push((row.case, branch, job_id, row.status, published));
+    }
+
+    for (case, branch, job_id, status, published) in &queued {
+        let read = settled_job(&emulator, &app_id, branch, job_id, case).await;
+        let steps = list_member(&read.member("job"), "steps").clone();
+        let succeeded = *status == SUCCEED;
+        assert_eq!(
+            steps.len(),
+            if succeeded { 2 } else { 1 },
+            "case {case:?}: a settled deployment reports the steps its execution ran, \
+             got {steps:?}"
+        );
+
+        let deploy = &steps[0];
+        assert_eq!(
+            string_member(deploy, "stepName"),
+            DEPLOY_STEP,
+            "case {case:?}: the first step is the deploy of the content, got {deploy:?}"
+        );
+        assert_eq!(
+            string_member(deploy, "status"),
+            *status,
+            "case {case:?}: the deploy step reports the status the job reached, got {deploy:?}"
+        );
+        assert!(
+            timestamp_member(deploy, "startTime") <= timestamp_member(deploy, "endTime"),
+            "case {case:?}: a step's span starts before it ends, got {deploy:?}"
+        );
+
+        // The LOG of the execution, which a deployment wrote whatever it ended as: the
+        // address leads here, and what it serves names this job and what it did.
+        let log_url = step_url(deploy, "logUrl").unwrap_or_else(|| {
+            panic!("case {case:?}: the deploy step reports the log of its execution, got {deploy:?}")
+        });
+        let log = served_output(&emulator, case, "the deploy step's logUrl", &log_url).await;
+        let log_text = String::from_utf8_lossy(&log.body).to_string();
+        assert!(
+            log.media_type.starts_with("text/plain"),
+            "case {case:?}: a log is read as text, got {:?}",
+            log.media_type
+        );
+        assert!(
+            log_text.contains(&format!("{DEPLOY_STEP} job {job_id}")),
+            "case {case:?}: the log names the job whose execution it records, got {log_text:?}"
+        );
+        assert!(
+            log_text.contains(status),
+            "case {case:?}: the log records how the execution ended, got {log_text:?}"
+        );
+        for path in published.iter().filter(|_| succeeded) {
+            assert!(
+                log_text.contains(path.as_str()),
+                "case {case:?}: the log names {path:?} among the files it published, \
+                 got {log_text:?}"
+            );
+        }
+
+        // The ARTIFACT is what the deployment PUBLISHED, so only a deployment that
+        // published reports one — and what it serves is the manifest of those files.
+        let artifacts_url = step_url(deploy, "artifactsUrl");
+        if !succeeded {
+            assert_eq!(
+                artifacts_url, None,
+                "case {case:?}: a deployment that published nothing reports no artifact, \
+                 got {deploy:?}"
+            );
+            assert!(
+                deploy.get("statusReason").and_then(Value::as_str).is_some(),
+                "case {case:?}: a deployment that failed explains why on its step, \
+                 got {deploy:?}"
+            );
+            continue;
+        }
+        let artifacts_url = artifacts_url.unwrap_or_else(|| {
+            panic!("case {case:?}: a published deployment reports its artifact, got {deploy:?}")
+        });
+        let artifact =
+            served_output(&emulator, case, "the deploy step's artifactsUrl", &artifacts_url).await;
+        let manifest: Value = serde_json::from_slice(&artifact.body).unwrap_or_else(|error| {
+            panic!("case {case:?}: an artifact manifest is a document, got {error}")
+        });
+        assert_eq!(
+            &manifest_paths(&manifest, case),
+            published,
+            "case {case:?}: the manifest lists the files this deployment published, \
+             got {manifest:?}"
+        );
+
+        // The VERIFICATION of the site that deployment published: its own span, its own
+        // artifact, one screenshot per device it visited the site as — and no log, because
+        // reading a published site back runs no build.
+        let verify = &steps[1];
+        assert_eq!(
+            string_member(verify, "stepName"),
+            VERIFY_STEP,
+            "case {case:?}: the deploy is followed by the verification, got {verify:?}"
+        );
+        assert_eq!(
+            string_member(verify, "status"),
+            SUCCEED,
+            "case {case:?}: the verification of a published site reports what it found, \
+             got {verify:?}"
+        );
+        assert_eq!(
+            step_url(verify, "logUrl"),
+            None,
+            "case {case:?}: the verification writes no build log, got {verify:?}"
+        );
+        // The two steps DIVIDE the job's execution: the verification begins where the
+        // deploy ends, and neither covers the other's span.
+        assert_eq!(
+            timestamp_member(deploy, "endTime"),
+            timestamp_member(verify, "startTime"),
+            "case {case:?}: the verification begins where the deploy ends, got {steps:?}"
+        );
+        assert!(
+            timestamp_member(verify, "startTime") < timestamp_member(verify, "endTime"),
+            "case {case:?}: the verification has a span of its own, got {verify:?}"
+        );
+
+        let verify_artifacts = step_url(verify, "artifactsUrl").unwrap_or_else(|| {
+            panic!("case {case:?}: the verification reports its artifact, got {verify:?}")
+        });
+        let found = served_output(
+            &emulator,
+            case,
+            "the verification step's artifactsUrl",
+            &verify_artifacts,
+        )
+        .await;
+        let found: Value = serde_json::from_slice(&found.body).unwrap_or_else(|error| {
+            panic!("case {case:?}: the verification's artifact is a document, got {error}")
+        });
+        assert_eq!(
+            string_member(&found, "verifiedPath"),
+            "/",
+            "case {case:?}: the verification reads the site's root back, got {found:?}"
+        );
+
+        let screenshots = verify
+            .get("screenshots")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: the verification reports its captures, got {verify:?}")
+            });
+        assert!(
+            !screenshots.is_empty(),
+            "case {case:?}: the verification visited the site as at least one device, \
+             got {verify:?}"
+        );
+        for (device, url) in &screenshots {
+            let url = url.as_str().unwrap_or_else(|| {
+                panic!("case {case:?}: a screenshot is addressed by a URL, got {verify:?}")
+            });
+            let capture = served_output(
+                &emulator,
+                case,
+                &format!("the {device:?} capture"),
+                url,
+            )
+            .await;
+            let capture: Value = serde_json::from_slice(&capture.body).unwrap_or_else(|error| {
+                panic!("case {case:?}: a capture is a document, got {error}")
+            });
+            // Each device's address serves THAT device's capture of the published site,
+            // which is the answer the site gave the visit: the document it published.
+            assert_eq!(
+                &string_member(&capture, "device"),
+                device,
+                "case {case:?}: a capture names the device whose visit it records, \
+                 got {capture:?}"
+            );
+            assert_eq!(
+                capture.get("status").and_then(Value::as_u64),
+                Some(200),
+                "case {case:?}: the site answered the {device:?} visit, got {capture:?}"
+            );
+            assert!(
+                capture.get("bytes").and_then(Value::as_u64).unwrap_or(0) > 0,
+                "case {case:?}: the {device:?} capture records what the site served, \
+                 got {capture:?}"
+            );
+        }
+
+        // The plane only READS: an output address takes no write, and a HEAD of one is the
+        // same answer without the body.
+        let head = follow(&emulator, "HEAD", &log_url).await;
+        assert_eq!(
+            head.status, 200,
+            "case {case:?}: a HEAD of a step's output is answered, got HTTP {}",
+            head.status
+        );
+        assert!(
+            head.body.is_empty(),
+            "case {case:?}: a HEAD carries no body"
+        );
+        let written = follow(&emulator, "PUT", &log_url).await;
+        assert_eq!(
+            written.status, 405,
+            "case {case:?}: a step's output is read, not written, got HTTP {}",
+            written.status
+        );
+    }
+}
+
+/// Rule 6: `Branch$totalNumberOfJobs` counts the BUILDS a branch has run, and deploying
+/// content runs none — so a branch deployed to reports the builds it ran and nothing more,
+/// while the deployment it ran is still its `activeJobId` and still in its job listing.
+///
+/// The rows differ along what the rule generalises over: how many deployments and how many
+/// builds one branch runs, and in which order.
+#[tokio::test]
+async fn a_branch_counts_the_builds_it_ran_and_not_the_content_it_deployed() {
+    let emulator = Emulator::new();
+    // A repository app, because `StartJob` builds the app's connected repository, while a
+    // deployment of content needs no repository at all.
+    let app_id = emulator
+        .app_id_of_new_repository_app("deployment-build-count")
+        .await;
+
+    // (case, branch, deployments to run, builds to run, builds first?)
+    let rows: &[(&str, &str, usize, usize, bool)] = &[
+        ("deployments only", "deployed", 2, 0, false),
+        ("builds only", "built", 0, 3, true),
+        ("a build after two deployments", "mixed", 2, 1, false),
+        ("a deployment after a build", "built-then-deployed", 1, 1, true),
+    ];
+    for (case, branch, deployments, builds, builds_first) in rows {
+        branch_arn_of_new_branch(&emulator, &app_id, branch).await;
+        let mut jobs = 0usize;
+        let mut last_job_id = String::new();
+
+        let order: [(&str, usize); 2] = if *builds_first {
+            [("build", *builds), ("deployment", *deployments)]
+        } else {
+            [("deployment", *deployments), ("build", *builds)]
+        };
+        for (kind, count) in order {
+            for index in 0..count {
+                let case = format!("{case}: {kind} {index}");
+                last_job_id = match kind {
+                    "build" => {
+                        let started = emulator
+                            .call(
+                                "POST",
+                                &format!("/apps/{app_id}/branches/{branch}/jobs"),
+                                Some(&json!({ "jobType": "RELEASE" })),
+                            )
+                            .await;
+                        assert_eq!(
+                            started.status, 200,
+                            "case {case:?}: expected HTTP 200 from StartJob, got {started:?}"
+                        );
+                        string_member(&started.member("jobSummary"), "jobId")
+                    }
+                    _ => {
+                        let reserved =
+                            create_deployment(&emulator, &app_id, branch, &json!({})).await;
+                        assert_eq!(
+                            reserved.status, 200,
+                            "case {case:?}: expected HTTP 200 from CreateDeployment, \
+                             got {reserved:?}"
+                        );
+                        let job_id = string_member(&reserved.body, "jobId");
+                        upload(
+                            &emulator,
+                            &case,
+                            &string_member(&reserved.body, "zipUploadUrl"),
+                            &zip_of(&["index.html"]),
+                        )
+                        .await;
+                        let started = start_deployment(
+                            &emulator,
+                            &app_id,
+                            branch,
+                            &json!({ "jobId": job_id }),
+                        )
+                        .await;
+                        assert_eq!(
+                            started.status, 200,
+                            "case {case:?}: expected HTTP 200 from StartDeployment, \
+                             got {started:?}"
+                        );
+                        job_id
+                    }
+                };
+                // A branch SERIALIZES its jobs, so the next one is started only once the
+                // clock has settled this one — waited for by polling for that status
+                // rather than for a span of time.
+                settled_job(&emulator, &app_id, branch, &last_job_id, &case).await;
+                jobs += 1;
+            }
+        }
+
+        let record = emulator.get_branch(&app_id, branch).await.member("branch");
+        assert_eq!(
+            string_member(&record, "totalNumberOfJobs"),
+            builds.to_string(),
+            "case {case:?}: totalNumberOfJobs counts the branch's builds, got {record:?}"
+        );
+        // The deployments are still jobs of the branch: the last one started is its active
+        // job, and every job it ran is in its listing.
+        assert_eq!(
+            string_member(&record, "activeJobId"),
+            format!("{last_job_id:0>10}"),
+            "case {case:?}: the job started last is the branch's active one, got {record:?}"
+        );
+        let listed = list_jobs(&emulator, &app_id, branch).await;
+        assert_eq!(
+            list_member(&listed.body, "jobSummaries").len(),
+            jobs,
+            "case {case:?}: every job the branch ran is listed, got {listed:?}"
         );
     }
 }

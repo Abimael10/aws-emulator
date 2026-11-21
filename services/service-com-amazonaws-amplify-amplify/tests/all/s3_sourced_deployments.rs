@@ -362,13 +362,16 @@ fn job_summary(reply: &Reply) -> Value {
     reply.member("jobSummary")
 }
 
-/// The one execution step a settled job carries, as a client reads it.
+/// The DEPLOY step of a settled job — the FIRST step of the sequence its execution ran,
+/// which is the one carrying that deployment's own status and reason.
+///
+/// A deployment that succeeded is followed by the VERIFY step its verification ran; that
+/// sequence is the subject of the `deployment_job_steps` cases, not of these.
 fn settled_step(job: &Value) -> Value {
     let steps = list_member(job, "steps");
-    assert_eq!(
-        steps.len(),
-        1,
-        "a settled job carries one execution step, got {steps:?}"
+    assert!(
+        !steps.is_empty(),
+        "a settled job carries the steps its execution ran, got {steps:?}"
     );
     steps[0].clone()
 }

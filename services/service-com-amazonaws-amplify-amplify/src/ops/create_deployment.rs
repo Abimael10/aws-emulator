@@ -268,7 +268,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let files: ::std::collections::BTreeMap<String, crate::state::DeploymentFile> = declared
             .into_iter()
             .map(|(file_name, content_md5)| {
-                let token = store.mint_upload_token();
+                let token = store.mint_plane_token();
                 (
                     file_name,
                     crate::state::DeploymentFile {
@@ -279,7 +279,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
         let zip = if files.is_empty() {
-            let token = store.mint_upload_token();
+            let token = store.mint_plane_token();
             Some(upload(ctx, &endpoint_host, &input.app_id, &job_id, token))
         } else {
             // `zipUploadUrl` is returned "when the fileMap argument is not provided in

@@ -67,6 +67,20 @@
 //! `StartDeployment` that `crate::state::DEPLOYMENT_WINDOW_MILLIS` carries). Nothing else
 //! about the service is reachable through it.
 //!
+//! ## The job-output plane
+//!
+//! A settled job's steps report the URLs its output is READ at — `Step$logUrl`,
+//! `Step$artifactsUrl` and the `Step$screenshots` of its verification — and a URL is a
+//! promise that it can be followed, so those addresses are served here too
+//! (`crate::state::job_steps`). They are presigned against the base this emulator
+//! publishes, under the job's own path
+//! (`/apps/<appId>/jobs/<jobId>/outputs/<token>`) — a path the model binds no operation
+//! to — so, exactly like an upload destination, such a request reaches this file twice:
+//! [`Service::can_handle`] claims it when THIS store serves that output, and
+//! [`Service::override_routing_error`] answers it with the output's own bytes and media
+//! type. The plane only READS: what each address serves was produced when the clock
+//! settled the job that published it.
+//!
 //! ## The hosting edge
 //!
 //! A deployed branch is VISITED, at the default domain the control plane reports for it:
@@ -341,6 +355,51 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         store.hosts_a_branch(address)
     }
 
+    /// The output a published job-output URL names, or `None` when this store serves
+    /// nothing at that address — which is what makes the service's claim on such a
+    /// request unambiguous: an address this emulator never published is claimed by nobody.
+    fn job_output(
+        &self,
+        target: &crate::state::JobOutputTarget,
+    ) -> Option<crate::state::StepOutput> {
+        let state = crate::state::service_state(&*self.engine)?;
+        let store = state.lock();
+        store.job_output(target)
+    }
+
+    /// Serve one request to a published job-output URL: the bytes that output carries,
+    /// with the media type it is read as.
+    ///
+    /// A step's output is a document a client FETCHES, so a `GET` (or a `HEAD`, which is
+    /// the same answer without the body) is answered and every other method is refused:
+    /// the plane publishes what an execution produced, it takes no writes.
+    fn serve_job_output(
+        &self,
+        req: &RtRequest,
+        target: &crate::state::JobOutputTarget,
+    ) -> RtResponse {
+        let method = req.method();
+        if method != "GET" && method != "HEAD" {
+            return plane_error(405, "MethodNotAllowed", JOB_OUTPUT_METHOD_MESSAGE);
+        }
+        let Some(output) = self.job_output(target) else {
+            return plane_error(404, "NoSuchKey", JOB_OUTPUT_NOT_FOUND_MESSAGE);
+        };
+        let length = output.content.len();
+        let mut resp = RtResponse::new(
+            StatusCode::try_from(200u16).expect("200 is a valid status"),
+            if method == "HEAD" {
+                SdkBody::empty()
+            } else {
+                SdkBody::from(output.content)
+            },
+        );
+        resp.headers_mut().insert("content-type", output.media_type);
+        resp.headers_mut()
+            .insert("content-length", length.to_string());
+        resp
+    }
+
     /// Serve one request to a branch's hosting edge from what that branch's latest
     /// successful deployment published, as the owning app's rewrite and redirect rules
     /// resolve it.
@@ -570,6 +629,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                 return true;
             }
         }
+        // A request that FOLLOWS an output address a settled job's steps published is
+        // claimed the same way, and for the same reason: it is presigned, so it carries
+        // no `Authorization` header, and its path binds no modelled operation.
+        if let Some(target) = crate::state::parse_job_output_path(parts.uri.path()) {
+            return self.job_output(&target).is_some();
+        }
         // A request that FOLLOWS an upload destination this service handed out is
         // claimed by the store that minted it, whatever else the request carries: it
         // has no signature and its endpoint host may name no service at all, so the
@@ -658,6 +723,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                 return Some(self.serve_hosted_site(req, &address, request_path));
             }
         }
+        if let Some(target) = crate::state::parse_job_output_path(request_path) {
+            return Some(self.serve_job_output(req, &target));
+        }
         let target = crate::state::parse_deployment_upload_path(request_path)?;
         Some(self.serve_deployment_upload(req, &target))
     }
@@ -695,6 +763,14 @@ const UPLOAD_UNREADABLE_MESSAGE: &str = "The upload's body could not be read";
 
 /// The body of a hosting-edge answer for a path the branch's deployment did not publish.
 const SITE_NOT_FOUND_MESSAGE: &str = "The requested file was not found";
+
+/// The body of a job-output refusal that found no output at the address: one sentence
+/// carrying nothing from the request, so a caller cannot probe for the output of jobs it
+/// was not handed an address for.
+const JOB_OUTPUT_NOT_FOUND_MESSAGE: &str = "The requested job output does not exist";
+
+/// The body of a job-output refusal of a method other than the read of a document.
+const JOB_OUTPUT_METHOD_MESSAGE: &str = "A job's output is read by GET or HEAD";
 
 /// The body of a hosting-edge refusal of a method other than the read of a file.
 const SITE_METHOD_MESSAGE: &str = "This site is read by GET or HEAD";

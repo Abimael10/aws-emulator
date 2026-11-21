@@ -18,8 +18,9 @@
 //! 2. A job is deleted THROUGH its branch and its app, so an unknown app, an unknown
 //!    branch or a job id belonging to another branch is the modelled 404, and nothing is
 //!    deleted on the way.
-//! 3. `Branch$totalNumberOfJobs` counts the jobs a branch has STARTED, so deleting one
-//!    out of its history does not rewrite that count.
+//! 3. `Branch$totalNumberOfJobs` counts the BUILDS a branch has run, so deleting a job
+//!    out of its history does not rewrite that count — and a deployment of content, which
+//!    builds nothing, never added to it.
 //!
 //! The harness (`Emulator`, `Reply`) is the one `app_branch_lifecycle` already drives.
 
@@ -325,14 +326,19 @@ async fn a_deleted_job_is_answered_and_leaves_its_branchs_history() {
             "case {case:?}: expected the modelled NotFoundException, got {again:?}"
         );
 
-        // Rule 3: the count of jobs the branch has STARTED is not rewritten by deleting
-        // one out of its history — a reserved deployment nothing started counts none.
+        // Rule 3: the count of BUILDS the branch has run is not rewritten by deleting a
+        // job out of its history — and a deployment of content runs no build of the
+        // branch, so neither a reserved deployment nor one that published counts.
         let record = emulator.get_branch(&app_id, branch).await.member("branch");
-        let expected_started = if matches!(state, JobState::Reserved) { "0" } else { "1" };
+        let expected_started = if matches!(state, JobState::Reserved | JobState::Deployed) {
+            "0"
+        } else {
+            "1"
+        };
         assert_eq!(
             string_member(&record, "totalNumberOfJobs"),
             expected_started,
-            "case {case:?}: deleting a job does not un-start it, got {record:?}"
+            "case {case:?}: deleting a job does not un-run the branch's builds, got {record:?}"
         );
     }
 }

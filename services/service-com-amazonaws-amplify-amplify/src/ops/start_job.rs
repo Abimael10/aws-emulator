@@ -252,7 +252,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            branch.mint_job_id()
+            branch.mint_build_job_id()
         };
 
         // The commit a job builds is whatever the request carries; a RETRY that does
@@ -298,14 +298,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         // The branch's own view of its jobs: the job just started is the active one,
-        // and `totalNumberOfJobs` counts the jobs this branch has STARTED — which a
+        // and `totalNumberOfJobs` counts the BUILDS this branch has run — which a
         // RETRY, re-running an existing job, leaves where it was, and which retiring
         // old history does not rewrite. `activeJobId` IDENTIFIES that job rather than
         // reporting its number, so it carries the fixed-width form the job's ARN
         // segment carries (`crate::state::padded_job_number`), which is what a client
         // correlating a branch with its job compares.
         branch.branch.active_job_id = crate::state::padded_job_number(&summary.job_id);
-        branch.branch.total_number_of_jobs = branch.jobs_started().to_string();
+        branch.branch.total_number_of_jobs = branch.builds_started().to_string();
 
         Ok(StartJobOutput {
             job_summary: JobSummaryProjection::executed(summary),

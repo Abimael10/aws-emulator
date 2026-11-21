@@ -200,15 +200,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // The ONLY write this report performs, and the same one `GetJob` performs: the
-        // status change the clock has ALREADY made due for each job, which was owed at
-        // that instant whether or not anybody called. A job whose instant has not come
-        // is left exactly as it is, so a listing taken straight after `StartJob` still
-        // reports the non-terminal status, and a listed job agrees member for member
-        // with a `GetJob` of the same job.
-        for stored in branch.jobs.values_mut() {
-            stored.settle();
-        }
+        // The ONLY write this report performs, and the same one `GetJob` performs: what
+        // the clock has ALREADY made due for this branch — each job's status change, the
+        // site a finished deployment publishes and the output a settled job's steps
+        // report — which was owed at that instant whether or not anybody called. A job
+        // whose instant has not come is left exactly as it is, so a listing taken
+        // straight after `StartJob` still reports the non-terminal status, and a listed
+        // job agrees member for member with a `GetJob` of the same job.
+        branch.settle();
 
         // One page of this branch's job history, NEWEST JOB FIRST — a branch's jobs are
         // reported most recent first, so a client polling the deployment it just started

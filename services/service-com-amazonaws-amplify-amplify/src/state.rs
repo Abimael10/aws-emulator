@@ -36,6 +36,9 @@ pub mod custom_headers;
 /// The address an app's hosting is announced at, and the host one branch's site answers
 /// on.
 pub mod hosting_address;
+/// The execution steps a settled job reports, and the output each of them publishes a URL
+/// for.
+pub mod job_steps;
 
 pub use basic_auth::{
     ingest_auto_branch_basic_auth, ingest_basic_auth, presented_credentials, BasicAuthCredentials,
@@ -45,6 +48,11 @@ pub use custom_headers::{
     ingest_custom_headers, matched_headers, CustomHeaderRule, IngestedCustomHeaders,
     MAX_CUSTOM_HEADER_RULES_PER_APP,
 };
+pub use job_steps::{
+    job_output_path, parse_job_output_path, JobOutputTarget, JobOutputTokens, JobOutputs,
+    StepOutput, StepOutputAddress, VERIFICATION_DEVICES, VERIFY_STEP_NAME,
+};
+
 pub use hosting_address::{
     addressed_hosted_site, announced_default_domain, default_domain_prefix, hosted_branch_host,
     hosted_site_host, hosted_site_path, hosting_plane_prefix, HostedSiteAddress,
@@ -160,23 +168,23 @@ pub struct AmplifyBranch {
     /// [`AmplifyBranch::make_room_for_a_job`]). A branch's job history is therefore
     /// finite however many jobs are started on it, and a job that was retired is
     /// `NotFoundException` to every reader. `Branch$totalNumberOfJobs` counts the
-    /// jobs the branch has STARTED ([`AmplifyBranch::jobs_started`]), not the
-    /// retained ones, so retiring history does not rewrite that count.
+    /// BUILDS the branch has run ([`AmplifyBranch::builds_started`]), not the
+    /// retained jobs, so retiring history does not rewrite that count.
     pub jobs: BTreeMap<String, BranchJob>,
     /// Monotonic counter feeding every `jobId` this branch hands out —
-    /// [`AmplifyBranch::mint_job_id`] for a job it is starting and
-    /// [`AmplifyBranch::reserve_job_id`] for a deployment it is reserving.
+    /// [`AmplifyBranch::mint_build_job_id`] for a build it is starting and
+    /// [`AmplifyBranch::reserve_job_id`] for a deployment's.
     ///
-    /// ONE sequence for both, so a reserved id is never handed to a later job: the
+    /// ONE sequence for all of them, so a reserved id is never handed to a later job: the
     /// deployment that reserved it is started by its own call, under that id.
     pub next_job_seq: u64,
-    /// How many jobs this branch has STARTED, which is what
-    /// [`AmplifyBranch::jobs_started`] reports.
+    /// How many BUILDS this branch has started, which is what
+    /// [`AmplifyBranch::builds_started`] reports.
     ///
-    /// Not the same as [`Self::next_job_seq`]: reserving a deployment takes an id out
-    /// of that sequence without starting anything, and a job exists only once a
-    /// start call creates it.
-    pub started_jobs: u64,
+    /// Not the number of jobs it has: a deployment runs a job of this branch without
+    /// being a build of it, and reserving a deployment takes an id out of
+    /// [`Self::next_job_seq`] without starting anything at all.
+    pub started_builds: u64,
     /// The files this branch's hosting edge serves now, keyed by the path each is
     /// served at under the site root — what the branch's LATEST deployment to have
     /// succeeded published, and empty for a branch nothing has deployed to yet.
@@ -228,7 +236,7 @@ impl AmplifyBranch {
             deployments: BTreeMap::new(),
             jobs: BTreeMap::new(),
             next_job_seq: 0,
-            started_jobs: 0,
+            started_builds: 0,
             site: BTreeMap::new(),
             staged_site: None,
             basic_auth,
@@ -263,6 +271,23 @@ impl AmplifyBranch {
         for job in self.jobs.values_mut() {
             job.settle();
         }
+        self.publish_a_settled_deployment();
+        // What each settled job's steps REPORT is materialised last, against the site as
+        // it now stands: the deployment that has just published is verified on what it
+        // published, and a job that published its outputs already is left as it is (see
+        // [`BranchJob::publish_step_outputs`]).
+        let site = &self.site;
+        for job in self.jobs.values_mut() {
+            job.publish_step_outputs(site);
+        }
+    }
+
+    /// Put the site a STARTED deployment staged live, once the clock has settled that
+    /// deployment's job.
+    ///
+    /// A staged deployment whose job FAILED publishes nothing: a deployment that could
+    /// not be carried out does not take the live site down with it.
+    fn publish_a_settled_deployment(&mut self) {
         let Some(staged) = self.staged_site.as_ref() else {
             return;
         };
@@ -283,37 +308,40 @@ impl AmplifyBranch {
         }
     }
 
-    /// Mint a `jobId` for a job this branch is STARTING, and count that job as started.
+    /// Mint a `jobId` for a BUILD this branch is STARTING, and count that build.
     ///
     /// `JobId` is modelled `length 0..255, pattern ^[0-9]+$`
     /// (`smithy_query(query="shape",shape="JobSummary")`), so a job id is decimal
     /// digits — not an opaque token — and a job is addressed within its branch
     /// (`/apps/{appId}/branches/{branchName}/jobs/{jobId}`). The ids are therefore a
     /// per-branch count: the first job a branch runs is `1`, the next `2`, which is
-    /// also what `Branch$activeJobId` and `Branch$totalNumberOfJobs` report about.
-    pub fn mint_job_id(&mut self) -> String {
+    /// also what `Branch$activeJobId` identifies a job by.
+    ///
+    /// A DEPLOYMENT's job takes its id out of the same sequence without being counted —
+    /// [`Self::reserve_job_id`] — because `Branch$totalNumberOfJobs` counts this branch's
+    /// builds (see [`Self::builds_started`]).
+    pub fn mint_build_job_id(&mut self) -> String {
         let job_id = self.reserve_job_id();
-        self.started_a_job();
+        self.count_a_build();
         job_id
     }
 
-    /// Count one more job as STARTED on this branch without taking an id out of its
+    /// Count one more BUILD as started on this branch without taking an id out of its
     /// sequence.
     ///
-    /// What starting a deployment whose id was already reserved does: the id came out of
-    /// the sequence when `CreateDeployment` reserved it ([`Self::reserve_job_id`]), and
-    /// the job under it exists only once a start call creates it — which is the moment
-    /// the branch has started one more job.
-    pub fn started_a_job(&mut self) {
-        self.started_jobs = self.started_jobs.wrapping_add(1);
+    /// What a build whose id already exists does: a `RETRY` re-runs an existing job, so
+    /// nothing is minted — and a build the branch mints an id for is counted by
+    /// [`Self::mint_build_job_id`], which is this call and that mint in one.
+    pub fn count_a_build(&mut self) {
+        self.started_builds = self.started_builds.wrapping_add(1);
     }
 
-    /// Take the next `jobId` of this branch's id sequence without starting a job on it.
+    /// Take the next `jobId` of this branch's id sequence without counting a build.
     ///
     /// What `CreateDeployment` reserves: it hands the caller the id its later
     /// `StartDeployment` will run under, so the id is spent — no job this branch
     /// starts afterwards may be handed the same one — while the branch has still
-    /// started no job, since nothing runs until that start call.
+    /// run no build, since a deployment of content is not a build of the branch.
     pub fn reserve_job_id(&mut self) -> String {
         loop {
             self.next_job_seq = self.next_job_seq.wrapping_add(1);
@@ -324,15 +352,23 @@ impl AmplifyBranch {
         }
     }
 
-    /// How many jobs this branch has STARTED, which is what
+    /// How many BUILDS this branch has started, which is what
     /// `Branch$totalNumberOfJobs` reports.
     ///
-    /// Not the number of jobs the branch still holds: the history is bounded (see
-    /// [`AmplifyBranch::jobs`]), and a branch that has run a thousand jobs has run a
-    /// thousand jobs whether or not the oldest are still readable. Not the number of
-    /// ids it has handed out either: a reserved deployment nobody started is not a job.
-    pub fn jobs_started(&self) -> u64 {
-        self.started_jobs
+    /// `Branch$totalNumberOfJobs` is "the total number of jobs that are part of an Amplify
+    /// app", modelled `length 0..1000` with no pattern
+    /// (`smithy_query(query="shape",shape="Branch")`), so what it counts is the service's
+    /// rather than the model's: recorded behaviour shows a branch whose job is a manual
+    /// deployment of content reporting `0` after that deployment has succeeded, while a
+    /// branch whose repository was BUILT reports its builds. A deployment is therefore a
+    /// job of the branch — it is its `activeJobId`, it is listed by `ListJobs` — and not
+    /// one of the builds this counts.
+    ///
+    /// Not the number of jobs the branch still holds either: the history is bounded (see
+    /// [`AmplifyBranch::jobs`]), and a branch that has run a thousand builds has run a
+    /// thousand builds whether or not the oldest are still readable.
+    pub fn builds_started(&self) -> u64 {
+        self.started_builds
     }
 
     /// Drop every reservation whose deployment window the clock has already closed.
@@ -612,7 +648,7 @@ pub struct DeploymentFile {
 /// the deployment.
 #[derive(Debug, Clone)]
 pub struct DeploymentUpload {
-    /// The opaque token that authorises this one upload ([`ComAmazonawsAmplifyAmplifyState::mint_upload_token`]).
+    /// The opaque token that authorises this one upload ([`ComAmazonawsAmplifyAmplifyState::mint_plane_token`]).
     pub token: String,
     /// The URL the reservation handed its caller for this upload.
     pub url: String,
@@ -782,6 +818,10 @@ pub struct BranchJob {
     /// [`Self::cancel`] turns on, because there is nothing to wind down for work that
     /// never began.
     pub work_has_begun: bool,
+    /// Where this job's steps publish the output each produced, and what this emulator
+    /// serves there — `None` for a job that produces none at all, which reports the one
+    /// step its conclusion names and no URL (see [`job_steps::settled_steps`]).
+    pub outputs: Option<JobOutputs>,
 }
 
 impl BranchJob {
@@ -796,21 +836,25 @@ impl BranchJob {
             JobSummaryProjection::executed(summary),
             conclusion,
             deployed_assets,
+            None,
         )
     }
 
     /// A manual DEPLOYMENT's job that a `StartDeployment` call has just queued: the same
     /// settling as [`Self::settling`], reporting only what a deployment's job has a value
-    /// for (see [`JobSummaryProjection::deploying`]).
+    /// for (see [`JobSummaryProjection::deploying`]) and publishing its execution's own
+    /// output at the addresses that call minted for it (`outputs`).
     pub fn deploying(
         summary: JobSummary,
         conclusion: JobConclusion,
         deployed_assets: BTreeSet<String>,
+        outputs: JobOutputs,
     ) -> Self {
         Self::queued(
             JobSummaryProjection::deploying(summary),
             conclusion,
             deployed_assets,
+            Some(outputs),
         )
     }
 
@@ -820,6 +864,7 @@ impl BranchJob {
         summary: JobSummaryProjection,
         conclusion: JobConclusion,
         deployed_assets: BTreeSet<String>,
+        outputs: Option<JobOutputs>,
     ) -> Self {
         Self {
             job: Job {
@@ -833,6 +878,7 @@ impl BranchJob {
             conclusion,
             deployed_assets,
             work_has_begun: true,
+            outputs,
         }
     }
 
@@ -859,6 +905,10 @@ impl BranchJob {
             conclusion: JobConclusion::not_deployed(DEPLOYMENT_WINDOW_CLOSED_REASON),
             deployed_assets: BTreeSet::new(),
             work_has_begun: false,
+            // Nothing has run under this job, so there is no execution to publish the
+            // output of: a window that closes on a deployment nobody started produced no
+            // log and no artifact.
+            outputs: None,
         }
     }
 
@@ -882,7 +932,11 @@ impl BranchJob {
     ///
     /// What it settles TO is the job's own [`JobConclusion`], recorded when the job was
     /// started: the reason is carried on the one modelled member that can hold it —
-    /// `Step$statusReason` — because `JobSummary` models no reason of its own.
+    /// `Step$statusReason` — because `JobSummary` models no reason of its own. The STEPS
+    /// it reports are the whole sequence that conclusion's execution ran
+    /// ([`job_steps::settled_steps`]); what each of their URLs leads to is published by
+    /// [`Self::publish_step_outputs`], which the branch calls with the site this
+    /// deployment put live.
     pub fn settle(&mut self) {
         let Some(due) = self.settles_at else {
             return;
@@ -891,30 +945,44 @@ impl BranchJob {
             return;
         }
         self.settles_at = None;
-        let ended = ::aws_smithy_types::DateTime::from_millis(due);
         // The settling is the instant this job's work RAN, so a job that had work to run
         // now reports the instant it started as well as the status it reached.
         if self.work_has_begun {
             self.job.summary.work_began();
         }
         self.job.summary.status = self.conclusion.status.clone();
-        self.job.summary.end_time = Some(ended);
-        self.job.steps = vec![Step {
-            step_name: self.conclusion.step_name.clone(),
-            start_time: self.job.summary.start_time,
-            status: self.conclusion.status.clone(),
-            end_time: ended,
-            status_reason: self.conclusion.status_reason.clone(),
-            // Every URL below addresses an artifact a build produced, and no build
-            // ran; `screenshots` and `context` likewise only exist for a step that
-            // executed.
-            log_url: None,
-            artifacts_url: None,
-            test_artifacts_url: None,
-            test_config_url: None,
-            screenshots: None,
-            context: None,
-        }];
+        self.job.summary.end_time = Some(::aws_smithy_types::DateTime::from_millis(due));
+        self.job.steps = job_steps::settled_steps(
+            &self.conclusion,
+            self.job.summary.start_time,
+            due,
+            self.outputs.as_ref(),
+        );
+    }
+
+    /// Publish what this job's steps produced, once the clock has settled it: fill every
+    /// address the start call minted with the output served there
+    /// ([`job_steps::capture`]).
+    ///
+    /// `site` is the branch's site as it stands, which for the deployment that has just
+    /// settled is the site it published — so the verification its steps report is of its
+    /// own content. Called by [`AmplifyBranch::settle`], after that publishing; a job that
+    /// has not settled, that publishes no output, or whose output is already published is
+    /// left exactly as it is, so no later read rewrites what an execution produced.
+    pub fn publish_step_outputs(&mut self, site: &BTreeMap<String, Vec<u8>>) {
+        if self.settles_at.is_some() {
+            return;
+        }
+        let Some(outputs) = self.outputs.as_mut() else {
+            return;
+        };
+        job_steps::capture(
+            &self.job,
+            &self.conclusion,
+            &self.deployed_assets,
+            site,
+            outputs,
+        );
     }
 
     /// Stop this job: it reaches [`JOB_STATUS_CANCELLED`] now if no work had begun under
@@ -933,6 +1001,11 @@ impl BranchJob {
     /// status and the reason are the cancellation's.
     pub fn cancel(&mut self) {
         self.conclusion = JobConclusion::cancelled(&self.conclusion.step_name);
+        // A cancelled execution published nothing and verified nothing, so whatever its
+        // steps had addressed is not served: the outputs are dropped with the steps.
+        if let Some(outputs) = self.outputs.as_mut() {
+            outputs.served.clear();
+        }
         if !self.work_has_begun {
             self.job.summary.status = JOB_STATUS_CANCELLED.to_string();
             // A job that never ran produced no step and has no execution that ended, so
@@ -1499,7 +1572,7 @@ pub struct ComAmazonawsAmplifyAmplifyState {
     pub next_app_id_seq: u64,
     /// Monotonic counter feeding [`ComAmazonawsAmplifyAmplifyState::mint_webhook_id`].
     pub next_webhook_id_seq: u64,
-    /// Monotonic counter feeding [`ComAmazonawsAmplifyAmplifyState::mint_upload_token`].
+    /// Monotonic counter feeding [`ComAmazonawsAmplifyAmplifyState::mint_plane_token`].
     pub next_upload_token_seq: u64,
 }
 
@@ -1550,14 +1623,15 @@ impl ComAmazonawsAmplifyAmplifyState {
         }
     }
 
-    /// Mint the opaque token that authorises ONE upload of a reserved deployment.
+    /// Mint the opaque token that authorises ONE destination this service publishes — an
+    /// upload of a reserved deployment, an output of a settled job's step.
     ///
-    /// A deployment's upload destination is handed to the caller and to nobody else,
-    /// so what authorises writing to it cannot be the app id, the branch name or the
-    /// job id the caller already knows: it is 128 bits from the same mixer that mints
-    /// an app id, rendered as hexadecimal, minted once per upload so no two uploads of
-    /// a deployment — and no two deployments — share a destination.
-    pub fn mint_upload_token(&mut self) -> String {
+    /// Such an address is handed to the caller and to nobody else, so what authorises
+    /// reaching it cannot be the app id, the branch name or the job id the caller already
+    /// knows: it is 128 bits from the same mixer that mints an app id, rendered as
+    /// hexadecimal, minted once per destination so no two destinations of a deployment —
+    /// and no two deployments — share one.
+    pub fn mint_plane_token(&mut self) -> String {
         self.next_upload_token_seq = self.next_upload_token_seq.wrapping_add(1);
         let (high, low) = mixed_pair(self.next_upload_token_seq);
         format!("{high:016x}{low:016x}")
@@ -1676,6 +1750,30 @@ impl ComAmazonawsAmplifyAmplifyState {
     /// emulator never handed out is claimed by nobody.
     pub fn holds_deployment_upload(&self, target: &DeploymentUploadTarget) -> bool {
         self.reservation_of_upload(target).is_some()
+    }
+
+    /// The output one published job-output URL names, or `None` for an address nothing is
+    /// served at.
+    ///
+    /// A pure READ: the output is what the job's execution produced, published when the
+    /// clock settled that job ([`BranchJob::publish_step_outputs`]), so fetching it
+    /// changes nothing a later caller sees. The token is the receipt, exactly as an
+    /// upload's is: the job it belongs to is found by scanning the app's branches, because
+    /// the address names the app and the job and not the branch.
+    pub fn job_output(&self, target: &JobOutputTarget) -> Option<StepOutput> {
+        self.apps
+            .get(&target.app_id)?
+            .branches
+            .values()
+            .filter_map(|branch| branch.jobs.get(&target.job_id))
+            .find_map(|job| job.outputs.as_ref()?.served.get(&target.token))
+            .cloned()
+    }
+
+    /// Whether this store serves the output one job-output URL names — the question
+    /// `Service::can_handle` asks of a request that followed such a URL.
+    pub fn serves_job_output(&self, target: &JobOutputTarget) -> bool {
+        self.job_output(target).is_some()
     }
 
     /// The reservation a deployment-upload URL names, to READ.

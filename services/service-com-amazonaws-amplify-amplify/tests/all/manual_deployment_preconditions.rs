@@ -418,8 +418,9 @@ async fn a_deployment_whose_file_never_arrived_is_not_started() {
         let record = emulator.get_branch(&app_id, &branch).await.member("branch");
         assert_eq!(
             string_member(&record, "totalNumberOfJobs"),
-            "1",
-            "case {case:?}: the started deployment is counted, got {record:?}"
+            "0",
+            "case {case:?}: a deployment of content is no build of the branch, so the \
+             branch's build count stays where it was, got {record:?}"
         );
         assert_eq!(
             string_member(&record, "activeJobId"),
@@ -478,7 +479,9 @@ async fn a_deleted_branch_reports_the_jobs_it_actually_started() {
             case: "a deployment that did start",
             repository: false,
             active: Some("1"),
-            total: "1",
+            // A deployment of content runs no build of the branch, so the branch's build
+            // count stays at none however many deployments succeed on it.
+            total: "0",
         },
     ];
 

@@ -229,6 +229,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
+        // The addresses this deployment's steps will publish their output at, taken out of
+        // the store's own token sequence BEFORE the branch record is held through it; what
+        // each one serves is filled in when the clock settles the job
+        // (`crate::state::BranchJob::publish_step_outputs`).
+        let output_tokens = crate::state::JobOutputTokens::minted(&mut store);
         // What this store already holds of other deployments' content, which bounds what
         // THIS one may publish into it: the reservation this call spends is not counted,
         // because starting it hands its uploads over to the deployment rather than
@@ -278,11 +283,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the call that starts it, so it cannot be started twice.
             Source::Reserved(pending) => {
                 branch.deployments.remove(&pending.job_id);
-                branch.started_a_job();
                 pending.job_id.clone()
             }
-            _ => branch.mint_job_id(),
+            // A deployment is a job of the branch but not a BUILD of it, so its id comes
+            // out of the branch's sequence without counting one (see
+            // `crate::state::AmplifyBranch::builds_started`).
+            _ => branch.reserve_job_id(),
         };
+
+        // Where this deployment's steps publish the output each produces: the tokens were
+        // taken out of the store above, and the addresses are composed HERE, now that the
+        // job has a number — signing one reads the request this call is serving.
+        let outputs = output_tokens.addressed(
+            ctx,
+            &crate::state::request_endpoint_host(ctx.parts(), &region),
+            &input.app_id,
+            &job_id,
+        );
 
         let summary = JobSummary {
             job_arn: crate::state::job_arn(&branch_arn, &job_id),
@@ -318,8 +335,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let deployed_assets = deployment.assets();
         let publishes = deployment.publishes();
-        let record =
-            crate::state::BranchJob::deploying(summary, deployment.conclusion, deployed_assets);
+        let record = crate::state::BranchJob::deploying(
+            summary,
+            deployment.conclusion,
+            deployed_assets,
+            outputs,
+        );
         let job_id = record.job.summary.job_id.clone();
         let answer = record.job.summary.clone();
         branch.jobs.insert(job_id.clone(), record);
@@ -332,12 +353,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The branch's own view of its jobs: the deployment just started is the active
-        // one, and `totalNumberOfJobs` counts the jobs this branch has STARTED.
-        // `activeJobId` IDENTIFIES that job rather than reporting its number, so it
+        // one. `activeJobId` IDENTIFIES that job rather than reporting its number, so it
         // carries the fixed-width form the job's ARN segment carries
-        // (`crate::state::padded_job_number`).
+        // (`crate::state::padded_job_number`). `totalNumberOfJobs` is left where it
+        // stands: it counts the branch's BUILDS, and deploying content runs none (see
+        // `crate::state::AmplifyBranch::builds_started`).
         branch.branch.active_job_id = crate::state::padded_job_number(&job_id);
-        branch.branch.total_number_of_jobs = branch.jobs_started().to_string();
 
         // The summary of the job just recorded, so this call and every later read of that
         // job report it the same way.
