@@ -918,7 +918,9 @@ async fn a_training_instance_type_outside_the_set_states_the_condition_it_failed
 
     // The contrast: the HOSTING instance types are another value set, and a value outside
     // it is still told the set — so the condition above is a property of the training set
-    // and not of every member named `InstanceType`.
+    // and not of every member named `InstanceType`. The set is told over the values the
+    // model declares, listed in the order the service's own table of them is walked rather
+    // than in the model's declaration order (see `service::validation`).
     let emulator = Emulator::new();
     let (status, refused) = emulator
         .call(
@@ -945,10 +947,28 @@ async fn a_training_instance_type_outside_the_set_states_the_condition_it_failed
         "case \"a hosting instance type outside its set\": expected 400 \
          ValidationException, got {status} {refused:?}"
     );
-    assert!(
-        requirement_stated.starts_with("Member must satisfy enum value set: [ml.t2.medium, ")
-            && requirement_stated != requirement,
-        "case \"a hosting instance type outside its set\": expected the value set to be \
-         listed, got {requirement_stated:?}"
+    // Source: `smithy_query(query="shape",shape="ProductionVariantInstanceType")`, read
+    // through the generated constant.
+    let declared: Vec<&str> =
+        service_com_amazonaws_sagemaker_sagemaker::ops::types::PRODUCTION_VARIANT_INSTANCE_TYPE_VALUES
+            .to_vec();
+    let listed: Vec<&str> = requirement_stated
+        .strip_prefix("Member must satisfy enum value set: [")
+        .and_then(|tail| tail.strip_suffix(']'))
+        .map(|values| values.split(", ").collect())
+        .unwrap_or_default();
+    let mut listed_set = listed.clone();
+    let mut declared_set = declared.clone();
+    listed_set.sort_unstable();
+    declared_set.sort_unstable();
+    assert_eq!(
+        listed_set, declared_set,
+        "case \"a hosting instance type outside its set\": expected the whole value set to \
+         be listed, got {requirement_stated:?}"
+    );
+    assert_ne!(
+        requirement_stated, requirement,
+        "case \"a hosting instance type outside its set\": expected the set to be listed \
+         rather than the condition the training types state, got {requirement_stated:?}"
     );
 }

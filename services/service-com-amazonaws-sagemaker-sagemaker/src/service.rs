@@ -50,6 +50,12 @@ use std::sync::Arc;
 // handlers that enforce a constraint the model cannot express.
 pub(crate) mod validation;
 
+/// The one refusal this service states from the REQUEST rather than from the violations
+/// alone — a constraint a list's ELEMENTS break, stated at the list member quoting the list
+/// the request sent — and the operation wrapper it is applied in
+/// ([`list_element_refusals::StatedFromRequest`]).
+mod list_element_refusals;
+
 /// Whether IAM lets a request perform the action it names, which the ML Lineage reads decide
 /// before they report anything ([`authorization::authorize`]).
 pub mod authorization;
@@ -78,6 +84,10 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// published opens. Held rather than built per request because
     /// [`Service::override_operation`] hands the router a BORROW of it.
     presigned_session: presigned_session::PresignedSessionRoute<Eng>,
+    /// The wrapper every routable request is served through, so a constraint a list's
+    /// ELEMENTS break is stated at the list member quoting the list the request sent; see
+    /// [`list_element_refusals`]. Held for the same reason the route above is.
+    stated_from_request: list_element_refusals::StatedFromRequest,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -87,6 +97,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             presigned_session: presigned_session::PresignedSessionRoute::new(Arc::clone(&engine)),
+            stated_from_request: list_element_refusals::StatedFromRequest,
             entry: crate::ServiceDefinition::new(engine),
         }
     }
@@ -159,22 +170,49 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The model binds no operation to the address a presigned URL points at — an
         // opened session is not an API call, it is what the API's URL leads to — so that
         // address is served here.
-        self.presigned_session_route(req.method(), req.uri())
+        //
+        // Every OTHER request the generated routing table can serve is served through the
+        // wrapper that states the one refusal this service words from the REQUEST — a
+        // constraint a list's ELEMENTS break, stated at the list member quoting the list the
+        // request sent (see [`list_element_refusals`]) — which delegates to that same table
+        // entry for everything else. The routing stays the model's: a request whose target
+        // names no modelled operation is declined here, so the framework answers it as the
+        // unroutable request it is.
+        if let Some(route) = self.presigned_session_route(req.method(), req.uri()) {
+            return Some(route);
+        }
+        let routes = self
+            .entry
+            .protocol()
+            .routing_key(req)
+            .ok()
+            .and_then(|key| self.entry.routing_table().get(key))
+            .is_some();
+        routes.then_some(&self.stated_from_request as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. SageMaker states two of those facts differently from
-        // the framework — a `@pattern` without its whole-value anchors, and an enum
-        // value set in the service's own declared order — so a constraint failure is
-        // reworded through `validation`, which restates the code (`ValidationException`)
+        // service reword it. SageMaker states several of those facts differently from
+        // the framework — a `@pattern` without its whole-value anchors, an enum
+        // value set over the values the service holds and in the order its own table
+        // of them is walked, and the clauses of one refusal in the order that same
+        // findings table is walked — so a constraint failure is reworded through
+        // `validation`, which restates the code (`ValidationException`)
         // together with the message: a chosen `Refused` replaces both.
+        //
+        // It is handed the violations ALONE — no request — so the one clause whose value
+        // half is the request's own (the list a failed ELEMENT belongs to) cannot be
+        // stated here: `list_element_refusals` answers that before this walk is reached,
+        // through the SAME renderer, so the wording cannot differ between the two paths.
         //
         // Every other refusal class keeps the framework's wording: an unauthenticated
         // caller is answered by the framework's own 403.
         match refusal {
-            Refusal::Invalid(violations) => validation::refusal(violations),
+            Refusal::Invalid(violations) => {
+                validation::refusal(violations, &[], &std::collections::HashMap::new())
+            }
             _ => None,
         }
     }
