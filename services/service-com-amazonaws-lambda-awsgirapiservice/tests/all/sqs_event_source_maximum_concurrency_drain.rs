@@ -27,7 +27,9 @@
 //! and how deep the backlog is. The upper end of that range, and what the FUNCTION's own
 //! reservation bounds the ceiling to, are [`crate::event_source_mapping_scaling_concurrency`]'s
 //! and [`crate::event_source_mapping_concurrency_ceiling`]'s rows, which read the same ceiling
-//! off Lambda's own `ConcurrentExecutions` series.
+//! off Lambda's own `ConcurrentExecutions` series. WHICH configuration a mapping is bounded by
+//! once an update has changed it is [`crate::sqs_event_source_updated_concurrency`]'s rule,
+//! which shares this suite's handler and spans rather than copying them.
 //!
 //! Nothing here waits a span of its own: every wait looks again until what it waits for is
 //! there or a generous deadline passes, and the one window that asserts something did NOT
@@ -50,7 +52,10 @@ use crate::invoke_request_id::one_invocation_stream_at_a_time;
 /// `VisibilityTimeout`: the same value, which is the pairing `CreateEventSourceMapping` accepts
 /// (a queue must outlast the function it feeds). Long enough that an invocation this suite
 /// holds is still its own when the suite releases it.
-const TIMEOUT_SECONDS: i64 = 30;
+///
+/// Shared with [`crate::sqs_event_source_updated_concurrency`], which observes the same ceiling
+/// after an update changed it, rather than copied there.
+pub(crate) const TIMEOUT_SECONDS: i64 = 30;
 
 /// How long a row waits for work the emulator owes — a batch polled, a handler run, a record
 /// forwarded, the backlog drained.
@@ -59,7 +64,9 @@ const TIMEOUT_SECONDS: i64 = 30;
 /// itself allows ONE attempt (the wait for a share of the run capacity and the wait for the
 /// run's own answer) rather than picked here: a row fails only when the work did not happen at
 /// all.
-const BUDGET: Duration = PERMIT_WAIT
+///
+/// Shared; see [`TIMEOUT_SECONDS`].
+pub(crate) const BUDGET: Duration = PERMIT_WAIT
     .saturating_add(HOST_WAIT_CEILING)
     .saturating_add(Duration::from_secs(60));
 
@@ -69,15 +76,21 @@ const BUDGET: Duration = PERMIT_WAIT
 /// Generous on purpose: it is far longer than the hand-over of a batch takes on any host — the
 /// invocations the row waited for have already reported by the time this window opens — so an
 /// invocation past the ceiling would be seen inside it.
-const QUIET_WINDOW: Duration = Duration::from_secs(3);
+///
+/// Shared; see [`TIMEOUT_SECONDS`].
+pub(crate) const QUIET_WINDOW: Duration = Duration::from_secs(3);
 
 /// The environment entries the handler below reads its two queues from.
-const STARTED_QUEUE_URL: &str = "STARTED_QUEUE_URL";
+///
+/// Shared; see [`TIMEOUT_SECONDS`].
+pub(crate) const STARTED_QUEUE_URL: &str = "STARTED_QUEUE_URL";
 /// See [`STARTED_QUEUE_URL`].
-const RELEASE_QUEUE_URL: &str = "RELEASE_QUEUE_URL";
+pub(crate) const RELEASE_QUEUE_URL: &str = "RELEASE_QUEUE_URL";
 
 /// The body a release message carries, which the handler neither reads nor reports.
-const RELEASE: &str = "go";
+///
+/// Shared; see [`TIMEOUT_SECONDS`].
+pub(crate) const RELEASE: &str = "go";
 
 /// The handler every row runs: it reports each record it was handed on the side-channel queue
 /// and then stays in its invocation, polling the release queue until this suite sends it a
@@ -85,7 +98,9 @@ const RELEASE: &str = "go";
 ///
 /// Nothing here sleeps for a span: the handler waits on a QUEUE, and the suite decides when
 /// that wait ends.
-const HANDLER_SOURCE: &str = r#"
+///
+/// Shared; see [`TIMEOUT_SECONDS`].
+pub(crate) const HANDLER_SOURCE: &str = r#"
 import os
 
 import boto3
