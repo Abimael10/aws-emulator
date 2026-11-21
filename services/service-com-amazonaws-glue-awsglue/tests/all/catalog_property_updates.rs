@@ -38,12 +38,23 @@ fn federation_source(name: &str) -> Value {
 
 /// A `TargetRedshiftCatalog` resource link, the kind of catalog whose own definition this
 /// Data Catalog holds — and so the kind an update of its properties writes.
-fn resource_link(name: &str) -> Value {
+///
+/// One copy, shared with [`crate::catalog_definition_write_scope`], so the two suites that
+/// drive a catalog update cannot drift apart on what such a catalog looks like.
+pub fn resource_link(name: &str) -> Value {
     json!({ "CatalogArn": format!("arn:aws:glue:{REGION}:{ACCOUNT_ID}:catalog/{name}") })
 }
 
-/// Register one catalog that is a resource link, so an update has a catalog to write.
-async fn given_linked_catalog(router: &MultiServiceRouter, name: &str) {
+/// Register one catalog that is a resource link, carrying `tags`, so an update has a catalog
+/// to write and a tag set beside the definition it writes.
+///
+/// One copy, shared with [`crate::catalog_definition_write_scope`]: the request a catalog
+/// create is driven with is maintained here.
+pub async fn given_linked_catalog_with_tags(
+    router: &MultiServiceRouter,
+    name: &str,
+    tags: &Value,
+) {
     ok(
         router,
         "CreateCatalog",
@@ -54,14 +65,43 @@ async fn given_linked_catalog(router: &MultiServiceRouter, name: &str) {
                 "Parameters": { "owner": "analytics" },
                 "TargetRedshiftCatalog": resource_link(name),
             },
-            "Tags": { "owner": "data-platform" },
+            "Tags": tags,
         }),
     )
     .await;
 }
 
+/// The same, with the tag set the rows of this suite stage their catalogs with.
+async fn given_linked_catalog(router: &MultiServiceRouter, name: &str) {
+    given_linked_catalog_with_tags(router, name, &json!({ "owner": "data-platform" })).await;
+}
+
+/// Assert the members no `CatalogInput` carries are the ones the create left: a catalog's name
+/// and its two id members address it, its kind is read off its own definition, its ARN is
+/// minted from both, and `CreateTime` is "the time at which the catalog was created".
+///
+/// One copy, shared with [`crate::catalog_definition_write_scope`].
+pub fn assert_server_owned_members_unchanged(case: &str, created: &Value, read: &Value) {
+    for member in [
+        "Name",
+        "CatalogId",
+        "CatalogIdentifier",
+        "CatalogType",
+        "ResourceArn",
+        "CreateTime",
+    ] {
+        assert_eq!(
+            read.get(member),
+            created.get(member),
+            "case {case}: {member} is not this request's to change, got {read}"
+        );
+    }
+}
+
 /// The `Catalog` a `GetCatalog` for `catalog_id` reports.
-async fn get_catalog(router: &MultiServiceRouter, catalog_id: &str) -> Value {
+///
+/// One copy, shared with [`crate::catalog_definition_write_scope`].
+pub async fn get_catalog(router: &MultiServiceRouter, catalog_id: &str) -> Value {
     let read = ok(router, "GetCatalog", &json!({ "CatalogId": catalog_id })).await;
     read.get("Catalog")
         .cloned()
@@ -83,7 +123,9 @@ async fn get_catalog_through_the_listing(router: &MultiServiceRouter, name: &str
 
 /// Update `catalog_id` with `input` and assert the call is served with the modelled empty
 /// answer.
-async fn update(router: &MultiServiceRouter, catalog_id: &str, input: &Value) {
+///
+/// One copy, shared with [`crate::catalog_definition_write_scope`].
+pub async fn update(router: &MultiServiceRouter, catalog_id: &str, input: &Value) {
     let answer = ok(
         router,
         "UpdateCatalog",
@@ -200,13 +242,7 @@ async fn an_update_states_the_catalogs_whole_definition() {
         }
 
         // The members no `CatalogInput` carries are not the update's to change.
-        for member in ["Name", "CatalogId", "CatalogType", "ResourceArn", "CreateTime"] {
-            assert_eq!(
-                read.get(member),
-                created.get(member),
-                "case {case}: {member} is not this request's to change, got {read}"
-            );
-        }
+        assert_server_owned_members_unchanged(case, &created, &read);
         // "The time at which the catalog was last updated" moves with the write.
         let created_at = created
             .get("CreateTime")
@@ -231,8 +267,11 @@ async fn an_update_states_the_catalogs_whole_definition() {
     }
 
     // The catalog's tags are written through the tagging operations and the `Catalog` shape
-    // carries no tag member, so a definition write has nothing to report about them: what
-    // this suite pins is that the write states the definition and nothing beside it.
+    // carries no tag member, so a definition write has nothing to report about them: that the
+    // write leaves the tag set as the create recorded it is read back through `GetTags` by
+    // [`crate::catalog_definition_write_scope`], which pins what a definition write touches at
+    // all, where what this suite pins is WHICH definition the write leaves and the refusals it
+    // earns.
 }
 
 /// An update reaches the catalog its id addresses under any casing of that catalog's name —
