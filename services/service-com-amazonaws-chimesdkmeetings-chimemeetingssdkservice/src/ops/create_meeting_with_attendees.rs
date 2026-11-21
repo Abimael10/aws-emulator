@@ -211,9 +211,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
-        // The reserved-prefix rule the model states on `ExternalMeetingId`, applied before
-        // anything is resolved, minted or stored.
-        if let Some(refusal) = crate::state::reserved_prefix_refusal(
+        // The documented rules on `ExternalMeetingId` — its character pattern and the
+        // reserved prefix — applied before anything is resolved, minted or stored.
+        if let Some(refusal) = crate::state::external_identifier_refusal(
             crate::state::EXTERNAL_MEETING_ID_MEMBER,
             &input.external_meeting_id,
         ) {
@@ -320,9 +320,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut created: Vec<Attendee> = Vec::new();
         let mut errors: Vec<CreateAttendeeError2> = Vec::new();
         for item in input.attendees {
-            // The reserved-prefix rule the model states on `ExternalUserId`, read as a
-            // per-item failure exactly as a capability conflict is.
-            if let Some(refusal) = crate::state::reserved_prefix_refusal(
+            // The documented rules on `ExternalUserId` — its character pattern and the
+            // reserved prefix — read as a per-item failure exactly as a capability
+            // conflict is.
+            if let Some(refusal) = crate::state::external_identifier_refusal(
                 crate::state::EXTERNAL_USER_ID_MEMBER,
                 &item.external_user_id,
             ) {

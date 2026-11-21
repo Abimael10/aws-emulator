@@ -203,9 +203,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
-        // The reserved-prefix rule the model states on `ExternalMeetingId`, applied before
-        // anything is resolved, minted or stored.
-        if let Some(refusal) = crate::state::reserved_prefix_refusal(
+        // The documented rules on `ExternalMeetingId` — its character pattern and the
+        // reserved prefix — applied before anything is resolved, minted or stored.
+        if let Some(refusal) = crate::state::external_identifier_refusal(
             crate::state::EXTERNAL_MEETING_ID_MEMBER,
             &input.external_meeting_id,
         ) {

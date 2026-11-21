@@ -184,11 +184,83 @@ pub fn reserved_prefix_refusal(member: &str, value: &str) -> Option<BadRequestEx
         .then(|| bad_request(reserved_prefix_problem(member)))
 }
 
-/// The input member of `CreateAttendee` the reserved-prefix rule is documented on.
+/// The input member of `CreateAttendee` the external-identifier rules are documented on.
 pub const EXTERNAL_USER_ID_MEMBER: &str = "ExternalUserId";
 
-/// The input member of `CreateMeeting` the same rule is documented on.
+/// The input member of `CreateMeeting` the same rules are documented on.
 pub const EXTERNAL_MEETING_ID_MEMBER: &str = "ExternalMeetingId";
+
+/// The characters the model ADMITS in the two caller-supplied identifiers of this
+/// service, written as the documentation writes them.
+///
+/// From the model: `CreateAttendeeRequest$ExternalUserId`, `Attendee$ExternalUserId` and
+/// `CreateMeetingRequest$ExternalMeetingId` all document "Pattern:
+/// `[-_&@+=,(){}\[\]\/«».:|'"#a-zA-Z0-9À-ÿ\s]*`" in the same paragraph as the reserved
+/// prefix above
+/// (`smithy_query(query="doc",shape="CreateAttendeeRequest",member="ExternalUserId")`).
+/// NEITHER shape carries a Smithy `@pattern` trait (both are `string, length 2..64,
+/// sensitive`), so nothing enforces the pattern before a handler and
+/// [`external_identifier_pattern_refusal`] is what applies it.
+pub const EXTERNAL_IDENTIFIER_PATTERN: &str = r##"[-_&@+=,(){}\[\]\/«».:|'"#a-zA-Z0-9À-ÿ\s]*"##;
+
+/// Whether `candidate` is one of the characters [`EXTERNAL_IDENTIFIER_PATTERN`] admits.
+///
+/// The arms are that character class read left to right: the punctuation it lists
+/// literally (its escapes `\[`, `\]` and `\/` stand for the brackets and the slash), the
+/// two guillemets, the ASCII letters and digits, the `À-ÿ` Latin-1 range, and `\s`, whose
+/// Unicode definition is [`char::is_whitespace`]. The class is CLOSED: a character it
+/// does not list is not admitted.
+fn admitted_identifier_char(candidate: char) -> bool {
+    matches!(candidate,
+        '-' | '_' | '&' | '@' | '+' | '=' | ',' | '(' | ')' | '{' | '}' | '[' | ']' | '/'
+            | '«' | '»' | '.' | ':' | '|' | '\'' | '"' | '#'
+            | 'a'..='z'
+            | 'A'..='Z'
+            | '0'..='9'
+            | 'À'..='ÿ'
+    ) || candidate.is_whitespace()
+}
+
+/// How a request carrying a character the documented pattern excludes in `member` is
+/// refused.
+///
+/// The sentence is FIXED text for this error class apart from the INPUT MEMBER it names —
+/// which tells the caller which of the identifiers it supplied was the offending one —
+/// and the pattern, quoted as the documentation writes it, which tells it what is
+/// admitted. No value of the request is in it: both members are `@sensitive`, so a
+/// refusal never echoes one back.
+pub fn pattern_problem(member: &str) -> String {
+    format!(
+        "Validation error for {member}, value must match the pattern \
+         '{EXTERNAL_IDENTIFIER_PATTERN}'."
+    )
+}
+
+/// `None` when every character of `value` is one [`EXTERNAL_IDENTIFIER_PATTERN`] admits,
+/// or the refusal when any character is outside it.
+///
+/// The whole value is compared, so one out-of-pattern character anywhere in it — first,
+/// inside or last — refuses the request.
+pub fn external_identifier_pattern_refusal(
+    member: &str,
+    value: &str,
+) -> Option<BadRequestException> {
+    (!value.chars().all(admitted_identifier_char)).then(|| bad_request(pattern_problem(member)))
+}
+
+/// `None` when `value` may be stored under `member`, or the refusal for the first rule of
+/// the documented paragraph it breaks.
+///
+/// Both sentences of that paragraph constrain the value — the character pattern and the
+/// reserved prefix — and both are the same modelled refusal, so every operation that
+/// takes one of these identifiers applies them through this ONE function rather than
+/// picking a sentence. The pattern is read first, in the order the documentation states
+/// the two rules; the reserved prefix is itself inside the pattern, so a value that
+/// enters the reserved namespace with admitted characters is still reported as reserved.
+pub fn external_identifier_refusal(member: &str, value: &str) -> Option<BadRequestException> {
+    external_identifier_pattern_refusal(member, value)
+        .or_else(|| reserved_prefix_refusal(member, value))
+}
 
 /// How a tagging call naming a `MeetingId` this service holds no meeting under is refused.
 ///

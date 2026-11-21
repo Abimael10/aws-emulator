@@ -22,13 +22,24 @@
 //!    that uses this prefix. Case insensitive.", so a value that begins with it — in any
 //!    casing — is refused with the modelled `BadRequestException` (HTTP 400) naming the
 //!    input member, and nothing is created.
+//! 3. CHARACTER PATTERN. The sentence BEFORE that one, in the same paragraph, documents
+//!    "Pattern: `[-_&@+=,(){}\[\]\/«».:|'"#a-zA-Z0-9À-ÿ\s]*`", so a value carrying any
+//!    character that class does not list is refused the same way — the modelled
+//!    `BadRequestException` (HTTP 400) naming the input member — and nothing is created
+//!    for it, while a value made only of admitted characters is stored and read back
+//!    unchanged. Neither shape carries a Smithy `@pattern` trait, so nothing enforces this
+//!    before a handler and these cases exercise the handlers' own judgement over the wire.
 //!
 //! The tables span what the rules generalise over: the FORM of the identifier (both ends of
 //! the modelled `@length(2..64)`, characters from the documented pattern, a value that only
 //! contains the reserved prefix, the prefix in upper, capitalised and mixed case, one that
 //! merely starts like it), which operation supplies it (`CreateAttendee`,
 //! `BatchCreateAttendee`, `CreateMeeting`, `CreateMeetingWithAttendees`), how many times it
-//! is repeated, and which meeting it is repeated in.
+//! is repeated, and which meeting it is repeated in. For rule 3 they span WHICH excluded
+//! character the value carries (ASCII punctuation the class omits, and the code points
+//! immediately outside the `À-ÿ` range it lists), WHERE in the value it sits (first, inside,
+//! last), which member carries it, and which operation supplies that member — the two batch
+//! paths refusing the ITEM as they refuse any other bad item.
 
 use std::sync::Arc;
 
@@ -640,6 +651,445 @@ async fn an_external_identifier_in_the_reserved_namespace_is_refused() {
             attendee.status,
             attendee.error_code,
             attendee.body
+        );
+    }
+}
+
+/// The character class the model documents on both identifiers, copied verbatim from
+/// `Attendee$ExternalUserId` / `CreateMeetingRequest$ExternalMeetingId`
+/// (`smithy_query(query="doc",shape="CreateAttendeeRequest",member="ExternalUserId")` ->
+/// "Pattern: `[-_&@+=,(){}\[\]\/«».:|'\"#a-zA-Z0-9À-ÿ\s]*`").
+const DOCUMENTED_PATTERN: &str = r##"[-_&@+=,(){}\[\]\/«».:|'"#a-zA-Z0-9À-ÿ\s]*"##;
+
+/// How a request carrying a character the documented pattern excludes in `member` is
+/// refused, as this service words it: fixed text apart from the input member it names and
+/// the documented pattern it quotes. The VALUE is not in it — both members are
+/// `@sensitive`.
+fn pattern_message(member: &str) -> String {
+    format!("Validation error for {member}, value must match the pattern '{DOCUMENTED_PATTERN}'.")
+}
+
+/// Characters the documented class does NOT list, so a value carrying one is outside the
+/// pattern. The ASCII rows are punctuation absent from the class (which lists only
+/// `-_&@+=,(){}[]/.:|'"#`); the last three are a code point far beyond the `À-ÿ` range the
+/// class names and the two immediately outside its bounds.
+const EXCLUDED_CHARACTERS: &[(&str, char)] = &[
+    ("a dollar sign", '$'),
+    ("a semicolon", ';'),
+    ("an asterisk", '*'),
+    ("a backslash", '\\'),
+    ("a percent sign", '%'),
+    ("a question mark", '?'),
+    ("an angle bracket", '<'),
+    ("an exclamation mark", '!'),
+    ("a tilde", '~'),
+    ("a caret", '^'),
+    ("a backtick", '`'),
+    ("a code point far beyond the À-ÿ range", '€'),
+    ("the code point just below the À-ÿ range", '¿'),
+    ("the code point just above the À-ÿ range", 'Ā'),
+];
+
+/// Values spanning the excluded characters and the POSITION one takes in the value. Every
+/// value stays inside the member's modelled `@length(2..64)`, so what refuses it is the
+/// pattern and not its length.
+fn out_of_pattern_values() -> Vec<(String, String)> {
+    let mut rows = Vec::new();
+    for (name, character) in EXCLUDED_CHARACTERS {
+        for (position, value) in [
+            ("first", format!("{character}user1")),
+            ("inside", format!("user{character}1")),
+            ("last", format!("user1{character}")),
+        ] {
+            rows.push((format!("{name} {position}"), value));
+        }
+    }
+    rows
+}
+
+/// Values made only of characters the documented class lists: each group of it, both ends
+/// of its `À-ÿ` range and a code point inside that range, plus `\s` whitespace.
+fn in_pattern_values() -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "every punctuation character the class lists",
+            r##"-_&@+=,(){}[]/.:|'"#"##.to_string(),
+        ),
+        ("the guillemets the class lists", "«quoted»".to_string()),
+        ("ASCII letters and digits", "User0123".to_string()),
+        ("whitespace", "two words".to_string()),
+        (
+            "the lower bound of the À-ÿ range",
+            "\u{c0}-at-the-start".to_string(),
+        ),
+        (
+            "the upper bound of the À-ÿ range",
+            "\u{ff}-at-the-start".to_string(),
+        ),
+        ("a letter inside the À-ÿ range", "rené-é".to_string()),
+    ]
+}
+
+/// RULE 3, through `CreateAttendee`: a value carrying a character the documented pattern
+/// excludes is refused with the modelled 400 naming the member, and the meeting gains no
+/// attendee for it.
+#[tokio::test]
+async fn an_external_user_id_outside_the_documented_pattern_is_refused() {
+    let emulator = Emulator::new();
+    let meeting_id = emulator.meeting_id("tok-pattern-attendee").await;
+    let expected = pattern_message("ExternalUserId");
+
+    for (case, value) in out_of_pattern_values() {
+        let reply = emulator.create_attendee(&meeting_id, &value).await;
+        assert_eq!(
+            (
+                reply.status,
+                reply.error_code.as_deref(),
+                reply.text("Message")
+            ),
+            (
+                400,
+                Some("BadRequestException"),
+                Some(expected.as_str())
+            ),
+            "case {case:?} (CreateAttendee {value:?}): expected the modelled 400 naming the \
+             member, got {} {:?} with {:?}",
+            reply.status,
+            reply.error_code,
+            reply.body
+        );
+        assert!(
+            emulator.list_attendees(&meeting_id).await.is_empty(),
+            "case {case:?} ({value:?}): a refused create must mint nothing"
+        );
+    }
+}
+
+/// RULE 3 as a PER-ITEM refusal of `BatchCreateAttendee`: the offending item is reported in
+/// `Errors` naming the value the caller sent, the item beside it is created, and the call
+/// itself succeeds.
+#[tokio::test]
+async fn a_batch_item_outside_the_documented_pattern_is_refused_on_its_own() {
+    let emulator = Emulator::new();
+    let meeting_id = emulator.meeting_id("tok-pattern-batch").await;
+    let expected = pattern_message("ExternalUserId");
+
+    for (index, (case, value)) in out_of_pattern_values().into_iter().enumerate() {
+        let admitted = format!("user-admitted-{index}");
+        let reply = emulator
+            .batch_create_attendee(&meeting_id, &[&value, &admitted])
+            .await;
+        assert_eq!(
+            (reply.status, reply.error_code.as_deref()),
+            (200, None),
+            "case {case:?} ({value:?}): a per-item refusal must not fail the call, got {} \
+             {:?} with {:?}",
+            reply.status,
+            reply.error_code,
+            reply.body
+        );
+        let errors = reply.list("Errors");
+        assert_eq!(
+            errors.len(),
+            1,
+            "case {case:?} ({value:?}): expected exactly the out-of-pattern item refused, \
+             got {errors:?}"
+        );
+        assert_eq!(
+            (
+                errors[0]["ExternalUserId"].as_str(),
+                errors[0]["ErrorCode"].as_str(),
+                errors[0]["ErrorMessage"].as_str()
+            ),
+            (
+                Some(value.as_str()),
+                Some("BadRequest"),
+                Some(expected.as_str())
+            ),
+            "case {case:?} ({value:?}): expected the item refusal to name the value sent and \
+             the rule, got {errors:?}"
+        );
+        let stored = emulator.list_attendees(&meeting_id).await;
+        let out_of_pattern: Vec<&Value> = stored
+            .iter()
+            .filter(|attendee| attendee["ExternalUserId"].as_str() == Some(value.as_str()))
+            .collect();
+        assert!(
+            out_of_pattern.is_empty(),
+            "case {case:?} ({value:?}): a refused item must mint nothing, got \
+             {out_of_pattern:?}"
+        );
+        assert_eq!(
+            stored.len(),
+            index + 1,
+            "case {case:?} ({value:?}): expected only the admitted item of each round stored, \
+             got {stored:?}"
+        );
+    }
+}
+
+/// RULE 3 on the MEETING's own external id, through both creation paths: the whole call is
+/// refused, no meeting is created, and the refused `ClientRequestToken` is free to serve
+/// the corrected request.
+#[tokio::test]
+async fn an_external_meeting_id_outside_the_documented_pattern_is_refused() {
+    let emulator = Emulator::new();
+    let expected = pattern_message("ExternalMeetingId");
+
+    for (index, (case, value)) in out_of_pattern_values().into_iter().enumerate() {
+        let token = format!("tok-pattern-meeting-{index}");
+        let reply = emulator.create_meeting(&token, &value).await;
+        assert_eq!(
+            (
+                reply.status,
+                reply.error_code.as_deref(),
+                reply.text("Message")
+            ),
+            (
+                400,
+                Some("BadRequestException"),
+                Some(expected.as_str())
+            ),
+            "case {case:?} (CreateMeeting {value:?}): expected the modelled 400 naming the \
+             member, got {} {:?} with {:?}",
+            reply.status,
+            reply.error_code,
+            reply.body
+        );
+
+        let with_attendees = emulator
+            .create_meeting_with_attendees(
+                &format!("tok-pattern-cwa-{index}"),
+                &value,
+                &["user-with-bad-meeting"],
+            )
+            .await;
+        assert_eq!(
+            (
+                with_attendees.status,
+                with_attendees.error_code.as_deref(),
+                with_attendees.text("Message")
+            ),
+            (
+                400,
+                Some("BadRequestException"),
+                Some(expected.as_str())
+            ),
+            "case {case:?} (CreateMeetingWithAttendees {value:?}): expected the modelled 400 \
+             naming the member, got {} {:?} with {:?}",
+            with_attendees.status,
+            with_attendees.error_code,
+            with_attendees.body
+        );
+
+        // The refused create left no idempotency record: the same token still mints a
+        // meeting once the identifier is corrected.
+        let corrected = emulator
+            .create_meeting(&token, &format!("ext-corrected-{index}"))
+            .await;
+        assert_eq!(
+            (corrected.status, corrected.error_code.as_deref()),
+            (200, None),
+            "case {case:?}: expected the corrected create to be served, got {} {:?} with {:?}",
+            corrected.status,
+            corrected.error_code,
+            corrected.body
+        );
+    }
+}
+
+/// RULE 3 as a PER-ITEM refusal of `CreateMeetingWithAttendees`: the meeting is created,
+/// the out-of-pattern item is reported in `Errors`, and only the admitted item becomes an
+/// attendee of it.
+#[tokio::test]
+async fn a_create_with_attendees_item_outside_the_documented_pattern_is_refused_on_its_own() {
+    let emulator = Emulator::new();
+    let expected = pattern_message("ExternalUserId");
+
+    for (index, (case, value)) in out_of_pattern_values().into_iter().enumerate() {
+        let admitted = format!("user-admitted-{index}");
+        let reply = emulator
+            .create_meeting_with_attendees(
+                &format!("tok-pattern-cwa-item-{index}"),
+                &format!("ext-cwa-item-{index}"),
+                &[&value, &admitted],
+            )
+            .await;
+        assert_eq!(
+            (reply.status, reply.error_code.as_deref()),
+            (200, None),
+            "case {case:?} ({value:?}): a per-item refusal must not fail the call, got {} \
+             {:?} with {:?}",
+            reply.status,
+            reply.error_code,
+            reply.body
+        );
+        let errors = reply.list("Errors");
+        assert_eq!(
+            errors.len(),
+            1,
+            "case {case:?} ({value:?}): expected exactly the out-of-pattern item refused, \
+             got {errors:?}"
+        );
+        assert_eq!(
+            (
+                errors[0]["ExternalUserId"].as_str(),
+                errors[0]["ErrorCode"].as_str(),
+                errors[0]["ErrorMessage"].as_str()
+            ),
+            (
+                Some(value.as_str()),
+                Some("BadRequest"),
+                Some(expected.as_str())
+            ),
+            "case {case:?} ({value:?}): expected the item refusal to name the value sent and \
+             the rule, got {errors:?}"
+        );
+        let meeting_id = reply.body["Meeting"]["MeetingId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no MeetingId in {:?}", reply.body))
+            .to_string();
+        let stored = emulator.list_attendees(&meeting_id).await;
+        assert_eq!(
+            stored.len(),
+            1,
+            "case {case:?} ({value:?}): expected only the admitted item stored, got {stored:?}"
+        );
+        assert_eq!(
+            stored[0]["ExternalUserId"].as_str(),
+            Some(admitted.as_str()),
+            "case {case:?} ({value:?}): expected the admitted identity stored, got {stored:?}"
+        );
+    }
+}
+
+/// The other side of RULE 3: a value made only of characters the documented class lists is
+/// admitted by every creating operation and read back unchanged through `GetMeeting` and
+/// `GetAttendee`.
+#[tokio::test]
+async fn an_external_identifier_inside_the_documented_pattern_round_trips() {
+    let emulator = Emulator::new();
+
+    for (index, (case, value)) in in_pattern_values().into_iter().enumerate() {
+        // The meeting's own identifier, read back from the stored meeting.
+        let meeting = emulator
+            .create_meeting(&format!("tok-ok-{index}"), &value)
+            .await;
+        assert_eq!(
+            (meeting.status, meeting.error_code.as_deref()),
+            (200, None),
+            "case {case:?} (CreateMeeting {value:?}): expected it admitted, got {} {:?} with \
+             {:?}",
+            meeting.status,
+            meeting.error_code,
+            meeting.body
+        );
+        let meeting_id = meeting.body["Meeting"]["MeetingId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no MeetingId in {:?}", meeting.body))
+            .to_string();
+        let read_meeting = emulator
+            .call("GET", &format!("/meetings/{meeting_id}"), None)
+            .await;
+        assert_eq!(
+            read_meeting.body["Meeting"]["ExternalMeetingId"].as_str(),
+            Some(value.as_str()),
+            "case {case:?} (GetMeeting): expected the stored identifier, got {:?}",
+            read_meeting.body
+        );
+
+        // The attendee's identifier, read back from the stored attendee.
+        let attendee = emulator.create_attendee(&meeting_id, &value).await;
+        assert_eq!(
+            (attendee.status, attendee.error_code.as_deref()),
+            (200, None),
+            "case {case:?} (CreateAttendee {value:?}): expected it admitted, got {} {:?} with \
+             {:?}",
+            attendee.status,
+            attendee.error_code,
+            attendee.body
+        );
+        let attendee_id = attendee.body["Attendee"]["AttendeeId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no AttendeeId in {:?}", attendee.body))
+            .to_string();
+        let read_attendee = emulator
+            .call(
+                "GET",
+                &format!("/meetings/{meeting_id}/attendees/{attendee_id}"),
+                None,
+            )
+            .await;
+        assert_eq!(
+            read_attendee.body["Attendee"]["ExternalUserId"].as_str(),
+            Some(value.as_str()),
+            "case {case:?} (GetAttendee): expected the stored identifier, got {:?}",
+            read_attendee.body
+        );
+
+        // The two batch paths admit it too, refusing nothing.
+        let batch = emulator
+            .batch_create_attendee(&meeting_id, &[&value])
+            .await;
+        assert_eq!(
+            (batch.status, batch.list("Errors").len()),
+            (200, 0),
+            "case {case:?} (BatchCreateAttendee {value:?}): expected it admitted and nothing \
+             refused, got {} with {:?}",
+            batch.status,
+            batch.body
+        );
+        let with_attendees = emulator
+            .create_meeting_with_attendees(&format!("tok-ok-cwa-{index}"), &value, &[&value])
+            .await;
+        assert_eq!(
+            (with_attendees.status, with_attendees.list("Errors").len()),
+            (200, 0),
+            "case {case:?} (CreateMeetingWithAttendees {value:?}): expected it admitted and \
+             nothing refused, got {} with {:?}",
+            with_attendees.status,
+            with_attendees.body
+        );
+    }
+}
+
+/// A value that breaks BOTH sentences of the documented paragraph — the reserved prefix AND
+/// the pattern — is still the one modelled refusal naming the member, so a caller sees a
+/// 400 whichever of the two rules the service reads first.
+#[tokio::test]
+async fn a_value_breaking_both_documented_rules_is_refused_once() {
+    let emulator = Emulator::new();
+    let meeting_id = emulator.meeting_id("tok-pattern-both").await;
+
+    for (case, value) in [
+        (
+            "the reserved prefix with an excluded character",
+            "aws:user$1",
+        ),
+        ("an excluded character before the prefix", "$aws:user"),
+        (
+            "the prefix in mixed case with an excluded character",
+            "AwS:u*1",
+        ),
+    ] {
+        let reply = emulator.create_attendee(&meeting_id, value).await;
+        assert_eq!(
+            (reply.status, reply.error_code.as_deref()),
+            (400, Some("BadRequestException")),
+            "case {case:?} ({value:?}): expected the modelled 400, got {} {:?} with {:?}",
+            reply.status,
+            reply.error_code,
+            reply.body
+        );
+        let message = reply.text("Message").unwrap_or_default().to_string();
+        assert!(
+            message.contains("ExternalUserId"),
+            "case {case:?} ({value:?}): expected the refusal to name the input member, got \
+             {message:?}"
+        );
+        assert!(
+            emulator.list_attendees(&meeting_id).await.is_empty(),
+            "case {case:?} ({value:?}): a refused create must mint nothing"
         );
     }
 }

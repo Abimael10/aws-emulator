@@ -195,10 +195,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut created: Vec<Attendee> = Vec::new();
         let mut errors: Vec<CreateAttendeeError2> = Vec::new();
         for item in input.attendees {
-            // The reserved-prefix rule the model states on `ExternalUserId`, read as a
-            // per-item failure exactly as a capability conflict is: the item is refused
-            // and nothing is minted for it, while the rest of the batch is served.
-            if let Some(refusal) = crate::state::reserved_prefix_refusal(
+            // The documented rules on `ExternalUserId` — its character pattern and the
+            // reserved prefix — read as a per-item failure exactly as a capability
+            // conflict is: the item is refused and nothing is minted for it, while the
+            // rest of the batch is served.
+            if let Some(refusal) = crate::state::external_identifier_refusal(
                 crate::state::EXTERNAL_USER_ID_MEMBER,
                 &item.external_user_id,
             ) {

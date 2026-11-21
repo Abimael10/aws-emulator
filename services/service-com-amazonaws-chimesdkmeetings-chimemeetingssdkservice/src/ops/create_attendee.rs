@@ -8,9 +8,10 @@
 //!
 //! `ExternalUserId` is modelled as an idempotency token, so a repeat call for an identity
 //! that already has an attendee in this meeting answers with THAT attendee — the same
-//! `AttendeeId` and `JoinToken` — rather than minting a second one; and a value beginning
-//! with the prefix the model reserves is refused before anything is resolved
-//! ([`crate::state::reserved_prefix_refusal`]). A `Capabilities` set the meeting's
+//! `AttendeeId` and `JoinToken` — rather than minting a second one; and a value the
+//! documented rules on that member exclude — a character outside its pattern, or the
+//! prefix the model reserves — is refused before anything is resolved
+//! ([`crate::state::external_identifier_refusal`]). A `Capabilities` set the meeting's
 //! `MeetingFeatures` do not admit is refused the same way — before the repeat is answered —
 //! since that refusal is a fact about the request rather than about what the meeting holds
 //! ([`crate::state::capability_problem`]).
@@ -181,9 +182,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
-        // The reserved-prefix rule the model states on this member, applied BEFORE
-        // anything is resolved or minted, so a refused request leaves the store as it was.
-        if let Some(refusal) = crate::state::reserved_prefix_refusal(
+        // The documented rules on this member — its character pattern and the reserved
+        // prefix — applied BEFORE anything is resolved or minted, so a refused request
+        // leaves the store as it was.
+        if let Some(refusal) = crate::state::external_identifier_refusal(
             crate::state::EXTERNAL_USER_ID_MEMBER,
             &input.external_user_id,
         ) {
