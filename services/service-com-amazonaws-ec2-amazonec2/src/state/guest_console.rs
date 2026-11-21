@@ -242,9 +242,10 @@ pub struct GuestIdentity {
 }
 
 impl GuestMachine {
-    /// The same machine, running as the role `identity` names.
+    /// The same machine, running as the role `identity` names, holding the credentials of that
+    /// role `identity` carries.
     ///
-    /// The ONE place that fact reaches a machine, so the boot's own program and a command
+    /// The ONE place those two facts reach a machine, so the boot's own program and a command
     /// something later sends the guest publish one role rather than two readings of it.
     #[must_use]
     pub fn running_as(mut self, identity: &GuestIdentity) -> Self {

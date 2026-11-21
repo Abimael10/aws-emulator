@@ -2371,6 +2371,13 @@ pub use instance_detail::*;
 pub mod iam_instance_profile_associations;
 pub use iam_instance_profile_associations::*;
 
+/// WHETHER an instance gets the credentials of the role its instance profile carries — the
+/// trust that role has to publish for an instance to assume it at all — in a module of its
+/// own, re-exported so a handler reaches its words as `crate::state::<item>` like every other
+/// primitive here. What those credentials ARE is [`instance_role_credentials`].
+pub mod instance_profile_credentials;
+pub use instance_profile_credentials::*;
+
 /// Hand the ONE list of stores whose resources carry the modelled `Tag` list to `consumer`,
 /// which is given the bindings in the brackets ahead of it.
 ///

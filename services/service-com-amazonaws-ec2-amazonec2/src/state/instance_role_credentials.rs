@@ -26,7 +26,9 @@
 //!
 //! * which role the instance runs as is read through this crate's ONE resolution of that fact
 //!   ([`super::instance_profile_role`] — this store's association, then IAM's own profile
-//!   report), so no second copy of either reading is kept;
+//!   report), so no second copy of either reading is kept, and a role that role's own trust
+//!   policy lets no instance assume yields no session at all
+//!   ([`super::role_is_assumable_by_an_instance`]);
 //! * the SESSION is minted by the TOKEN SERVICE's own role-session mint
 //!   ([`sts_store::mint_role_session`]), which records it everywhere a temporary credential's
 //!   principal is resolved from: `sts:GetCallerIdentity` under the credential reports the
@@ -188,7 +190,8 @@ struct ResolvedRole {
 /// The credentials the guest of the instance `instance_id` names is served for the role its
 /// instance profile carries, minting a session if this emulator holds none that is still good
 /// to publish — and `None` for an instance that runs as no instance profile, one whose profile
-/// the account's IAM records hold nothing for, one whose profile carries no role, and an
+/// the account's IAM records hold nothing for, one whose profile carries no role, one whose
+/// profile's role no instance may assume ([`super::role_is_assumable_by_an_instance`]), and an
 /// engine with no token service to mint a session with.
 ///
 /// Call it with NO guard of this service's store held: it takes this store's guard to read
@@ -254,17 +257,26 @@ pub fn instance_role_credentials<Eng: Send + Sync + 'static>(
     Some(credentials)
 }
 
-/// The role the instance `instance_id` RUNS AS, as a session of it is minted from.
+/// The role the instance `instance_id` RUNS AS, as a session of it is minted from — and `None`
+/// where no session of it may be minted at all.
 ///
 /// The role itself is resolved through this crate's ONE resolution of that fact
 /// ([`super::instance_profile_role`], which takes this store's guard to read which profile the
 /// instance runs as and releases it before IAM's is taken), so the name the guest is published
 /// and the role a session is minted for cannot come from two different records.
+///
+/// A role an instance may NOT assume yields none: an instance obtains the credentials of its
+/// profile's role by assuming it, so a role whose trust policy admits another service entirely
+/// is one no session can be minted of ([`super::role_is_assumable_by_an_instance`], where that
+/// rule and its evidence live).
 fn instance_role<Eng: Send + Sync + 'static>(
     engine: &Eng,
     instance_id: &str,
 ) -> Option<ResolvedRole> {
     let role = super::instance_profile_role(engine, instance_id)?;
+    if !super::role_is_assumable_by_an_instance(&role) {
+        return None;
+    }
     let parsed = ::service_common::arn::parse(&role.arn)?;
     Some(ResolvedRole {
         arn: role.arn.clone(),
