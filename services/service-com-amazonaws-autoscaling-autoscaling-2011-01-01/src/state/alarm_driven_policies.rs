@@ -7,7 +7,10 @@
 //!
 //! A scaling policy is what a CloudWatch alarm acts THROUGH: an alarm whose action list names
 //! a policy's ARN hands the transition to this service when it moves, and this service then
-//! performs that policy — the same performance `ExecutePolicy` makes
+//! performs that policy — including a `TargetTrackingScaling` policy, which is performed by
+//! the alarms it owns and by nothing else, from the metric value they graded against the
+//! target it states ([`super::policy_execution::tracked_capacity`]) — the same performance
+//! `ExecutePolicy` makes
 //! ([`super::policy_execution`]), so the adjustment, the group's own `MinSize`..`MaxSize`
 //! bounds and the scaling activity it records are the same whichever asked for it. The
 //! activity names the alarm that drove it ([`super::policy_execution::alarm_execution_cause`]),
@@ -47,7 +50,9 @@ use std::time::SystemTime;
 
 use ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801 as cloudwatch;
 
-use super::policy_execution::{grades_a_metric_value, PolicyExecutionRequest, PolicyTrigger};
+use super::policy_execution::{
+    grades_a_metric_value, tracks_a_target, PolicyExecutionRequest, PolicyTrigger,
+};
 use super::suspended_processes::PROCESS_ALARM_NOTIFICATION;
 use super::{AutoScalingState, PolicyKey};
 
@@ -120,9 +125,15 @@ impl AutoScalingState {
             // supported otherwise" (`ExecutePolicyType$MetricValue`): a simple policy carries
             // its own adjustment and is performed without either number.
             let graded = grades_a_metric_value(&policy_type);
+            // A policy that tracks a TARGET is performed from the value its own alarm graded
+            // as well, and reads what that value is to be off itself rather than off the
+            // alarm's threshold ([`super::policy_execution::tracked_capacity`]).
+            let tracks = tracks_a_target(&policy_type);
             let request = PolicyExecutionRequest {
                 honor_cooldown: true,
-                metric_value: graded.then_some(notification.metric_value).flatten(),
+                metric_value: (graded || tracks)
+                    .then_some(notification.metric_value)
+                    .flatten(),
                 breach_threshold: graded.then_some(notification.breach_threshold).flatten(),
             };
             let trigger = PolicyTrigger::Alarm {

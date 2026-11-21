@@ -31,7 +31,20 @@
 //!
 //! A `TargetTrackingScaling` or `PredictiveScaling` policy states a TARGET for the metric
 //! its own alarms watch rather than an adjustment, so no adjustment can be read off it,
-//! and `ExecutePolicy`'s own members carry none for it.
+//! and `ExecutePolicy`'s own members carry none for it — which is why `ExecutePolicy`
+//! refuses such a policy outright.
+//!
+//! A target-tracking policy is performed by the ALARMS it owns instead, and what they hand
+//! it is the value of the metric it tracks ([`super::alarm_driven_policies`]). The target is
+//! the value the metric is to sit AT — "the target value for the metric"
+//! (`TargetTrackingConfiguration$TargetValue`), measured per unit of the capacity the group
+//! maintains — so the capacity that holds the metric at or below the target is the smallest
+//! one at which the load the metric reports divides down to it:
+//! `ceil(current × metric ÷ target)` ([`tracked_capacity`]), inside the group's own bounds
+//! like every other adjustment. A policy whose configuration disables scaling in never
+//! moves the capacity DOWN for it: "If scaling in is disabled, the target tracking scaling
+//! policy doesn't remove instances from the Auto Scaling group"
+//! (`TargetTrackingConfiguration$DisableScaleIn`).
 //!
 //! # The cooldowns
 //!
@@ -59,7 +72,10 @@
 
 use std::time::SystemTime;
 
-use super::scaling_policies::{POLICY_TYPE_SIMPLE_SCALING, POLICY_TYPE_STEP_SCALING};
+use super::scaling_policies::{
+    StoredScalingPolicy, DEFAULT_DISABLE_SCALE_IN, POLICY_TYPE_SIMPLE_SCALING,
+    POLICY_TYPE_STEP_SCALING, POLICY_TYPE_TARGET_TRACKING,
+};
 use super::{AutoScalingState, PolicyKey};
 
 /// The policy types a request can perform: the ones whose own configuration states the
@@ -79,6 +95,14 @@ pub fn is_executable_policy_type(policy_type: &str) -> bool {
 #[must_use]
 pub fn grades_a_metric_value(policy_type: &str) -> bool {
     policy_type == POLICY_TYPE_STEP_SCALING
+}
+
+/// Whether a policy of `policy_type` states a TARGET for the metric it watches rather than
+/// an adjustment, so performing it is computing the capacity that holds the metric at that
+/// target.
+#[must_use]
+pub fn tracks_a_target(policy_type: &str) -> bool {
+    policy_type == POLICY_TYPE_TARGET_TRACKING
 }
 
 /// The number of instances a `PercentChangeInCapacity` adjustment moves the capacity by at
@@ -140,6 +164,16 @@ pub enum PolicyTrigger<'a> {
 }
 
 impl PolicyTrigger<'_> {
+    /// Whether one of the alarms watching the policy asked for it, rather than a request of
+    /// this service's own API.
+    ///
+    /// What a target-tracking policy is performed BY: its own alarms are the ones that carry
+    /// the metric value it tracks, and `ExecutePolicy` carries none for it.
+    #[must_use]
+    pub fn is_alarm(&self) -> bool {
+        matches!(self, Self::Alarm { .. })
+    }
+
     /// The cause the capacity change this trigger asks for records.
     #[must_use]
     pub fn cause(&self, at: SystemTime, policy_name: &str, from: i32, to: i32) -> String {
@@ -202,6 +236,9 @@ pub enum PolicyExecutionRefusal {
     /// The policy states an adjustment the service cannot read: no `AdjustmentType`, or one
     /// outside [`super::ADJUSTMENT_TYPES`].
     UnreadableAdjustment,
+    /// The policy tracks a target the service cannot read: no `TargetTrackingConfiguration`,
+    /// or one whose `TargetValue` no capacity can be computed from.
+    UnreadableTarget,
     /// The group still holds instances from an earlier scaling activity, so the launches
     /// this change needs do not fit beside them yet.
     InstancesStillTerminating,
@@ -350,6 +387,11 @@ pub fn no_matching_step_message(breach: MetricBreach) -> String {
 pub const UNREADABLE_ADJUSTMENT_MESSAGE: &str =
     "The scaling policy states no AdjustmentType, so its scaling adjustment cannot be applied.";
 
+/// The sentence an unreadable target is refused with: the policy carries no target value, so
+/// there is no capacity for the metric it tracks to be divided down to.
+pub const UNREADABLE_TARGET_MESSAGE: &str =
+    "The scaling policy states no TargetValue, so the capacity it tracks cannot be computed.";
+
 impl PolicyExecutionRefusal {
     /// The sentence this refusal carries, where `policy_name` is the policy the request
     /// named and `group_name` the group it belongs to.
@@ -370,6 +412,7 @@ impl PolicyExecutionRefusal {
             } => not_supported_for_policy_type_message(member, policy_type),
             Self::NoMatchingStep(breach) => no_matching_step_message(*breach),
             Self::UnreadableAdjustment => UNREADABLE_ADJUSTMENT_MESSAGE.to_string(),
+            Self::UnreadableTarget => UNREADABLE_TARGET_MESSAGE.to_string(),
             Self::InstancesStillTerminating => {
                 super::instances_still_terminating_message(group_name)
             }
@@ -413,8 +456,10 @@ impl AutoScalingState {
     /// Perform the scaling policy `key` names, and answer the capacity it moved the group
     /// between.
     ///
-    /// THE ONE place a policy is performed: the adjustment is read off the policy, applied
-    /// to the capacity the group maintains, held inside the group's own bounds and then
+    /// THE ONE place a policy is performed: the capacity it asks for — the adjustment read
+    /// off the policy, or the ratio a target-tracking policy's own alarm implies
+    /// ([`tracked_capacity`]) — is applied to the capacity the group maintains, held inside
+    /// the group's own bounds and then
     /// converged on through [`AutoScalingState::apply_capacity`], so a policy-driven change
     /// launches and terminates the account's own Amazon EC2 instances and records its
     /// activities exactly as a manual capacity change does. The activity's cause names the
@@ -437,32 +482,40 @@ impl AutoScalingState {
             return Err(PolicyExecutionRefusal::NoSuchPolicy);
         };
         let policy_type = policy.policy_type.clone();
-        if !is_executable_policy_type(&policy_type) {
-            return Err(PolicyExecutionRefusal::UnexecutablePolicyType(policy_type));
-        }
-        let breach = metric_breach(&policy_type, request)?;
-
-        // The adjustment the policy states for this request: its own for a simple policy,
-        // and the step the breach falls in for a step policy.
-        let adjustment = match breach {
-            Some(breach) => applicable_step_adjustment(&policy.step_adjustments, breach)
-                .ok_or(PolicyExecutionRefusal::NoMatchingStep(breach))?,
-            None => policy
-                .scaling_adjustment
-                .ok_or(PolicyExecutionRefusal::UnreadableAdjustment)?,
-        };
         let from = group.desired_capacity;
-        let adjustment_type = policy
-            .adjustment_type
-            .as_deref()
-            .ok_or(PolicyExecutionRefusal::UnreadableAdjustment)?;
-        let asked = adjusted_capacity(
-            adjustment_type,
-            adjustment,
-            policy.min_adjustment_magnitude.or(policy.min_adjustment_step),
-            from,
-        )
-        .ok_or(PolicyExecutionRefusal::UnreadableAdjustment)?;
+        // A policy that tracks a target states no adjustment at all, so the capacity it asks
+        // for is computed from the metric its own alarms graded against that target; every
+        // other type reads an adjustment off the policy and applies it to the capacity the
+        // group maintains.
+        let asked = if tracks_a_target(&policy_type) && trigger.is_alarm() {
+            tracked_capacity_asked(&policy, from, request.metric_value)?
+        } else {
+            if !is_executable_policy_type(&policy_type) {
+                return Err(PolicyExecutionRefusal::UnexecutablePolicyType(policy_type));
+            }
+            let breach = metric_breach(&policy_type, request)?;
+
+            // The adjustment the policy states for this request: its own for a simple policy,
+            // and the step the breach falls in for a step policy.
+            let adjustment = match breach {
+                Some(breach) => applicable_step_adjustment(&policy.step_adjustments, breach)
+                    .ok_or(PolicyExecutionRefusal::NoMatchingStep(breach))?,
+                None => policy
+                    .scaling_adjustment
+                    .ok_or(PolicyExecutionRefusal::UnreadableAdjustment)?,
+            };
+            let adjustment_type = policy
+                .adjustment_type
+                .as_deref()
+                .ok_or(PolicyExecutionRefusal::UnreadableAdjustment)?;
+            adjusted_capacity(
+                adjustment_type,
+                adjustment,
+                policy.min_adjustment_magnitude.or(policy.min_adjustment_step),
+                from,
+            )
+            .ok_or(PolicyExecutionRefusal::UnreadableAdjustment)?
+        };
         // A group never holds a capacity outside the bounds it was configured with, so a
         // policy that asks for more than its `MaxSize` or less than its `MinSize` moves it
         // to the bound rather than being refused. The two bounds are read LOWEST FIRST:
@@ -540,6 +593,67 @@ fn metric_breach(
         metric_value,
         breach_threshold,
     }))
+}
+
+/// The capacity a target-tracking `policy` asks for from `from`, for the `metric_value` one
+/// of its own alarms graded.
+///
+/// The policy's `TargetValue` is where the metric is to sit, so the capacity asked for is
+/// [`tracked_capacity`] of the two — never below the capacity the group holds for a policy
+/// whose `DisableScaleIn` bars it from removing an instance.
+fn tracked_capacity_asked(
+    policy: &StoredScalingPolicy,
+    from: i32,
+    metric_value: Option<f64>,
+) -> Result<i32, PolicyExecutionRefusal> {
+    let Some(metric_value) = metric_value else {
+        return Err(PolicyExecutionRefusal::MemberRequired {
+            member: METRIC_VALUE_SUBJECT,
+            policy_type: policy.policy_type.clone(),
+        });
+    };
+    let configuration = policy
+        .target_tracking_configuration
+        .as_ref()
+        .ok_or(PolicyExecutionRefusal::UnreadableTarget)?;
+    let asked = tracked_capacity(from, metric_value, configuration.target_value)
+        .ok_or(PolicyExecutionRefusal::UnreadableTarget)?;
+    let scale_in_disabled = configuration
+        .disable_scale_in
+        .unwrap_or(DEFAULT_DISABLE_SCALE_IN);
+    Ok(if scale_in_disabled {
+        asked.max(from)
+    } else {
+        asked
+    })
+}
+
+/// The capacity at which a metric now reading `metric_value` over `current` units of
+/// capacity sits at or below `target_value`.
+///
+/// The target is stated per unit of the capacity the group maintains, so the load the metric
+/// reports over that capacity is `current × metric_value`, and the capacity that divides it
+/// down to the target is `current × metric_value ÷ target_value` — taken UP to the next
+/// whole instance, because a capacity below that quotient leaves the metric above the
+/// target. Scaling in follows from the same quotient: a metric under the target divides down
+/// to fewer instances than the group holds.
+///
+/// A group maintaining no capacity is scaled by no ratio of itself — there is nothing for the
+/// metric to be divided over — so it stays where it is. `None` when the quotient cannot be
+/// taken at all: a target of zero or a value that is not a finite number states no capacity.
+#[must_use]
+pub fn tracked_capacity(current: i32, metric_value: f64, target_value: f64) -> Option<i32> {
+    if !metric_value.is_finite() || !target_value.is_finite() || target_value <= 0.0 {
+        return None;
+    }
+    if current <= 0 {
+        return Some(current);
+    }
+    let wanted = (f64::from(current) * metric_value / target_value).ceil();
+    if !wanted.is_finite() {
+        return None;
+    }
+    Some(wanted.clamp(0.0, f64::from(i32::MAX)) as i32)
 }
 
 /// The `ScalingAdjustment` of the step whose interval the breach falls in.
