@@ -2971,10 +2971,11 @@ pub fn delivery_refusal(
     if let Some(refusal) = role_assumption::assume_role_refusal(Some(role_arn), rule_arn, iam) {
         return Some(refusal);
     }
-    let documents = role_documents(role_arn, iam)?;
     let (action, resource) = (attempt.action, attempt.resource);
-    let request = ::service_common::iam_authorization::Request::new(action, resource, &[]);
-    let decision = ::service_common::iam_authorization::identity_decision(&documents, &request);
+    // What the documents in force on the role state about this call, read through
+    // the ONE reading of that question — the same one the GRANT half of it uses
+    // ([`role_grant::role_identity_decision`]).
+    let decision = role_grant::role_identity_decision(role_arn, attempt, iam)?;
     if decision == ::service_common::iam_authorization::Decision::Allowed {
         return None;
     }
@@ -3091,51 +3092,36 @@ fn target_invocation_condition_context(rule_arn: &str) -> Vec<(String, String)> 
     ]
 }
 
-/// Whether the TARGET whose own resource policy is `policy` admits the invocation
-/// `attempt` describes.
+/// What the TARGET's document `policy` states about the invocation `attempt`
+/// describes, in IAM's own three answers.
 ///
 /// "For Lambda functions, Amazon SNS topics and Amazon SQS queues, EventBridge
 /// relies on resource-based policies": such a target is invoked as this
-/// service's own principal ([`SERVICE_PRINCIPAL`]) rather than as the target
-/// owner or as a role, and a service principal holds no identity-based policies
-/// — so the TARGET's document is the only one in force and it alone decides the
-/// invocation. In IAM's own order: an explicit `Deny` about the invocation
-/// refuses it whatever any grant says, and otherwise the invocation needs an
-/// `Allow` about it — a target carrying no policy at all, or one whose
-/// statements are about something else, has granted nothing, which is IAM's
-/// implicit deny. That is the opposite reading from a bus's own policy
-/// ([`publication_refusal`]), where the publisher is an identity whose own
-/// documents may grant the call; here there is no second document to grant it.
+/// service's own principal ([`SERVICE_PRINCIPAL`]) when it names no role, and a
+/// service principal holds no identity-based policies — so the TARGET's document
+/// is then the only one in force and it alone decides the invocation. In IAM's
+/// own order: an explicit `Deny` about the invocation refuses it whatever any
+/// grant says, and otherwise the invocation needs an `Allow` about it — a target
+/// carrying no policy at all, or one whose statements are about something else,
+/// has granted nothing, which is IAM's implicit deny. A target that DOES name a
+/// role is reached as that role, whose own permissions are then a second document
+/// that may grant the call while an explicit deny here still refuses it, which is
+/// why the three answers are reported rather than collapsed to a grant
+/// (`crate::ops::put_events`'s `admitted_by_target_or_role`). SEVERAL documents
+/// are in force over some targets — a log group's own resource policy and the
+/// account's are both over a write into that group
+/// ([`log_group_target::documents_decision`]) — and the order spans the whole
+/// set, which one document's verdict cannot say either.
 ///
 /// The decision carries the keys such a grant is scoped by
 /// ([`target_invocation_condition_context`]), so a statement conditioned on the
 /// invoking rule is decided for the rule being invoked and no other: a grant
 /// scoped to one rule's ARN authorizes that rule's deliveries alone.
 ///
-/// WHICH of the two refusals it was is deliberately not answered: the target's
-/// service does not tell EventBridge either, and what EventBridge reports for a
-/// delivery it could not make is the answer that service gave it (see
-/// [`queue_access_refusal`]).
-pub fn target_policy_admits(
-    policy: Option<&str>,
-    attempt: &DeliveryAttempt<'_>,
-    rule_arn: &str,
-) -> bool {
-    policy.is_some_and(|document| {
-        target_policy_decision(document, attempt, rule_arn)
-            == ::service_common::iam_authorization::Decision::Allowed
-    })
-}
-
-/// What the TARGET's document `policy` states about the invocation `attempt`
-/// describes, in IAM's own three answers.
-///
-/// The decision [`target_policy_admits`] reads, answered rather than collapsed to
-/// a grant for the target over which SEVERAL documents are in force — a log
-/// group's own resource policy and the account's are both over a write into that
-/// group ([`log_group_target::documents_admit`]) — because IAM's order spans the
-/// whole set: an explicit `Deny` in ANY document refuses the invocation whatever
-/// another grants, which one document's verdict cannot say.
+/// WHICH of the two refusals it was is deliberately not reported to the caller of
+/// a delivery: the target's service does not tell EventBridge either, and what
+/// EventBridge reports for a delivery it could not make is the answer that
+/// service gave it (see [`queue_access_refusal`]).
 pub fn target_policy_decision(
     policy: &str,
     attempt: &DeliveryAttempt<'_>,
@@ -3208,8 +3194,9 @@ const SQS_QUEUE_DOES_NOT_EXIST_MESSAGE: &str =
 /// sentence inside the metadata block an AWS error carries.
 ///
 /// The queue's own policy is what governs the delivery
-/// ([`target_policy_admits`]) — EventBridge assumes no role for a queue target,
-/// so that document is the only one in force — and what the delivery SEES when it
+/// ([`target_policy_decision`]) — the only document in force over a queue target
+/// that names no role, and the one whose explicit deny refuses the send even for
+/// a target that names one — and what the delivery SEES when it
 /// grants nothing is the answer Amazon SQS gives a sender it has not authorized,
 /// which is its NOT-FOUND answer: that service does not disclose whether a queue
 /// it will not let the caller write to is there, and `SendMessage` models no
@@ -4913,6 +4900,11 @@ pub mod oauth;
 /// every target invocation begins with, and the one that decides a handover
 /// whose own API call never gets made.
 pub mod role_assumption;
+
+/// Whether that role's own permissions GRANT the target's API call, which is the
+/// identity half of the one-account decision over a target whose own
+/// resource-based policy would otherwise be the whole of it.
+pub mod role_grant;
 
 /// The two bounds a target's `RetryPolicy` puts on a RETRIED delivery — its
 /// attempt allowance and the event's age — and which of them ended one, which is

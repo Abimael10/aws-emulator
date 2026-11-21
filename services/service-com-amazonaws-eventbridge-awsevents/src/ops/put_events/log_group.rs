@@ -47,10 +47,15 @@ use super::*;
 /// answered it with, and one the group has not taken YET is retried first
 /// ([`crate::state::retry_bounds`]) — the attempts and the retries the delivery
 /// made, reported in `spent`.
+///
+/// `stores` is where the ROLE the target names is read from, because each of the
+/// two calls the write is made of is granted by that role on its own (see
+/// [`log_group_grants`]).
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn deliver_log_event(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     clients: &mut Clients,
+    stores: &Stores<'_>,
     region: &str,
     arn: &str,
     action: &str,
@@ -101,7 +106,7 @@ pub(super) async fn deliver_log_event(
     let client = clients.logs(callback, region).clone();
     let stream = handover.rule;
     let stream_arn = crate::state::log_group_target::log_stream_arn(arn, stream);
-    let grants = log_group_grants(&client, arn, &stream_arn, handover).await;
+    let grants = log_group_grants(&client, stores, arn, &stream_arn, handover).await;
     if !grants.write {
         ::tracing::warn!(
             log_group = %arn,
@@ -313,7 +318,7 @@ pub(super) const LOG_STREAM_ALREADY_OPEN_CODE: &str = "ResourceAlreadyExistsExce
 /// service principal [`crate::state::SERVICE_PRINCIPAL`], which holds no
 /// identity-based policies, so the documents in force over the GROUP are the only
 /// ones over this delivery and what they state decides it
-/// ([`crate::state::log_group_target::documents_admit`]) — nothing is written
+/// ([`crate::state::log_group_target::documents_decision`]) — nothing is written
 /// without a grant of
 /// [`crate::state::log_group_target::PUT_LOG_EVENTS_ACTION`] to that principal on
 /// the group's streams, an explicit deny in ANY of those documents refuses the
@@ -331,7 +336,12 @@ pub(super) const LOG_STREAM_ALREADY_OPEN_CODE: &str = "ResourceAlreadyExistsExce
 /// ([`crate::state::log_group_target::log_stream_arn`]), which is the resource
 /// CloudWatch Logs names for the write, so a grant written over the group with
 /// everything under it and one written over its streams — the two forms a client
-/// writes for a logs delivery — both admit it.
+/// writes for a logs delivery — both admit it. Each is also decided against the
+/// ROLE the target names, which can grant that one call on its own
+/// ([`super::role_grants_call`]): EventBridge writes into a group as its own
+/// service principal when the target names no role and as that role when it names
+/// one, so the role is asked per CALL rather than once for the delivery — a role
+/// allowed the write and not the open opens no stream.
 ///
 /// The documents are read through the group's own `DescribeResourcePolicies`, so
 /// what decides a delivery is what a client's last `PutResourcePolicy` left: both
@@ -341,6 +351,7 @@ pub(super) const LOG_STREAM_ALREADY_OPEN_CODE: &str = "ResourceAlreadyExistsExce
 /// reason [`queue_policy`] gives.
 pub(super) async fn log_group_grants(
     client: &::aws_sdk_cloudwatchlogs::Client,
+    stores: &Stores<'_>,
     group_arn: &str,
     stream_arn: &str,
     handover: &Handover<'_>,
@@ -358,11 +369,24 @@ pub(super) async fn log_group_grants(
             action,
             resource: stream_arn,
         };
-        crate::state::log_group_target::documents_admit(
+        match crate::state::log_group_target::documents_decision(
             &documents,
             &attempt,
             handover.rule_arn,
-        )
+        ) {
+            ::service_common::iam_authorization::Decision::Allowed => true,
+            // An explicit deny in a document in force over the group refuses the
+            // call whatever the role the target names allows.
+            ::service_common::iam_authorization::Decision::Denied => false,
+            // Nothing in force over the group is about this call, so what can
+            // grant it is the role the delivery is made as.
+            ::service_common::iam_authorization::Decision::NotStated => super::role_grants_call(
+                stores,
+                handover.target.role_arn.as_deref(),
+                handover,
+                &attempt,
+            ),
+        }
     };
     LogGroupGrants {
         open: admits(crate::state::log_group_target::CREATE_LOG_STREAM_ACTION),

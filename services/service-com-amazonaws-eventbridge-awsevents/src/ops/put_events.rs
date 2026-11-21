@@ -46,15 +46,22 @@
 //! the kinds AWS governs by the TARGET's own resource-based policy instead —
 //! "for Lambda functions, Amazon SNS topics and Amazon SQS queues, EventBridge
 //! relies on resource-based policies" — the call is made as this service's own
-//! principal, so that document alone decides the delivery and a target which has
+//! principal when the target names NO role, so that document alone decides the
+//! delivery and a target which has
 //! granted it nothing, or which denies it, receives nothing
-//! ([`crate::state::target_policy_admits`], read on a queue target and on a
+//! ([`crate::state::target_policy_decision`], read on a queue target and on a
 //! dead-letter queue by [`queue_delivery_refusal`], on a topic target by
 //! [`topic_delivery_refusal`], on a function target by
 //! [`function_delivery_refusal`] and on a log-group target by
 //! [`log_group_grants`]; what such a refusal REPORTS is the answer that
 //! target's own service gives it, which for a target that IS there and refused
-//! this principal names the permission in each of those services). A topic target that is ENCRYPTED with a
+//! this principal names the permission in each of those services). A target of
+//! one of those kinds that DOES name a role is reached as that role, and within
+//! one account "the resource-based policy and the identity-based policy are
+//! evaluated together, and access is granted if either allows it" — so the
+//! permissions in force on that role grant the call as well, while an explicit
+//! deny in the target's own document still refuses it whatever the role allows
+//! ([`role_grants_call`], [`admitted_by_target_or_role`]). A topic target that is ENCRYPTED with a
 //! customer managed key is decided by a second document as well — that key's own
 //! policy, since the publish has Amazon SNS generate a data key under it — so a
 //! key policy withholding `kms:GenerateDataKey` from this service is a delivery
@@ -2105,6 +2112,21 @@ pub(crate) async fn deliver(
             // ARN for every kind but one ([`TargetKind::action_resource`]).
             resource: kind.action_resource(handover),
         };
+        // A target reached AS a role is one whose own API call that role's
+        // permissions can grant: within one account "the resource-based policy and
+        // the identity-based policy are evaluated together, and access is granted
+        // if either allows it". So for the kinds whose call AWS governs by the
+        // TARGET's own document ([`invoked_under_target_role`] answers no for
+        // them, which is why `role_arn` above is `None` there), the role the
+        // caller named is a SECOND grant of the same call — read once per handover
+        // and handed to the invocation, which would otherwise read that document
+        // alone ([`role_grants_call`]). A log-group write is made of TWO calls and
+        // asks for each of them where it decides them
+        // ([`log_group::log_group_grants`]), so the one answer about this
+        // delivery's own action is of no use to it and is not read for it.
+        let role_grants = role_arn.is_none()
+            && !matches!(kind, TargetKind::LogGroup)
+            && role_grants_call(stores, named_role, handover, &attempt);
         match kind.role_bars(stores, role_arn, handover, &attempt) {
             Some((code, message)) => crate::state::InvocationOutcome::Failed { code, message },
             // "Input: valid JSON text passed to the target": what a target is
@@ -2126,7 +2148,7 @@ pub(crate) async fn deliver(
                     match kind
                         .invoke(
                             callback, clients, stores, region, handover, body, &mut spent,
-                            budget, sends,
+                            budget, sends, role_grants,
                         )
                         .await
                     {
@@ -2840,6 +2862,61 @@ fn assume_role_refusal(
     crate::state::role_assumption::assume_role_refusal(role_arn, rule_arn, &iam.lock())
 }
 
+/// Whether the documents in force over a target admit this delivery: the
+/// target's OWN resource-based policy, and the role the target names where it
+/// grants the same call (`role_grants`, see [`role_grants_call`]).
+///
+/// IAM's order spans the whole set, so an explicit `Deny` in the target's own
+/// document refuses the delivery whatever the role is allowed — "the
+/// resource-based policy and the identity-based policy are evaluated together,
+/// and access is granted if either allows it" is about the ALLOWs. A document
+/// that states nothing about the call grants nothing itself, which leaves the
+/// role's own grant deciding, and a target carrying no policy at all is in that
+/// same position.
+fn admitted_by_target_or_role(
+    policy: Option<&str>,
+    attempt: &crate::state::DeliveryAttempt<'_>,
+    rule_arn: &str,
+    role_grants: bool,
+) -> bool {
+    let decision = policy.map_or(
+        ::service_common::iam_authorization::Decision::NotStated,
+        |document| crate::state::target_policy_decision(document, attempt, rule_arn),
+    );
+    match decision {
+        ::service_common::iam_authorization::Decision::Allowed => true,
+        ::service_common::iam_authorization::Decision::Denied => false,
+        ::service_common::iam_authorization::Decision::NotStated => role_grants,
+    }
+}
+
+/// Whether the role the target names GRANTS `attempt` itself, as the account's
+/// IAM records show it — [`crate::state::role_grant::role_grants_delivery`],
+/// asked here with the IAM guard held for the read alone.
+///
+/// Asked of the kinds whose call AWS governs by the TARGET's own resource-based
+/// policy, where a role the caller named is the identity the call is made as and
+/// so a second grant of it (see that module): `false` for a target naming no
+/// role, for a role the account does not hold and for one whose documents do not
+/// allow the call, each of which leaves the target's own document deciding the
+/// delivery.
+fn role_grants_call(
+    stores: &Stores<'_>,
+    role_arn: Option<&str>,
+    handover: &Handover<'_>,
+    attempt: &crate::state::DeliveryAttempt<'_>,
+) -> bool {
+    let Some(iam) = stores.iam else {
+        return false;
+    };
+    crate::state::role_grant::role_grants_delivery(
+        role_arn,
+        handover.rule_arn,
+        attempt,
+        &iam.lock(),
+    )
+}
+
 /// What is recorded for a handover to a target this emulator makes no API call
 /// for: which service it would have been made on, and that there is no
 /// invocation for it. Nothing is invented in its place.
@@ -3144,6 +3221,12 @@ impl TargetKind {
     /// is recorded as NOT ATTEMPTED rather than counted as a failed invocation:
     /// dead-lettering an event for a gap in the emulator would report a failure
     /// that AWS never produces.
+    ///
+    /// `role_grants` is what the ROLE the target names says about this call, for
+    /// the kinds whose call AWS otherwise governs by the target's own
+    /// resource-based policy ([`role_grants_call`]): a delivery made as a role
+    /// that may make the call is admitted by that role, so the target's own
+    /// document is not what decides it and is not read.
     #[allow(clippy::too_many_arguments)]
     async fn invoke(
         self,
@@ -3156,6 +3239,7 @@ impl TargetKind {
         spent: &mut Spent,
         budget: &mut DeliveryBudget,
         sends: &mut QueueSends,
+        role_grants: bool,
     ) -> Option<crate::state::InvocationOutcome> {
         let target = handover.target;
         let arn = target.arn.as_str();
@@ -3171,7 +3255,14 @@ impl TargetKind {
             // what that batch answered, not one that was skipped.
             Self::Queue => {
                 match queue_sends::hand_over(
-                    callback, clients, stores, region, handover, body, sends,
+                    callback,
+                    clients,
+                    stores,
+                    region,
+                    handover,
+                    body,
+                    sends,
+                    role_grants,
                 )
                 .await
                 {
@@ -3184,13 +3275,16 @@ impl TargetKind {
                 // for the reason the queue branch above gives.
                 let client = clients.lambda(callback, region).clone();
                 // The FUNCTION's own resource-based policy decides this delivery
-                // before anything is invoked ([`function_delivery_refusal`]). It
-                // is read ONCE per request per function
-                // ([`Clients::function_policy`]), for the reason the queue branch
-                // above gives.
+                // before anything is invoked ([`function_delivery_refusal`]),
+                // together with the ROLE the target names where it grants the
+                // invocation too — and an explicit deny in that document still
+                // refuses whatever the role allows
+                // ([`admitted_by_target_or_role`]). It is read ONCE per request
+                // per function ([`Clients::function_policy`]), for the reason the
+                // queue branch above gives.
                 let policy = clients.function_policy(&client, arn).await;
                 if let Some(refusal) =
-                    function_delivery_refusal(policy, arn, self.action(), handover)
+                    function_delivery_refusal(policy, arn, self.action(), handover, role_grants)
                 {
                     return Some(refusal);
                 }
@@ -3219,9 +3313,13 @@ impl TargetKind {
                 // request per topic ([`Clients::topic_attributes`]), for the
                 // reason the queue branch above gives.
                 let attributes = clients.topic_attributes(&client, arn).await;
-                if let Some(refusal) =
-                    topic_delivery_refusal(attributes.as_ref(), arn, self.action(), handover)
-                {
+                if let Some(refusal) = topic_delivery_refusal(
+                    attributes.as_ref(),
+                    arn,
+                    self.action(),
+                    handover,
+                    role_grants,
+                ) {
                     return Some(refusal);
                 }
                 if let Some(refusal) =
@@ -3330,6 +3428,7 @@ impl TargetKind {
                 deliver_log_event(
                     callback,
                     clients,
+                    stores,
                     region,
                     arn,
                     self.action(),
@@ -3648,10 +3747,14 @@ const STRING_ATTRIBUTE_TYPE: &str = "String";
 /// queues, EventBridge relies on resource-based policies", and the call it makes
 /// on a queue is `sqs:SendMessage` as the service principal
 /// [`crate::state::SERVICE_PRINCIPAL`]. So the queue's OWN `Policy` attribute
-/// decides this delivery ([`crate::state::target_policy_admits`]): nothing is
+/// decides this delivery ([`crate::state::target_policy_decision`]): nothing is
 /// enqueued without a grant for that principal, an explicit deny refuses whatever
 /// else is granted, and a grant scoped by `aws:SourceArn` authorizes the
-/// deliveries of the rule it names and no other. For an ENCRYPTED queue there is
+/// deliveries of the rule it names and no other. A target naming a ROLE that may
+/// make the send is admitted by that role as well (`role_grants`, see
+/// [`role_grants_call`]), while an explicit deny in the queue's own document
+/// refuses the send whatever the role allows ([`admitted_by_target_or_role`]).
+/// For an ENCRYPTED queue there is
 /// a second document — the policy of the key its messages are encrypted under
 /// ([`queue_key_refusal`]) — and the delivery needs both.
 ///
@@ -3673,6 +3776,7 @@ const STRING_ATTRIBUTE_TYPE: &str = "String";
 /// `None`): the `SendMessage` that follows reports what such a queue answers,
 /// which is the queue's own refusal rather than a verdict read off a document
 /// this never saw.
+#[allow(clippy::too_many_arguments)]
 fn queue_delivery_refusal(
     attributes: Option<&QueueAttributes>,
     kms: Option<&::engine::ServiceState<crate::state::target_encryption::KmsState>>,
@@ -3681,6 +3785,7 @@ fn queue_delivery_refusal(
     action: &str,
     resource: &str,
     handover: &Handover<'_>,
+    role_grants: bool,
 ) -> Option<crate::state::InvocationOutcome> {
     let attributes = attributes?;
     let attempt = crate::state::DeliveryAttempt {
@@ -3689,10 +3794,11 @@ fn queue_delivery_refusal(
         action,
         resource,
     };
-    if !crate::state::target_policy_admits(
+    if !admitted_by_target_or_role(
         attributes.policy.as_deref(),
         &attempt,
         handover.rule_arn,
+        role_grants,
     ) {
         ::tracing::warn!(
             queue = %queue_url,
@@ -3893,11 +3999,15 @@ async fn read_queue_attributes(
 /// Lambda functions, Amazon SNS topics and Amazon SQS queues, EventBridge relies
 /// on resource-based policies", and the call it makes on a topic is `sns:Publish`
 /// as the service principal [`crate::state::SERVICE_PRINCIPAL`] — so the TOPIC's
-/// own access policy is the only document in force over this delivery and what it
-/// states decides it ([`crate::state::target_policy_admits`]): nothing is
+/// own access policy is the only document in force over this delivery when the
+/// target names no role and what it states decides it
+/// ([`crate::state::target_policy_decision`]): nothing is
 /// published without a grant for that principal, an explicit deny refuses
 /// whatever else is granted, and a grant scoped by `aws:SourceArn` authorizes the
-/// deliveries of the rule it names and no other. A topic carrying only the policy
+/// deliveries of the rule it names and no other. A target naming a ROLE that may
+/// publish is admitted by that role as well (`role_grants`, see
+/// [`role_grants_call`]), while an explicit deny in the topic's own policy refuses
+/// the publish whatever the role allows ([`admitted_by_target_or_role`]). A topic carrying only the policy
 /// Amazon SNS generates for its owner has granted this service nothing, so the
 /// publish is refused until a statement grants it.
 ///
@@ -3920,6 +4030,7 @@ fn topic_delivery_refusal(
     topic_arn: &str,
     action: &str,
     handover: &Handover<'_>,
+    role_grants: bool,
 ) -> Option<crate::state::InvocationOutcome> {
     let policy = attributes?.policy.clone();
     let attempt = crate::state::DeliveryAttempt {
@@ -3928,7 +4039,12 @@ fn topic_delivery_refusal(
         action,
         resource: topic_arn,
     };
-    if crate::state::target_policy_admits(policy.as_deref(), &attempt, handover.rule_arn) {
+    if admitted_by_target_or_role(
+        policy.as_deref(),
+        &attempt,
+        handover.rule_arn,
+        role_grants,
+    ) {
         return None;
     }
     ::tracing::warn!(
@@ -4013,7 +4129,7 @@ const SNS_AUTHORIZATION_ERROR_STATUS: u16 = 403;
 /// not publish to, because the topic granted this service nothing.
 ///
 /// The topic's own policy is what governs the delivery
-/// ([`crate::state::target_policy_admits`]), and what the delivery SEES when that
+/// ([`crate::state::target_policy_decision`]), and what the delivery SEES when that
 /// document grants nothing is Amazon SNS's own refusal of the `sns:Publish`: the
 /// authorization sentence naming the principal the call was made as, the action
 /// and the topic, followed by the metadata block an AWS error carries — the
@@ -4145,10 +4261,13 @@ const KMS_GENERATE_DATA_KEY_OPERATION: &str = "GenerateDataKey";
 /// call it makes on a function is `lambda:InvokeFunction` as the service
 /// principal [`crate::state::SERVICE_PRINCIPAL`] — so the FUNCTION's own policy
 /// is the only document in force over this delivery and what it states decides it
-/// ([`crate::state::target_policy_admits`]): nothing is invoked without a grant
+/// ([`crate::state::target_policy_decision`]): nothing is invoked without a grant
 /// for that principal, an explicit deny refuses whatever else is granted, and a
 /// grant scoped by `aws:SourceArn` authorizes the deliveries of the rule it names
-/// and no other. A function carrying no policy at all has granted this service
+/// and no other. A target naming a ROLE that may invoke the function is admitted
+/// by that role as well (`role_grants`, see [`role_grants_call`]), while an
+/// explicit deny in the function's own policy refuses the invocation whatever the
+/// role allows ([`admitted_by_target_or_role`]). A function carrying no policy at all has granted this service
 /// nothing, so the invocation is withheld until a statement grants it — and a
 /// target that is no longer there is in exactly that position, since the document
 /// that would have admitted the invocation is as absent in one case as in the
@@ -4175,6 +4294,7 @@ fn function_delivery_refusal(
     function_arn: &str,
     action: &str,
     handover: &Handover<'_>,
+    role_grants: bool,
 ) -> Option<crate::state::InvocationOutcome> {
     let policy = policy?;
     let attempt = crate::state::DeliveryAttempt {
@@ -4183,7 +4303,12 @@ fn function_delivery_refusal(
         action,
         resource: function_arn,
     };
-    if crate::state::target_policy_admits(policy.as_deref(), &attempt, handover.rule_arn) {
+    if admitted_by_target_or_role(
+        policy.as_deref(),
+        &attempt,
+        handover.rule_arn,
+        role_grants,
+    ) {
         return None;
     }
     ::tracing::warn!(
@@ -4254,7 +4379,7 @@ const LAMBDA_ACCESS_DENIED_STATUS: u16 = 403;
 /// could not invoke, because the function granted this service nothing.
 ///
 /// The function's own policy is what governs the delivery
-/// ([`crate::state::target_policy_admits`]), and what the delivery SEES when that
+/// ([`crate::state::target_policy_decision`]), and what the delivery SEES when that
 /// document grants nothing is AWS Lambda's own refusal of the invocation: the
 /// authorization sentence naming the principal the call was made as, the action
 /// and the function, followed by the metadata block an AWS error carries — the
@@ -4345,6 +4470,12 @@ async fn dead_letter(
         TargetKind::Queue.action(),
         dead_letter_arn,
         handover,
+        // The dead letter is not the TARGET's invocation: EventBridge writes it
+        // as its own service principal whatever role the target names, so the
+        // dead-letter queue's own policy is the whole of what admits it ("grant
+        // permissions to the EventBridge service principal" for a dead-letter
+        // queue).
+        false,
     )
     .is_some()
     {

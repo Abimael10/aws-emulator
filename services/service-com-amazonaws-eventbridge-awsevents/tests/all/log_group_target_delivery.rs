@@ -61,14 +61,17 @@ fn account() -> &'static str {
 }
 
 /// One CloudWatch Logs call (`Logs_20140328`, awsJson1_1).
-async fn logs(emulator: &Emulator, operation: &str, body: &Value) -> (u16, Value) {
+///
+/// `pub(crate)` because the sibling suite for a log-group target under the target's own
+/// `RoleArn` (`log_group_target_role_grant`) reads the group through the same calls.
+pub(crate) async fn logs(emulator: &Emulator, operation: &str, body: &Value) -> (u16, Value) {
     rpc(emulator, "logs", "Logs_20140328", "1.1", operation, body).await
 }
 
 /// A log group called `name`, answered with the ARN `DescribeLogGroups` reports for
 /// it — the form carrying everything under the group, which is the ARN a client
 /// reads off that listing.
-async fn given_log_group(emulator: &Emulator, case: &str, name: &str) -> String {
+pub(crate) async fn given_log_group(emulator: &Emulator, case: &str, name: &str) -> String {
     let (status, body) = logs(emulator, "CreateLogGroup", &json!({ "logGroupName": name })).await;
     assert_eq!(
         status, 200,
@@ -114,7 +117,7 @@ async fn given_resource_policy(
 }
 
 /// Every log event the group `group` holds, as `FilterLogEvents` reports them.
-async fn written(emulator: &Emulator, case: &str, group: &str) -> Vec<Value> {
+pub(crate) async fn written(emulator: &Emulator, case: &str, group: &str) -> Vec<Value> {
     let (status, body) = logs(
         emulator,
         "FilterLogEvents",

@@ -47,8 +47,9 @@ pub const PUT_LOG_EVENTS_ACTION: &str = "logs:PutLogEvents";
 pub const CREATE_LOG_STREAM_ACTION: &str = "logs:CreateLogStream";
 
 /// Whether the documents in force over a target admit the invocation `attempt`
-/// describes — the decision over a SET of documents rather than over one
-/// ([`target_policy_admits`]).
+/// describes, which is [`documents_decision`] answering `Allowed` (the decision
+/// over a SET of documents rather than over one,
+/// [`super::target_policy_decision`]).
 ///
 /// A write into a log group is decided by more than one document: the resource
 /// policy attached to that group and the account's own resource policies are
@@ -57,20 +58,42 @@ pub const CREATE_LOG_STREAM_ACTION: &str = "logs:CreateLogStream";
 /// them refuses it whatever another grants, and otherwise the invocation needs
 /// an `Allow` about it in one of them — a set that states nothing has granted
 /// nothing, which is IAM's implicit deny.
-pub fn documents_admit(
+#[cfg(test)]
+fn documents_admit(
     documents: &[String],
     attempt: &DeliveryAttempt<'_>,
     rule_arn: &str,
 ) -> bool {
-    let mut admitted = false;
+    documents_decision(documents, attempt, rule_arn)
+        == ::service_common::iam_authorization::Decision::Allowed
+}
+
+/// What the documents in force over a target STATE about the invocation `attempt`
+/// describes, in IAM's own three answers — the decision every caller reads,
+/// answered rather than collapsed to a grant.
+///
+/// Answered because the order spans more than these documents: a delivery made
+/// AS the role a target names is granted by that role's own permissions too, and
+/// an explicit `Deny` here refuses it whatever the role allows, which one
+/// boolean cannot say (`crate::ops::put_events`).
+pub fn documents_decision(
+    documents: &[String],
+    attempt: &DeliveryAttempt<'_>,
+    rule_arn: &str,
+) -> ::service_common::iam_authorization::Decision {
+    let mut decided = ::service_common::iam_authorization::Decision::NotStated;
     for document in documents {
         match target_policy_decision(document, attempt, rule_arn) {
-            ::service_common::iam_authorization::Decision::Denied => return false,
-            ::service_common::iam_authorization::Decision::Allowed => admitted = true,
+            ::service_common::iam_authorization::Decision::Denied => {
+                return ::service_common::iam_authorization::Decision::Denied
+            }
+            ::service_common::iam_authorization::Decision::Allowed => {
+                decided = ::service_common::iam_authorization::Decision::Allowed;
+            }
             ::service_common::iam_authorization::Decision::NotStated => {}
         }
     }
-    admitted
+    decided
 }
 
 /// The suffix the ARN of a log group carries when it names the group TOGETHER

@@ -155,6 +155,14 @@ pub(super) enum Handled {
 /// Hand one event to the queue target the handover names: decide the delivery
 /// against the documents in force over that queue, and hold the message for that
 /// queue's next batch.
+///
+/// `role_grants` is what the ROLE the target names says about the send (see
+/// [`super::role_grants_call`]): a delivery made as a role that may send to the
+/// queue is admitted by that role, so the queue's own `Policy` is not what
+/// decides this one — its KEY still is, because the policy of the key a queue's
+/// messages are encrypted under is a document about the ENCRYPTION rather than
+/// about the send.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn hand_over(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     clients: &mut Clients,
@@ -163,6 +171,7 @@ pub(super) async fn hand_over(
     handover: &Handover<'_>,
     body: &str,
     sends: &mut QueueSends,
+    role_grants: bool,
 ) -> Handled {
     let arn = handover.target.arn.as_str();
     let Some(queue) = sqs_queue(arn) else {
@@ -189,6 +198,7 @@ pub(super) async fn hand_over(
         TargetKind::Queue.action(),
         arn,
         handover,
+        role_grants,
     ) {
         return Handled::Outcome(refusal);
     }

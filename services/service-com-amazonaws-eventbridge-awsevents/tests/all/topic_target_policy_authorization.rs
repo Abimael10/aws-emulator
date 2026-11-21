@@ -110,7 +110,10 @@ fn another_rule_arn() -> String {
 
 /// The policy a queue SUBSCRIBED to a topic needs for the notification to reach it:
 /// Amazon SNS's own send, which that service decides against this document.
-fn granting_sns(queue_arn: &str) -> String {
+///
+/// `pub(crate)` because the sibling suite for a topic target under the target's own
+/// `RoleArn` (`topic_target_role_grant`) observes a publish the same way.
+pub(crate) fn granting_sns(queue_arn: &str) -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -125,7 +128,7 @@ fn granting_sns(queue_arn: &str) -> String {
 
 /// How a row writes the document its topic carries: from the topic's own ARN, so a
 /// row can state something about the very topic the document is installed on.
-type PolicyFor = Box<dyn Fn(&str) -> String>;
+pub(crate) type PolicyFor = Box<dyn Fn(&str) -> String>;
 
 /// One row: the case, the document the topic carries beside the one Amazon SNS
 /// generates, and whether EventBridge publishes to it.
@@ -139,7 +142,9 @@ struct Row {
 
 /// A topic called `name` carrying the document `policy` builds from its own ARN, with
 /// `subscriber_arn` subscribed to it; answers the topic's ARN.
-async fn given_topic(
+///
+/// `pub(crate)` for the reason [`granting_sns`] is.
+pub(crate) async fn given_topic(
     emulator: &Emulator,
     case: &str,
     name: &str,
