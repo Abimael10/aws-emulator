@@ -84,9 +84,11 @@ const ABSENT_DIGEST: &str =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
 /// A reference into the public gallery under an alias this emulator's gallery was NOT
-/// assigned: the gallery AWS publishes serves many registries, this emulator holds one, so a
-/// reference into another names a registry it does not hold.
-const FOREIGN_ALIAS_IMAGE: &str = "public.ecr.aws/docker/library/busybox:latest";
+/// assigned and whose published images it does not hold either: the gallery AWS publishes
+/// serves many registries, this emulator holds a store for one and the published releases of
+/// a few repositories that gallery publishes itself, so a reference into any other names a
+/// registry it can say nothing about.
+const FOREIGN_ALIAS_IMAGE: &str = "public.ecr.aws/third-party-alias/app:1";
 
 /// A bare name, which a container runtime resolves against a public registry this emulator
 /// does not hold either.

@@ -50,7 +50,10 @@
 //!      cross-account pull nothing here serves and the task does not start;
 //!    * a repository under the registry ALIAS of the one public gallery this emulator
 //!      serves, which resolves the reference against the repositories and tags it holds
-//!      ([`::service_com_amazonaws_ecrpublic_spencerfrontendservice::state::gallery_pull`]).
+//!      ([`::service_com_amazonaws_ecrpublic_spencerfrontendservice::state::gallery_pull`]),
+//!      or a repository that gallery publishes ITSELF whose image this emulator holds, which
+//!      the releases it publishes decide
+//!      ([`::service_com_amazonaws_ecrpublic_spencerfrontendservice::state::published_images`]).
 //!
 //!    Either way the registry that holds the image is the one that answers, and the manifest
 //!    digest it resolved is what the container reports for the image it ran
@@ -637,7 +640,9 @@ fn fetch_image<Eng: Send + Sync + 'static>(
     now: SystemTime,
 ) -> ImageFetch {
     use ::service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::state::registry_pull;
-    use ::service_com_amazonaws_ecrpublic_spencerfrontendservice::state::gallery_pull;
+    use ::service_com_amazonaws_ecrpublic_spencerfrontendservice::state::{
+        gallery_pull, published_images,
+    };
 
     // Amazon ECR answers for every account's registry its own reading of a reference names,
     // this one's included, so whose registry it is comes back from there rather than being
@@ -668,18 +673,27 @@ fn fetch_image<Eng: Send + Sync + 'static>(
     // The public gallery answers for the alias it was ASSIGNED: the pull is a question for
     // the registry the reference names, and an alias this gallery was not given names a
     // registry this emulator does not hold.
-    match gallery_pull::parse_gallery_reference(image) {
-        Some(reference)
-            if gallery_pull::serves_registry_alias(engine, &reference.registry_alias) =>
-        {
-            match gallery_pull::serve_pull(engine, &reference) {
-                Ok(digest) => ImageFetch::Served(digest),
-                Err(gallery_pull::GalleryPullRefusal::NotFound { .. }) => {
-                    ImageFetch::Refused(image_not_found_message(image))
-                }
+    let Some(reference) = gallery_pull::parse_gallery_reference(image) else {
+        return ImageFetch::Undecided;
+    };
+    if gallery_pull::serves_registry_alias(engine, &reference.registry_alias) {
+        return match gallery_pull::serve_pull(engine, &reference) {
+            Ok(digest) => ImageFetch::Served(digest),
+            Err(gallery_pull::GalleryPullRefusal::NotFound { .. }) => {
+                ImageFetch::Refused(image_not_found_message(image))
             }
+        };
+    }
+    // A repository that gallery publishes ITSELF, whose image this emulator holds: what the
+    // gallery publishes decides the reference, so a tag it publishes no release under resolves
+    // to no image ([`published_images`]). No digest is stated for such an image: the
+    // repository's published tags name releases, not the content a digest addresses.
+    match published_images::published_image(&reference) {
+        Some(published_images::PublishedImage::Published) => ImageFetch::Served(None),
+        Some(published_images::PublishedImage::NotPublished) => {
+            ImageFetch::Refused(image_not_found_message(image))
         }
-        _ => ImageFetch::Undecided,
+        None => ImageFetch::Undecided,
     }
 }
 

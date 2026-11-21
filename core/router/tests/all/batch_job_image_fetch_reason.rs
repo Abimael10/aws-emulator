@@ -688,11 +688,12 @@ async fn a_placed_job_reports_what_the_fetch_of_its_image_answered() {
             says: None,
         },
         Row {
-            // The public gallery answers for the registry alias it was ASSIGNED; an alias it
-            // holds no registry for names another ACCOUNT's public registry, which this
+            // The public gallery answers for the registry alias it was ASSIGNED, and for the
+            // repositories that gallery publishes ITSELF whose image this emulator holds; an
+            // alias that is neither names another ACCOUNT's public registry, which this
             // emulator has no store for, so nothing is decided against such a reference.
             case: "a gallery alias this registry was not assigned, under a tag nothing holds",
-            image: format!("public.ecr.aws/docker/{GALLERY_REPOSITORY}:no-such-tag"),
+            image: format!("public.ecr.aws/third-party-alias/{GALLERY_REPOSITORY}:no-such-tag"),
             execution_role: granted.clone(),
             refused: false,
             says: None,

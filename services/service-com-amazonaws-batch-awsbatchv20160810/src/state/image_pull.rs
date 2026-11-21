@@ -43,7 +43,10 @@
 //!   ([`::service_com_amazonaws_ecrpublic_spencerfrontendservice::state::gallery_pull`]) — for
 //!   the ONE registry this emulator holds there ([`gallery_pull::serves_registry_alias`]). An
 //!   alias it holds no registry for is another account's public registry, which this emulator
-//!   has no store for, so nothing is decided about such a reference either.
+//!   has no store for, so nothing is decided about such a reference either — EXCEPT for the
+//!   repositories that gallery publishes itself whose image this emulator holds, where what
+//!   the gallery publishes decides the reference
+//!   ([`::service_com_amazonaws_ecrpublic_spencerfrontendservice::state::published_images`]).
 //!
 //! A reference naming any OTHER registry is not one this emulator holds and so not one it
 //! answers for: nothing is decided about such an image, and the job's container runs the
@@ -108,6 +111,25 @@ pub fn pull_access_denied_message(image: &str, manifest_url: &str) -> String {
 /// authorize it"), which is what the Docker Registry HTTP API V2 answers such a manifest
 /// request and therefore what the runtime reports for it.
 const FORBIDDEN_STATUS: &str = "403 Forbidden";
+
+/// The `statusReason` of a job whose image a PUBLIC registry holds nothing for: the same
+/// `CannotPullContainerError` class, in the words the container agent words a reference that
+/// resolves to no content with.
+///
+/// The image's MANIFEST is what is fetched first, and the agent retries that fetch before it
+/// gives up ([`MANIFEST_FETCH_RETRIES`]); it then names the reference it could not resolve
+/// twice — once as the reference the fetch asked for, and once as the answer it got about it,
+/// which for a reference that resolves to nothing is that same reference and `not found`. A
+/// public registry answers a `docker pull` with a status and that sentence rather than with an
+/// API shape of its own, so there is no second wording to carry; the same sentence the Amazon
+/// ECS crate reports as the `stoppedReason` of such a task, because a Batch job's container IS
+/// an Amazon ECS task's container.
+pub fn image_not_found_message(image: &str) -> String {
+    format!(
+        "CannotPullContainerError: pull image manifest has been retried \
+         {MANIFEST_FETCH_RETRIES} time(s): failed to resolve ref {image}: {image}: not found"
+    )
+}
 
 /// How many times the runtime retried the image MANIFEST fetch before it reported the
 /// failure: a registry that refuses a request refuses it however often it is asked, so the
@@ -275,7 +297,9 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
 /// verdict is not collected — and nothing is recorded for a fact this emulator does not hold.
 pub fn settle_job_image_fetches<Eng: Send + Sync + 'static>(engine: &Eng) {
     use ::service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::state::registry_pull;
-    use ::service_com_amazonaws_ecrpublic_spencerfrontendservice::state::gallery_pull;
+    use ::service_com_amazonaws_ecrpublic_spencerfrontendservice::state::{
+        gallery_pull, published_images,
+    };
 
     let Some(state) = service_state(engine) else {
         return;
@@ -337,6 +361,20 @@ pub fn settle_job_image_fetches<Eng: Send + Sync + 'static>(engine: &Eng) {
                     Ok(_) => ImageFetch::Served,
                     Err(gallery_pull::GalleryPullRefusal::NotFound { message }) => {
                         ImageFetch::Refused(cannot_pull_image_message(&fetch.image, &message))
+                    }
+                }
+            } else if let Some(published) = gallery_pull::parse_gallery_reference(&fetch.image)
+                .as_ref()
+                .and_then(published_images::published_image)
+            {
+                // A repository the gallery AWS serves publishes ITSELF, whose image this
+                // emulator holds: what it publishes decides the reference, so a tag it
+                // publishes no release under resolves to no image and the fetch fails in the
+                // agent's own words ([`published_images`], [`image_not_found_message`]).
+                match published {
+                    published_images::PublishedImage::Published => ImageFetch::Served,
+                    published_images::PublishedImage::NotPublished => {
+                        ImageFetch::Refused(image_not_found_message(&fetch.image))
                     }
                 }
             } else {

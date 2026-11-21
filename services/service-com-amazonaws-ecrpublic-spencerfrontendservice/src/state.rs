@@ -53,6 +53,10 @@ pub mod gallery_pull;
 /// publishes on that address.
 pub mod registry_address;
 
+/// The repositories the gallery AWS serves publishes itself, and which releases of each this
+/// emulator holds — the registries beside this account's that a pull can be decided against.
+pub mod published_images;
+
 pub use logo_asset::{logo_asset_route, logo_url, StoredLogo};
 pub use logo_socket::{ensure_logo_asset_base, LogoAssetSocket};
 pub use registry_address::announced_gallery_authority;

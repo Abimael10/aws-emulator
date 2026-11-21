@@ -852,10 +852,10 @@ async fn an_image_no_registry_here_serves_fails_the_job_at_the_fetch() {
         },
         PullRow {
             // The alias names another ACCOUNT's public registry in the gallery AWS serves,
-            // which this emulator holds no store for: nothing is decided against the fetch,
-            // exactly as for another registry host.
+            // which this emulator holds no store for and no published image of: nothing is
+            // decided against the fetch, exactly as for another registry host.
             case: "a gallery alias this registry was not assigned",
-            image: |_| "public.ecr.aws/docker/library/busybox:latest".to_string(),
+            image: |_| "public.ecr.aws/third-party-alias/library/busybox:latest".to_string(),
             refused: false,
         },
         PullRow {
