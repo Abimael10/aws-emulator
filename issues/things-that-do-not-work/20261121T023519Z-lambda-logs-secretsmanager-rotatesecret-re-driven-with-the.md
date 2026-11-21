@@ -1,0 +1,38 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: lambda__logs__secretsmanager.deep-secrets-and-params-failed-finishsecret-leaves-candidate-awspending-and-rejects-new-rotation
+Issue-Key: secrets-manager|RotateSecret|InvalidRequestException
+Issue-Commit: 34cbf26053278f98cefaf82e17444d2784be9247
+
+# lambda__logs__secretsmanager: RotateSecret re-driven with the SAME ClientRequestToken as an incomplete rotation is refused InvalidRequestException instead of resuming that rotation (1 cause)
+
+> _Note: this issue was identified against the code base at commit `34cbf26053278f98cefaf82e17444d2784be9247`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+RotateSecret
+
+## Description
+One net-new root cause. The failing check is neither marked ALREADY FILED nor OWNED by the suite report. Related open issues exist but none carries this replay key: 20261111T030649Z-lambda-logs-secretsmanager-a-rotation-whose-testsecret-step.md (the sibling testSecret check that burns its budget), 20261117T115022Z-iam-lambda-logs-secretsmanager-2-causes-rotatesecret-never.md (RotationRules Duration/cron validation) and 20261104T044754Z-secretsmanager-a-scheduled-but-unfired-rotation-never-runs.md (unfired scheduled rotation) — all describe other aspects of rotation, not the resume path below.
+
+Cause 1 of 1: a rotation left incomplete by a failing finishSecret cannot be resumed — RotateSecret with the SAME ClientRequestToken is refused as though it were a new rotation.
+AWS: RotateSecret's ClientRequestToken is the operation's idempotency token. Smithy: RotateSecret.ClientRequestToken is @idempotencyToken, length 32-64, documented as "A unique identifier for the new version of the secret. You only need to specify this value if you implement your own retry logic and you want to ensure that Secrets Manager doesn't attempt to create a secret version twice... Secrets Manager uses this value to prevent the accidental creation of duplicate versions if there are failures and retries during a rotation." So the token distinguishes two cases on a secret whose previous rotation did not finish: a request carrying a NEW token is refused with InvalidRequestException (modeled error, client kind, HTTP 400) whose message is the fixed text "A previous rotation isn't complete. That rotation will be reattempted." — no variable parts; while a request carrying the token of the outstanding rotation is ACCEPTED and re-drives that same rotation, answering 200 with ARN, Name and VersionId echoing the supplied token, minting no third version. The check asserts exactly that pair: the new-token call is refused with that code and that message (that assertion passed), and the same-token call then resumes and promotes the already-staged AWSPENDING candidate, leaving the original version at AWSPREVIOUS.
+Emulator: the same-token re-drive is refused with the new-token refusal. The check errors on `sm.rotate_secret(SecretId=secret_arn, ClientRequestToken=token, RotateImmediately=True)` — the token already staged as AWSPENDING by the first, failed rotation — with `botocore.errorfactory.InvalidRequestException: An error occurred (InvalidRequestException) when calling the RotateSecret operation: A previous rotation isn't complete. That rotation will be reattempted.` The emulator evidently gates RotateSecret on "is a rotation outstanding?" alone and never compares the request's ClientRequestToken with the outstanding rotation's token, so the error code, HTTP 400 and message text are right for the new-token case and wrong here: the correct answer to this request is a 200 RotateSecretResponse, not an error at all.
+Why: a client whose rotation function failed part-way (the normal, documented recovery path: fix the function, re-drive the same token) can never finish or abandon that rotation. The secret is wedged permanently with AWSCURRENT on the stale credential and the candidate stranded at AWSPENDING: every retry — the one AWS tells callers to make, and the one the SDK's own retry logic makes with the token it already generated — is refused, so no API call can advance or clear the rotation. Both arms of the defect are invisible to the caller, because the refusal message claims the rotation "will be reattempted".
+Fix: the RotateSecret handler and the rotation state it consults — the outstanding-rotation guard must compare the request's ClientRequestToken against the token of the in-progress rotation and, when they match, resume that rotation (re-invoke the rotation function from its current step against the already-staged AWSPENDING version) and return success echoing that VersionId, reserving the InvalidRequestException refusal for a request whose token differs.
+Traces: lambda__logs__secretsmanager.deep-secrets-and-params-failed-finishsecret-leaves-candidate-awspending-and-rejects-new-rotation.
+
+## Evidence
+Cause 1 — Expected: after a rotation whose finishSecret step raised (DescribeSecret showing {original: [AWSCURRENT], token: [AWSPENDING]}, which the emulator did produce correctly, and the new-token RotateSecret correctly refused InvalidRequestException "A previous rotation isn't complete. That rotation will be reattempted."), a RotateSecret carrying that SAME ClientRequestToken is accepted — HTTP 200, VersionId equal to the supplied token — and re-drives the rotation so the staged candidate becomes AWSCURRENT and the original becomes AWSPREVIOUS, with no third version minted.
+Actual: that same-token call is refused with HTTP 400 `InvalidRequestException` and the new-token message text:
+  botocore.errorfactory.InvalidRequestException: An error occurred (InvalidRequestException) when calling the RotateSecret operation: A previous rotation isn't complete. That rotation will be reattempted.
+raised out of botocore client.py `_make_api_call`, which aborts the check at its positive-control step (`resumed = sm.rotate_secret(SecretId=secret_arn, ClientRequestToken=token, RotateImmediately=True)`) after every preceding assertion — the four-step delivery, the unchanged staging map, the ResourceNotFoundException for the refused intruder token — had passed. The message's fixed text is correct for a differing token and has no variable parts; the defect is that it is emitted for a matching one, where no error belongs.
+
+## Steps to Reproduce
+1. CreateSecret with a known SecretString; note VersionId (the original version).
+2. Create a rotation Lambda implementing createSecret/setSecret/testSecret/finishSecret whose finishSecret step raises (gated on an environment variable), and AddPermission so secretsmanager.amazonaws.com may invoke it.
+3. RotateSecret(SecretId, ClientRequestToken=T, RotationLambdaARN, RotationRules={AutomaticallyAfterDays:30}, RotateImmediately=true) and wait until the function has logged its finishSecret step.
+4. DescribeSecret: VersionIdsToStages is {original: [AWSCURRENT], T: [AWSPENDING]} — correct.
+5. RotateSecret with a NEW token T2: refused InvalidRequestException "A previous rotation isn't complete. That rotation will be reattempted." — correct.
+6. Clear the environment variable so finishSecret now succeeds, then RotateSecret(SecretId, ClientRequestToken=T, RotateImmediately=true).
+Observed: step 6 is refused with HTTP 400 InvalidRequestException and the same "A previous rotation isn't complete." message. Expected: step 6 returns 200 with VersionId=T, the rotation resumes, and DescribeSecret ends at {T: [AWSCURRENT], original: [AWSPREVIOUS]} with GetSecretValue serving the bytes the function minted for T.
