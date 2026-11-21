@@ -6,9 +6,10 @@
 //! document with the whitespace between its JSON tokens removed — so
 //! `GetLifecyclePolicy` reports exactly the text this call answers with.
 //!
-//! Storing a policy is also what evaluates it, so the stored record carries this call's
-//! instant as the policy's `lastEvaluatedAt` — the member `GetLifecyclePolicy` and
-//! `DeleteLifecyclePolicy` report and this operation's own output does not model.
+//! Storing a policy is not a RUN of it: the stored record carries no last-run instant, so
+//! the `lastEvaluatedAt` `GetLifecyclePolicy` and `DeleteLifecyclePolicy` report — the
+//! member this operation's own output does not model — stays the never-run instant until an
+//! evaluation of the policy actually happens.
 //!
 //! ## Shape of an operation
 //!
@@ -203,7 +204,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::parse_lifecycle_policy(&input.lifecycle_policy_text)
             .map_err(fault_error)?;
 
-        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         let repo = store
             .repository_mut(&region, &input.repository_name)
@@ -212,12 +212,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A put REPLACES the policy. What is stored is the document as ECR reports it:
         // the whitespace between its JSON tokens is removed and nothing else about it is
         // touched, so the read cannot differ from the write. `insert` answers the record
-        // just written, which is what the response reports. The policy is evaluated by
-        // being set, so the record carries this instant as the one it was last evaluated
-        // at.
+        // just written, which is what the response reports. Storing a policy is not a RUN
+        // of it, so the record carries no last-run instant: only an evaluation of the
+        // policy against the repository's images writes one
+        // (`crate::state::StoredLifecyclePolicy::last_evaluated_at`).
         let written = repo.lifecycle_policy.insert(crate::state::StoredLifecyclePolicy {
             text: crate::state::normalize_lifecycle_policy(&input.lifecycle_policy_text),
-            last_evaluated_at: now,
+            last_evaluated_at: None,
         });
         let text = written.text.clone();
 

@@ -3,7 +3,7 @@
 //! @op GetLifecyclePolicy
 //! Reports the lifecycle policy stored on a repository: the document
 //! `PutLifecyclePolicy` persisted — the one it reported, with the whitespace between its
-//! JSON tokens removed — and the instant the registry last evaluated it. A pure read — it
+//! JSON tokens removed — and the instant the registry last ran it. A pure read — it
 //! stores nothing and expires no image.
 //!
 //! A repository that carries no policy is refused with `LifecyclePolicyNotFoundException`,
@@ -214,11 +214,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             registry_id: Some(repo.registry_id.clone()),
             repository_name: Some(repo.name.clone()),
             lifecycle_policy_text: Some(policy.text.clone()),
-            // "The time stamp of the last time that the lifecycle policy was run." The
-            // policy was evaluated when it was set, so the stored record carries that
-            // instant and this read reports it; the read itself moves nothing, so a later
-            // caller sees the same instant.
-            last_evaluated_at: Some(crate::state::reported_instant(policy.last_evaluated_at)),
+            // "The time stamp of the last time that the lifecycle policy was run." No run
+            // of this policy has happened unless an evaluation performed one, so what is
+            // reported is the stored record's own reading of that
+            // (`crate::state::StoredLifecyclePolicy::reported_last_evaluated_at`): the
+            // never-run instant for a policy that was only ever stored. The read itself
+            // moves nothing, so a later caller sees the same instant.
+            last_evaluated_at: Some(policy.reported_last_evaluated_at()),
         })
     }
 }

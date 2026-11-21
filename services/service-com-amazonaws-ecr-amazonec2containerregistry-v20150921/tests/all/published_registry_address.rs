@@ -28,8 +28,9 @@
 //! zone, which this emulator does not answer on), another partition's registry host and this
 //! service's dual-stack endpoint host (two more zones AWS publishes its own endpoints in),
 //! the emulator's own socket, a loopback name with a port, an endpoint carried only on the
-//! request URI, this service's control-plane endpoint host (which names a service, so no
-//! registry client can use it) and a `Host` that is no endpoint at all — crossed with the
+//! request URI, this service's control-plane endpoint host, a host an operator serves THIS
+//! service at and one of ANOTHER service (whose traffic routes there instead, so no registry
+//! client can use it) and a `Host` that is no endpoint at all — crossed with the
 //! repository-name forms `RepositoryName`'s pattern allows. No row is the recorded request;
 //! the recorded case is one name at one endpoint.
 //!
@@ -112,6 +113,23 @@ fn endpoints() -> Vec<Endpoint> {
             uri_authority: None,
             // No registry client can use a host that routes to a service, so the address
             // this emulator is served at is reported instead.
+            announced_endpoint: ANNOUNCED_REGISTRY_ENDPOINT.to_string(),
+        },
+        Endpoint {
+            case: "a host of THIS service an operator serves the emulator at",
+            host: Some("ecr.localhost:39355".to_string()),
+            uri_authority: None,
+            // A host the front door resolves to THIS service reaches this service's own
+            // registry plane, so the caller is reported the address it is already talking
+            // to rather than one it may not reach.
+            announced_endpoint: "ecr.localhost:39355".to_string(),
+        },
+        Endpoint {
+            case: "a host of ANOTHER service the emulator serves",
+            host: Some("dynamodb.localhost:39355".to_string()),
+            uri_authority: None,
+            // That host routes to the service its first label names, so no registry
+            // request addressed to it reaches this plane: the served address is reported.
             announced_endpoint: ANNOUNCED_REGISTRY_ENDPOINT.to_string(),
         },
         Endpoint {

@@ -66,39 +66,65 @@
 /// registry URL a `docker login` of that caller is pointed at is built on
 /// ([`registry_login_url`]).
 ///
-/// Two endpoints can satisfy that, and the tree's one reading of the question picks between
-/// them (`service_common::data_plane_addressing::reached_emulator_endpoint`):
+/// Two endpoints can satisfy that:
 ///
-/// - the endpoint the CALLER reached this emulator on, when that endpoint names no
-///   service — the emulator's own socket, a loopback name, and a registry host itself,
-///   whose first label is an account id. `crate::service`'s registry data plane claims a
-///   `/v2` request exactly when its endpoint names no service, so such a caller is reported
-///   the address it is already talking to and reaches the registry there;
-/// - otherwise the address this emulator is served at: a caller that came in on some
-///   service's endpoint host (an SDK pointed at `api.ecr.<region>.amazonaws.com`) would be
-///   handed an address a registry client cannot use, because that host routes to a service
-///   and no registry request addressed to it reaches this plane — and so would a caller that
-///   came in on a host inside a zone AWS publishes its OWN endpoints in
-///   (`addresses_an_aws_endpoint`), which resolves nowhere near this process. Taking the
-///   served address WHOLE, host and port together, is what keeps the reported address
-///   dialable.
+/// - the endpoint the CALLER reached this emulator on, whenever this registry answers a
+///   `/v2` request addressed there ([`answers_registry_requests_at`]) — the emulator's own
+///   socket, a loopback name, a registry host itself, and this service's own endpoint host,
+///   because a request routed to THIS service by its host is served by this service's
+///   registry plane (`crate::service`'s `override_routing_error`). Such a caller is reported
+///   the address it is already talking to, which is the one address it is known to reach;
+/// - otherwise the address this emulator is served at: a caller that came in on ANOTHER
+///   service's endpoint host would be handed an address a registry client cannot use,
+///   because that host routes to that service and no registry request addressed to it
+///   reaches this plane — and so would a caller that came in on a host inside a zone AWS
+///   publishes its OWN endpoints in (`addresses_an_aws_endpoint`), which resolves nowhere
+///   near this process. Taking the served address WHOLE, host and port together, is what
+///   keeps the reported address dialable.
 pub fn announced_registry_endpoint(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
 ) -> String {
     let parts = ctx.parts();
-    ::service_common::data_plane_addressing::reached_emulator_endpoint(
+    ::service_common::data_plane_addressing::addressed_host(
         &parts.uri.to_string(),
         parts
             .headers
             .get(::http::header::HOST)
             .and_then(|value| value.to_str().ok()),
     )
-    .filter(|reached| {
-        !::service_common::data_plane_addressing::addresses_an_aws_endpoint(reached)
-    })
+    .filter(|reached| answers_registry_requests_at(reached, ctx.identity().signing_name()))
     .unwrap_or_else(|| {
         ::service_common::data_plane_addressing::emulator_endpoint_authority(ctx)
     })
+}
+
+/// Whether a `/v2` request addressed to `reached` — the `host[:port]` a caller stated — is
+/// one THIS registry answers, which is what makes that authority reportable as the address a
+/// `docker login` is pointed at ([`announced_registry_endpoint`]).
+///
+/// Three readings, each the tree's own:
+///
+/// - it has to be an ADDRESS at all
+///   (`service_common::data_plane_addressing::is_host_shaped`), so nothing a caller wrote
+///   that is not a `host[:port]` reaches a URL this service announces;
+/// - it must not be a host AWS publishes its OWN endpoints at
+///   (`addresses_an_aws_endpoint`): such a name resolves nowhere near this process or, worse,
+///   at genuine AWS infrastructure, which sends the next client out of the emulated
+///   environment carrying the credential it is holding;
+/// - it must name no OTHER service than `this_service`
+///   (`service_common::data_plane_addressing::service_named_by_host`, the reading written
+///   for exactly this question — "for a plane that has to tell its OWN service's endpoint
+///   from another service's"): a host the front door resolves to another service routes
+///   there, so no registry request addressed to it reaches this plane, while a host that
+///   resolves to THIS service reaches it (`crate::service`), as does one that names no
+///   service at all.
+fn answers_registry_requests_at(reached: &str, this_service: &str) -> bool {
+    use ::service_common::data_plane_addressing as addressing;
+
+    addressing::is_host_shaped(reached)
+        && !addressing::addresses_an_aws_endpoint(reached)
+        && addressing::service_named_by_host(reached)
+            .is_none_or(|named| named == this_service)
 }
 
 /// The Region of the registry a request to one of this registry's own DATA-PLANE endpoints

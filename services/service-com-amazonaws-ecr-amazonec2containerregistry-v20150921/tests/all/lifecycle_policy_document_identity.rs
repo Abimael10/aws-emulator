@@ -16,8 +16,8 @@
 //! whitespace inside a string is part of the string. The same bytes come back from the put
 //! that stored it, the read, the preview start, the preview read and the delete. Two of
 //! those operations also model `lastEvaluatedAt` (`GetLifecyclePolicy`,
-//! `DeleteLifecyclePolicy`): they report the instant the policy was last evaluated, which
-//! a read never moves.
+//! `DeleteLifecyclePolicy`): they report the instant the policy was last RUN, which is the
+//! never-run instant until an evaluation has run it, and which no read moves.
 //!
 //! The table is therefore a ROUND-TRIP invariant stated as `(sent bytes, reported bytes)`,
 //! with rows differing along what the rule generalises over: where the whitespace is
@@ -402,116 +402,107 @@ async fn a_document_a_preview_start_names_itself_is_reported_minified_too() {
     }
 }
 
+/// The instant `lastEvaluatedAt` carries for a policy the registry has never RUN: the UNIX
+/// epoch, the instant that is no run at all.
+const NEVER_RUN: f64 = 0.0;
+
 #[tokio::test]
-async fn the_evaluation_instant_is_set_when_the_policy_is_set_and_unchanged_by_a_read() {
+async fn the_last_run_instant_is_the_never_run_instant_until_the_policy_is_run() {
+    // RULE: `lastEvaluatedAt` is "The time stamp of the last time that the lifecycle policy
+    // was run", so nothing but a RUN of the policy advances it — storing the document,
+    // replacing it, reading it back and removing it are not runs of it. Every document the
+    // table carries is only ever stored, so every operation that reports the member reports
+    // the never-run instant, however many times the policy was written or read.
     let router = emulator();
-    let name = "document-identity-evaluation";
-    repository(&router, name).await;
+    for (index, document) in documents().iter().enumerate() {
+        // One repository per row, so each row is answered about a policy of its own.
+        let name = format!("document-identity-last-run-{index}");
+        repository(&router, &name).await;
 
-    let table = documents();
-    let first = &table[0];
-    let second = &table[1];
-
-    let before = now_epoch_secs();
-    ok(
-        &router,
-        first.case,
-        "PutLifecyclePolicy",
-        &json!({ "repositoryName": name, "lifecyclePolicyText": first.sent }),
-    )
-    .await;
-    let after = now_epoch_secs();
-
-    let got = ok(
-        &router,
-        first.case,
-        "GetLifecyclePolicy",
-        &json!({ "repositoryName": name }),
-    )
-    .await;
-    let evaluated = got["lastEvaluatedAt"].as_f64().unwrap_or_else(|| {
-        panic!(
-            "case {:?}: the read must report a lastEvaluatedAt timestamp, got {:?}",
-            first.case, got["lastEvaluatedAt"]
-        )
-    });
-    assert!(
-        evaluated >= before - 1.0 && evaluated <= after + 1.0,
-        "case {:?}: lastEvaluatedAt must be the instant the policy was set, between \
-         {before} and {after}, got {evaluated}",
-        first.case
-    );
-
-    // A read is a read: the instant it reports does not move because somebody read it.
-    for attempt in ["second read", "third read"] {
-        let again = ok(
+        // The clock is read before and after the write, so a failure says whether the
+        // reported instant is a clock reading rather than the sentinel.
+        let before = now_epoch_secs();
+        ok(
             &router,
-            attempt,
+            document.case,
+            "PutLifecyclePolicy",
+            &json!({ "repositoryName": name, "lifecyclePolicyText": document.sent }),
+        )
+        .await;
+        let after = now_epoch_secs();
+
+        // Reading it back, twice, and then replacing it and reading it again: a read is a
+        // read, and a put is not a run.
+        for attempt in ["the first read", "the second read"] {
+            let got = ok(
+                &router,
+                document.case,
+                "GetLifecyclePolicy",
+                &json!({ "repositoryName": name }),
+            )
+            .await;
+            let case = format!("{}, {attempt}", document.case);
+            let reported = got["lastEvaluatedAt"].as_f64().unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: the read must report a lastEvaluatedAt timestamp, got {:?}",
+                    got["lastEvaluatedAt"]
+                )
+            });
+            assert_eq!(
+                reported, NEVER_RUN,
+                "case {case:?}: no run of this policy has happened, so lastEvaluatedAt must \
+                 be {NEVER_RUN}, got {reported} (the write fell between {before} and {after})"
+            );
+        }
+
+        // A replacement is another store, so the member stays where it was.
+        let replacement = &documents()[(index + 1) % documents().len()];
+        ok(
+            &router,
+            replacement.case,
+            "PutLifecyclePolicy",
+            &json!({ "repositoryName": name, "lifecyclePolicyText": replacement.sent }),
+        )
+        .await;
+        let replaced = ok(
+            &router,
+            replacement.case,
             "GetLifecyclePolicy",
             &json!({ "repositoryName": name }),
         )
         .await;
+        let case = format!("{}, replaced by {}", document.case, replacement.case);
         assert_eq!(
-            again["lastEvaluatedAt"].as_f64(),
-            Some(evaluated),
-            "case {attempt:?}: a read must not move lastEvaluatedAt, got {:?}",
-            again["lastEvaluatedAt"]
+            replaced["lastEvaluatedAt"].as_f64(),
+            Some(NEVER_RUN),
+            "case {case:?}: replacing the document is not a run of it, so lastEvaluatedAt \
+             must be {NEVER_RUN}, got {:?}",
+            replaced["lastEvaluatedAt"]
+        );
+        assert_eq!(
+            replaced["lifecyclePolicyText"].as_str(),
+            Some(replacement.reported.as_str()),
+            "case {case:?}: the read must report the replacement, got {:?}",
+            replaced["lifecyclePolicyText"]
+        );
+
+        // The delete is the last place the member can be read, and it reports the same
+        // instant the read did — one source of truth for the two operations that carry it.
+        let deleted = ok(
+            &router,
+            replacement.case,
+            "DeleteLifecyclePolicy",
+            &json!({ "repositoryName": name }),
+        )
+        .await;
+        assert_eq!(
+            deleted["lastEvaluatedAt"].as_f64(),
+            Some(NEVER_RUN),
+            "case {case:?}: the delete must report the same never-run instant the read \
+             reported, got {:?}",
+            deleted["lastEvaluatedAt"]
         );
     }
-
-    // Setting a policy again evaluates the new document: the instant is at or after the
-    // first one, and belongs to the replacement.
-    ok(
-        &router,
-        second.case,
-        "PutLifecyclePolicy",
-        &json!({ "repositoryName": name, "lifecyclePolicyText": second.sent }),
-    )
-    .await;
-    let replaced = ok(
-        &router,
-        second.case,
-        "GetLifecyclePolicy",
-        &json!({ "repositoryName": name }),
-    )
-    .await;
-    let replaced_evaluated = replaced["lastEvaluatedAt"].as_f64().unwrap_or_else(|| {
-        panic!(
-            "case {:?}: the read must report a lastEvaluatedAt timestamp, got {:?}",
-            second.case, replaced["lastEvaluatedAt"]
-        )
-    });
-    assert!(
-        replaced_evaluated >= evaluated,
-        "case {:?}: a replacement is evaluated no earlier than what it replaced, got \
-         {replaced_evaluated} after {evaluated}",
-        second.case
-    );
-    assert_eq!(
-        replaced["lifecyclePolicyText"].as_str(),
-        Some(second.reported.as_str()),
-        "case {:?}: the read must report the replacement, got {:?}",
-        second.case,
-        replaced["lifecyclePolicyText"]
-    );
-
-    // The delete is the last place the evaluation instant of the policy it removes can be
-    // read, and it reports the one that was stored.
-    let deleted = ok(
-        &router,
-        second.case,
-        "DeleteLifecyclePolicy",
-        &json!({ "repositoryName": name }),
-    )
-    .await;
-    assert_eq!(
-        deleted["lastEvaluatedAt"].as_f64(),
-        Some(replaced_evaluated),
-        "case {:?}: the delete must report the evaluation instant of the policy it \
-         removed, got {:?}",
-        second.case,
-        deleted["lastEvaluatedAt"]
-    );
 }
 
 #[tokio::test]

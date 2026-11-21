@@ -210,15 +210,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::lifecycle_policy_not_found_message(&repo.name),
             ))
         })?;
+        // The policy that was just removed carries the instant it was last RUN, which is
+        // the never-run instant unless an evaluation performed one (see
+        // `PutLifecyclePolicy`), and this farewell response is the last place a caller can
+        // read it. It is the same reading `GetLifecyclePolicy` reports, so the two cannot
+        // disagree about a policy's evaluation.
+        let last_evaluated_at = removed.reported_last_evaluated_at();
 
         Ok(DeleteLifecyclePolicyOutput {
             registry_id: Some(repo.registry_id.clone()),
             repository_name: Some(repo.name.clone()),
             lifecycle_policy_text: Some(removed.text),
-            // The policy that was just removed carries the instant it was last evaluated
-            // (see `PutLifecyclePolicy`), and this farewell response is the last place a
-            // caller can read it.
-            last_evaluated_at: Some(crate::state::reported_instant(removed.last_evaluated_at)),
+            last_evaluated_at: Some(last_evaluated_at),
         })
     }
 }

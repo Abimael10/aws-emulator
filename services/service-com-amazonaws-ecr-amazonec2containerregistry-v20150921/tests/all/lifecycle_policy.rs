@@ -155,12 +155,14 @@ async fn a_lifecycle_policy_put_is_read_back_as_stored_and_then_deleted() {
         "case {:?}: the read must report this registry, got {got:?}",
         "read back"
     );
-    // Storing a policy evaluates it, so the read reports the instant it was last
-    // evaluated; `lifecycle_policy_document_identity` is where that instant is pinned to
-    // the put that set it.
-    assert!(
-        got["lastEvaluatedAt"].as_f64().is_some_and(|at| at > 0.0),
-        "case {:?}: the read must report the instant the policy was evaluated, got {got:?}",
+    // Storing a policy is not a RUN of it, so the read reports the never-run instant;
+    // `lifecycle_policy_document_identity` is where that instant is pinned over the table
+    // of documents and over every path that reports it.
+    assert_eq!(
+        got["lastEvaluatedAt"].as_f64(),
+        Some(0.0),
+        "case {:?}: no run of this policy has happened, so the read must report the \
+         never-run instant, got {got:?}",
         "read back"
     );
 

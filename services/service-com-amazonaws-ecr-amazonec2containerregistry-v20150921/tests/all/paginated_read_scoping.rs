@@ -369,8 +369,9 @@ async fn every_reported_instant_is_stated_to_the_millisecond() {
     given_repository(&router, repository, json!({})).await;
     let digest = given_image(&router, repository, "v1").await;
 
-    // A lifecycle policy, so `GetLifecyclePolicy` has an evaluation instant to report. The
-    // document is padded past the modelled minimum length of `lifecyclePolicyText`.
+    // A lifecycle policy, so `GetLifecyclePolicy` has a policy to report the last-run
+    // instant of. The document is padded past the modelled minimum length of
+    // `lifecyclePolicyText`.
     let mut policy = "{\"rules\":[{\"rulePriority\":1,\"description\":\"keep ten\",\
          \"action\":{\"type\":\"expire\"},\"selection\":{\"tagStatus\":\"any\",\
          \"countType\":\"imageCountMoreThan\",\"countNumber\":10}}]}"
@@ -398,41 +399,49 @@ async fn every_reported_instant_is_stated_to_the_millisecond() {
     )
     .await;
 
-    // Each row: the case, the operation, its request, and the pointer to the instant.
-    let rows: Vec<(&str, &str, Value, &str)> = vec![
+    // Each row: the case, the operation, its request, the pointer to the instant, and
+    // whether the member reports an instant of something that HAPPENED — a member that
+    // reports the never-happened instant (the epoch) is stated to the same resolution, and
+    // `lifecycle_policy_document_identity` is where that instant itself is pinned.
+    let rows: Vec<(&str, &str, Value, &str, bool)> = vec![
         (
             "the instant a repository was created",
             "DescribeRepositories",
             json!({"repositoryNames": [repository]}),
             "/repositories/0/createdAt",
+            true,
         ),
         (
             "the instant an image was pushed",
             "DescribeImages",
             json!({"repositoryName": repository}),
             "/imageDetails/0/imagePushedAt",
+            true,
         ),
         (
             "the instant an image was archived",
             "DescribeImages",
             json!({"repositoryName": repository}),
             "/imageDetails/0/lastArchivedAt",
+            true,
         ),
         (
             "the instant a registry credential expires",
             "GetAuthorizationToken",
             json!({}),
             "/authorizationData/0/expiresAt",
+            true,
         ),
         (
-            "the instant a lifecycle policy was evaluated",
+            "the instant a lifecycle policy was last run, which it never was",
             "GetLifecyclePolicy",
             json!({"repositoryName": repository}),
             "/lastEvaluatedAt",
+            false,
         ),
     ];
 
-    for (case, operation, request, pointer) in rows {
+    for (case, operation, request, pointer, of_an_event) in rows {
         let answer = ok(&router, case, operation, &request).await;
         let instant = at(&answer, pointer);
         let digits = fractional_digits(&instant).unwrap_or_else(|| {
@@ -443,9 +452,11 @@ async fn every_reported_instant_is_stated_to_the_millisecond() {
             "case {case:?}: an instant is stated in seconds and milliseconds, \
              so at most 3 fractional digits; {pointer} has {digits} ({instant:?})"
         );
-        assert!(
+        assert_eq!(
             instant.as_f64().is_some_and(|seconds| seconds > 0.0),
-            "case {case:?}: {pointer} must be an instant after the epoch, got {instant:?}"
+            of_an_event,
+            "case {case:?}: {pointer} must be an instant after the epoch exactly when it \
+             reports something that happened ({of_an_event}), got {instant:?}"
         );
     }
 }

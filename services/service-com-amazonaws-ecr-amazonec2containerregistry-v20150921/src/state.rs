@@ -1401,7 +1401,7 @@ fn identifier_members_of(digest: &str, tag: &str) -> String {
 }
 
 /// The lifecycle policy a repository carries: the document [`Repo`] was given, and the
-/// instant that policy was last evaluated.
+/// instant the registry last ran that policy, if it ever has.
 ///
 /// The document is held as TEXT and never as a parsed value: `lifecyclePolicyText` is an
 /// opaque document (`ecr#LifecyclePolicyText`, a string), so what is stored is what every
@@ -1417,17 +1417,32 @@ pub struct StoredLifecyclePolicy {
     /// ([`normalize_lifecycle_policy`]). Every operation that reports this policy reports
     /// these same bytes, so a read never differs from another read.
     pub text: String,
-    /// The instant this policy was last evaluated — the `lastEvaluatedAt`
+    /// The instant the registry last RAN this policy — the `lastEvaluatedAt`
     /// `GetLifecyclePolicy` and `DeleteLifecyclePolicy` report (`ecr#EvaluationTimestamp`,
     /// "The time stamp of the last time that the lifecycle policy was run").
     ///
-    /// Setting a policy is what evaluates it, so this is the instant of the
-    /// `PutLifecyclePolicy` that stored this document: ECR documents that the images an
-    /// evaluation claims are then acted on "within 24 hours" of it, which is longer than
-    /// any run of this emulator, so nothing here removes an image behind a caller's back
-    /// and `StartLifecyclePolicyPreview` stays the way to see what a policy would act on.
-    /// No read writes this instant, so two reads of one policy report the same one.
-    pub last_evaluated_at: SystemTime,
+    /// `None` until a run of the policy has actually happened, which is the state every
+    /// policy this registry holds is in: storing a document is not running it, and the only
+    /// evaluation this registry performs is the one a `StartLifecyclePolicyPreview` asks for,
+    /// which acts on nothing and is reported as a preview of its own
+    /// ([`LifecyclePreview`]). A policy whose rules have never been applied to the
+    /// repository's images therefore has no last-run instant to report, and
+    /// [`StoredLifecyclePolicy::reported_last_evaluated_at`] is the one reading of that
+    /// state. Nothing but a run writes it, and no read writes it at all, so two reads of one
+    /// policy report the same instant.
+    pub last_evaluated_at: Option<SystemTime>,
+}
+
+impl StoredLifecyclePolicy {
+    /// The `lastEvaluatedAt` a response reports for this policy: the instant of its last
+    /// run, and the UNIX epoch — the instant that is no run at all — while it has never
+    /// been run.
+    ///
+    /// The ONE place that reading is written, so `GetLifecyclePolicy` and
+    /// `DeleteLifecyclePolicy` cannot report a policy's evaluation differently.
+    pub fn reported_last_evaluated_at(&self) -> ::aws_smithy_types::DateTime {
+        reported_instant(self.last_evaluated_at.unwrap_or(SystemTime::UNIX_EPOCH))
+    }
 }
 
 /// The lifecycle policy preview one `StartLifecyclePolicyPreview` call started.
@@ -2165,7 +2180,7 @@ pub struct Repo {
     pub layer_blobs: BTreeMap<String, LayerBlob>,
     /// The repository's lifecycle policy, which `PutLifecyclePolicy` sets: the policy
     /// `StartLifecyclePolicyPreview` evaluates when the start call names none, and the
-    /// document and evaluation instant `GetLifecyclePolicy` reports. `None` until a
+    /// document and last-run instant `GetLifecyclePolicy` reports. `None` until a
     /// policy is put and again once `DeleteLifecyclePolicy` removes it, which is what the
     /// two of them report `LifecyclePolicyNotFoundException` for.
     pub lifecycle_policy: Option<StoredLifecyclePolicy>,
