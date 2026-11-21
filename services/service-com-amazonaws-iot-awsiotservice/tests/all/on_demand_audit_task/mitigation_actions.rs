@@ -22,6 +22,12 @@
 //! `DeleteMitigationAction` models no not-found error at all, so a repeated delete answers
 //! exactly as the first one did.
 //!
+//! The identity that create mints is the record's own: it is drawn fresh for the record,
+//! independently of the request that created it, and is then immutable for the record's
+//! life, so every read and every update report it byte for byte while two records — two
+//! created by byte-identical requests, or one that reuses a name a delete freed — carry
+//! different ids.
+//!
 //! The table spans what that rule generalises over: every modelled `MitigationActionType`,
 //! which is one per member of `MitigationActionParams`
 //! (`smithy_query(query="shape",shape="MitigationActionParams")`) — read against the
@@ -617,6 +623,163 @@ async fn an_update_replaces_the_members_it_names_and_a_delete_is_idempotent() {
         expected,
         "case after the delete: expected every other action to stand, got {}",
         listed.text()
+    );
+}
+
+/// Whether `value` has the canonical lowercase hyphenated identifier form: five groups of
+/// 8-4-4-4-12 lowercase hex digits.
+///
+/// `MitigationActionId` is a plain string shape — no `@length` and no `@pattern`
+/// (`smithy_query(query="shape",shape="MitigationActionId")`) — so the form is this
+/// plane's, and this is the one every identifier it mints carries.
+fn is_canonical_identifier(value: &str) -> bool {
+    let groups: Vec<&str> = value.split('-').collect();
+    groups.len() == 5
+        && groups
+            .iter()
+            .zip([8usize, 4, 4, 4, 12])
+            .all(|(group, width)| {
+                group.len() == width
+                    && group.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+            })
+}
+
+/// RULE: the unique identifier this plane mints for a record is drawn FRESH for that
+/// record, independently of the request that created it, and is then immutable for the
+/// life of the record — every read and every update of the record reports the same id byte
+/// for byte, while two records carry different ids even when byte-identical requests
+/// created them and even when one reuses a name a delete just freed.
+#[tokio::test]
+async fn a_minted_action_id_is_fresh_per_record_and_immutable_for_its_life() {
+    let emulator = Emulator::new();
+    // One row per modelled `MitigationActionType`: the identity rule holds whichever type
+    // of change the record's parameters define.
+    let minted = emulator.create_every_row().await;
+
+    for ((action_name, params, _action_type), action_id) in rows().into_iter().zip(minted.iter())
+    {
+        assert!(
+            is_canonical_identifier(action_id),
+            "case {action_name}: expected the canonical lowercase hyphenated identifier \
+             form, got {action_id:?}"
+        );
+
+        // A read reports the stored identity and mints nothing, so repeated reads are one
+        // value rather than one per call.
+        for read in 1..=2 {
+            let described = emulator.describe(action_name).await;
+            assert_eq!(
+                described.json()["actionId"].as_str(),
+                Some(action_id.as_str()),
+                "case {action_name} read {read}: expected the id the create minted, got {}",
+                described.text()
+            );
+        }
+
+        // An update re-identifies nothing: the members it names change, the identity the
+        // create minted stands — in the update's own response and in the next read.
+        let updated = emulator
+            .update(
+                action_name,
+                &json!({ "roleArn": REPLACEMENT_ROLE_ARN, "actionParams": params }),
+            )
+            .await;
+        assert_eq!(
+            updated.status,
+            200,
+            "case {action_name}: expected 200 from the update, got {} body {}",
+            updated.status,
+            updated.text()
+        );
+        assert_eq!(
+            updated.json()["actionId"].as_str(),
+            Some(action_id.as_str()),
+            "case {action_name}: expected the update to echo the id the create minted, got {}",
+            updated.text()
+        );
+        let described = emulator.describe(action_name).await;
+        assert_eq!(
+            described.json()["actionId"].as_str(),
+            Some(action_id.as_str()),
+            "case {action_name} after the update: expected the id the create minted, got {}",
+            described.text()
+        );
+    }
+
+    let distinct: BTreeSet<&String> = minted.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        minted.len(),
+        "expected one distinct actionId per record, got {minted:?}"
+    );
+
+    // Two records created by requests that differ in nothing but the name the request line
+    // carries (and the name IS the record's identity) carry different ids: the id is the
+    // record's own, not a function of the request's content.
+    let body = json!({ "roleArn": ROLE_ARN, "actionParams": rows()[0].1.clone() });
+    let mut twin_ids = Vec::new();
+    for action_name in ["identical-request-one", "identical-request-two"] {
+        let created = emulator.create(action_name, &body).await;
+        assert_eq!(
+            created.status,
+            200,
+            "case {action_name}: expected 200 from the create, got {} body {}",
+            created.status,
+            created.text()
+        );
+        twin_ids.push(
+            created.json()["actionId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        );
+    }
+    assert_ne!(
+        twin_ids[0], twin_ids[1],
+        "case two byte-identical creates: expected one id per record, got {twin_ids:?}"
+    );
+
+    // A name a delete freed and a create took again is a NEW record, so it carries a newly
+    // minted id rather than the deleted record's.
+    let reused_name = "identical-request-one";
+    let deleted = emulator.delete(reused_name).await;
+    assert_eq!(
+        deleted.status,
+        200,
+        "case deleting {reused_name}: expected 200, got {} body {}",
+        deleted.status,
+        deleted.text()
+    );
+    let recreated = emulator.create(reused_name, &body).await;
+    assert_eq!(
+        recreated.status,
+        200,
+        "case recreating {reused_name}: expected 200, got {} body {}",
+        recreated.status,
+        recreated.text()
+    );
+    let recreated_id = recreated.json()["actionId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        is_canonical_identifier(&recreated_id),
+        "case recreating {reused_name}: expected the canonical identifier form, got \
+         {recreated_id:?}"
+    );
+    assert_ne!(
+        recreated_id, twin_ids[0],
+        "case recreating {reused_name}: expected a freshly minted id, got the deleted \
+         record's {:?}",
+        twin_ids[0]
+    );
+    let described = emulator.describe(reused_name).await;
+    assert_eq!(
+        described.json()["actionId"].as_str(),
+        Some(recreated_id.as_str()),
+        "case recreating {reused_name}: expected the read to report the new record's id, \
+         got {}",
+        described.text()
     );
 }
 
