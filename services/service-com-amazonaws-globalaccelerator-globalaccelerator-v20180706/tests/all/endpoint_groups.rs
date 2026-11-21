@@ -161,8 +161,14 @@ async fn an_endpoint_group_round_trips_through_the_store() {
                     { "ListenerPort": 443, "EndpointPort": 1443 },
                 ],
                 "EndpointConfigurations": [
+                    // Client IP address preservation is not optional for an EC2 instance
+                    // endpoint, so the instance here names it `true`, while an endpoint of
+                    // another kind takes either value — the rule
+                    // [`an_update_refuses_client_ip_preservation_false_for_an_ec2_instance_endpoint`]
+                    // states, over every identifier form.
                     { "EndpointId": "i-0123456789abcdef0", "Weight": 7,
-                      "ClientIPPreservationEnabled": false },
+                      "ClientIPPreservationEnabled": true },
+                    { "EndpointId": ALB_ENDPOINT, "ClientIPPreservationEnabled": false },
                     { "EndpointId": "198.51.100.7" },
                 ],
             }),
@@ -183,6 +189,8 @@ async fn an_endpoint_group_round_trips_through_the_store() {
                     // Accelerator Developer Guide). The emulator runs no health checks,
                     // so every endpoint is reported INITIAL.
                     { "EndpointId": "i-0123456789abcdef0", "Weight": 7,
+                      "HealthState": "INITIAL", "ClientIPPreservationEnabled": true },
+                    { "EndpointId": ALB_ENDPOINT, "Weight": 128,
                       "HealthState": "INITIAL", "ClientIPPreservationEnabled": false },
                     { "EndpointId": "198.51.100.7", "Weight": 128,
                       "HealthState": "INITIAL" },
@@ -1986,4 +1994,265 @@ async fn an_add_claiming_an_attachment_that_grants_nothing_is_refused() {
         stored, before,
         "case claimed-attachment: a refused add must add nothing, got {stored}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Client IP address preservation
+// ---------------------------------------------------------------------------
+
+/// The sentence the service states when a registration turns client IP address
+/// preservation off for an endpoint that is an EC2 instance: fixed text, with no instance
+/// id, ARN or Region interpolated.
+const PRESERVATION_NOT_OPTIONAL: &str =
+    "Client IP Preservation cannot be set to false for EC2 instances";
+
+/// One `EndpointConfiguration`, naming `ClientIPPreservationEnabled` only where a row
+/// does.
+fn configuration(endpoint_id: &str, preservation: Option<bool>) -> Value {
+    let mut configuration = json!({ "EndpointId": endpoint_id });
+    if let Some(preservation) = preservation {
+        configuration["ClientIPPreservationEnabled"] = json!(preservation);
+    }
+    configuration
+}
+
+/// The `EndpointDescription` a group reports for an endpoint registered that way: a weight
+/// no row names takes the documented default of 128, the emulator runs no health checks so
+/// every endpoint is `INITIAL`, and the preservation flag is reported only where the caller
+/// set it.
+fn described(endpoint_id: &str, preservation: Option<bool>) -> Value {
+    let mut described = json!({
+        "EndpointId": endpoint_id,
+        "Weight": 128,
+        "HealthState": "INITIAL",
+    });
+    if let Some(preservation) = preservation {
+        described["ClientIPPreservationEnabled"] = json!(preservation);
+    }
+    described
+}
+
+/// The identifier forms a registration names an endpoint with, each with the
+/// `ClientIPPreservationEnabled` the row asks for and whether registering it is refused.
+///
+/// The forms are the ones `EndpointConfiguration$EndpointId` names — a load balancer ARN,
+/// an Elastic IP address allocation ID, an EC2 instance ID, an Elastic IP address — and an
+/// EC2 instance ID is `i-` followed by either eight or seventeen hexadecimal characters
+/// (Amazon EC2 resource IDs), so both published lengths are rows here, and one digit past
+/// each of them, and a character that is not a hexadecimal digit, name no instance at all.
+///
+/// (case, EndpointId, the flag the row names, whether the registration is refused)
+fn preservation_rows() -> Vec<(&'static str, &'static str, Option<bool>, bool)> {
+    vec![
+        ("instance-long-id-off", INSTANCE_ENDPOINT, Some(false), true),
+        ("instance-short-id-off", "i-1a2b3c4d", Some(false), true),
+        ("instance-long-id-on", INSTANCE_ENDPOINT, Some(true), false),
+        ("instance-short-id-flag-unset", "i-1a2b3c4d", None, false),
+        ("alb-off", ALB_ENDPOINT, Some(false), false),
+        ("nlb-off", NLB_ENDPOINT, Some(false), false),
+        ("eip-allocation-off", EIP_ENDPOINT, Some(false), false),
+        ("elastic-ip-address-off", "198.51.100.7", Some(false), false),
+        ("nine-hex-digits-off", "i-1a2b3c4d5", Some(false), false),
+        (
+            "eighteen-hex-digits-off",
+            "i-0123456789abcdef01",
+            Some(false),
+            false,
+        ),
+        (
+            "a-non-hex-digit-off",
+            "i-0123456789abcdefg",
+            Some(false),
+            false,
+        ),
+    ]
+}
+
+/// RULE: an endpoint that is an EC2 instance keeps client IP address preservation on, so a
+/// registration setting `ClientIPPreservationEnabled` to false for an `EndpointId` of the
+/// EC2 instance-id form is refused with the modelled `InvalidArgumentException` and
+/// registers nothing, while an endpoint named any other way takes either value. On the
+/// update leg: the group it refused keeps the membership it had, an accepted list replaces
+/// that membership and round-trips through a read, and an empty list deregisters it.
+#[tokio::test]
+async fn an_update_refuses_client_ip_preservation_false_for_an_ec2_instance_endpoint() {
+    let router = emulator();
+    let arn = group_holding(&router, "cipp-update", json!([])).await;
+
+    for (case, endpoint_id, preservation, refused) in preservation_rows() {
+        let before = membership(&router, &arn).await;
+        let (status, body) = update_group(
+            &router,
+            &arn,
+            json!({ "EndpointConfigurations": [configuration(endpoint_id, preservation)] }),
+        )
+        .await;
+        if refused {
+            assert_eq!(
+                (status, error_code(&body).as_str()),
+                (400, "InvalidArgumentException"),
+                "case {case:?}: expected the modelled refusal, got {status} with {body}"
+            );
+            let actual = error_message(&body);
+            assert_eq!(
+                actual, PRESERVATION_NOT_OPTIONAL,
+                "case {case:?}: expected {PRESERVATION_NOT_OPTIONAL:?}, got {actual:?}"
+            );
+            let stored = membership(&router, &arn).await;
+            assert_eq!(
+                stored, before,
+                "case {case:?}: a refused update must register nothing, got {stored}"
+            );
+            continue;
+        }
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with {body}"
+        );
+        let stored = membership(&router, &arn).await;
+        assert_eq!(
+            stored,
+            json!([described(endpoint_id, preservation)]),
+            "case {case:?}: expected the endpoint to round-trip through the store, \
+             got {stored}"
+        );
+    }
+
+    // `EndpointConfigurations` is `@length 0..10`, so a list naming no endpoint is a valid
+    // argument: it deregisters every endpoint the group held.
+    let (status, body) = update_group(&router, &arn, json!({ "EndpointConfigurations": [] })).await;
+    assert_eq!(
+        status, 200,
+        "case deregister-all: expected HTTP 200, got {status} with {body}"
+    );
+    let stored = membership(&router, &arn).await;
+    assert_eq!(
+        stored,
+        json!([]),
+        "case deregister-all: expected an empty membership, got {stored}"
+    );
+}
+
+/// RULE: the create leg states the same rule in the same words as the update leg, and a
+/// create it refuses stores no endpoint group at all — the Region it named is still free.
+#[tokio::test]
+async fn a_create_refuses_client_ip_preservation_false_for_an_ec2_instance_endpoint() {
+    let router = emulator();
+
+    for (index, (case, endpoint_id, preservation, refused)) in
+        preservation_rows().into_iter().enumerate()
+    {
+        // One listener per row: a listener holds one endpoint group per Region, and a
+        // refused row asks again in the Region it was refused in.
+        let listener_arn = fixture(&router, &format!("cipp-create-{index}")).await;
+        let (status, body) = create_group(
+            &router,
+            &listener_arn,
+            "us-west-2",
+            case,
+            json!({ "EndpointConfigurations": [configuration(endpoint_id, preservation)] }),
+        )
+        .await;
+        if refused {
+            assert_eq!(
+                (status, error_code(&body).as_str()),
+                (400, "InvalidArgumentException"),
+                "case {case:?}: expected the modelled refusal, got {status} with {body}"
+            );
+            let actual = error_message(&body);
+            assert_eq!(
+                actual, PRESERVATION_NOT_OPTIONAL,
+                "case {case:?}: expected {PRESERVATION_NOT_OPTIONAL:?}, got {actual:?}"
+            );
+            let (status, body) = create_group(
+                &router,
+                &listener_arn,
+                "us-west-2",
+                &format!("{case}-again"),
+                json!({
+                    "EndpointConfigurations": [configuration(endpoint_id, Some(true))],
+                }),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: a refused create must store no group, so the Region is \
+                 still free, got {status} with {body}"
+            );
+            let arn = group_arn(&body["EndpointGroup"]);
+            let stored = membership(&router, &arn).await;
+            assert_eq!(
+                stored,
+                json!([described(endpoint_id, Some(true))]),
+                "case {case:?}: expected the endpoint to round-trip with preservation on, \
+                 got {stored}"
+            );
+            continue;
+        }
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with {body}"
+        );
+        let arn = group_arn(&body["EndpointGroup"]);
+        let stored = membership(&router, &arn).await;
+        assert_eq!(
+            stored,
+            json!([described(endpoint_id, preservation)]),
+            "case {case:?}: expected the endpoint to round-trip through the store, \
+             got {stored}"
+        );
+    }
+}
+
+/// RULE: the add leg states the same rule in the same words as the create and the update
+/// legs, and an add it refuses leaves the group's membership untouched.
+#[tokio::test]
+async fn an_add_refuses_client_ip_preservation_false_for_an_ec2_instance_endpoint() {
+    let router = emulator();
+    let arn = group_holding(&router, "cipp-add", json!([])).await;
+
+    for (case, endpoint_id, preservation, refused) in preservation_rows() {
+        let (status, body) = add_endpoints(
+            &router,
+            &arn,
+            json!([configuration(endpoint_id, preservation)]),
+        )
+        .await;
+        if refused {
+            assert_eq!(
+                (status, error_code(&body).as_str()),
+                (400, "InvalidArgumentException"),
+                "case {case:?}: expected the modelled refusal, got {status} with {body}"
+            );
+            let actual = error_message(&body);
+            assert_eq!(
+                actual, PRESERVATION_NOT_OPTIONAL,
+                "case {case:?}: expected {PRESERVATION_NOT_OPTIONAL:?}, got {actual:?}"
+            );
+            let stored = membership(&router, &arn).await;
+            assert_eq!(
+                stored,
+                json!([]),
+                "case {case:?}: a refused add must register nothing, got {stored}"
+            );
+            continue;
+        }
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with {body}"
+        );
+        assert_eq!(
+            body["EndpointDescriptions"],
+            json!([described(endpoint_id, preservation)]),
+            "case {case:?}: expected the add to answer the endpoint it registered, \
+             got {body}"
+        );
+        // Back to an empty group, so every row starts from the same membership.
+        let (status, body) =
+            update_group(&router, &arn, json!({ "EndpointConfigurations": [] })).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the group to be emptied, got {status} with {body}"
+        );
+    }
 }

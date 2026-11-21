@@ -144,6 +144,12 @@ pub const MAX_ENDPOINTS_PER_ENDPOINT_GROUP: usize = 10;
 /// [`MAX_ENDPOINTS_PER_ENDPOINT_GROUP`] gives.
 pub const MAX_PORT_OVERRIDES_PER_ENDPOINT_GROUP: usize = 10;
 
+/// How many hexadecimal characters follow the `i-` of an EC2 instance ID: the eight of
+/// the original form, or the seventeen of the long form every Region mints today (Amazon
+/// EC2 resource IDs). The two lengths an `EndpointId` is matched against in
+/// [`endpoint_id_names_ec2_instance`].
+pub const EC2_INSTANCE_ID_HEX_LENGTHS: [usize; 2] = [8, 17];
+
 /// Destination configurations one CUSTOM ROUTING endpoint group can hold: the model's own
 /// `@length` on `CustomRoutingDestinationConfigurations` (1..100). Re-checked in
 /// [`destinations_from_configurations`] for the reason
@@ -1284,13 +1290,44 @@ pub fn port_overrides_to_pairs(overrides: &[PortOverride]) -> Result<Vec<(i32, i
     Ok(pairs)
 }
 
+/// Whether an `EndpointId` names an Amazon EC2 instance.
+///
+/// The member's own doc says how each endpoint kind is named: "If the endpoint is a
+/// Network Load Balancer or Application Load Balancer, this is the Amazon Resource Name
+/// (ARN) of the resource. If the endpoint is an Elastic IP address, this is the Elastic IP
+/// address allocation ID. For Amazon EC2 instances, this is the EC2 instance ID"
+/// (`EndpointConfiguration$EndpointId`). An instance ID is `i-` followed by hexadecimal
+/// characters, one of [`EC2_INSTANCE_ID_HEX_LENGTHS`] of them, so an id of exactly that
+/// form names an instance and an id of any other form names an endpoint of another kind.
+pub fn endpoint_id_names_ec2_instance(endpoint_id: &str) -> bool {
+    let Some(hex) = endpoint_id.strip_prefix("i-") else {
+        return false;
+    };
+    EC2_INSTANCE_ID_HEX_LENGTHS.contains(&hex.len())
+        && hex.chars().all(|digit| matches!(digit, '0'..='9' | 'a'..='f'))
+}
+
+/// The sentence this service states when a registration turns client IP address
+/// preservation OFF for an endpoint that is an EC2 instance.
+///
+/// An EC2 instance endpoint is reached WITH the client's address preserved — client IP
+/// address preservation "is supported ... for endpoints that are Application Load
+/// Balancers, Amazon EC2 instances, and Network Load Balancers with security groups"
+/// (`EndpointConfiguration$ClientIPPreservationEnabled`), and for an instance it cannot be
+/// turned off — so the refusal is the class's wording, fixed text with no part taken from
+/// the request (recorded wire behaviour on `UpdateEndpointGroup`).
+pub const CLIENT_IP_PRESERVATION_NOT_OPTIONAL_MESSAGE: &str =
+    "Client IP Preservation cannot be set to false for EC2 instances";
+
 /// An `EndpointConfigurations` list as the endpoints the store holds.
 ///
 /// An endpoint configuration identifies one resource to send traffic to ("A resource
 /// must be valid and active when you add it as an endpoint", `EndpointConfiguration`
 /// doc), so an entry naming no `EndpointId` names no resource and one resource cannot
 /// be named twice in the same group — two weights for one endpoint. An absent `Weight`
-/// takes [`DEFAULT_ENDPOINT_WEIGHT`].
+/// takes [`DEFAULT_ENDPOINT_WEIGHT`]. An endpoint that is an EC2 instance keeps client IP
+/// address preservation on, the rule
+/// [`CLIENT_IP_PRESERVATION_NOT_OPTIONAL_MESSAGE`] states.
 ///
 /// The list is refused past [`MAX_ENDPOINTS_PER_ENDPOINT_GROUP`] BEFORE it is walked,
 /// and membership is tested through a set rather than by rescanning what has been
@@ -1322,6 +1359,16 @@ pub fn endpoints_from_configurations(
                 "EndpointConfigurations names endpoint {endpoint_id:?} more than once; an \
                  endpoint group holds each endpoint once"
             ));
+        }
+        // Client IP address preservation is not optional for an endpoint that is an EC2
+        // instance — the rule [`CLIENT_IP_PRESERVATION_NOT_OPTIONAL_MESSAGE`] states —
+        // while an endpoint of any other kind takes either value, so a configuration that
+        // turns it off for an instance ID is refused here, on every leg that registers an
+        // endpoint, before anything is stored.
+        if configuration.client_ip_preservation_enabled == Some(false)
+            && endpoint_id_names_ec2_instance(endpoint_id)
+        {
+            return Err(CLIENT_IP_PRESERVATION_NOT_OPTIONAL_MESSAGE.to_string());
         }
         endpoints.push(StoredEndpoint {
             endpoint_id: endpoint_id.to_string(),
