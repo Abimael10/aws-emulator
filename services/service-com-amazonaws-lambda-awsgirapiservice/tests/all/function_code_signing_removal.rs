@@ -506,19 +506,20 @@ async fn removing_a_functions_code_signing_configuration_leaves_it_holding_none(
                 "case {label:?}: after removal {attempt} the function must report no \
                  configuration, got {after:?}"
             );
-            // "No configuration" is the member's ABSENCE: `CodeSigningConfigArn` names a
-            // configuration and its own pattern admits no string standing for none, so
-            // the body carries that member only while the function holds one — while the
-            // FUNCTION this read reports on is named either way.
+            // "No attachment" is the ABSENCE of the PAIR: `CodeSigningConfigArn` names a
+            // configuration and its own pattern admits no string standing for none, and the
+            // `FunctionName` beside it names the function that configuration covers — so the
+            // body carries the two together while the function holds an attachment, and
+            // neither of them once it holds none.
             let raw = get_association(&router, case.function).await;
             assert_eq!(
                 (
                     raw.json().get("CodeSigningConfigArn").cloned(),
                     raw.json().get("FunctionName").cloned()
                 ),
-                (None, Some(json!(case.function))),
-                "case {label:?}: after removal {attempt} the body must name the function \
-                 and carry no CodeSigningConfigArn member, got {}",
+                (None, None),
+                "case {label:?}: after removal {attempt} the body must carry neither member \
+                 of the attachment pair, got {}",
                 raw.text()
             );
         }

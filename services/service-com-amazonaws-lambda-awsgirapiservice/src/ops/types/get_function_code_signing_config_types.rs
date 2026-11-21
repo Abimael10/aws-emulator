@@ -18,31 +18,31 @@ pub struct GetFunctionCodeSigningConfigInput {
 }
 
 /// `GetFunctionCodeSigningConfigResponse`: the code signing configuration a function is
-/// associated with, and the function holding it — the function always, the configuration only
-/// when there is one.
+/// associated with, and the function holding it — the PAIR that describes one attachment, or
+/// neither member when there is no attachment to describe.
 ///
 /// Written out rather than generated from the shape because both members carry `@required`,
-/// which the shape derive renders as bare `String`s written on every response, while only one
-/// of them is a fact about every function. `FunctionName` is "The name or ARN of the Lambda
-/// function" this call reports on, which it resolved from the request, so it is reported on
-/// every answer. The association is not: a function nothing has associated a configuration
-/// with has no ARN to report, and `CodeSigningConfigArn`'s own pattern
-/// (`^arn:…:code-signing-config:csc-[a-z0-9]{17}$`, from
+/// which the shape derive renders as bare `String`s written on every response, while neither
+/// of them is a fact about a function that holds no association. The two members describe one
+/// attachment together: `CodeSigningConfigArn` is "The Amazon Resource Name (ARN) of the code
+/// signing configuration" and `FunctionName` is the function it covers, and the ARN's own
+/// pattern (`^arn:…:code-signing-config:csc-[a-z0-9]{17}$`, from
 /// `smithy_query(query="shape", shape="CodeSigningConfigArn")`) admits no string that stands
 /// for "none" — the empty string least of all, since it satisfies the pattern no better than
 /// any other non-ARN.
 ///
-/// So the body names the function it reports on either way, and carries the configuration ARN
-/// beside it exactly when the function holds one. That is how every other optional member of
-/// this service reports absence, and it is what AWS answers: the read of a function that holds
-/// no configuration still names the function.
+/// So a function that holds an association is reported as that pair, and a function that holds
+/// none is reported with NEITHER member: the absence of the pair is what tells a caller the
+/// function is covered by no code signing at all, which is what AWS answers for such a read.
+/// Reporting the function's name alone would read as "an attachment exists" while withholding
+/// the ARN that attachment is, which is neither answer.
 #[derive(Debug, Clone, Default)]
 pub struct GetFunctionCodeSigningConfigOutput {
     /// The configuration the function is associated with, or `None` when it holds none.
     pub code_signing_config_arn: Option<String>,
-    /// The function this call reports on, as the request resolved it — reported whether or
-    /// not there is an association beside it.
-    pub function_name: String,
+    /// The function the association above covers, or `None` when there is no association to
+    /// report — the two are written together or not at all.
+    pub function_name: Option<String>,
 }
 
 #[allow(non_upper_case_globals)]
@@ -93,13 +93,15 @@ impl ::aws_smithy_schema::serde::SerializableStruct for GetFunctionCodeSigningCo
         &self,
         serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
     ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
-        // The function this call reports on is named on every answer; the association is
-        // written beside it only when the function holds one (see the struct's own
-        // documentation).
+        // The two members describe ONE attachment, so each is written exactly when the
+        // function holds one and the body of a function that holds none carries neither (see
+        // the struct's own documentation).
         if let Some(arn) = self.code_signing_config_arn.as_ref() {
             serializer.write_string(&Self::M_CODE_SIGNING_CONFIG_ARN, arn.as_str())?;
         }
-        serializer.write_string(&Self::M_FUNCTION_NAME, self.function_name.as_str())?;
+        if let Some(function_name) = self.function_name.as_ref() {
+            serializer.write_string(&Self::M_FUNCTION_NAME, function_name.as_str())?;
+        }
         Ok(())
     }
 }

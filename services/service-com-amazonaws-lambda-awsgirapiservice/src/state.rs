@@ -4753,3 +4753,9 @@ pub use code_signing::{
     code_verification_failed_message, untrusted_deployment_refusal, DeployedArtifact,
     CODE_SIGNING_POLICY_ENFORCE, CODE_SIGNING_UNSUPPORTED_FOR_IMAGE_MESSAGE,
 };
+
+/// WHICH values a member whose `@pattern` alternates whole-value branches admits — the "an
+/// ARN, or nothing at all" members no request boundary judges as a whole value; see the
+/// module's own header.
+mod arn_member_form;
+pub use arn_member_form::{arn_or_empty_refusal, is_arn_or_empty, ARN_OR_EMPTY_PATTERN};

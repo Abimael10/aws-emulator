@@ -474,6 +474,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(message));
         }
 
+        // A member whose `@pattern` ALTERNATES whole-value branches is satisfied only by a
+        // value one branch matches end to end, which the boundary walk cannot judge for an
+        // expression anchored at its two ends alone — so the member carrying this model's "an
+        // ARN, or nothing at all" expression is judged here (see
+        // [`crate::state::arn_or_empty_refusal`]), on the REQUEST and before anything is
+        // created.
+        if let Some(message) =
+            crate::state::arn_or_empty_refusal(&[(&["KMSKeyArn"], input.kms_key_arn.as_deref())])
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
         // "Creates a mapping between an event source and an Lambda Event Function." The
         // event source is either a resource ARN (`EventSourceArn`) or a self-managed
         // Apache Kafka cluster (`SelfManagedEventSource`: "The self-managed Apache Kafka

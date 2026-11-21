@@ -99,6 +99,10 @@ md-5 = "0.10"
 hmac = "0.12"
 # The hexadecimal the guest hands bytes over and reads digests back as.
 hex = { workspace = true }
+# The regular-expression engine the WHOLE-VALUE reading of a `@pattern` whose branches are
+# alternatives is checked with (`state::arn_member_form`): the model's own expression,
+# compiled once, rather than a hand-written reading of it.
+regex = "1.13"
 # The cryptographic random bytes `crypto.randomBytes`/`randomUUID` draw from: the one
 # source of randomness a run has, read from the platform rather than from a seed.
 getrandom = "0.3"

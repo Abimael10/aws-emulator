@@ -16160,6 +16160,7 @@ dependencies = [
  "nix",
  "percent-encoding",
  "rand 0.9.5",
+ "regex",
  "rquickjs",
  "rustls",
  "rustpython-pylib",

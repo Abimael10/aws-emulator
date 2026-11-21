@@ -459,6 +459,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_parameter(message.to_string()));
         }
 
+        // A member whose `@pattern` ALTERNATES whole-value branches is satisfied only by a
+        // value one branch matches end to end, which the boundary walk cannot judge for an
+        // expression anchored at its two ends alone — so the members carrying this model's
+        // "an ARN, or nothing at all" expression are judged here (see
+        // [`crate::state::arn_or_empty_refusal`]), on the REQUEST and before anything is
+        // created.
+        if let Some(message) = crate::state::arn_or_empty_refusal(&[
+            (&["KMSKeyArn"], input.kms_key_arn.as_deref()),
+            (
+                &["DeadLetterConfig", "TargetArn"],
+                input
+                    .dead_letter_config
+                    .as_ref()
+                    .and_then(|config| config.target_arn.as_deref()),
+            ),
+            (
+                &["DurableConfig", "KMSKeyArn"],
+                input
+                    .durable_config
+                    .as_ref()
+                    .and_then(|config| config.kms_key_arn.as_deref()),
+            ),
+            (
+                &["Code", "SourceKMSKeyArn"],
+                input.code.source_kms_key_arn.as_deref(),
+            ),
+        ]) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
         let mut code = package_code(&package_type, &input)?;
 
         // SnapStart "create[s] a snapshot of the initialized execution environment when

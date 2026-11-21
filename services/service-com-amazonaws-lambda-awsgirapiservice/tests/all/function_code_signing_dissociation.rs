@@ -6,9 +6,9 @@
 //! The rule under test: the association is one function-level binding, so the two readers
 //! of it answer out of that one value — `ListFunctionsByCodeSigningConfig` reports a
 //! function's ARN for exactly as long as the function holds the configuration, and
-//! `GetFunctionCodeSigningConfig` reports the function itself, so for a function holding
-//! no configuration it is a 200 whose body simply carries no `CodeSigningConfigArn`
-//! member rather than an error or a value the member's own pattern
+//! `GetFunctionCodeSigningConfig` reports the ATTACHMENT, whose two members it carries
+//! together, so for a function holding no configuration it is a 200 whose body carries
+//! neither of them rather than an error or a value the ARN member's own pattern
 //! (`^arn:…:code-signing-config:csc-[a-z0-9]{17}$`, from
 //! `smithy_query(query="shape", shape="CodeSigningConfigArn")`) does not admit. After
 //! `DeleteFunctionCodeSigningConfig` is answered, both readers report the function as
@@ -206,9 +206,9 @@ async fn associate(case: &str, router: &MultiServiceRouter, reference: &str, con
 /// addresses: the ARN it holds, or `None` when it holds none.
 ///
 /// The function existing is what the call reports on, so every answer is a 200; and what the
-/// body carries is the FUNCTION it reports on either way, with the configuration's ARN beside
-/// it for a function that holds one and no such member for a function that holds none, never
-/// an empty or otherwise non-conforming value standing in for "none".
+/// body carries is the PAIR of members that describes the attachment the function holds — the
+/// configuration's ARN and the function it covers — or neither of them for a function that
+/// holds none, never an empty or otherwise non-conforming value standing in for "none".
 async fn reported(
     case: &str,
     router: &MultiServiceRouter,
@@ -237,9 +237,11 @@ async fn reported(
         "case {case:?}: a CodeSigningConfigArn that is present must be a string, got {}",
         answer.text()
     );
-    assert!(
+    assert_eq!(
         answer.string("FunctionName").is_some(),
-        "case {case:?}: the body names the FUNCTION this read reports on either way, got {}",
+        arn.is_some(),
+        "case {case:?}: the body names the FUNCTION an attachment covers exactly while it \
+         reports that attachment, got {}",
         answer.text()
     );
     arn
@@ -692,13 +694,13 @@ async fn a_function_holding_no_config_reports_none_however_it_came_to_hold_none(
             answer.text()
         );
         // It is a REPORT of the function, not a refusal: the status is the operation's own
-        // 200, and the body names the function it reports on whether or not there is a
-        // configuration to report beside it.
+        // 200, and with no attachment to describe the body carries neither member of the
+        // pair that would describe one.
         assert_eq!(
             (answer.status, answer.string("FunctionName")),
-            (200, Some(function.to_string())),
-            "case {function:?}: expected a 200 naming the function and no configuration, got \
-             {} {}",
+            (200, None),
+            "case {function:?}: expected a 200 carrying neither member of the attachment \
+             pair, got {} {}",
             answer.status,
             answer.text()
         );

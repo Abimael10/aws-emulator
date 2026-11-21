@@ -5,14 +5,15 @@
 //! RULE: the operation "Returns the code signing configuration for the specified
 //! function", and its response has exactly two members, both `@required`:
 //! `CodeSigningConfigArn` and `FunctionName`
-//! (`smithy_query(query="operation", operation="GetFunctionCodeSigningConfig")`). The
-//! FUNCTION is what the call reports on and the request resolved it, so the body names it
-//! on every answer; the configuration ARN is a fact about the function only while one is
-//! attached, and `CodeSigningConfigArn`'s own pattern
-//! (`^arn:…:code-signing-config:csc-[a-z0-9]{17}$`, from
-//! `smithy_query(query="shape", shape="CodeSigningConfigArn")`) admits no string standing
-//! for "none" — so that member is carried exactly when the function holds an association,
-//! and the body is never empty.
+//! (`smithy_query(query="operation", operation="GetFunctionCodeSigningConfig")`). Required
+//! TOGETHER, the two describe one ATTACHMENT — the configuration, and the function it covers
+//! — so they are reported together: a function that holds an attachment is answered with the
+//! pair, and a function that holds none is answered with NEITHER member, the absence of the
+//! pair being what tells a caller the function is covered by no code signing at all.
+//! `CodeSigningConfigArn`'s own pattern (`^arn:…:code-signing-config:csc-[a-z0-9]{17}$`, from
+//! `smithy_query(query="shape", shape="CodeSigningConfigArn")`) admits no string standing for
+//! "none", and a `FunctionName` reported alone would read as an attachment whose ARN was
+//! withheld — which is neither answer.
 //!
 //! The rows differ along what the rule generalises over: HOW the function came to hold its
 //! association (none at all, stated on `CreateFunction`, set by
@@ -237,8 +238,8 @@ fn references(name: &str) -> Vec<(String, String)> {
 }
 
 /// Assert `GetFunctionCodeSigningConfig` reports `expected_arn` for `name`, addressed in
-/// every documented `FunctionName` form: the function is named on every answer, and the
-/// configuration ARN stands beside it exactly when the function holds one.
+/// every documented `FunctionName` form: the attachment is reported as the PAIR of members
+/// that describes it, and a function holding none is reported with neither of them.
 async fn assert_reports(
     case: &str,
     router: &MultiServiceRouter,
@@ -258,8 +259,9 @@ async fn assert_reports(
         );
         assert_eq!(
             answer.string("FunctionName"),
-            Some(name.to_string()),
-            "case {label:?}: the body must name the function it reports on, got {}",
+            expected_arn.map(|_| name.to_string()),
+            "case {label:?}: the body must name the function exactly while it reports an \
+             attachment covering it, got {}",
             answer.text()
         );
         assert_eq!(
@@ -279,9 +281,9 @@ async fn assert_reports(
     }
 }
 
-/// RULE: the read names the function either way, and carries the configuration ARN exactly
-/// while one is attached — however the function came to hold it, and however the request
-/// addresses the function.
+/// RULE: the read reports the attachment the function holds — the configuration ARN and the
+/// function it covers — and reports neither member for a function that holds none, however
+/// the function came to hold (or lose) it and however the request addresses the function.
 #[tokio::test]
 async fn the_read_names_its_function_and_the_configuration_it_holds() {
     let engine = Arc::new(engine::InMemoryEngine::new());
@@ -290,7 +292,7 @@ async fn the_read_names_its_function_and_the_configuration_it_holds() {
     let first = given_config(&router, 1).await;
     let second = given_config(&router, 2).await;
 
-    // A function that holds no association at all: the body names it and nothing else.
+    // A function that holds no association at all: the body carries no member at all.
     given_function(&engine, &router, "csc-read-none", None).await;
     assert_reports("a function holding no configuration", &router, "csc-read-none", None).await;
 
@@ -351,8 +353,8 @@ async fn the_read_names_its_function_and_the_configuration_it_holds() {
     )
     .await;
 
-    // And the removal: the function survives it, so the read still names the function,
-    // with no configuration beside it.
+    // And the removal: the function survives it, so the read is still the operation's own
+    // 200 — now with no attachment to describe, so with neither member.
     let removed = call(
         &router,
         "DELETE",
@@ -387,4 +389,174 @@ async fn the_read_names_its_function_and_the_configuration_it_holds() {
         first != second,
         "the two configurations must differ, got {first:?} twice"
     );
+}
+
+/// RULE, stated over the MEMBER SET itself: the body carries exactly the two members that
+/// describe an attachment, or exactly none of them — never one of the pair alone.
+///
+/// The rows span the states a function can be in and the ways it got there: never attached,
+/// attached at creation, attached by the put, re-attached over an existing attachment,
+/// detached, and detached then attached again. The member set is read off the body as a
+/// SORTED key list, so a member nobody asserted on would fail here too.
+#[tokio::test]
+async fn the_body_carries_the_attachment_pair_or_neither_member() {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(&engine);
+
+    let first = given_config(&router, 3).await;
+    let second = given_config(&router, 4).await;
+
+    /// What the association calls do to one function, in order.
+    enum Step {
+        /// `PutFunctionCodeSigningConfig` with the configuration named by the index.
+        Attach(usize),
+        /// `DeleteFunctionCodeSigningConfig`.
+        Detach,
+    }
+
+    /// One row: the case, the function, the configuration its CREATE states, the steps run
+    /// on it, and the attachment it must then report.
+    struct Row {
+        case: &'static str,
+        function: &'static str,
+        created_with: Option<usize>,
+        steps: Vec<Step>,
+        expected: Option<usize>,
+    }
+
+    let configs = [first.clone(), second.clone()];
+    let rows: Vec<Row> = vec![
+        Row {
+            case: "never attached",
+            function: "csc-pair-never",
+            created_with: None,
+            steps: Vec::new(),
+            expected: None,
+        },
+        Row {
+            case: "attached at creation",
+            function: "csc-pair-created",
+            created_with: Some(0),
+            steps: Vec::new(),
+            expected: Some(0),
+        },
+        Row {
+            case: "attached by the put",
+            function: "csc-pair-put",
+            created_with: None,
+            steps: vec![Step::Attach(1)],
+            expected: Some(1),
+        },
+        Row {
+            case: "re-attached over an existing attachment",
+            function: "csc-pair-replaced",
+            created_with: Some(0),
+            steps: vec![Step::Attach(1)],
+            expected: Some(1),
+        },
+        Row {
+            case: "detached",
+            function: "csc-pair-detached",
+            created_with: Some(0),
+            steps: vec![Step::Detach],
+            expected: None,
+        },
+        Row {
+            case: "detached and attached again",
+            function: "csc-pair-rebound",
+            created_with: None,
+            steps: vec![Step::Attach(0), Step::Detach, Step::Attach(1)],
+            expected: Some(1),
+        },
+    ];
+
+    for Row {
+        case,
+        function,
+        created_with,
+        steps,
+        expected,
+    } in &rows
+    {
+        given_function(
+            &engine,
+            &router,
+            function,
+            created_with.map(|index| configs[index].as_str()),
+        )
+        .await;
+        for step in steps {
+            let answer = match step {
+                Step::Attach(index) => {
+                    call(
+                        &router,
+                        "PUT",
+                        &association_uri(function),
+                        &json!({ "CodeSigningConfigArn": configs[*index] }),
+                    )
+                    .await
+                }
+                Step::Detach => {
+                    call(&router, "DELETE", &association_uri(function), &Value::Null).await
+                }
+            };
+            let served = matches!(step, Step::Attach(_));
+            assert_eq!(
+                answer.status,
+                if served { 200 } else { 204 },
+                "case {case:?}: the association call must be served, got {} {}",
+                answer.status,
+                answer.text()
+            );
+        }
+
+        let answer = call(&router, "GET", &association_uri(function), &Value::Null).await;
+        assert_eq!(
+            answer.status,
+            200,
+            "case {case:?}: the function exists, so the read is a report rather than a \
+             refusal: expected 200, got {} {}",
+            answer.status,
+            answer.text()
+        );
+        // The body is a JSON object either way — an object with no members at all for a
+        // function that holds no attachment, never a value standing in for one.
+        let body = answer.json();
+        let members: Vec<String> = body
+            .as_object()
+            .map(|object| {
+                let mut named: Vec<String> = object.keys().cloned().collect();
+                named.sort();
+                named
+            })
+            .unwrap_or_else(|| panic!("case {case:?}: expected a JSON object, got {}", answer.text()));
+        let wanted: Vec<String> = match expected {
+            Some(_) => vec![
+                "CodeSigningConfigArn".to_string(),
+                "FunctionName".to_string(),
+            ],
+            None => Vec::new(),
+        };
+        assert_eq!(
+            members, wanted,
+            "case {case:?}: expected the body to carry exactly {wanted:?}, got {}",
+            answer.text()
+        );
+        // And when the pair is there, both halves describe the attachment this function
+        // holds: the stored configuration, and the function it covers.
+        if let Some(index) = expected {
+            assert_eq!(
+                (
+                    answer.string("CodeSigningConfigArn"),
+                    answer.string("FunctionName")
+                ),
+                (
+                    Some(configs[*index].clone()),
+                    Some((*function).to_string())
+                ),
+                "case {case:?}: expected the stored attachment, got {}",
+                answer.text()
+            );
+        }
+    }
 }

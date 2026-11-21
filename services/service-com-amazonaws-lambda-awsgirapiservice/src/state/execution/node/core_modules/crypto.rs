@@ -9,6 +9,13 @@
 //! source. This module is the Node-shaped interface over them: it holds the bytes a program
 //! feeds a hash or a cipher, names the algorithm, and hands the answer back in the encoding
 //! the program asked for. Nothing here reaches a host file, socket or environment.
+//!
+//! The WHATWG interface over the same computations is part of that surface rather than a
+//! second implementation of it: `crypto.webcrypto` — which is also the global `crypto` a
+//! modern Node program reaches `crypto.subtle` through — carries the `SubtleCrypto` methods
+//! for the algorithms this host computes (the digests, the keyed digest they instantiate, and
+//! the AES modes), each over the same host call the node API uses. An algorithm the registry
+//! here does not name is refused by name rather than answered with another one's computation.
 
 /// `crypto`: hashes, HMACs, symmetric ciphers and random bytes.
 pub(super) const CRYPTO_SOURCE: &str = r##"
@@ -390,18 +397,13 @@ Cipher.prototype.final = function (outputEncoding) {
     return cipherOutput(this.notYetHandedOver(this.transformed()), outputEncoding);
 };
 
+// The WHATWG interface over the same computations: the random source, the identifier, and the
+// `SubtleCrypto` surface. Its methods are installed BELOW rather than written inline here,
+// because each of them is written over the helpers that follow.
 var webcrypto = {
     getRandomValues: getRandomValues,
     randomUUID: randomUUID,
-    subtle: {
-        digest: function (algorithm, data) {
-            var named = typeof algorithm === 'string' ? algorithm : algorithm.name;
-            var hashed = new Hash(named).update(Buffer.from(data)).digest();
-            return Promise.resolve(
-                hashed.buffer.slice(hashed.byteOffset, hashed.byteOffset + hashed.length)
-            );
-        }
-    }
+    subtle: {}
 };
 
 // The bytes `value` holds, as the ArrayBuffer a WebCrypto call answers with.
@@ -409,27 +411,140 @@ function arrayBufferOf(bytes) {
     return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.length);
 }
 
-// The cipher one WebCrypto algorithm names, for a key of that many bytes: the two names
-// speak of the same transforms, so one table maps between them.
-function webCipherName(algorithm, keyBytes) {
-    var named = String(typeof algorithm === 'string' ? algorithm : algorithm.name).toUpperCase();
-    var bits = keyBytes * 8;
-    if (named === 'AES-GCM' || named === 'AES-CBC' || named === 'AES-CTR') {
-        return 'aes-' + bits + '-' + named.slice('AES-'.length).toLowerCase();
-    }
+// The refusal a call naming an algorithm this runtime does not implement gets, worded and
+// named the way the interface reports that failure. An algorithm outside the registry below
+// is refused rather than answered with the computation of another one.
+function unrecognizedAlgorithm() {
     var error = new Error('Unrecognized algorithm name');
     error.name = 'NotSupportedError';
-    throw error;
+    return error;
 }
 
-// A key a WebCrypto call holds: the raw bytes, with what the key may be used for. The bytes
-// are held on the key and nowhere else, which is what `exportKey` reads back.
+// The refusal a computation that did not complete gets: the interface reports every failure
+// of the operation itself as this ONE class, whatever the node API's own name for it is — a
+// message whose tag does not verify included.
+function operationFailed() {
+    var error = new Error('The operation failed for an operation-specific reason');
+    error.name = 'OperationError';
+    return error;
+}
+
+// The name an algorithm is identified by, which a call states either as a string or as the
+// `name` of an object. The registry matches a name without regard to its case, so the name is
+// resolved in one case and compared in it.
+function webAlgorithmName(algorithm) {
+    var named = algorithm === null || algorithm === undefined
+        ? undefined
+        : (typeof algorithm === 'string' ? algorithm : algorithm.name);
+    if (named === null || named === undefined) {
+        throw unrecognizedAlgorithm();
+    }
+    return String(named).toUpperCase();
+}
+
+// The hashes the WebCrypto registry defines, by the name it spells each under, mapped to the
+// name the HOST computes that digest under ([`super::super::digest`]). The keyed digest and
+// the plain one are both instantiated over one of these and over nothing else.
+var WEB_DIGESTS = {
+    'SHA-1': 'sha1',
+    'SHA-256': 'sha256',
+    'SHA-384': 'sha384',
+    'SHA-512': 'sha512'
+};
+
+// The block length of each of those hashes, in bytes, which is the length of a keyed-digest
+// key a generating call states none for: the construction's own block.
+var WEB_DIGEST_BLOCK_BYTES = { sha1: 64, sha256: 64, sha384: 128, sha512: 128 };
+
+// The host's name for the hash a WebCrypto call names, which is the one computation behind
+// both `digest` and the keyed digest below.
+function webDigestName(hash) {
+    var named = WEB_DIGESTS[webAlgorithmName(hash)];
+    if (named === undefined) {
+        throw unrecognizedAlgorithm();
+    }
+    return named;
+}
+
+// The key sizes AES is defined for, in bytes — the ones the host's own ciphers are named for
+// ([`super::super::cipher::CIPHERS`]).
+var AES_KEY_BYTES = [16, 24, 32];
+
+// The refusal key DATA whose length its algorithm is not defined for gets: the length of an
+// IMPORTED key is a property of the data handed over, so a size no transform takes is a fault
+// of that data.
+function invalidKeyLength() {
+    var error = new Error('Invalid key length');
+    error.name = 'DataError';
+    return error;
+}
+
+// The cipher one WebCrypto algorithm names, for a key of that many bytes: the two names
+// speak of the same transforms, so one table maps between them. A key that is not one of the
+// sizes the cipher is defined for names no transform; whose fault that is depends on where
+// the length came from, so the caller states it — `sizeFailure` for a length the CALL chose
+// (a generated key), and the key-data refusal by default.
+function webCipherName(algorithm, keyBytes, sizeFailure) {
+    var named = webAlgorithmName(algorithm);
+    if (named !== 'AES-GCM' && named !== 'AES-CBC' && named !== 'AES-CTR') {
+        throw unrecognizedAlgorithm();
+    }
+    if (AES_KEY_BYTES.indexOf(keyBytes) < 0) {
+        throw typeof sizeFailure === 'function' ? sizeFailure() : invalidKeyLength();
+    }
+    return 'aes-' + (keyBytes * 8) + '-' + named.slice('AES-'.length).toLowerCase();
+}
+
+// A key a WebCrypto call holds: the raw bytes, with the algorithm they belong to and what the
+// key may be used for. The bytes are held on the key and nowhere else, which is what
+// `exportKey` reads back.
 function SubtleKey(algorithm, extractable, usages, bytes) {
     this.type = 'secret';
-    this.algorithm = typeof algorithm === 'string' ? { name: algorithm } : algorithm;
+    this.algorithm = algorithm;
     this.extractable = extractable !== false;
     this.usages = usages === undefined || usages === null ? [] : usages;
     this.keyBytes = bytes;
+}
+
+// The algorithm a secret key REPORTS, as the interface normalises it: the name, the key's own
+// length in bits, and — for a keyed digest, which is instantiated over a hash — the hash the
+// key is held for, so every later call on that key computes the same construction.
+function webKeyAlgorithm(algorithm, keyBytes) {
+    var named = webAlgorithmName(algorithm);
+    if (named === 'HMAC') {
+        return {
+            name: 'HMAC',
+            hash: { name: webAlgorithmName(algorithm.hash) },
+            length: keyBytes * 8
+        };
+    }
+    return { name: named, length: keyBytes * 8 };
+}
+
+// What a key may be used FOR: a key is held for ONE algorithm and for one set of operations,
+// so a call is refused when the key it was handed belongs to another algorithm or does not
+// carry the usage that call needs — the one access failure the interface names for either.
+// `named` is the algorithm the key must be held for, where the call has one to state.
+function usableFor(key, usage, named) {
+    var refused = new Error('Unable to use this key to ' + usage);
+    refused.name = 'InvalidAccessError';
+    var held = key === null || key === undefined || key.algorithm === null
+        || key.algorithm === undefined
+        ? null
+        : key.algorithm;
+    if (named !== undefined && (held === null || webAlgorithmName(held) !== named)) {
+        throw refused;
+    }
+    var usages = key === null || key === undefined || key.usages === null
+        || key.usages === undefined
+        ? []
+        : key.usages;
+    for (var index = 0; index < usages.length; index += 1) {
+        if (String(usages[index]) === usage) {
+            return;
+        }
+    }
+    throw refused;
 }
 
 // The nonce or counter a WebCrypto AES call carries, by the member that mode names it in.
@@ -460,9 +575,7 @@ function webTransform(algorithm, key, data, decrypting) {
     // the node cipher API hands it over separately.
     if (authenticated && decrypting) {
         if (bytes.length < WEB_TAG_BYTES) {
-            var short = new Error('The operation failed for an operation-specific reason');
-            short.name = 'OperationError';
-            return Promise.reject(short);
+            return Promise.reject(operationFailed());
         }
         tag = Buffer.from(bytes.subarray(bytes.length - WEB_TAG_BYTES));
         bytes = Buffer.from(bytes.subarray(0, bytes.length - WEB_TAG_BYTES));
@@ -483,13 +596,11 @@ function webTransform(algorithm, key, data, decrypting) {
         decrypting
     );
     if (answered[0] !== 'ok') {
-        var failed = cipherFailure(answered[0], cipher);
-        // WebCrypto reports every failure of the transform itself as one error class,
-        // whatever the node API's own name for it is.
-        if (answered[0] === 'unopened') {
-            failed = new Error('The operation failed for an operation-specific reason');
-            failed.name = 'OperationError';
-        }
+        // A message that did not open is the transform's own failure, which the interface
+        // reports as its one operation-failure class ([`operationFailed`]).
+        var failed = answered[0] === 'unopened'
+            ? operationFailed()
+            : cipherFailure(answered[0], cipher);
         return Promise.reject(failed);
     }
     var out = Buffer.from(answered[1], 'hex');
@@ -499,6 +610,40 @@ function webTransform(algorithm, key, data, decrypting) {
     return Promise.resolve(arrayBufferOf(out));
 }
 
+// The keyed digest a signing call computes, as the bytes of the MAC: the construction is the
+// host's ([`super::super::digest`]), instantiated over the hash the KEY is held for, so a
+// signature this interface produces is the one `createHmac` computes for the same key and
+// message — and the one any other implementation of the construction computes.
+//
+// The key is already known to be held for this algorithm ([`usableFor`]), so the hash is the
+// key's own: a key held for one hash is not signed over with another.
+function webSignature(algorithm, key, data) {
+    if (webAlgorithmName(algorithm) !== 'HMAC') {
+        throw unrecognizedAlgorithm();
+    }
+    var hashed = webDigestName(key.algorithm.hash);
+    return Buffer.from(
+        host().hmac(
+            hashed,
+            Buffer.from(key.keyBytes).toString('hex'),
+            Buffer.from(data).toString('hex')
+        ),
+        'hex'
+    );
+}
+
+webcrypto.subtle.digest = function (algorithm, data) {
+    try {
+        var hashed = host().digest(
+            webDigestName(algorithm),
+            Buffer.from(data).toString('hex')
+        );
+        return Promise.resolve(arrayBufferOf(Buffer.from(hashed, 'hex')));
+    } catch (error) {
+        return Promise.reject(error);
+    }
+};
+
 webcrypto.subtle.importKey = function (format, keyData, algorithm, extractable, usages) {
     if (String(format) !== 'raw') {
         var unsupported = new Error('Unsupported key format');
@@ -507,11 +652,91 @@ webcrypto.subtle.importKey = function (format, keyData, algorithm, extractable, 
     }
     var bytes = Buffer.from(keyData);
     try {
-        webCipherName(algorithm, bytes.length);
+        // A key is held for ONE algorithm, so the algorithm is resolved as the key is
+        // imported: a keyed digest is instantiated over its hash, and a cipher takes a key
+        // of one of the sizes it is defined for.
+        if (webAlgorithmName(algorithm) === 'HMAC') {
+            webDigestName(algorithm.hash);
+        } else {
+            webCipherName(algorithm, bytes.length);
+        }
+        return Promise.resolve(new SubtleKey(
+            webKeyAlgorithm(algorithm, bytes.length),
+            extractable,
+            usages,
+            bytes
+        ));
     } catch (error) {
         return Promise.reject(error);
     }
-    return Promise.resolve(new SubtleKey(algorithm, extractable, usages, bytes));
+};
+
+webcrypto.subtle.generateKey = function (algorithm, extractable, usages) {
+    try {
+        // The length a call STATES, in bits; `null` when it states none, which each
+        // algorithm answers for itself below.
+        var stated = algorithm !== null && algorithm !== undefined
+            && typeof algorithm !== 'string' && algorithm.length !== undefined
+            && algorithm.length !== null
+            ? Math.trunc(Number(algorithm.length))
+            : null;
+        if (webAlgorithmName(algorithm) === 'HMAC') {
+            var hashed = webDigestName(algorithm.hash);
+            // A keyed-digest key a call states no length for is the hash's own BLOCK, which
+            // is the length the construction is defined over.
+            var keyBits = stated === null ? WEB_DIGEST_BLOCK_BYTES[hashed] * 8 : stated;
+            if (!Number.isSafeInteger(keyBits) || keyBits <= 0 || keyBits % 8 !== 0) {
+                // A GENERATED key's length is a parameter of the CALL rather than a
+                // property of key data handed over, so a length no key can be drawn at is
+                // the operation's own failure.
+                throw operationFailed();
+            }
+            return Promise.resolve(new SubtleKey(
+                webKeyAlgorithm({ name: 'HMAC', hash: algorithm.hash }, keyBits / 8),
+                extractable,
+                usages,
+                randomBytes(keyBits / 8)
+            ));
+        }
+        // A cipher key is DRAWN at the size the call asks for, so a call that states none —
+        // or one that is not whole bytes — names no key to draw. That length is the CALL's,
+        // so a size the cipher is not defined for is the operation's own failure rather than
+        // a fault of key data, while the ALGORITHM is resolved first and refused by name.
+        var keyBytes = stated === null ? -1 : stated / 8;
+        webCipherName(algorithm, keyBytes, operationFailed);
+        return Promise.resolve(new SubtleKey(
+            webKeyAlgorithm(algorithm, keyBytes),
+            extractable,
+            usages,
+            randomBytes(keyBytes)
+        ));
+    } catch (error) {
+        return Promise.reject(error);
+    }
+};
+
+webcrypto.subtle.sign = function (algorithm, key, data) {
+    try {
+        usableFor(key, 'sign', 'HMAC');
+        return Promise.resolve(arrayBufferOf(webSignature(algorithm, key, data)));
+    } catch (error) {
+        return Promise.reject(error);
+    }
+};
+
+webcrypto.subtle.verify = function (algorithm, key, signature, data) {
+    try {
+        usableFor(key, 'verify', 'HMAC');
+        var computed = webSignature(algorithm, key, data);
+        var given = Buffer.from(signature);
+        // A signature of another length is simply not this one; one of the same length is
+        // compared without leaking where it first differs.
+        return Promise.resolve(
+            given.length === computed.length && timingSafeEqual(given, computed)
+        );
+    } catch (error) {
+        return Promise.reject(error);
+    }
 };
 
 webcrypto.subtle.exportKey = function (format, key) {
@@ -530,6 +755,7 @@ webcrypto.subtle.exportKey = function (format, key) {
 
 webcrypto.subtle.encrypt = function (algorithm, key, data) {
     try {
+        usableFor(key, 'encrypt');
         return webTransform(algorithm, key, data, false);
     } catch (error) {
         return Promise.reject(error);
@@ -538,6 +764,7 @@ webcrypto.subtle.encrypt = function (algorithm, key, data) {
 
 webcrypto.subtle.decrypt = function (algorithm, key, data) {
     try {
+        usableFor(key, 'decrypt');
         return webTransform(algorithm, key, data, true);
     } catch (error) {
         return Promise.reject(error);

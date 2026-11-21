@@ -356,6 +356,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx);
 
+        // A member whose `@pattern` ALTERNATES whole-value branches is satisfied only by a
+        // value one branch matches end to end, which the boundary walk cannot judge for an
+        // expression anchored at its two ends alone — so the member carrying this model's "an
+        // ARN, or nothing at all" expression is judged here (see
+        // [`crate::state::arn_or_empty_refusal`]), on the REQUEST and before the record is
+        // read or touched.
+        if let Some(message) = crate::state::arn_or_empty_refusal(&[(
+            &["SourceKMSKeyArn"],
+            input.source_kms_key_arn.as_deref(),
+        )]) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
         // A Lambda function is a REGIONAL resource, so a `FunctionName` given as an ARN of
         // another Region names no function at this endpoint and is refused exactly as a
         // name no function is held under is
