@@ -68,6 +68,11 @@ pub use resolvers::*;
 mod caching_config;
 pub use caching_config::*;
 
+/// The sync configuration a resolver or a function is written with: the conflict handler
+/// it names, and the refusal for a handler the configuration does not configure.
+mod sync_config;
+pub use sync_config::*;
+
 /// The members whose modelled `@pattern` admits any text at all — mapping templates and
 /// descriptions — and the `@length` that is the only bound left on them.
 mod free_text;

@@ -217,6 +217,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The same sync rule the resolver writes enforce, over the same member: only the
+        // `LAMBDA` conflict handler is configured by a member beside it — "`LAMBDA`:
+        // Resolve conflicts with an Lambda function supplied in the
+        // `LambdaConflictHandlerConfig`" (`SyncConfig$conflictHandler`) — so a function
+        // naming that handler and supplying no such configuration names no function to
+        // resolve a conflict with, and a configuration it DOES supply names a Lambda
+        // function of the calling account. Either fault is refused before anything is
+        // written (`crate::state::sync_config_refusal`).
+        if let Some(message) = crate::state::sync_config_refusal(input.sync_config.as_ref()) {
+            return Err(CreateFunctionErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+            .into());
+        }
+
         // A function whose definition members do not pair up describes no function
         // AppSync could run, so it is refused before anything is written and the
         // refusal leaves nothing behind.

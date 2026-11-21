@@ -235,6 +235,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The same sync rule the create enforces, over the same member: only the `LAMBDA`
+        // conflict handler is configured by a member beside it — "`LAMBDA`: Resolve
+        // conflicts with an Lambda function supplied in the `LambdaConflictHandlerConfig`"
+        // (`SyncConfig$conflictHandler`) — so an update naming that handler and supplying
+        // no such configuration, or supplying one that names no Lambda function of the
+        // calling account, is refused and the stored resolver is left exactly as it was
+        // (`crate::state::sync_config_refusal`).
+        if let Some(message) = crate::state::sync_config_refusal(input.sync_config.as_ref()) {
+            return Err(UpdateResolverErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+            .into());
+        }
+
         // An update states the resolver's definition in full, so the kind it is of is
         // the one THIS request names — "A UNIT resolver is the default resolver type"
         // (`Resolver$kind`), so a request that names none asks for a UNIT resolver,
@@ -291,6 +306,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
+
+        // The same pairing the create enforces: conflict detection and resolution work on
+        // the item versions a data source keeps, so an update that would configure them
+        // against a data source that keeps none is refused and the stored resolver is left
+        // exactly as it was (`crate::state::versioned_data_source_refusal`).
+        if let Some(message) = crate::state::versioned_data_source_refusal(
+            input.sync_config.as_ref(),
+            input
+                .data_source_name
+                .as_deref()
+                .and_then(|name| api.data_sources.get(name)),
+        ) {
+            return Err(UpdateResolverErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+            .into());
+        }
 
         // A resolver is addressed by the type and field it is attached to, so a field
         // the API carries no resolver on names no resource to update — the update

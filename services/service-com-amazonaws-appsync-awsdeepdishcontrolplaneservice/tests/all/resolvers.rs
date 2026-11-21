@@ -50,10 +50,16 @@ use service_com_amazonaws_appsync_awsdeepdishcontrolplaneservice::state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::error_contract::{call, create_api, router, Answer};
-use super::functions::{create_data_source, create_function, rows as function_rows, RUNTIME};
+use super::functions::{create_function, rows as function_rows, RUNTIME};
 
 /// The name of the one data source the seeded resolvers resolve against.
 pub(crate) const DATA_SOURCE: &str = "ds_resolvers";
+
+/// The table that data source keeps its items in, the Region it keeps them in, and the
+/// role AppSync reaches it by assuming (`DataSource$serviceRoleArn`).
+const DATA_SOURCE_TABLE: &str = "resolver_items";
+const DATA_SOURCE_REGION: &str = "us-east-1";
+const DATA_SOURCE_ROLE: &str = "arn:aws:iam::000000000000:role/service-role/appsync-resolvers";
 
 /// The type whose fields the seeded resolvers are attached to.
 pub(crate) const TYPE: &str = "Query";
@@ -161,6 +167,13 @@ fn rows() -> Vec<Row> {
                 "ttl": CACHING_TTLS[1],
                 "cachingKeys": ["$context.arguments.id", "$context.identity.sub"],
             })),
+            // Conflict resolution is configured against the versioned data source this
+            // row names, which is the only thing a `syncConfig` can be attached to
+            // (`CreateResolverRequest$syncConfig`).
+            sync_config: Some(json!({
+                "conflictDetection": "NONE",
+                "conflictHandler": "NONE",
+            })),
             ..Row::bare("an APPSYNC_JS UNIT resolver, cached at the maximum TTL")
         },
         Row {
@@ -187,10 +200,6 @@ fn rows() -> Vec<Row> {
             pipeline: true,
             code: Some("export function request(ctx) { return ctx.args; }"),
             metrics_config: Some(METRICS_CONFIGS[0]),
-            sync_config: Some(json!({
-                "conflictDetection": "NONE",
-                "conflictHandler": "NONE",
-            })),
             ..Row::bare("an APPSYNC_JS PIPELINE resolver")
         },
         Row {
@@ -432,6 +441,34 @@ fn listed_fields(listed: &[Value]) -> Vec<String> {
         .collect()
 }
 
+/// Create the data source the seeded resolvers resolve against: a DynamoDB table
+/// configured for VERSIONED items, which is what a resolver carrying a `syncConfig`
+/// resolves against ("Set to TRUE to use Conflict Detection and Resolution with this data
+/// source", `DynamodbDataSourceConfig$versioned`), so one seeded API serves the rows that
+/// configure conflict resolution and the rows that do not.
+async fn create_versioned_data_source(router: &MultiServiceRouter, api_id: &str) {
+    let answer = call(
+        router,
+        "POST",
+        &format!("/v1/apis/{api_id}/datasources"),
+        Some(json!({
+            "name": DATA_SOURCE,
+            "type": "AMAZON_DYNAMODB",
+            "serviceRoleArn": DATA_SOURCE_ROLE,
+            "dynamodbConfig": {
+                "tableName": DATA_SOURCE_TABLE,
+                "awsRegion": DATA_SOURCE_REGION,
+                "versioned": true,
+            },
+        })),
+    )
+    .await;
+    assert_eq!(
+        answer.status, 200,
+        "case create the versioned data source {DATA_SOURCE:?}: expected 200, got {answer:?}"
+    );
+}
+
 /// One API with the data source and the function the table's rows need, and the id of
 /// that function.
 pub(crate) async fn api_with_dependencies(
@@ -439,7 +476,7 @@ pub(crate) async fn api_with_dependencies(
     name: &str,
 ) -> (String, String) {
     let api_id = create_api(router, name).await;
-    create_data_source(router, &api_id, DATA_SOURCE).await;
+    create_versioned_data_source(router, &api_id).await;
     let created = create_function(router, &api_id, DATA_SOURCE, &function_rows()[0]).await;
     assert_eq!(
         created.status, 200,

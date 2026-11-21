@@ -233,6 +233,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A sync configuration describes a conflict AppSync could resolve: only its
+        // `LAMBDA` handler is configured by a member beside it — "`LAMBDA`: Resolve
+        // conflicts with an Lambda function supplied in the `LambdaConflictHandlerConfig`"
+        // (`SyncConfig$conflictHandler`) — so a configuration naming that handler and
+        // supplying no such configuration names no function to resolve a conflict with,
+        // and a configuration it DOES supply names "the Lambda function to use as the
+        // Conflict Handler" (`LambdaConflictHandlerConfig$lambdaConflictHandlerArn`) of
+        // the calling account. Either fault is refused before anything is written
+        // (`crate::state::sync_config_refusal`).
+        if let Some(message) = crate::state::sync_config_refusal(input.sync_config.as_ref()) {
+            return Err(CreateResolverErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+            .into());
+        }
+
         // "A UNIT resolver is the default resolver type" (`Resolver$kind`), so a
         // request that names no kind asks for one, and the resolver is stored — and
         // judged below — as the kind it is.
@@ -291,6 +308,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
+
+        // Conflict detection and resolution work on the item versions a data source
+        // keeps, so a resolver that configures them has to resolve against a data source
+        // configured for versioned items: `syncConfig` is "The SyncConfig for a resolver
+        // attached to a versioned data source" (`CreateResolverRequest$syncConfig`), and
+        // nothing is written for a resolver that configures them against anything else
+        // (`crate::state::versioned_data_source_refusal`).
+        if let Some(message) = crate::state::versioned_data_source_refusal(
+            input.sync_config.as_ref(),
+            input
+                .data_source_name
+                .as_deref()
+                .and_then(|name| api.data_sources.get(name)),
+        ) {
+            return Err(CreateResolverErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+            .into());
+        }
 
         // A field is resolved by at most one resolver, so a field that already carries
         // one is not re-attached: the create is refused and the resolver already there

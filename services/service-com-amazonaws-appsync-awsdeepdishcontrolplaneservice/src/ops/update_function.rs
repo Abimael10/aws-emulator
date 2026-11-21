@@ -219,6 +219,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The same sync rule the create enforces, over the same member: only the `LAMBDA`
+        // conflict handler is configured by a member beside it — "`LAMBDA`: Resolve
+        // conflicts with an Lambda function supplied in the `LambdaConflictHandlerConfig`"
+        // (`SyncConfig$conflictHandler`) — so an update naming that handler and supplying
+        // no such configuration, or supplying one that names no Lambda function of the
+        // calling account, is refused and the stored function is left as it was
+        // (`crate::state::sync_config_refusal`).
+        if let Some(message) = crate::state::sync_config_refusal(input.sync_config.as_ref()) {
+            return Err(UpdateFunctionErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+            .into());
+        }
+
         // The `code` the function would be defined by has to compile, exactly as on the
         // create: an update that would store code the runtime cannot read is refused with
         // the faults the compiler found, and one whose compile could not be run at all is
