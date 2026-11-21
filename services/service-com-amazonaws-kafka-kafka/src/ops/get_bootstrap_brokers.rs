@@ -2,15 +2,19 @@
 
 //! @op GetBootstrapBrokers
 //! Renders the cluster's bootstrap-broker strings from its persisted access settings:
-//! one string per access path the cluster actually enables, each carrying one
+//! one string per ACCESS METHOD the cluster actually enables, each carrying one
 //! `hostname:port` pair per broker node the cluster holds — the address THIS emulator
-//! accepts an Apache Kafka connection on for that node on that path, so a client that
+//! accepts an Apache Kafka connection on for that node on that method, so a client that
 //! splits the string to size its connection pool, to pin a replication factor to the
 //! broker count or to fail over to another broker sees the cluster `DescribeCluster`
-//! reports. A path the
+//! reports. Every pair of ONE string carries the SAME port, the one that method is
+//! served on, and each node is told apart by its own host — Amazon MSK's listener model,
+//! where a port identifies the access method and the host the broker — so two methods
+//! never share a port and a client that writes a rule per port writes it per method.
+//! A method the
 //! cluster does not enable has no string at all — a member is populated exactly when
 //! the cluster's encryption-in-transit setting AND its client authentication admit a
-//! client arriving on that path's connection scheme (and, for the public, multi-VPC
+//! client arriving on that method's connection scheme (and, for the public, multi-VPC
 //! and IPv6 siblings, its connectivity configuration too), so a cluster that requires
 //! a SASL credential offers neither the plaintext nor the unauthenticated-TLS string.
 //! A cluster the service is still provisioning has no brokers yet
@@ -18,11 +22,11 @@
 //! is refused with `BadRequestException` rather than answered with endpoints nothing
 //! serves on.
 //!
-//! The address is a socket the CORE owns, opened per broker node for the cluster on the
+//! The address is a socket the CORE owns, opened per ACCESS METHOD of the cluster on the
 //! first read of its endpoints and kept for as long as the store lives
 //! ([`crate::state::broker_plane::ensure_cluster_endpoints`]) — so every later read
 //! answers the same addresses, and the broker behind each of them serves the protocol a
-//! client takes the string to: the SASL exchange the path requires, the topic
+//! client takes the string to: the SASL exchange the method requires, the topic
 //! configuration the control plane stored, and the records a client produces and fetches.
 //!
 //! Authentication is NOT this handler's business: the emulator verifies every
@@ -269,8 +273,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             vpc_tls,
             vpc_scram,
             vpc_iam,
-            scram_admitted,
-            iam_admitted,
         ) = {
             let mut state = state.lock();
             // An ARN this endpoint's region holds no cluster for — absent, or
@@ -343,37 +345,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 cluster.vpc_connectivity_tls_enabled(),
                 cluster.vpc_connectivity_sasl_scram_enabled(),
                 cluster.vpc_connectivity_sasl_iam_enabled(),
-                // Whether the cluster admits clients of each SASL scheme AT ALL,
-                // which is what decides whether its socket is opened at all: the one
-                // definition of that union, shared with the broker plane that offers
-                // the mechanism on it ([`crate::state::broker_plane::sasl`]), so the
-                // socket a member is published at cannot be one whose SASL exchange
-                // offers nothing.
-                cluster.scram_clients_admitted(),
-                cluster.iam_clients_admitted(),
             )
         };
 
-        // The ADDRESSES each path is announced at are the ones the emulator ANSWERS Apache
-        // Kafka connections on: the core binds a socket per broker node of each path on
+        // The ADDRESSES each access method is announced at are the ones the emulator
+        // ANSWERS Apache Kafka connections on: the core binds ONE socket per method on
         // this emulator's own interface and this service serves the Kafka wire protocol
-        // there ([`crate::state::broker_plane`]), so a client that takes any pair of a
-        // bootstrap string verbatim reaches a broker. A path whose sockets could not be
-        // opened is reported as a server fault rather than announced as an address nothing
-        // serves.
-        let mut announced: Vec<(state::broker_plane::AccessPath, Option<String>)> = Vec::new();
-        for path in [
-            state::broker_plane::AccessPath::Plaintext,
-            state::broker_plane::AccessPath::Tls,
-            state::broker_plane::AccessPath::SaslScram,
-            state::broker_plane::AccessPath::SaslIam,
-        ] {
-            let wanted = match path {
-                state::broker_plane::AccessPath::Plaintext => plaintext_offered && !serverless,
-                state::broker_plane::AccessPath::Tls => (tls_offered || vpc_tls) && !serverless,
-                state::broker_plane::AccessPath::SaslScram => scram_admitted && !serverless,
-                state::broker_plane::AccessPath::SaslIam => serverless || iam_admitted,
-            };
+        // there for every broker node of the cluster ([`crate::state::broker_plane`]), so
+        // a client that takes any pair of a bootstrap string verbatim reaches a broker,
+        // and every pair of one string carries that method's own port. A method whose
+        // socket could not be opened is reported as a server fault rather than announced
+        // as an address nothing serves.
+        type Method = state::broker_plane::AccessPath;
+        // Each access method is published exactly when the cluster entitles the member it
+        // serves, so one port is opened per member a client may use and none for a member
+        // the answer leaves out.
+        let methods: [(Method, bool); 10] = [
+            (Method::Plaintext, plaintext_offered && !serverless),
+            (Method::Tls, tls_offered && !serverless),
+            (Method::SaslScram, scram && !serverless),
+            (Method::SaslIam, serverless || iam),
+            // Public access carries no plaintext port: a public endpoint is
+            // reachable only over TLS or SASL.
+            (Method::PublicTls, public && tls_offered && !serverless),
+            (Method::PublicSaslScram, public && scram && !serverless),
+            (Method::PublicSaslIam, public && iam && !serverless),
+            (Method::VpcTls, vpc_tls && !serverless),
+            (Method::VpcSaslScram, vpc_scram && !serverless),
+            (Method::VpcSaslIam, vpc_iam && !serverless),
+        ];
+        let mut announced: Vec<(Method, Option<String>)> = Vec::new();
+        for (path, wanted) in methods {
             if !wanted {
                 announced.push((path, None));
                 continue;
@@ -402,10 +404,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             // "A string containing one or more hostname:port pairs": one pair per broker
             // node of the cluster, comma-separated, which is how a client splits the
-            // string into the brokers it may bootstrap against.
+            // string into the brokers it may bootstrap against — every one of them on this
+            // method's single port.
             announced.push((path, Some(authorities.join(","))));
         }
-        let endpoint = |path: state::broker_plane::AccessPath| -> Option<String> {
+        let endpoint = |path: Method| -> Option<String> {
             announced
                 .iter()
                 .find(|(served, _)| *served == path)
@@ -415,46 +418,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // MSK Serverless has exactly one bootstrap string: the SASL/IAM one.
         if serverless {
             return Ok(GetBootstrapBrokersOutput {
-                bootstrap_broker_string_sasl_iam: endpoint(
-                    state::broker_plane::AccessPath::SaslIam,
-                ),
+                bootstrap_broker_string_sasl_iam: endpoint(Method::SaslIam),
                 ..GetBootstrapBrokersOutput::default()
             });
         }
 
-        // One string per access path the cluster enables, each naming every broker node's
-        // address on that path. `when` keeps a path's member absent rather than empty when
-        // the cluster does not offer it.
-        let when = |enabled: bool, path: state::broker_plane::AccessPath| {
-            enabled.then(|| endpoint(path)).flatten()
-        };
-        let plaintext_path = state::broker_plane::AccessPath::Plaintext;
-        let tls_path = state::broker_plane::AccessPath::Tls;
-        let scram_path = state::broker_plane::AccessPath::SaslScram;
-        let iam_path = state::broker_plane::AccessPath::SaslIam;
+        // One string per access method the cluster enables, each naming every broker
+        // node's address on that method's own port. A method the cluster does not enable
+        // has no endpoint at all, so its member is absent rather than empty.
+        let when = |enabled: bool, path: Method| enabled.then(|| endpoint(path)).flatten();
 
         Ok(GetBootstrapBrokersOutput {
-            bootstrap_broker_string: when(plaintext_offered, plaintext_path),
-            bootstrap_broker_string_tls: when(tls_offered, tls_path),
-            bootstrap_broker_string_sasl_scram: when(scram, scram_path),
-            bootstrap_broker_string_sasl_iam: when(iam, iam_path),
-            // Public access carries no plaintext port: a public endpoint is
-            // reachable only over TLS or SASL.
-            bootstrap_broker_string_public_tls: when(public && tls_offered, tls_path),
-            bootstrap_broker_string_public_sasl_scram: when(public && scram, scram_path),
-            bootstrap_broker_string_public_sasl_iam: when(public && iam, iam_path),
-            bootstrap_broker_string_vpc_connectivity_tls: when(vpc_tls, tls_path),
-            bootstrap_broker_string_vpc_connectivity_sasl_scram: when(vpc_scram, scram_path),
-            bootstrap_broker_string_vpc_connectivity_sasl_iam: when(vpc_iam, iam_path),
+            bootstrap_broker_string: endpoint(Method::Plaintext),
+            bootstrap_broker_string_tls: endpoint(Method::Tls),
+            bootstrap_broker_string_sasl_scram: endpoint(Method::SaslScram),
+            bootstrap_broker_string_sasl_iam: endpoint(Method::SaslIam),
+            bootstrap_broker_string_public_tls: endpoint(Method::PublicTls),
+            bootstrap_broker_string_public_sasl_scram: endpoint(Method::PublicSaslScram),
+            bootstrap_broker_string_public_sasl_iam: endpoint(Method::PublicSaslIam),
+            bootstrap_broker_string_vpc_connectivity_tls: endpoint(Method::VpcTls),
+            bootstrap_broker_string_vpc_connectivity_sasl_scram: endpoint(Method::VpcSaslScram),
+            bootstrap_broker_string_vpc_connectivity_sasl_iam: endpoint(Method::VpcSaslIam),
             // A dual-stack cluster answers on the same ports over IPv6, through
             // the SAME broker endpoint: an MSK broker endpoint is one address whose
             // record set gains AAAA entries on a `DUAL` cluster, so these members
-            // repeat the IPv4 strings by design. An IPv4-only cluster (the model's
-            // default `NetworkType`) has no IPv6 path at all.
-            bootstrap_broker_string_ipv6: when(dual_stack && plaintext_offered, plaintext_path),
-            bootstrap_broker_string_tls_ipv6: when(dual_stack && tls_offered, tls_path),
-            bootstrap_broker_string_sasl_scram_ipv6: when(dual_stack && scram, scram_path),
-            bootstrap_broker_string_sasl_iam_ipv6: when(dual_stack && iam, iam_path),
+            // repeat the IPv4 strings by design — the access method is the same one, and
+            // an access method has one port. An IPv4-only cluster (the model's default
+            // `NetworkType`) has no IPv6 path at all.
+            bootstrap_broker_string_ipv6: when(dual_stack, Method::Plaintext),
+            bootstrap_broker_string_tls_ipv6: when(dual_stack, Method::Tls),
+            bootstrap_broker_string_sasl_scram_ipv6: when(dual_stack, Method::SaslScram),
+            bootstrap_broker_string_sasl_iam_ipv6: when(dual_stack, Method::SaslIam),
         })
     }
 }

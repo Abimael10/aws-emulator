@@ -261,6 +261,7 @@ async fn every_published_pair_answers_and_reports_the_whole_broker_list() {
             usize::try_from(*brokers).unwrap_or_default(),
             "case {case:?}: expected one pair per broker node, got {pairs:?}"
         );
+        let mut coordinators: BTreeSet<String> = BTreeSet::new();
         for pair in &pairs {
             let probe = format!("{case} / {pair}");
             let mut client = Client::plaintext(&probe, pair).await;
@@ -283,8 +284,13 @@ async fn every_published_pair_answers_and_reports_the_whole_broker_list() {
                 "case {probe:?}: expected Metadata to report the published brokers {pairs:?}, \
                  got {reported:?}"
             );
-            // The node this pair addresses reports ITSELF as the coordinator of a group a
-            // client asks it for, so a client stays on the connection it already has.
+            // The coordinator of a group a client asks for is a broker OF THIS CLUSTER, at
+            // an address the string publishes and on the port of the access method the
+            // client dialled — so the client follows the answer to a broker it already
+            // knows, over the method it is already using, rather than to an address nothing
+            // serves. The brokers of one access method share that port, so WHICH node
+            // answers a connection the operating system routed to it is not the client's
+            // choice, and the answer is the same for every pair of the string.
             let coordinator: ::kafka_protocol::messages::FindCoordinatorResponse = client
                 .call(
                     &probe,
@@ -295,12 +301,26 @@ async fn every_published_pair_answers_and_reports_the_whole_broker_list() {
                         .with_key_type(0),
                 )
                 .await;
-            assert_eq!(
-                format!("{}:{}", coordinator.host.as_str(), coordinator.port),
-                *pair,
-                "case {probe:?}: the coordinator must be the broker the client dialled"
+            let answered = format!("{}:{}", coordinator.host.as_str(), coordinator.port);
+            assert!(
+                pairs.contains(&answered),
+                "case {probe:?}: the coordinator must be one of the cluster's published \
+                 brokers {pairs:?}, got {answered:?}"
             );
+            let (_dialled_host, dialled_port) = split(pair, &probe);
+            assert_eq!(
+                coordinator.port,
+                i32::from(dialled_port),
+                "case {probe:?}: the coordinator must be reached on the access method the \
+                 client dialled, got {answered:?}"
+            );
+            coordinators.insert(answered);
         }
+        assert_eq!(
+            coordinators.len(),
+            1,
+            "case {case:?}: one group has one coordinator, got {coordinators:?}"
+        );
     }
 }
 

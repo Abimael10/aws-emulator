@@ -406,14 +406,20 @@ async fn a_connectivity_update_lands_once_the_clock_makes_it_due() {
                     )
                 });
                 // The address a bootstrap string names is the one this emulator
-                // answers Apache Kafka connections on for that access path, so what
-                // is asserted here is that the member is published and names an
-                // address of this emulator.
+                // answers Apache Kafka connections on for that access method, under
+                // the broker node's own host, so what is asserted here is that the
+                // member is published and names a broker on this emulator's own
+                // interface.
                 assert!(
-                    endpoints
-                        .split(',')
-                        .all(|endpoint| endpoint.starts_with("127.0.0.1:")),
-                    "case {}: expected {name} to name this emulator's own address, got \
+                    endpoints.split(',').all(|endpoint| {
+                        endpoint.starts_with("b-")
+                            && endpoint.rsplit_once(':').is_some_and(|(host, port)| {
+                                ::service_common::data_plane_addressing::
+                                    names_the_loopback_interface(host)
+                                    && port.parse::<u16>().is_ok_and(|port| port > 0)
+                            })
+                    }),
+                    "case {}: expected {name} to name this emulator's own brokers, got \
                      {endpoints:?}",
                     case.name()
                 );

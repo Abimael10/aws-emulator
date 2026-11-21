@@ -877,14 +877,12 @@ impl Broker {
             .collect()
     }
 
-    /// The authority the core bound for THIS broker node of this path, which is the
-    /// address a client on this connection reached it at.
+    /// The authority THIS broker node is published at for this access method, which is
+    /// the address a client on this connection reached it at.
     fn authority(&self) -> String {
         self.state
             .lock()
-            .cluster_endpoints
-            .get(&(self.cluster_arn.clone(), self.path, self.node_id))
-            .map(|endpoint| endpoint.authority().to_string())
+            .broker_authority(&self.region, &self.cluster_arn, self.path, self.node_id)
             .unwrap_or_default()
     }
 
@@ -1459,34 +1457,31 @@ impl Broker {
     /// `Metadata`: the brokers a client reaches this cluster at, and the topics it
     /// asked about.
     ///
-    /// Every broker node the cluster holds is reported, each at the address the CORE
-    /// bound for THAT node on this path — one address per node, so a client that sizes
-    /// its connection pool from the broker list, or re-resolves the cluster from its
-    /// metadata, reaches this emulator's own socket for each of them rather than a name
-    /// nothing serves. Each partition is placed on as many of those nodes as the
-    /// topic's replication factor, starting at the node its own index falls on, and led
-    /// by the first of them — the placement Apache Kafka lays a topic out with, so a
-    /// client reads back the replication the topic was created with.
+    /// Every broker node the cluster holds is reported, each at the address it is
+    /// PUBLISHED at for this access method — its own host on the one port the method is
+    /// served on, so a client that sizes its connection pool from the broker list, or
+    /// re-resolves the cluster from its metadata, reaches this emulator's own socket for
+    /// each of them rather than a name nothing serves. Each partition is placed on as
+    /// many of those nodes as the topic's replication factor, starting at the node its
+    /// own index falls on, and led by the first of them — the placement Apache Kafka lays
+    /// a topic out with, so a client reads back the replication the topic was created
+    /// with.
     fn metadata(&self, request: &MetadataRequest) -> MetadataResponse {
         let now = SystemTime::now();
         let (held, brokers) = {
             let mut store = self.state.lock();
             let ids = store.broker_node_ids(&self.region, &self.cluster_arn);
-            // A node whose socket this emulator has not opened is reported at the one
-            // this connection arrived on: that address does serve the cluster, where a
-            // node's own unopened one would serve nothing.
+            // A node this emulator publishes no address for is reported at the one this
+            // connection arrived on: that address does serve the cluster, where a node's
+            // own unpublished one would serve nothing.
             let own = store
-                .cluster_endpoints
-                .get(&(self.cluster_arn.clone(), self.path, self.node_id))
-                .map(|endpoint| endpoint.authority().to_string())
+                .broker_authority(&self.region, &self.cluster_arn, self.path, self.node_id)
                 .unwrap_or_default();
             let brokers: Vec<(i32, String)> = ids
                 .iter()
                 .map(|node_id| {
                     let authority = store
-                        .cluster_endpoints
-                        .get(&(self.cluster_arn.clone(), self.path, *node_id))
-                        .map(|endpoint| endpoint.authority().to_string())
+                        .broker_authority(&self.region, &self.cluster_arn, self.path, *node_id)
                         .unwrap_or_else(|| own.clone());
                     (*node_id, authority)
                 })

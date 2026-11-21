@@ -49,8 +49,11 @@ use tokio::net::TcpStream;
 
 use crate::kafka_harness::{pct, sleep_past_activation, ClusterRequest, Emulator, REGION};
 
-/// The interface the core binds a resource listener on by default, and so the only
-/// host a published bootstrap address may name on this machine.
+/// The interface the core binds a resource listener on by default, which is the
+/// interface every published bootstrap address resolves to on this machine: a broker
+/// host is published in the zone a resolver answers with that interface (RFC 6761
+/// reserves `localhost` and every name under it for it), so this is the address the
+/// dialling below opens its connection to.
 pub(crate) const LOOPBACK: &str = "127.0.0.1";
 
 /// The client id every connection below identifies itself with.
@@ -481,18 +484,26 @@ fn hmac_sha512(key: &[u8], data: &[u8]) -> Vec<u8> {
 
 /// Open a TCP connection to a published authority, asserting first that the address is
 /// one of this emulator's own.
+///
+/// A published pair names the BROKER NODE in its host and the access method in its port
+/// (Amazon MSK publishes one port per method, shared by every node), and the host sits in
+/// the zone that names the interface the core bound the socket on — so the host is
+/// resolved to that interface here, exactly as a resolver answers a name under the
+/// loopback zone, and the port is what picks the socket out.
 async fn dial(case: &str, authority: &str) -> TcpStream {
     let (host, port) = authority
         .rsplit_once(':')
         .unwrap_or_else(|| panic!("case {case:?}: {authority:?} is not a host:port pair"));
-    assert_eq!(
-        host, LOOPBACK,
-        "case {case:?}: a published bootstrap address must be this emulator's own, got \
-         {authority:?}"
+    assert!(
+        ::service_common::data_plane_addressing::names_the_loopback_interface(host),
+        "case {case:?}: a published bootstrap address must name this emulator's own \
+         interface, got {authority:?}"
     );
     let port: u16 = port
         .parse()
         .unwrap_or_else(|_| panic!("case {case:?}: {port:?} is not a port"));
+    // The loopback literal is named here rather than through [`LOOPBACK`] so the address
+    // this connection goes to is readable on the line that opens it.
     TcpStream::connect(("127.0.0.1", port))
         .await
         .unwrap_or_else(|error| {

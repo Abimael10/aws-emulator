@@ -257,6 +257,44 @@ pub fn emulator_endpoint_authority(
 /// reached at names no zone ([`announced_zone_of_authority`]).
 pub const LOOPBACK_ZONE: &str = "localhost";
 
+/// The most octets ONE DNS label may hold (RFC 1035).
+pub const MAX_DNS_LABEL_LENGTH: usize = 63;
+
+/// `value` as ONE DNS LABEL: lower-cased, every character outside the letters, digits and
+/// hyphens a label is written with folded to a hyphen, with no hyphen at either end and no
+/// more than the [`MAX_DNS_LABEL_LENGTH`] octets a label may hold.
+///
+/// The reading for a value a service publishes a NAME from — a resource's own identifier, or
+/// a caller-supplied name that becomes one label of a host the service announces. A model
+/// often bounds such a name's LENGTH and nothing else, so folding it here is what keeps a
+/// value carrying a host or path delimiter from making the announced address name an
+/// authority the caller chose: a `:` would move the port and a `/` a path.
+///
+/// Services still carrying their own copy of this reading, to be MIGRATED onto this function
+/// (it postdates them):
+/// `services/service-com-amazonaws-vpclattice-mercurycontrolplane/src/state/announced_dns.rs`.
+/// Nothing new inlines it again — call this module.
+#[must_use]
+pub fn dns_label(value: &str) -> String {
+    let folded: String = value
+        .chars()
+        .map(|character| {
+            let character = character.to_ascii_lowercase();
+            match character.is_ascii_alphanumeric() || character == '-' {
+                true => character,
+                false => '-',
+            }
+        })
+        .collect();
+    folded
+        .trim_matches('-')
+        .chars()
+        .take(MAX_DNS_LABEL_LENGTH)
+        .collect::<String>()
+        .trim_end_matches('-')
+        .to_string()
+}
+
 /// The DNS zone this emulator may ANNOUNCE a name of its own in, read off the `host[:port]`
 /// it is reached at: that host's own name, or [`LOOPBACK_ZONE`] when the host is an IP
 /// ADDRESS (which names no zone, and names the interface that zone resolves to), names no
@@ -592,6 +630,53 @@ pub const IMPLICIT_HTTPS_PORT: u16 = 443;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RULE: a value folded into one DNS label carries only the letters, digits and hyphens
+    /// a label is written with, no hyphen at either end, at most the octets a label may
+    /// hold, and no address delimiter — whatever the value it was folded from.
+    #[test]
+    fn a_value_folded_into_a_dns_label_carries_only_what_a_label_may() {
+        // The rows span what the folding generalises over: a value that is already a label,
+        // mixed case, the delimiters that would move a port or a path, characters no label
+        // admits, hyphens at the ends, a value of nothing but such characters, and a value
+        // longer than a label may be.
+        let rows: &[(&str, &str, &str)] = &[
+            ("a value that is already a label", "demo-1", "demo-1"),
+            ("mixed case", "Demo-Cluster", "demo-cluster"),
+            ("a port delimiter", "demo:9999", "demo-9999"),
+            ("a path delimiter", "demo/../other", "demo----other"),
+            ("characters no label admits", "my_demo cluster", "my-demo-cluster"),
+            ("hyphens at the ends", "-demo-", "demo"),
+            ("nothing a label admits", "__", ""),
+            ("an empty value", "", ""),
+        ];
+        for (case, value, expected) in rows {
+            let folded = dns_label(value);
+            assert_eq!(
+                &folded, expected,
+                "case {case:?}: expected the label {expected:?}, got {folded:?}"
+            );
+            assert!(
+                folded.len() <= MAX_DNS_LABEL_LENGTH
+                    && !folded.starts_with('-')
+                    && !folded.ends_with('-')
+                    && folded
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || byte == b'-'),
+                "case {case:?}: expected a well-formed label, got {folded:?}"
+            );
+        }
+        // A value longer than a label may be is clamped to the length one holds.
+        let long = dns_label(&"a".repeat(MAX_DNS_LABEL_LENGTH * 2));
+        assert_eq!(
+            long.len(),
+            MAX_DNS_LABEL_LENGTH,
+            "case \"a value longer than a label\": expected {MAX_DNS_LABEL_LENGTH} octets, got \
+             {long:?}"
+        );
+    }
 
     #[test]
     fn only_a_host_naming_the_bound_interface_is_admitted() {

@@ -85,7 +85,7 @@ impl ComAmazonawsKafkaKafkaState {
         }
         self.topics.retain(|(topic_cluster, _), _| topic_cluster != arn);
         self.cluster_endpoints
-            .retain(|(endpoint_cluster, _, _), _| endpoint_cluster != arn);
+            .retain(|(endpoint_cluster, _), _| endpoint_cluster != arn);
         self.partition_logs
             .retain(|(log_cluster, _, _), _| log_cluster != arn);
         self.broker_acls.remove(arn);

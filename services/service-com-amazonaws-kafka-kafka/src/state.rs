@@ -1105,8 +1105,11 @@ const CLUSTER_PAGE_TOKEN_PREFIX: &str = "kafka:clusters:";
 pub struct BrokerNode {
     /// 1-based broker id, as it appears in the `b-<id>` DNS label.
     pub id: i32,
-    /// `b-<id>.<cluster>.<suffix>.kafka.<region>.amazonaws.com` — the port is
-    /// appended per access path.
+    /// `b-<id>.<cluster>.<suffix>.kafka.<region>.amazonaws.com`, the name Amazon MSK
+    /// gives this node ([`broker_plane::addressing::broker_endpoint_host`]).
+    /// `GetBootstrapBrokers` publishes it in the zone this emulator may announce a name
+    /// of its own in, with the port of the access method appended
+    /// ([`broker_plane::addressing::published_broker_host`]).
     pub endpoint_host: String,
     /// The one subnet of `BrokerNodeGroupInfo$ClientSubnets` this broker's
     /// network interface sits in. Stored rather than recomputed per read, so the
@@ -1143,7 +1146,8 @@ impl BrokerNode {
         client_subnets: &[String],
         now: SystemTime,
     ) -> Self {
-        let endpoint_host = format!("b-{id}.{name}.{dns_suffix}.kafka.{region}.amazonaws.com");
+        let endpoint_host =
+            broker_plane::addressing::broker_endpoint_host(region, name, dns_suffix, id);
         // The brokers are placed round-robin over the submitted subnets, so
         // broker 1 lands in the first. A cluster whose stored group names none
         // (which the model's `required` `ClientSubnets` does not allow a create
@@ -2980,16 +2984,17 @@ pub struct ComAmazonawsKafkaKafkaState {
     /// Monotonic counter feeding each VPC connection's ARN, so each one gets a
     /// distinct identity.
     pub next_vpc_connection_suffix: u64,
-    /// The socket each broker node of each cluster is reached on, keyed by (cluster ARN,
-    /// access path, broker node id), and the address `GetBootstrapBrokers` announces for
-    /// it ([`broker_plane::ClusterEndpoint`]). One per BROKER NODE, because a bootstrap
-    /// string carries one `host:port` pair per node of the cluster. Opened on the first
-    /// bootstrap read of a cluster the registry HOLDS, bounded by
+    /// The socket each ACCESS METHOD of each cluster is reached on, keyed by (cluster
+    /// ARN, access method), and what `GetBootstrapBrokers` announces every broker node of
+    /// that cluster at on it ([`broker_plane::ClusterEndpoint`]). One per access METHOD,
+    /// shared by every broker node, because Amazon MSK publishes one port per method and
+    /// tells its nodes apart by their hosts. Opened on the first bootstrap read of a
+    /// cluster the registry HOLDS, bounded by
     /// [`broker_plane::MAX_CLUSTER_ENDPOINTS`] entries, and held for as long as that
     /// cluster is in the registry, so an announced address never moves under a client;
     /// dropped when the cluster is unregistered, which closes the port.
     pub cluster_endpoints:
-        HashMap<(String, broker_plane::AccessPath, i32), broker_plane::ClusterEndpoint>,
+        HashMap<(String, broker_plane::AccessPath), broker_plane::ClusterEndpoint>,
     /// The records each partition of each topic holds, keyed by (cluster ARN, topic
     /// name, partition index): what a `Produce` on that cluster's endpoint appends
     /// and a `Fetch` reads, with the records the topic's `retention.ms` has aged out

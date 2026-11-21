@@ -126,9 +126,9 @@ async fn listed_broker_ids(emulator: &Emulator, cluster_arn: &str, case: &str) -
         .collect()
 }
 
-/// Every broker host a `GetBootstrapBrokers` answer names, with the per-path port
-/// stripped: the endpoints a client would connect to, rendered from the same
-/// stored nodes the listing reports.
+/// Every broker host a `GetBootstrapBrokers` answer names, with the per-method port
+/// stripped: the hosts a client would connect to, one per broker node, rendered from
+/// the same stored nodes the listing reports.
 async fn bootstrap_hosts(emulator: &Emulator, cluster_arn: &str, case: &str) -> BTreeSet<String> {
     let reply = emulator.bootstrap_brokers(cluster_arn).await;
     assert_eq!(
@@ -370,9 +370,10 @@ async fn an_accepted_update_lands_the_broker_nodes_once_the_clock_owes_it() {
         );
 
         // The NODES moved with the count: the listing reports one per broker the
-        // cluster now holds. The bootstrap endpoints name the ADDRESS the emulator
-        // answers Apache Kafka connections on for this cluster rather than one
-        // synthesised name per node, so what they are asserted on is that address.
+        // cluster now holds. The bootstrap endpoints name every broker node of the
+        // cluster at the ADDRESS this emulator answers Apache Kafka connections on for
+        // it — one host per node, on the one port its access method is served on — so
+        // what they are asserted on is that there is one such host per node.
         let nodes_after = listed_broker_ids(&emulator, &arn, case).await;
         assert_eq!(
             nodes_after,
@@ -381,10 +382,18 @@ async fn an_accepted_update_lands_the_broker_nodes_once_the_clock_owes_it() {
         );
         let hosts = bootstrap_hosts(&emulator, &arn, case).await;
         assert_eq!(
-            hosts,
-            std::collections::BTreeSet::from(["127.0.0.1".to_string()]),
-            "case {case}: expected the cluster's own served address, got {hosts:?}"
+            hosts.len(),
+            nodes_after.len(),
+            "case {case}: expected one published host per broker node, got {hosts:?}"
         );
+        for host in &hosts {
+            assert!(
+                host.starts_with("b-")
+                    && ::service_common::data_plane_addressing::names_the_loopback_interface(host),
+                "case {case}: expected a broker host on this emulator's own interface, got \
+                 {host:?}"
+            );
+        }
 
         let new_version = after
             .at("/clusterInfo/currentVersion")
