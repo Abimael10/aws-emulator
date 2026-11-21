@@ -41,18 +41,26 @@ const MAX_LIMIT: usize = 50;
 const DESTINATION_TYPES: [&str; 4] = ["CWL", "FH", "S3", "XRAY"];
 
 /// The `OutputFormat`s the operation publishes for each destination type: a destination that
-/// stores one structured record for each delivered item takes the structured format alone, a
-/// destination that receives a stream of records takes each per-record encoding, and a
-/// delivery that writes objects takes those plus the columnar file layout.
-const RECORD_DESTINATION_FORMATS: [&str; 1] = ["json"];
-const STREAM_DESTINATION_FORMATS: [&str; 3] = ["plain", "json", "w3c"];
+/// receives log RECORDS takes the two per-record renderings, whether it stores one record for
+/// each delivered item or receives a stream of them, and a delivery that WRITES OBJECTS takes
+/// those plus the two file layouts — the headed text file and the columnar one, both properties
+/// of a file rather than of a record. The X-Ray trace destination receives spans as structured
+/// documents.
+const RECORD_DESTINATION_FORMATS: [&str; 2] = ["plain", "json"];
 const OBJECT_DESTINATION_FORMATS: [&str; 4] = ["plain", "json", "w3c", "parquet"];
+const TRACE_DESTINATION_FORMATS: [&str; 1] = ["json"];
 
 /// The field delimiters the operation publishes for a delivery that delivers in a delimited
 /// format, and the one a template defaults to: `FieldDelimiter` is modelled `@length 0..5`, so
 /// NO delimiter is a value in its own right and it is the published default.
 const FIELD_DELIMITERS: [&str; 3] = ["\t", " ", ","];
 const DEFAULT_FIELD_DELIMITER: &str = "";
+
+/// The log sources whose record is the SENDING SERVICE'S OWN DOCUMENT, published as the one
+/// field that carries it — (service, log type) — and the one rendering such a record is on offer
+/// in: the document as the delivered line.
+const DOCUMENT_RECORD_SOURCES: [(&str, &str); 1] = [("securityhub", "SECURITY_FINDING_LOGS")];
+const DOCUMENT_RECORD_FORMAT: &str = "plain";
 
 /// One published log source, and the record schema of its log type: the field names in the
 /// order `recordFields` restates them, each paired with whether a delivery MUST carry it.
@@ -79,17 +87,34 @@ struct Row {
 /// One row per log source the catalogue publishes a distinct record schema for.
 const ROWS: &[Row] = &[
     // A generic vended-log envelope: the record's own timestamp, the ARN and id of the
-    // resource that sent it and the instant of the event, then that sender's dimensions and
-    // the logged content.
+    // resource that sent it and the instant of the event — every part of it OPTIONAL, because a
+    // delivery that names only the log type's own fields still delivers the log type — then
+    // that sender's dimensions and the logged content, which it may not drop.
     Row {
         service: "aidevops",
         resource_type: "agent-space",
         log_type: "APPLICATION_LOGS",
         schema: &[
             ("timestamp", false),
-            ("resource_arn", true),
+            ("resource_arn", false),
             ("resource_id", false),
-            ("event_timestamp", true),
+            ("event_timestamp", false),
+            ("log_level", false),
+            ("operation", false),
+            ("request_id", false),
+            ("message", true),
+        ],
+    },
+    // The same envelope, published by another sender of it: one kind of resource, one log type.
+    Row {
+        service: "codewhisperer",
+        resource_type: "customization",
+        log_type: "EVENT_LOGS",
+        schema: &[
+            ("timestamp", false),
+            ("resource_arn", false),
+            ("resource_id", false),
+            ("event_timestamp", false),
             ("log_level", false),
             ("operation", false),
             ("request_id", false),
@@ -118,9 +143,8 @@ const ROWS: &[Row] = &[
         log_type: "ERROR_LOGS",
         schema: &[
             ("timestamp", false),
-            ("resource_arn", true),
-            ("resource_id", false),
-            ("event_timestamp", true),
+            ("resource_arn", false),
+            ("event_timestamp", false),
             ("log_timestamp", false),
             ("transformer_arn", false),
             ("object_identifier", false),
@@ -135,9 +159,9 @@ const ROWS: &[Row] = &[
         log_type: "AUTO_MODE_LOAD_BALANCING_LOGS",
         schema: &[
             ("timestamp", false),
-            ("resource_arn", true),
+            ("resource_arn", false),
             ("resource_id", false),
-            ("event_timestamp", true),
+            ("event_timestamp", false),
             ("level", false),
             ("stream", false),
             ("message", false),
@@ -159,9 +183,9 @@ const ROWS: &[Row] = &[
         log_type: "ERROR_LOGS",
         schema: &[
             ("timestamp", false),
-            ("resource_arn", true),
+            ("resource_arn", false),
             ("resource_id", false),
-            ("message_timestamp_ms", true),
+            ("message_timestamp_ms", false),
             ("subscriber_name", false),
             ("request_id", false),
             ("event_id", false),
@@ -202,9 +226,9 @@ const ROWS: &[Row] = &[
         log_type: "APPLICATION_LOGS",
         schema: &[
             ("timestamp", false),
-            ("resource_arn", true),
+            ("resource_arn", false),
             ("resource_id", false),
-            ("event_timestamp", true),
+            ("event_timestamp", false),
             ("account_id", false),
             ("request_id", false),
             ("session_id", false),
@@ -244,17 +268,22 @@ const ROWS: &[Row] = &[
             ("conn_trace_id", true),
         ],
     },
-    // Service-specific families.
+    // Service-specific families: a sender that publishes its OWN event document marks mandatory
+    // the parts of that document a delivery may not drop.
     Row {
         service: "mediatailor",
         resource_type: "playbackConfiguration",
         log_type: "AD_DECISION_SERVER_LOGS",
         schema: &[
+            ("timestamp", false),
+            ("originId", false),
             ("eventTimestamp", true),
             ("awsAccountId", true),
+            ("customerId", false),
             ("eventType", false),
+            ("sessionType", false),
+            ("requestId", false),
             ("sessionId", false),
-            ("originId", false),
             ("playbackConfigurationName", false),
             ("vastResponse", false),
             ("vastAds", false),
@@ -269,8 +298,8 @@ const ROWS: &[Row] = &[
         log_type: "ACCESS_CONTROL_LOGS",
         schema: &[
             ("timestamp", false),
-            ("organization_arn", true),
-            ("event_timestamp", true),
+            ("organization_arn", false),
+            ("event_timestamp", false),
             ("request_id", true),
             ("user_id", true),
             ("impersonator_id", false),
@@ -459,9 +488,9 @@ async fn the_packaging_a_template_publishes_follows_from_its_destination_type() 
             "case {destination_type}: every destination type the model names has templates, got none"
         );
         let expected_formats: Vec<String> = match destination_type {
-            "CWL" | "XRAY" => RECORD_DESTINATION_FORMATS.iter(),
+            "XRAY" => TRACE_DESTINATION_FORMATS.iter(),
             "S3" => OBJECT_DESTINATION_FORMATS.iter(),
-            _ => STREAM_DESTINATION_FORMATS.iter(),
+            _ => RECORD_DESTINATION_FORMATS.iter(),
         }
         .map(|format| (*format).to_string())
         .collect();
@@ -469,10 +498,32 @@ async fn the_packaging_a_template_publishes_follows_from_its_destination_type() 
             .iter()
             .map(|delimiter| (*delimiter).to_string())
             .collect();
-        let delimited = destination_type == "S3" || destination_type == "FH";
+        // A delimited rendering is on offer at every destination that receives records and at
+        // the one that writes objects, so the delimiters to choose from are published there too;
+        // the trace destination takes the structured rendering alone.
+        let delimited = destination_type != "XRAY";
 
         for template in &page {
             let case = format!("{destination_type} template {template}");
+            // A log type whose record is the sending service's OWN DOCUMENT, published as the
+            // one field that carries it, has nothing to render it as but the document itself:
+            // such a log type publishes the delivered-line rendering alone, whatever else its
+            // destination could store.
+            let document_record = DOCUMENT_RECORD_SOURCES.contains(&(
+                template
+                    .get("service")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                template
+                    .get("logType")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            ));
+            let expected_formats: Vec<String> = if document_record {
+                vec![DOCUMENT_RECORD_FORMAT.to_string()]
+            } else {
+                expected_formats.clone()
+            };
             let formats = strings(template, "allowedOutputFormats", &case);
             assert_eq!(
                 formats, expected_formats,
@@ -519,11 +570,11 @@ async fn an_s3_templates_suffix_path_variables_are_the_ones_its_sender_publishes
     let logs = Logs::new();
 
     // (service, log type, resource type, the published variables, the default path): a sender
-    // whose resource takes two variables, two that publish the resource variable before the
+    // whose resource takes two variables, senders that publish the resource variable before the
     // Region, one that publishes it after, and two that publish none at all — and the defaults
     // they publish, which name a resource variable only where that sender's own default does:
-    // one path partitioning by the resource and the stage, three by the hour and one by the day.
-    let cases: [(&str, &str, &str, &[&str], &str); 6] = [
+    // two paths partitioning by the resource, four by the hour and one by the day.
+    let cases: [(&str, &str, &str, &[&str], &str); 7] = [
         (
             "apigateway",
             "EXECUTION_LOGS",
@@ -540,7 +591,7 @@ async fn an_s3_templates_suffix_path_variables_are_the_ones_its_sender_publishes
             &[
                 "accountid", "cluster_id", "region", "yyyy", "MM", "dd", "HH",
             ],
-            "{region}/{cluster_id}/{yyyy}/{MM}/{dd}/{HH}/",
+            "{region}/{yyyy}/{MM}/{dd}/{HH}/",
         ),
         (
             "events",
@@ -555,7 +606,22 @@ async fn an_s3_templates_suffix_path_variables_are_the_ones_its_sender_publishes
                 "dd",
                 "HH",
             ],
-            "{region}/{subscriber_name}/{yyyy}/{MM}/{dd}/{HH}/",
+            "{region}/{yyyy}/{MM}/{dd}/{HH}/",
+        ),
+        (
+            "codewhisperer",
+            "EVENT_LOGS",
+            "customization",
+            &[
+                "accountid",
+                "region",
+                "customization_id",
+                "yyyy",
+                "MM",
+                "dd",
+                "HH",
+            ],
+            "{region}/{customization_id}/{yyyy}/{MM}/{dd}/{HH}/",
         ),
         (
             "bedrock-agentcore",

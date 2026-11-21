@@ -114,3 +114,54 @@ Cross-cutting in the emulator's output: allowedFieldDelimiters, allowedSuffixPat
 2. Replay fixture logs-catalog-describe-configuration-templates, step task#1: POST the CloudWatch Logs DescribeConfigurationTemplates target with {"service": "aidevops"} and compare configurationTemplates[0..5] with the recorded response — the emulator returns no matching entries.
 3. Repeat for the same fixture's steps task#2 (service apigateway), task#3 (autoloop), task#4 (bedrock), task#5 (bedrock-agentcore), task#7 (codewhisperer), task#10 (eks), task#11 (elasticloadbalancing), task#14 (events) and task#18 (mediatailor).
 4. In each response, check for the members allowedFieldDelimiters, allowedSuffixPathFields, s3TablesIntegration and defaultDeliveryConfigValues.fieldDelimiter, and compare logType/resourceType/allowedOutputFormats and the allowedFields mandatory flags against the recording.
+
+## Resolution (what was fixed, and the residue that was not)
+
+The report was filed against a commit before the catalogue rewrite, so three of its cross-cutting
+claims no longer held when this was picked up: `allowedFieldDelimiters`, `allowedSuffixPathFields`,
+`s3TablesIntegration` and `defaultDeliveryConfigValues.fieldDelimiter` were already published, and
+every log type already contributed one template per delivery destination type. What was still wrong
+was fixed as RULES over the whole catalogue (`src/state/vended_log_templates.rs`):
+
+* a template's `allowedOutputFormats` is now the renderings its DESTINATION can store narrowed to
+  the ones its RECORD has something to say in: every destination that receives records takes the two
+  per-record renderings (the record as the delivered line and as a structured document), writing
+  objects adds the two FILE layouts (the headed text file and the columnar one), the trace
+  destination receives spans as structured documents, and a log type whose record is the sending
+  service's own single document is on offer as that document alone. Because a delimited rendering is
+  now on offer at every destination that receives records, `allowedFieldDelimiters` and the empty
+  default `fieldDelimiter` are published there too (causes 2 and 3, and the Security Hub rows);
+* the vended-log envelope a sender attributes its records with — the record's own timestamp, the
+  resource it came from and the instant of the event — is published as OPTIONAL, because
+  `mandatory` says the field "must be present in the recordFields parameter", which is a statement
+  about the record and not about the attribution a delivery MAY carry (causes 3 and 9, and the
+  WorkMail, Amazon Q Business, AgentCore, EKS, SES and DevOps Agent rows that publish that
+  envelope); a sender whose record is its own event document still marks mandatory the parts of
+  that document a delivery may not drop;
+* the bare `resource_id` field and the suffix-path variable naming the sending resource are the
+  same identifier, so the autoloop row — which names no resource variable — publishes neither
+  (cause 3);
+* the per-sender object-layout defaults the report states: the EKS cluster and EventBridge
+  subscriber S3 templates partition by time alone (causes 7 and 9), and the EventBridge subscriber
+  row is published before the event-bus row, as the newer Security Hub hub resource already is
+  (cause 9);
+* the MediaTailor ad-insertion record is the published one (cause 10), and the Amazon CodeWhisperer
+  `EVENT_LOGS`/`customization` row is published, with the suffix path variables and default object
+  layout the report states, so a delivery source over a customization can be created at all
+  (cause 6).
+
+Residue, still diverging on replay (the key
+`logs|DescribeConfigurationTemplates|2xx->2xx|$.configurationTemplates[*]`), all of it recorded
+catalogue content that neither the model nor this report states, so no rows and no field names were
+invented to reach it:
+
+* the DevOps Agent slice's recorded ROW COUNT (6) — the model's own `logType` catalogue names one
+  log type for that sender ("For DevOps Agent, the valid value is `APPLICATION_LOGS`"), so six
+  templates means a second kind of resource this report does not name (cause 1);
+* the record schemas of senders the report gives only a prefix or a count for: the AgentCore
+  `workload-identity` 21-entry default record field list (cause 5), the CodeWhisperer customization
+  record, and the tail of the MediaTailor record;
+* the order a service's log types are published in within its own slice, which decides cause 4
+  (Bedrock agent-alias) and cause 8 (the ALB connection-log row): every candidate ordering fits
+  some of the recorded rows and contradicts the others, and the report states only the first row of
+  each slice.

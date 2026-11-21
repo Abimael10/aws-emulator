@@ -162,10 +162,10 @@ async fn a_services_templates_are_published_in_one_order() {
 
     // (service, log type, the kinds of resource it sends those logs from, in published order):
     // the service whose two hub resources send the SAME log type — the newer one first — and one
-    // whose two kinds of resource are published in the order the catalogue states them.
+    // whose two kinds of resource are published the same way, the newer kind of resource first.
     let cases: [(&str, &str, &[&str]); 2] = [
         ("securityhub", "SECURITY_FINDING_LOGS", &["hubv2", "hub"]),
-        ("events", "ERROR_LOGS", &["event-bus", "subscriber"]),
+        ("events", "ERROR_LOGS", &["subscriber", "event-bus"]),
     ];
 
     for (service, log_type, expected) in cases {

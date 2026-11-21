@@ -46,6 +46,12 @@ const DESTINATION_TYPE_ORDER: [&str; 4] = ["S3", "CWL", "FH", "XRAY"];
 /// (`smithy_query(query="shape",shape="OutputFormat")`).
 const OUTPUT_FORMATS: [&str; 5] = ["json", "parquet", "plain", "raw", "w3c"];
 
+/// The log sources whose record is the SENDING SERVICE'S OWN DOCUMENT, published as the one
+/// field that carries it — (service, log type) — and the one rendering such a record is on offer
+/// in: the document as the delivered line.
+const DOCUMENT_RECORD_SOURCES: [(&str, &str); 1] = [("securityhub", "SECURITY_FINDING_LOGS")];
+const DOCUMENT_RECORD_FORMAT: &str = "plain";
+
 /// The `logType` of a source that sends traces rather than log records, as the `logType`
 /// member's own catalogue spells it
 /// (`smithy_query(query="doc",shape="PutDeliverySourceRequest",member="logType")`).
@@ -84,7 +90,7 @@ const VENDED_LOGS_DELIVERY_ACTION: &str = "AllowVendedLogDeliveryForResource";
 /// Balancer access log delivered to Firehose, an AgentCore trace delivered to X-Ray, a
 /// Security Hub finding log delivered to S3 from each of the two hub resources that send one,
 /// and an Amazon Q Business event log delivered to a log group.
-const CATALOGUE_TEMPLATES: usize = 188;
+const CATALOGUE_TEMPLATES: usize = 191;
 const PINNED_TEMPLATES: [&str; 9] = [
     "cloudfront|ACCESS_LOGS|distribution|S3",
     "workmail|ACCESS_CONTROL_LOGS|organization|CWL",
@@ -410,27 +416,39 @@ async fn every_template_derives_its_allowed_values_from_its_destination_type() {
             "case {case}: expected the action {expected_action}, got {action}"
         );
 
-        // The formats: every one the model names is allowed where the destination can store
-        // it, a destination that stores one structured record each takes only `json`, and the
-        // columnar file format applies only where the delivery writes objects.
+        // The formats: every one the model names is allowed where the destination can store it
+        // and the record says something in it — the trace destination receives spans as
+        // structured documents, the file layouts apply only where the delivery writes objects,
+        // and a record that IS one document is on offer as that document alone.
         let formats = strings(template, "allowedOutputFormats", &case);
         assert!(
             !formats.is_empty() && formats.iter().all(|format| OUTPUT_FORMATS.contains(&format.as_str())),
             "case {case}: the allowed formats are a non-empty subset of {OUTPUT_FORMATS:?}, got {formats:?}"
         );
-        let one_record_each = destination_type == "CWL" || destination_type == TRACE_DESTINATION_TYPE;
-        if one_record_each {
+        let document_record = DOCUMENT_RECORD_SOURCES.contains(&(service.as_str(), field(&case, 1)));
+        if destination_type == TRACE_DESTINATION_TYPE {
             assert_eq!(
                 formats,
                 vec!["json".to_string()],
-                "case {case}: a destination storing one structured record each allows json alone, got {formats:?}"
+                "case {case}: the trace destination receives structured spans alone, got {formats:?}"
+            );
+        } else if document_record {
+            assert_eq!(
+                formats,
+                vec![DOCUMENT_RECORD_FORMAT.to_string()],
+                "case {case}: a record that is one document is on offer as that document alone, got {formats:?}"
+            );
+        } else {
+            assert_eq!(
+                formats.contains(&"parquet".to_string()),
+                destination_type == "S3",
+                "case {case}: the columnar format applies exactly where the delivery writes objects, got {formats:?}"
+            );
+            assert!(
+                formats.contains(&"plain".to_string()) && formats.contains(&"json".to_string()),
+                "case {case}: every destination that receives records takes both per-record renderings, got {formats:?}"
             );
         }
-        assert_eq!(
-            formats.contains(&"parquet".to_string()),
-            destination_type == "S3",
-            "case {case}: the columnar format applies exactly where the delivery writes objects, got {formats:?}"
-        );
 
         // The delimiter: the delimiters a caller MAY choose apply exactly where a delimited
         // format is allowed, while the DEFAULT every template publishes is the same one — none
@@ -591,9 +609,12 @@ async fn every_template_derives_its_allowed_values_from_its_destination_type() {
                     .to_string()
             })
             .collect();
+        // A mandatory field "must be present in the recordFields parameter", so every one of
+        // them is delivered by default. Nothing says a log type has to have one: a sender whose
+        // record a delivery may restate in any part at all publishes none.
         assert!(
-            !mandatory.is_empty() && mandatory.iter().all(|name| default_fields.contains(name)),
-            "case {case}: the mandatory fields are a non-empty subset of {default_fields:?}, got {mandatory:?}"
+            mandatory.iter().all(|name| default_fields.contains(name)),
+            "case {case}: the mandatory fields are a subset of {default_fields:?}, got {mandatory:?}"
         );
     }
 }

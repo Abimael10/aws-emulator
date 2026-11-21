@@ -1905,6 +1905,7 @@ pub use vended_log_templates::{
     configuration_template_key, configuration_template_output_formats, configuration_templates,
     ConfigurationTemplateSource, CONFIGURATION_TEMPLATE_DEFAULT_FIELD_DELIMITER,
     CONFIGURATION_TEMPLATE_DEFAULT_HIVE_COMPATIBLE_PATH, CONFIGURATION_TEMPLATE_SOURCES,
+    VENDED_LOG_ENVELOPE_FIELDS,
 };
 
 /// The log types a delivery source over `resource_arn` may send, or `None` when this service

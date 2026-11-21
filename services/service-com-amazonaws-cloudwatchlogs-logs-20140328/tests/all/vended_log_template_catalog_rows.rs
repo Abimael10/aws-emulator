@@ -293,6 +293,9 @@ async fn the_default_record_fields_are_the_allowed_fields_a_delivery_carries_by_
                 "payload",
             ],
         ),
+        // A sender that publishes no variable naming the sending resource among its suffix path
+        // fields publishes no bare `resource_id` field either, so its default list is its whole
+        // record less the record's own ingestion timestamp.
         (
             "autoloop",
             "ERROR_LOGS",
@@ -416,18 +419,22 @@ async fn the_default_record_fields_are_the_allowed_fields_a_delivery_carries_by_
                 "spanId",
             ],
         ),
-        // A record that carries NEITHER of the fields a delivery leaves out by default, so
-        // every allowed field is delivered.
+        // A record that carries the sending service's own event document: its own ingestion
+        // `timestamp` is allowed without being delivered by default, and every other field it
+        // publishes is delivered.
         (
             "mediatailor",
             "AD_DECISION_SERVER_LOGS",
             "playbackConfiguration",
             &[
+                "originId",
                 "eventTimestamp",
                 "awsAccountId",
+                "customerId",
                 "eventType",
+                "sessionType",
+                "requestId",
                 "sessionId",
-                "originId",
                 "playbackConfigurationName",
                 "vastResponse",
                 "vastAds",
@@ -618,8 +625,8 @@ async fn the_catalogue_holds_one_row_per_kind_of_resource_a_service_sends_logs_f
         (
             "events",
             &[
-                ("event-bus", &["ERROR_LOGS", "INFO_LOGS"]),
                 ("subscriber", &["ERROR_LOGS", "INFO_LOGS"]),
+                ("event-bus", &["ERROR_LOGS", "INFO_LOGS"]),
             ],
         ),
     ];
