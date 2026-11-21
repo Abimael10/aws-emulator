@@ -15,11 +15,11 @@
 //! No operation of this service answers the framework's synthetic `ValidationException`,
 //! which its model does not declare at all.
 //!
-//! RULE 2 — every CREATE of this service requires the idempotency token its input models:
-//! a request that states no `ClientToken` is refused `400` with `InvalidInputException` and
-//! the fixed text naming the member it has to carry, and mints nothing; a create that
-//! carries one is served and mints its resource, and a repeat carrying the same token
-//! replays that one resource rather than minting a second.
+//! RULE 2 — no create of this service REQUIRES the `@idempotencyToken` `ClientToken` its
+//! input models, because the model leaves that member optional: a request that states no
+//! token is served and mints its resource exactly as one carrying a token is, and simply
+//! buys no replay record — a tokenless repeat of the same name is the name collision,
+//! while a repeat carrying the same token replays the one resource that token minted.
 //!
 //! RULE 3 — `DescribeEventBus` resolves the whole `EventBusArn` it is given, identifier
 //! segment included: an ARN carrying an identifier this service never minted addresses no
@@ -78,11 +78,6 @@ const UNMODELLED_REFUSAL: &str = "ValidationException";
 /// `Message` of that class.
 const RESOURCE_ALREADY_EXISTS_EXCEPTION: &str = "ResourceAlreadyExistsException";
 const RESOURCE_ALREADY_EXISTS: &str = eventsv2::state::RESOURCE_ALREADY_EXISTS_MESSAGE;
-
-/// The whole `Message` a create of this service is refused with when the request states no
-/// idempotency token, spelled out here rather than taken from the crate, so a reworded
-/// refusal fails this suite.
-pub(crate) const CLIENT_TOKEN_REQUIRED: &str = "ClientToken is required";
 
 /// The whole `Message` of a refusal of a value that addresses no resource of this
 /// service.
@@ -393,7 +388,8 @@ pub(crate) fn unminted_arn(region: &str, name: &str, bus_id: &str) -> String {
 }
 
 /// A `CreateEventBusInput` naming `name`, with `client_token` as the caller supplied it:
-/// `None` is the request that states no token at all, which this service refuses.
+/// `None` is the request that states no token at all, which the model accepts and this
+/// service serves.
 pub(crate) fn create_bus(name: &str, client_token: Option<&str>) -> CreateEventBusInput {
     CreateEventBusInput {
         name: name.to_string(),
@@ -653,16 +649,15 @@ async fn every_modelled_operation_states_its_refusal_in_the_modelled_shape() {
 }
 
 // ---------------------------------------------------------------------------
-// RULE 2: a create REQUIRES the idempotency token its input models
+// RULE 2: a create is served WITHOUT the idempotency token its input models
 // ---------------------------------------------------------------------------
 
 /// RULE 2 on the create whose whole output the model states: a request that states no
-/// `ClientToken` is refused and mints nothing, and the same request carrying one is served
-/// and reports the resource the store now holds — over rows varying the name grammar and
-/// the storage configuration, so neither the refusal nor the answer is keyed to one request
-/// shape.
+/// `ClientToken` is served and mints the bus — over rows varying the name grammar and the
+/// storage configuration, so neither the answer nor the mint is keyed to one request shape
+/// — and the bus it reports is the bus the store holds.
 #[tokio::test]
-async fn a_bus_create_states_its_idempotency_token_or_is_refused() {
+async fn a_bus_create_is_served_and_mints_the_bus_without_an_idempotency_token() {
     let wire = Wire::new();
 
     // (case, the bus name, the RetentionPeriodInDays the request names)
@@ -695,35 +690,10 @@ async fn a_bus_create_states_its_idempotency_token_or_is_refused() {
             client_token: None,
             ..Default::default()
         };
-        let (status, body) = wire
-            .call::<CreateEventBus<InMemoryEngine>>(&tokenless)
-            .await;
-        assert_eq!(
-            status, 400,
-            "case {case:?}: a create stating no ClientToken must be refused, got {status} with \
-             {:?}",
-            rendered(&body)
-        );
-        let (code, message) = refusal(case, &body);
-        assert_eq!(
-            code, INVALID_INPUT_EXCEPTION,
-            "case {case:?}: expected {INVALID_INPUT_EXCEPTION}, got {code:?} with {message:?}"
-        );
-        assert_eq!(
-            message, CLIENT_TOKEN_REQUIRED,
-            "case {case:?}: expected {CLIENT_TOKEN_REQUIRED:?}, got {message:?}"
-        );
-
-        // The refused create minted nothing, so the name it asked for is still free: the
-        // same request carrying a token is served under it.
+        // The model leaves `ClientToken` optional, so this is a well-formed create: it is
+        // served, and what it reports is the bus it minted.
         let created = wire
-            .ok::<CreateEventBus<InMemoryEngine>>(
-                case,
-                &CreateEventBusInput {
-                    client_token: Some(format!("token-for-{name}")),
-                    ..tokenless
-                },
-            )
+            .ok::<CreateEventBus<InMemoryEngine>>(case, &tokenless)
             .await;
 
         assert_eq!(
@@ -800,47 +770,29 @@ async fn a_bus_create_states_its_idempotency_token_or_is_refused() {
         minted.push(arn);
     }
 
-    // Each row carried a token of its own, so every one of them minted a bus of its own.
+    // Each row named a bus of its own, so every one of them minted a bus of its own — no
+    // tokenless create replayed another's.
     let mut distinct = minted.clone();
     distinct.sort();
     distinct.dedup();
     assert_eq!(
         distinct.len(),
         minted.len(),
-        "each create carrying a token of its own must mint its own bus, got {minted:?}"
+        "each tokenless create of a name of its own must mint its own bus, got {minted:?}"
     );
 }
 
-/// RULE 2 on the two remaining creates, which model the same token: each is refused while
-/// the request states none — before the bus the request names is even resolved — and is
-/// served once it carries one, with the resource it minted read back through its own
-/// Describe.
+/// RULE 2 on the two remaining creates, which model the same optional token: each is
+/// served while the request states none, with the resource it minted read back through its
+/// own Describe — and the only thing a tokenless create is refused for is a resource it
+/// NAMES that is not there, which is the bus and not the token.
 #[tokio::test]
-async fn an_event_source_and_a_subscriber_state_their_idempotency_token_or_are_refused() {
+async fn an_event_source_and_a_subscriber_are_served_without_the_token_they_model() {
     let wire = Wire::new();
     let bus = wire.active_bus("the host bus", "token-rule-bus").await;
 
-    let case = "CreateEventSource with no ClientToken";
-    let (status, body) = wire
-        .call::<CreateEventSource<InMemoryEngine>>(&create_source("tokenless-source", &bus, None))
-        .await;
-    assert_eq!(
-        status, 400,
-        "case {case:?}: a create stating no ClientToken must be refused, got {status} with {:?}",
-        rendered(&body)
-    );
-    let (code, message) = refusal(case, &body);
-    assert_eq!(
-        code, INVALID_INPUT_EXCEPTION,
-        "case {case:?}: expected {INVALID_INPUT_EXCEPTION}, got {code:?} with {message:?}"
-    );
-    assert_eq!(
-        message, CLIENT_TOKEN_REQUIRED,
-        "case {case:?}: expected {CLIENT_TOKEN_REQUIRED:?}, got {message:?}"
-    );
-
-    // The refusal is about the REQUEST, so it is the answer even where the bus the request
-    // names was never minted: the token is missing whatever the rest of the request says.
+    // The missing token is nothing to refuse: what is left to refuse a tokenless create
+    // for is the bus it names that was never minted.
     let case = "CreateEventSource with no ClientToken on a bus that does not exist";
     let (status, body) = wire
         .call::<CreateEventSource<InMemoryEngine>>(&create_source(
@@ -850,26 +802,26 @@ async fn an_event_source_and_a_subscriber_state_their_idempotency_token_or_are_r
         ))
         .await;
     assert_eq!(
-        status, 400,
-        "case {case:?}: the missing token must be answered before the bus is resolved, got \
-         {status} with {:?}",
+        status, 404,
+        "case {case:?}: a create naming a bus that does not exist must be refused for that \
+         bus, got {status} with {:?}",
         rendered(&body)
     );
     let (code, message) = refusal(case, &body);
     assert_eq!(
-        code, INVALID_INPUT_EXCEPTION,
-        "case {case:?}: expected {INVALID_INPUT_EXCEPTION}, got {code:?} with {message:?}"
+        code, RESOURCE_NOT_FOUND_EXCEPTION,
+        "case {case:?}: expected {RESOURCE_NOT_FOUND_EXCEPTION}, got {code:?} with {message:?}"
     );
-    assert_eq!(
-        message, CLIENT_TOKEN_REQUIRED,
-        "case {case:?}: expected {CLIENT_TOKEN_REQUIRED:?}, got {message:?}"
+    assert!(
+        message.contains("no-such-bus"),
+        "case {case:?}: the refusal must name the bus the request addressed, got {message:?}"
     );
 
-    let case = "CreateEventSource carrying a ClientToken";
+    let case = "CreateEventSource with no ClientToken";
     let source = wire
         .ok::<CreateEventSource<InMemoryEngine>>(
             case,
-            &create_source("tokenless-source", &bus, Some("a-source-token")),
+            &create_source("tokenless-source", &bus, None),
         )
         .await;
     let source_arn = source.event_source_arn.clone().unwrap_or_else(|| {
@@ -897,33 +849,10 @@ async fn an_event_source_and_a_subscriber_state_their_idempotency_token_or_are_r
     );
 
     let case = "CreateSubscriber with no ClientToken";
-    let (status, body) = wire
-        .call::<CreateSubscriber<InMemoryEngine>>(&create_subscriber(
-            "tokenless-subscriber",
-            &bus,
-            None,
-        ))
-        .await;
-    assert_eq!(
-        status, 400,
-        "case {case:?}: a create stating no ClientToken must be refused, got {status} with {:?}",
-        rendered(&body)
-    );
-    let (code, message) = refusal(case, &body);
-    assert_eq!(
-        code, INVALID_INPUT_EXCEPTION,
-        "case {case:?}: expected {INVALID_INPUT_EXCEPTION}, got {code:?} with {message:?}"
-    );
-    assert_eq!(
-        message, CLIENT_TOKEN_REQUIRED,
-        "case {case:?}: expected {CLIENT_TOKEN_REQUIRED:?}, got {message:?}"
-    );
-
-    let case = "CreateSubscriber carrying a ClientToken";
     let subscriber = wire
         .ok::<CreateSubscriber<InMemoryEngine>>(
             case,
-            &create_subscriber("tokenless-subscriber", &bus, Some("a-subscriber-token")),
+            &create_subscriber("tokenless-subscriber", &bus, None),
         )
         .await;
     let subscriber_arn = subscriber.subscriber_arn.clone().unwrap_or_else(|| {
@@ -951,10 +880,10 @@ async fn an_event_source_and_a_subscriber_state_their_idempotency_token_or_are_r
     );
 }
 
-/// What the token BUYS, beside being required: a repeat carrying one and the same token is
-/// the one resource that token minted, while a create carrying a token of its own mints a
-/// resource of its own — and a second create of a name already taken, token or not, is the
-/// name collision.
+/// What the token BUYS, since it is not required: a repeat carrying one and the same token
+/// is the one resource that token minted, while a create carrying a token of its own mints
+/// a resource of its own — and a second create of a name already taken, token or not, is
+/// the name collision.
 #[tokio::test]
 async fn a_repeated_token_replays_the_bus_it_minted_and_a_fresh_one_mints_its_own() {
     let wire = Wire::new();

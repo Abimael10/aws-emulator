@@ -591,7 +591,7 @@ async fn the_wire_answer_reports_a_revoked_event_source() {
         &router,
         &CreateEventBusInput {
             name: "revoke-wire-bus".to_string(),
-            // The idempotency token this service requires of every create.
+            // The create's `@idempotencyToken`, which the model leaves optional.
             client_token: Some("a-wire-bus-token".to_string()),
             ..Default::default()
         },

@@ -431,7 +431,7 @@ async fn every_reported_instant_is_a_whole_second_tagged_epoch_value() {
                 storage_configuration: Some(StorageConfiguration {
                     retention_period_in_days: Some(7),
                 }),
-                // The idempotency token this service requires of every create.
+                // The create's `@idempotencyToken`, which the model leaves optional.
                 client_token: Some("an-instants-token".to_string()),
                 ..Default::default()
             },

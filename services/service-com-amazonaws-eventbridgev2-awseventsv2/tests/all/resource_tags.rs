@@ -634,7 +634,7 @@ async fn the_wire_answer_carries_the_stored_tag_set() {
         &CreateEventBusInput {
             name: "tags-wire-bus".to_string(),
             tags: Some(bus_tags.clone().into_iter().collect()),
-            // The idempotency token this service requires of every create.
+            // The create's `@idempotencyToken`, which the model leaves optional.
             client_token: Some("a-wire-bus-token".to_string()),
             ..Default::default()
         },

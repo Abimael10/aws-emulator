@@ -199,8 +199,8 @@ async fn given_active_bus(router: &MultiServiceRouter, case: &str, name: &str) -
         router,
         &CreateEventBusInput {
             name: name.to_string(),
-            // Every create this service serves carries the idempotency token it
-            // requires; the name makes the token of each row its own.
+            // The create's `@idempotencyToken`, which the model leaves optional; the
+            // name makes the token of each row its own.
             client_token: Some(format!("token-for-{name}")),
             ..Default::default()
         },
@@ -268,7 +268,7 @@ async fn given_subscriber(
             transformer: requested.transformer,
             starting_position: requested.starting_position.map(str::to_string),
             point_in_time_configuration: requested.point,
-            // The idempotency token this service requires of every create.
+            // The create's `@idempotencyToken`, which the model leaves optional.
             client_token: Some(format!("token-for-{name}")),
             ..Default::default()
         },

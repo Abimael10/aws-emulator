@@ -359,7 +359,7 @@ async fn the_event_bus_workflow_runs_over_the_wire() {
         storage_configuration: Some(StorageConfiguration {
             retention_period_in_days: Some(7),
         }),
-        // The idempotency token this service requires of every create.
+        // The create's `@idempotencyToken`, which the model leaves optional.
         client_token: Some("a-wire-demo-token".to_string()),
         ..Default::default()
     };

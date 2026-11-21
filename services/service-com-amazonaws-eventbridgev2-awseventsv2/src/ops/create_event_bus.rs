@@ -226,9 +226,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is gone replays nothing and its name is free again. The lookup is per
         // region, because a bus belongs to the region its create named.
         //
-        // A request that states no token at all is refused before it reaches
-        // here (`crate::service::validation`), so the `None` arm is only
-        // reachable from a caller inside this process.
+        // The member is the model's `@idempotencyToken` and optional: a request
+        // that states no token asks for no replay, so it falls through to the
+        // mint below and the bus it creates carries no replay record.
         if let Some(token) = input.client_token.as_deref() {
             if let Some(bus) = state.bus_by_client_token(&region, token) {
                 if !matches_stored(bus, &input) {

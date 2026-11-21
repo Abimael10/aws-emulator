@@ -968,7 +968,7 @@ async fn the_event_source_workflow_runs_over_the_wire() {
         .ok::<CreateEventBus<InMemoryEngine>>(
             &CreateEventBusInput {
                 name: "wire-bus".to_string(),
-                // The idempotency token this service requires of every create.
+                // The create's `@idempotencyToken`, which the model leaves optional.
                 client_token: Some("a-wire-bus-token".to_string()),
                 ..Default::default()
             },
