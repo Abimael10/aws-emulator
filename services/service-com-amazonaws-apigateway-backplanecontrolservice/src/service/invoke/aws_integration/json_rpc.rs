@@ -91,9 +91,20 @@ const SERVED: &[&JsonRpcApi] = &[&super::dynamodb::API, &super::kinesis::API];
 /// stream api, `operation="GetItem"` on the table api).
 const REFUSAL_STATUS: u16 = 400;
 
-/// The shape each of these apis names an authorization refusal by, in its own namespace
-/// (`com.amazonaws.{subdomain}#AccessDeniedException`).
+/// The error code each of these apis names an authorization refusal by, which is the whole of
+/// what the refusal's `__type` carries: an authorization refusal is decided AHEAD of the
+/// service's own code and serialized by the layer that decides it, not by the modelled error
+/// shape of the api, so the value is the BARE code rather than a shape id qualified by the
+/// model's namespace — which is also what an SDK resolves the error code it classifies by out
+/// of `__type`.
 const ACCESS_DENIED_TYPE: &str = "AccessDeniedException";
+
+/// The member that refusal carries its sentence in, written by the same layer: `Message`,
+/// capitalized, rather than the lower-case `message` member one of these apis declares on its
+/// own modelled error shape. The AWS common error envelope spells it this way wherever a
+/// service's frontend words a refusal of its own — the Lambda data plane's refusal of the same
+/// integration carries it under that member too ([`super::lambda`]).
+const MESSAGE_MEMBER: &str = "Message";
 
 /// The header a JSON-RPC request names its operation in.
 const TARGET_HEADER: &str = "x-amz-target";
@@ -277,15 +288,17 @@ fn addressed_resource(api: &JsonRpcApi, body: &[u8]) -> Addressed {
 /// protocol words an unauthorized call in — the principal the call would have been made as,
 /// the action it asked for, the resource it addressed and the clause IAM closes an implicit
 /// deny with, through the tree's one formatter for that sentence
-/// ([`::service_common::iam_authorization::not_authorized_by_identity_policy`]).
+/// ([`::service_common::iam_authorization::not_authorized_by_identity_policy`]) — under the
+/// error code and the message member that envelope carries ([`ACCESS_DENIED_TYPE`],
+/// [`MESSAGE_MEMBER`]).
+///
+/// `principal` is the identity the call would have been made AS, which is a session of the
+/// role the integration names rather than the role itself ([`super::acting_principal`]).
 pub(super) fn access_denied(call: &Call, principal: &str) -> Answered {
     let action = call.iam_action();
     let body = ::serde_json::json!({
-        "__type": format!(
-            "com.amazonaws.{namespace}#{ACCESS_DENIED_TYPE}",
-            namespace = call.api.subdomain,
-        ),
-        "message": ::service_common::iam_authorization::not_authorized_by_identity_policy(
+        "__type": ACCESS_DENIED_TYPE,
+        MESSAGE_MEMBER: ::service_common::iam_authorization::not_authorized_by_identity_policy(
             principal,
             &action,
             &call.resource_arn(),
@@ -523,28 +536,22 @@ mod tests {
         }
     }
 
-    /// RULE: a refusal of the integration's role carries the class the addressed api words an
-    /// unauthorized call in, naming the principal, the action and the resource.
+    /// RULE: a refusal of the integration's role carries the BARE error code the addressed api
+    /// words an unauthorized call under, in the AWS common envelope's `Message` member, naming
+    /// the principal the call would have been made as, the action and the resource.
     #[test]
     fn an_unauthorized_call_is_refused_the_way_the_addressed_api_words_it() {
-        const ROLE: &str = "arn:aws:iam::000000000000:role/apigateway-integration";
-        /// (case, the api, the action, the document, the `__type`, the resource the sentence
-        /// names)
-        type Row<'a> = (
-            &'a str,
-            &'static JsonRpcApi,
-            &'a str,
-            &'a str,
-            &'a str,
-            &'a str,
-        );
+        /// The identity such a call is made as, which is what the sentence names.
+        const SESSION: &str =
+            "arn:aws:sts::000000000000:assumed-role/apigateway-integration/BackplaneAssumeRoleSession";
+        /// (case, the api, the action, the document, the resource the sentence names)
+        type Row<'a> = (&'a str, &'static JsonRpcApi, &'a str, &'a str, &'a str);
         let rows: &[Row<'_>] = &[
             (
                 "a table write",
                 &super::super::dynamodb::API,
                 "PutItem",
                 r#"{"TableName":"capacity"}"#,
-                "com.amazonaws.dynamodb#AccessDeniedException",
                 "arn:aws:dynamodb:eu-west-1:000000000000:table/capacity",
             ),
             (
@@ -552,12 +559,18 @@ mod tests {
                 &super::super::kinesis::API,
                 "PutRecord",
                 r#"{"StreamName":"orders","Data":"aGk=","PartitionKey":"k"}"#,
-                "com.amazonaws.kinesis#AccessDeniedException",
                 "arn:aws:kinesis:eu-west-1:000000000000:stream/orders",
             ),
+            (
+                "a stream write naming its stream by ARN, in another Region",
+                &super::super::kinesis::API,
+                "PutRecords",
+                r#"{"StreamARN":"arn:aws:kinesis:us-east-2:000000000000:stream/other","Records":[]}"#,
+                "arn:aws:kinesis:us-east-2:000000000000:stream/other",
+            ),
         ];
-        for (case, api, action, body, expected_type, expected_resource) in rows {
-            let refused = access_denied(&call(api, action, body), ROLE);
+        for (case, api, action, body, expected_resource) in rows {
+            let refused = access_denied(&call(api, action, body), SESSION);
             assert_eq!(
                 refused.status, REFUSAL_STATUS,
                 "case {case:?}: expected the status that api refuses a client-side failure \
@@ -568,15 +581,21 @@ mod tests {
                 .expect("the refusal carries the service's own JSON envelope");
             assert_eq!(
                 document["__type"],
-                Value::String((*expected_type).to_string()),
-                "case {case:?}: expected the class the service names it by, got {document:?}"
+                Value::String(ACCESS_DENIED_TYPE.to_string()),
+                "case {case:?}: expected the bare error code the service names it by, got \
+                 {document:?}"
             );
-            let message = document["message"].as_str().unwrap_or_default();
+            assert!(
+                document.get("message").is_none(),
+                "case {case:?}: the sentence travels under {MESSAGE_MEMBER:?} alone, got \
+                 {document:?}"
+            );
+            let message = document[MESSAGE_MEMBER].as_str().unwrap_or_default();
             let action = format!("{}:{action}", api.subdomain);
             assert_eq!(
                 message,
                 format!(
-                    "User: {ROLE} is not authorized to perform: {action} on resource: \
+                    "User: {SESSION} is not authorized to perform: {action} on resource: \
                      {expected_resource} because no identity-based policy allows the {action} \
                      action"
                 ),

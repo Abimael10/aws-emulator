@@ -857,14 +857,21 @@ async fn the_integration_role_decides_whether_the_publish_is_made() {
                     answered.body
                 );
                 let sentence = xml_element(&answered.body, "Message").unwrap_or_default();
+                // The call is made as a SESSION of the role, never as the role itself, so
+                // that session is the identity the refusal names.
+                let session = format!(
+                    "arn:aws:sts::{account}:assumed-role/{role}/BackplaneAssumeRoleSession",
+                    account = ::engine::emulator_account_id(),
+                    role = without_publish.rsplit('/').next().unwrap_or_default(),
+                );
                 assert!(
                     sentence.contains(&format!(
-                        "User: {without_publish} is not authorized to perform: SNS:Publish on \
+                        "User: {session} is not authorized to perform: SNS:Publish on \
                          resource: {topic_arn}"
                     )) && sentence
                         .contains("because no identity-based policy allows the SNS:Publish action"),
-                    "case {case:?}: expected the sentence naming the role, the action and the \
-                     topic, got {sentence:?}"
+                    "case {case:?}: expected the sentence naming the role's session, the action \
+                     and the topic, got {sentence:?}"
                 );
             }
             _ => assert_eq!(

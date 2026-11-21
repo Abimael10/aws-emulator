@@ -177,7 +177,8 @@ impl TopicCall {
 /// addressed and the clause closing an implicit deny, through the tree's one formatter for
 /// that sentence ([`::service_common::iam_authorization::not_authorized_by_identity_policy`]).
 ///
-/// `principal` is the role the call would have been made under.
+/// `principal` is the identity the call would have been made as: a session of the role the
+/// integration names ([`super::acting_principal`]).
 pub(super) fn access_denied(call: &TopicCall, principal: &str) -> Answered {
     let action = call.iam_action();
     let message = ::service_common::iam_authorization::not_authorized_by_identity_policy(

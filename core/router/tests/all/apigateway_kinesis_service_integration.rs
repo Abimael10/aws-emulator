@@ -110,8 +110,28 @@ const CONFIGURATION_ERROR_MESSAGE: &str = "Internal server error";
 /// The class the stream api names a refusal of a call the caller may not make by: that model
 /// declares `AccessDeniedException` a client error (`smithy_query(query="operation",
 /// operation="PutRecord")`). The STATUS a caller reads is the one the api's own integration
-/// response names; the class is the service's, and travels in the document it sent.
+/// response names; the class is the service's, and travels in the document it sent — as the
+/// BARE code, which is what the layer that decides authorization ahead of the service writes.
 const ACCESS_DENIED_TYPE: &str = "AccessDeniedException";
+
+/// The member that refusal carries its sentence in: the AWS common error envelope's
+/// capitalized `Message`.
+const MESSAGE_MEMBER: &str = "Message";
+
+/// The name of the session API Gateway assumes an integration's `credentials` role into,
+/// which is the identity such a call is made as and therefore the principal its refusal names.
+const INTEGRATION_SESSION_NAME: &str = "BackplaneAssumeRoleSession";
+
+/// The session of the role `role_arn` an integration's call acts as:
+/// `arn:aws:sts::{account}:assumed-role/{role name}/{session name}` — a role is never acted as
+/// directly.
+fn integration_session(role_arn: &str) -> String {
+    let name = role_arn.rsplit('/').next().unwrap_or_default();
+    format!(
+        "arn:aws:sts::{account}:assumed-role/{name}/{INTEGRATION_SESSION_NAME}",
+        account = engine::emulator_account_id()
+    )
+}
 
 /// The `statusCode` of the integration response every row declares with NO
 /// `selectionPattern` — the api's DEFAULT, which catches an answer no pattern selects.
@@ -808,24 +828,19 @@ async fn a_deployed_method_integrating_a_kinesis_action_performs_it() {
                     answered.status,
                     answered.text()
                 );
-                let class = body["__type"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .rsplit(['#', '/'])
-                    .next()
-                    .unwrap_or_default()
-                    .to_string();
                 assert_eq!(
-                    class, ACCESS_DENIED_TYPE,
-                    "case {case:?}: expected the class that api names an unauthorized call by, \
-                     got {body:?}"
+                    body["__type"].as_str().unwrap_or_default(),
+                    ACCESS_DENIED_TYPE,
+                    "case {case:?}: expected the bare code that api names an unauthorized \
+                     call by, got {body:?}"
                 );
                 let action = format!("kinesis:{}", row.action);
                 assert_eq!(
-                    body["message"].as_str().unwrap_or_default(),
+                    body[MESSAGE_MEMBER].as_str().unwrap_or_default(),
                     format!(
-                        "User: {elsewhere} is not authorized to perform: {action} on resource: \
+                        "User: {session} is not authorized to perform: {action} on resource: \
                          {resource} because no identity-based policy allows the {action} action",
+                        session = integration_session(&elsewhere),
                         resource = stream_arn(STREAM)
                     ),
                     "case {case:?}: expected the sentence IAM words an authorization failure \

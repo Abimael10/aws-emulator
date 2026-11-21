@@ -200,7 +200,8 @@ impl Call {
 /// the principal the call would have been made as, the action it asked for, the function it
 /// addressed and the clause closing an implicit deny.
 ///
-/// `principal` is the role the call would have been made under.
+/// `principal` is the identity the call would have been made as: a session of the role the
+/// integration names ([`super::acting_principal`]).
 pub(super) fn access_denied(call: &Call, principal: &str) -> Answered {
     let action = call.iam_action();
     let body = ::serde_json::json!({

@@ -832,7 +832,7 @@ async fn a_deployed_method_integrating_a_dynamodb_action_performs_it() {
         refused.status,
         refused.text()
     );
-    let message = refused.json()["message"]
+    let message = refused.json()["Message"]
         .as_str()
         .unwrap_or_default()
         .to_string();

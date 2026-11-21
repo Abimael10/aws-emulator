@@ -66,7 +66,9 @@
 //!   the resource it addresses ([`::service_common::iam_authorization`], the tree's one
 //!   evaluation of policy documents). A call they do not allow is REFUSED, and it is
 //!   refused the way the service it was addressed to refuses an unauthorized call: HTTP
-//!   403 with the `AccessDenied` code and the sentence that service publishes for it. That
+//!   403 with the `AccessDenied` code and the sentence that service publishes for it,
+//!   which names the SESSION of that role the call would have been made as
+//!   ([`acting_principal`]) rather than the role's own IAM ARN. That
 //!   refusal is then mapped like any other backend answer (below), which is what lets an
 //!   api that declares an integration response for the 4xx class answer its caller 403 and
 //!   one that declares none answer through its default.
@@ -160,6 +162,17 @@ const INTEGRATION_REQUEST_PATH_PREFIX: &str = "integration.request.path.";
 /// The service principal an integration's execution role has to trust for API Gateway to
 /// make the call under it, as a trust document names one.
 const SERVICE_PRINCIPAL: &str = "apigateway.amazonaws.com";
+
+/// The name of the SESSION API Gateway opens when it assumes an integration's `credentials`
+/// role, which is the session every call made under that role acts as and therefore the
+/// identity an authorization refusal of such a call names
+/// (`assumed-role/{role name}/{this}`): a role is never acted as directly, so what IAM
+/// decides and blames is the session. It names this GATEWAY's own assumption rather than any
+/// one api, which is why the HTTP-api plane opens the session it MINTS for the same member
+/// under the same name (`service-com-amazonaws-apigatewayv2-apigatewayv2`'s
+/// `service::invoke::service_action::credentials`), and `session_name` is each plane's own to
+/// state ([`::service_common::iam_role::assumed_role_session_arn`]).
+const INTEGRATION_ROLE_SESSION_NAME: &str = "BackplaneAssumeRoleSession";
 
 /// The `credentials` value that asks for the CALLER's own identity to be passed through
 /// rather than for a role to be assumed, as the operation that stores the member states it
@@ -531,9 +544,9 @@ impl ServiceCall {
     /// The refusal the service answers a call the caller may not make with, in that
     /// service's own error envelope and naming the resource the call addressed.
     ///
-    /// `principal` is the role the call would have been made under, for the service that words
-    /// its refusal with the principal as IAM does; the services whose envelope names only the
-    /// resource do not carry it.
+    /// `principal` is the identity the call would have been made AS ([`acting_principal`]),
+    /// for the service that words its refusal with the principal as IAM does; the services
+    /// whose envelope names only the resource do not carry it.
     fn access_denied(&self, principal: &str) -> Answered {
         match self {
             Self::Object(object) => Answered {
@@ -620,9 +633,9 @@ async fn served(
 ) -> Result<Served, UnservedIntegration> {
     let backend = match authorization(ctx, integration, target).await {
         Authorization::Unassumable(reason) => return Err(unanswered(&reason)),
-        Authorization::Withheld => Backend::of(
-            target.access_denied(integration.credentials.as_deref().unwrap_or_default()),
-        ),
+        Authorization::Withheld => Backend::of(target.access_denied(&acting_principal(
+            integration.credentials.as_deref().unwrap_or_default(),
+        ))),
         Authorization::Admitted => target.answered(ctx, call).await?,
     };
     let answered = backend.answered;
@@ -661,6 +674,24 @@ enum Authorization {
     /// The role may not make this call, so the service refuses it in its own words
     /// ([`ServiceCall::access_denied`]).
     Withheld,
+}
+
+/// The identity an `AWS` integration's call is made AS, which is the principal a refusal of
+/// it names: a SESSION of the role `Integration$credentials` names
+/// (`arn:{partition}:sts::{account}:assumed-role/{role name}/{session name}`), opened under
+/// the name this service opens one with ([`INTEGRATION_ROLE_SESSION_NAME`]), through the
+/// tree's one shaping of that ARN.
+///
+/// A role is never acted as directly — "the credentials required for the integration"
+/// (`Integration$credentials`) are a role API Gateway ASSUMES — so the IAM ARN the member
+/// carries names what was assumed and not who the call speaks for. The role's own partition
+/// and account are kept, and a role held under a path is named by the name IAM holds it under,
+/// which a session ARN carries no path for.
+fn acting_principal(role_arn: &str) -> String {
+    ::service_common::iam_role::assumed_role_session_arn(
+        role_arn.trim(),
+        INTEGRATION_ROLE_SESSION_NAME,
+    )
 }
 
 /// What the integration's `credentials` role makes of the call `target` addresses.
@@ -1914,6 +1945,52 @@ mod tests {
                 selected.is_none(),
                 "case {case:?}: expected no integration response to map it, got {:?}",
                 selected.map(|response| response.status_code.clone())
+            );
+        }
+    }
+
+    /// RULE: the identity an `AWS` integration's call is made as is a SESSION of the role its
+    /// `credentials` names, so that is the principal a refusal names — never the role's own
+    /// IAM ARN. The rows differ along how the role is held: directly, under a path several
+    /// levels deep, in another partition, and in another account.
+    #[test]
+    fn the_call_is_made_as_a_session_of_the_role_the_integration_names() {
+        // (case, the `credentials` value, the session the call acts as)
+        let rows: &[(&str, &str, &str)] = &[
+            (
+                "a role of this account",
+                "arn:aws:iam::000000000000:role/apigateway-kinesis",
+                "arn:aws:sts::000000000000:assumed-role/apigateway-kinesis/\
+                 BackplaneAssumeRoleSession",
+            ),
+            (
+                "a role held under a path, which a session ARN carries none of",
+                "arn:aws:iam::000000000000:role/integrations/stream/writer",
+                "arn:aws:sts::000000000000:assumed-role/writer/BackplaneAssumeRoleSession",
+            ),
+            (
+                "a role of another partition",
+                "arn:aws-us-gov:iam::210987654321:role/published",
+                "arn:aws-us-gov:sts::210987654321:assumed-role/published/\
+                 BackplaneAssumeRoleSession",
+            ),
+            (
+                "a role of another account, named as that account's session",
+                "arn:aws:iam::111122223333:role/cross-account",
+                "arn:aws:sts::111122223333:assumed-role/cross-account/\
+                 BackplaneAssumeRoleSession",
+            ),
+            (
+                "a value carrying surrounding space, as the member is read everywhere else",
+                "  arn:aws:iam::000000000000:role/padded  ",
+                "arn:aws:sts::000000000000:assumed-role/padded/BackplaneAssumeRoleSession",
+            ),
+        ];
+        for (case, credentials, expected) in rows.iter().copied() {
+            let named = acting_principal(credentials);
+            assert_eq!(
+                named, expected,
+                "case {case:?}: expected {expected:?}, got {named:?}"
             );
         }
     }

@@ -752,6 +752,15 @@ async fn a_deployed_method_integrating_a_function_invokes_it_under_the_role_it_n
         },
     ];
 
+    // The call is made as a SESSION of the role the integration names, never as the role
+    // itself, so that session is the identity Lambda's refusal names: a session ARN carries
+    // the role's own name under the session name API Gateway opens one with, and no path.
+    let narrow_session = format!(
+        "arn:aws:sts::{account}:assumed-role/{role}/BackplaneAssumeRoleSession",
+        account = engine::emulator_account_id(),
+        role = narrow.rsplit('/').next().unwrap_or_default(),
+    );
+
     for row in &rows {
         let answered = invoke(&router, &api, row.route, &json!({ "name": row.name })).await;
         let text = answered.text();
@@ -814,9 +823,9 @@ async fn a_deployed_method_integrating_a_function_invokes_it_under_the_role_it_n
                     answered.json()["Message"].as_str(),
                     Some(
                         format!(
-                            "User: {narrow} is not authorized to perform: {INVOKE_ACTION} on \
-                             resource: {function} because no identity-based policy allows the \
-                             {INVOKE_ACTION} action"
+                            "User: {narrow_session} is not authorized to perform: \
+                             {INVOKE_ACTION} on resource: {function} because no identity-based \
+                             policy allows the {INVOKE_ACTION} action"
                         )
                         .as_str()
                     ),
