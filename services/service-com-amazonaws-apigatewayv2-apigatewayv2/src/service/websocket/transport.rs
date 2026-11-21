@@ -621,9 +621,12 @@ async fn admission(
     if let Some(refusal) = browser_refusal(offer) {
         return Decided::refused(None, refusal);
     }
-    let stage_name = super::super::data_plane::first_segment(offer.path())
-        .unwrap_or_default()
-        .to_string();
+    // The stage this handshake names, read the way the service endpoint reads it: the path's
+    // first segment, or the stage behind the endpoint marker a client that rewrote the
+    // announced URI into a path carries. A marker naming another api names no stage of this
+    // one, which is an address that serves nothing — the empty name below resolves to no
+    // stage, so `offered` refuses it `403` exactly as an unknown stage name is refused.
+    let stage_name = super::stage_on_the_apis_socket(api_id, offer.path()).unwrap_or_default();
     let offered = match offered(state, api_id, &stage_name, offer) {
         Ok(offered) => offered,
         Err(refusal) => return Decided::refused(None, refusal),

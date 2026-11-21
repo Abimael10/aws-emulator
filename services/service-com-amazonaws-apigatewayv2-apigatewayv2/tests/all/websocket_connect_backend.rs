@@ -17,15 +17,17 @@
 //! The rule the LAST table is a slice of: **a WEBSOCKET connection request is admitted or
 //! refused by the REPLY the `$connect` route's integration produced, so a route that fronts a
 //! BACKEND is refused only by the status that backend answered — and with the body it
-//! answered — while the gateway's own `500` `{"message":"Internal server error"}` is owed
-//! exactly to a `$connect` route that can serve the connection request no reply at all: one
-//! targeting no integration of the api, and one bound to a `MOCK`, which reaches no backend
-//! and so gives the connection request no decision. An api with no `$connect` route has
-//! nothing to refuse the connection.** `MOCK` is "for integrating the route or method request
-//! with API Gateway as a 'loopback' endpoint without invoking any backend" and `AWS_PROXY` is
+//! answered — while a route bound to a `MOCK` is admitted or refused by the reply that
+//! loopback integration computes from its own records; the gateway's own `500`
+//! `{"message":"Internal server error"}` is owed exactly to a `$connect` route that can serve
+//! the connection request no reply at all: one targeting no integration of the api, and a
+//! `MOCK` that selects no integration response to answer from. An api with no `$connect` route
+//! has nothing to refuse the connection.** `MOCK` is "for integrating the route or method
+//! request with API Gateway as a 'loopback' endpoint without invoking any backend. Supported
+//! only for WebSocket APIs" and `AWS_PROXY` is
 //! "for integrating the route or method request with a Lambda function or other AWS service
 //! action" (`smithy_query(query="shape", shape="Integration")`, member `IntegrationType`),
-//! which is why the two answer a connection request differently.
+//! which is why the two REACH a connection request's decision differently.
 //!
 //! Nothing in the first table is a value this emulator fills in: the mapping is asserted
 //! through the DECISION of a function that ran, which is why AWS Lambda is mounted beside
@@ -549,6 +551,10 @@ enum Connect {
     /// `2xx` a loopback integration answers from its own records, and the `$default`
     /// integration response that status selects.
     Mock,
+    /// The same `MOCK` request template with NO integration response for the status it
+    /// renders to select: a loopback integration that answers the connection request nothing
+    /// at all.
+    MockWithoutResponse,
     /// An `AWS_PROXY` integration whose function answers this `statusCode` and this `body`
     /// (an empty body being a reply that carries none).
     Proxy(u16, &'static str),
@@ -575,7 +581,8 @@ struct AdmissionRow {
 }
 
 /// The rows differ along what the `$connect` route fronts — nothing at all, a `MOCK` loopback
-/// whose template renders a `2xx`, a function that admits, a function that refuses — and
+/// whose template renders a `2xx`, a `MOCK` with no integration response to select, a function
+/// that admits, a function that refuses — and
 /// along the status and body that function answers: a `2xx`, a `4xx` the client is refused
 /// with, and a `5xx`, each of which the gateway relays rather than replacing with one of its
 /// own. The recorded case is the `MOCK` row and the `(200, "")` row, which is the same api's
@@ -594,6 +601,12 @@ const ADMISSION_ROWS: &[AdmissionRow] = &[
     AdmissionRow {
         case: "a $connect route bound to a MOCK loopback that renders a 2xx",
         connect: Connect::Mock,
+        expected: Expected::Admitted,
+    },
+    AdmissionRow {
+        case: "a $connect route bound to a MOCK loopback that selects no integration \
+               response",
+        connect: Connect::MockWithoutResponse,
         expected: Expected::Unplaceable,
     },
     AdmissionRow {
@@ -665,7 +678,7 @@ async fn deploy_connect(
     // all.
     let target: Option<String> = match connect {
         Connect::Absent => None,
-        Connect::Mock => {
+        Connect::Mock | Connect::MockWithoutResponse => {
             let integration = created(
                 emulator,
                 case,
@@ -678,14 +691,18 @@ async fn deploy_connect(
             )
             .await;
             let integration_id = as_str(&integration, "integrationId");
-            created(
-                emulator,
-                case,
-                &format!("/v2/apis/{api_id}/integrations/{integration_id}/integrationresponses"),
-                json!({ "integrationResponseKey": "$default" }),
-                "CreateIntegrationResponse",
-            )
-            .await;
+            if matches!(connect, Connect::Mock) {
+                created(
+                    emulator,
+                    case,
+                    &format!(
+                        "/v2/apis/{api_id}/integrations/{integration_id}/integrationresponses"
+                    ),
+                    json!({ "integrationResponseKey": "$default" }),
+                    "CreateIntegrationResponse",
+                )
+                .await;
+            }
             Some(integration_id)
         }
         Connect::Proxy(status, body) => {

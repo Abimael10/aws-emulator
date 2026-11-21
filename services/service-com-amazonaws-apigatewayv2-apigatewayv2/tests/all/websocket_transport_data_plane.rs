@@ -62,9 +62,11 @@ const REPLY_DEADLINE: Duration = Duration::from_secs(120);
 const SWITCHING_PROTOCOLS: u16 = 101;
 
 /// The statuses a refused handshake carries: the `403` an `execute-api` endpoint answers for
-/// a stage it does not serve, and the `500` a gateway answers for a connection request its
-/// api's configuration cannot be served from.
+/// a stage it does not serve, the `404` a `$connect` integration's own reply refuses a client
+/// with, and the `500` a gateway answers for a connection request its api's configuration
+/// cannot be served from.
 const FORBIDDEN: u16 = 403;
+const NOT_FOUND: u16 = 404;
 const INTERNAL_SERVER_ERROR: u16 = 500;
 
 /// The expression AWS documents for a WebSocket api whose messages carry an `action`
@@ -404,8 +406,12 @@ async fn the_announced_socket_answers_the_handshake_from_the_apis_records() {
             expected: Err(INTERNAL_SERVER_ERROR),
         },
         Row {
-            case: "a $connect route whose MOCK integration selects a 2xx response still \
-                   fails the handshake: a MOCK gives no connection decision",
+            // A `MOCK` is API Gateway's loopback endpoint for a WebSocket route, so it
+            // ANSWERS the connection request from the integration's own records: the status
+            // its rendered request template names selects an integration response, and a
+            // `2xx` admits the connection exactly as a backend's `2xx` would.
+            case: "a $connect route whose MOCK integration selects a 2xx response completes \
+                   the handshake",
             connect_integration: Some(json!({
                 "integrationType": "MOCK",
                 "requestTemplates": { "$default": "{\"statusCode\": 200}" }
@@ -413,11 +419,14 @@ async fn the_announced_socket_answers_the_handshake_from_the_apis_records() {
             connect_responses: vec![json!({ "integrationResponseKey": "/2\\d\\d/" })],
             deploy: true,
             handshake_stage: stage,
-            expected: Err(INTERNAL_SERVER_ERROR),
+            expected: Ok(()),
         },
         Row {
-            case: "a $connect route whose MOCK integration selects a 4xx response fails \
-                   the handshake",
+            // The other side of that reading: a reply outside `2xx` refuses the handshake
+            // with the status the integration answered, which for a `MOCK` is the status its
+            // own template named.
+            case: "a $connect route whose MOCK integration selects a 4xx response refuses \
+                   the handshake with that status",
             connect_integration: Some(json!({
                 "integrationType": "MOCK",
                 "requestTemplates": { "$default": "{\"statusCode\": 404}" }
@@ -425,7 +434,7 @@ async fn the_announced_socket_answers_the_handshake_from_the_apis_records() {
             connect_responses: vec![json!({ "integrationResponseKey": "/4\\d{2}/" })],
             deploy: true,
             handshake_stage: stage,
-            expected: Err(INTERNAL_SERVER_ERROR),
+            expected: Err(NOT_FOUND),
         },
         Row {
             // A $connect route whose integration fronts a FUNCTION this emulator does not
@@ -529,6 +538,216 @@ async fn the_announced_socket_answers_the_handshake_from_the_apis_records() {
             (Err(expected), Ok(_socket)) => panic!(
                 "case {case:?}: expected the handshake refused {expected}, got \
                  {SWITCHING_PROTOCOLS}"
+            ),
+        }
+    }
+}
+
+/// The whole exchange an api that reaches NO backend at all carries: a `$connect` route bound
+/// to a `MOCK` whose own records admit the connection, and action routes whose `MOCK`
+/// integrations render the reply each frame is answered with on that same socket.
+///
+/// It is the configuration a client can deploy without any compute service — the one a
+/// CloudFormation template of api, integrations, integration responses, routes, route
+/// responses, a deployment and a stage describes (`core/router/tests/all/
+/// cloudformation_websocket_action_dispatch.rs` deploys exactly that estate) — so the whole
+/// of it has to hold over one connection rather than row by row.
+#[tokio::test]
+async fn a_mock_backed_api_admits_the_connection_and_answers_each_action() {
+    /// One row: the message the client sends, and the reply the route it selects renders.
+    struct Row {
+        case: &'static str,
+        message: &'static str,
+        expected: &'static str,
+    }
+
+    let case = "an api whose every route is a MOCK loopback";
+    let emulator = emulator();
+    let api = create_api(&emulator, case, "mock-session-api").await;
+
+    // The `$connect` route's own integration: a MOCK that renders a 2xx and holds the
+    // response that status selects, which is what admits the connection.
+    let connect = create_integration(
+        &emulator,
+        case,
+        &api.api_id,
+        json!({
+            "integrationType": "MOCK",
+            "requestTemplates": { "$default": "{\"statusCode\": 200}" }
+        }),
+    )
+    .await;
+    create_integration_response(
+        &emulator,
+        case,
+        &api.api_id,
+        &connect,
+        json!({ "integrationResponseKey": "/2\\d\\d/" }),
+    )
+    .await;
+    create_route(&emulator, case, &api.api_id, "$connect", &connect, false).await;
+
+    // One two-way route per action value the api serves, each with the reply its own
+    // integration response renders: the two the expression selects by name, and `$default`.
+    for (route_key, reply) in [
+        ("echo", r#"{"served":"echo"}"#),
+        ("status", r#"{"served":"status"}"#),
+        ("$default", r#"{"served":"default"}"#),
+    ] {
+        let integration = create_integration(
+            &emulator,
+            case,
+            &api.api_id,
+            json!({
+                "integrationType": "MOCK",
+                "requestTemplates": { "$default": "{\"statusCode\": 200}" }
+            }),
+        )
+        .await;
+        create_integration_response(
+            &emulator,
+            case,
+            &api.api_id,
+            &integration,
+            json!({
+                "integrationResponseKey": "/2\\d\\d/",
+                "responseTemplates": { "$default": reply }
+            }),
+        )
+        .await;
+        create_route(&emulator, case, &api.api_id, route_key, &integration, true).await;
+    }
+    create_stage(&emulator, case, &api.api_id, "prod", true).await;
+
+    let mut socket = handshake(case, &api.authority, "prod")
+        .await
+        .unwrap_or_else(|status| {
+            panic!(
+                "case {case:?}: a MOCK-backed $connect whose records reply 2xx must complete \
+                 the handshake, got {status}"
+            )
+        });
+
+    // The rows span what the dispatch generalises over: each declared action value, an action
+    // no route key matches, and a message carrying no action member at all.
+    let rows = &[
+        Row {
+            case: "the first declared action selects its own route",
+            message: r#"{"action":"echo","note":"one"}"#,
+            expected: r#"{"served":"echo"}"#,
+        },
+        Row {
+            case: "the second declared action selects the other route",
+            message: r#"{"action":"status"}"#,
+            expected: r#"{"served":"status"}"#,
+        },
+        Row {
+            case: "an action no declared route key matches is served by $default",
+            message: r#"{"action":"not-declared"}"#,
+            expected: r#"{"served":"default"}"#,
+        },
+        Row {
+            case: "a message carrying no action member is served by $default",
+            message: r#"{"note":"no action here"}"#,
+            expected: r#"{"served":"default"}"#,
+        },
+    ];
+
+    for row in rows {
+        let answered = exchanged_reply(row.case, &mut socket, row.message).await;
+        assert_eq!(
+            answered, row.expected,
+            "case {:?}: expected the reply {:?}, got {answered:?}",
+            row.case, row.expected
+        );
+    }
+}
+
+/// A handshake arriving on the api's own socket names its stage either way a client writes
+/// the address: the path's first segment, or the endpoint MARKER a client that rewrote the
+/// announced URI into a path carries.
+#[tokio::test]
+async fn the_announced_socket_reads_the_stage_the_endpoint_marker_carries() {
+    /// One row: the path the client's handshake addresses, built from the api's id, and
+    /// whether the socket completes it.
+    struct Row {
+        case: &'static str,
+        path: fn(&str) -> String,
+        expected: Result<(), u16>,
+    }
+
+    /// The stage every row addresses, named once so the stage these rows are created with
+    /// and the one their paths spell cannot drift (a `fn` pointer captures nothing, so the
+    /// rows read this const rather than a binding).
+    const STAGE: &str = "prod";
+
+    // The rows span the spellings of ONE address: the plain stage path, the marker followed
+    // by the endpoint PREFIX and the api id, the marker followed by the endpoint HOST, a
+    // marker naming another api, and a marker naming no stage of this api. The last two name
+    // nothing this socket serves, which is the `403` an `execute-api` endpoint answers for
+    // what it does not serve.
+    let rows: &[Row] = &[
+        Row {
+            case: "the plain stage path a client hands a WebSocket library",
+            path: |_api_id| format!("/{STAGE}"),
+            expected: Ok(()),
+        },
+        Row {
+            case: "the endpoint marker with the endpoint prefix and the api id",
+            path: |api_id| format!("/_aws/execute-api/{api_id}/{STAGE}"),
+            expected: Ok(()),
+        },
+        Row {
+            case: "the endpoint marker with the endpoint host itself",
+            path: |api_id| {
+                format!("/_aws/{api_id}.execute-api.us-east-1.amazonaws.com/{STAGE}")
+            },
+            expected: Ok(()),
+        },
+        Row {
+            case: "the endpoint marker naming another api than the one this socket serves",
+            path: |_api_id| format!("/_aws/execute-api/notthisapi/{STAGE}"),
+            expected: Err(FORBIDDEN),
+        },
+        Row {
+            case: "the endpoint marker naming no stage of this api",
+            path: |api_id| format!("/_aws/execute-api/{api_id}/no-such-stage"),
+            expected: Err(FORBIDDEN),
+        },
+    ];
+
+    let case = "an api whose stage is addressed by every spelling of its own address";
+    let emulator = emulator();
+    let api = create_api(&emulator, case, "marker-api").await;
+    let integration = create_integration(
+        &emulator,
+        case,
+        &api.api_id,
+        json!({ "integrationType": "MOCK" }),
+    )
+    .await;
+    create_route(&emulator, case, &api.api_id, "$default", &integration, false).await;
+    create_stage(&emulator, case, &api.api_id, STAGE, true).await;
+
+    for row in rows {
+        let path = (row.path)(&api.api_id);
+        let answered = handshake_at(row.case, &api.authority, &path).await;
+        match (&row.expected, &answered) {
+            (Ok(()), Ok(_socket)) => {}
+            (Err(expected), Err(status)) => assert_eq!(
+                status, expected,
+                "case {:?} ({path}): expected the handshake refused {expected}, got {status}",
+                row.case
+            ),
+            (Ok(()), Err(status)) => panic!(
+                "case {:?} ({path}): expected the handshake completed with \
+                 {SWITCHING_PROTOCOLS}, got {status}",
+                row.case
+            ),
+            (Err(expected), Ok(_socket)) => panic!(
+                "case {:?} ({path}): expected the handshake refused {expected}, got \
+                 {SWITCHING_PROTOCOLS}",
+                row.case
             ),
         }
     }

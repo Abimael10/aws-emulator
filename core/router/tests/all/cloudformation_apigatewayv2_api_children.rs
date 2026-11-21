@@ -16,11 +16,12 @@
 //!
 //! `cloudformation_apigatewayv2_resources.rs` owns the api, the custom domain name and the
 //! api mapping; this suite owns the resources that hang off an api, which is what a deployed
-//! api needs before it holds any route at all. Together they are every
-//! `AWS::ApiGatewayV2::*` type whose create AND delete API Gateway v2 serves: an
-//! `::IntegrationResponse`, a `::Model`, a `::RouteResponse` and a `::RoutingRule` are left
-//! declared-only on purpose, because that service's own delete of each is still a 501 stub,
-//! and a stack must not create a resource it could then not delete.
+//! api needs before it holds any route at all, and
+//! `cloudformation_websocket_action_dispatch.rs` owns the three that say what a route REPLIES
+//! (an `::IntegrationResponse`, a `::RouteResponse` and a `::Model`), which a WEBSOCKET api
+//! needs before a frame is answered at all. An `::ApiGatewayV2::VpcLink` is left
+//! declared-only, and the `::RoutingRule` of a custom domain name is the one type of the
+//! namespace no suite here drives yet.
 //!
 //! The rows differ along what the rule generalises over: which of the types the template
 //! declares, the api's `ProtocolType` (and so which integration types and route keys are

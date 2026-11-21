@@ -2076,6 +2076,95 @@ pub(crate) const APIGATEWAYV2_AUTHORIZER_CHILD: ApiGatewayV2Child = ApiGatewayV2
 /// declaration states, under the `apis` segment every operation of that api is bound below.
 pub(crate) const APIGATEWAYV2_API_PATH: &[(&str, &str)] = &[("ApiId", "apis")];
 
+/// `AWS::ApiGatewayV2::IntegrationResponse`: `POST
+/// /v2/apis/{ApiId}/integrations/{IntegrationId}/integrationresponses`, whose answer carries
+/// the `IntegrationResponseId` that service assigned ("Ref returns the integration response
+/// ID").
+///
+/// A response of one INTEGRATION of one api, so its collection is addressed by both labels
+/// that create takes. It is what gives a route's integration a reply to render at all: a
+/// `MOCK` integration answers a call by selecting one of these by the status the call produced
+/// and rendering its `ResponseTemplates`, so a stack that declared none left the api with
+/// nothing to answer with.
+pub(crate) const APIGATEWAYV2_INTEGRATION_RESPONSE_CHILD: ApiGatewayV2Child = ApiGatewayV2Child {
+    path: APIGATEWAYV2_INTEGRATION_PATH,
+    collection: "integrationresponses",
+    assigned_id: Some(("integrationResponseId", "CreateIntegrationResponse")),
+    named_by: None,
+    data_keys: &["ResponseParameters", "ResponseTemplates"],
+    taggable: false,
+    reported: &[
+        "ContentHandlingStrategy",
+        "IntegrationResponseKey",
+        "ResponseParameters",
+        "ResponseTemplates",
+        "TemplateSelectionExpression",
+    ],
+    // `UpdateIntegrationResponse` takes every member of the create but the api and the
+    // integration that hold the response, which are this type's `path`.
+    create_only: &[],
+    // API Gateway v2 publishes no call that clears a member of an integration response.
+    cleared: &[],
+    cleared_entries: &[],
+};
+
+/// `AWS::ApiGatewayV2::RouteResponse`: `POST
+/// /v2/apis/{ApiId}/routes/{RouteId}/routeresponses`, whose answer carries the
+/// `RouteResponseId` that service assigned ("Ref returns the route response ID").
+///
+/// A response of one ROUTE of one api, so its collection is addressed by both labels that
+/// create takes. It is what makes a route TWO-WAY — "to define a two-way route, create a
+/// route response" — so a stack that declared none left a route whose integration reply
+/// reached no client.
+pub(crate) const APIGATEWAYV2_ROUTE_RESPONSE_CHILD: ApiGatewayV2Child = ApiGatewayV2Child {
+    path: APIGATEWAYV2_ROUTE_PATH,
+    collection: "routeresponses",
+    assigned_id: Some(("routeResponseId", "CreateRouteResponse")),
+    named_by: None,
+    data_keys: &["ResponseModels", "ResponseParameters"],
+    taggable: false,
+    reported: &[
+        "ModelSelectionExpression",
+        "ResponseModels",
+        "ResponseParameters",
+        "RouteResponseKey",
+    ],
+    // `UpdateRouteResponse` takes every member of the create but the api and the route that
+    // hold the response, which are this type's `path`.
+    create_only: &[],
+    // API Gateway v2 publishes no call that clears a member of a route response.
+    cleared: &[],
+    cleared_entries: &[],
+};
+
+/// `AWS::ApiGatewayV2::Model`: `POST /v2/apis/{ApiId}/models`, whose answer carries the
+/// `ModelId` that service assigned ("Ref returns the model ID") — the id a route's
+/// `RequestModels` and a route response's `ResponseModels` are not keyed by, and which is
+/// still the handle every later call on the model takes, so the `Name` a declaration states
+/// is only what the model is called.
+pub(crate) const APIGATEWAYV2_MODEL_CHILD: ApiGatewayV2Child = ApiGatewayV2Child {
+    path: APIGATEWAYV2_API_PATH,
+    collection: "models",
+    assigned_id: Some(("modelId", "CreateModel")),
+    named_by: None,
+    data_keys: &[],
+    taggable: false,
+    reported: &["ContentType", "Description", "Name", "Schema"],
+    // `UpdateModel` takes every member of the create but the api that holds the model.
+    create_only: &[],
+    // API Gateway v2 publishes no call that clears a member of a model.
+    cleared: &[],
+    cleared_entries: &[],
+};
+
+/// The collection path of a resource that lives inside one INTEGRATION of an api, and of one
+/// inside one ROUTE: the api and the parent's own identifier, which are the two `@httpLabel`s
+/// of every call on such a resource.
+pub(crate) const APIGATEWAYV2_INTEGRATION_PATH: &[(&str, &str)] =
+    &[("ApiId", "apis"), ("IntegrationId", "integrations")];
+pub(crate) const APIGATEWAYV2_ROUTE_PATH: &[(&str, &str)] =
+    &[("ApiId", "apis"), ("RouteId", "routes")];
+
 /// The URI of the collection one of these resources lives in, built from the properties
 /// that address it — the api the resource belongs to, which its own declaration states.
 pub(crate) fn apigatewayv2_collection_uri(

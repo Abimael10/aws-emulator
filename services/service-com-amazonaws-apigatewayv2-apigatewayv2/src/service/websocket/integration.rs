@@ -155,12 +155,13 @@ pub async fn perform(
                 &connection.stage_variables,
                 Some(body),
             )),
-            // A connection request a `MOCK` integration fronts has no decision to be
-            // admitted by at all ([`dispatch::no_connection_decision`]).
-            Call::Connect => return Err(dispatch::no_connection_decision()),
-            // A close carries no frame of its own, so a template rendered for it reads the
-            // call's context and nothing of a payload.
-            Call::Disconnect { .. } => {
+            // A connection request and a close each carry no frame of their own, so a
+            // template rendered for one reads the call's context and nothing of a payload.
+            // Both are still calls this integration ANSWERS — a `MOCK` is API Gateway's
+            // "loopback" endpoint for a WebSocket route — and for the connection request the
+            // status it answers is what admits or refuses the handshake
+            // ([`dispatch::admission`]).
+            Call::Connect | Call::Disconnect { .. } => {
                 Some(TemplateCall::new(&context, &connection.stage_variables, None))
             }
         };

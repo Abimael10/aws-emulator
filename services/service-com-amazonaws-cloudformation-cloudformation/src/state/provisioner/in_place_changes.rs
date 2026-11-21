@@ -582,6 +582,41 @@ impl Provisioner {
                 ))
                 .await
             }
+            // The three that say what a route replies have their own patches too
+            // (`UpdateIntegrationResponse`, `UpdateRouteResponse`, `UpdateModel`), each
+            // addressed by the api, the parent that holds the resource and the identifier
+            // that service minted for it, and each taking the same members its create does.
+            // Boxed for the reason the arms above are.
+            Self::ApiGatewayV2IntegrationResponse => {
+                Box::pin(update_apigatewayv2_child(
+                    ctx,
+                    region,
+                    resource,
+                    declared,
+                    &APIGATEWAYV2_INTEGRATION_RESPONSE_CHILD,
+                ))
+                .await
+            }
+            Self::ApiGatewayV2RouteResponse => {
+                Box::pin(update_apigatewayv2_child(
+                    ctx,
+                    region,
+                    resource,
+                    declared,
+                    &APIGATEWAYV2_ROUTE_RESPONSE_CHILD,
+                ))
+                .await
+            }
+            Self::ApiGatewayV2Model => {
+                Box::pin(update_apigatewayv2_child(
+                    ctx,
+                    region,
+                    resource,
+                    declared,
+                    &APIGATEWAYV2_MODEL_CHILD,
+                ))
+                .await
+            }
             // `PutRoutingRule` ("puts a routing rule") is the one call that changes a routing
             // rule the custom domain name already holds, and it takes every property of
             // `AWS::ApiGatewayV2::RoutingRule` but the domain name that addresses it — so a

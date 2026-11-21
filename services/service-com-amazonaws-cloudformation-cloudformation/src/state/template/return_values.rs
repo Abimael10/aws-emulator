@@ -591,7 +591,11 @@ pub fn published_list_attribute_names(resource_type: &str) -> &'static [&'static
 /// `AuthorizerId` names an authorizer by the minted id, and no name could stand in for
 /// either. (A custom `AWS::ApiGatewayV2::DomainName` is NOT one of them: its identifier is
 /// the domain name the template states; nor is an `AWS::ApiGatewayV2::Stage`, whose
-/// identifier is the stage name it states.)
+/// identifier is the stage name it states.) The INTEGRATION RESPONSE, the ROUTE RESPONSE and
+/// the MODEL of an api are three more ([`APIGATEWAYV2_INTEGRATION_RESPONSE`] and its
+/// siblings): `CreateIntegrationResponse`, `CreateRouteResponse` and `CreateModel` each take
+/// no identifier and answer the one that service assigned, which is what the type's `Ref`
+/// returns and the handle every later call on the resource takes.
 ///
 /// An AWS Transfer Family server is one more: `CreateServer` takes no identifier and
 /// answers the `ServerId` it assigned, and that type's `Ref` returns the server's ARN,
@@ -723,6 +727,9 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         || resource_type == APIGATEWAYV2_ROUTE
         || resource_type == APIGATEWAYV2_DEPLOYMENT
         || resource_type == APIGATEWAYV2_AUTHORIZER
+        || resource_type == APIGATEWAYV2_INTEGRATION_RESPONSE
+        || resource_type == APIGATEWAYV2_ROUTE_RESPONSE
+        || resource_type == APIGATEWAYV2_MODEL
         // A ROUTING RULE of a custom domain name is one more: `CreateRoutingRule` takes no
         // identifier for the rule — a declaration states the domain it is on, its priority,
         // its conditions and its actions — and answers the id API Gateway v2 minted together

@@ -39,6 +39,11 @@
 //! mapping to answer from — which is a fault of the api's configuration rather than of the
 //! caller: the connection request fails with `500`, and a message is answered with the
 //! gateway's own `Internal server error` frame.
+//!
+//! The CONNECTION REQUEST is one of the calls such an integration answers: `MOCK` is the
+//! integration type "supported only for WebSocket APIs", and a `$connect` route bound to one
+//! is answered from that integration's own records, so the status its reply carries admits or
+//! refuses the handshake exactly as a backend's reply would ([`admission`]).
 
 use std::collections::BTreeMap;
 
@@ -194,11 +199,20 @@ pub enum Admission {
     /// there is nothing to refuse the connection.
     Admitted,
     /// REFUSED by the configuration itself: the `$connect` route's integration can produce no
-    /// reply for the connection request at all — it targets no integration of this api, or it
-    /// is a `MOCK` that answers from its own records and reaches no backend — so the
-    /// handshake fails whatever a backend would have said. The string says which, for this
-    /// emulator's own log.
+    /// reply for the connection request at all — it targets no integration of this api, or the
+    /// `MOCK` it targets selects no integration response to answer from — so the handshake
+    /// fails whatever a backend would have said. The string says which, for this emulator's
+    /// own log.
     Refused(String),
+    /// DECIDED by the integration's own records: the `$connect` route is bound to a `MOCK`,
+    /// which "lets API Gateway return a response without sending the request further to the
+    /// backend", so the reply the records compute IS the connection request's answer and the
+    /// status it carries is outside `2xx` — the handshake is refused with THAT status and the
+    /// payload that reply rendered, the same answer the api's own socket gives it.
+    ///
+    /// A `MOCK` whose reply is a `2xx` is [`Self::Admitted`]: there is nothing left to refuse
+    /// the connection.
+    RepliedWith(Reply),
     /// UNDECIDED by the configuration: the `$connect` route fronts a BACKEND, and the
     /// connection is admitted or refused by the status that backend answers, which no reading
     /// of the records can give. The caller that holds an in-process transport obtains it
@@ -215,23 +229,33 @@ pub enum Admission {
 ///
 /// * an api with NO `$connect` route admits the connection — there is no route to refuse it;
 /// * a `$connect` route whose integration replies with a `2xx` status admits it
-///   ([`is_success_status`], applied to the reply the backend gave);
+///   ([`is_success_status`], applied to the reply that integration gave);
 /// * a `$connect` route whose integration produces no reply, or a reply outside `2xx`, fails
 ///   the handshake.
 ///
-/// A `MOCK` integration produces NO connection decision at all: it answers from the
-/// integration's own records without reaching a backend, and a connection request is
-/// precisely a call whose answer the backend has to give (which is why `$connect` is the
-/// route an authorizer and a handler admit or refuse a client at). A `$connect` route bound
-/// to one therefore fails the handshake, which is the recorded behaviour of API Gateway for
-/// that configuration — the client reads `500` and no connection is established. So does a
-/// route that targets no integration at all: there is nothing to serve the connection
-/// request with.
+/// A `MOCK` integration serves the connection request from the integration's OWN RECORDS:
+/// `MOCK` is the type "for integrating the route or method request with API Gateway as a
+/// 'loopback' endpoint without invoking any backend. Supported only for WebSocket APIs"
+/// (`CreateIntegration$IntegrationType`), so the reply it computes ([`mock_reply`]) IS this
+/// call's reply, and the status that reply carries decides the handshake exactly as a
+/// backend's would: a `2xx` admits the connection ([`Admission::Admitted`]) and anything else
+/// refuses it with that status and the payload the selected response rendered
+/// ([`Admission::RepliedWith`]). A `MOCK` that selects no integration response produces no
+/// reply at all, which is a fault of the api's configuration — [`Admission::Refused`], the
+/// gateway's own `500` — and so is a route that targets no integration: there is nothing to
+/// serve the connection request with.
 ///
 /// Every OTHER integration type fronts a backend, and what that backend answered is the whole
 /// decision: this reading reports [`Admission::BackendDecides`] rather than a refusal, so the
 /// gateway's `500` — the answer a configuration that cannot be served earns — is never given
 /// to a configuration whose only unknown is a reply nobody has asked the backend for yet.
+///
+/// The records are read ALONE here, with no call to render a template against: the status a
+/// `MOCK` request template names is the template's own literal (`{"statusCode": 200}`, the
+/// documented form), so a template that derived its status from `$context` or
+/// `$stageVariables` instead is out of this reading's scope and is decided where the CALL is
+/// in hand ([`super::integration::perform`]), which is the path every connection request a
+/// socket carries takes.
 pub fn admission(deployed: &DeployedConfiguration) -> Admission {
     let Some(route) = deployed_route(deployed, CONNECT_ROUTE_KEY) else {
         return Admission::Admitted;
@@ -245,32 +269,14 @@ pub fn admission(deployed: &DeployedConfiguration) -> Admission {
     if integration.integration_type != MOCK_INTEGRATION_TYPE {
         return Admission::BackendDecides;
     }
-    Admission::Refused(no_connection_decision_reason())
-}
-
-/// Why a `MOCK` integration gives the CONNECTION REQUEST no decision at all.
-///
-/// A connection request is precisely a call whose answer the BACKEND has to give — which is
-/// why `$connect` is the route an authorizer and a handler admit or refuse a client at — and
-/// a `MOCK` integration "lets API Gateway return a response without sending the request
-/// further to the backend". A `$connect` route bound to one therefore fails the handshake,
-/// whatever status its templates render, which is the recorded behaviour of API Gateway for
-/// that configuration: the client reads `500` and no connection is established.
-///
-/// Stated here, as the one owner of the rule, because both the reading of the records and
-/// the performing of the integration apply it ([`super::integration::perform`]).
-pub fn no_connection_decision() -> Unserved {
-    Unserved::Unperformable(no_connection_decision_reason())
-}
-
-/// The sentence [`no_connection_decision`] carries, which is also the reason an
-/// [`Admission::Refused`] read off the records alone carries for that configuration: one
-/// owner, so the reading of a `MOCK`-bound `$connect` and the performing of it cannot drift.
-pub fn no_connection_decision_reason() -> String {
-    format!(
-        "a {MOCK_INTEGRATION_TYPE} integration answers from the integration's own records \
-         and reaches no backend, so it gives the connection request no decision"
-    )
+    match mock_reply(integration, None) {
+        Ok(reply) if is_success_status(reply.status_code.as_deref()) => Admission::Admitted,
+        Ok(reply) => Admission::RepliedWith(reply),
+        Err(unserved) => Admission::Refused(format!(
+            "the {CONNECT_ROUTE_KEY} route's {MOCK_INTEGRATION_TYPE} integration answers the \
+             connection request from its own records and produced no reply: {unserved:?}"
+        )),
+    }
 }
 
 /// Whether a status a reply carries is a SUCCESS — the `2xx` class, which is what admits a

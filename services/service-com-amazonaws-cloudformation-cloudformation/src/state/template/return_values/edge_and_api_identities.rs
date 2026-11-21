@@ -197,6 +197,21 @@ pub const APIGATEWAYV2_STAGE: &str = "AWS::ApiGatewayV2::Stage";
 pub const APIGATEWAYV2_DEPLOYMENT: &str = "AWS::ApiGatewayV2::Deployment";
 pub const APIGATEWAYV2_AUTHORIZER: &str = "AWS::ApiGatewayV2::Authorizer";
 
+/// The Amazon API Gateway v2 resource types whose resources live inside an INTEGRATION or a
+/// ROUTE of an api, plus the schema an api holds for them — the ones a stack declares to say
+/// what a route of a WebSocket api REPLIES, which is what makes such a route two-way.
+///
+/// `AWS::ApiGatewayV2::IntegrationResponse`: "Ref returns the integration response ID",
+/// `AWS::ApiGatewayV2::RouteResponse`: "Ref returns the route response ID" and
+/// `AWS::ApiGatewayV2::Model`: "Ref returns the model ID" — each of those ids is MINTED by
+/// API Gateway v2 (`CreateIntegrationResponse` answers the `IntegrationResponseId` it
+/// assigned, `CreateRouteResponse` the `RouteResponseId` and `CreateModel` the `ModelId`,
+/// none of the three creates taking an identifier of its own), which is why
+/// [`identity_is_service_assigned`] names all three.
+pub const APIGATEWAYV2_INTEGRATION_RESPONSE: &str = "AWS::ApiGatewayV2::IntegrationResponse";
+pub const APIGATEWAYV2_ROUTE_RESPONSE: &str = "AWS::ApiGatewayV2::RouteResponse";
+pub const APIGATEWAYV2_MODEL: &str = "AWS::ApiGatewayV2::Model";
+
 /// The Amazon API Gateway v2 resource type whose resources live inside a CUSTOM DOMAIN NAME:
 /// the routing rule that decides which api a request to that domain is served by.
 ///

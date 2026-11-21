@@ -373,6 +373,17 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         | APIGATEWAYV2_STAGE
         | APIGATEWAYV2_AUTHORIZER => &["ApiId"],
         APIGATEWAYV2_DEPLOYMENT => &["ApiId", "StageName"],
+        // An INTEGRATION RESPONSE lives inside one integration of one api and a ROUTE
+        // RESPONSE inside one route of one api: both labels address every call on the
+        // resource, the create included, and API Gateway v2 publishes no call that moves one
+        // to another integration, route or api — so a declaration naming another asks for a
+        // different resource. A MODEL lives in its api the same way. Every other property of
+        // the three is a member of their own patches
+        // (`UpdateIntegrationResponse`, `UpdateRouteResponse`, `UpdateModel`), so stating one
+        // differently is a change to the resource the stack already has.
+        APIGATEWAYV2_INTEGRATION_RESPONSE => &["ApiId", "IntegrationId"],
+        APIGATEWAYV2_ROUTE_RESPONSE => &["ApiId", "RouteId"],
+        APIGATEWAYV2_MODEL => &["ApiId"],
         // A ROUTING RULE exists on the custom domain name its `DomainNameArn` names, and API
         // Gateway v2 publishes no call that moves one to another domain — the domain is an
         // `@httpLabel` of every call on a rule, the create included — so a declaration naming

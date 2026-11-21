@@ -57,12 +57,14 @@
 //!    `{"message":"Internal server error"}`. Past that precondition the authorizer's own
 //!    function decides, and a DENY is `403` ([`connect_authorizer`]);
 //! 5. the CONNECTION REQUEST itself is served by the `$connect` route's integration,
-//!    PERFORMED ([`integration`]), and the handshake completes only on a `2xx` reply: a reply
-//!    outside `2xx` refuses the handshake with the status that integration answered and the
-//!    body it answered, because `$connect` is where a backend admits or refuses a client,
-//!    while a `$connect` route that can serve the connection request no reply AT ALL — one
-//!    targeting no integration, or one bound to a `MOCK`, which answers from its own records
-//!    and reaches no backend — is `500` `{"message":"Internal server error"}`
+//!    PERFORMED ([`integration`]) whatever that integration's type is — a `MOCK` answers it
+//!    from the integration's own records, which is what that type is for on a WebSocket api —
+//!    and the handshake completes only on a `2xx` reply: a reply outside `2xx` refuses the
+//!    handshake with the status that integration answered and the body it answered, because
+//!    `$connect` is where a backend admits or refuses a client, while a `$connect` route that
+//!    can serve the connection request no reply AT ALL — one targeting no integration, or a
+//!    `MOCK` that selects no integration response — is `500`
+//!    `{"message":"Internal server error"}`
 //!    ([`dispatch::admission`], the same rule the api's own socket applies).
 //!
 //! # What it does not do, and what it answers instead
@@ -377,6 +379,28 @@ fn resolve<'s>(
     }
 }
 
+/// The STAGE a handshake that arrived on ONE api's own socket names — the address that api
+/// announced, where the api is the socket rather than anything the request carries.
+///
+/// Two spellings reach that address, and both name a stage the same way the service endpoint
+/// reads it ([`resolve`]): the path's first segment (`/{stage}`, what a client hands a
+/// WebSocket library), and the endpoint MARKER a client that rewrote the announced URI into a
+/// path carries (`/_aws/execute-api/{api-id}/{stage}`, the one reading of it being the HTTP
+/// data plane's, [`super::invoke::local_endpoint_path`]). A marker naming ANOTHER api than
+/// the one this socket serves names no stage of it, which is an address that serves nothing.
+///
+/// `pub(crate)` because the socket ([`transport`]) is the one caller: the service endpoint has
+/// the whole store to resolve against, while a socket already knows its api.
+pub(crate) fn stage_on_the_apis_socket(api_id: &str, path: &str) -> Option<String> {
+    if let Some((marked, stage_path)) = super::invoke::local_endpoint_path(path) {
+        if marked != api_id {
+            return None;
+        }
+        return Some(first_segment(stage_path).unwrap_or_default().to_string());
+    }
+    Some(first_segment(path).unwrap_or_default().to_string())
+}
+
 /// Whether this api speaks the WebSocket protocol: `ProtocolType` is an enum of exactly
 /// `HTTP | WEBSOCKET` (`smithy_query(query="shape", shape="ProtocolType")`).
 fn is_websocket(api: &Api) -> bool {
@@ -520,22 +544,41 @@ fn seam_transport<Eng: Send + Sync + 'static>(
 /// they do not refuse.
 ///
 /// What the records refuse is a `$connect` route that can serve the connection request no
-/// reply at all — see [`dispatch::admission`]. A route that fronts a BACKEND is not refused
-/// here: the decision is that backend's, and giving the gateway's configuration-fault status
-/// to a configuration API Gateway serves would make a correctly configured Lambda-backed
-/// `$connect` indistinguishable from one this endpoint cannot serve at all.
+/// reply at all, and a route whose own records ANSWER it outside `2xx` — see
+/// [`dispatch::admission`]. A route that fronts a BACKEND is not refused here: the decision is
+/// that backend's, and giving the gateway's configuration-fault status to a configuration API
+/// Gateway serves would make a correctly configured Lambda-backed `$connect`
+/// indistinguishable from one this endpoint cannot serve at all.
 fn refused_by_the_records(offered: &OfferedHandshake) -> Option<RtResponse> {
-    let dispatch::Admission::Refused(reason) = &offered.admission else {
-        return None;
-    };
-    tracing::info!(
-        api_id = %offered.connection.api_id,
-        stage = %offered.connection.stage_name,
-        %reason,
-        "refusing a WebSocket opening handshake: the connection request's route can serve it \
-         no reply"
-    );
-    Some(json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None))
+    match &offered.admission {
+        dispatch::Admission::Refused(reason) => {
+            tracing::info!(
+                api_id = %offered.connection.api_id,
+                stage = %offered.connection.stage_name,
+                %reason,
+                "refusing a WebSocket opening handshake: the connection request's route can \
+                 serve it no reply"
+            );
+            Some(json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None))
+        }
+        // The `$connect` route's own records answered the connection request, and that answer
+        // is outside `2xx`: the client reads the status and the body that reply carries, which
+        // is what the api's own socket answers it too.
+        dispatch::Admission::RepliedWith(reply) => {
+            tracing::info!(
+                api_id = %offered.connection.api_id,
+                stage = %offered.connection.stage_name,
+                status = ?reply.status_code,
+                "refusing a WebSocket opening handshake: the connection request's \
+                 integration did not reply successfully"
+            );
+            Some(refused_by_the_connection_request(&integration::Answered {
+                status_code: reply.status_code.clone(),
+                payload: reply.payload.clone().map(String::into_bytes),
+            }))
+        }
+        dispatch::Admission::Admitted | dispatch::Admission::BackendDecides => None,
+    }
 }
 
 /// The refusal an ADMITTED handshake earns on this endpoint: the capability this emulator's

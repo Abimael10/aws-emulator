@@ -478,7 +478,8 @@ use super::template::{
     AMPLIFYUIBUILDER_THEME, AMPLIFY_APP, AMPLIFY_BRANCH, AOSS_COLLECTION,
     AOSS_SECURITY_POLICY, AOSS_VPC_ENDPOINT, APIGATEWAY_BASE_PATH_MAPPING, APIGATEWAY_DOMAIN_NAME, APIGATEWAYV2_API,
     APIGATEWAYV2_API_MAPPING, APIGATEWAYV2_AUTHORIZER, APIGATEWAYV2_DEPLOYMENT,
-    APIGATEWAYV2_DOMAIN_NAME, APIGATEWAYV2_INTEGRATION, APIGATEWAYV2_ROUTE,
+    APIGATEWAYV2_DOMAIN_NAME, APIGATEWAYV2_INTEGRATION, APIGATEWAYV2_INTEGRATION_RESPONSE,
+    APIGATEWAYV2_MODEL, APIGATEWAYV2_ROUTE, APIGATEWAYV2_ROUTE_RESPONSE,
     APIGATEWAYV2_ROUTING_RULE,
     APIGATEWAYV2_STAGE, APPLICATION_INSIGHTS_APPLICATION, APPLICATION_INSIGHTS_APPLICATION_PATH,
     APPLICATION_SIGNALS_GROUPING_CONFIGURATION,
@@ -1142,6 +1143,15 @@ pub(super) enum Provisioner {
     ApiGatewayV2Stage,
     ApiGatewayV2Deployment,
     ApiGatewayV2Authorizer,
+    /// `AWS::ApiGatewayV2::IntegrationResponse`, `AWS::ApiGatewayV2::RouteResponse` and
+    /// `AWS::ApiGatewayV2::Model`: the three resources that say what a route of an api
+    /// REPLIES — the response one integration selects by the status a call produced, the
+    /// response that makes a route two-way, and the schema either names — each created in the
+    /// collection its parent holds ([`ApiGatewayV2Child`]) and each identified by the id API
+    /// Gateway v2 minted for it.
+    ApiGatewayV2IntegrationResponse,
+    ApiGatewayV2RouteResponse,
+    ApiGatewayV2Model,
     /// `AWS::ApiGatewayV2::RoutingRule`: a routing rule of a CUSTOM DOMAIN NAME of the same
     /// control plane, which `CreateRoutingRule` creates on the domain its declaration names,
     /// `PutRoutingRule` changes and `DeleteRoutingRule` removes. That service MINTS the
@@ -1657,6 +1667,9 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         APIGATEWAYV2_STAGE => Some(Provisioner::ApiGatewayV2Stage),
         APIGATEWAYV2_DEPLOYMENT => Some(Provisioner::ApiGatewayV2Deployment),
         APIGATEWAYV2_AUTHORIZER => Some(Provisioner::ApiGatewayV2Authorizer),
+        APIGATEWAYV2_INTEGRATION_RESPONSE => Some(Provisioner::ApiGatewayV2IntegrationResponse),
+        APIGATEWAYV2_ROUTE_RESPONSE => Some(Provisioner::ApiGatewayV2RouteResponse),
+        APIGATEWAYV2_MODEL => Some(Provisioner::ApiGatewayV2Model),
         APIGATEWAYV2_ROUTING_RULE => Some(Provisioner::ApiGatewayV2RoutingRule),
         CODECOMMIT_REPOSITORY => Some(Provisioner::CodeCommitRepository),
         CODEARTIFACT_DOMAIN => Some(Provisioner::CodeArtifactDomain),
@@ -2422,6 +2435,33 @@ impl Provisioner {
                     &APIGATEWAYV2_AUTHORIZER_CHILD,
                 )
                 .await
+            }
+            // The three that say what a route REPLIES: a response of one integration, a
+            // response of one route, and a model of the api. None of the three publishes
+            // `Tags`, so no tags are propagated to one.
+            Self::ApiGatewayV2IntegrationResponse => {
+                create_apigatewayv2_child(
+                    ctx,
+                    region,
+                    resource,
+                    propagated,
+                    &APIGATEWAYV2_INTEGRATION_RESPONSE_CHILD,
+                )
+                .await
+            }
+            Self::ApiGatewayV2RouteResponse => {
+                create_apigatewayv2_child(
+                    ctx,
+                    region,
+                    resource,
+                    propagated,
+                    &APIGATEWAYV2_ROUTE_RESPONSE_CHILD,
+                )
+                .await
+            }
+            Self::ApiGatewayV2Model => {
+                create_apigatewayv2_child(ctx, region, resource, propagated, &APIGATEWAYV2_MODEL_CHILD)
+                    .await
             }
             // `AWS::ApiGatewayV2::RoutingRule` publishes `Actions`, `Conditions`,
             // `DomainNameArn` and `Priority` and no `Tags`: a routing rule is no taggable
@@ -3539,6 +3579,24 @@ impl Provisioner {
             Self::ApiGatewayV2Authorizer => {
                 delete_apigatewayv2_child(ctx, region, resource, &APIGATEWAYV2_AUTHORIZER_CHILD)
                     .await
+            }
+            // Each addressed by the api, the parent that holds it and its own identifier,
+            // every one of which the resource's record carries.
+            Self::ApiGatewayV2IntegrationResponse => {
+                delete_apigatewayv2_child(
+                    ctx,
+                    region,
+                    resource,
+                    &APIGATEWAYV2_INTEGRATION_RESPONSE_CHILD,
+                )
+                .await
+            }
+            Self::ApiGatewayV2RouteResponse => {
+                delete_apigatewayv2_child(ctx, region, resource, &APIGATEWAYV2_ROUTE_RESPONSE_CHILD)
+                    .await
+            }
+            Self::ApiGatewayV2Model => {
+                delete_apigatewayv2_child(ctx, region, resource, &APIGATEWAYV2_MODEL_CHILD).await
             }
             // The delete addresses the rule by the ARN API Gateway v2 minted for it, which is
             // this resource's physical id and carries both of the labels that delete takes:

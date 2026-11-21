@@ -521,6 +521,29 @@ impl Provisioner {
                 describe_apigatewayv2_child(ctx, region, resource, &APIGATEWAYV2_AUTHORIZER_CHILD)
                     .await
             }
+            // Read back by the api, the parent and the identifier that address each one's
+            // own delete.
+            Self::ApiGatewayV2IntegrationResponse => {
+                describe_apigatewayv2_child(
+                    ctx,
+                    region,
+                    resource,
+                    &APIGATEWAYV2_INTEGRATION_RESPONSE_CHILD,
+                )
+                .await
+            }
+            Self::ApiGatewayV2RouteResponse => {
+                describe_apigatewayv2_child(
+                    ctx,
+                    region,
+                    resource,
+                    &APIGATEWAYV2_ROUTE_RESPONSE_CHILD,
+                )
+                .await
+            }
+            Self::ApiGatewayV2Model => {
+                describe_apigatewayv2_child(ctx, region, resource, &APIGATEWAYV2_MODEL_CHILD).await
+            }
             // Read back by the same ARN the delete addresses the routing rule by.
             Self::ApiGatewayV2RoutingRule => {
                 describe_apigatewayv2_routing_rule(ctx, region, resource).await
