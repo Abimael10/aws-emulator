@@ -69,7 +69,7 @@ const SERIES: [&str; 3] = [
 ];
 
 /// The counters of events, in the order a counter row states its expected totals.
-const EVENT_COUNTERS: [&str; 4] = [
+pub(crate) const EVENT_COUNTERS: [&str; 4] = [
     NUMBER_OF_MESSAGES_SENT,
     NUMBER_OF_MESSAGES_RECEIVED,
     NUMBER_OF_EMPTY_RECEIVES,
@@ -78,11 +78,11 @@ const EVENT_COUNTERS: [&str; 4] = [
 
 /// The period a read folds its window into: one minute, the resolution these series are
 /// published at.
-const PERIOD_SECS: i64 = 60;
+pub(crate) const PERIOD_SECS: i64 = 60;
 
 /// How many seconds either side of the calls a read spans: wide enough that every observation
 /// a test makes falls inside it whichever minute the clock is in.
-const WINDOW_SECS: f64 = 300.0;
+pub(crate) const WINDOW_SECS: f64 = 300.0;
 
 /// How long a test waits for a datapoint the CLOCK owes, and how often it looks again. Far
 /// longer than the one tick the clock needs, so a loaded machine does not fail a case the
@@ -92,7 +92,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// The whole emulator over one engine, exactly as the binary assembles it, with the engine
 /// handed back so a test can make the next minute's reading due through its seam.
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine = aws_emulator_router::new_engine();
     let mut router = aws_emulator_router::build_router(Arc::clone(&engine));
     // Signature verification is the front door's concern, not this suite's.
@@ -142,7 +142,12 @@ async fn rpc(
 }
 
 /// One Amazon SQS call (`awsJson1_0`, `AmazonSQS.<Operation>`) that must answer 200.
-async fn sqs(router: &MultiServiceRouter, case: &str, operation: &str, body: &Value) -> Value {
+pub(crate) async fn sqs(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    body: &Value,
+) -> Value {
     let (status, parsed) = rpc(router, "sqs", "AmazonSQS", "1.0", operation, body).await;
     assert_eq!(
         status, 200,
@@ -169,7 +174,7 @@ async fn cloudwatch_call(
 }
 
 /// The same, requiring a 200.
-async fn cloudwatch(
+pub(crate) async fn cloudwatch(
     router: &MultiServiceRouter,
     case: &str,
     operation: &str,
@@ -184,7 +189,7 @@ async fn cloudwatch(
 }
 
 /// A queue called `name` with `attributes`: its url.
-async fn given_queue(
+pub(crate) async fn given_queue(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
@@ -243,7 +248,7 @@ fn reopen_sample_slot(engine: &engine::InMemoryEngine) {
 }
 
 /// Wall-clock now as the epoch seconds a metric window is measured in.
-fn now_secs() -> f64 {
+pub(crate) fn now_secs() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0.0, |since| since.as_secs_f64())
@@ -366,7 +371,7 @@ async fn indexed_series(router: &MultiServiceRouter, queue: &str) -> Vec<String>
 }
 
 /// Send one message of `body` to the queue at `url`, with `delay_seconds` when it carries one.
-async fn send(
+pub(crate) async fn send(
     router: &MultiServiceRouter,
     case: &str,
     url: &str,
@@ -382,7 +387,7 @@ async fn send(
 
 /// Poll the queue at `url` for up to `max` messages, answering every receipt handle it handed
 /// over.
-async fn receive(
+pub(crate) async fn receive(
     router: &MultiServiceRouter,
     case: &str,
     url: &str,
