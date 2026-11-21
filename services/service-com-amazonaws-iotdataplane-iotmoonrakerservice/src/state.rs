@@ -36,6 +36,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
+pub mod shadow_topics;
+
 /// How many `traceId`s this process has minted. Part of what makes the next one
 /// unique: two calls in the same clock tick still differ.
 static TRACE_IDS_MINTED: AtomicU64 = AtomicU64::new(0);

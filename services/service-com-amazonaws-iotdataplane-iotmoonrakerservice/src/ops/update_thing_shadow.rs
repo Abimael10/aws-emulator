@@ -11,6 +11,13 @@
 //! and is announced `content-type: application/json` — see the media-type note in
 //! `crate::service`, which decides that for every operation that answers with one.
 //!
+//! An accepted update is also ANNOUNCED to the shadow's own subscribers, on the reserved
+//! topics the Device Shadow service keeps for it (`crate::state::shadow_topics`):
+//! `…/update/accepted` and `…/update/documents` for every accepted update, and
+//! `…/update/delta` while the merged desired state is not matched by the merged reported
+//! state. A device does not poll a shadow — it subscribes to those topics and acts on the
+//! delta it is pushed — and none of that changes this response.
+//!
 //! Every failure here answers in the data plane's `{message, traceId}` envelope, with
 //! the service's own fixed text for the condition — see `crate::state` for the
 //! catalog and `super::types::shared_types` for the envelope.
@@ -317,10 +324,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ACCUMULATED document, not one request, so an update whose result would
         // exceed it has to be refused without having changed what is stored.
         let timestamp_secs = crate::state::now_secs();
-        let mut merged = guard
+        let previous = guard
             .stored_shadow(&key)
-            .map(|(document, _)| document.clone())
-            .unwrap_or_default();
+            .map(|(document, _version)| document.clone());
+        let mut merged = previous.clone().unwrap_or_default();
         merged.apply(desired, reported, timestamp_secs);
         merged.timestamp_secs = timestamp_secs;
         let version = stored_version + 1;
@@ -355,7 +362,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The slot's counter was read under this same guard, so the version it consumes
         // here is exactly the `version` the reply reports.
         slot.consume_version();
+        let current = merged.clone();
         slot.document = Some(merged);
+        // This service's store is released before the broker's is taken: the announcements
+        // below are a publication, and no store is held across the fan-out.
+        drop(guard);
 
         // The reply is the stored document plus the request's own correlation token; the
         // token is not state, so what was just stored — and therefore what every later
@@ -364,6 +375,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stored_document,
             document.get(crate::state::CLIENT_TOKEN),
         );
+
+        // The update was accepted, so it is ANNOUNCED on the shadow's own reserved topics:
+        // a device does not poll a shadow, it subscribes to them. See
+        // `crate::state::shadow_topics`, the one place those topics and the messages they
+        // carry live.
+        crate::state::shadow_topics::announce_update(
+            &*self.engine,
+            &input.thing_name,
+            input.shadow_name.as_deref(),
+            &crate::state::shadow_topics::AcceptedUpdate {
+                accepted: &accepted,
+                previous: previous.as_ref(),
+                previous_version: stored_version,
+                current: &current,
+                version,
+                timestamp_secs,
+                client_token: document.get(crate::state::CLIENT_TOKEN),
+            },
+        );
+
         Ok(UpdateThingShadowOutput {
             payload: Some(
                 ::serde_json::to_vec(&accepted).expect("a shadow document serializes to JSON"),

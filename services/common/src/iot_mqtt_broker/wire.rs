@@ -17,9 +17,11 @@
 //!
 //! The protocol itself is read and written with the maintained MQTT codec
 //! ([`::mqttbytes`]): this module decides what the broker DOES with each packet, not how a
-//! packet is laid out. MQTT 3.1.1 is the version served; a client announcing another is
-//! answered with the CONNACK the protocol reserves for exactly that, because a CONNACK of
-//! a version the client did not speak is unreadable to it.
+//! packet is laid out. BOTH versions AWS IoT Core's message broker serves are served here —
+//! MQTT 3.1.1 and MQTT 5, the one a connection speaks being the one its own CONNECT
+//! announces ([`protocol`]) — and a client announcing a version this broker serves no
+//! protocol for is answered with the CONNACK the protocol reserves for exactly that,
+//! because a CONNACK of a version the client did not speak is unreadable to it.
 //!
 //! Bounds: the core owns the socket, the connection cap, the handshake deadline and the
 //! idle timeout, so a connection that goes silent is dropped without this module timing
@@ -34,7 +36,6 @@ use std::sync::{Arc, OnceLock};
 
 use ::bytes::BytesMut;
 use ::emulator_server::{ListenerConn, NativeHandler, TlsUpgrader};
-use ::mqttbytes::v4;
 use ::mqttbytes::QoS;
 use ::smithy_server_runtime::EmbeddedEmulator;
 use ::tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -46,14 +47,17 @@ use super::{
     MAX_PENDING_DELIVERIES,
 };
 
+pub mod protocol;
+
 /// The first byte of an MQTT CONNECT: packet type 1 in the high nibble, with no flags —
 /// the only packet a client may open an MQTT connection with. A TLS record opens with
 /// `0x16` and an HTTP request with a method's first letter, so one byte tells the three
 /// apart.
 pub const MQTT_CONNECT_FIRST_BYTE: u8 = 0x10;
 
-/// The MQTT protocol level this broker speaks: 4, which is MQTT 3.1.1.
-pub const PROTOCOL_LEVEL: u8 = 4;
+/// Which MQTT versions this broker speaks, and the level each announces — see
+/// [`protocol::Version`].
+pub use protocol::{Version, PROTOCOL_LEVEL_V311, PROTOCOL_LEVEL_V5};
 
 /// The most bytes one MQTT packet may carry on this endpoint.
 ///
@@ -161,30 +165,30 @@ async fn serve_mqtt(
     let (mut reader, mut writer) = ::tokio::io::split(conn);
     let mut buffer = BytesMut::with_capacity(READ_CHUNK_BYTES);
 
-    // The CONNECT: until it has been read there is no session, and a connection that
-    // opens with anything else is no MQTT connection at all.
-    let connect = match read_packet(&mut reader, &mut buffer).await {
-        Some(v4::Packet::Connect(connect)) => connect,
-        Some(_other) => return,
-        None => {
-            // A CONNECT this codec could not read is answered with the refusal the
-            // protocol reserves for a version the broker does not serve, which is the one
-            // a client of another version can still read.
+    // The CONNECT: until it has been read there is no session, and it is also what says
+    // WHICH version of MQTT the rest of this connection is spoken in.
+    let (version, connect) = match read_connect(&mut reader, &mut buffer).await {
+        Some(Ok(opened)) => opened,
+        Some(Err(version)) => {
+            // A CONNECT whose version this broker serves no protocol for, and one the
+            // version's own codec could not read, are answered with the refusal the
+            // protocol reserves for exactly that.
             let _ = write_connack(
+                version,
                 &mut writer,
-                v4::ConnectReturnCode::RefusedProtocolVersion,
-                false,
+                protocol::Connack::UnsupportedProtocolVersion,
             )
             .await;
             return;
         }
+        None => return,
     };
 
     let client_id = connect.client_id.clone();
     if client_id.is_empty() {
         // A session is keyed by its client id, so a connection that names none cannot be
         // reported on at all: MQTT's own refusal for an unusable client id.
-        let _ = write_connack(&mut writer, v4::ConnectReturnCode::BadClientId, false).await;
+        let _ = write_connack(version, &mut writer, protocol::Connack::ClientIdNotValid).await;
         return;
     }
 
@@ -239,7 +243,11 @@ async fn serve_mqtt(
             session.client_id = client_id.clone();
             session.connected = true;
             session.clean_session = connect.clean_session;
-            session.keep_alive_seconds = i32::from(connect.keep_alive);
+            session.keep_alive_seconds = connect.keep_alive_seconds;
+            // The Session Expiry Interval an MQTT 5 CONNECT configured, which is a fact
+            // about this connection; a 3.1.1 client's protocol carries none, so it
+            // configures none.
+            session.session_expiry_seconds = connect.session_expiry_seconds;
             session.connected_since_millis = opened_at;
             session.disconnected_since_millis = 0;
             session.disconnect_reason = None;
@@ -275,14 +283,19 @@ async fn serve_mqtt(
         }
     };
     let Some((connection_id, session_present, queued)) = opened else {
-        // The protocol's own `ServiceUnavailable` — what a broker at its connection quota
+        // The protocol's own "server unavailable" — what a broker at its connection quota
         // answers — and no session was opened.
-        let _ =
-            write_connack(&mut writer, v4::ConnectReturnCode::ServiceUnavailable, false).await;
+        let _ = write_connack(version, &mut writer, protocol::Connack::ServerUnavailable).await;
         return;
     };
 
-    if !write_connack(&mut writer, v4::ConnectReturnCode::Success, session_present).await {
+    if !write_connack(
+        version,
+        &mut writer,
+        protocol::Connack::Accepted { session_present },
+    )
+    .await
+    {
         close_session(&state, &client_id, connection_id, CONNECTION_LOST);
         return;
     }
@@ -294,13 +307,14 @@ async fn serve_mqtt(
     for message in queued {
         let packet_id = next_packet_id;
         next_packet_id = next_packet_id.checked_add(1).unwrap_or(1);
-        if !write_publish(&mut writer, &message, packet_id).await {
+        if !write_publish(version, &mut writer, &message, packet_id).await {
             close_session(&state, &client_id, connection_id, CONNECTION_LOST);
             return;
         }
     }
 
     let reason = serve_session(
+        version,
         &state,
         &client_id,
         connection_id,
@@ -325,6 +339,7 @@ async fn serve_mqtt(
 /// IoT data plane's `DeleteConnection` has already closed and recorded its own reason for.
 #[allow(clippy::too_many_arguments)]
 async fn serve_session<R, W>(
+    version: protocol::Version,
     state: &::engine::ServiceState<MqttBrokerState>,
     client_id: &str,
     connection_id: u64,
@@ -369,49 +384,49 @@ where
                 if let Some(acknowledged) = delivery.acknowledged.filter(|_| confirmed) {
                     awaiting.insert(packet_id, acknowledged);
                 }
-                if !write_publish(writer, &delivery.message, packet_id).await {
+                if !write_publish(version, writer, &delivery.message, packet_id).await {
                     return Some(CONNECTION_LOST);
                 }
                 continue;
             }
-            packet = read_packet(reader, buffer) => packet,
+            packet = read_packet(version, reader, buffer) => packet,
         };
         let Some(packet) = packet else {
             return Some(CONNECTION_LOST);
         };
         match packet {
             // A publication: handed to every session subscribed to its topic, and
-            // acknowledged to the publisher when it asked for an acknowledgement.
-            v4::Packet::Publish(publish) => {
-                if publish.qos == QoS::ExactlyOnce {
+            // acknowledged to the publisher when it asked for an acknowledgement. The
+            // message is the one the client sent, message properties and all: an MQTT 5
+            // subscriber of that topic is handed each of them.
+            protocol::ClientPacket::Publish {
+                mut message,
+                packet_id,
+            } => {
+                if message.qos > MAX_GRANTED_QOS {
                     // AWS IoT Core supports QoS 0 and 1 only, so there is no exchange
                     // this broker could complete for a QoS 2 publication.
                     return Some(CONNECTION_LOST);
                 }
-                if !::mqttbytes::valid_topic(&publish.topic) {
+                if !::mqttbytes::valid_topic(&message.topic) {
                     // A PUBLISH whose topic is no topic NAME — it is empty, or carries a
                     // subscription wildcard, which only a filter may — is a protocol
                     // violation, and MQTT 3.1.1 gives a server no way to refuse one
                     // packet: the connection ends.
                     return Some(CONNECTION_LOST);
                 }
-                if publish.payload.len() > MAX_PAYLOAD_BYTES {
+                if message.payload.len() > MAX_PAYLOAD_BYTES {
                     // Larger than the broker's own message quota, so there is no
                     // publication to make; the packet was framed, so the connection ends
                     // rather than the message being delivered in part.
                     return Some(CONNECTION_LOST);
                 }
-                let message = DirectMessage {
-                    topic: publish.topic.clone(),
-                    payload: publish.payload.to_vec(),
-                    qos: qos_number(publish.qos),
-                    delivered_at_millis: now_millis(),
-                    ..DirectMessage::default()
-                };
+                let at_least_once = message.qos >= MAX_GRANTED_QOS;
+                message.delivered_at_millis = now_millis();
                 super::publish_to_subscribers(state, &message);
-                if publish.qos == QoS::AtLeastOnce
+                if at_least_once
                     && !write_packet(writer, |buffer| {
-                        v4::PubAck::new(publish.pkid).write(buffer)
+                        protocol::render_puback(version, buffer, packet_id)
                     })
                     .await
                 {
@@ -421,13 +436,13 @@ where
             // The client acknowledged a delivery: the caller that asked to hear about it
             // is told. Nothing is retransmitted by this broker, so the acknowledgement
             // completes the exchange and is recorded nowhere else.
-            v4::Packet::PubAck(acknowledged) => {
-                if let Some(waiting) = awaiting.remove(&acknowledged.pkid) {
+            protocol::ClientPacket::PubAck { packet_id } => {
+                if let Some(waiting) = awaiting.remove(&packet_id) {
                     let _ = waiting.send(());
                 }
             }
-            v4::Packet::Subscribe(subscribe) => {
-                let mut granted = Vec::with_capacity(subscribe.filters.len());
+            protocol::ClientPacket::Subscribe { packet_id, filters } => {
+                let mut granted = Vec::with_capacity(filters.len());
                 {
                     let mut held = state.lock();
                     // The session this connection opened, while it is still this
@@ -441,62 +456,67 @@ where
                     {
                         return None;
                     }
-                    for filter in &subscribe.filters {
+                    for filter in &filters {
                         // A filter longer than a topic can be, one that is no filter at
                         // all, and one past the session's subscription quota are each
                         // refused for that filter alone — which is what a SUBACK's
-                        // per-filter return codes say.
+                        // per-filter return codes say, each naming its own reason where
+                        // the version has one for it.
                         if filter.path.len() > MAX_TOPIC_FILTER_BYTES
                             || !::mqttbytes::valid_filter(&filter.path)
                         {
-                            granted.push(v4::SubscribeReasonCode::Failure);
+                            granted.push(protocol::Grant::TopicFilterInvalid);
                             continue;
                         }
                         if session.subscriptions.len() >= MAX_SUBSCRIPTIONS_PER_SESSION
                             && !session.subscriptions.contains_key(&filter.path)
                         {
-                            granted.push(v4::SubscribeReasonCode::Failure);
+                            granted.push(protocol::Grant::QuotaExceeded);
                             continue;
                         }
-                        let qos = qos_number(filter.qos).clamp(0, MAX_GRANTED_QOS);
+                        let qos = filter.qos.clamp(0, MAX_GRANTED_QOS);
                         session.subscriptions.insert(filter.path.clone(), qos);
-                        granted.push(v4::SubscribeReasonCode::Success(qos_of(qos)));
+                        granted.push(protocol::Grant::Qos(qos));
                     }
                 }
                 if !write_packet(writer, |buffer| {
-                    v4::SubAck::new(subscribe.pkid, granted.clone()).write(buffer)
+                    protocol::render_suback(version, buffer, packet_id, &granted)
                 })
                 .await
                 {
                     return Some(CONNECTION_LOST);
                 }
             }
-            v4::Packet::Unsubscribe(unsubscribe) => {
+            protocol::ClientPacket::Unsubscribe { packet_id, filters } => {
                 {
                     let mut held = state.lock();
                     let session = held.sessions.get_mut(client_id)?;
-                    for filter in &unsubscribe.topics {
+                    for filter in &filters {
                         session.subscriptions.remove(filter);
                     }
                 }
                 if !write_packet(writer, |buffer| {
-                    v4::UnsubAck::new(unsubscribe.pkid).write(buffer)
+                    protocol::render_unsuback(version, buffer, packet_id, filters.len())
                 })
                 .await
                 {
                     return Some(CONNECTION_LOST);
                 }
             }
-            v4::Packet::PingReq => {
-                if !write_packet(writer, |buffer| v4::PingResp.write(buffer)).await {
+            protocol::ClientPacket::PingReq => {
+                if !write_packet(writer, |buffer| protocol::render_pingresp(version, buffer))
+                    .await
+                {
                     return Some(CONNECTION_LOST);
                 }
             }
-            v4::Packet::Disconnect => return Some(CLIENT_INITIATED_DISCONNECT),
-            // Every other packet is one only a server sends, or part of an exchange this
-            // broker does not run (QoS 2); a client that sends one is not speaking the
-            // protocol this endpoint serves.
-            _ => return Some(CONNECTION_LOST),
+            protocol::ClientPacket::Disconnect => return Some(CLIENT_INITIATED_DISCONNECT),
+            // A second CONNECT on an open connection, a packet only a server sends, and
+            // one of an exchange this broker does not run (QoS 2): a client that sends one
+            // is not speaking the protocol this endpoint serves.
+            protocol::ClientPacket::Connect(_) | protocol::ClientPacket::Unserved => {
+                return Some(CONNECTION_LOST)
+            }
         }
     }
 }
@@ -531,19 +551,63 @@ fn close_session(
     }
 }
 
-/// Read one packet off `reader`, buffering what arrives until the codec can frame one.
+/// Read the opening CONNECT: the MQTT version it announces, and what it asks for.
+///
+/// The version is read off the packet's own bytes BEFORE any codec frames it
+/// ([`protocol::announced_protocol_level`]), because the codec that frames a packet is the
+/// one of the version the client speaks and each version's CONNACK is readable only to a
+/// client of that version.
+///
+/// `Err(version)` is a connection there is no session to open for — a version this broker
+/// serves no protocol for, or a CONNECT its own codec could not read — carrying the version
+/// its refusal is to be written in. `None` is a connection there is nothing to answer at
+/// all: the client closed it, the read failed, or it opened with some other packet.
+async fn read_connect<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    buffer: &mut BytesMut,
+) -> Option<Result<(protocol::Version, protocol::Connect), protocol::Version>> {
+    // Enough of the packet to carry the protocol level, read before a codec is chosen.
+    let announced = loop {
+        if let Some(level) = protocol::announced_protocol_level(buffer) {
+            break protocol::Version::of_protocol_level(level);
+        }
+        if buffer.len() >= protocol::MAX_PROTOCOL_LEVEL_OFFSET {
+            break None;
+        }
+        let mut chunk = [0u8; READ_CHUNK_BYTES];
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => return None,
+            Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+        }
+    };
+    // A client of a version this broker serves no protocol for is refused the way MQTT
+    // 3.1.1 does it: the shortest CONNACK, and the one a client of an unknown version has
+    // the best chance of reading.
+    let Some(version) = announced else {
+        return Some(Err(protocol::Version::V311));
+    };
+    match read_packet(version, reader, buffer).await {
+        Some(protocol::ClientPacket::Connect(connect)) => Some(Ok((version, connect))),
+        Some(_not_a_connect) => None,
+        None => Some(Err(version)),
+    }
+}
+
+/// Read one packet off `reader` with `version`'s codec, buffering what arrives until the
+/// codec can frame one.
 ///
 /// `None` ends the connection: the client closed it, the read failed, or the bytes are no
 /// packet this codec can read — including one larger than [`MAX_PACKET_BYTES`].
 async fn read_packet<R: AsyncRead + Unpin>(
+    version: protocol::Version,
     reader: &mut R,
     buffer: &mut BytesMut,
-) -> Option<v4::Packet> {
+) -> Option<protocol::ClientPacket> {
     loop {
-        match v4::read(buffer, MAX_PACKET_BYTES) {
-            Ok(packet) => return Some(packet),
-            Err(::mqttbytes::Error::InsufficientBytes(_needed)) => {}
-            Err(_unreadable) => return None,
+        match protocol::frame(version, buffer, MAX_PACKET_BYTES) {
+            protocol::Framing::Packet(packet) => return Some(packet),
+            protocol::Framing::Incomplete => {}
+            protocol::Framing::Unreadable => return None,
         }
         // What one connection may make this process hold, stated here rather than left to
         // the codec: a client that keeps sending bytes the codec cannot frame yet is read
@@ -573,31 +637,29 @@ where
     writer.write_all(&rendered).await.is_ok() && writer.flush().await.is_ok()
 }
 
-/// Answer a CONNECT with its CONNACK.
+/// Answer a CONNECT with its CONNACK, in the codes of the version the client speaks.
 async fn write_connack<W: AsyncWrite + Unpin>(
+    version: protocol::Version,
     writer: &mut W,
-    code: v4::ConnectReturnCode,
-    session_present: bool,
+    outcome: protocol::Connack,
 ) -> bool {
     write_packet(writer, |buffer| {
-        v4::ConnAck::new(code, session_present).write(buffer)
+        protocol::render_connack(version, buffer, outcome)
     })
     .await
 }
 
-/// Write one delivery to the client as a PUBLISH, at the QoS the delivery was made at.
+/// Write one delivery to the client as a PUBLISH, at the QoS the delivery was made at and
+/// with the message properties the client's own version can carry.
 async fn write_publish<W: AsyncWrite + Unpin>(
+    version: protocol::Version,
     writer: &mut W,
     message: &DirectMessage,
     packet_id: u16,
 ) -> bool {
-    let qos = qos_of(message.qos.clamp(0, MAX_GRANTED_QOS));
+    let now = now_millis();
     write_packet(writer, |buffer| {
-        let mut publish = v4::Publish::new(&message.topic, qos, message.payload.clone());
-        if qos != QoS::AtMostOnce {
-            publish.pkid = packet_id;
-        }
-        publish.write(buffer)
+        protocol::render_publish(version, buffer, message, packet_id, now)
     })
     .await
 }

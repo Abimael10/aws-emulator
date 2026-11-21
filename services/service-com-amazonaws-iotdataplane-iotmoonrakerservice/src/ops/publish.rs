@@ -9,6 +9,12 @@
 //! topic's retained message, and an empty retained payload clears it, which is how MQTT
 //! deletes a retained message.
 //!
+//! The message the broker forwards carries the MQTT5 PROPERTIES this request set — the
+//! payload format indicator, the content type, the response topic, the correlation data,
+//! the user properties and the message expiry — so a subscriber whose own connection can
+//! carry them (an MQTT 5 client) is handed each one, and a publication that set none
+//! arrives carrying none.
+//!
 //! An accepted message is also what the RULES ENGINE runs on: every enabled topic rule
 //! of the account whose SQL statement selects the published topic has its actions
 //! performed for this message
@@ -141,6 +147,19 @@ pub const RESERVED_TOPIC_MESSAGE: &str = "Topic can't start with $";
 /// not publish to.
 pub fn is_reserved_topic(topic: &str) -> bool {
     topic.starts_with(RESERVED_TOPIC_PREFIX)
+}
+
+/// The message expiry interval a `messageExpiry` carries to the broker, in SECONDS, or
+/// `None` for a publication that does not expire.
+///
+/// "A user-defined integer value that represents the message expiry interval in seconds.
+/// If absent, the message doesn't expire" (`PublishRequest$messageExpiry`), and the member
+/// is modelled with a default of 0 — so a request that named none arrives as 0, which is
+/// the absent case. The interval travels to a subscriber as MQTT 5's own Message Expiry
+/// Interval, a four-byte integer, so that is as much of it as can be carried.
+#[must_use]
+pub fn message_expiry_interval(message_expiry: i64) -> Option<u32> {
+    (message_expiry > 0).then(|| u32::try_from(message_expiry).unwrap_or(u32::MAX))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -370,6 +389,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // connection, and an offline client's persistent session holds it for its return.
         // A topic nobody subscribes to reaches nobody, which is what a broker does with
         // one, and none of it changes this response.
+        //
+        // The message carries the MQTT5 PROPERTIES this request set, each as the member
+        // that set it: a subscriber whose own connection can carry them (an MQTT 5 client)
+        // is handed every one, and a publication that set none arrives carrying none.
         if let Some(broker) = crate::state::broker(&*self.engine) {
             ::service_common::iot_mqtt_broker::publish_to_subscribers(
                 &broker,
@@ -377,9 +400,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     topic: input.topic.clone(),
                     payload: payload.clone(),
                     qos: input.qos,
+                    content_type: input.content_type.clone(),
+                    response_topic: input.response_topic.clone(),
                     user_properties: input.user_properties.clone(),
+                    payload_format_indicator: input.payload_format_indicator.clone(),
+                    correlation_data: input.correlation_data.clone(),
+                    message_expiry_seconds: message_expiry_interval(input.message_expiry),
                     delivered_at_millis: crate::state::now_millis(),
-                    ..::service_common::iot_mqtt_broker::DirectMessage::default()
                 },
             );
         }

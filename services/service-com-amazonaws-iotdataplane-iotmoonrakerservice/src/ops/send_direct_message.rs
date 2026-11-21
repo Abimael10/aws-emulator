@@ -280,6 +280,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 user_properties: input.user_properties.clone(),
                 payload_format_indicator: input.payload_format_indicator.clone(),
                 correlation_data: input.correlation_data.clone(),
+                // `SendDirectMessage` models no message expiry, so a direct message
+                // carries none and never expires on its way to the client.
+                message_expiry_seconds: None,
                 delivered_at_millis: now_millis,
             };
             // A connected client is handed the message over its own connection; an

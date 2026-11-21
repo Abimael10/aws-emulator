@@ -97,9 +97,40 @@ pub struct DirectMessage {
     pub response_topic: Option<String>,
     pub user_properties: Option<String>,
     pub payload_format_indicator: Option<String>,
+    /// The correlation data, BASE64-encoded — the form the HTTP data plane carries it in
+    /// ("The base64-encoded binary data used by the sender of the request message to
+    /// identify which request the response message is for",
+    /// `PublishRequest$correlationData`). On the MQTT wire the property is raw bytes, so
+    /// the wire decodes this on its way out and encodes what a publisher sent on its way
+    /// in; one form is kept, so a message read back is the message that was sent.
     pub correlation_data: Option<String>,
+    /// The message expiry interval the publisher set, in SECONDS, or `None` for a message
+    /// that does not expire ("A user-defined integer value that represents the message
+    /// expiry interval in seconds. If absent, the message doesn't expire",
+    /// `PublishRequest$messageExpiry`). What a subscriber is FORWARDED is this less the
+    /// time the message waited here — see [`DirectMessage::forwarded_message_expiry`].
+    pub message_expiry_seconds: Option<u32>,
     /// When the message was delivered, in epoch MILLISECONDS.
     pub delivered_at_millis: i64,
+}
+
+impl DirectMessage {
+    /// The message expiry interval this message is FORWARDED with at `now_millis`: what
+    /// the publisher set, less the whole seconds the message waited in the broker, and
+    /// `None` when the publisher set none.
+    ///
+    /// MQTT 5 section 3.3.2.3.3 states it: "The PUBLISH packet sent to a Client by the
+    /// Server MUST contain a Message Expiry Interval set to the received value minus the
+    /// time that the Application Message has been waiting in the Server" — so a message
+    /// handed straight to a live subscriber carries what was published, and one that waited
+    /// on an offline client's session carries less. `Some(0)` says the interval is spent.
+    #[must_use]
+    pub fn forwarded_message_expiry(&self, now_millis: i64) -> Option<u32> {
+        let published = self.message_expiry_seconds?;
+        let waited_millis = now_millis.saturating_sub(self.delivered_at_millis).max(0);
+        let waited = u32::try_from(waited_millis / 1_000).unwrap_or(u32::MAX);
+        Some(published.saturating_sub(waited))
+    }
 }
 
 /// One message on its way to a client over its live connection, and the caller waiting to

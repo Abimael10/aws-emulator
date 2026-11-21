@@ -141,12 +141,14 @@ uuid = { version = "1", features = ["v4"] }
 # `iot_mqtt_broker`: `sync` carries the per-connection channel the broker hands a live
 # client's session its deliveries over, and the notification that closes one.
 tokio = { workspace = true, features = ["io-util", "rt", "sync", "time"] }
-# `iot_mqtt_broker`: the MQTT 3.1.1 packet codec the broker reads a client's CONNECT,
+# `iot_mqtt_broker`: the MQTT packet codec the broker reads a client's CONNECT,
 # SUBSCRIBE and PUBLISH with and writes its own CONNACK, SUBACK, PUBLISH and PINGRESP
 # with — the maintained serializer of the protocol, so the wire a stock MQTT client
 # speaks is read by that codec rather than by a framing reader written here. A codec
 # over bytes: it opens no socket (the core owns it) and reaches nothing off this process.
-mqttbytes = "0.6"
+# `v5` carries the MQTT 5 half of it — the version's own reason codes and a publication's
+# message properties — which is the second of the two versions the broker serves.
+mqttbytes = { version = "0.6", features = ["v5"] }
 # `iot_mqtt_broker`: the published broker address serves the IoT HTTPS data plane as well
 # as MQTT — one address, both wires, as the host AWS publishes for an account's data
 # endpoint does — so that socket speaks HTTP/1.1 with the same server its sibling planes

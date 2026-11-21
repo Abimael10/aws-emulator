@@ -14,6 +14,11 @@
 //! blob) and is announced `content-type: application/json` — see the media-type note
 //! in `crate::service`, which decides that for every operation that answers with one.
 //!
+//! An accepted delete is also ANNOUNCED on the shadow's own reserved
+//! `…/delete/accepted` topic (`crate::state::shadow_topics`), exactly as an accepted
+//! update is announced on its: a device subscribed to the shadow learns its document is
+//! gone from the service rather than by asking for it again.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -205,6 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The deletion acknowledgement names the version that was deleted and when the
         // deletion was accepted.
+        let timestamp_secs = crate::state::now_secs();
         let mut acknowledgement = ::serde_json::Map::new();
         acknowledgement.insert(
             "version".to_string(),
@@ -212,7 +218,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         acknowledgement.insert(
             "timestamp".to_string(),
-            ::serde_json::Value::from(crate::state::now_secs()),
+            ::serde_json::Value::from(timestamp_secs),
+        );
+
+        // The delete was accepted, so it is ANNOUNCED on the shadow's own reserved topic,
+        // exactly as an accepted update is: a device subscribed to the shadow learns its
+        // document is gone from the service rather than by asking for it again. See
+        // `crate::state::shadow_topics`.
+        crate::state::shadow_topics::announce_delete(
+            &*self.engine,
+            &input.thing_name,
+            input.shadow_name.as_deref(),
+            deleted_version,
+            timestamp_secs,
+            None,
         );
 
         Ok(DeleteThingShadowOutput {
