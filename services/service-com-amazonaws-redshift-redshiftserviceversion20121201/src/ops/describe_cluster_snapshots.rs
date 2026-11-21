@@ -244,6 +244,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // The two time members name the interval TOGETHER — "a value that
+        // requests only snapshots created at or after the specified time" and
+        // its `EndTime` counterpart — and one that ends before it begins holds
+        // no instant at all. Decided on the request alone, like the combination
+        // above.
+        if st::inverted_time_interval(input.start_time, input.end_time) {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
+                st::INVERTED_TIME_INTERVAL,
+            ));
+        }
+
         // `SnapshotAttributeToSortBy` declares three values, so a longer list can
         // only repeat one: the cap keeps the sort work a small constant multiple
         // of one pass, which matters because it runs under the state lock.

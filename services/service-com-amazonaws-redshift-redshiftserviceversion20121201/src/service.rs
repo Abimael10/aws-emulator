@@ -52,6 +52,7 @@
 //! framework.
 
 pub mod query_error_envelope;
+pub mod stated_enum_value_sets;
 
 use query_error_envelope::{RedshiftDefinition, RequestIdEnvelopeOperation};
 use smithy_server_runtime::{
@@ -143,12 +144,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The MESSAGE is the shared rendering of AWS's own envelope over the
         // framework's clauses (`service_common::validation_message`), so nothing
         // about the sentence — the count word, the member paths or the
-        // requirements — is spelled per service.
+        // requirements — is spelled per service. ONE thing inside a clause is
+        // this service's own and not the model's: the ORDER an enumerated type's
+        // value set is listed in ([`stated_enum_value_sets`]), which is restated
+        // on the VIOLATIONS before that rendering runs, so the clause, the
+        // envelope and the code all stay where they are written.
         //
         // An authentication refusal is declined: it is a 403 under its own code
         // rather than an input refusal, and this seam is handed no detail of
         // which credential failure it was.
-        let message = ::service_common::validation_message::aws_validation_refusal(refusal)?.message;
+        let stated = stated_enum_value_sets::in_stated_order(refusal);
+        let message =
+            ::service_common::validation_message::aws_validation_refusal(&stated)?.message;
         Some(Refused {
             code: INPUT_REFUSAL_CODE.to_string(),
             message,

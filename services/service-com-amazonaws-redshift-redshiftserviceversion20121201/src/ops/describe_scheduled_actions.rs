@@ -180,6 +180,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
 
+        // The two time members name the interval TOGETHER — "only active
+        // scheduled actions that have invocations after this time are
+        // retrieved", and before `EndTime` — and one that ends before it begins
+        // holds no instant at all. Decided on the request alone, before the
+        // store is reached.
+        if st::inverted_time_interval(input.start_time, input.end_time) {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
+                st::INVERTED_TIME_INTERVAL,
+            ));
+        }
+
         let Some(state) = st::service_state(&*self.engine) else {
             return Err(
                 DescribeScheduledActionsErrorModeled::DependentServiceUnavailableFault(

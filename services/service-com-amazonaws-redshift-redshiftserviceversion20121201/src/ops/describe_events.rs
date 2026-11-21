@@ -198,6 +198,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             _ => {}
         }
 
+        // The two time members name the interval TOGETHER, and one that ends
+        // before it begins holds no instant at all: `StartTime` is "the
+        // beginning of the time interval to retrieve events for" and `EndTime`
+        // "the end" of it. Decided on the request alone, before the store is
+        // reached, like the source pair above.
+        if st::inverted_time_interval(input.start_time, input.end_time) {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
+                st::INVERTED_TIME_INTERVAL,
+            ));
+        }
+
         let Some(state) = st::service_state(&*self.engine) else {
             return Err(
                 DescribeEventsErrorModeled::DependentServiceUnavailableFault(

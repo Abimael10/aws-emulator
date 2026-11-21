@@ -497,3 +497,99 @@ async fn a_successful_response_keeps_its_response_metadata_request_id() {
         assert_request_id_shape(case, &ids[0]);
     }
 }
+
+/// `com.amazonaws.redshift#SourceType`'s value set as Amazon Redshift LISTS it in
+/// a constraint clause: the service's own order, which is neither the order the
+/// model declares the values in nor a sort of them.
+///
+/// Written out here rather than read from the crate, like every other expected
+/// sentence in this suite, so an order that drifts fails this test.
+const STATED_SOURCE_TYPE_SET: &str =
+    "cluster-security-group, cluster-parameter-group, scheduled-action, cluster-snapshot, cluster";
+
+/// `com.amazonaws.redshift#SnapshotAttributeToSortBy`'s value set as the MODEL
+/// declares it (`smithy_query(query="shape", shape="SnapshotAttributeToSortBy")`),
+/// which is the order a clause about it lists, because this service publishes no
+/// order of its own for that type.
+const DECLARED_SORT_ATTRIBUTE_SET: &str = "SOURCE_TYPE, TOTAL_SIZE, CREATE_TIME";
+
+/// A value outside an enumerated type's set is refused with the validation
+/// envelope, and the clause lists that type's values in the order the SERVICE
+/// states them — which belongs to the type, so it does not depend on the value
+/// that missed it, and leaves every type the service publishes no order for
+/// listed as the model declares it.
+#[tokio::test]
+async fn an_enum_refusal_lists_the_value_set_in_the_order_the_service_states_it() {
+    let emulator = Emulator::new();
+
+    // Rows differ along the rejected VALUE — a near-miss of a permitted value,
+    // one differing only in case, one differing only in its punctuation, a value
+    // belonging to another of this service's domains, and one carrying a space —
+    // while the set the sentence lists stays the same, because it belongs to the
+    // type and not to the value.
+    for (case, supplied) in [
+        ("a near-miss of a permitted value", "redshift-cluster"),
+        ("a permitted value in capitals", "CLUSTER"),
+        ("an underscore where the set has a hyphen", "cluster_snapshot"),
+        ("a value of another domain of this service", "automated"),
+        ("a permitted value with a trailing space", "cluster "),
+    ] {
+        let answer = emulator
+            .call(
+                "DescribeEvents",
+                &[
+                    ("SourceType", supplied),
+                    ("SourceIdentifier", "enum-order-cluster"),
+                ],
+            )
+            .await;
+        assert_eq!(
+            (answer.status, answer.error_code().as_deref()),
+            (400, Some("ValidationError")),
+            "case {case:?}: expected 400 / ValidationError, got {} / {:?} with body {}",
+            answer.status,
+            answer.error_code(),
+            answer.body
+        );
+        let expected = format!(
+            "1 validation error detected: Value '{supplied}' at 'sourceType' failed to satisfy \
+             constraint: Member must satisfy enum value set: [{STATED_SOURCE_TYPE_SET}]"
+        );
+        assert_eq!(
+            answer.text("Message").as_deref(),
+            Some(expected.as_str()),
+            "case {case:?}: expected the message {expected:?}, got {:?} with body {}",
+            answer.text("Message"),
+            answer.body
+        );
+    }
+
+    // A type this service publishes no order for keeps the model's own order, so
+    // the order above is a property of ONE type rather than a re-ordering of
+    // every clause.
+    let other = emulator
+        .call(
+            "DescribeClusterSnapshots",
+            &[(
+                "SortingEntities.SnapshotSortingEntity.1.Attribute",
+                "LAST_RESTORE",
+            )],
+        )
+        .await;
+    assert_eq!(
+        (other.status, other.error_code().as_deref()),
+        (400, Some("ValidationError")),
+        "case \"a sorting attribute outside its set\": expected 400 / ValidationError, got {} / \
+         {:?} with body {}",
+        other.status,
+        other.error_code(),
+        other.body
+    );
+    let clause = format!("Member must satisfy enum value set: [{DECLARED_SORT_ATTRIBUTE_SET}]");
+    let message = other.text("Message").unwrap_or_default();
+    assert!(
+        message.contains(&clause),
+        "case \"a sorting attribute outside its set\": expected the clause {clause:?}, got \
+         {message:?}"
+    );
+}

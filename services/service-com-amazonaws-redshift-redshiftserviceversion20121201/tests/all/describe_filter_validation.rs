@@ -20,7 +20,9 @@
 //! * a value outside a member's published domain is refused with that member's own
 //!   sentence, and a BLANK value of a member whose domain admits blank selects
 //!   everything, exactly as an omitted member does;
-//! * an event read may not reach back past the published retention window.
+//! * an event read may not reach back past the published retention window;
+//! * a read scoped by a caller-supplied `StartTime`/`EndTime` interval refuses an
+//!   interval whose end precedes its beginning, whichever read it is.
 //!
 //! Every refusal is checked on its STATUS, its wire error code and its whole
 //! message: a client branches on the code and an operator reads the sentence, so
@@ -786,4 +788,120 @@ async fn a_snapshot_read_filters_by_cluster_identifier_instead_of_resolving_it()
         missing.error_code(),
         missing.body
     );
+}
+
+/// The reads of this service whose input carries the `StartTime`/`EndTime` pair
+/// that names the interval they report over, which is the whole class the rule
+/// below holds over.
+///
+/// From the model: `DescribeEventsMessage`, `DescribeClusterSnapshotsMessage` and
+/// `DescribeScheduledActionsMessage` are the input shapes carrying both members
+/// (`smithy_query(query="operation",
+/// operation="DescribeEvents,DescribeClusterSnapshots,DescribeScheduledActions")`).
+/// `CreateScheduledAction` / `ModifyScheduledAction` carry the pair too, but there
+/// it is the action's own activation window — a value stored and reported back,
+/// not the interval of a read — so they are not of this class.
+const INTERVAL_SCOPED_READS: [&str; 3] = [
+    "DescribeEvents",
+    "DescribeClusterSnapshots",
+    "DescribeScheduledActions",
+];
+
+/// A read scoped by a caller-supplied time interval refuses, on the request
+/// alone, an interval whose end precedes its beginning: such an interval holds no
+/// instant, so there is nothing to report over and nothing the caller could have
+/// meant by it.
+///
+/// The sentence is entirely fixed text — it names neither member and echoes
+/// neither instant — and the refusal is the query-protocol parameter-combination
+/// one, because each end is an acceptable instant on its own and only the pair is
+/// impossible.
+#[tokio::test]
+async fn a_read_whose_interval_ends_before_it_begins_is_refused() {
+    let emulator = Emulator::new();
+    let now = SystemTime::now();
+    let second = Duration::from_secs(1);
+    let minute = Duration::from_secs(60);
+    let half_hour = Duration::from_secs(30 * 60);
+
+    // The one sentence AWS answers this error class with.
+    let expected = "End time must not precede start time";
+
+    // Rows differ along HOW FAR the end precedes the beginning (a second, a
+    // minute, half an hour), where the interval sits relative to the request's
+    // own instant (behind it, straddling it, ahead of it), and which ends the
+    // request named at all — the two degenerate cases (an interval of zero width,
+    // and one end alone) being the boundary the refusal stops at. Every instant
+    // stays inside the published event-retention window, so no row can pass by
+    // being refused for reaching too far back.
+    let rows: Vec<(&str, Option<SystemTime>, Option<SystemTime>, bool)> = vec![
+        ("neither end named", None, None, false),
+        ("the beginning alone", Some(now - half_hour), None, false),
+        ("the end alone", None, Some(now - half_hour), false),
+        (
+            "an interval of zero width",
+            Some(now - minute),
+            Some(now - minute),
+            false,
+        ),
+        (
+            "an interval half an hour wide",
+            Some(now - half_hour),
+            Some(now),
+            false,
+        ),
+        (
+            "an interval a minute wide, ahead of the request",
+            Some(now + minute),
+            Some(now + 2 * minute),
+            false,
+        ),
+        (
+            "an end one second before its start",
+            Some(now - minute),
+            Some(now - minute - second),
+            true,
+        ),
+        (
+            "an end one minute before its start",
+            Some(now - minute),
+            Some(now - 2 * minute),
+            true,
+        ),
+        (
+            "an end half an hour before its start",
+            Some(now),
+            Some(now - half_hour),
+            true,
+        ),
+        (
+            "an inverted interval entirely ahead of the request",
+            Some(now + half_hour),
+            Some(now + minute),
+            true,
+        ),
+    ];
+
+    for action in INTERVAL_SCOPED_READS {
+        for (row, start, end, refused) in &rows {
+            let mut params: Vec<(&str, String)> = Vec::new();
+            if let Some(at) = start {
+                params.push(("StartTime", iso8601(*at)));
+            }
+            if let Some(at) = end {
+                params.push(("EndTime", iso8601(*at)));
+            }
+            let borrowed: Vec<(&str, &str)> = params
+                .iter()
+                .map(|(name, value)| (*name, value.as_str()))
+                .collect();
+            let answer = emulator.call(action, &borrowed).await;
+            let case = format!("{action} with {row}");
+            if *refused {
+                assert_refused(&case, &answer, 400, "InvalidParameterCombination", expected);
+            } else {
+                assert_served(&case, &answer);
+            }
+        }
+    }
 }

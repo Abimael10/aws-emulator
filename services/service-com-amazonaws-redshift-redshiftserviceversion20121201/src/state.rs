@@ -131,6 +131,9 @@ mod snapshot_schedules;
 /// The scheduled actions an account created: the record each one is, the
 /// schedule expression it runs on and the invocation times computed from it.
 mod scheduled_actions;
+/// The closed time interval a read scopes itself by, and the refusal a request
+/// naming one that ends before it begins carries.
+mod time_intervals;
 /// The lakehouse configuration a cluster carries, and the registration a
 /// `ModifyLakehouseConfiguration` writes onto it.
 mod lakehouse;
@@ -173,6 +176,7 @@ pub use resize::*;
 pub use scheduled_actions::*;
 pub use snapshot_schedules::*;
 pub use tags::*;
+pub use time_intervals::*;
 
 /// How long after the call that starts it a provisioning transition falls due:
 /// a cluster or a snapshot reported `creating` becomes `available` this long
