@@ -52,6 +52,13 @@ pub(super) enum OperandKind {
 /// is read, so what it holds is known only once an item is read. The one position that
 /// needs a literal is `attribute_type (path, type)`'s type code, which names a member of a
 /// closed set ([`check_attribute_type_name`]).
+///
+/// `contains` is the function whose SEARCHED operand takes either as well: the collection it
+/// searches may be one the REQUEST carried rather than one the item holds, which is how a
+/// membership test over a list of expression-attribute values is written
+/// (`contains(:candidates, #attribute)`), and AWS is observed to evaluate that call per item
+/// instead of refusing it. Both positions are then read the same way, and what each holds is
+/// known only once an item is read.
 pub(super) fn function_signature(name: &str) -> Option<&'static [OperandKind]> {
     const PATH: &[OperandKind] = &[OperandKind::Path];
     const PATH_VALUE: &[OperandKind] = &[OperandKind::Path, OperandKind::Value];
@@ -60,8 +67,8 @@ pub(super) fn function_signature(name: &str) -> Option<&'static [OperandKind]> {
     match name {
         "attribute_exists" | "attribute_not_exists" | "size" => Some(PATH),
         "attribute_type" => Some(PATH_VALUE),
-        "begins_with" | "contains" | "if_not_exists" => Some(PATH_EITHER),
-        "list_append" => Some(EITHER_EITHER),
+        "begins_with" | "if_not_exists" => Some(PATH_EITHER),
+        "contains" | "list_append" => Some(EITHER_EITHER),
         _ => None,
     }
 }
@@ -123,11 +130,19 @@ pub(super) fn check_operand_kind(
 /// over the OPERATOR and the first operand, rendered as the token list its refusals print a
 /// document path as ([`DocumentPath::render_tokens`]). Two DIFFERENT locations are compared,
 /// so that call is read against the item like any other.
+///
+/// The rule is about two operands naming ONE LOCATION, so it is asked only where both of
+/// them name one: a call searching a collection the request carried has no path to be
+/// distinct from, and the values it compares are the request's own rather than the same
+/// attribute read twice.
 pub(super) fn check_contains_operands(
     member: &str,
-    path: &DocumentPath,
+    searched: &Operand,
     operand: &Operand,
 ) -> Result<(), RequestError> {
+    let Operand::Path(path) = searched else {
+        return Ok(());
+    };
     if matches!(operand, Operand::Path(other) if other == path) {
         return Err(invalid_expression_member(
             member,

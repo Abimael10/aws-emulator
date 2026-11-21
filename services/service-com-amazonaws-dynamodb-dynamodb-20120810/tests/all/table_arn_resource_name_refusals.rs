@@ -264,9 +264,10 @@ async fn an_arn_of_another_resource_kind_still_states_its_type_and_a_table_s_own
 
     // An ARN of this service whose resource TYPE is not a table's is refused by the type:
     // its resource name is acceptable, so the ARN-format clause has nothing to say about
-    // it. The clause names the member, the value the request sent and the constraint that
-    // value broke, like every other refusal on this member. The rows span another type, a
-    // mis-cased one and no type at all.
+    // it. The diagnosis names the FIELD of the ARN that is wrong, over the value the
+    // request sent — the frame this operation states an ARN field's refusals in, the same
+    // one it states a cross-region ARN in. The rows span another type, a mis-cased one and
+    // no type at all.
     for (case, value) in [
         (
             "a backup ARN",
@@ -292,13 +293,9 @@ async fn an_arn_of_another_resource_kind_still_states_its_type_and_a_table_s_own
             (code.as_str(), stated.as_str()),
             (
                 "ValidationException",
-                format!(
-                    "1 validation error detected: Value '{value}' at 'tableName' failed to \
-                     satisfy constraint: Invalid resource type"
-                )
-                .as_str()
+                format!("1 validation error detected: Invalid resource type in '{value}'").as_str()
             ),
-            "case {case:?}: expected the resource-type constraint clause, got {code} with \
+            "case {case:?}: expected the resource-type sentence over the ARN, got {code} with \
              {stated:?}"
         );
     }

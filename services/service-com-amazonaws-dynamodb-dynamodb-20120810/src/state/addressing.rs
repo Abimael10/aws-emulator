@@ -64,12 +64,26 @@ pub const TABLE_NAME_MEMBER_PATH: &str = "tableName";
 /// accepts.
 pub(super) const TABLE_RESOURCE_TYPE: &str = "table";
 
-/// The refusal an ARN of this service that names a resource of ANOTHER KIND earns: the
-/// TYPE is what is wrong with the value, so the requirement the clause states is that —
-/// reported, like every other way this member refuses a value, as the member it came in,
-/// the value the request sent and the constraint that value broke ([`invalid_member`]).
-pub(super) fn invalid_resource_type(member: &str, arn: &str) -> RequestError {
-    invalid_member(member, Some(arn), INVALID_RESOURCE_TYPE_REQUIREMENT)
+/// The refusal an ARN of this service that names a resource of ANOTHER KIND earns, stated
+/// as the SENTENCE naming the ARN: the offending ARN, as the request spelled it.
+///
+/// The TYPE field of the ARN is what is wrong with the value, and a fact about an ARN's own
+/// field is stated over that ARN rather than as a constraint of the member that carried it
+/// — exactly as the fact about its REGION field is ([`invalid_arn_region`]). Both are read
+/// out of the same ARN by the same resolution, so both are stated in the same frame, and an
+/// operation that states one form states the other in it too ([`ArnRefusalForm`]).
+pub(super) fn invalid_resource_type(arn: &str) -> RequestError {
+    refused(format!("{INVALID_RESOURCE_TYPE_REQUIREMENT} in '{arn}'"))
+}
+
+/// The same fact as that member's own CONSTRAINT: the member path, the ARN the request sent
+/// and the requirement its resource-type field broke ([`invalid_member`]).
+///
+/// The echo is held to the longest value the MEMBER itself admits
+/// ([`MAX_ECHOED_TABLE_NAME`]), like every other clause about this member.
+fn resource_type_outside_this_service(member: &str, arn: &str) -> RequestError {
+    let echoed = ::service_common::validation::quoted_echo_up_to(arn, MAX_ECHOED_TABLE_NAME);
+    invalid_member(member, Some(&echoed), INVALID_RESOURCE_TYPE_REQUIREMENT)
 }
 
 /// The requirement phrase an ARN naming a resource of another kind fails: fixed text,
@@ -100,6 +114,16 @@ pub fn resolve_table_name(table_name: &str) -> Result<String, RequestError> {
 /// are the same whichever member carried the name, which is why there is one
 /// resolution and only the path differs.
 pub fn resolve_table_name_of(member: &str, table_name: &str) -> Result<String, RequestError> {
+    resolve_table_name_framed(member, table_name, ArnRefusalForm::Sentence)
+}
+
+/// That resolution with the FRAME an ARN-field refusal is stated in made explicit, so the
+/// operation that resolves the name chooses it ([`ArnRefusalForm`]).
+fn resolve_table_name_framed(
+    member: &str,
+    table_name: &str,
+    form: ArnRefusalForm,
+) -> Result<String, RequestError> {
     // A value spelled as an ARN is refused in one of THREE ways, and which one depends
     // on what is wrong with it:
     //
@@ -108,8 +132,8 @@ pub fn resolve_table_name_of(member: &str, table_name: &str) -> Result<String, R
     //     the ARN FORM, because that is what is wrong with it: the value was parsed as
     //     an ARN and the ARN is what it failed as;
     //   * an ARN OF THIS SERVICE whose resource type is not a table's names a resource
-    //     of another kind, and the refusal says so over the ARN that was sent
-    //     ([`invalid_resource_type`]);
+    //     of another kind, and the refusal says so over the ARN that was sent, in the
+    //     frame this operation states an ARN field's refusals in ([`ArnRefusalForm`]);
     //   * any other well-formed ARN that does not name a table of this service is no way
     //     of naming a table, so it is refused as the table NAME it would have to be,
     //     by the pattern a table name must satisfy.
@@ -146,7 +170,7 @@ pub fn resolve_table_name_of(member: &str, table_name: &str) -> Result<String, R
                 None => (*resource, ""),
             };
             if resource_type != TABLE_RESOURCE_TYPE {
-                return Err(invalid_resource_type(member, table_name));
+                return Err(form.resource_type_refusal(member, table_name));
             }
             // The resource NAME of a table's ARN is the table name, so it is held to
             // the table name's own form — and a value spelled as an ARN that breaks it
@@ -273,22 +297,37 @@ fn region_outside_this_endpoint(member: &str, table_name: &str) -> RequestError 
     invalid_member(member, Some(&echoed), INVALID_ARN_REGION_REQUIREMENT)
 }
 
-/// Which FORM an operation states a cross-region ARN refusal in, read at the one place the
-/// resolution raises it ([`resolve_region_addressed`]) so the two cannot drift apart.
+/// Which FORM an operation states a refusal about a FIELD of the ARN a table-naming member
+/// carried in, read at the one place the resolution raises one ([`resolve_region_addressed`],
+/// [`resolve_table_name_framed`]) so the forms cannot drift apart.
+///
+/// The frame belongs to the OPERATION rather than to the field: an operation that states one
+/// ARN field's refusal as the sentence states every other field's that way too, so the
+/// region and the resource type are reported in one frame per operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RegionRefusalForm {
-    /// The sentence alone, naming the ARN ([`invalid_arn_region`]).
+enum ArnRefusalForm {
+    /// The sentence alone, naming the ARN ([`invalid_arn_region`],
+    /// [`invalid_resource_type`]).
     Sentence,
-    /// That member's own constraint clause ([`region_outside_this_endpoint`]).
+    /// That member's own constraint clause ([`region_outside_this_endpoint`],
+    /// [`resource_type_outside_this_service`]).
     MemberClause,
 }
 
-impl RegionRefusalForm {
-    /// The refusal this form states for `table_name`, reported under `member`.
-    fn refusal(self, member: &str, table_name: &str) -> RequestError {
+impl ArnRefusalForm {
+    /// The REGION refusal this form states for `table_name`, reported under `member`.
+    fn region_refusal(self, member: &str, table_name: &str) -> RequestError {
         match self {
             Self::Sentence => invalid_arn_region(table_name),
             Self::MemberClause => region_outside_this_endpoint(member, table_name),
+        }
+    }
+
+    /// The RESOURCE-TYPE refusal this form states for `table_name`, reported under `member`.
+    fn resource_type_refusal(self, member: &str, table_name: &str) -> RequestError {
+        match self {
+            Self::Sentence => invalid_resource_type(table_name),
+            Self::MemberClause => resource_type_outside_this_service(member, table_name),
         }
     }
 }
@@ -310,34 +349,35 @@ fn resolve_region_addressed(
     member: &str,
     table_name: &str,
     region: &str,
-    form: RegionRefusalForm,
+    form: ArnRefusalForm,
 ) -> Result<String, RequestError> {
-    let name = resolve_table_name_of(member, table_name)?;
+    let name = resolve_table_name_framed(member, table_name, form)?;
     if table_arn_region(table_name).is_some_and(|addressed| addressed != region) {
-        return Err(form.refusal(member, table_name));
+        return Err(form.region_refusal(member, table_name));
     }
     Ok(name)
 }
 
-/// That resolution for the request-level `TableName`, stating the cross-region refusal as the
+/// That resolution for the request-level `TableName`, stating an ARN-FIELD refusal as the
 /// sentence alone — the form every operation but the ones below is observed to state.
 pub fn resolve_table_name_in(table_name: &str, region: &str) -> Result<String, RequestError> {
     resolve_table_name_in_member(TABLE_NAME_MEMBER_PATH, table_name, region)
 }
 
-/// The same resolution whose cross-region refusal is stated as the table-name member's own
+/// The same resolution whose ARN-FIELD refusals are stated as the table-name member's own
 /// CONSTRAINT CLAUSE rather than as the sentence alone — the form the single-item READ is
-/// observed to state it in, over the `tableName` path with the ARN echoed.
+/// observed to state them in, over the `tableName` path with the ARN echoed.
 ///
-/// Called by the operations observed to state that form; every other operation keeps
-/// [`invalid_arn_region`]'s sentence. Which form an operation states is recorded at its one
-/// call site rather than in a list here, because the operation is what makes the choice.
+/// Called by the operations observed to state that form; every other operation keeps the
+/// field sentence. Which form an operation states is recorded at its one call site rather
+/// than in a list here, because the operation is what makes the choice — and it is the same
+/// form for every field of the ARN ([`ArnRefusalForm`]).
 pub fn resolve_table_name_in_clause(table_name: &str, region: &str) -> Result<String, RequestError> {
     resolve_region_addressed(
         TABLE_NAME_MEMBER_PATH,
         table_name,
         region,
-        RegionRefusalForm::MemberClause,
+        ArnRefusalForm::MemberClause,
     )
 }
 
@@ -348,7 +388,7 @@ pub fn resolve_table_name_in_member(
     table_name: &str,
     region: &str,
 ) -> Result<String, RequestError> {
-    resolve_region_addressed(member, table_name, region, RegionRefusalForm::Sentence)
+    resolve_region_addressed(member, table_name, region, ArnRefusalForm::Sentence)
 }
 
 /// The REGION field of a value spelled as an ARN, or `None` when the value is not

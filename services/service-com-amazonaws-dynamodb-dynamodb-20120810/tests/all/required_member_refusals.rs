@@ -28,8 +28,8 @@
 //!    more parameter values were invalid: ARNs must start with 'arn:': <value>` — while a
 //!    well-formed ARN that addresses no table of this endpoint is refused by the member it
 //!    was sent in, and an ARN of this service that names a resource of another KIND is
-//!    refused by that type: the clause states the constraint `Invalid resource type` over
-//!    that member and that value.
+//!    refused by that type: the diagnosis `Invalid resource type` is stated over the ARN
+//!    the request sent, in the frame that operation states an ARN field's refusals in.
 //! 6. A reserved word is an attribute name only in an expression that PARSES: an
 //!    expression the grammar cannot complete is the syntax error it is, reported at the
 //!    token the parse stopped at, and only a complete expression earns the reserved-word
@@ -641,7 +641,9 @@ async fn a_table_arn_naming_another_kind_of_resource_is_refused_by_its_type() {
     // The rows span the resource types an ARN of this service can name where a table's
     // belongs — a backup, a mis-cased `Table`, an import and no type at all — over
     // operations on both planes. The type is what is wrong with every one of them, so
-    // every one states the same sentence over the ARN that was sent.
+    // every one states the same diagnosis over the ARN that was sent, in the frame that
+    // operation states an ARN FIELD's refusals in: the sentence naming the ARN, and the
+    // member's own constraint clause for the single-item read.
     let arns: Vec<(&str, String)> = vec![
         (
             "a backup ARN",
@@ -663,31 +665,35 @@ async fn a_table_arn_naming_another_kind_of_resource_is_refused_by_its_type() {
 
     for (case, arn) in &arns {
         let stream = format!("arn:aws:kinesis:{REGION}:{ACCOUNT}:stream/cdc");
-        for (operation, request) in [
-            ("DescribeTable", json!({"TableName": arn})),
+        let sentence = format!("1 validation error detected: Invalid resource type in '{arn}'");
+        let member_clause = format!(
+            "1 validation error detected: Value '{arn}' at 'tableName' failed to \
+             satisfy constraint: Invalid resource type"
+        );
+        for (operation, request, expected) in [
+            ("DescribeTable", json!({"TableName": arn}), &sentence),
             (
                 "DescribeKinesisStreamingDestination",
                 json!({"TableName": arn}),
+                &sentence,
             ),
             (
                 "EnableKinesisStreamingDestination",
                 json!({"TableName": arn, "StreamArn": stream}),
+                &sentence,
             ),
             (
                 "GetItem",
                 json!({"TableName": arn, "Key": {"pk": {"S": "one"}}}),
+                &member_clause,
             ),
         ] {
             let (code, stated) = refusal(&router, case, operation, request).await;
-            let expected = format!(
-                "1 validation error detected: Value '{arn}' at 'tableName' failed to \
-                 satisfy constraint: Invalid resource type"
-            );
             assert_eq!(
                 (code.as_str(), stated.as_str()),
                 ("ValidationException", expected.as_str()),
-                "case {case:?} ({operation}): expected the resource-type refusal, got {code} \
-                 with {stated:?}"
+                "case {case:?} ({operation}): expected the resource-type refusal {expected:?}, \
+                 got {code} with {stated:?}"
             );
         }
     }

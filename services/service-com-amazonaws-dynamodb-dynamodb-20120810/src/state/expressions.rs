@@ -3732,15 +3732,17 @@ impl<'a> ExprParser<'a> {
                 check_begins_with_prefix(self.member, &prefix)?;
                 ConditionNode::BeginsWith(value, prefix)
             }
-            // The closed set above holds nothing else.
+            // The closed set above holds nothing else: `contains`, whose searched operand
+            // is read at the kind its signature declares like every other position — a
+            // location the item holds, or a collection the REQUEST carried.
             _ => {
-                let path = self.function_path(name)?;
+                let searched = self.function_operand(name, signature, 0)?;
                 self.expect(&ExprToken::Comma)?;
                 let needle = self.function_operand(name, signature, 1)?;
                 // The one rule beyond the operand kinds: the two operands address
                 // different locations ([`check_contains_operands`]).
-                check_contains_operands(self.member, &path, &needle)?;
-                ConditionNode::Contains(Operand::Path(path), needle)
+                check_contains_operands(self.member, &searched, &needle)?;
+                ConditionNode::Contains(searched, needle)
             }
         };
         self.expect(&ExprToken::Close)?;
