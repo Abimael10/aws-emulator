@@ -1,0 +1,46 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: eventbridgev2.subscriber-name-collision-on-same-bus-rejected-but-allowed-on-another
+Issue-Shape-Id: com.amazonaws.eventbridgev2#AWSEventsV2
+Issue-Key: eventbridgev2|CreateSubscriber|ResourceAlreadyExistsException
+Issue-Commit: 86b7b93924596014dcc0f9434ec83d2158b7f62b
+
+# eventbridgev2: CreateSubscriber scopes subscriber-name uniqueness per region instead of per event bus, so a name already used on another bus is refused with ResourceAlreadyExistsException
+
+> _Note: this issue was identified against the code base at commit `86b7b93924596014dcc0f9434ec83d2158b7f62b`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateSubscriber
+
+## Description
+REOPENS 20261104T183027Z-eventbridgev2-createsubscriber-stub.md: its fix left the call refused. That fix implemented CreateSubscriber (it now answers 200 and the name-collision message is AWS's constant text, so the wording half of the open issue 20261113T145420Z-eventbridgev2-4-net-new-behavioral-causes-createsubscriber-s.md Cause 2 no longer reproduces), but a model-valid CreateSubscriber that reuses a name on a DIFFERENT event bus is still refused instead of minting the subscriber. This is the exact regression that issue's Cause 2 warned about in its fixer note ("the emulator also scopes the collision per REGION rather than per bus ... the per-bus scoping must be preserved when the wording is fixed"); the check's replay key has changed (the assertion on the message now passes and the failure is an uncaught ResourceAlreadyExistsException from the later create), so no open issue carries it.
+
+=== Cause 1 of 1: subscriber-name uniqueness is enforced per account+region rather than per event bus ===
+AWS: Smithy (services/service-com-amazonaws-eventbridgev2-awseventsv2/smithy-model/com-amazonaws-eventbridgev2-awseventsv2.json): CreateSubscriber takes @required Name (SubscriberName, @length 1-256, @pattern ^[A-Za-z0-9][\.\-_A-Za-z0-9]*$) and @required EventBusArn (pattern .../event-busv2/<name>/<25 chars>), and declares ResourceAlreadyExistsException (@error client, @httpError 409, single member Message), documented "A resource with the same name already exists." A subscriber is a child of one event bus (SubscriberArn is arn:aws:events:<region>:<account>:subscriber/<Name>/<25-char id>, and ListSubscribers/DescribeSubscriber are reached through EventBusArn), so the namespace a Name has to be unique in is ONE event bus: a second CreateSubscriber with a name already held on the SAME bus and a fresh ClientToken is refused 409 ResourceAlreadyExistsException with the fixed message "Resource already exists" (entirely fixed text, interpolating nothing from the request or state), while the SAME Name on ANOTHER bus in the same account and region is ACCEPTED and returns its own distinct SubscriberArn, its Name echoed and its EventBusArn set to the second bus.
+Emulator: the same-bus refusal and its wording are now correct, but the create of that name on a second bus is also refused — HTTP 409, error code ResourceAlreadyExistsException, message "Resource already exists" — so the check dies on an uncaught botocore.errorfactory.ResourceAlreadyExistsException raised by CreateSubscriber on the second bus. The handler's collision test ignores the bus entirely: services/service-com-amazonaws-eventbridgev2-awseventsv2/src/ops/create_subscriber.rs:400 asks `state.subscriber_by_name(&region, &input.name)` (the lookup in src/state.rs is keyed by region + name only), and the comment above it at create_subscriber.rs:397-399 states the intended rule as "a subscriber name is unique per account AND region". The emulator therefore makes one subscriber name consume the name on every bus in the region.
+Why: a client that organises subscribers by bus — the standard EventBridge v2 layout, where each bus carries a subscriber per consumer and consumers are named for their role ("orders-to-sqs", "audit"), so the same name legitimately appears on many buses — cannot create its second bus's subscriber at all against the emulator. The failure is a 409 on a call AWS accepts, so client retry/idempotency logic treats it as a pre-existing resource and either aborts deployment or starts reusing the OTHER bus's subscriber ARN; multi-bus fan-out, blue/green bus cutovers and per-tenant buses are all unreachable. Conversely any test that asserts the per-bus namespace (same name, two buses, two ARNs) can never pass.
+Fix: the CreateSubscriber handler's name-collision validation and the subscriber index in service state — the existence test must be scoped to the request's EventBusArn (name unique per bus), not to the region, and must keep refusing a same-bus duplicate with the modeled ResourceAlreadyExistsException (409, "Resource already exists"). Code: services/service-com-amazonaws-eventbridgev2-awseventsv2/src/ops/create_subscriber.rs:397-409 and the `subscriber_by_name` lookup in services/service-com-amazonaws-eventbridgev2-awseventsv2/src/state.rs. Any other reader of that lookup (ListSubscribers' NamePrefix filtering, UpdateSubscriber's rename path if one exists) must be checked for the same region-wide assumption. Note the ClientToken replay lookup just above (create_subscriber.rs:371-395) is per region as well, which is correct for a token but must not be conflated with the name namespace.
+Traces: eventbridgev2.subscriber-name-collision-on-same-bus-rejected-but-allowed-on-another.
+
+## Evidence
+Replay of behavioral suite simparity-behavioral-aws-v1 against the emulator built from this checkout: 23/42 passed; eventbridgev2 13/17 (4 failed), of which this is the only net-new, unowned one (the others are ALREADY FILED/OWNED).
+
+[error] eventbridgev2.subscriber-name-collision-on-same-bus-rejected-but-allowed-on-another
+  Sequence: CreateEventBus(bus A) -> ACTIVE; CreateEventBus(bus B) -> ACTIVE; CreateSubscriber(Name=<S>, EventBusArn=A, ClientToken=<t1>, InvokeConfiguration={RoleArn, TargetArn:<sqs arn>, SqsParameters:{}}, Description='sim2real first') -> ARN1; CreateSubscriber(Name=<S>, EventBusArn=A, ClientToken=<t2>, Description='sim2real second')
+    expected refusal ('ResourceAlreadyExistsException', 'Resource already exists') -> observed, this assertion now PASSES; ListSubscribers(A, NamePrefix=<S>) == [ARN1] and DescribeSubscriber(ARN1).Description == 'sim2real first' also hold.
+  Then CreateSubscriber(Name=<S>, EventBusArn=B, ClientToken=<t3>, InvokeConfiguration same) — the step AWS accepts:
+    expected HTTP 200 with SubscriberArn != ARN1, Name == <S>, EventBusArn == B (bus B's ARN)
+    actual   botocore.errorfactory.ResourceAlreadyExistsException: An error occurred (ResourceAlreadyExistsException) when calling the CreateSubscriber operation: Resource already exists  (HTTP 409; the exception propagates uncaught out of the check, which only wraps the same-bus call in its _refused helper)
+  In the message, "Resource already exists" is the whole fixed text of this error class and is correct here; the defect is that the class is raised at all for a name held only on a different bus. <S> is the check's per-run unique name (sim2real-behav-ebv2-sub-<hex>) and A/B are per-run bus ARNs — run values, not part of the requirement.
+  Emulator source: src/ops/create_subscriber.rs:400 `if state.subscriber_by_name(&region, &input.name).is_some()` — keyed by (region, name) with no bus component; comment at 397-399 declares the (wrong) rule "a subscriber name is unique per account AND region".
+  Model: CreateSubscriber input EventBusArn @required; errors include ResourceAlreadyExistsException (client, httpError 409).
+
+## Steps to Reproduce
+1. git_clone the repo and run run_behavioral_suite (it builds and boots the emulator).
+2. Reproduce check eventbridgev2.subscriber-name-collision-on-same-bus-rejected-but-allowed-on-another directly:
+   a. CreateEventBus(Name=<unique A>, ClientToken=<tok>) and poll DescribeEventBus until State == ACTIVE. Repeat for a second bus <unique B> in the same account and region.
+   b. Pick one subscriber name <S> matching ^[A-Za-z0-9][\.\-_A-Za-z0-9]*$. CreateSubscriber(Name=<S>, EventBusArn=<A arn>, ClientToken=<t1>, InvokeConfiguration={RoleArn:<any role arn in the account>, TargetArn:<any sqs queue arn>, SqsParameters:{}}, Description='sim2real first') -> ARN1.
+   c. CreateSubscriber(Name=<S>, EventBusArn=<A arn>, ClientToken=<t2> (fresh), same InvokeConfiguration, Description='sim2real second'): must be refused 409 ResourceAlreadyExistsException / 'Resource already exists' (it is), and must leave ListSubscribers(EventBusArn=<A arn>, NamePrefix=<S>) == [ARN1] with ARN1's Description still 'sim2real first' (it does).
+   d. CreateSubscriber(Name=<S>, EventBusArn=<B arn>, ClientToken=<t3> (fresh), same InvokeConfiguration): AWS returns 200 with a NEW SubscriberArn (!= ARN1), Name == <S>, EventBusArn == <B arn>; the emulator refuses it with 409 ResourceAlreadyExistsException 'Resource already exists'.
+   e. ListSubscribers(EventBusArn=<B arn>, NamePrefix=<S>) must then list exactly that second subscriber's ARN; against the emulator it lists nothing because step (d) never created it.
