@@ -320,23 +320,33 @@ pub(crate) async fn messages_in(router: &MultiServiceRouter, group: &str) -> Vec
         .unwrap_or_default()
 }
 
-/// The messages `group` holds, polled until it holds at least `at_least` of them or the polls
-/// run out. The delivery of a run's log is not part of the invocation's answer, so this waits
-/// for the CONDITION rather than for a span.
-pub(crate) async fn messages_at_least(
+/// The messages `group` holds, polled until `held` satisfies `ready` or the polls run out. The
+/// delivery of a run's log is not part of the invocation's answer, so this waits for the
+/// CONDITION rather than for a span; a suite states the condition it needs.
+pub(crate) async fn messages_until_condition(
     router: &MultiServiceRouter,
     group: &str,
-    at_least: usize,
+    ready: impl Fn(&[String]) -> bool,
 ) -> Vec<String> {
     let mut held = messages_in(router, group).await;
     for _ in 0..POLLS {
-        if held.len() >= at_least {
+        if ready(&held) {
             return held;
         }
         tokio::time::sleep(POLL).await;
         held = messages_in(router, group).await;
     }
     held
+}
+
+/// The messages `group` holds, polled until it holds at least `at_least` of them or the polls
+/// run out.
+pub(crate) async fn messages_at_least(
+    router: &MultiServiceRouter,
+    group: &str,
+    at_least: usize,
+) -> Vec<String> {
+    messages_until_condition(router, group, |held| held.len() >= at_least).await
 }
 
 /// Poll `GetFunctionConfiguration` until AWS Lambda first reports the function `Active`, and
