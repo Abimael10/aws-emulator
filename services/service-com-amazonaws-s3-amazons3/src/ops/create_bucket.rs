@@ -396,6 +396,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !::service_common::s3_bucket_name::is_well_formed(&input.bucket) {
                 return Err(invalid_bucket_name(&input.bucket));
             }
+            // The NAMESPACE the name itself asks for. A general purpose bucket name of the
+            // account regional form ([`account_regional_account_id`]) is a name in ONE
+            // account's own subdivision of the global namespace, so S3 serves such a create
+            // only when the request DECLARES the namespace it is addressing and the account
+            // the name states is the caller's own — whichever value the header declares, the
+            // name is the statement of whose namespace it is. Nothing is written until both
+            // hold, so a refused create leaves the name free for the request that is formed
+            // right.
+            if let Some(named_account) = account_regional_account_id(&input.bucket) {
+                if input.bucket_namespace.is_none() {
+                    return Err(missing_namespace_header());
+                }
+                if named_account != caller_account_id() {
+                    return Err(invalid_bucket_namespace(&input.bucket, named_account));
+                }
+            }
         }
 
         // Where the bucket lives, from the request's own location constraint. Note this
@@ -702,6 +718,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The `BucketNamespace` value whose buckets live in the caller's account regional
 /// namespace rather than the shared global one (one of that enum's two values).
 const ACCOUNT_REGIONAL_NAMESPACE: &str = "account-regional";
+
+/// The request header a create DECLARES the namespace in: `CreateBucketRequest$BucketNamespace`
+/// is bound to `httpHeader x-amz-bucket-namespace`
+/// (`smithy_query(query="operation",operation="CreateBucket")`).
+const BUCKET_NAMESPACE_HEADER: &str = "x-amz-bucket-namespace";
+
+/// The last segment of the name of a bucket in an account regional namespace: "bucket names
+/// must follow the format `bucket-name-prefix-accountId-region-an`"
+/// (`CreateBucketRequest$BucketNamespace`).
+const ACCOUNT_REGIONAL_NAME_SUFFIX: &str = "-an";
+
+/// The account id `bucket`'s name places it in the ACCOUNT REGIONAL namespace of, or `None`
+/// for a name in the shared global namespace.
+///
+/// The form is the one the namespace member documents: "these buckets consist of a bucket
+/// name prefix that you create, and a suffix that contains your 12-digit Amazon Web Services
+/// Account ID, the Amazon Web Services Region code, and ends with `-an` … bucket names must
+/// follow the format `bucket-name-prefix-accountId-region-an`"
+/// (`CreateBucketRequest$BucketNamespace`). So the name is read from its END: the `-an`
+/// segment, a Region code before it, and an account id — exactly twelve digits, the one
+/// reading of that form this workspace has (`service_common::arn::is_account_id`) — before
+/// that. The prefix the caller chose is whatever is left, which is why the account id is the
+/// LAST such segment with a Region code still after it: a prefix may carry twelve digits of
+/// its own, and the id that places the bucket is the one the Region code follows.
+///
+/// A name that does not end that way names no account regional namespace at all and is an
+/// ordinary global bucket name, which is what every name S3 held before the namespace
+/// existed still is.
+fn account_regional_account_id(bucket: &str) -> Option<&str> {
+    let named = bucket.strip_suffix(ACCOUNT_REGIONAL_NAME_SUFFIX)?;
+    let segments: Vec<&str> = named.split('-').collect();
+    segments
+        .iter()
+        .enumerate()
+        // A Region code is at least one segment, so an account id with nothing after it is
+        // the tail of the caller's own prefix rather than the id of a namespace.
+        .filter(|(position, segment)| {
+            position + 1 < segments.len() && ::service_common::arn::is_account_id(segment)
+        })
+        .map(|(_, segment)| *segment)
+        .next_back()
+}
+
+/// The account id of the CALLER this create speaks for, which is the one account this
+/// emulator serves ([`::engine::emulator_account_id`]) — the same id every bucket's owner and
+/// every expected-owner check of this service is judged against
+/// (`crate::service::authorization`).
+fn caller_account_id() -> &'static str {
+    ::engine::emulator_account_id()
+}
+
+/// The wire error code S3 refuses a create of an account-regional-namespace bucket name that
+/// does not declare the namespace with (recorded behaviour: the code is not in this service's
+/// model, so it is answered through the unmodelled channel).
+const MISSING_NAMESPACE_HEADER_CODE: &str = "MissingNamespaceHeader";
+
+/// The wire error code S3 refuses a create that declares the account regional namespace of an
+/// account that is not the caller's with (recorded behaviour, like
+/// [`MISSING_NAMESPACE_HEADER_CODE`]).
+const INVALID_BUCKET_NAMESPACE_CODE: &str = "InvalidBucketNamespace";
+
+/// The refusal S3 answers a create whose bucket NAME is in an account regional namespace but
+/// whose request does not declare the namespace: `MissingNamespaceHeader` (400), naming the
+/// header the caller must add in the `<Header>` member the envelope carries it in.
+///
+/// The sentence is fixed text — nothing of the request is interpolated into it, the header it
+/// names being the one header such a create can be missing ([`BUCKET_NAMESPACE_HEADER`]) —
+/// and the member is the machine-readable half, so a client adds the header it is handed
+/// rather than parsing the sentence.
+fn missing_namespace_header() -> CreateBucketError {
+    crate::scaffolded::Scaffolded::unmodeled(
+        MISSING_NAMESPACE_HEADER_CODE,
+        crate::state::INVALID_ARGUMENT_STATUS,
+        format!(
+            "The requested bucket is an account-regional namespace bucket, but your request \
+             is missing the required {BUCKET_NAMESPACE_HEADER} header."
+        ),
+    )
+    .naming(crate::scaffolded::ErrorDetail::MissingHeader(
+        BUCKET_NAMESPACE_HEADER.to_string(),
+    ))
+}
+
+/// The refusal S3 answers a create that declares the account regional namespace of ANOTHER
+/// account: `InvalidBucketNamespace` (400), naming the requested bucket name in the
+/// `<BucketNamespace>` member the envelope carries it in.
+///
+/// The variable parts of the sentence are the two account ids it is about — the one the
+/// requested NAME embeds, and the caller's own ([`caller_account_id`]) — because the whole
+/// refusal is that the two differ; everything else is fixed text.
+fn invalid_bucket_namespace(bucket: &str, named_account: &str) -> CreateBucketError {
+    crate::scaffolded::Scaffolded::unmodeled(
+        INVALID_BUCKET_NAMESPACE_CODE,
+        crate::state::INVALID_ARGUMENT_STATUS,
+        format!(
+            "The requested bucket is an account-regional namespace bucket, but the requested \
+             AWS Account ID '{named_account}' does not match the caller's AWS Account ID \
+             '{}'. Specify the caller's AWS Account ID in the bucket name.",
+            caller_account_id()
+        ),
+    )
+    .naming(crate::scaffolded::ErrorDetail::BucketNamespace(
+        bucket.to_string(),
+    ))
+}
 
 /// Where this create places a DIRECTORY bucket, `None` when it asks for a general purpose
 /// bucket, or the refusal the request earns.

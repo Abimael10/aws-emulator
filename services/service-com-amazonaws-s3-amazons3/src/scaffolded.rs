@@ -960,9 +960,11 @@ static TAG_VALUE: Schema = Schema::new_member(
 )
 .with_xml_name("TagValue");
 
-/// The `<Header>` of an S3 error document: the request HEADER whose functionality the
-/// service does not implement for the resource the request addressed.
-static UNIMPLEMENTED_HEADER: Schema = Schema::new_member(
+/// The `<Header>` of an S3 error document: the request HEADER the refusal is about — the one
+/// whose functionality the service does not implement for the resource the request
+/// addressed, or the one the request had to carry and did not. Either way the member is the
+/// header a caller drops or adds, which the sentence of such a class leaves to it.
+static REFUSED_HEADER: Schema = Schema::new_member(
     ShapeId::from_static(
         "smithy.framework#Unimplemented$header",
         "smithy.framework",
@@ -1048,6 +1050,21 @@ static STORAGE_CLASS_REQUESTED: Schema = Schema::new_member(
     26,
 )
 .with_xml_name("StorageClassRequested");
+
+/// The `<BucketNamespace>` of an S3 error document: the bucket NAME a create addressed the
+/// account regional namespace by, as the request spelled it — the only place such a refusal
+/// says which name, and which account id in it, was rejected. See [`BUCKET_NAME`].
+static BUCKET_NAMESPACE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#RefusedResource$bucketNamespace",
+        "smithy.framework",
+        "bucketNamespace",
+    ),
+    ShapeType::String,
+    "bucketNamespace",
+    27,
+)
+.with_xml_name("BucketNamespace");
 
 /// The `<Message>` S3 sends with [`crate::state::NOT_IMPLEMENTED_CODE`] when it is a QUERY
 /// PARAMETER that asked for functionality the service does not implement for the resource
@@ -1250,6 +1267,14 @@ pub enum ErrorDetail {
     /// sentence of that class names only the KIND of thing that implied it, so the member is
     /// the only place the refusal says which one the caller must drop.
     Unimplemented(UnimplementedBy),
+    /// A request refused for a HEADER it had to carry and did not, named by `<Header>`: the
+    /// header the caller must add, which is the machine-readable half of such a refusal.
+    MissingHeader(String),
+    /// A refusal about the bucket NAMESPACE a create addressed, named by
+    /// `<BucketNamespace>`: the bucket name the request asked for, which is where the
+    /// namespace, and the account id a name in an account regional namespace embeds, are
+    /// spelled.
+    BucketNamespace(String),
 }
 
 /// What asked for functionality the service does not implement — see
@@ -1373,9 +1398,9 @@ impl ErrorDetail {
                 s.write_long(&REFUSED_SIZE, *size)?;
                 s.write_long(&MAX_SIZE_ALLOWED, *max_size_allowed)
             }
-            Self::Unimplemented(UnimplementedBy::Header(header)) => {
-                s.write_string(&UNIMPLEMENTED_HEADER, header)
-            }
+            Self::Unimplemented(UnimplementedBy::Header(header))
+            | Self::MissingHeader(header) => s.write_string(&REFUSED_HEADER, header),
+            Self::BucketNamespace(bucket) => s.write_string(&BUCKET_NAMESPACE, bucket),
             Self::Unimplemented(UnimplementedBy::QueryParameter(parameter)) => {
                 s.write_string(&UNIMPLEMENTED_QUERY_PARAMETER, parameter)
             }
@@ -1396,7 +1421,9 @@ impl ErrorDetail {
             | Self::Upload(name)
             | Self::Condition(name)
             | Self::LocationConstraint(name)
-            | Self::StorageClassRequested(name) => name.clone(),
+            | Self::StorageClassRequested(name)
+            | Self::MissingHeader(name)
+            | Self::BucketNamespace(name) => name.clone(),
             Self::Unimplemented(by) => by.name().to_string(),
             // The first of the series, which is the one such a refusal is reported by.
             Self::Arguments(arguments) => arguments
