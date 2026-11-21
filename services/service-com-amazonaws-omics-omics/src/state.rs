@@ -2079,17 +2079,25 @@ pub fn definition_digest(definition_zip: Option<&[u8]>) -> Option<String> {
 }
 
 /// The checksum of one uploaded read set part: the content digest
-/// `UploadReadSetPart` answers with and `ListReadSetUploadParts` reports for that part.
+/// `UploadReadSetPart` answers with, `ListReadSetUploadParts` reports for that part and
+/// `CompleteMultipartReadSetUpload` accepts for it.
 ///
-/// SHA-256 over the part's bytes (the `sha2` crate — no hashing is written here),
-/// rendered as lowercase hex, exactly as [`definition_digest`] digests a workflow
-/// definition. It is computed from the content alone, so a caller that digests the bytes
-/// it sent gets the same value back and can confirm the part the service holds is the
-/// part it uploaded; re-uploading a part number with the same content yields the same
-/// checksum, and different content a different one.
+/// SHA-256 over the part's bytes (the `sha2` crate — no hashing is written here), rendered
+/// as standard, `=`-padded base64 (`aws_smithy_types::base64`, the codec this workspace
+/// already carries), which is the encoding an AWS content checksum travels in: the 32
+/// digest bytes as 44 characters. That is the value a caller compares against, since a
+/// client digests the bytes it sent and base64-encodes them; the same digest rendered as
+/// hex is a different string and would fail that comparison. This is NOT the rendering of
+/// a workflow definition's digest ([`definition_digest`]), whose modelled length of at
+/// most 64 characters is the hex form a client gets from hashing the archive it uploaded.
+///
+/// It is computed from the content alone, so a caller that digests the bytes it sent gets
+/// the same value back and can confirm the part the service holds is the part it uploaded;
+/// re-uploading a part number with the same content yields the same checksum, and
+/// different content a different one.
 pub fn read_set_part_checksum(payload: &[u8]) -> String {
     use sha2::Digest;
-    hex::encode(sha2::Sha256::digest(payload))
+    ::aws_smithy_types::base64::encode(sha2::Sha256::digest(payload).as_slice())
 }
 
 /// Whether `account_id` names the one account this emulator serves

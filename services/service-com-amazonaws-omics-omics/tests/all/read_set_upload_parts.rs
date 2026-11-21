@@ -18,6 +18,11 @@
 //!   * uploading a source and part number the upload already holds REPLACES that part:
 //!     its size and checksum become the new content's, the instant it was first uploaded
 //!     stands, and the upload holds no second part for that pair;
+//!   * the checksum is the SHA-256 digest of the part's bytes rendered as standard,
+//!     `=`-padded base64 — the encoding an AWS content checksum travels in — and never the
+//!     hexadecimal rendering of the same digest, so one value travels every path that
+//!     carries it: the upload response, the listing entry, and the checksum a completion
+//!     has to list for that part;
 //! * `ListReadSetUploadParts` reports exactly the parts stored for the one upload and
 //!   source the request names, in ascending part-number order, each member read from the
 //!   stored part, paging over them and narrowing them by creation instant;
@@ -38,8 +43,8 @@ use crate::multipart_read_set_uploads::{
     REFERENCE_ARN,
 };
 use crate::private_workflow_runs::{
-    assert_absent, assert_arn, assert_members, assert_timestamp, call, error_code, expected_digest,
-    POLL_INTERVAL, REGION, SETTLE_DEADLINE,
+    assert_absent, assert_arn, assert_members, assert_timestamp, call, error_code, POLL_INTERVAL,
+    REGION, SETTLE_DEADLINE,
 };
 
 /// Every value the modelled `ReadSetPartSource` enum admits.
@@ -144,7 +149,7 @@ fn parts_of(case: &str, status: u16, body: &Value) -> Vec<Value> {
 }
 
 /// The `checksum` of a 200 upload response, after asserting the status and that the value
-/// is the hex digest form the service reports.
+/// is the base64 SHA-256 form the service reports.
 fn uploaded_checksum(case: &str, status: u16, body: &Value) -> String {
     assert_eq!(
         status, 200,
@@ -155,14 +160,61 @@ fn uploaded_checksum(case: &str, status: u16, body: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("case {case:?}: response carried no checksum, got {body:?}"))
         .to_string();
-    assert!(
-        !checksum.is_empty()
-            && checksum
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
-        "case {case:?}: expected a lowercase hex checksum, got {checksum:?}"
-    );
+    assert_base64_sha256(case, &checksum);
     checksum
+}
+
+/// The width of a SHA-256 digest in bytes, and the number of characters standard base64
+/// renders it in: 44, the last of them padding.
+/// Source: SHA-256 (FIPS 180-4) is a 256-bit digest, and standard base64 (RFC 4648 section
+/// 4) codes every 3 bytes as 4 characters, padding the final group.
+const SHA256_DIGEST_BYTES: usize = 32;
+const BASE64_SHA256_WIDTH: usize = 44;
+
+/// The checksum this service reports for a part carrying `bytes`: the base64 of their
+/// SHA-256 digest.
+fn expected_part_checksum(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    ::aws_smithy_types::base64::encode(sha2::Sha256::digest(bytes).as_slice())
+}
+
+/// The lowercase hexadecimal rendering of the same digest — used only to prove it is NOT
+/// what the service answers with, and is not accepted in its place.
+fn hex_part_digest(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(bytes))
+}
+
+/// Assert `value` is a SHA-256 digest in standard, padded base64: 44 characters of the
+/// base64 alphabet that decode to 32 bytes.
+fn assert_base64_sha256(case: &str, value: &str) {
+    assert_eq!(
+        value.len(),
+        BASE64_SHA256_WIDTH,
+        "case {case:?}: expected a {BASE64_SHA256_WIDTH}-character base64 checksum, got \
+         {value:?} of {} characters",
+        value.len()
+    );
+    assert!(
+        value.bytes().all(|byte| byte.is_ascii_alphanumeric()
+            || byte == b'+'
+            || byte == b'/'
+            || byte == b'='),
+        "case {case:?}: expected only standard base64 characters, got {value:?}"
+    );
+    assert!(
+        value.ends_with('='),
+        "case {case:?}: expected the padding a 32-byte digest's base64 ends in, got {value:?}"
+    );
+    let decoded = ::aws_smithy_types::base64::decode(value)
+        .unwrap_or_else(|error| panic!("case {case:?}: {value:?} is not base64: {error}"));
+    assert_eq!(
+        decoded.len(),
+        SHA256_DIGEST_BYTES,
+        "case {case:?}: expected {SHA256_DIGEST_BYTES} decoded digest bytes, got {} from \
+         {value:?}",
+        decoded.len()
+    );
 }
 
 /// The request body every upload below is initiated with.
@@ -269,7 +321,7 @@ async fn an_uploaded_part_is_stored_once_and_reported_from_that_record() {
         // gets exactly this value back.
         assert_eq!(
             checksum,
-            expected_digest(&part.payload),
+            expected_part_checksum(&part.payload),
             "case {:?}: expected the digest of the uploaded bytes, got {checksum:?}",
             part.case
         );
@@ -336,7 +388,7 @@ async fn an_uploaded_part_is_stored_once_and_reported_from_that_record() {
             );
             assert_eq!(
                 item.get("checksum").and_then(Value::as_str),
-                Some(expected_digest(&part.payload).as_str()),
+                Some(expected_part_checksum(&part.payload).as_str()),
                 "case {case:?}: expected the content digest as the listed checksum, \
                  got {item:?}"
             );
@@ -377,11 +429,133 @@ async fn an_uploaded_part_is_stored_once_and_reported_from_that_record() {
         );
         assert_eq!(
             held.checksum,
-            expected_digest(&part.payload),
+            expected_part_checksum(&part.payload),
             "case {:?}: the stored checksum must be the digest of the stored bytes",
             part.case
         );
     }
+}
+
+#[tokio::test]
+async fn a_part_checksum_is_the_base64_sha256_of_its_bytes_on_every_path() {
+    let (router, _engine, store, upload) = store_and_upload("the checksum destination").await;
+    // The same table of contents: the encoding rule holds for every size and byte pattern
+    // a part can carry, not for one payload.
+    let cases = part_cases();
+    let mut answered: Vec<(&'static str, i32, String)> = Vec::new();
+
+    for part in &cases {
+        let (status, body) = upload_part(
+            &router,
+            &store,
+            &upload,
+            part.part_source,
+            part.part_number,
+            &part.payload,
+        )
+        .await;
+        // `uploaded_checksum` asserts the base64 shape: 44 characters that decode to the
+        // 32 bytes of a SHA-256 digest.
+        let checksum = uploaded_checksum(part.case, status, &body);
+        assert_eq!(
+            checksum,
+            expected_part_checksum(&part.payload),
+            "case {:?}: expected the base64 SHA-256 of the uploaded bytes, got {checksum:?}",
+            part.case
+        );
+        // The same digest rendered the other way is a different string, and the response
+        // carries the base64 one.
+        let hex = hex_part_digest(&part.payload);
+        assert_ne!(
+            checksum, hex,
+            "case {:?}: expected the base64 rendering of the digest, got the hexadecimal one",
+            part.case
+        );
+        assert_eq!(
+            ::aws_smithy_types::base64::decode(&checksum)
+                .unwrap_or_else(|error| panic!("case {:?}: {checksum:?} is not base64: {error}", part.case)),
+            hex::decode(&hex)
+                .unwrap_or_else(|error| panic!("case {:?}: {hex:?} is not hex: {error}", part.case)),
+            "case {:?}: both renderings must carry the same digest bytes",
+            part.case
+        );
+        answered.push((part.part_source, part.part_number, checksum));
+    }
+
+    // The listing reports, for each part, the very value the upload answered with.
+    for source in PART_SOURCES {
+        let (status, body) = list_parts(
+            &router,
+            &store,
+            &upload,
+            "",
+            &json!({ "partSource": source }),
+        )
+        .await;
+        for item in &parts_of(source, status, &body) {
+            let number = item
+                .get("partNumber")
+                .and_then(Value::as_i64)
+                .unwrap_or_else(|| panic!("case {source:?}: a listed part carried no partNumber"));
+            let expected = answered
+                .iter()
+                .find(|(part_source, part_number, _)| {
+                    part_source == source && i64::from(*part_number) == number
+                })
+                .map(|(_, _, checksum)| checksum.clone())
+                .unwrap_or_else(|| {
+                    panic!("case {source:?}: part {number} was never uploaded, got {item:?}")
+                });
+            let reported = item
+                .get("checksum")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("case {source:?}: part {number} listed no checksum"));
+            assert_base64_sha256(&format!("{source} part {number}"), reported);
+            assert_eq!(
+                reported, expected,
+                "case {source:?}: part {number} must be listed with the checksum the upload \
+                 answered, got {reported:?}"
+            );
+        }
+    }
+
+    // A completion listing the hexadecimal rendering of each digest is naming a checksum
+    // no part of this upload carries, so it is refused and forms nothing...
+    let hex_listed: Vec<(&str, i32, String)> = cases
+        .iter()
+        .map(|part| {
+            (
+                part.part_source,
+                part.part_number,
+                hex_part_digest(&part.payload),
+            )
+        })
+        .collect();
+    let (status, body) = complete_upload(&router, &store, &upload, &parts_list(&hex_listed)).await;
+    assert_eq!(
+        status, 400,
+        "case \"hexadecimal checksums\": expected 400 from the completion, got {body:?}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ValidationException",
+        "case \"hexadecimal checksums\": expected ValidationException, got {body:?}"
+    );
+
+    // ...while the values the service answered with are exactly what it accepts for them.
+    let base64_listed: Vec<(&str, i32, String)> = answered
+        .iter()
+        .map(|(part_source, part_number, checksum)| {
+            (*part_source, *part_number, checksum.clone())
+        })
+        .collect();
+    let (status, body) =
+        complete_upload(&router, &store, &upload, &parts_list(&base64_listed)).await;
+    let read_set_id = completed_read_set_id("the answered checksums", status, &body);
+    assert!(
+        !read_set_id.is_empty(),
+        "case \"the answered checksums\": expected a readSetId, got {body:?}"
+    );
 }
 
 #[tokio::test]
@@ -417,7 +591,7 @@ async fn re_uploading_a_part_number_replaces_that_part() {
         let first_checksum = uploaded_checksum(case, status, &body);
         assert_eq!(
             first_checksum,
-            expected_digest(first),
+            expected_part_checksum(first),
             "case {case:?}: expected the digest of the first content, got {body:?}"
         );
         let listed = listed_part(&router, &store, &upload, case, *part_number).await;
@@ -428,7 +602,7 @@ async fn re_uploading_a_part_number_replaces_that_part() {
         let second_checksum = uploaded_checksum(case, status, &body);
         assert_eq!(
             second_checksum,
-            expected_digest(second),
+            expected_part_checksum(second),
             "case {case:?}: expected the digest of the replacing content, got {body:?}"
         );
 
@@ -1021,7 +1195,7 @@ async fn upload_all(
         let checksum = uploaded_checksum(case, status, &body);
         assert_eq!(
             checksum,
-            expected_digest(payload),
+            expected_part_checksum(payload),
             "case {case:?}: part {part_number} of {part_source} must report the digest of \
              its own content"
         );

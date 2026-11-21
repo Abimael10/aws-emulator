@@ -262,7 +262,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The checksum is read off the bytes this request carried, and the record keeps
+        // The checksum is read off the bytes this request carried — the base64 of their
+        // SHA-256 digest, the form an SDK caller compares against — and the record keeps
         // both the content and that checksum, so what a later read reports for this part
         // is the part that was uploaded.
         let checksum = crate::state::read_set_part_checksum(&input.payload);
