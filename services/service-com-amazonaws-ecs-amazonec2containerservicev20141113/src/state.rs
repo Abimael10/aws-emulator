@@ -318,6 +318,11 @@ pub use load_balancer_targets::*;
 mod container_insights;
 pub use container_insights::*;
 
+/// What one container's run CONSUMES — how long its program has spent executing and how many
+/// bytes it is occupying — measured on the session this emulator performs it in.
+mod container_consumption;
+pub use container_consumption::*;
+
 /// The `AWS/ECS` CPU and memory utilization a SERVICE publishes into CloudWatch while it
 /// holds a running task, on the cluster-and-service dimension pair that identifies it.
 mod service_utilization;

@@ -1,0 +1,250 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! What ONE container's run CONSUMES, measured on the session that performs it.
+//!
+//! # The rule this module implements
+//!
+//! A container's resource consumption is a MEASUREMENT taken on the container while it runs —
+//! the CPU its process is using and the memory it is occupying — and every utilization series
+//! about a task or a service is that measurement over what the task definition gives the
+//! container (the ECS developer guide's service utilization divides what the tasks of one
+//! service use by what that service's task definition reserves). So a series of it can only
+//! report what something really measured, and what this emulator can measure is what it
+//! really performs: a container's program runs IN THIS PROCESS
+//! ([`super::container_shell`]), on one in-process performer per container, over an in-memory
+//! filesystem and an in-memory session store.
+//!
+//! Two quantities of that run are therefore observable, and this module is where the session
+//! records them as it goes:
+//!
+//! * how long the container's program has spent EXECUTING — the time it held its performer,
+//!   as against the time it spent waiting (a `sleep`, a wait for the stop signal, a server
+//!   held in the foreground), which is time it used nothing in;
+//! * how many BYTES the container is occupying — what its session holds (the variables it
+//!   has set and the output line it is assembling) beside what its own writable layer holds
+//!   ([`super::container_filesystem`]).
+//!
+//! Both are the container's own, so they are held per RUN ([`super::container_runtime`]) and
+//! shared with whatever samples them: nothing here publishes anything, and nothing here
+//! depends on who called. A program that burns its performer reads as a high share of it and
+//! one that sleeps as almost none, which is exactly what the utilization of a busy and of an
+//! idle container is — and a container whose program this emulator is no longer performing
+//! consumes nothing, which is what its series then reports.
+//!
+//! # What is NOT measured
+//!
+//! The CPU time of a process, the resident set of one, and the memory of a container's image
+//! are all facts of a host and a container runtime this emulator does not have, so none of
+//! them is reported: every number here is this process's own accounting of the work it
+//! performed for the container. The health-check probes the agent runs in a container
+//! ([`super::container_health`]) are the agent's session rather than the container's program,
+//! and are accounted to neither.
+
+use ::std::sync::atomic::{AtomicU64, Ordering};
+
+use super::*;
+
+/// How many bytes one mebibyte is, which is the unit a task definition states a memory
+/// reservation in (`TaskDefinition$memory`, `ContainerDefinition$memory`).
+const BYTES_PER_MIB: u64 = 1024 * 1024;
+
+/// What ONE container's run has consumed so far: written by the session performing it and read
+/// by the collections that sample it, so both see one accounting of one container.
+#[derive(Debug, Default)]
+pub struct ContainerConsumption {
+    /// How long the container's program has spent EXECUTING, in nanoseconds, cumulatively
+    /// over the whole run.
+    executing_nanos: AtomicU64,
+    /// How many bytes the container's SESSION is holding right now — zero once that session
+    /// is over, because a session that has ended holds nothing.
+    held_bytes: AtomicU64,
+}
+
+impl ContainerConsumption {
+    /// The accounting of a run that has not performed anything yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How long this container's program has spent executing, in nanoseconds.
+    pub fn executing_nanos(&self) -> u64 {
+        self.executing_nanos.load(Ordering::Acquire)
+    }
+
+    /// How many bytes this container's session is holding.
+    pub fn held_bytes(&self) -> u64 {
+        self.held_bytes.load(Ordering::Acquire)
+    }
+
+    /// Account `span` to the time this container's program has spent executing.
+    ///
+    /// Saturating, so an accounting of an absurd span cannot wrap the total back to a small
+    /// one: a measurement is never reported as less work than was done.
+    pub fn record_execution(&self, span: Duration) {
+        let nanos = u64::try_from(span.as_nanos()).unwrap_or(u64::MAX);
+        let mut held = self.executing_nanos.load(Ordering::Acquire);
+        while let Err(current) = self.executing_nanos.compare_exchange_weak(
+            held,
+            held.saturating_add(nanos),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            held = current;
+        }
+    }
+
+    /// Record that the container's session is holding `bytes` right now.
+    pub fn hold(&self, bytes: u64) {
+        self.held_bytes.store(bytes, Ordering::Release);
+    }
+
+    /// Record that the session is OVER: it holds nothing more.
+    ///
+    /// What the container's filesystem holds is not released with it — that is the
+    /// container's own layer and it outlives the session that wrote it
+    /// ([`super::container_filesystem`]) — so the bytes a later sample reads for this
+    /// container are the ones it really still holds.
+    pub fn release(&self) {
+        self.held_bytes.store(0, Ordering::Release);
+    }
+}
+
+/// ONE reading of what the containers of one service's RUNNING tasks consume.
+///
+/// Taken off the runs this store holds, so every number in it is an accounting of work this
+/// emulator really performed for those containers.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct ServiceConsumption {
+    /// How long the programs of those containers have spent executing, in nanoseconds,
+    /// cumulatively since each run began.
+    pub(super) executing_nanos: u128,
+    /// How many of those containers this emulator is performing a program for — the
+    /// performers whose time the span above is a share of.
+    pub(super) performers: u64,
+    /// How many bytes those containers are occupying at this instant: their sessions' own
+    /// stores and their writable layers.
+    pub(super) held_bytes: u128,
+    /// How many bytes of memory the task definitions of those tasks RESERVE for them, and
+    /// zero when none of them states a reservation at all — the denominator a memory
+    /// utilization is a percentage of.
+    pub(super) reserved_bytes: u128,
+}
+
+impl ServiceConsumption {
+    /// The share of ITS PERFORMERS the service's containers used over the `span` this reading
+    /// closes, as a percentage, given what `previous` read at the start of that span.
+    ///
+    /// The capacity this emulator gives one container's program is the one in-process
+    /// performer that runs it, so the CPU a container uses over the CPU it was given is the
+    /// share of the span its program spent executing — zero for a service whose containers
+    /// are all waiting, and the whole of it for one whose program never stops working. A span
+    /// of no length, and a service nothing is performing a program for, have no share to
+    /// report and read as zero rather than as a quotient of nothing.
+    pub(super) fn executing_share(&self, previous: u128, span: Duration) -> f64 {
+        let executed = self.executing_nanos.saturating_sub(previous);
+        let given = span.as_nanos().saturating_mul(u128::from(self.performers));
+        percentage(executed, given)
+    }
+
+    /// The share of what the task definitions RESERVE that the service's containers are
+    /// occupying, as a percentage — and `None` for a service whose task definitions reserve
+    /// no memory at all, which gives the percentage no denominator, so there is no
+    /// utilization of it to report.
+    pub(super) fn memory_share(&self) -> Option<f64> {
+        (self.reserved_bytes > 0).then(|| percentage(self.held_bytes, self.reserved_bytes))
+    }
+}
+
+/// `part` as a percentage of `whole`, inside the range a utilization carries.
+///
+/// A utilization is a share of what was given, so it is never negative and never past 100:
+/// the accounting above is taken on a running process while that process keeps working, so a
+/// reading can land a little over the span it is measured against, and what that says is that
+/// the performer was busy for the whole of it.
+fn percentage(part: u128, whole: u128) -> f64 {
+    if whole == 0 {
+        return 0.0;
+    }
+    let share = 100.0 * (part as f64) / (whole as f64);
+    if share.is_finite() {
+        share.clamp(0.0, 100.0)
+    } else {
+        0.0
+    }
+}
+
+impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
+    /// What the containers of the RUNNING tasks of one service consume, read off the runs this
+    /// store holds for them.
+    ///
+    /// The tasks are the ones a client reads the service's `runningCount` off
+    /// ([`Self::service_tally`]), so what is measured is exactly what is reported as running.
+    pub(super) fn service_consumption(
+        &self,
+        cluster_name: &str,
+        service_name: &str,
+    ) -> ServiceConsumption {
+        let mut reading = ServiceConsumption::default();
+        for task in self.tasks.values().filter(|task| {
+            task.desired_status == STATUS_RUNNING
+                && task.last_status == STATUS_RUNNING
+                && task.cluster_name == cluster_name
+                && task.service_name.as_deref() == Some(service_name)
+        }) {
+            reading.reserved_bytes = reading
+                .reserved_bytes
+                .saturating_add(u128::from(task_reserved_memory_bytes(task)));
+            for container in &task.containers {
+                let Some(run) = self.container_runs.get(&container.container_arn) else {
+                    continue;
+                };
+                let consumption = run.consumption();
+                reading.executing_nanos = reading
+                    .executing_nanos
+                    .saturating_add(u128::from(consumption.executing_nanos()));
+                reading.held_bytes = reading.held_bytes.saturating_add(u128::from(
+                    consumption.held_bytes().saturating_add(run.layer_bytes()),
+                ));
+                if run.is_performing_a_program() {
+                    reading.performers = reading.performers.saturating_add(1);
+                }
+            }
+        }
+        reading
+    }
+}
+
+/// How many bytes of memory ONE task's definition RESERVES for it, and zero for a definition
+/// that states no reservation anywhere.
+///
+/// `TaskDefinition$memory` is "the amount of memory (in MiB) used by the task", which is what
+/// the whole task reserves; a definition that states none states it per CONTAINER instead
+/// (`ContainerDefinition$memory`, "the amount (in MiB) of memory to present to the container",
+/// or `$memoryReservation`, "the soft limit (in MiB) of memory to reserve for the container"),
+/// and what the task then reserves is the sum over its containers. The hard limit is the
+/// reservation where a container states both: "If you specify both, `memory` must be greater
+/// than `memoryReservation`."
+fn task_reserved_memory_bytes(task: &TaskRecord) -> u64 {
+    if let Some(mib) = task.memory.as_deref().and_then(memory_mib) {
+        return mebibytes_as_bytes(mib);
+    }
+    task.containers
+        .iter()
+        .filter_map(|container| {
+            container
+                .memory
+                .as_deref()
+                .or(container.memory_reservation.as_deref())
+        })
+        .filter_map(memory_mib)
+        .map(mebibytes_as_bytes)
+        .fold(0, u64::saturating_add)
+}
+
+/// `mib` mebibytes as a number of bytes.
+fn mebibytes_as_bytes(mib: i64) -> u64 {
+    u64::try_from(mib)
+        .unwrap_or_default()
+        .saturating_mul(BYTES_PER_MIB)
+}

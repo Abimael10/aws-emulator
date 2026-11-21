@@ -566,6 +566,14 @@ pub struct ContainerShell {
     /// is what the utilities that report a process's own session answer
     /// ([`super::container_process`]).
     process: ContainerProcess,
+    /// Where what this session CONSUMES is accounted for: how long its program has spent
+    /// executing, and how many bytes it is holding right now
+    /// ([`super::container_consumption`]). A session built without one accounts into a
+    /// reading of its own, which nothing samples.
+    consumption: Arc<ContainerConsumption>,
+    /// The instant that accounting was last brought up to date — what the next span this
+    /// session spends executing is measured from.
+    executing_since: Instant,
 }
 
 impl ContainerShell {
@@ -620,6 +628,8 @@ impl ContainerShell {
             last_status: EXIT_SUCCESS,
             aws: None,
             process: ContainerProcess::default(),
+            consumption: Arc::new(ContainerConsumption::new()),
+            executing_since: Instant::now(),
         }
     }
 
@@ -639,6 +649,16 @@ impl ContainerShell {
     #[must_use]
     pub fn with_aws_cli(mut self, aws: ContainerAwsCli) -> Self {
         self.aws = Some(Arc::new(aws));
+        self
+    }
+
+    /// This session accounting what it consumes into `consumption` — the accounting of the
+    /// container's RUN, which the collections that report a container's utilization sample
+    /// ([`super::container_consumption`]).
+    #[must_use]
+    pub fn with_consumption(mut self, consumption: Arc<ContainerConsumption>) -> Self {
+        self.consumption = consumption;
+        self.executing_since = Instant::now();
         self
     }
 
@@ -663,6 +683,9 @@ impl ContainerShell {
         // The last line the program wrote may not have ended in a newline; the container's
         // output ends where the container does, so it is delivered as the line it is.
         self.flush_pending_line().await;
+        // The last span of this run is accounted for where it ended, so what the run consumed
+        // is complete when it is read ([`Self::account_for_execution`]).
+        self.account_for_execution();
         if self.abandoned || self.unperformed {
             ContainerOutcome::Abandoned
         } else {
@@ -1028,6 +1051,9 @@ impl ContainerShell {
     /// `false` ABANDONS the run: the budget or the deadline is spent, so the program did
     /// not end and nothing is claimed about the container's status.
     async fn take_command_budget(&mut self) -> bool {
+        // Every step passes through here, so this is where the time the program has spent
+        // EXECUTING is accounted for ([`Self::account_for_execution`]).
+        self.account_for_execution();
         if self.commands_left == 0 || Instant::now() >= self.deadline {
             self.abandoned = true;
             return false;
@@ -1037,8 +1063,36 @@ impl ContainerShell {
         if self.commands_since_yield >= COMMANDS_PER_YIELD {
             self.commands_since_yield = 0;
             ::tokio::task::yield_now().await;
+            // The handback is not this program executing: the span another task had the
+            // runtime for is none of the container's doing.
+            self.executing_since = Instant::now();
         }
         true
+    }
+
+    /// Bring the accounting of what this container's run consumes up to date: the span since
+    /// it was last brought up to date is time this program spent EXECUTING, and the bytes the
+    /// session holds right now are the bytes it is occupying
+    /// ([`super::container_consumption`]).
+    ///
+    /// Called from the two places a session's time divides at — the step it is about to take,
+    /// and the wait it is about to enter — so the accounting separates the time the program
+    /// held its performer from the time it was waiting on something.
+    fn account_for_execution(&mut self) {
+        let now = Instant::now();
+        self.consumption
+            .record_execution(now.saturating_duration_since(self.executing_since));
+        self.executing_since = now;
+        self.consumption.hold(self.occupied_bytes());
+    }
+
+    /// How many bytes of this process this session is holding: the variables it has set and
+    /// the output line it is assembling. What the container's FILESYSTEM holds is the
+    /// container's own rather than this session's, and is read off the layer itself
+    /// ([`super::container_filesystem`]).
+    fn occupied_bytes(&self) -> u64 {
+        u64::try_from(self.held_bytes.saturating_add(self.pending_line.len()))
+            .unwrap_or(u64::MAX)
     }
 
     /// Deliver the termination signal if it has arrived and its handler has not run yet.
@@ -1084,6 +1138,9 @@ impl ContainerShell {
     /// Every wait is clamped to what is left of this run's deadline, so no wait a program
     /// asks for outlives the bound this emulator gave the run.
     async fn wait_for(&mut self, duration: Option<Duration>) -> bool {
+        // A wait is not time this program spends executing, so what it has spent is accounted
+        // for before the wait and measured again from the instant it ends.
+        self.account_for_execution();
         let left = self.deadline.saturating_duration_since(Instant::now());
         let waiting = duration.map_or(left, |asked| asked.min(left));
         // The waiter is registered BEFORE the flag is read, so a signal raised between the
@@ -1094,6 +1151,7 @@ impl ContainerShell {
             return true;
         }
         let interrupted = ::tokio::time::timeout(waiting, signalled).await.is_ok();
+        self.executing_since = Instant::now();
         if interrupted || self.signals.terminating() {
             self.pending_term = true;
             return true;

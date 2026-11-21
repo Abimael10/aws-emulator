@@ -6,13 +6,14 @@
 //!
 //! Amazon ECS publishes the CPU and the memory a service's tasks use as the `AWS/ECS` metrics
 //! [`METRIC_CPU_UTILIZATION`] and [`METRIC_MEMORY_UTILIZATION`] — each a PERCENTAGE
-//! ([`PERCENT_UNIT`]) of what the service's task definition reserves, which is why neither is
-//! ever negative and neither passes 100 — dimensioned on exactly the service they measure: the
+//! ([`PERCENT_UNIT`]) of what the service's tasks were GIVEN, which is why neither is ever
+//! negative and neither passes 100 — dimensioned on exactly the service they measure: the
 //! pair [`CLUSTER_DIMENSION`] + [`SERVICE_DIMENSION`] (the ECS developer guide's "Service
 //! utilization", whose formula divides what the tasks of one service use by what that
-//! service's task definition reserves). That pair is the whole series identity: it is what a
-//! per-service alarm and an Application Auto Scaling target-tracking policy select, so a
-//! service that publishes nothing leaves every such alarm without data.
+//! service's task definition reserves; what stands for each of those two reservations here is
+//! below). That pair is the whole series identity: it is what a per-service alarm and an
+//! Application Auto Scaling target-tracking policy select, so a service that publishes nothing
+//! leaves every such alarm without data.
 //!
 //! A SERVICE-level series therefore exists for a service and never for a cluster alone. The
 //! cluster-wide utilization of the same namespace is a different measurement — it divides what
@@ -34,15 +35,28 @@
 //!
 //! # What one datapoint SAYS
 //!
-//! Each of these two numbers is a measurement taken on the containers of a running task, and
-//! what this emulator performs for a container is its program inside this process
-//! ([`super::container_shell`]) with no resource accounting of any kind standing behind it — so
-//! in every period the quantity each metric measures is zero: nothing is using the CPU units
-//! the task reserved, and nothing is occupying the MiB it reserved either. Any other number
-//! would be a measurement of work nothing measured, which a client could not tell from a
-//! measured one ([`UTILIZATION_SAMPLE`]). What the series does carry is what this store DOES
-//! know: which services are being metered, from when, on which dimension pair, in which unit
-//! and at which resolution.
+//! Each of these two numbers is a MEASUREMENT taken on the containers of the service's
+//! running tasks, and what this emulator performs for a container is its program inside this
+//! process, over an in-memory filesystem and an in-memory session store
+//! ([`super::container_shell`]). So each is read off the accounting that session keeps of
+//! what it really consumed ([`super::container_consumption`]):
+//!
+//! * [`METRIC_CPU_UTILIZATION`] is the share of the collection interval the service's
+//!   containers spent EXECUTING — the time they held the one in-process performer this
+//!   emulator gives each of them, which is the CPU a container here is given, as against the
+//!   time they spent waiting. A container whose program never stops working reads as the
+//!   whole of it and one that sleeps as almost none, exactly as a busy and an idle container's
+//!   utilization do.
+//! * [`METRIC_MEMORY_UTILIZATION`] is the bytes those containers are OCCUPYING — their
+//!   sessions' own stores beside their writable layers — over the memory their task
+//!   definitions reserve for them. A service whose task definitions reserve no memory at all
+//!   gives that percentage no denominator, so no memory datapoint is published for it, while
+//!   the CPU series is published all the same.
+//!
+//! Neither is ever negative and neither passes 100, because each is a share of what the
+//! container was given. Nothing is reported for work nothing performed: a container whose
+//! program this emulator is no longer performing holds its performer for none of the interval
+//! and its session holds nothing, so what it consumed is what the series then reports.
 //!
 //! # When a datapoint is published
 //!
@@ -58,7 +72,8 @@
 //! apart from then on: the real series has been running for as long as the tasks have, so an
 //! alarm created straight after the service converged sees as many periods of data as its
 //! `EvaluationPeriods` asks for instead of waiting minutes for them. Those two spans are the
-//! emulator's own, and they change the SCHEDULE alone — never what a datapoint says.
+//! emulator's own, and they change the SCHEDULE alone: each datapoint measures the interval
+//! that has just elapsed, whatever stamp the schedule gives it.
 //!
 //! The collection is owed by the clock, whether or not anybody calls: it is driven from the
 //! same pass that materialises a task's own transitions and from the clock pump behind it
@@ -79,28 +94,17 @@ use super::*;
 /// ([`super::container_insights::CONTAINER_INSIGHTS_NAMESPACE`]).
 pub const SERVICE_METRIC_NAMESPACE: &str = "AWS/ECS";
 
-/// The percentage of the CPU units the service's task definition reserves that its tasks are
-/// using (the ECS developer guide's service `CPUUtilization`).
+/// The percentage of the CPU the service's containers are given that they are using: the
+/// share of the collection interval their programs spent EXECUTING (the ECS developer guide's
+/// service `CPUUtilization`, measured as [`super::container_consumption`] describes).
 pub const METRIC_CPU_UTILIZATION: &str = "CPUUtilization";
 
-/// The percentage of the memory the service's task definition reserves — the task's hard
-/// memory limit — that its tasks are using (service `MemoryUtilization`).
+/// The percentage of the memory the service's task definition reserves that its containers
+/// are occupying (service `MemoryUtilization`).
 pub const METRIC_MEMORY_UTILIZATION: &str = "MemoryUtilization";
 
 /// The `StandardUnit` a percentage is published in.
 pub const PERCENT_UNIT: &str = "Percent";
-
-/// What every sample of both metrics measured: nothing, so zero.
-///
-/// Each of them is a measurement taken on the containers of a running task — service
-/// `CPUUtilization` is the CPU units those containers use over the CPU units the task
-/// definition reserves, and service `MemoryUtilization` the memory they occupy over the memory
-/// it reserves — and what this emulator performs for a container is its program inside this
-/// process, with no resource accounting behind it at all. So in every period the quantity each
-/// metric measures is zero, which is also what each of their definitions gives for exactly
-/// that period. Any other number would be a measurement of work nothing measured, which a
-/// client could not tell from a measured one.
-pub const UTILIZATION_SAMPLE: f64 = 0.0;
 
 /// The `StorageResolution` these datapoints are stored at, in seconds: the standard resolution
 /// every metric a service publishes about itself takes ("standard resolution, with data having
@@ -124,13 +128,13 @@ const RUN_UP_PERIODS: u32 = 5;
 /// How far apart the DATAPOINTS of one series come due while that series is still catching up
 /// with the present.
 ///
-/// THE EMULATOR'S OWN SPAN, and the publish schedule's alone: it never changes what a datapoint
-/// says, and it is deliberately non-zero, so a caller that reads the instant a service starts
-/// running still finds the series opening rather than complete.
+/// THE EMULATOR'S OWN SPAN, and the publish schedule's alone: it is deliberately non-zero, so
+/// a caller that reads the instant a service starts running still finds the series opening
+/// rather than complete.
 const ACCELERATED_SPACING: Duration = Duration::from_millis(250);
 
-/// One service's place in its publish schedule: the stamp its next datapoint carries, and when
-/// that datapoint comes due.
+/// One service's place in its publish schedule: the stamp its next datapoint carries, when
+/// that datapoint comes due, and the reading its last one was measured against.
 #[derive(Debug)]
 pub struct UtilizationSeries {
     /// The time stamp the next datapoint carries. Advances by [`PUBLISH_INTERVAL`] per
@@ -138,6 +142,12 @@ pub struct UtilizationSeries {
     next_stamp: SystemTime,
     /// The instant the next datapoint comes due. Stored, never slept on.
     next_datapoint_at: SystemTime,
+    /// How long the service's containers had spent EXECUTING when the previous datapoint was
+    /// published, so the next one measures the interval between the two
+    /// ([`super::container_consumption`]).
+    executing_nanos: u128,
+    /// When that reading was taken: the start of the interval the next datapoint measures.
+    measured_at: SystemTime,
 }
 
 impl UtilizationSeries {
@@ -159,6 +169,27 @@ impl UtilizationSeries {
             .clamp(ACCELERATED_SPACING, PUBLISH_INTERVAL);
         self.next_datapoint_at = now.checked_add(wait).unwrap_or(now);
         stamp
+    }
+
+    /// What the datapoints due at `now` REPORT, given what the service's containers consume
+    /// (`reading`): the CPU utilization, and the memory utilization of a service whose task
+    /// definitions reserve memory to express it as a percentage of.
+    ///
+    /// The interval measured is the one since this series' previous datapoint, so the two
+    /// readings an interval is the difference of are both this series' own. A datapoint that
+    /// closes an interval of NO LENGTH — a series' first, published the instant the service
+    /// became metered — reports no CPU utilization and leaves the reading open, so the work
+    /// its containers have done is reported by the datapoint that does close an interval.
+    fn measure(&mut self, reading: &ServiceConsumption, now: SystemTime) -> (f64, Option<f64>) {
+        let memory = reading.memory_share();
+        let span = now.duration_since(self.measured_at).unwrap_or_default();
+        if span.is_zero() {
+            return (0.0, memory);
+        }
+        let cpu = reading.executing_share(self.executing_nanos, span);
+        self.executing_nanos = reading.executing_nanos;
+        self.measured_at = now;
+        (cpu, memory)
     }
 }
 
@@ -200,22 +231,53 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     // The first datapoint of a series is due at once: the service has been
                     // running for as long as its tasks have.
                     next_datapoint_at: now,
+                    executing_nanos: 0,
+                    measured_at: now,
                 });
         }
+        // What each service that owes a datapoint CONSUMES, read before any series is
+        // advanced: the reading is taken off the whole store (the service's running tasks and
+        // the runs behind their containers), so it cannot be taken while one series is held.
+        let due: Vec<(String, String)> = self
+            .service_utilization
+            .iter()
+            .filter(|(_, series)| series.next_datapoint_at <= now)
+            .map(|(service, _)| service.clone())
+            .collect();
+        let readings: Vec<((String, String), ServiceConsumption)> = due
+            .into_iter()
+            .map(|service| {
+                let reading = self.service_consumption(&service.0, &service.1);
+                (service, reading)
+            })
+            .collect();
         let mut published = Vec::new();
-        for ((cluster_name, service_name), series) in &mut self.service_utilization {
-            if series.next_datapoint_at > now {
+        for ((cluster_name, service_name), reading) in readings {
+            let Some(series) = self
+                .service_utilization
+                .get_mut(&(cluster_name.clone(), service_name.clone()))
+            else {
                 continue;
-            }
+            };
             let stamp = series.advance(now);
+            let (cpu, memory) = series.measure(&reading, now);
             let dimensions: BTreeMap<String, String> = [
-                (CLUSTER_DIMENSION.to_string(), cluster_name.clone()),
-                (SERVICE_DIMENSION.to_string(), service_name.clone()),
+                (CLUSTER_DIMENSION.to_string(), cluster_name),
+                (SERVICE_DIMENSION.to_string(), service_name),
             ]
             .into_iter()
             .collect();
             let timestamp_secs = epoch_seconds(stamp);
-            for metric_name in [METRIC_CPU_UTILIZATION, METRIC_MEMORY_UTILIZATION] {
+            let samples = [
+                (METRIC_CPU_UTILIZATION, Some(cpu)),
+                (METRIC_MEMORY_UTILIZATION, memory),
+            ];
+            for (metric_name, sample) in samples {
+                // A metric this collection measured nothing for publishes nothing: there is
+                // no percentage of a reservation a task definition does not state.
+                let Some(sample) = sample else {
+                    continue;
+                };
                 published.push((
                     cloudwatch::MetricKey {
                         namespace: SERVICE_METRIC_NAMESPACE.to_string(),
@@ -226,9 +288,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                         timestamp_secs,
                         // One observation: this collection's own reading of the service.
                         sample_count: 1.0,
-                        sum: UTILIZATION_SAMPLE,
-                        minimum: UTILIZATION_SAMPLE,
-                        maximum: UTILIZATION_SAMPLE,
+                        sum: sample,
+                        minimum: sample,
+                        maximum: sample,
                         unit: Some(PERCENT_UNIT.to_string()),
                         storage_resolution: STORAGE_RESOLUTION_SECS,
                     },

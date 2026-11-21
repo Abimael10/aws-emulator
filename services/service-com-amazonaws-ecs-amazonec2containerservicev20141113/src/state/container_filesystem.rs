@@ -125,6 +125,17 @@ impl ContainerLayer {
     fn files(&self) -> MutexGuard<'_, ShellVolume> {
         self.files.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    /// How many bytes this layer holds — the sum of what every file on it holds, which is
+    /// memory this process is really holding for the container
+    /// ([`super::container_consumption`]). The same sum [`ContainerFilesystem::layer_bytes`]
+    /// reports for a session running over it.
+    pub fn held_bytes(&self) -> u64 {
+        self.files()
+            .stored_files()
+            .map(|(_, contents)| u64::try_from(contents.len()).unwrap_or(u64::MAX))
+            .sum()
+    }
 }
 
 /// A handle onto the files ONE volume this emulator holds itself holds, shared by every
@@ -376,11 +387,7 @@ impl ContainerFilesystem {
     /// on it holds, which is what the space on that filesystem is reported as used
     /// ([`super::container_process`]).
     pub fn layer_bytes(&self) -> u64 {
-        let files = self.layer.files();
-        files
-            .stored_files()
-            .map(|(_, contents)| u64::try_from(contents.len()).unwrap_or(u64::MAX))
-            .sum()
+        self.layer.held_bytes()
     }
 
     /// `path` as a process of this container resolves it: a relative path against the

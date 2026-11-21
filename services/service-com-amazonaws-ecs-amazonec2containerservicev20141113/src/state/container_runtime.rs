@@ -167,6 +167,50 @@ pub struct ContainerRun {
     /// health-check probes read it back through the same handle
     /// ([`super::container_filesystem::ContainerLayer`]).
     layer: ContainerLayer,
+    /// What this run CONSUMES, shared with the session performing it: how long its program
+    /// has spent executing and how many bytes that session is holding
+    /// ([`super::container_consumption`]). Held beside the run for the same reason the layer
+    /// is — it belongs to the CONTAINER rather than to one session of it — so what a
+    /// collection samples is the accounting of what this emulator really performed.
+    consumption: Arc<ContainerConsumption>,
+}
+
+impl ContainerRun {
+    /// What this run has consumed so far ([`super::container_consumption`]).
+    pub(super) fn consumption(&self) -> &ContainerConsumption {
+        &self.consumption
+    }
+
+    /// Whether a PROGRAM of the container's own is still being performed: a run that only
+    /// initialises the container's log driver performs none, and one that has ended is
+    /// performing nothing any longer.
+    pub(super) fn is_performing_a_program(&self) -> bool {
+        self.runs_a_program && !self.ended
+    }
+
+    /// How many bytes the container's own writable LAYER holds — the files its image and its
+    /// program put there, which this process is really holding for it.
+    pub(super) fn layer_bytes(&self) -> u64 {
+        self.layer.held_bytes()
+    }
+}
+
+/// One container whose run this pass is STARTING, as the entry the store keeps for it: minted
+/// where the launch is assembled, so the handles the run and the session share — its signals,
+/// its writable layer and its accounting — are one set rather than two.
+#[derive(Debug)]
+struct StartedRun {
+    /// The container the run is of.
+    container_arn: String,
+    /// The signals it answers.
+    signals: Arc<ContainerSignals>,
+    /// Whether a PROGRAM of the container's own is being performed
+    /// ([`ContainerRun::runs_a_program`]).
+    runs_a_program: bool,
+    /// The container's own writable layer.
+    layer: ContainerLayer,
+    /// Where what the run consumes is accounted for ([`super::container_consumption`]).
+    consumption: Arc<ContainerConsumption>,
 }
 
 /// What ONE container's run needs, taken out of the store under its lock.
@@ -228,6 +272,9 @@ pub struct ContainerLaunch {
     /// ([`ContainerRun::layer`]): the program runs over the CONTAINER's filesystem, not over
     /// one of its own.
     layer: ContainerLayer,
+    /// Where the session records what this container's run CONSUMES, the one the store holds
+    /// for it ([`ContainerRun::consumption`]).
+    consumption: Arc<ContainerConsumption>,
 }
 
 impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
@@ -306,8 +353,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 },
                 None => TaskRoleCredential::Absent,
             };
-            let mut started: Vec<(String, Arc<ContainerSignals>, bool, ContainerLayer)> =
-                Vec::new();
+            let mut started: Vec<StartedRun> = Vec::new();
             for container in &task.containers {
                 // A container that has not STARTED yet runs nothing: one whose
                 // `dependsOn` conditions are not met is still `PENDING`, and its program
@@ -425,12 +471,17 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 // handed to every session that runs in it — the program's below, and each
                 // health-check probe's off the stored run.
                 let layer = ContainerLayer::new();
-                started.push((
-                    container.container_arn.clone(),
-                    Arc::clone(&signals),
-                    program.is_some(),
-                    layer.clone(),
-                ));
+                // Where the session performing this container's program accounts for what it
+                // consumes, minted once for the container and shared with the run the store
+                // holds ([`super::container_consumption`]).
+                let consumption = Arc::new(ContainerConsumption::new());
+                started.push(StartedRun {
+                    container_arn: container.container_arn.clone(),
+                    signals: Arc::clone(&signals),
+                    runs_a_program: program.is_some(),
+                    layer: layer.clone(),
+                    consumption: Arc::clone(&consumption),
+                });
                 launches.push(ContainerLaunch {
                     container_arn: container.container_arn.clone(),
                     program,
@@ -464,18 +515,20 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     // definition its program is, and off the task's own placement.
                     process: ContainerProcess::of(Some(stored), task),
                     layer,
+                    consumption,
                 });
             }
-            for (container_arn, signals, runs_a_program, layer) in started {
+            for started in started {
                 self.container_runs.insert(
-                    container_arn,
+                    started.container_arn,
                     ContainerRun {
-                        signals,
+                        signals: started.signals,
                         task_arn: task_arn.clone(),
-                        runs_a_program,
+                        runs_a_program: started.runs_a_program,
                         ended: false,
                         handle: None,
-                        layer,
+                        layer: started.layer,
+                        consumption: started.consumption,
                     },
                 );
             }
@@ -777,8 +830,14 @@ async fn run_container(
     ))
     // What the process this session IS runs as, which is what the utilities that report a
     // process's own session answer ([`super::container_process`]).
-    .with_process(launch.process.clone());
+    .with_process(launch.process.clone())
+    // Where this session accounts for what the container's run consumes
+    // ([`super::container_consumption`]).
+    .with_consumption(Arc::clone(&launch.consumption));
     let outcome = shell.run(program).await;
+    // The session is OVER, so it holds nothing more: what the container still occupies is its
+    // own layer, which outlives the session that wrote it.
+    launch.consumption.release();
     state
         .lock()
         .record_container_outcome(&launch.container_arn, outcome);
