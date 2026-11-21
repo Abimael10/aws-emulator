@@ -37,7 +37,9 @@
 //! Scaling group's `Tag` carries `PropagateAtLaunch` as well, "determines whether the tag is
 //! added to new instances as they are launched in the group", so a declared tag keeps the
 //! value its declaration gave it and a tag no declaration states carries none
-//! ([`auto_scaling_group_tags`]).
+//! ([`auto_scaling_group_tags`]). A group that already exists has its tag set reconciled
+//! through the two calls that service publishes for one ([`retag_auto_scaling_group`]), since
+//! `UpdateAutoScalingGroup` has no member for it.
 
 use super::*;
 
@@ -612,25 +614,28 @@ const UPDATE_AUTO_SCALING_GROUP_MEMBERS: &[(&str, QueryMember)] = &[
 /// The `AWS::AutoScaling::AutoScalingGroup` properties no call this arm makes applies to a
 /// group that EXISTS, so a declaration that changes one is asking for a change this emulator
 /// does not make to the group: the instance a group was built from, which is only ever a
-/// group's SOURCE, and the attachments and the tag set, each of which Amazon EC2 Auto Scaling
+/// group's SOURCE, and the attachments, each of which Amazon EC2 Auto Scaling
 /// changes through a pair of calls of its own (`AttachLoadBalancers`/`DetachLoadBalancers`,
 /// `AttachLoadBalancerTargetGroups`/`DetachLoadBalancerTargetGroups`,
-/// `AttachTrafficSources`/`DetachTrafficSources`, `CreateOrUpdateTags`/`DeleteTags`) that no
+/// `AttachTrafficSources`/`DetachTrafficSources`) that no
 /// arm here is written on. Such a change is REFUSED rather than reported applied: the group
 /// would be left as it is, and a stack reporting the change as applied would be reporting a
 /// group it does not have.
 ///
 /// Named for what it decides — which changes no arm here applies — rather than "create-only",
-/// because CloudFormation itself does change a group's tags and attachments: what is missing is
+/// because CloudFormation itself does change a group's attachments: what is missing is
 /// an arm for them, not a call of that service's.
 ///
-/// The group's lifecycle HOOKS are not among them: that property has its own pair of calls
-/// and this arm applies a changed declaration of it through them
+/// The group's TAG SET is not among them: a tag set is carried by no configuration-update call
+/// of any owning service, and this one changes a group's tags through the pair it publishes for
+/// a group that exists — so a changed declaration of them is applied after the configuration
+/// change, by the re-tagging arm every other type's tags travel through
+/// ([`retag_auto_scaling_group`]). Nor are the group's lifecycle HOOKS: that property has its
+/// own pair of calls and this arm applies a changed declaration of it through them
 /// ([`reconcile_lifecycle_hooks`]).
 const AUTO_SCALING_GROUP_CHANGES_NO_ARM_APPLIES: &[&str] = &[
     "InstanceId",
     "LoadBalancerNames",
-    "Tags",
     "TargetGroupARNs",
     "TrafficSources",
 ];
@@ -638,11 +643,13 @@ const AUTO_SCALING_GROUP_CHANGES_NO_ARM_APPLIES: &[&str] = &[
 /// The `AWS::AutoScaling::AutoScalingGroup` properties an UPDATE does not write into the
 /// `UpdateAutoScalingGroup` request: the group's NAME and its `VPCZoneIdentifier`, which this
 /// arm pushes itself; the lifecycle hooks, which reach that service through their own two calls
-/// ([`reconcile_lifecycle_hooks`]); and the tag set, the attachments and the source instance,
-/// which no member of that call carries at all. A declaration that CHANGES one of the last
-/// group is refused before anything is sent ([`AUTO_SCALING_GROUP_CHANGES_NO_ARM_APPLIES`]), so
-/// what is left out here is only a property this revision restates unchanged — which asks
-/// nothing of the update.
+/// ([`reconcile_lifecycle_hooks`]); the tag set, which reaches that service through the two
+/// calls it publishes for the tags of a group that exists ([`retag_auto_scaling_group`]); and
+/// the attachments and the source instance, which no member of that call carries at all. A
+/// declaration that CHANGES one of the last two is refused before anything is sent
+/// ([`AUTO_SCALING_GROUP_CHANGES_NO_ARM_APPLIES`]), so what is left out here is either applied
+/// by a call of its own or a property this revision restates unchanged — which asks nothing of
+/// the update.
 const AUTO_SCALING_GROUP_PROPERTIES_NOT_UPDATED: &[&str] = &[
     "AutoScalingGroupName",
     "InstanceId",
@@ -662,6 +669,11 @@ const AUTO_SCALING_GROUP_PROPERTIES_NOT_UPDATED: &[&str] = &[
 /// and remove ONE hook of a group that exists ([`reconcile_lifecycle_hooks`]): the group's
 /// hooks are a property of it that the owning service changes after the group was created,
 /// not part of what `UpdateAutoScalingGroup` carries.
+///
+/// A changed `Tags` property is applied too, but not from here: a tag set is carried by no
+/// member of this call ([`UPDATE_AUTO_SCALING_GROUP_MEMBERS`]), so it travels through the
+/// owning service's own tagging calls after the configuration change, exactly as every other
+/// type's tag set does ([`retag_auto_scaling_group`]).
 ///
 /// A declaration that changes a property no call here applies is REFUSED
 /// ([`AUTO_SCALING_GROUP_CHANGES_NO_ARM_APPLIES`]): the group would be left as it is, and a
@@ -897,6 +909,210 @@ async fn reconcile_lifecycle_hooks(
         .await?;
     }
     Ok(())
+}
+
+/// The `ResourceType` one tag of a tagging call names the group by: "the only supported value
+/// is `auto-scaling-group`" (`Tag$ResourceType`).
+const GROUP_TAG_RESOURCE_TYPE: &str = "auto-scaling-group";
+
+/// One tag the Auto Scaling group is to end up carrying: its key, its value, and the
+/// `PropagateAtLaunch` stated for it where one is stated at all.
+///
+/// That third member is this service's `Tag` alone — "determines whether the tag is added to
+/// new instances as they are launched in the group" — so the pair every other service's tag set
+/// is reconciled as ([`tag_delta`]) cannot carry it, and the arm below reconciles the triple. A
+/// tag no declaration states the flag for carries `None`: its propagation is then the owning
+/// service's own default for that member rather than a value invented here, exactly as it is
+/// for the tags the CREATE applies ([`auto_scaling_group_tags`]).
+type GroupTag = (String, String, Option<String>);
+
+/// The tags this deployment gives the group: the set every type's tags are read as ([`tags_of`]
+/// — the declaration's own, in declaration order, then the ones CloudFormation propagates under
+/// every key it does not use), each carrying the propagation decision its own declaration
+/// states.
+fn auto_scaling_group_desired_tags(
+    declared: &Value,
+    propagated: &[(String, String)],
+) -> Vec<GroupTag> {
+    tags_of(declared, propagated)
+        .into_iter()
+        .map(|(key, value)| {
+            let propagate = declared_propagate_at_launch(declared, &key);
+            (key, value, propagate)
+        })
+        .collect()
+}
+
+/// Whether the group has to be WRITTEN the tag `wanted`: one it does not carry at all, one it
+/// carries with another value, or one whose declaration states a propagation decision differing
+/// from the one in force.
+///
+/// A declaration stating no `PropagateAtLaunch` for a key asks nothing about that member, so the
+/// tag it already carries is left as it is rather than re-written to a flag chosen here.
+fn group_tag_needs_writing(held: &[GroupTag], wanted: &GroupTag) -> bool {
+    let (key, value, propagate) = wanted;
+    match held.iter().find(|(held_key, _, _)| held_key == key) {
+        None => true,
+        Some((_, held_value, held_propagate)) => {
+            held_value != value
+                || propagate
+                    .as_ref()
+                    .is_some_and(|stated| Some(stated) != held_propagate.as_ref())
+        }
+    }
+}
+
+/// The two members that say WHICH resource one tag of a tagging call is on, beside the KEY that
+/// identifies the tag itself: the group's name ("the name of the Auto Scaling group",
+/// `Tag$ResourceId`) and the one resource type this service tags
+/// ([`GROUP_TAG_RESOURCE_TYPE`]). Both calls below take the tag the same way, so the three are
+/// pushed once here.
+fn push_group_tag_identity(
+    parameters: &mut Vec<(String, String)>,
+    position: usize,
+    name: &str,
+    key: &str,
+) {
+    parameters.push((
+        format!("Tags.member.{position}.ResourceId"),
+        name.to_string(),
+    ));
+    parameters.push((
+        format!("Tags.member.{position}.ResourceType"),
+        GROUP_TAG_RESOURCE_TYPE.to_string(),
+    ));
+    parameters.push((format!("Tags.member.{position}.Key"), key.to_string()));
+}
+
+/// Bring the tags of the Auto Scaling group a stack already has to the set this deployment
+/// gives it, through the two calls Amazon EC2 Auto Scaling publishes for the tags of a group
+/// that EXISTS: `CreateOrUpdateTags` "creates or updates tags for the specified Auto Scaling
+/// group" — "when you specify a tag with a key that already exists, the operation overwrites
+/// the previous tag definition" — and `DeleteTags` "deletes the specified tags".
+///
+/// This is where a group's tag set is reconciled because no member of `UpdateAutoScalingGroup`
+/// carries one ([`UPDATE_AUTO_SCALING_GROUP_MEMBERS`]): the `Tags` the create passed apply to
+/// the group that call created and to no group that already exists, and a deployment can state
+/// a stack's tags differently with no declaration changing at all — the position every other
+/// type whose service tags a resource through calls of its own is in
+/// ([`super::Provisioner::retag`]).
+///
+/// What the group HOLDS is read back from that service rather than guessed from the declaration
+/// it was last deployed with, so the two halves are computed against the tags really in force;
+/// where they already agree neither call is made at all, which is what makes this safe to ask
+/// on every deployment.
+pub(super) async fn retag_auto_scaling_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+    propagated: &[(String, String)],
+) -> Result<(), Refusal> {
+    let name = resource.physical_resource_id.clone();
+    let desired = auto_scaling_group_desired_tags(declared, propagated);
+    let held = described_group_tags(ctx, region, &name).await?;
+    // A key the group carries that this deployment no longer gives it is REMOVED first, so a
+    // revision that renames a tag cannot run into the account's per-group tag quota on the way
+    // through.
+    let removed: Vec<&String> = held
+        .iter()
+        .map(|(key, _, _)| key)
+        .filter(|key| !desired.iter().any(|(wanted, _, _)| wanted == *key))
+        .collect();
+    if !removed.is_empty() {
+        let mut parameters = Vec::new();
+        for (index, key) in removed.iter().enumerate() {
+            push_group_tag_identity(&mut parameters, index + 1, &name, key);
+        }
+        call_query(
+            ctx,
+            AUTOSCALING_SIGNING_NAME,
+            region,
+            AUTOSCALING_API_VERSION,
+            "DeleteTags",
+            &parameters,
+        )
+        .await?;
+    }
+    let written: Vec<&GroupTag> = desired
+        .iter()
+        .filter(|wanted| group_tag_needs_writing(&held, wanted))
+        .collect();
+    if written.is_empty() {
+        return Ok(());
+    }
+    let mut parameters = Vec::new();
+    for (index, (key, value, propagate)) in written.iter().enumerate() {
+        let position = index + 1;
+        push_group_tag_identity(&mut parameters, position, &name, key);
+        parameters.push((format!("Tags.member.{position}.Value"), value.clone()));
+        if let Some(propagate) = propagate {
+            parameters.push((
+                format!("Tags.member.{position}.PropagateAtLaunch"),
+                propagate.clone(),
+            ));
+        }
+    }
+    call_query(
+        ctx,
+        AUTOSCALING_SIGNING_NAME,
+        region,
+        AUTOSCALING_API_VERSION,
+        "CreateOrUpdateTags",
+        &parameters,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// The tags Amazon EC2 Auto Scaling holds for one group right now, as the triples the arm above
+/// reconciles.
+///
+/// Read off the GROUP's own report — `DescribeAutoScalingGroups` carries "the tags for the Auto
+/// Scaling group" as that group's `Tags` list, one `<member>` per tag — so the reconciliation
+/// needs no second read and sees exactly what a client reading the group sees. The list is read
+/// through the one reader of a list of STRUCTURES this crate has ([`xml_member_structures`]), so
+/// a tag reporting one member and not another is read as that tag with the other absent rather
+/// than as a pairing of one tag's key with another's value. A group carrying no tag at all
+/// reports the empty list, and so does a name that service holds no group for.
+async fn described_group_tags(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    name: &str,
+) -> Result<Vec<GroupTag>, Refusal> {
+    let parameters = vec![(
+        "AutoScalingGroupNames.member.1".to_string(),
+        name.to_string(),
+    )];
+    let answered = call_query(
+        ctx,
+        AUTOSCALING_SIGNING_NAME,
+        region,
+        AUTOSCALING_API_VERSION,
+        "DescribeAutoScalingGroups",
+        &parameters,
+    )
+    .await?;
+    Ok(xml_member_structures(&answered, "Tags")
+        .into_iter()
+        .filter_map(|tag| {
+            let key = tag
+                .get("Key")
+                .and_then(Value::as_str)
+                .filter(|key| !key.is_empty())?;
+            Some((
+                key.to_string(),
+                tag.get("Value")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                tag.get("PropagateAtLaunch")
+                    .and_then(Value::as_str)
+                    .filter(|propagate| !propagate.is_empty())
+                    .map(str::to_string),
+            ))
+        })
+        .collect())
 }
 
 /// Apply a CHANGED `AWS::EC2::LaunchTemplate` declaration to the template that exists, by

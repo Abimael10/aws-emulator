@@ -877,6 +877,15 @@ impl Provisioner {
                 )
                 .await
             }
+            // An Auto Scaling group's tags are Amazon EC2 Auto Scaling's own
+            // `CreateOrUpdateTags` and `DeleteTags`: `CreateAutoScalingGroup`'s `Tags` member
+            // applies to the group that call creates, and `UpdateAutoScalingGroup` carries no
+            // tags at all — the member does not exist on it — so this is where the set a group
+            // is to end up carrying is reconciled, propagation flag included
+            // ([`retag_auto_scaling_group`]).
+            Self::AutoScalingGroup => {
+                retag_auto_scaling_group(ctx, region, resource, declared, propagated).await
+            }
             // A suite definition's tags are that service's own `TagResource` and
             // `UntagResource`: `CreateSuiteDefinition`'s `tags` map applies to the suite that
             // call creates, and `UpdateSuiteDefinition` carries no tags at all, so this is
