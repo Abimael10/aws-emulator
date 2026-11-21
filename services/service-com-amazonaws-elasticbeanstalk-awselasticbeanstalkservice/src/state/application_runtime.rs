@@ -96,6 +96,16 @@ pub struct GuestRun {
     pub stdout: String,
     /// Everything it wrote to standard error, verbatim.
     pub stderr: String,
+    /// What the application wrote while SERVING the request this run carried —
+    /// the lines the instance's log file gains from that one request, and empty
+    /// for a run that served none.
+    ///
+    /// A run that serves a request STARTS the application first (this emulator
+    /// runs the deployment per request rather than keeping a process standing),
+    /// so what the application wrote while starting is in the streams above and
+    /// only what it wrote while serving is here: the output a request produced is
+    /// attributable to that request.
+    pub served: String,
     pub response: Option<GuestResponse>,
     /// The uncaught exception that ended the run, if one did.
     pub failure: Option<String>,
@@ -106,6 +116,11 @@ pub struct GuestRun {
 struct Capture {
     stdout: String,
     stderr: String,
+    /// What has been written since the application was handed its request, which
+    /// is what the host turns on ([`Capture::serving`]) once the entry point has
+    /// been evaluated.
+    served: String,
+    serving: bool,
     response: Option<GuestResponse>,
 }
 
@@ -114,6 +129,14 @@ impl Capture {
     /// [`MAX_CAPTURED_BYTES`] for it and on a character boundary, so a capped
     /// stream is still a string.
     fn write(&mut self, error_stream: bool, text: &str) {
+        if self.serving {
+            let room = MAX_CAPTURED_BYTES.saturating_sub(self.served.len());
+            let mut end = text.len().min(room);
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.served.push_str(&text[..end]);
+        }
         let stream = if error_stream {
             &mut self.stderr
         } else {
@@ -155,6 +178,7 @@ pub fn run_application(
     GuestRun {
         stdout: captured.stdout.clone(),
         stderr: captured.stderr.clone(),
+        served: captured.served.clone(),
         response: captured.response.clone(),
         failure,
     }
@@ -196,6 +220,10 @@ fn evaluate(
             return Ok(());
         };
         set_json(&ctx, "__ebRequest", &request_object(request))?;
+        // Everything written from here on was written while SERVING this
+        // request, which is what makes the output one request produced
+        // attributable to it.
+        captured(capture).serving = true;
         run_one(&ctx, DISPATCH_PRELUDE)
     })
 }

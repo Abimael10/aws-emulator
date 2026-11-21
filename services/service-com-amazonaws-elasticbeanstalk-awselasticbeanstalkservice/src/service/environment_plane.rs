@@ -23,9 +23,14 @@
 //! running no application this emulator could start answers as an address with
 //! nothing behind it.
 //!
-//! Serving traffic WRITES NOTHING: no status moves, no quota is consumed and no
-//! counter is bumped, so a client dialling the address leaves every later caller
-//! seeing exactly what it saw.
+//! Serving traffic moves no status, consumes no quota and bumps no counter, so a
+//! client dialling the address leaves every later caller seeing exactly what it
+//! saw. What it does leave behind is what the APPLICATION wrote while answering:
+//! an application's own output goes to the instance's standard-output log file on
+//! a real instance, so an environment whose configuration streams its instance
+//! logs delivers the lines one request produced into the group that file is
+//! streamed to ([`crate::state::stream_instance_logs`]) — the log of a request is
+//! the application's doing, not a reading of this service's state.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_types::body::SdkBody;
@@ -34,8 +39,8 @@ use smithy_server_runtime::{http, BoxFuture, ErasedOperation, OperationContext, 
 use ::service_common::data_plane_addressing::{first_segment, EMULATOR_PATH_NAMESPACE};
 
 use crate::state::{
-    environment_serving_cname_prefix, service_state, GuestRequest, GuestResponse,
-    DATA_PLANE_SEGMENT,
+    environment_serving_cname_prefix, service_state, stream_instance_logs, GuestRequest,
+    GuestResponse, InstanceLogStreaming, DATA_PLANE_SEGMENT,
 };
 
 /// What this plane answers for an address no environment serves — the prefix of
@@ -51,6 +56,11 @@ const NO_APPLICATION_STATUS: u16 = 502;
 
 /// The media type an answer this plane renders itself carries.
 const PLAIN_TEXT: &str = "text/plain; charset=utf-8";
+
+/// The headers of the client's own request that describe a request BODY, which is
+/// not handed to the application: no body travels to it, so a length or a transfer
+/// encoding stating one would describe a body that is not there.
+const HEADERS_DESCRIBING_A_BODY: &[&str] = &["content-length", "transfer-encoding"];
 
 /// Whether `path` addresses this plane at all: the reserved namespace segment,
 /// then this service's own plane segment, then a Region and a CNAME prefix.
@@ -148,9 +158,9 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for EnvironmentPlane<Eng> {
         &'r self,
         _svc: &'r dyn Service,
         req: &'r RtRequest,
-        _ctx: &'r OperationContext<'r>,
+        ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
-        Box::pin(async move { serve(&*self.engine, req).await })
+        Box::pin(async move { serve(&*self.engine, req, ctx).await })
     }
 
     fn auth_schemes(&self) -> Option<&'static [&'static str]> {
@@ -162,7 +172,11 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for EnvironmentPlane<Eng> {
 }
 
 /// Serve one request the environment's own address received.
-async fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtResponse {
+async fn serve<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    req: &RtRequest,
+    ctx: &OperationContext<'_>,
+) -> RtResponse {
     let path = ::service_common::request_path(req.uri());
     let Some((region, prefix, application_path)) = addressed(path) else {
         return rendered(NOT_SERVED_STATUS, PLAIN_TEXT, Vec::new());
@@ -176,15 +190,20 @@ async fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtR
     let request = GuestRequest {
         method: req.method().to_string(),
         path: application_path,
+        // No request BODY travels to the application: nothing of this plane reads
+        // one, so the headers that DESCRIBE one are left out too — an application
+        // is handed a request whose headers match the request it was handed,
+        // rather than one declaring a body that was never delivered.
         headers: req
             .headers()
             .iter()
             .map(|(name, value)| (name.to_string(), value.to_string()))
+            .filter(|(name, _)| !HEADERS_DESCRIBING_A_BODY.contains(&name.as_str()))
             .collect(),
     };
     // The deployment is read out of the store and the store released: the
     // application then RUNS with no guard held.
-    let deployed = {
+    let (deployed, streaming) = {
         let Some(state) = service_state(engine) else {
             return rendered(NO_APPLICATION_STATUS, PLAIN_TEXT, Vec::new());
         };
@@ -194,18 +213,45 @@ async fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtR
             return rendered(NOT_SERVED_STATUS, PLAIN_TEXT, Vec::new());
         };
         let environment_id = environment.environment_id.clone();
-        store.deployed_application(&environment_id)
+        // Where this environment's instance logs go, read while the store is held
+        // — the delivery itself calls another service and so happens below, with
+        // no guard taken.
+        let streaming = store.instance_log_streaming(region, &environment_id);
+        (store.deployed_application(&environment_id), streaming)
     };
     let Some(deployed) = deployed else {
         return rendered(NO_APPLICATION_STATUS, PLAIN_TEXT, Vec::new());
     };
     let answered = deployed.serve(&request).await;
-    match answered {
+    delivered(ctx, streaming.as_ref(), &answered.output).await;
+    match answered.response {
         Some(response) => served(&response),
         // The application ran and answered nothing at this address, and its
         // bundle carries no file for it either.
         None => rendered(NOT_SERVED_STATUS, PLAIN_TEXT, Vec::new()),
     }
+}
+
+/// Deliver what the application wrote while answering one request into the group
+/// the instance's standard-output log file is streamed to — for an environment
+/// whose configuration streams its instance logs, and where the application wrote
+/// anything at all.
+///
+/// The REGION the groups are held in is the environment's own, which is what the
+/// streaming record carries — read off the address the request was sent to, since
+/// a client of that address presents no credential to read a Region from.
+async fn delivered(
+    ctx: &OperationContext<'_>,
+    streaming: Option<&InstanceLogStreaming>,
+    output: &[String],
+) {
+    let Some(streaming) = streaming else {
+        return;
+    };
+    if output.is_empty() {
+        return;
+    }
+    stream_instance_logs(ctx, streaming, output).await;
 }
 
 /// The response the application ended, as the client reads it: its status, every

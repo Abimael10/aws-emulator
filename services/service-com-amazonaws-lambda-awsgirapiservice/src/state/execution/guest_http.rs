@@ -940,6 +940,42 @@ class HTTPMessage(email.message.Message):
         return [line for line in self.keys() if line.lower().startswith(name)]
 
 
+# How long one header line may be, and how many of them one message may carry, as the
+# standard library's own reader bounds them.
+_MAXLINE = 65536
+_MAXHEADERS = 100
+
+
+def _read_headers(fp):
+    """The header lines of one message, read off `fp` up to the blank line that ends them."""
+    headers = []
+    while True:
+        line = fp.readline(_MAXLINE + 1)
+        if len(line) > _MAXLINE:
+            raise LineTooLong("header line")
+        headers.append(line)
+        if len(headers) > _MAXHEADERS:
+            raise HTTPException("got more than %d headers" % _MAXHEADERS)
+        if line in (b"\r\n", b"\n", b""):
+            break
+    return headers
+
+
+def parse_headers(fp, _class=HTTPMessage):
+    """The headers of one message, parsed off `fp`.
+
+    What the standard library's own HTTP SERVER reads a request's headers through, and what
+    its client reads a response's through: the lines up to the blank one, parsed by the email
+    parser as the message they are. That parser is imported HERE rather than with this
+    module, so importing the HTTP client costs only what the client itself needs.
+    """
+    import email.parser
+
+    headers = _read_headers(fp)
+    text = b"".join(headers).decode("iso-8859-1")
+    return email.parser.Parser(_class=_class).parsestr(text)
+
+
 class HTTPResponse(io.BytesIO):
     """One answer, read the way the standard library's response is read.
 

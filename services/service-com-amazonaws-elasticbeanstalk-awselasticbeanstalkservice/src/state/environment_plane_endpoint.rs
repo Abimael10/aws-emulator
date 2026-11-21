@@ -52,8 +52,12 @@ const SERVICE_ENDPOINT: &str = "elasticbeanstalk.amazonaws.com";
 /// the status a proxy answers for an upstream that did not finish.
 ///
 /// An EMULATOR bound: the request is served in this process, so this only bounds
-/// a request whose serving does not return.
-const REQUEST_DEADLINE: ::std::time::Duration = ::std::time::Duration::from_secs(30);
+/// a request whose serving does not return. Wide enough for the RUN that serves
+/// it and for the wait for a run slot before it, so a request is answered by the
+/// application, or by the status the plane renders for one that produced nothing,
+/// rather than being cut off between the two
+/// ([`crate::state::deployed_application`] states both spans).
+const REQUEST_DEADLINE: ::std::time::Duration = ::std::time::Duration::from_secs(90);
 
 /// What this socket answers a request its own machinery could not serve: the
 /// status a proxy answers when it produced the answer itself instead of the

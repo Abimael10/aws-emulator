@@ -47,20 +47,24 @@ pub const NAMESPACE_PYTHON_CONTAINER: &str = "aws:elasticbeanstalk:container:pyt
 /// that contains the WSGI application".
 pub const OPTION_WSGI_PATH: &str = "WSGIPath";
 
-/// The suffix of a file the interpreter imports as a module.
-const PYTHON_SUFFIX: &str = ".py";
+/// The suffix of a file the interpreter imports as a module, or runs as a program.
+pub(super) const PYTHON_SUFFIX: &str = ".py";
 
 /// How long ONE run of a deployed Python application may last.
 ///
 /// An EMULATOR bound, not an AWS one: the code runs in this process, so a loop with no exit
-/// would otherwise hold a thread for ever. Long enough for an application's module to be
-/// imported and one request to be answered by it.
-const RUN_WALL_CLOCK: Duration = Duration::from_secs(5);
+/// would otherwise hold a thread for ever. This is the WALL CLOCK, so it has to be wide
+/// enough for the run a deployed web application really costs here on a host busy with other
+/// work: the modules of the standard library its own server is built on are imported into a
+/// fresh interpreter for every run, which is seconds of work before a line of the
+/// application's own code is reached. The bound that does NOT depend on how fast the host is
+/// — and so the one that stops code that diverges — is [`RUN_STEPS`] beside it.
+const RUN_WALL_CLOCK: Duration = Duration::from_secs(45);
 
 /// How many traced events one run may execute — the STEP bound beside the wall-clock one, and
-/// the one that does not depend on how fast the host is. CHOSEN: large enough to import a
-/// web application's module and answer a request through it.
-const RUN_STEPS: u64 = 2_000_000;
+/// the one that does not depend on how fast the host is. CHOSEN: large enough to import the
+/// standard library an application's server is built on and answer a request through it.
+const RUN_STEPS: u64 = 20_000_000;
 
 /// How much memory one run may add to this process. CHOSEN, for the same reason.
 const RUN_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
@@ -152,6 +156,36 @@ pub fn python_entry(
     bundle_module(bundle, &module).map(|module| PythonEntry { module, callable })
 }
 
+/// The WSGI application the start command `command` serves, or `None` when it names none of
+/// `bundle`.
+///
+/// A command that starts a WSGI SERVER over the application — the `gunicorn`, `uwsgi` or
+/// `waitress-serve` an Elastic Beanstalk Python platform's own default command and its
+/// documented `Procfile` examples run — states which application it serves as the
+/// `module:callable` specification those servers take, among its own options. So the entry
+/// point such a command starts is read out of the command itself, by the same rule the
+/// platform's `WSGIPath` is read by ([`python_entry`]): the module has to BE in the deployment.
+#[must_use]
+pub fn python_wsgi_specified(
+    bundle: &ApplicationBundle,
+    command: &str,
+) -> Option<PythonEntry> {
+    command
+        .split_whitespace()
+        // An option of the server itself, whose value may well carry the separator
+        // (`--bind :8000`), names no application.
+        .filter(|token| !token.starts_with('-'))
+        .filter_map(|token| token.split_once(':'))
+        .filter(|(_, callable)| !callable.is_empty())
+        .find_map(|(path, callable)| {
+            let module = module_path(bundle_relative(path)?);
+            bundle_module(bundle, &module).map(|module| PythonEntry {
+                module,
+                callable: Some(callable.to_string()),
+            })
+        })
+}
+
 /// `path` as a path INSIDE the deployment, or `None` when it is not one: a path of its own
 /// root, and one that climbs out of the deployment, names no file the platform could start the
 /// application from.
@@ -192,16 +226,20 @@ fn bundle_module(bundle: &ApplicationBundle, module: &str) -> Option<String> {
 /// Every Python module `bundle` carries, as the interpreter is handed them: a file whose
 /// bytes are not text is left out, because nothing here can present a module it cannot read.
 ///
-/// The module this emulator SUPPLIES ([`SERVE_MODULE`]) is left out of them: the interpreter
-/// is handed the deployment's modules and that one over them, so a bundle carrying a file of
-/// the same name cannot replace the server side of the platform with its own.
+/// The modules this emulator SUPPLIES — this one and the serving layer a program runs on
+/// ([`SERVE_MODULE`], [`super::python_program::SERVE_MODULE`]) — are left out of them: the
+/// interpreter is handed the deployment's modules and those over them, so a bundle carrying a
+/// file of either name cannot replace the server side of the platform with its own.
 #[must_use]
 pub fn python_modules(bundle: &ApplicationBundle) -> Vec<PackageModule> {
-    let supplied = format!("{SERVE_MODULE}{PYTHON_SUFFIX}");
+    let supplied: Vec<String> = [SERVE_MODULE, super::python_program::SERVE_MODULE]
+        .iter()
+        .map(|module| format!("{module}{PYTHON_SUFFIX}"))
+        .collect();
     bundle
         .files
         .iter()
-        .filter(|(path, _)| path.ends_with(PYTHON_SUFFIX) && **path != supplied)
+        .filter(|(path, _)| path.ends_with(PYTHON_SUFFIX) && !supplied.contains(path))
         .filter_map(|(path, bytes)| {
             ::std::str::from_utf8(bytes).ok().map(|source| PackageModule {
                 path: path.clone(),
@@ -212,7 +250,7 @@ pub fn python_modules(bundle: &ApplicationBundle) -> Vec<PackageModule> {
 }
 
 /// What one run of a deployed application may spend, which is every bound this module states.
-fn application_budget() -> python::Budget {
+pub(super) fn application_budget() -> python::Budget {
     python::Budget {
         wall_clock: RUN_WALL_CLOCK,
         steps: RUN_STEPS,
@@ -247,17 +285,37 @@ pub fn run_python_application(
         "request": request.map(request_document),
     })
     .to_string();
+    run_guest(
+        &supplied,
+        &format!("{SERVE_MODULE}.{SERVE_FUNCTION}"),
+        &event,
+        environment,
+    )
+}
+
+/// Run `handler` of the modules `supplied` over `event`, under the bounds and the containment
+/// one run of a deployed application has.
+///
+/// The one place this crate starts the embedded interpreter, so a deployment started by the
+/// platform's own server ([`run_python_application`]) and one started as a program
+/// ([`super::python_program::run_python_program`]) cannot be run under different bounds, in a
+/// different environment or with a different seam.
+pub(super) fn run_guest(
+    supplied: &[PackageModule],
+    handler: &str,
+    event: &str,
+    environment: &[(String, String)],
+) -> GuestRun {
     let environment: BTreeMap<String, String> = environment.iter().cloned().collect();
-    let handler = format!("{SERVE_MODULE}.{SERVE_FUNCTION}");
     let finished = python::run(&python::Run {
-        modules: &supplied,
-        handler: &handler,
+        modules: supplied,
+        handler,
         environment: &environment,
         // The instruction set the environment the application runs in has, which the run
         // reports as its own machine: an Elastic Beanstalk environment names none, so it is
         // the one the engine reports when none is named.
         architecture: DEFAULT_ARCHITECTURE,
-        event: Some(&event),
+        event: Some(event),
         request_id: "",
         invoked_function_arn: "",
         client_context: None,
@@ -275,8 +333,9 @@ pub fn run_python_application(
     guest_run(finished)
 }
 
-/// One request, as the JSON the WSGI environment is built from.
-fn request_document(request: &GuestRequest) -> ::serde_json::Value {
+/// One request, as the JSON the WSGI environment — or the request bytes a program's own
+/// server is handed — is built from.
+pub(super) fn request_document(request: &GuestRequest) -> ::serde_json::Value {
     let headers: ::serde_json::Map<String, ::serde_json::Value> = request
         .headers
         .iter()
@@ -298,8 +357,11 @@ fn request_document(request: &GuestRequest) -> ::serde_json::Value {
 /// the output the application wrote, the response it answered, and the account of a run that
 /// answered none.
 fn guest_run(finished: python::Finished) -> GuestRun {
-    let (response, failure) = match &finished.completion {
-        python::Completion::Returned(payload) => (served_response(payload), None),
+    let (answered, failure) = match &finished.completion {
+        python::Completion::Returned(payload) => (
+            ::serde_json::from_str::<::serde_json::Value>(payload).ok(),
+            None,
+        ),
         python::Completion::Raised {
             error_type,
             error_message,
@@ -319,16 +381,24 @@ fn guest_run(finished: python::Finished) -> GuestRun {
         // log, which is what the instance's standard-output log file carries.
         stdout: finished.log,
         stderr: String::new(),
-        response,
+        // What the application wrote while serving the request, which the serving layer
+        // captured on its own ([`SERVE_SOURCE`]) rather than leaving in the run's log beside
+        // the output of starting the application.
+        served: answered
+            .as_ref()
+            .and_then(|answered| answered.get("log"))
+            .and_then(::serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        response: answered.as_ref().and_then(served_response),
         failure,
     }
 }
 
-/// The response the WSGI application answered, read back off the document the supplied module
+/// The response the application answered, read back off the document the supplied module
 /// returned — and `None` for a run that answered no request (one started with none to serve,
 /// and one whose application never started a response), or whose answer could not be read.
-fn served_response(payload: &str) -> Option<GuestResponse> {
-    let answered: ::serde_json::Value = ::serde_json::from_str(payload).ok()?;
+fn served_response(answered: &::serde_json::Value) -> Option<GuestResponse> {
     let status = answered.get("status")?.as_u64()?;
     let headers = answered
         .get("headers")
@@ -456,6 +526,28 @@ def serve(event, context):
         # application wrote while being imported is its start-up output.
         return {}
 
+    # What the application writes from here on it writes while SERVING this request, so the
+    # platform's server captures it apart from the output of starting the application: it is
+    # the output that one request produced, and it is attributable to it.
+    served = io.StringIO()
+    writing, failing = sys.stdout, sys.stderr
+    sys.stdout = sys.stderr = served
+    try:
+        answered = _answer(module, event, request)
+    except BaseException:
+        # The application wrote this before it raised, and a run that answered nothing
+        # reports no request's output: it belongs in the run's own log instead of being lost.
+        writing.write(served.getvalue())
+        raise
+    finally:
+        sys.stdout, sys.stderr = writing, failing
+    if answered:
+        answered["log"] = served.getvalue()
+    return answered
+
+
+def _answer(module, event, request):
+    """Hand one request to the WSGI application and answer with what it returned."""
     answered = {}
     chunks = []
 

@@ -99,12 +99,23 @@ pub const LOG_SECTION_RULE: &str = "-------------------------------------";
 /// An EMULATOR bound: each run holds the engine's own heap
 /// ([`super::application_runtime`]) on a blocking thread, so this is what bounds
 /// what those runs can hold and occupy however many requests arrive together.
-const MAX_CONCURRENT_RUNS: usize = 4;
+/// What it bounds is the PRODUCT: this many runs, each inside the per-run memory
+/// ceiling its engine is given ([`super::python_application`]'s and
+/// [`super::application_runtime`]'s) and on a stack of
+/// [`PYTHON_APPLICATION_STACK_BYTES`], is the most this process holds for
+/// deployed applications at any moment.
+const MAX_CONCURRENT_RUNS: usize = 6;
 
 /// How long a request waits for one of those run slots before it is answered as
 /// an application that produced nothing, rather than queueing behind other
 /// callers' code.
-const RUN_PERMIT_WAIT: Duration = Duration::from_secs(5);
+///
+/// Long enough to wait out part of a run already in flight: one run of a deployed
+/// application that starts a server of its own imports the standard library that
+/// server is built on into a fresh interpreter, which is seconds of work
+/// ([`super::python_application`]), so a wait shorter than that would drop a
+/// request that only arrived while another was being served.
+const RUN_PERMIT_WAIT: Duration = Duration::from_secs(15);
 
 /// The run slots [`MAX_CONCURRENT_RUNS`] declares, over every environment of this
 /// process: the bound is on what the ENGINE may hold at once, which is a property
@@ -207,41 +218,54 @@ impl ApplicationBundle {
 /// What a deployed bundle is STARTED from, which is also which engine of this
 /// process RUNS it.
 ///
-/// An Elastic Beanstalk platform starts the application from a file of the
-/// deployment, in the language of that platform: a Node.js platform the `main` of
-/// the bundle's `package.json` (and otherwise `app.js`), a Python platform the
-/// module its `WSGIPath` names. A bundle carrying no such file is one this
-/// emulator starts no application from, and its environment serves the bundle's
-/// FILES instead.
+/// An Elastic Beanstalk platform starts the application with the command the
+/// bundle's own `Procfile` gives its web process, and otherwise with its own
+/// default command — which starts a file of the deployment in the language of that
+/// platform: a Node.js platform the `main` of the bundle's `package.json` (and
+/// otherwise `app.js`), a Python platform the module its `WSGIPath` names. A
+/// bundle carrying no such file is one this emulator starts no application from,
+/// and its environment serves the bundle's FILES instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApplicationEntry {
     /// The JavaScript file the platform starts, run by the embedded JavaScript
     /// engine ([`super::application_runtime`]).
     JavaScript(String),
-    /// The WSGI entry point the platform starts, run by the embedded Python
-    /// interpreter ([`super::python_application`]).
+    /// The WSGI entry point the platform's own server serves, run by the embedded
+    /// Python interpreter ([`super::python_application`]).
     Python(PythonEntry),
+    /// The Python PROGRAM the start command runs, which starts a server of its
+    /// own ([`super::python_program`]).
+    PythonProgram(PythonProgram),
 }
 
 /// What the bundle `bundle` deployed on a platform of category
 /// `platform_category`, under the configuration `option_settings`, is started
 /// from — or `None` for a deployment this emulator starts no application from.
 ///
-/// The PLATFORM decides, where this emulator embeds an engine for that platform's
-/// own language: a Python platform starts the module its `WSGIPath` names
-/// ([`python_entry`]) and a Node.js platform the file a Node.js platform starts,
-/// so a bundle carrying files of both languages is run by the engine of the
-/// platform it was deployed to. For a platform whose own language this emulator
-/// embeds no engine for — and for a custom platform version, whose language this
-/// service knows nothing about — the entry point is whichever of the two the
-/// BUNDLE carries, looked for in one order so that one deployment has one entry
-/// point: such an environment runs the application its deployment carries or none.
+/// The bundle's own `Procfile` decides first, where it carries one: the command it
+/// gives the web process is the command the platform starts the application with,
+/// whatever the platform's own default command would have started
+/// ([`started_by`]).
+///
+/// Otherwise the PLATFORM decides, where this emulator embeds an engine for that
+/// platform's own language: a Python platform starts the module its `WSGIPath`
+/// names ([`python_entry`]) and a Node.js platform the file a Node.js platform
+/// starts, so a bundle carrying files of both languages is run by the engine of
+/// the platform it was deployed to. For a platform whose own language this
+/// emulator embeds no engine for — and for a custom platform version, whose
+/// language this service knows nothing about — the entry point is whichever of the
+/// two the BUNDLE carries, looked for in one order so that one deployment has one
+/// entry point: such an environment runs the application its deployment carries or
+/// none.
 #[must_use]
 pub fn application_entry(
     bundle: &ApplicationBundle,
     platform_category: Option<&str>,
     option_settings: &[ConfigurationOptionSetting],
 ) -> Option<ApplicationEntry> {
+    if let Some(command) = procfile_command(bundle, WEB_PROCESS) {
+        return started_by(bundle, &command);
+    }
     match platform_category {
         Some(PLATFORM_CATEGORY_PYTHON) => {
             return python_entry(bundle, option_settings).map(ApplicationEntry::Python)
@@ -255,6 +279,47 @@ pub fn application_entry(
         .map(ApplicationEntry::JavaScript)
         .or_else(|| python_entry(bundle, option_settings).map(ApplicationEntry::Python))
 }
+
+/// What the start command `command` starts out of `bundle` — and `None` for a
+/// command this emulator embeds no engine for, which starts nothing.
+///
+/// A command states both the engine and what it runs, so the three forms are read
+/// in one order and the first one the deployment answers is the application: the
+/// Python program the interpreter is handed ([`python_program`]), the WSGI
+/// application a Python server command serves ([`python_wsgi_specified`]), and the
+/// JavaScript file a Node.js command runs ([`javascript_program`]).
+fn started_by(bundle: &ApplicationBundle, command: &str) -> Option<ApplicationEntry> {
+    python_program(bundle, command)
+        .map(ApplicationEntry::PythonProgram)
+        .or_else(|| python_wsgi_specified(bundle, command).map(ApplicationEntry::Python))
+        .or_else(|| javascript_program(bundle, command).map(ApplicationEntry::JavaScript))
+}
+
+/// The file names a command runs a Node.js program with, under either name a
+/// platform's own start command spells the runtime.
+const NODEJS_RUNTIMES: &[&str] = &["node", "nodejs"];
+
+/// The JavaScript file `command` runs out of `bundle`, or `None` when it runs
+/// none: the first path the runtime is handed past its own options, which has to
+/// be a file of the deployment the embedded JavaScript engine can run.
+fn javascript_program(bundle: &ApplicationBundle, command: &str) -> Option<String> {
+    let mut tokens = command.split_whitespace();
+    let runtime = tokens.next()?;
+    let runtime = runtime.rsplit('/').next().unwrap_or(runtime);
+    if !NODEJS_RUNTIMES.contains(&runtime) {
+        return None;
+    }
+    let file = tokens.find(|token| !token.starts_with('-'))?;
+    let file = file.trim_start_matches("./");
+    (JAVASCRIPT_SUFFIXES
+        .iter()
+        .any(|suffix| file.ends_with(suffix))
+        && bundle.files.contains_key(file))
+    .then(|| file.to_string())
+}
+
+/// The suffixes of a file the embedded JavaScript engine runs.
+const JAVASCRIPT_SUFFIXES: &[&str] = &[".js", ".mjs", ".cjs"];
 
 /// The `platform_category` of the platforms whose own language this emulator
 /// embeds an engine for, as the published platform catalog states it
@@ -277,6 +342,21 @@ pub struct DeployedApplication {
     /// The environment variables the application reads out of its own process
     /// environment.
     pub environment: Vec<(String, String)>,
+}
+
+/// What serving ONE request produced: the response the client is answered with,
+/// and what the application wrote to its own output while answering it.
+///
+/// Both come out of the same run, so an environment that streams its instance logs
+/// delivers exactly the lines the request that produced them did
+/// ([`super::stream_instance_logs`]).
+#[derive(Debug, Clone, Default)]
+pub struct Served {
+    /// The response the client reads, and `None` for an address the application
+    /// answered nothing at and the bundle carries no file for.
+    pub response: Option<GuestResponse>,
+    /// The lines the application wrote while answering the request, in order.
+    pub output: Vec<String>,
 }
 
 impl DeployedApplication {
@@ -306,16 +386,28 @@ impl DeployedApplication {
             .collect()
     }
 
-    /// What the application answers `request` with: the response its own request
-    /// handler ends, and otherwise the file of the bundle the request addresses.
+    /// What the application answers `request` with, and what it WROTE while
+    /// answering it: the response its own request handler ends, and otherwise the
+    /// file of the bundle the request addresses.
     ///
-    /// `None` when the application answers nothing at that address and the bundle
-    /// carries no file for it either, which the plane then answers as a path
-    /// nothing is served at.
-    pub async fn serve(&self, request: &GuestRequest) -> Option<GuestResponse> {
+    /// The response is `None` when the application answers nothing at that address
+    /// and the bundle carries no file for it either, which the plane then answers
+    /// as a path nothing is served at. The output is the lines the instance's
+    /// standard-output log file gains from this one request, which is what an
+    /// environment streaming its instance logs delivers for it.
+    pub async fn serve(&self, request: &GuestRequest) -> Served {
+        let mut served = Served::default();
         if let Some(run) = self.run(Some(request)).await {
+            served.output = run
+                .served
+                .split_inclusive('\n')
+                .map(|line| line.strip_suffix('\n').unwrap_or(line))
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect();
             if let Some(response) = run.response {
-                return Some(response);
+                served.response = Some(response);
+                return served;
             }
             if let Some(failure) = run.failure {
                 ::tracing::warn!(
@@ -325,7 +417,8 @@ impl DeployedApplication {
                 );
             }
         }
-        self.served_file(&request.path)
+        served.response = self.served_file(&request.path);
+        served
     }
 
     /// Run the entry point on a blocking thread, handing it `request` when there
@@ -341,6 +434,7 @@ impl DeployedApplication {
         match self.entry.as_ref()? {
             ApplicationEntry::JavaScript(file) => self.run_javascript(file, request).await,
             ApplicationEntry::Python(entry) => self.run_python(entry, request).await,
+            ApplicationEntry::PythonProgram(program) => self.run_program(program, request).await,
         }
     }
 
@@ -408,48 +502,31 @@ impl DeployedApplication {
         let entry = entry.clone();
         let environment = self.environment.clone();
         let request = request.cloned();
-        let permit = ::tokio::time::timeout(RUN_PERMIT_WAIT, application_runs().acquire()).await;
-        let permit = match permit {
-            Ok(Ok(permit)) => permit,
-            _ => {
-                ::tracing::warn!(
-                    "the deployed application was not run: every run slot this emulator holds \
-                     was taken",
-                );
-                return None;
-            }
-        };
-        let (sender, receiver) = ::tokio::sync::oneshot::channel();
-        let spawned = ::std::thread::Builder::new()
-            .name("eb-python-application".to_string())
-            .stack_size(PYTHON_APPLICATION_STACK_BYTES)
-            .spawn(move || {
-                // Held for as long as the run lasts, whoever is still waiting for
-                // it.
-                let _permit = permit;
-                let run = run_python_application(&entry, &modules, &environment, request.as_ref());
-                let _ = sender.send(run);
-            });
-        if let Err(error) = spawned {
-            ::tracing::warn!(
-                detail = %error,
-                "the thread the deployed application runs on could not be started",
-            );
-            return None;
-        }
-        match ::tokio::time::timeout(PYTHON_APPLICATION_HOST_WAIT, receiver).await {
-            Ok(Ok(run)) => Some(run),
-            // The run has still not answered a grace period past the spans the
-            // engine itself allows, which it has by then been stopped on: it is
-            // given up on and reported as an application that produced nothing.
-            _ => {
-                ::tracing::warn!(
-                    "the deployed application's own run did not answer inside the spans this \
-                     emulator allows it",
-                );
-                None
-            }
-        }
+        run_on_interpreter(move || {
+            run_python_application(&entry, &modules, &environment, request.as_ref())
+        })
+        .await
+    }
+
+    /// [`Self::run`] for a deployment the platform starts as a PROGRAM: the same
+    /// interpreter, the same bounds and the same thread of its own
+    /// ([`Self::run_python`]) — what differs is that the program starts a server
+    /// of its own and the request is handed to THAT server
+    /// ([`super::python_program`]).
+    async fn run_program(
+        &self,
+        program: &PythonProgram,
+        request: Option<&GuestRequest>,
+    ) -> Option<GuestRun> {
+        let source = self.bundle.source(&program.file)?.to_string();
+        let modules = python_modules(&self.bundle);
+        let program = program.clone();
+        let environment = self.environment.clone();
+        let request = request.cloned();
+        run_on_interpreter(move || {
+            run_python_program(&program, &source, &modules, &environment, request.as_ref())
+        })
+        .await
     }
 
     /// The file of the bundle a request path addresses: the path with its leading
@@ -468,6 +545,64 @@ impl DeployedApplication {
             )],
             body: body.clone(),
         })
+    }
+}
+
+/// Perform `run` on a thread of its OWN, with a stack of its own
+/// ([`PYTHON_APPLICATION_STACK_BYTES`]): the Python interpreter is synchronous and
+/// its stop lands at the next traced event, so the task waits for the run only as
+/// long as the engine's own spans allow ([`PYTHON_APPLICATION_HOST_WAIT`]).
+///
+/// One of [`MAX_CONCURRENT_RUNS`] slots is held for the run, by the THREAD rather
+/// than by the waiting task, so what the engines hold at once is bounded even
+/// where a request stopped waiting for its run.
+///
+/// `None` for a run this emulator did not perform at all — one it had no slot or
+/// no thread for, and one that had still not answered a grace period past the
+/// spans the engine allows it.
+async fn run_on_interpreter<R>(run: R) -> Option<GuestRun>
+where
+    R: FnOnce() -> GuestRun + Send + 'static,
+{
+    let permit = ::tokio::time::timeout(RUN_PERMIT_WAIT, application_runs().acquire()).await;
+    let permit = match permit {
+        Ok(Ok(permit)) => permit,
+        _ => {
+            ::tracing::warn!(
+                "the deployed application was not run: every run slot this emulator holds \
+                 was taken",
+            );
+            return None;
+        }
+    };
+    let (sender, receiver) = ::tokio::sync::oneshot::channel();
+    let spawned = ::std::thread::Builder::new()
+        .name("eb-python-application".to_string())
+        .stack_size(PYTHON_APPLICATION_STACK_BYTES)
+        .spawn(move || {
+            // Held for as long as the run lasts, whoever is still waiting for it.
+            let _permit = permit;
+            let _ = sender.send(run());
+        });
+    if let Err(error) = spawned {
+        ::tracing::warn!(
+            detail = %error,
+            "the thread the deployed application runs on could not be started",
+        );
+        return None;
+    }
+    match ::tokio::time::timeout(PYTHON_APPLICATION_HOST_WAIT, receiver).await {
+        Ok(Ok(run)) => Some(run),
+        // The run has still not answered a grace period past the spans the engine
+        // itself allows, which it has by then been stopped on: it is given up on
+        // and reported as an application that produced nothing.
+        _ => {
+            ::tracing::warn!(
+                "the deployed application's own run did not answer inside the spans this \
+                 emulator allows it",
+            );
+            None
+        }
     }
 }
 

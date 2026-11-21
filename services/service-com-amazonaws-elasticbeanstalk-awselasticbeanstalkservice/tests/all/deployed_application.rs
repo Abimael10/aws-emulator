@@ -971,7 +971,10 @@ fn streaming_rows() -> Vec<StreamingRow> {
 /// The `SolutionStackName` of a platform version in `category`, taken from the
 /// service's OWN published catalogue so a row cannot name a platform this
 /// emulator does not offer.
-fn solution_stack_of(category: &str) -> String {
+///
+/// `pub(crate)` so the other suites of this one binary read the same catalogue
+/// rather than spelling a platform name of their own.
+pub(crate) fn solution_stack_of(category: &str) -> String {
     eb::state::SOLUTION_STACKS
         .iter()
         .find(|stack| stack.platform_category == category)
@@ -984,8 +987,9 @@ fn solution_stack_of(category: &str) -> String {
 ///
 /// The emulator under test has that service mounted beside Elastic Beanstalk on
 /// one engine ([`Emulator::with_object_storage_and_logs`]), so what these suites
-/// read is the store the delivery really wrote into.
-async fn logs(emulator: &Emulator, case: &str, operation: &str, body: serde_json::Value) -> serde_json::Value {
+/// read is the store the delivery really wrote into. `pub(crate)` so the other
+/// suites of this one binary read the delivered logs the same way.
+pub(crate) async fn logs(emulator: &Emulator, case: &str, operation: &str, body: serde_json::Value) -> serde_json::Value {
     let authorization = format!(
         "AWS4-HMAC-SHA256 Credential={ACCOUNT_KEY_ID}/20261021/{TEST_REGION}/logs/aws4_request, \
          SignedHeaders=host, Signature=0123456789abcdef"

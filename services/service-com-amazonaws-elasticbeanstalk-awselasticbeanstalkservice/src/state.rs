@@ -69,7 +69,9 @@ pub mod managed_action_schedule;
 pub mod object_storage;
 pub mod platform_build;
 pub mod platform_catalog;
+pub mod procfile;
 pub mod python_application;
+pub mod python_program;
 /// Declared but not glob-re-exported: this module adds only methods to the
 /// store (an inherent `impl`), which every caller already reaches through the
 /// store itself, so there is no name to re-export.
@@ -94,7 +96,9 @@ pub use managed_action_schedule::*;
 pub use object_storage::*;
 pub use platform_build::*;
 pub use platform_catalog::*;
+pub use procfile::*;
 pub use python_application::*;
+pub use python_program::*;
 pub use version_processing::*;
 
 /// This service's ARN namespace, from the model's `aws.api#service` trait
