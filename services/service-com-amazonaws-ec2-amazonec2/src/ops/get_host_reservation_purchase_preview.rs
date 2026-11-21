@@ -87,26 +87,26 @@ use crate::state::{
     require_service_state, unresolvable_host_ids_message,
 };
 
-/// The code THIS operation is recorded answering a value outside the Dedicated Host id form:
+/// The code THIS operation is recorded answering a host id EC2 never issued to the account:
 /// `InvalidHostId.Malformed`.
 ///
 /// A spelling of its own beside [`crate::state::INVALID_HOST_ID_MALFORMED`]'s
 /// `InvalidHostID.Malformed`, named here rather than written at the call site because which of
 /// the two an operation answers is a fact OF that operation: the Dedicated Host operations
-/// themselves answer the crate constant, while this preview's recorded refusal of the all-zero
-/// placeholder `h-0…0` carries this one, in the set sentence
-/// ([`unresolvable_host_ids_message`]). The same per-operation split
+/// themselves answer the crate constant, while this preview's recorded refusals carry this
+/// one, in the set sentence ([`unresolvable_host_ids_message`]). The same per-operation split
 /// `crate::ops::purchase_host_reservation` records for its own not-found half.
 const INVALID_HOST_ID_MALFORMED_IN_PREVIEW: &str = "InvalidHostId.Malformed";
 
-/// HTTP 400 [`INVALID_HOST_ID_MALFORMED_IN_PREVIEW`]: the request named a value outside the
-/// Dedicated Host id form, so there is no host id to look up and nothing to price a
-/// reservation for.
+/// HTTP 400 [`INVALID_HOST_ID_MALFORMED_IN_PREVIEW`]: the request named a value this account
+/// was never issued as a Dedicated Host id, so validation has nothing to price a reservation
+/// for.
 ///
-/// The FORM half of an id this preview cannot resolve, which is a different answer from the
-/// existence half ([`hosts_not_found`]): a value EC2 could never have issued — one outside the
-/// published digit counts or alphabet, and the all-zero placeholder no host can hold
-/// ([`host_id_is_well_formed`]) — is refused for its shape, and that is all this refusal says.
+/// The VALIDATION half of an id this preview cannot accept, which is a different answer from
+/// the existence half ([`hosts_not_found`]): a value EC2 could never have issued — one outside
+/// the published digit counts or alphabet ([`host_id_is_well_formed`]) — and a value in the
+/// printed form that this account was never handed are both request defects, and that is all
+/// this refusal says.
 ///
 /// The preview prices a reservation for the whole `HostIdSet`, so the sentence names that SET,
 /// through the crate's one sentence for a set of ids it could not resolve
@@ -120,17 +120,15 @@ fn host_ids_malformed(host_id_set: &[String]) -> GetHostReservationPurchasePrevi
     )
 }
 
-/// `InvalidHostID.NotFound` (HTTP 400): every id the request named is a well-formed Dedicated
-/// Host id, and at least one of them names no host this account holds — one it never held, or
-/// one it has given back, whose id "can no longer be specified in another request"
-/// (`ReleaseHosts`).
+/// `InvalidHostID.NotFound` (HTTP 400): every id the request named is one this account WAS
+/// issued, and at least one of them names no host it still holds — a host it has given back,
+/// whose id "can no longer be specified in another request" (`ReleaseHosts`).
 ///
-/// The EXISTENCE half, reached only once the form check above has passed: a well-formed id EC2
-/// could have issued is resolved against the account's hosts, and an id that resolves to
-/// nothing is a host that is GONE rather than an input a caller mistyped — which is what this
-/// operation's recorded refusal of a released host answers, under the code EC2 publishes for
-/// it ([`INVALID_HOST_ID_NOT_FOUND`]). The sentence is the SET's, like the form half's, because
-/// the preview prices the whole `HostIdSet`.
+/// The EXISTENCE half, reached only once validation above has passed: an id this account was
+/// handed and has released is a host that is GONE rather than an input a caller got wrong —
+/// which is what this operation's recorded refusal of a released host answers, under the code
+/// EC2 publishes for it ([`INVALID_HOST_ID_NOT_FOUND`]). The sentence is the SET's, like the
+/// validation half's, because the preview prices the whole `HostIdSet`.
 fn hosts_not_found(host_id_set: &[String]) -> GetHostReservationPurchasePreviewError {
     Scaffolded::service_error(
         INVALID_HOST_ID_NOT_FOUND,
@@ -229,8 +227,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
         // A value that is not a Dedicated Host id at all names no host in ANY account, so it
-        // is refused for its FORM — before anything is looked up, because there is no id to
-        // look up. An id EC2 could have issued is a different refusal, taken below.
+        // is refused by VALIDATION — before anything is looked up, because there is no id to
+        // look up. The rest of validation needs the account's hosts, so it is taken below.
         if input
             .host_id_set
             .iter()
@@ -243,20 +241,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = require_service_state(&*self.engine)?;
         let store = state.lock();
 
-        // "You must have ACTIVE Dedicated Hosts in your account before you purchase a
-        // reservation": every id here is well formed, so it reaches the EXISTENCE check — a
-        // host the account does not hold, and one it has given back, whose id "can no longer
-        // be specified in another request" (`ReleaseHosts`), is not one a reservation can be
-        // priced for, and each is answered the not-found half rather than the form half, since
-        // the id itself is one EC2 could have issued. Asked BEFORE the offering is read,
-        // because a preview for a host that is not there cannot be priced whatever offering it
-        // names — which is the order this operation's recorded refusal shows.
-        if host_ids.iter().any(|host_id| {
-            store
-                .dedicated_hosts
-                .get(host_id.as_str())
-                .is_none_or(host_is_released)
-        }) {
+        // ONE decision per id, over the record the store holds for it — the two halves of this
+        // operation's contract read off the same lookup, so they cannot disagree about which
+        // ids the account was issued. Taken BEFORE the offering is read, because a preview for
+        // a host that is not there cannot be priced whatever offering it names.
+        //
+        // * NO RECORD AT ALL: the second half of validation. An id in the printed form that
+        //   this account was NEVER ISSUED is still a value EC2's own id validation does not
+        //   accept — there is nothing whose state could be reported — so it is answered the
+        //   same way as a value outside the form, which is what this operation's recorded
+        //   refusal of a made-up `h-` id carries.
+        // * A RECORD THE ACCOUNT GAVE BACK: "you must have ACTIVE Dedicated Hosts in your
+        //   account before you purchase a reservation". A released host — whose id "can no
+        //   longer be specified in another request" (`ReleaseHosts`), while a describe still
+        //   reports the record, which is what keeps this half reachable — is not one a
+        //   reservation can be priced for, and it is answered the not-found half, since the id
+        //   itself is one this account really held.
+        let mut released_host = false;
+        for host_id in &host_ids {
+            match store.dedicated_hosts.get(host_id.as_str()) {
+                None => return Err(host_ids_malformed(&input.host_id_set)),
+                Some(host) => released_host |= host_is_released(host),
+            }
+        }
+        if released_host {
             return Err(hosts_not_found(&input.host_id_set));
         }
 

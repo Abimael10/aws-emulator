@@ -3,13 +3,17 @@
 //! WHICH CHECK refused a Dedicated Host id, over the two operations that price a reservation
 //! for a `HostIdSet` — `GetHostReservationPurchasePreview` and `PurchaseHostReservation`.
 //!
-//! The rule under test: a value outside the id form EC2 issues for a resource is refused by
-//! FORM validation, and carries that resource's malformed code; an id EC2 could have issued
-//! reaches the EXISTENCE check, and an id that resolves to no live resource — one the account
-//! never held, or one it has given back — carries that resource's not-found code. The two say
-//! opposite things to a client ("your input is syntactically wrong" against "that host is
-//! gone"), so which one answers is decided by the id's FORM and never by whether this run
-//! happened to issue it.
+//! The rule under test, for the PREVIEW: a host id this account was never issued — a value
+//! outside the id form EC2 publishes, and a value in that form the account was never handed —
+//! fails the preview's id validation and carries its malformed code; only an id the account
+//! really held and has given back gets past validation to the existence answer, which carries
+//! the published not-found code. The two say opposite things to a client ("that is not a host
+//! id of yours" against "that host is gone"), so which one answers is decided by whether the
+//! account was EVER ISSUED the id and never by the request's spelling alone.
+//!
+//! The purchase beside it is recorded splitting the same two classes at a different place and
+//! spelling both codes differently, so every expectation here is per operation
+//! ([`expected_code`]) and neither operation is the specification for the other.
 //!
 //! Driven over the wire the service speaks (`ec2Query`, through the crate's shared
 //! [`super::ec2_query`] harness), so what is asserted is what a client reads.
@@ -17,20 +21,18 @@
 //! The rows span what the rule generalises over — the id's LENGTH (both published digit
 //! counts, one digit short of each, one digit long), its alphabet (uppercase hex, non-hex),
 //! its prefix (another resource's, none at all), the all-zero placeholder no host can hold,
-//! and, for the well-formed half, HOW the host came to be absent (never allocated, or
-//! allocated and released) — and the same table is driven through both operations, so no row
-//! and no operation is the specification. The two operations' codes are spelled as each was
-//! recorded, which is why the CLASS (the code's `.Malformed` / `.NotFound` half) is what the
-//! shared table asserts, with the preview's full codes pinned beside it.
+//! how many ids the set carries, and, for the ids EC2 could have issued, HOW the host came to
+//! be absent (never allocated, or allocated by this run and released) — so no row is the
+//! specification.
 
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::ec2_query::{call, error_code, indexed};
+use super::ec2_query::{call, error_code, error_message, indexed};
 use super::wire::{Param, param};
 
 /// The Region every call here is signed for.
-const REGION: &str = "us-east-1";
+pub(super) const REGION: &str = "us-east-1";
 
 /// The zone the hosts this suite allocates sit in.
 const ZONE: &str = "us-east-1a";
@@ -42,27 +44,38 @@ const FAMILY: &str = "m5";
 /// A one-year term, in seconds: the term of the offering this suite prices with.
 const ONE_YEAR_SECONDS: i32 = 365 * 24 * 60 * 60;
 
-/// Which check refused an id, as the code says: the half after the code's last `.`.
+/// How an id the request named fails to name a live Dedicated Host of this account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RefusedBy {
-    /// The id's FORM: EC2 could never have issued it, so there was nothing to look up.
-    Form,
-    /// The account's HOSTS: the id is one EC2 could have issued, and it names no live host.
-    Existence,
+pub(super) enum Unresolvable {
+    /// Outside the id form EC2 issues: no account could ever have been handed it.
+    OutsideForm,
+    /// In one of the printed id forms, but a value this account was NEVER ISSUED — no host of
+    /// it has ever carried the id.
+    NeverIssued,
+    /// An id this account really held and has given back, so the host it names is gone.
+    Released,
 }
 
-impl RefusedBy {
-    /// The suffix an EC2 refusal of this class carries on its code.
-    fn code_suffix(self) -> &'static str {
-        match self {
-            Self::Form => "Malformed",
-            Self::Existence => "NotFound",
-        }
+/// The full code `action` answers for an id that is unresolvable in way `kind`, as each
+/// operation's recorded refusals spell it.
+///
+/// The preview answers its own `InvalidHostId.Malformed` for every id the account was never
+/// issued, whatever its spelling, and the code EC2 publishes for an absent host
+/// ([`ec2::state::INVALID_HOST_ID_NOT_FOUND`]) for a host the account released; the purchase is
+/// recorded answering `InvalidHostID.Malformed` for a value outside the id form and
+/// `InvalidHostId.NotFound` for an id EC2 could have issued.
+fn expected_code(action: &str, kind: Unresolvable) -> &'static str {
+    const PREVIEW: &str = "GetHostReservationPurchasePreview";
+    match (action, kind) {
+        (PREVIEW, Unresolvable::Released) => ec2::state::INVALID_HOST_ID_NOT_FOUND,
+        (PREVIEW, _) => "InvalidHostId.Malformed",
+        (_, Unresolvable::OutsideForm) => ec2::state::INVALID_HOST_ID_MALFORMED,
+        (_, _) => "InvalidHostId.NotFound",
     }
 }
 
 /// Allocate `quantity` Dedicated Hosts of [`FAMILY`], answering their ids.
-async fn allocate(router: &MultiServiceRouter, quantity: usize) -> Vec<String> {
+pub(super) async fn allocate(router: &MultiServiceRouter, quantity: usize) -> Vec<String> {
     let params = vec![
         param("AvailabilityZone", ZONE),
         param("InstanceFamily", FAMILY),
@@ -83,7 +96,7 @@ async fn allocate(router: &MultiServiceRouter, quantity: usize) -> Vec<String> {
 }
 
 /// Give `host_id` back to EC2, so its id names no live host of the account any more.
-async fn release(router: &MultiServiceRouter, host_id: &str) {
+pub(super) async fn release(router: &MultiServiceRouter, host_id: &str) {
     let (status, body) = call(router, REGION, "ReleaseHosts", &indexed("HostId", &[host_id])).await;
     assert_eq!(
         status, 200,
@@ -93,7 +106,7 @@ async fn release(router: &MultiServiceRouter, host_id: &str) {
 
 /// The id of a published offering for [`FAMILY`] — read out of the catalogue the describe
 /// publishes, so this suite names no offering id of its own.
-async fn published_offering(router: &MultiServiceRouter) -> String {
+pub(super) async fn published_offering(router: &MultiServiceRouter) -> String {
     let mut params = vec![
         param("MinDuration", &ONE_YEAR_SECONDS.to_string()),
         param("MaxDuration", &ONE_YEAR_SECONDS.to_string()),
@@ -115,7 +128,7 @@ async fn published_offering(router: &MultiServiceRouter) -> String {
 
 /// One call of `action` naming `host_ids` and `offering_id` — the two members both the preview
 /// and the purchase take the `HostIdSet` and the offering through.
-async fn priced(
+pub(super) async fn priced(
     router: &MultiServiceRouter,
     action: &str,
     host_ids: &[&str],
@@ -126,43 +139,55 @@ async fn priced(
     call(router, REGION, action, &params).await
 }
 
-/// The id cases the rule generalises over, as `(case, ids, refused by)`.
+/// The sentence EC2 refuses a SET of Dedicated Host ids it cannot resolve with, over the ids
+/// the REQUEST carried — the one wording both halves of the preview's refusal use.
+pub(super) fn not_valid_sentence(host_ids: &[&str]) -> String {
+    let quoted: Vec<String> = host_ids.iter().map(|id| format!("'{id}'")).collect();
+    format!(
+        "The specified Dedicated host IDs [{ids}] are not valid.",
+        ids = quoted.join(", ")
+    )
+}
+
+/// The id cases the rule generalises over, as `(case, ids, how it is unresolvable)`.
 ///
 /// `held` is a host the account holds and `released` one it has given back, so a row can put
 /// an unresolvable id beside a resolvable one.
-fn rows<'a>(held: &'a str, released: &'a str) -> Vec<(&'static str, Vec<&'a str>, RefusedBy)> {
+fn rows<'a>(held: &'a str, released: &'a str) -> Vec<(&'static str, Vec<&'a str>, Unresolvable)> {
     vec![
-        // Well formed: `h-` and either published digit count, all lowercase hex — ids EC2
-        // could have issued, so each reaches the existence check.
+        // In a published form, so EC2 could have issued them — but this account never was:
+        // nothing of it has ever carried these ids.
         (
-            "the long id form, nothing holds",
+            "the long id form, never issued",
             vec!["h-0123456789abcdef0"],
-            RefusedBy::Existence,
+            Unresolvable::NeverIssued,
         ),
         (
-            "the short id form, nothing holds",
+            "the short id form, never issued",
             vec!["h-89abcdef"],
-            RefusedBy::Existence,
+            Unresolvable::NeverIssued,
         ),
         (
             "every digit at its maximum",
             vec!["h-fffffffffffffffff"],
-            RefusedBy::Existence,
+            Unresolvable::NeverIssued,
         ),
+        (
+            "a held host beside one never issued",
+            vec![held, "h-0fedcba987654321f"],
+            Unresolvable::NeverIssued,
+        ),
+        // Ids this account really held and gave back: the host is gone rather than the id
+        // being one of someone else's.
         (
             "a host the account released",
             vec![released],
-            RefusedBy::Existence,
+            Unresolvable::Released,
         ),
         (
             "a released host beside a held one",
             vec![held, released],
-            RefusedBy::Existence,
-        ),
-        (
-            "a held host beside one nothing holds",
-            vec![held, "h-0fedcba987654321f"],
-            RefusedBy::Existence,
+            Unresolvable::Released,
         ),
         // Outside the form: no digit count EC2 publishes, an alphabet it does not issue, no
         // host prefix at all, or the all-zero placeholder the mint counting from one can never
@@ -170,63 +195,70 @@ fn rows<'a>(held: &'a str, released: &'a str) -> Vec<(&'static str, Vec<&'a str>
         (
             "a digit short of the short form",
             vec!["h-1234567"],
-            RefusedBy::Form,
+            Unresolvable::OutsideForm,
         ),
         (
             "a digit past the short form",
             vec!["h-123456789"],
-            RefusedBy::Form,
+            Unresolvable::OutsideForm,
         ),
         (
             "a digit short of the long form",
             vec!["h-0123456789abcdef"],
-            RefusedBy::Form,
+            Unresolvable::OutsideForm,
         ),
         (
             "a digit past the long form",
             vec!["h-0123456789abcdef01"],
-            RefusedBy::Form,
+            Unresolvable::OutsideForm,
         ),
         (
             "uppercase hexadecimal digits",
             vec!["h-0123456789ABCDEF0"],
-            RefusedBy::Form,
+            Unresolvable::OutsideForm,
         ),
         (
             "digits outside hexadecimal",
             vec!["h-0123456789abcdefg"],
-            RefusedBy::Form,
+            Unresolvable::OutsideForm,
         ),
         (
             "another resource's prefix",
             vec!["i-0123456789abcdef0"],
-            RefusedBy::Form,
+            Unresolvable::OutsideForm,
         ),
-        ("no prefix at all", vec!["0123456789abcdef0"], RefusedBy::Form),
+        (
+            "no prefix at all",
+            vec!["0123456789abcdef0"],
+            Unresolvable::OutsideForm,
+        ),
         (
             "the all-zero placeholder",
             vec!["h-00000000000000000"],
-            RefusedBy::Form,
+            Unresolvable::OutsideForm,
         ),
         (
             "the all-zero placeholder, short form",
             vec!["h-00000000"],
-            RefusedBy::Form,
+            Unresolvable::OutsideForm,
         ),
-        ("not an id at all", vec!["not-a-host"], RefusedBy::Form),
+        (
+            "not an id at all",
+            vec!["not-a-host"],
+            Unresolvable::OutsideForm,
+        ),
         (
             "a malformed id beside a held host",
             vec![held, "not-a-host"],
-            RefusedBy::Form,
+            Unresolvable::OutsideForm,
         ),
     ]
 }
 
-/// The form check and the existence check answer DIFFERENT classes of code, over every way an
-/// id can fail to name a live host and over both operations that price a reservation for a set
-/// of hosts.
+/// Validation and the existence check answer DIFFERENT codes, over every way an id can fail to
+/// name a live host and over both operations that price a reservation for a set of hosts.
 #[tokio::test]
-async fn the_form_check_and_the_existence_check_answer_different_codes() {
+async fn validation_and_the_existence_check_answer_different_codes() {
     let (router, _engine) = super::ec2_query::emulator();
     let held = allocate(&router, 1).await.remove(0);
     let released = allocate(&router, 1).await.remove(0);
@@ -234,20 +266,17 @@ async fn the_form_check_and_the_existence_check_answer_different_codes() {
     let offering_id = published_offering(&router).await;
 
     for action in ["GetHostReservationPurchasePreview", "PurchaseHostReservation"] {
-        for (case, host_ids, refused_by) in rows(&held, &released) {
+        for (case, host_ids, kind) in rows(&held, &released) {
             let (status, body) = priced(&router, action, &host_ids, &offering_id).await;
             assert_eq!(
                 status, 400,
                 "{action} case {case:?}: expected HTTP 400, got {status} with body {body}"
             );
             let code = error_code(&body);
-            let class = code.rsplit('.').next().unwrap_or_default().to_string();
+            let expected = expected_code(action, kind);
             assert_eq!(
-                class,
-                refused_by.code_suffix(),
-                "{action} case {case:?}: expected a {refused_by:?} refusal \
-                 (code ending in {:?}), got {code:?} in {body}",
-                refused_by.code_suffix()
+                code, expected,
+                "{action} case {case:?} ({kind:?}): expected {expected:?}, got {code:?} in {body}"
             );
             // Whichever check refused it, the code names the Dedicated Host id as the thing
             // it could not accept, so a client can tell this refusal from one about the
@@ -260,40 +289,41 @@ async fn the_form_check_and_the_existence_check_answer_different_codes() {
     }
 }
 
-/// The preview's own codes, in full: the spellings its recorded refusals carry for the two
-/// halves — `InvalidHostId.Malformed` for a value outside the id form, and the code EC2
-/// publishes for an absent host for a well-formed id that names none — which is what a client
-/// branches on.
+/// The preview's refusal names the SET the request asked a price for, in both its halves: the
+/// preview prices the whole `HostIdSet`, so it is that set that is reported not valid, in the
+/// order and the spelling the request carried.
 #[tokio::test]
-async fn the_preview_answers_its_recorded_host_id_codes() {
+async fn the_preview_names_the_requested_host_id_set() {
     let (router, _engine) = super::ec2_query::emulator();
     let held = allocate(&router, 1).await.remove(0);
     let released = allocate(&router, 1).await.remove(0);
     release(&router, &released).await;
     let offering_id = published_offering(&router).await;
 
-    for (case, host_ids, refused_by) in rows(&held, &released) {
-        let expected = match refused_by {
-            RefusedBy::Form => "InvalidHostId.Malformed",
-            RefusedBy::Existence => ec2::state::INVALID_HOST_ID_NOT_FOUND,
-        };
-        let (status, body) =
-            priced(&router, "GetHostReservationPurchasePreview", &host_ids, &offering_id).await;
+    for (case, host_ids, _kind) in rows(&held, &released) {
+        let (status, body) = priced(
+            &router,
+            "GetHostReservationPurchasePreview",
+            &host_ids,
+            &offering_id,
+        )
+        .await;
         assert_eq!(
             status, 400,
             "case {case:?}: expected HTTP 400, got {status} with body {body}"
         );
+        let expected = not_valid_sentence(&host_ids);
         assert_eq!(
-            error_code(&body),
+            error_message(&body),
             expected,
-            "case {case:?}: expected {expected}, got {:?} in {body}",
-            error_code(&body)
+            "case {case:?}: expected {expected:?}, got {:?} in {body}",
+            error_message(&body)
         );
     }
 }
 
-/// An id the account DOES hold is not refused at all: the existence check is a check and not a
-/// blanket refusal, so a preview naming only held hosts is served.
+/// An id the account DOES hold is not refused at all: validation is a check and not a blanket
+/// refusal, so a preview naming only held hosts is served.
 #[tokio::test]
 async fn a_held_host_is_still_priced() {
     let (router, _engine) = super::ec2_query::emulator();
@@ -309,8 +339,13 @@ async fn a_held_host_is_still_priced() {
     ];
 
     for (case, host_ids) in rows {
-        let (status, body) =
-            priced(&router, "GetHostReservationPurchasePreview", &host_ids, &offering_id).await;
+        let (status, body) = priced(
+            &router,
+            "GetHostReservationPurchasePreview",
+            &host_ids,
+            &offering_id,
+        )
+        .await;
         assert_eq!(
             status, 200,
             "case {case:?}: expected the preview to be served, got {status} with body {body}"
