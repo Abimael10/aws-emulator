@@ -1473,6 +1473,11 @@ pub use service_managed::{
 /// miss for it.
 mod resource_not_found;
 
+/// How a refusal names a resource whose identity a create asked for and the store
+/// already holds. It lives beside the store because the identity is the store's, so every
+/// operation that mints that resource reports the same conflict for it.
+mod resource_conflict;
+
 /// The rules a domain create is admitted under, and the text each refusal carries. It
 /// lives beside the store because both rules are facts about the ACCOUNT's domain
 /// rather than about one request.
@@ -1493,7 +1498,12 @@ pub use resource_not_found::{
     DOMAIN_NOT_FOUND_MESSAGE, SPACE_NOT_FOUND_MESSAGE, VIEW_NOT_FOUND_RESOURCE,
 };
 
-pub use view_definition::{view_definition_rejection, INVALID_VIEW_DEFINITION};
+pub use resource_conflict::view_already_exists_message;
+
+pub use view_definition::{
+    view_definition_rejection, INVALID_VIEW_DEFINITION, VIEW_DEFINITION_MUST_BE_A_SELECT_QUERY,
+    VIEW_DEFINITION_MUST_BE_ONE_STATEMENT,
+};
 
 pub use principal_search::{
     identity_center_principals, is_identity_center_domain, principal_matches,

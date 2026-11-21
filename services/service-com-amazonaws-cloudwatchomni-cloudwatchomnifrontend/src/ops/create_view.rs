@@ -191,7 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(existing) = store.views.get(&input.name) {
             audit(ctx, &input.name, "refused_duplicate_name");
             return Err(CreateViewErrorModeled::ConflictException(ConflictException {
-                message: format!("A view named '{}' already exists.", input.name),
+                message: crate::state::view_already_exists_message(&input.name),
                 conflict_type: Some("ALREADY_EXISTS".to_string()),
                 resource_id: Some(existing.name.clone()),
                 resource_type: Some(crate::state::VIEW_RESOURCE_TYPE.to_string()),

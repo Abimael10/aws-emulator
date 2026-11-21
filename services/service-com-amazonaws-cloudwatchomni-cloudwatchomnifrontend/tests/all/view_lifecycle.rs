@@ -11,14 +11,15 @@
 //!
 //! * a view IS the SQL query it is defined by, so `CreateView` admits a `definition` a
 //!   SQL parser reads as ONE query — whatever form that query takes — and refuses one it
-//!   does not with `ValidationException` (400) carrying the parser's own diagnosis of the
-//!   submitted text, persisting nothing for the refusal (the diagnosis itself is
-//!   asserted row by row in `view_definition_diagnosis`);
+//!   does not with `ValidationException` (400) carrying what the definition rule says
+//!   about it, persisting nothing for the refusal (the message each class of defect earns
+//!   is asserted row by row in `view_definition_diagnosis`);
 //! * a created view is persisted and `GetView` answers from that same store, reporting
 //!   the definition, the description, the `USER` type, the ARN and the timestamps the
 //!   create reported;
 //! * a view's name is its identity within the account and region, so a second view under
-//!   a live name is a `ConflictException` (409) and leaves the first one as it was;
+//!   a live name is a `ConflictException` (409) stating that a view already exists under
+//!   the name the request carried, and leaves the first one as it was;
 //! * an unknown name resolves to nothing: `ResourceNotFoundException` (404);
 //! * `ListViews` reports the views the store holds, in creation order, as summaries
 //!   without their definitions, restricted to the ownership category the request names
@@ -42,7 +43,7 @@ use smithy_server_runtime::{
 
 use service_com_amazonaws_cloudwatchomni_cloudwatchomnifrontend as omni;
 
-use omni::ops::create_view::{CreateView, CreateViewError};
+use omni::ops::create_view::{CreateView, CreateViewError, CreateViewErrorModeled};
 use omni::ops::delete_view::{DeleteView, DeleteViewError};
 use omni::ops::get_view::{GetView, GetViewError};
 use omni::ops::list_views::{ListViews, ListViewsError};
@@ -51,9 +52,13 @@ use omni::ops::types::{
     GetViewOutput, ListViewsInput, ListViewsOutput, CREATE_VIEW_INPUT_SCHEMA,
     GET_VIEW_INPUT_SCHEMA, LIST_VIEWS_INPUT_SCHEMA, VIEW_TYPE_VALUES,
 };
+use omni::scaffolded::Scaffolded;
 use omni::state::{
-    view_definition_rejection, INVALID_VIEW_DEFINITION, VIEW_ARN_RESOURCE_TYPE, VIEW_TYPE_USER,
+    view_definition_rejection, INVALID_VIEW_DEFINITION, VIEW_ARN_RESOURCE_TYPE,
+    VIEW_DEFINITION_MUST_BE_A_SELECT_QUERY, VIEW_DEFINITION_MUST_BE_ONE_STATEMENT, VIEW_TYPE_USER,
 };
+
+use super::validation_message_wording::error_envelope;
 
 /// The region the suite signs for; the handlers record the signed region on each
 /// resource, so every ARN below is expected to carry it.
@@ -389,19 +394,17 @@ async fn a_definition_that_is_not_one_sql_query_is_refused_and_persists_nothing(
     for (index, (case, definition)) in NOT_ONE_QUERY.iter().enumerate() {
         let name = view_name(&format!("refused-{index}"));
         let result = omni.create_view(&create_input(&name, definition)).await;
-        // The refusal carries the parser's own reading of the submitted text under the
-        // fixed prefix, so a caller learns what is wrong with THIS definition from the
-        // message alone.
+        // The refusal carries what the definition rule says about this text, so a caller
+        // is told why its definition was not taken.
         let rendered = format!("{result:?}");
         let reason = view_definition_rejection(definition)
             .unwrap_or_else(|| panic!("case {case:?}: the definition rule must refuse this text"));
         assert!(
-            reason.starts_with(INVALID_VIEW_DEFINITION),
-            "case {case:?}: expected the refusal to open with {INVALID_VIEW_DEFINITION:?}, got {reason:?}"
-        );
-        assert!(
-            reason.len() > INVALID_VIEW_DEFINITION.len(),
-            "case {case:?}: expected the parser's diagnosis after the prefix, got {reason:?}"
+            reason.starts_with(INVALID_VIEW_DEFINITION)
+                || reason == VIEW_DEFINITION_MUST_BE_A_SELECT_QUERY
+                || reason == VIEW_DEFINITION_MUST_BE_ONE_STATEMENT,
+            "case {case:?}: the refusal must be one of the definition rule's three forms, got \
+             {reason:?}"
         );
         assert!(
             rendered.contains(&reason),
@@ -459,6 +462,82 @@ async fn a_views_name_is_its_identity_within_the_account_and_region() {
         "two views must carry two ARNs, got {:?} twice",
         second.arn
     );
+}
+
+/// The `message` of a `CreateView` conflict, with the error code and the modelled status
+/// checked first.
+async fn conflict_message(omni: &Omni, case: &str, input: &CreateViewInput) -> String {
+    match omni.create_view(input).await {
+        Ok(output) => panic!("case {case:?}: expected a ConflictException, got Ok({output:?})"),
+        Err(error) => {
+            assert_eq!(
+                (error.shape_name(), error.http_status()),
+                ("ConflictException", 409),
+                "case {case:?}: expected ConflictException (409), got {error:?}"
+            );
+            match error {
+                Scaffolded::Modeled(CreateViewErrorModeled::ConflictException(conflict)) => {
+                    conflict.message
+                }
+                other => {
+                    panic!("case {case:?}: expected the modelled ConflictException, got {other:?}")
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_taken_view_name_is_refused_with_the_name_it_is_held_under() {
+    let omni = Omni::new();
+    // Rows span the `ViewName` class the model admits (`@length(6..256)`,
+    // `^view\.[a-z0-9][a-z0-9_-]{0,250}$`): the shortest name, one carrying the
+    // punctuation the pattern allows, one whose first character is a digit, and the
+    // longest name — because the conflict states the name the request carried whatever
+    // form it takes.
+    for (case, name) in [
+        ("the shortest name the model admits", view_name("a")),
+        ("a name with punctuation", view_name("errors_by-service")),
+        ("a name starting with a digit", view_name("0-errors")),
+        (
+            "the longest name the model admits",
+            format!("view.{}", "v".repeat(251)),
+        ),
+    ] {
+        omni.create_view(&create_input(&name, "SELECT service FROM logs"))
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: the first view failed: {error:?}"));
+        // The template: the fixed "View already exists: " and the name the request
+        // carried — unquoted, with no trailing period.
+        let expected = format!("View already exists: {name}");
+        for (replay, definition) in [
+            ("the same definition", "SELECT service FROM logs"),
+            ("another definition", "SELECT count(*) FROM spans"),
+        ] {
+            let label = format!("{case}, {replay}");
+            let message = conflict_message(&omni, &label, &create_input(&name, definition)).await;
+            assert_eq!(
+                message, expected,
+                "case {label:?}: expected {expected:?}, got {message:?}"
+            );
+        }
+
+        // The same refusal reaches a real client over the rpcv2Cbor wire.
+        let (status, body) = omni
+            .over_the_wire(
+                "CreateView",
+                CREATE_VIEW_INPUT_SCHEMA,
+                &create_input(&name, "SELECT service FROM logs"),
+            )
+            .await;
+        let (code, message) = error_envelope(case, &body);
+        assert_eq!(
+            (status, code.as_str(), message.as_str()),
+            (409, "ConflictException", expected.as_str()),
+            "case {case:?}: the wire must answer 409 ConflictException with {expected:?}, got \
+             {status} {code:?}: {message:?}"
+        );
+    }
 }
 
 #[tokio::test]

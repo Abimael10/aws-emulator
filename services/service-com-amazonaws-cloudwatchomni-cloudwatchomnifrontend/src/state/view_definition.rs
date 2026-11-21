@@ -10,90 +10,62 @@
 //! by PARSING the definition with a real SQL parser rather than by inspecting its text,
 //! so a query is admitted for being a query rather than for the shape of its source.
 //!
-//! The refusal is the PARSER's own reading of the text, under one fixed prefix: a client
-//! that is told its definition was refused is told what the parser expected, which token
-//! it stopped on and the line and column that token sits at, so the refusal points at
-//! the defect in the submitted text instead of restating the rule. Nothing about the
-//! diagnosis is written here — every variable part of it comes from the parse of the
-//! request's own text.
+//! What the refusal says is decided by the CLASS of the defect, and recorded behavior
+//! words the three classes differently:
+//!
+//! * text no SQL parser can read as a statement at all is told the parser's own reading
+//!   of it under one fixed prefix — what was expected, the token it stopped on and that
+//!   token's line and column — because the defect is in the text itself and nothing but
+//!   the text says where;
+//! * text read as exactly one statement that is not a query is told the RULE it broke, as
+//!   one fixed sentence: the statement is well-formed SQL, so there is nothing to point
+//!   at, and what the caller has to change is the kind of statement it submitted;
+//! * text read as any other number of statements is told the other rule it broke, also as
+//!   one fixed sentence, for the same reason: each statement may be well-formed, and what
+//!   is wrong is how many there are.
+//!
+//! Neither fixed sentence carries a variable part, so a client that matches or surfaces
+//! one of them reads the same text whichever definition earned it.
 
 use ::sqlparser::ast::Statement;
-use ::sqlparser::dialect::{Dialect, GenericDialect};
-use ::sqlparser::parser::{Parser, ParserError};
-use ::sqlparser::tokenizer::Token;
+use ::sqlparser::dialect::GenericDialect;
+use ::sqlparser::parser::Parser;
 
-/// The fixed text every definition refusal opens with; the parser's own rendering of
-/// what is wrong with the definition follows it verbatim.
+/// The fixed text a refusal of text that is not SQL opens with; the parser's own rendering
+/// of what is wrong with the definition follows it verbatim.
 pub const INVALID_VIEW_DEFINITION: &str = "Invalid view definition: ";
+
+/// The whole text a refusal of one statement that is not a query carries: the rule such a
+/// definition broke, stated once.
+pub const VIEW_DEFINITION_MUST_BE_A_SELECT_QUERY: &str = "View definition must be a SELECT query";
+
+/// The whole text a refusal of anything but one statement carries: the rule such a
+/// definition broke, stated once.
+pub const VIEW_DEFINITION_MUST_BE_ONE_STATEMENT: &str =
+    "View definition must contain exactly one SQL statement";
 
 /// Why `definition` is not a view definition, or `None` when it is one.
 ///
 /// The parse is bounded twice over: `ViewDefinition`'s modelled `@length(1..10000)` caps
 /// the text the tokenizer walks, and the parser's own recursion limit ends a deeply
 /// nested expression with an error rather than a deep stack. Nothing here can panic on
-/// caller text: the parser returns its failures, and they are what the caller is told.
+/// caller text: the parser returns its failures, and they are what classes the refusal.
 pub fn view_definition_rejection(definition: &str) -> Option<String> {
-    not_one_query(definition).map(|error| format!("{INVALID_VIEW_DEFINITION}{error}"))
-}
-
-/// The parser's error for text that is not one SQL query, or `None` when it is one.
-fn not_one_query(definition: &str) -> Option<ParserError> {
     let dialect = GenericDialect {};
     let statements = match Parser::parse_sql(&dialect, definition) {
         Ok(statements) => statements,
         // Text no SQL parser can read as statements at all. ITS diagnosis is the
         // refusal: the expectation, the offending token and that token's position are
         // all facts about the submitted text, which is what the caller has to fix.
-        Err(error) => return Some(error),
+        Err(error) => return Some(format!("{INVALID_VIEW_DEFINITION}{error}")),
     };
-    if matches!(statements.as_slice(), [Statement::Query(_)]) {
-        return None;
+    match statements.as_slice() {
+        // One query: the definition IS a view definition.
+        [Statement::Query(_)] => None,
+        // One statement of another kind — a mutation, a definition, a transaction
+        // control. A view is the query it is defined by, so the kind is the defect.
+        [_] => Some(VIEW_DEFINITION_MUST_BE_A_SELECT_QUERY.to_string()),
+        // Any other count: more than one statement, or text that carries none at all.
+        _ => Some(VIEW_DEFINITION_MUST_BE_ONE_STATEMENT.to_string()),
     }
-    Some(not_one_query_error(&dialect, definition, &statements))
-}
-
-/// The parser's error for text that IS SQL but is not one query.
-///
-/// What the statement-level parse read decides what the parser is asked for next, so the
-/// refusal is in every case the parser's own reading of this text — its expectation, the
-/// token it stopped on and that token's line and column — rather than a sentence
-/// composed here.
-fn not_one_query_error(
-    dialect: &GenericDialect,
-    definition: &str,
-    statements: &[Statement],
-) -> ParserError {
-    let mut parser = match Parser::new(dialect).try_with_sql(definition) {
-        Ok(parser) => parser,
-        Err(error) => return error,
-    };
-    let stopped_on = match statements {
-        // Nothing the parser reads as a statement — whitespace, a bare comment. Asked
-        // for a statement, it reports what it expected and where the text ran out.
-        [] => parser.parse_statement().err(),
-        // One statement that is not a query. A view IS the query it is defined by, so
-        // the parser is asked for the query body a definition has to be, and stops on
-        // the keyword that starts the other kind of statement instead.
-        [_] => parser.parse_query_body(dialect.prec_unknown()).err(),
-        // More than one statement. Asked for the first statement and then for the end
-        // of the text, the parser names the token the next statement starts at.
-        _ => {
-            let mut error = parser.parse_statement().err();
-            if error.is_none() {
-                // A statement delimiter is part of the statement before it, so what is
-                // reported is the next statement's own first token.
-                while parser.consume_token(&Token::SemiColon) {}
-                error = parser.expect_token(&Token::EOF).err();
-            }
-            error
-        }
-    };
-    stopped_on.unwrap_or_else(|| {
-        // Unreachable: the statement-level parse read this text as something other than
-        // one query, so the parse above cannot have read it as one.
-        ParserError::ParserError(format!(
-            "Expected: a single SQL query, found: {} statements",
-            statements.len()
-        ))
-    })
 }

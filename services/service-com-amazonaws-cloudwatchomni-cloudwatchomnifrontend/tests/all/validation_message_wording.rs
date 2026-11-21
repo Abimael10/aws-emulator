@@ -38,9 +38,11 @@ use std::sync::Arc;
 use service_com_amazonaws_cloudwatchomni_cloudwatchomnifrontend as omni;
 
 use omni::ops::types::{
-    AccessGrantPrincipal, CreateAccessGrantInput, CreateDomainInput, CreateSpaceInput,
-    EncryptionConfiguration, ListSpacesInput, CREATE_ACCESS_GRANT_INPUT_SCHEMA,
-    CREATE_DOMAIN_INPUT_SCHEMA, CREATE_SPACE_INPUT_SCHEMA, LIST_SPACES_INPUT_SCHEMA,
+    AccessGrantPrincipal, CreateAccessGrantInput, CreateDomainInput,
+    CreateOneTimeDeepLinkCodeInput, CreateSpaceInput, EncryptionConfiguration, ListSpacesInput,
+    CREATE_ACCESS_GRANT_INPUT_SCHEMA, CREATE_DOMAIN_INPUT_SCHEMA,
+    CREATE_ONE_TIME_DEEP_LINK_CODE_INPUT_SCHEMA, CREATE_SPACE_INPUT_SCHEMA,
+    LIST_SPACES_INPUT_SCHEMA,
 };
 
 /// The error code every constraint refusal of this service names, as the model declares it
@@ -149,31 +151,49 @@ async fn dispatch(operation: &str, request_body: bytes::Bytes) -> (u16, bytes::B
 }
 
 /// The `__type` and `message` of an rpcv2Cbor error envelope, decoded as CBOR rather than
-/// scanned as text, so the message asserted on is the WHOLE message.
-fn refusal(case: &str, body: &[u8]) -> (String, String) {
+/// scanned as text, so the message asserted on is the WHOLE message. Shared with the suites
+/// that read a refusal's wording off the wire.
+///
+/// An envelope arrives written either with its member count or indefinitely, terminated by
+/// a break, and a member this suite does not read is skipped whatever it carries — both are
+/// valid CBOR and an encoder picks.
+pub(crate) fn error_envelope(case: &str, body: &[u8]) -> (String, String) {
     let mut decoder = aws_smithy_cbor::Decoder::new(body);
-    let members = decoder
-        .map()
-        .unwrap_or_else(|error| {
-            panic!("case {case:?}: the error envelope is not a CBOR map: {error}")
-        })
-        .unwrap_or_else(|| panic!("case {case:?}: the error envelope is an indefinite-length map"));
+    let declared = decoder.map().unwrap_or_else(|error| {
+        panic!("case {case:?}: the error envelope is not a CBOR map: {error}")
+    });
     let mut code = None;
     let mut message = None;
-    for _ in 0..members {
+    let mut read = 0_u64;
+    while !at_end(&mut decoder, declared, read, case) {
         let key = decoder
             .str()
             .unwrap_or_else(|error| panic!("case {case:?}: an envelope key is not text: {error}"))
             .into_owned();
-        let value = decoder
-            .str()
-            .unwrap_or_else(|error| panic!("case {case:?}: an envelope value is not text: {error}"))
-            .into_owned();
-        match key.as_str() {
-            "__type" => code = Some(value),
-            "message" => message = Some(value),
-            _ => {}
+        let datatype = decoder.datatype().unwrap_or_else(|error| {
+            panic!("case {case:?}: the envelope ends at the value of {key:?}: {error}")
+        });
+        if matches!(
+            datatype,
+            ::aws_smithy_cbor::data::Type::String | ::aws_smithy_cbor::data::Type::StringIndef
+        ) {
+            let value = decoder
+                .str()
+                .unwrap_or_else(|error| {
+                    panic!("case {case:?}: the value of {key:?} does not read: {error}")
+                })
+                .into_owned();
+            match key.as_str() {
+                "__type" => code = Some(value),
+                "message" => message = Some(value),
+                _ => {}
+            }
+        } else {
+            decoder.skip().unwrap_or_else(|error| {
+                panic!("case {case:?}: the value of {key:?} does not read: {error}")
+            });
         }
+        read += 1;
     }
     (
         code.unwrap_or_else(|| panic!("case {case:?}: the envelope names no error type")),
@@ -181,11 +201,30 @@ fn refusal(case: &str, body: &[u8]) -> (String, String) {
     )
 }
 
+/// Whether a map that declared `declared` members (or none, for an indefinite one) ends
+/// here, `read` members in.
+fn at_end(
+    decoder: &mut aws_smithy_cbor::Decoder<'_>,
+    declared: Option<u64>,
+    read: u64,
+    case: &str,
+) -> bool {
+    match declared {
+        Some(members) => read >= members,
+        None => matches!(
+            decoder
+                .datatype()
+                .unwrap_or_else(|error| panic!("case {case:?}: the envelope ends mid-member: {error}")),
+            ::aws_smithy_cbor::data::Type::Break
+        ),
+    }
+}
+
 /// Require that `operation` refuses `request_body` with the modelled error, and return the
 /// message it stated.
 async fn refused(case: &str, operation: &str, request_body: bytes::Bytes) -> String {
     let (status, body) = dispatch(operation, request_body).await;
-    let (code, message) = refusal(case, &body);
+    let (code, message) = error_envelope(case, &body);
     assert_eq!(
         (status, code.as_str()),
         (VALIDATION_STATUS, VALIDATION_EXCEPTION),
@@ -248,6 +287,16 @@ fn list_spaces(max_results: i32) -> ListSpacesInput {
     }
 }
 
+/// A `CreateOneTimeDeepLinkCodeInput` whose only questionable member is the lifetime the
+/// caller asks the code for; the domain it names satisfies `DomainId`'s pattern.
+fn create_one_time_deep_link_code(ttl_seconds: i32) -> CreateOneTimeDeepLinkCodeInput {
+    CreateOneTimeDeepLinkCodeInput {
+        domain_id: DOMAIN_ID.to_string(),
+        ttl_seconds: Some(ttl_seconds),
+        ..Default::default()
+    }
+}
+
 /// One row of the table: which request, and the whole message the refusal must state.
 struct Case {
     /// What the row is about, named in every assertion it makes.
@@ -264,7 +313,7 @@ struct Case {
 async fn a_constraint_refusal_names_the_member_and_the_requirement_only() {
     // The `@length`/`@pattern`/`@range`/`@uniqueItems`/enum facts each row relies on are the
     // model's own, read with
-    // `smithy_query(query="operation", operation="CreateDomain,CreateAccessGrant,CreateSpace,ListSpaces")`
+    // `smithy_query(query="operation", operation="CreateDomain,CreateAccessGrant,CreateSpace,ListSpaces,CreateOneTimeDeepLinkCode")`
     // and the shapes listed on `MODELLED_ENUMS`.
     let cases = vec![
         Case {
@@ -372,6 +421,30 @@ async fn a_constraint_refusal_names_the_member_and_the_requirement_only() {
             sent: String::new(),
             message: "1 validation error detected: Value at 'maxResults' failed to satisfy \
                       constraint: Member must have value less than or equal to 100"
+                .to_string(),
+        },
+        Case {
+            label: "a code lifetime below @range min",
+            operation: "CreateOneTimeDeepLinkCode",
+            request: body(
+                CREATE_ONE_TIME_DEEP_LINK_CODE_INPUT_SCHEMA,
+                &create_one_time_deep_link_code(59),
+            ),
+            sent: "59".to_string(),
+            message: "1 validation error detected: Value at 'ttlSeconds' failed to satisfy \
+                      constraint: Member must have value greater than or equal to 60"
+                .to_string(),
+        },
+        Case {
+            label: "a code lifetime above @range max",
+            operation: "CreateOneTimeDeepLinkCode",
+            request: body(
+                CREATE_ONE_TIME_DEEP_LINK_CODE_INPUT_SCHEMA,
+                &create_one_time_deep_link_code(601),
+            ),
+            sent: "601".to_string(),
+            message: "1 validation error detected: Value at 'ttlSeconds' failed to satisfy \
+                      constraint: Member must have value less than or equal to 600"
                 .to_string(),
         },
         Case {
@@ -493,6 +566,57 @@ async fn a_page_size_is_refused_only_outside_the_published_range() {
         assert_eq!(
             message, expected,
             "case {label:?}: expected {expected:?}, got {message:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_deep_link_lifetime_is_refused_only_outside_the_published_range() {
+    // `CreateOneTimeDeepLinkCode.ttlSeconds` is modelled `@range(min: 60, max: 600)`: both
+    // published bounds satisfy the constraint, and one step past each is refused with the
+    // requirement and the modelled bound, never the lifetime the caller asked for.
+    for ttl_seconds in [60, 600] {
+        let (status, body) = dispatch(
+            "CreateOneTimeDeepLinkCode",
+            body(
+                CREATE_ONE_TIME_DEEP_LINK_CODE_INPUT_SCHEMA,
+                &create_one_time_deep_link_code(ttl_seconds),
+            ),
+        )
+        .await;
+        assert_ne!(
+            status, VALIDATION_STATUS,
+            "case {ttl_seconds}: a lifetime inside the modelled range must not be refused as a \
+             constraint violation, got {status}: {:?}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    for (ttl_seconds, requirement) in [
+        (59, "Member must have value greater than or equal to 60"),
+        (601, "Member must have value less than or equal to 600"),
+    ] {
+        let label = format!("ttlSeconds {ttl_seconds}");
+        let message = refused(
+            &label,
+            "CreateOneTimeDeepLinkCode",
+            body(
+                CREATE_ONE_TIME_DEEP_LINK_CODE_INPUT_SCHEMA,
+                &create_one_time_deep_link_code(ttl_seconds),
+            ),
+        )
+        .await;
+        let expected = format!(
+            "1 validation error detected: Value at 'ttlSeconds' failed to satisfy constraint: \
+             {requirement}"
+        );
+        assert_eq!(
+            message, expected,
+            "case {label:?}: expected {expected:?}, got {message:?}"
+        );
+        assert!(
+            !message.contains(&ttl_seconds.to_string()),
+            "case {label:?}: the message renders the lifetime the caller sent, got {message:?}"
         );
     }
 }
