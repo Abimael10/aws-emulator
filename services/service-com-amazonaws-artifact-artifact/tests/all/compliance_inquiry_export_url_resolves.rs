@@ -36,12 +36,13 @@ const EXPORT_DOCUMENT_PATH_PREFIX: &str = "/v1/compliance-inquiry/download";
 /// serves the document.
 const LOOPBACK_HOST: &str = "127.0.0.1";
 
-/// Long enough that the inquiry's processing span is over. The handlers store the due
-/// instant rather than sleeping, so only the test waits.
-///
-/// `std::thread::sleep` rather than `tokio::time::sleep`: the workspace pins tokio
-/// without its `time` feature.
-const PAST_THE_PROCESSING_SPAN: std::time::Duration = std::time::Duration::from_millis(900);
+/// Wait until one inquiry's processing is over, through the one poll this crate's suites
+/// wait out the transition the clock owes an inquiry with. An export is served only from
+/// an inquiry whose processing is over, so every case that exports waits for that
+/// condition first.
+async fn settled(router: &MultiServiceRouter, case: &str, inquiry_id: &str) {
+    crate::harness::settled_inquiry_status(router, case, inquiry_id).await;
+}
 
 /// What the emulator answered: the status, the two headers a download carries, the raw
 /// bytes and the JSON body when there is one.
@@ -261,7 +262,7 @@ async fn an_announced_export_url_names_the_caller_s_endpoint_and_serves_the_docu
         let label = endpoint.label;
 
         let id = create_inquiry(&router, &endpoint, "Export URL resolves").await;
-        std::thread::sleep(PAST_THE_PROCESSING_SPAN);
+        settled(&router, label, &id).await;
         let announced = export_inquiry(&router, &endpoint, &id).await;
 
         let expected_prefix =
@@ -373,9 +374,10 @@ async fn a_host_that_is_not_an_endpoint_is_not_announced() {
             authority: "artifact.eu-west-1.amazonaws.com",
             on_uri: false,
         };
-        // An export reports on the inquiry whatever status the clock has brought it to,
-        // so this case does not wait the processing span out.
+        // An export is served from an inquiry whose processing is over, so the row waits
+        // for that condition before asking for one.
         let id = create_inquiry(&router, &endpoint, "Forged host").await;
+        settled(&router, forged, &id).await;
 
         let body = json!({ "complianceInquiryId": id });
         let exported = send(
@@ -459,6 +461,7 @@ async fn an_unusable_host_leaves_the_uri_authority_to_be_announced() {
             .as_str()
             .unwrap_or_default()
             .to_string();
+        settled(&router, forged, &id).await;
 
         let exported = send(
             &router,

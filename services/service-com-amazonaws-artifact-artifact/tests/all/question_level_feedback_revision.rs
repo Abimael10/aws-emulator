@@ -106,6 +106,9 @@ async fn put_feedback(router: &MultiServiceRouter, body: &Value) -> Answer {
 /// reports it: the document `ExportComplianceInquiry` announces, followed the way a client
 /// follows an announced URL (the harness owns that fetch).
 async fn recorded_feedback(router: &MultiServiceRouter, inquiry_id: &str) -> Vec<Value> {
+    // An export is served from an inquiry whose processing is over, so the control read
+    // waits for that condition first; the record it reads back is the same either way.
+    crate::harness::settled_inquiry_status(router, "the exported inquiry", inquiry_id).await;
     let exported = call(
         router,
         "POST",

@@ -276,6 +276,10 @@ async fn every_inquiry_write_emits_exactly_one_attributable_audit_record() {
     // cannot be disturbed by the feedback rows' refusals.
     let rated = fixture_inquiry(&router, 1).await;
     let exported = fixture_inquiry(&router, 2).await;
+    // The export rows report on an inquiry whose processing is OVER: an export of one that
+    // is still being processed is refused, so the rows below wait for that condition. A
+    // metadata read emits no audit record, so the wait leaves the capture alone.
+    crate::harness::settled_inquiry_status(&router, "the exported fixture", &exported).await;
 
     // A token the create rows replay, and one the feedback rows replay. `IdempotentClientToken`
     // is `^[\w\-]+$`, len 1..128.

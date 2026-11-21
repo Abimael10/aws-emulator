@@ -194,6 +194,9 @@ fn empty_file_body(name: &str) -> Value {
 /// record is observable: the export is rendered from the one inquiry record this service
 /// holds.
 async fn exported_feedback(router: &MultiServiceRouter, inquiry_id: &str) -> Vec<Value> {
+    // The export is served from an inquiry whose processing is OVER, so the control read
+    // waits for that condition first — the record it reads back is the same either way.
+    crate::harness::settled_inquiry_status(router, "the control export", inquiry_id).await;
     let exported = call(
         router,
         "POST",

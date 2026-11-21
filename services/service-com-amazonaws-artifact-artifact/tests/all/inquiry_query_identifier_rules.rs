@@ -68,10 +68,14 @@ async fn create(router: &MultiServiceRouter, body: &Value) -> String {
         "the control create must be accepted, got {} with {:?}",
         created.status, created.body
     );
-    created.body["complianceInquirySummary"]["id"]
+    let id = created.body["complianceInquirySummary"]["id"]
         .as_str()
         .unwrap_or_else(|| panic!("the create carries no inquiry id: {:?}", created.body))
-        .to_string()
+        .to_string();
+    // An export is served from an inquiry whose processing is over, so every inquiry this
+    // suite probes is waited out to that condition rather than exported mid-processing.
+    crate::harness::settled_inquiry_status(router, "the control inquiry", &id).await;
+    id
 }
 
 /// `ExportComplianceInquiry`, naming `query_identifiers` when the case names any.

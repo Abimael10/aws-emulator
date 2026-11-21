@@ -20,11 +20,13 @@
 //! * an inquiry id the store does not hold is refused the way every other inquiry
 //!   operation refuses it — the front door's 401 `UnauthorizedException`, which does not
 //!   confirm the resource's absence;
+//! * an inquiry whose PROCESSING is still underway has nothing finished to publish, so the
+//!   export is refused with the modelled `ValidationException` rather than served, and the
+//!   identical call is served once that inquiry's processing is over;
 //! * an export changes nothing a later reader of the inquiry sees.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -44,12 +46,20 @@ const ENDPOINT: &str = "artifact.eu-west-1.amazonaws.com";
 /// deliberately in both places.
 const EXPORT_DOCUMENT_PATH_PREFIX: &str = "/v1/compliance-inquiry/download";
 
-/// The span after which an inquiry's processing is due to be over, plus slack. The
-/// handlers store the due instant rather than sleeping, so only the test waits.
-///
-/// `std::thread::sleep` rather than `tokio::time::sleep`: the workspace pins tokio
-/// without its `time` feature.
-const PAST_THE_PROCESSING_SPAN: Duration = Duration::from_millis(900);
+/// `InquiryStatus`'s non-terminal value: the status a created inquiry is in while its
+/// processing is still underway, which is what an export is refused against.
+const PROCESSING: &str = "PROCESSING";
+
+/// The sentence the service states when an export is asked of an inquiry whose processing
+/// is not over. Fixed text for this error class, naming the state the resource was in.
+const UNEXPORTABLE_MESSAGE: &str =
+    "Unable to export resource in a `PROCESSING` state. Please wait for processing to complete.";
+
+/// Wait until `inquiry_id`'s processing is over, through the one poll this crate's suites
+/// wait out the transition the clock owes an inquiry with.
+async fn settled(router: &MultiServiceRouter, case: &str, inquiry_id: &str) -> String {
+    crate::harness::settled_inquiry_status(router, case, inquiry_id).await
+}
 
 /// Base64 of an uploaded document's bytes, as restJson1 carries a blob.
 const FILE_CONTENT: &str = "cXVlc3Rpb25uYWlyZQ==";
@@ -72,9 +82,13 @@ fn emulator() -> MultiServiceRouter {
     router
 }
 
-/// What the emulator answered: the HTTP status and the JSON body.
+/// What the emulator answered: the HTTP status, the `x-amzn-errortype` header a restJson1
+/// client resolves an error shape from, and the JSON body.
 struct Answer {
     status: u16,
+    /// The `x-amzn-errortype` header, or the empty string when the answer carries none —
+    /// which is every success.
+    error_type: String,
     body: Value,
 }
 
@@ -110,6 +124,12 @@ async fn send(router: &MultiServiceRouter, request: ::http::Request<Bytes>) -> A
     let uri = request.uri().to_string();
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
+    let error_type = response
+        .headers()
+        .get("x-amzn-errortype")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
     let bytes = response.into_body();
     let body = if bytes.is_empty() {
         Value::Null
@@ -121,7 +141,11 @@ async fn send(router: &MultiServiceRouter, request: ::http::Request<Bytes>) -> A
             )
         })
     };
-    Answer { status, body }
+    Answer {
+        status,
+        error_type,
+        body,
+    }
 }
 
 /// `CreateComplianceInquiry`, signed for `region`.
@@ -315,17 +339,15 @@ struct Case {
     covered: &'static [i32],
     /// The region the case signs both calls for.
     region: &'static str,
-    /// Whether the case waits past the processing span before exporting, so the inquiry
-    /// is terminal rather than `PROCESSING` — an export reports on the inquiry either
-    /// way.
-    after_terminal: bool,
 }
 
 /// The export cases this suite covers. The rows differ along everything the rule
 /// generalises over: the form of the submission (a query versus an uploaded document),
 /// how many tags the inquiry carries, whether the export names `queryIdentifiers` and
 /// which, whether it names `includeCitations` and which value, the region the request is
-/// signed for, and whether the inquiry has reached a terminal status yet.
+/// signed for, and which terminal status the clock brought the inquiry to (an upload
+/// carrying nothing to process settles to `FAILED`, and exports all the same: the
+/// precondition is that processing is OVER, not that it succeeded).
 fn cases() -> Vec<Case> {
     vec![
         Case {
@@ -336,7 +358,6 @@ fn cases() -> Vec<Case> {
             include_citations: None,
             covered: &[1],
             region: REGION,
-            after_terminal: true,
         },
         Case {
             label: "a query, the one identifier it owns, citations on",
@@ -350,7 +371,6 @@ fn cases() -> Vec<Case> {
             include_citations: Some(true),
             covered: &[1],
             region: REGION,
-            after_terminal: true,
         },
         Case {
             label: "a query, that identifier twice, citations off, another region",
@@ -364,17 +384,15 @@ fn cases() -> Vec<Case> {
             include_citations: Some(false),
             covered: &[1],
             region: "ap-southeast-3",
-            after_terminal: true,
         },
         Case {
-            label: "a query, exported inside the processing span",
+            label: "a query, no identifiers, citations on, a third region",
             body: text_body("Backups", "How often are backups taken?", &[("env", "dev")]),
             tags: &[("env", "dev")],
             query_identifiers: None,
             include_citations: Some(true),
             covered: &[1],
             region: "us-east-1",
-            after_terminal: false,
         },
         Case {
             label: "an uploaded document, no sections, no options",
@@ -384,7 +402,6 @@ fn cases() -> Vec<Case> {
             include_citations: None,
             covered: &[1],
             region: REGION,
-            after_terminal: true,
         },
         Case {
             label: "an uploaded document, two sections, an empty identifier list",
@@ -400,7 +417,6 @@ fn cases() -> Vec<Case> {
             // inquiry owns — one per submitted section.
             covered: &[1, 2],
             region: "us-west-2",
-            after_terminal: true,
         },
         Case {
             label: "an uploaded document, three sections, the second of them",
@@ -414,7 +430,6 @@ fn cases() -> Vec<Case> {
             include_citations: Some(true),
             covered: &[2],
             region: REGION,
-            after_terminal: true,
         },
         Case {
             label: "an upload carrying no bytes, so no query to cover",
@@ -424,7 +439,6 @@ fn cases() -> Vec<Case> {
             include_citations: None,
             covered: &[],
             region: REGION,
-            after_terminal: true,
         },
     ]
 }
@@ -444,9 +458,9 @@ async fn an_export_answers_a_url_naming_the_inquiry_it_was_taken_from() {
         );
         let id = created_id(&created);
 
-        if case.after_terminal {
-            std::thread::sleep(PAST_THE_PROCESSING_SPAN);
-        }
+        // An export is served from an inquiry whose processing is OVER, so the row waits
+        // for that condition rather than for a span.
+        settled(&router, label, &id).await;
 
         let body = export_body(&id, case.query_identifiers, case.include_citations);
         let exported = export_in(&router, case.region, &body).await;
@@ -612,7 +626,7 @@ async fn following_a_document_url_is_a_read_that_changes_nothing() {
     )
     .await;
     let id = created_id(&created);
-    std::thread::sleep(PAST_THE_PROCESSING_SPAN);
+    settled(&router, "downloaded twice", &id).await;
 
     let exported = export(&router, &export_body(&id, None, Some(true))).await;
     let url = exported.url().to_string();
@@ -680,7 +694,8 @@ async fn a_document_url_that_names_no_export_of_this_caller_s_is_refused() {
     )
     .await;
     let second_id = created_id(&second);
-    std::thread::sleep(PAST_THE_PROCESSING_SPAN);
+    settled(&router, "the first inquiry", &first_id).await;
+    settled(&router, "the second inquiry", &second_id).await;
 
     let served = export(&router, &export_body(&first_id, None, None)).await;
     let url = served.url().to_string();
@@ -760,7 +775,7 @@ async fn every_export_of_one_inquiry_is_its_own_document() {
         created.status, created.body
     );
     let id = created_id(&created);
-    std::thread::sleep(PAST_THE_PROCESSING_SPAN);
+    settled(&router, "repeat export", &id).await;
 
     // The rows differ along the options, so the invariant holds both for repeats of one
     // request and for exports taken under different options.
@@ -805,7 +820,13 @@ async fn query_identifiers_the_inquiry_does_not_own_are_refused() {
     let file_id = created_id(&file);
     let upload = create(&router, &file_body("Questionnaire", &["Sheet 1"], &[])).await;
     let upload_id = created_id(&upload);
-    std::thread::sleep(PAST_THE_PROCESSING_SPAN);
+    for (label, id) in [
+        ("the text inquiry", &text_id),
+        ("the empty upload", &file_id),
+        ("the sectioned upload", &upload_id),
+    ] {
+        settled(&router, label, id).await;
+    }
 
     // `queryIdentifiers` is a list of `Integer`, which the model bounds in no other way
     // (`smithy_query(query="shape",shape="QueryIdentifiersList")`), so the rows walk the
@@ -884,6 +905,7 @@ async fn an_inquiry_id_the_store_does_not_hold_is_refused_as_unauthorized() {
     )
     .await;
     let known = created_id(&created);
+    settled(&router, "the control inquiry", &known).await;
 
     // Well-formed `InquiryId`s (`^compliance-inquiry-[a-zA-Z0-9]{16}$`) the store does
     // not hold: the gateway authorizes the TARGET, so an id this account holds no inquiry
@@ -931,7 +953,7 @@ async fn an_export_changes_nothing_a_later_reader_of_the_inquiry_sees() {
         let router = emulator();
         let created = create_in(&router, case.region, &case.body).await;
         let id = created_id(&created);
-        std::thread::sleep(PAST_THE_PROCESSING_SPAN);
+        settled(&router, label, &id).await;
 
         let before = get_metadata(&router, &id).await;
         assert_eq!(
@@ -966,6 +988,115 @@ async fn an_export_changes_nothing_a_later_reader_of_the_inquiry_sees() {
              against {:?}",
             after.body["tags"],
             before.body["tags"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_export_of_an_inquiry_still_being_processed_is_refused() {
+    // The same rows the served cases are taken from, so they differ along everything the
+    // rule generalises over — the form of the submission, which `queryIdentifiers` the
+    // export names, whether and how it names `includeCitations`, and the region it is
+    // signed for. What every row shares is the STATE of the resource: each exports an
+    // inquiry the create answered its 202 with, before the clock has taken it off
+    // `PROCESSING`.
+    for case in cases() {
+        let label = case.label;
+        // One emulator per case, so the wait one row does cannot decide what another
+        // observes.
+        let router = emulator();
+        let created = create_in(&router, case.region, &case.body).await;
+        assert_eq!(
+            created.status, 202,
+            "case {label:?}: the create must succeed, got {} with {:?}",
+            created.status, created.body
+        );
+        let id = created_id(&created);
+        // The create answers 202 with the non-terminal status, which is the state the
+        // refusal below is keyed on.
+        assert_eq!(
+            created.body["complianceInquirySummary"]["status"].as_str(),
+            Some(PROCESSING),
+            "case {label:?}: the create must answer the non-terminal status, got {:?}",
+            created.body["complianceInquirySummary"]["status"]
+        );
+
+        let body = export_body(&id, case.query_identifiers, case.include_citations);
+        let refused = export_in(&router, case.region, &body).await;
+        assert_eq!(
+            refused.status, 400,
+            "case {label:?}: an export of an inquiry still being processed must be \
+             refused with HTTP 400, got {} with {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_code(),
+            "ValidationException",
+            "case {label:?}: expected the modelled ValidationException, got {:?}",
+            refused.body
+        );
+        assert_eq!(
+            refused.error_type, "ValidationException",
+            "case {label:?}: a restJson1 client resolves the error shape from \
+             x-amzn-errortype, got {:?}",
+            refused.error_type
+        );
+        assert_eq!(
+            refused.body["message"].as_str(),
+            Some(UNEXPORTABLE_MESSAGE),
+            "case {label:?}: expected the sentence this error class states, got {:?}",
+            refused.body["message"]
+        );
+        // A precondition on the RESOURCE, not a member of the request: the reason is the
+        // enum's catch-all and there is no member for `fieldList` to name.
+        assert_eq!(
+            refused.body["reason"].as_str(),
+            Some("other"),
+            "case {label:?}: expected the state-precondition reason, got {:?}",
+            refused.body["reason"]
+        );
+        assert!(
+            refused.body["fieldList"].is_null(),
+            "case {label:?}: nothing the request carried failed, so the refusal names no \
+             member, got {:?}",
+            refused.body["fieldList"]
+        );
+        assert!(
+            refused.body["documentPresignedUrl"].is_null(),
+            "case {label:?}: a refused export must serve no URL, got {:?}",
+            refused.body["documentPresignedUrl"]
+        );
+
+        // The refusal is the state of the resource rather than a race: the inquiry a
+        // later reader sees is still the one being processed.
+        let read = get_metadata(&router, &id).await;
+        assert_eq!(
+            read.body["complianceInquiryDetail"]["status"].as_str(),
+            Some(PROCESSING),
+            "case {label:?}: the refusal must be explained by the inquiry's own state, \
+             got {:?}",
+            read.body["complianceInquiryDetail"]["status"]
+        );
+
+        // And the IDENTICAL call is served once that inquiry's processing is over, which
+        // is what says the refusal judges the state and not the request.
+        let status = settled(&router, label, &id).await;
+        assert_ne!(
+            status, PROCESSING,
+            "case {label:?}: the inquiry must leave the non-terminal status"
+        );
+        let served = export_in(&router, case.region, &body).await;
+        assert_eq!(
+            served.status, 200,
+            "case {label:?}: the identical export must be served once the inquiry has \
+             settled to {status:?}, got {} with {:?}",
+            served.status, served.body
+        );
+        assert!(
+            served.url().starts_with("https://"),
+            "case {label:?}: the served export must answer a URL a client can follow, \
+             got {:?}",
+            served.url()
         );
     }
 }

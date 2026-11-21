@@ -179,6 +179,9 @@ async fn create_inquiry(router: &MultiServiceRouter, name: &str, query: &str) ->
 
 /// `ExportComplianceInquiry` of one inquiry, answering the URL it announced, taken apart.
 async fn export_inquiry(router: &MultiServiceRouter, inquiry_id: &str) -> Announced {
+    // An export is served from an inquiry whose processing is over, so this waits for that
+    // condition before asking for one.
+    crate::harness::settled_inquiry_status(router, "the exported inquiry", inquiry_id).await;
     let body = json!({ "complianceInquiryId": inquiry_id });
     let answer = call(
         router,

@@ -12,7 +12,11 @@
 //!   that id, rather than a 404 confirming the resource's absence — and the `tags` it
 //!   answers with are read off that one record — the same projection
 //!   `CreateComplianceInquiry` and `GetComplianceInquiryMetadata` return, so no two of
-//!   them can disagree;
+//!   them can disagree. An inquiry whose PROCESSING is still underway is refused with the
+//!   modelled `ValidationException` naming the state it was asked in
+//!   ([`crate::state::unexportable_while_processing`]): the document is rendered from the
+//!   inquiry as it stands, so there is nothing finished to publish until the clock has
+//!   taken that inquiry off its non-terminal status;
 //! * `queryIdentifiers` selects WHICH of the inquiry's queries the export covers, so an
 //!   identifier that names no query of that inquiry is refused with the modelled
 //!   `ValidationException` naming the member and the requirement it failed; naming none
@@ -239,6 +243,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(crate::scaffolded::Scaffolded::FrontDoor(refusal));
             }
         };
+
+        // An export publishes a DOCUMENT rendered from the inquiry as it stands, so it has
+        // a precondition on the inquiry's own lifecycle: while the inquiry is still being
+        // processed there is nothing finished to render, and the call is refused with the
+        // modelled `ValidationException` naming the state it was asked in
+        // ([`crate::state::unexportable_while_processing`]) rather than answering a URL for
+        // a document a later reader of the inquiry would not recognise. Asked BEFORE the
+        // request's own members are, and before anything is minted: the state of the
+        // resource decides whether this call can be served at all.
+        if inquiry.processing_in_progress() {
+            ::tracing::info!(
+                target: "emulator::audit",
+                operation = "ExportComplianceInquiry",
+                akid = %akid,
+                region = %region,
+                compliance_inquiry_id = %input.compliance_inquiry_id,
+                outcome = "refused",
+                reason = "the inquiry's processing is not over",
+                "state-changing operation"
+            );
+            return Err(ExportComplianceInquiryErrorModeled::ValidationException(
+                crate::state::unexportable_while_processing(&inquiry.status),
+            )
+            .into());
+        }
 
         // Read off the one stored record through the one tags projection every inquiry
         // operation answers with ([`crate::state::ComplianceInquiry::reported_tags`]), so

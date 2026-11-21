@@ -478,6 +478,73 @@ pub async fn get_signed(router: &MultiServiceRouter, uri: &str, authorization: &
     send_signed(router, "GET", uri, Bytes::new(), Some(authorization)).await
 }
 
+/// `InquiryStatus`'s non-terminal value — the status `CreateComplianceInquiry` answers its
+/// 202 with, and the one the clock takes an inquiry off once its processing is due to be
+/// over.
+pub const INQUIRY_PROCESSING: &str = "PROCESSING";
+
+/// How long a suite waits for the transition the CLOCK owes an inquiry before giving up.
+///
+/// Generous on purpose: it bounds the wait on a CONDITION, not the span itself
+/// (`crate::state::INQUIRY_PROCESSING_SPAN`), so a loaded or slow host cannot turn the wait
+/// into a failure.
+pub const SETTLE_DEADLINE: ::std::time::Duration = ::std::time::Duration::from_secs(30);
+
+/// How long one turn of the settle poll rests before looking again.
+///
+/// `std::thread::sleep` rather than `tokio::time::sleep`: the workspace pins tokio without
+/// its `time` feature.
+const SETTLE_POLL_INTERVAL: ::std::time::Duration = ::std::time::Duration::from_millis(20);
+
+/// `GetComplianceInquiryMetadata` for one inquiry.
+pub async fn get_compliance_inquiry_metadata(
+    router: &MultiServiceRouter,
+    inquiry_id: &str,
+) -> Answer {
+    get(
+        router,
+        &format!("/v1/compliance-inquiry/getMetadata?complianceInquiryId={inquiry_id}"),
+    )
+    .await
+}
+
+/// Wait until `inquiry_id`'s processing is OVER — until a metadata read reports any
+/// `InquiryStatus` but [`INQUIRY_PROCESSING`] — and answer the status it settled to.
+///
+/// The ONE place this crate's suites wait out the transition the clock owes an inquiry: the
+/// handlers store the due instant rather than sleeping, so a suite that needs a settled
+/// inquiry (an export, for instance, which is refused while one is still being processed)
+/// polls for that CONDITION instead of resting for a fixed span. `case` names the row that
+/// is waiting.
+pub async fn settled_inquiry_status(
+    router: &MultiServiceRouter,
+    case: &str,
+    inquiry_id: &str,
+) -> String {
+    let deadline = ::std::time::Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let answer = get_compliance_inquiry_metadata(router, inquiry_id).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: the metadata read must be served while waiting for the inquiry to \
+             settle, got {} with {:?}",
+            answer.status, answer.body
+        );
+        let status = answer.body["complianceInquiryDetail"]["status"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if status != INQUIRY_PROCESSING {
+            return status;
+        }
+        assert!(
+            ::std::time::Instant::now() < deadline,
+            "case {case:?}: the inquiry must leave {INQUIRY_PROCESSING:?}, got {status:?}"
+        );
+        ::std::thread::sleep(SETTLE_POLL_INTERVAL);
+    }
+}
+
 pub async fn list_reports(router: &MultiServiceRouter, query: &str) -> Answer {
     get(router, &format!("/v1/report/list{query}")).await
 }

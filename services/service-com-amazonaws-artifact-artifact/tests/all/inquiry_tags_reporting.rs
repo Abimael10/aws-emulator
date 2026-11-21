@@ -154,6 +154,9 @@ async fn get_metadata(router: &MultiServiceRouter, inquiry_id: &str) -> Answer {
 
 /// `POST /v1/compliance-inquiry/export` — the third reporter.
 async fn export(router: &MultiServiceRouter, inquiry_id: &str) -> Answer {
+    // An export is served from an inquiry whose processing is over, so this reporter waits
+    // for that condition; the tag set it reports is the same either way.
+    crate::harness::settled_inquiry_status(router, "the reported inquiry", inquiry_id).await;
     call(
         router,
         "POST",

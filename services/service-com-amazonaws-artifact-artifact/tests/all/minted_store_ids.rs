@@ -129,7 +129,13 @@ async fn fixture(store: Store) -> Fixture {
     // between the mints under test. It mints an INQUIRY id, which is another store's
     // counter.
     let inquiry_id = match store {
-        Store::Exports => create_inquiry(&router).await,
+        Store::Exports => {
+            let id = create_inquiry(&router).await;
+            // An export is served from an inquiry whose processing is over, so the fixture
+            // waits for that condition before any mint is taken from it.
+            crate::harness::settled_inquiry_status(&router, "the exported fixture", &id).await;
+            id
+        }
         _ => String::new(),
     };
     Fixture {

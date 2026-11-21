@@ -289,6 +289,9 @@ async fn published(router: &MultiServiceRouter) -> Vec<Published> {
         .as_str()
         .unwrap_or_else(|| panic!("the create carries an inquiry id: {:?}", created.body))
         .to_string();
+    // An export is served from an inquiry whose processing is over, so this waits for that
+    // condition before asking for one.
+    crate::harness::settled_inquiry_status(router, "the exported document", &inquiry_id).await;
     let exported = call(
         router,
         "POST",

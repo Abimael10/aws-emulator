@@ -254,6 +254,10 @@ async fn every_inquiry_operation_serves_an_inquiry_the_account_holds() {
     )
     .await;
 
+    // `ExportComplianceInquiry` is served from an inquiry whose processing is over, so the
+    // walk waits for that condition before asking every operation for an answer.
+    crate::harness::settled_inquiry_status(&router, "the held inquiry", &held).await;
+
     for (operation, answer) in every_inquiry_operation(&router, &held).await {
         assert!(
             (200..300).contains(&answer.status),

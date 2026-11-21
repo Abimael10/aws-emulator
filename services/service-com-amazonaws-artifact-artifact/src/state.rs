@@ -338,6 +338,12 @@ pub const INQUIRY_EXPORT_CONTENT_TYPE: &str = "application/json";
 /// refused — what `fieldList` names the member in.
 pub const REASON_FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
 
+/// `ValidationExceptionReason`'s value for a request refused on the STATE of the resource
+/// it named rather than on a member of its own input — the enum's own catch-all, which is
+/// what a precondition on a resource's lifecycle is stated under: no member of the request
+/// failed, so there is no member for `fieldList` to name.
+pub const REASON_OTHER: &str = "other";
+
 /// How long after the create call an inquiry's processing is due to be over.
 ///
 /// AWS answers `CreateComplianceInquiry` with HTTP 202 and a `PROCESSING` inquiry, so
@@ -1138,11 +1144,12 @@ impl ComplianceInquiry {
     ///   and the inquiry RESTS in `HUMAN_REVIEW` while the review its support mode asked
     ///   for is pending ([`review_type_for`], the one thing that decides the review every
     ///   query of this inquiry carries), rather than being moved on as though a review had
-    ///   happened. Nothing reads an inquiry only once it is terminal: every reader of one
-    ///   (`GetComplianceInquiryMetadata`, `ListComplianceInquiries`,
-    ///   `ListComplianceInquiryQueries`, `ExportComplianceInquiry`,
-    ///   `PutComplianceInquiryFeedback`) reports or records against it in whatever status
-    ///   it is in;
+    ///   happened. Every reader of an inquiry (`GetComplianceInquiryMetadata`,
+    ///   `ListComplianceInquiries`, `ListComplianceInquiryQueries`) and every writer
+    ///   against one (`PutComplianceInquiryFeedback`) reports or records in whatever
+    ///   status it is in; only `ExportComplianceInquiry` has a precondition on it, because
+    ///   a document can be rendered only from an inquiry whose processing is over
+    ///   ([`processing_in_progress`](Self::processing_in_progress));
     /// * the modelled FAILED state is for a submission with NOTHING to process
     ///   ([`InquiryContentRecord::nothing_to_process`]) — it never got as far as a unit of
     ///   work. A submission that DID carry something to process is processed, so it reaches
@@ -1217,6 +1224,22 @@ impl ComplianceInquiry {
     pub fn record_modification(&mut self, now: SystemTime) {
         self.materialise(now);
         self.updated_at = now;
+    }
+
+    /// Whether this inquiry's processing is STILL UNDERWAY — its status is `InquiryStatus`'s
+    /// non-terminal [`INQUIRY_STATUS_PROCESSING`], the status the create answered its 202
+    /// with and the one the clock moves it off ([`materialise`](Self::materialise)).
+    ///
+    /// The precondition `ExportComplianceInquiry` is refused against
+    /// ([`unexportable_while_processing`]): the document an export publishes is rendered
+    /// from the inquiry as it stands, so there is nothing finished to render while the
+    /// inquiry is still being processed. An inquiry whose processing IS over — whatever it
+    /// came to — is exported: the status the document reports is read off this same record.
+    ///
+    /// Asked of the inquiry rather than spelled out at the call site, so the one condition
+    /// the refusal is keyed on and the status every reader reports cannot disagree.
+    pub fn processing_in_progress(&self) -> bool {
+        self.status == INQUIRY_STATUS_PROCESSING
     }
 
     /// Every query identifier this inquiry OWNS, in the ascending order its queries are
@@ -2907,6 +2930,26 @@ pub fn reserved_tag_keys(member: &str) -> ValidationException {
 /// echoing the refused identifiers back: the request already carried them.
 pub fn unknown_query_identifiers(member: &str) -> ValidationException {
     field_validation_failed(member, UNKNOWN_QUERY_IDENTIFIER_REQUIREMENT)
+}
+
+/// The modelled `ValidationException` for an export asked of a resource whose processing
+/// is still underway, naming the `state` it was asked in — the resource's own stored status
+/// ([`ComplianceInquiry::processing_in_progress`]).
+///
+/// A state PRECONDITION rather than a field failure: nothing the request carried is
+/// invalid, so `reason` is [`REASON_OTHER`] and `fieldList` names no member — unlike
+/// [`field_validation_failed`], whose clause is about a value the request sent. The
+/// sentence is the fixed text AWS states for this class, and the state it names is read off
+/// the resource rather than off the request, which is the only part of it that varies.
+pub fn unexportable_while_processing(state: &str) -> ValidationException {
+    ValidationException {
+        message: format!(
+            "Unable to export resource in a `{state}` state. Please wait for processing to \
+             complete."
+        ),
+        reason: REASON_OTHER.to_string(),
+        field_list: None,
+    }
 }
 
 /// The modelled `ValidationException` for a value the SERVICE itself refused on `member`,

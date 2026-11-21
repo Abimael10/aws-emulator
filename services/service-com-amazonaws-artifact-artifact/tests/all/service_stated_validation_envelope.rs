@@ -301,8 +301,11 @@ async fn rows(router: &MultiServiceRouter) -> Vec<Row> {
     let (_, half_full) = created_inquiry(router, "holding half the ceiling", &half).await;
 
     // An inquiry owning exactly one query — its text submission — so every identifier but
-    // the first names a query it does not own.
+    // the first names a query it does not own. Waited out to the end of its processing,
+    // because an export of an inquiry still being processed is refused on the state of the
+    // resource before any member of the request is read.
     let (inquiry, _) = created_inquiry(router, "one query of its own", &[]).await;
+    crate::harness::settled_inquiry_status(router, "one query of its own", &inquiry).await;
 
     vec![
         Row {
