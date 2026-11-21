@@ -13,6 +13,9 @@
 //!    `DirectoryRegistrationStatusReason` carries `DIRECTORY_RESOURCE_NOT_FOUND`:
 //!    `smithy_query(query="shape",
 //!    shape="DirectoryRegistrationStatus,DirectoryRegistrationStatusReason")`.)
+//!    Checked both through the single-resource read and by POLLING the collection —
+//!    the wait a client that only has `ListDirectoryRegistrations` performs — with a
+//!    page carrying both outcomes at once.
 //! 2. `DeleteDirectoryRegistration` (DELETE, 202, `@idempotent`) deauthorizes it: the
 //!    registration moves to `DELETING` and then STOPS EXISTING, after which
 //!    `GetDirectoryRegistration` refuses the ARN with 404
@@ -24,8 +27,9 @@
 //! INSTANT the clock is waiting on — never a status, which the handlers still
 //! compute from the records themselves.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -82,6 +86,21 @@ const ALREADY_DUE: Duration = Duration::from_secs(1);
 /// How long a case that waits on the REAL clock gives a move past its own span, so a
 /// slow machine does not read the status one instant early.
 const CLOCK_MARGIN: Duration = Duration::from_millis(750);
+
+/// How long a case that POLLS for a terminal status keeps looking before it gives up:
+/// many times over the span this service publishes for the move, so a loaded machine
+/// that gets there late still gets there. Nothing asserts on how long the move took.
+const TERMINAL_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How often that poll looks again — one more collection read, which is exactly what
+/// a client waiting for a terminal status does.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// The `DirectoryRegistrationStatus` values a registration STOPS at. The enum is
+/// [CREATING, ACTIVE, DELETING, FAILED]
+/// (`smithy_query(query="shape",shape="DirectoryRegistrationStatus")`), of which
+/// `CREATING` and `DELETING` are moves still under way.
+const TERMINAL_STATUSES: &[&str] = &["ACTIVE", "FAILED"];
 
 /// This service and the owner of directories over ONE shared engine — the same
 /// engine the production router builds — plus that engine, for a case that needs a
@@ -497,4 +516,178 @@ async fn an_unheld_directory_never_leaves_the_registration_at_an_unterminated_st
         code, "ResourceNotFoundException",
         "expected ResourceNotFoundException, got {code:?} / {gone}"
     );
+}
+
+/// Read `ListDirectoryRegistrations` over and over — the COLLECTION read alone, with
+/// nothing reaching into any store — until every ARN of `arns` reports a status the
+/// registration stops at, and answer that last page's summaries keyed by ARN.
+///
+/// The wait is on the CONDITION and not on a duration: it looks again until every
+/// registration has settled or [`TERMINAL_DEADLINE`] has passed, and asserts nothing
+/// about how long that took.
+async fn poll_listing_until_terminal(
+    router: &MultiServiceRouter,
+    arns: &[String],
+) -> BTreeMap<String, Value> {
+    let give_up_at = Instant::now() + TERMINAL_DEADLINE;
+    loop {
+        let (status, _, page) = list_page(router, None, None).await;
+        assert_eq!(
+            status, 200,
+            "ListDirectoryRegistrations must answer 200, got {status} / {page}"
+        );
+        let summaries: BTreeMap<String, Value> = page["DirectoryRegistrations"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|summary| {
+                        summary["Arn"]
+                            .as_str()
+                            .map(|arn| (arn.to_string(), summary.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let pending: Vec<&String> = arns
+            .iter()
+            .filter(|arn| {
+                summaries
+                    .get(*arn)
+                    .and_then(|summary| summary["Status"].as_str())
+                    .is_none_or(|status| !TERMINAL_STATUSES.contains(&status))
+            })
+            .collect();
+        if pending.is_empty() {
+            return summaries;
+        }
+        assert!(
+            Instant::now() < give_up_at,
+            "the listing must reach a terminal status for every registration; \
+             still waiting on {pending:?} in {page}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+#[tokio::test]
+async fn polling_the_listing_settles_every_registration_on_its_own_terminal_state_and_reason() {
+    // A client that learns whether a registration became usable by polling the
+    // COLLECTION, which is the only read in this case: no state is reached into, so
+    // the spans this service publishes are what move every row, and each entry of
+    // the page must carry the terminal state its own directory earned it —
+    // `StatusReason` included, since it is the additional information a FAILED status
+    // carries.
+    let (router, _engine) = fleet();
+
+    // The rows differ along the one thing the rule generalises over: whether the
+    // account holds the directory the registration names — held, held and then
+    // deleted, and never created at all — across the forms a directory id takes.
+    // They are created together, so one poll covers a page carrying both outcomes
+    // at once.
+    let mut rows: Vec<Row> = Vec::new();
+    for name in &DIRECTORY_NAMES[..2] {
+        let held_name = format!("listed-{name}");
+        let directory_id = create_directory(&router, &held_name).await;
+        rows.push(Row {
+            case: format!("the directory created as {held_name} ({directory_id})"),
+            directory_id,
+            status: "ACTIVE",
+            reason: None,
+        });
+    }
+    let deleted_name = format!("listed-gone-{}", DIRECTORY_NAMES[2]);
+    let deleted_id = create_directory(&router, &deleted_name).await;
+    delete_directory(&router, &deleted_id).await;
+    rows.push(Row {
+        case: format!("the directory deleted at {deleted_name} ({deleted_id})"),
+        directory_id: deleted_id,
+        status: "FAILED",
+        reason: Some(REASON_NOT_FOUND),
+    });
+    for directory_id in &ABSENT_DIRECTORY_IDS[..3] {
+        rows.push(Row {
+            case: format!("the id {directory_id}, which no directory was created for"),
+            directory_id: (*directory_id).to_string(),
+            status: "FAILED",
+            reason: Some(REASON_NOT_FOUND),
+        });
+    }
+
+    let mut arns = Vec::new();
+    for row in &rows {
+        arns.push(create_registration(&router, &row.directory_id).await);
+    }
+
+    let settled = poll_listing_until_terminal(&router, &arns).await;
+    for (row, arn) in rows.iter().zip(arns.iter()) {
+        let case = &row.case;
+        let summary = settled
+            .get(arn)
+            .unwrap_or_else(|| panic!("case {case:?}: the listing must carry {arn}"));
+        assert_eq!(
+            summary["DirectoryId"].as_str(),
+            Some(row.directory_id.as_str()),
+            "case {case:?}: the entry must name the directory the create was given, got {summary}"
+        );
+        assert_eq!(
+            summary["Status"].as_str(),
+            Some(row.status),
+            "case {case:?}: expected Status {}, got {summary}",
+            row.status
+        );
+        assert_eq!(
+            summary["StatusReason"].as_str(),
+            row.reason,
+            "case {case:?}: expected StatusReason {:?}, got {summary}",
+            row.reason
+        );
+        // `StatusReason` is additional information about the status IF THE STATUS IS
+        // FAILED, so it is present exactly for the rows that failed.
+        assert_eq!(
+            summary["StatusReason"].is_null(),
+            row.status != "FAILED",
+            "case {case:?}: StatusReason belongs to a FAILED status and to no other, \
+             got {summary}"
+        );
+
+        // Every reporting operation shows the same terminal state for the same
+        // resource, so the single-resource read agrees member for member.
+        let (read_status, _, read) = get_registration(&router, arn).await;
+        assert_eq!(
+            read_status, 200,
+            "case {case:?}: GetDirectoryRegistration must answer 200, got {read_status} / {read}"
+        );
+        let registration = &read["DirectoryRegistration"];
+        for member in ["Arn", "DirectoryId", "Status", "StatusReason"] {
+            assert_eq!(
+                summary[member], registration[member],
+                "case {case:?} / {member}: the listing and the read must agree, \
+                 got {summary} vs {registration}"
+            );
+        }
+    }
+
+    // Reading the collection is not what settles it: a later listing reports the very
+    // same terminal states to the next caller.
+    let (_, _, again) = list_page(&router, None, None).await;
+    for (row, arn) in rows.iter().zip(arns.iter()) {
+        let case = &row.case;
+        let summary = again["DirectoryRegistrations"]
+            .as_array()
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|summary| summary["Arn"].as_str() == Some(arn.as_str()))
+            })
+            .unwrap_or_else(|| panic!("case {case:?}: the listing must still carry {arn}"));
+        for member in ["Status", "StatusReason"] {
+            assert_eq!(
+                summary[member], settled[arn][member],
+                "case {case:?} / {member}: a second read must report the same terminal state, \
+                 got {summary} vs {}",
+                settled[arn]
+            );
+        }
+    }
 }
