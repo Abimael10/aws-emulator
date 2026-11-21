@@ -17,7 +17,11 @@
 //!   "a rollback is not supported" is refused rather than served with the preference
 //!   quietly turned off ([`AUTO_ROLLBACK_WITHOUT_DESIRED_CONFIGURATION_MESSAGE`]);
 //! * `AlarmSpecification`: the CloudWatch alarms the refresh fails on, which is an empty
-//!   specification for a refresh that watches none.
+//!   specification for a refresh that watches none;
+//! * `CheckpointDelay`: "if you specify a value for `CheckpointPercentages` and not for
+//!   `CheckpointDelay`, the `CheckpointDelay` defaults to `3600` (1 hour)", so a refresh
+//!   that stated thresholds runs under a delay either way
+//!   ([`DEFAULT_CHECKPOINT_DELAY`]).
 //!
 //! So a client that reads a running refresh back is told the effective value of each,
 //! never an absent member it would have to know the default of. The preferences are
@@ -26,10 +30,10 @@
 //! group does not rewrite the preferences of a refresh already under way.
 //!
 //! Every member the request DID state is kept exactly as written, including the ones this
-//! service applies no default to (`CheckpointPercentages`, `CheckpointDelay`,
-//! `MaxHealthyPercentage`, `ScaleInProtectedInstances`, `StandbyInstances`, `BakeTime`):
-//! the group has no value of its own for any of them, so a refresh that states none runs
-//! under the service's own behaviour rather than a value invented here.
+//! service applies no default to (`CheckpointPercentages`, `MaxHealthyPercentage`,
+//! `ScaleInProtectedInstances`, `StandbyInstances`, `BakeTime`): the group has no value of
+//! its own for any of them, so a refresh that states none runs under the service's own
+//! behaviour rather than a value invented here.
 
 use crate::ops::types::{AlarmSpecification, RefreshPreferences};
 
@@ -47,6 +51,15 @@ pub const DEFAULT_MIN_HEALTHY_PERCENTAGE: i32 = 90;
 /// `HealthCheckGracePeriod` is itself "Default: 0 seconds"
 /// ([`super::DEFAULT_HEALTH_CHECK_GRACE_PERIOD`]), so this is the floor under that chain.
 pub const DEFAULT_INSTANCE_WARMUP: i32 = super::DEFAULT_HEALTH_CHECK_GRACE_PERIOD;
+
+/// `RefreshPreferences$CheckpointDelay`, in seconds, when the request states checkpoint
+/// thresholds but no delay to hold at them: "if you specify a value for
+/// `CheckpointPercentages` and not for `CheckpointDelay`, the `CheckpointDelay` defaults to
+/// `3600` (1 hour)".
+///
+/// A request that states NO thresholds has no checkpoint to hold at, so this default does
+/// not reach it: the member stays as the request left it.
+pub const DEFAULT_CHECKPOINT_DELAY: i32 = 3600;
 
 /// `RefreshPreferences$SkipMatching` when the request states none: "the default is
 /// `false`".
@@ -99,6 +112,9 @@ pub fn effective(
                 .or(group.health_check_grace_period)
                 .unwrap_or(DEFAULT_INSTANCE_WARMUP),
         );
+    }
+    if preferences.checkpoint_delay.is_none() && preferences.checkpoint_percentages.is_some() {
+        preferences.checkpoint_delay = Some(DEFAULT_CHECKPOINT_DELAY);
     }
     preferences.skip_matching = Some(preferences.skip_matching.unwrap_or(DEFAULT_SKIP_MATCHING));
     preferences.auto_rollback = Some(preferences.auto_rollback.unwrap_or(DEFAULT_AUTO_ROLLBACK));

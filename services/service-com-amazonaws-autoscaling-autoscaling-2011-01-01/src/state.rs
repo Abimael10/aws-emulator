@@ -22,7 +22,9 @@
 //!   cooldown to elapse before it is applied (`HonorCooldown`);
 //! * a running instance refresh replaces one instance of its group per
 //!   [`INSTANCE_REFRESH_REPLACEMENT`], waits the warmup it runs under after each
-//!   replacement comes into service ([`StoredInstanceRefresh::instance_warmup`]) and,
+//!   replacement comes into service ([`StoredInstanceRefresh::instance_warmup`]), holds at
+//!   each checkpoint threshold its progress reaches for the delay it runs under
+//!   ([`StoredInstanceRefresh::checkpoint_hold`]) and,
 //!   once it has replaced them all, waits the bake time it runs under — reported
 //!   `Baking` while it does ([`StoredInstanceRefresh::bake_time`]) — before it succeeds
 //!   ([`StoredInstanceRefresh`]);
@@ -1563,6 +1565,58 @@ impl StoredInstanceRefresh {
             .max(0);
         Duration::from_secs(u64::from(seconds.unsigned_abs()))
     }
+
+    /// How long this refresh waits at a checkpoint it has reached before it carries on.
+    ///
+    /// "The amount of time, in seconds, to wait after a checkpoint before continuing"
+    /// (`smithy_query(query="doc",shape="RefreshPreferences",member="CheckpointDelay")`), so
+    /// the wait is the `CheckpointDelay` the refresh runs under, in the seconds it was
+    /// stated in: a documented wait keeps the value the caller asked for. A refresh that
+    /// stated thresholds and no delay waits the hour the same member documents for it
+    /// ([`refresh_preferences::DEFAULT_CHECKPOINT_DELAY`]), and one that stated no
+    /// threshold has no checkpoint to wait at at all.
+    pub fn checkpoint_delay(&self) -> Duration {
+        let preferences = self.preferences.as_ref();
+        let seconds = match preferences.and_then(|preferences| preferences.checkpoint_delay) {
+            Some(stated) => stated.max(0),
+            None if preferences
+                .and_then(|preferences| preferences.checkpoint_percentages.as_ref())
+                .is_some() =>
+            {
+                refresh_preferences::DEFAULT_CHECKPOINT_DELAY
+            }
+            None => 0,
+        };
+        Duration::from_secs(u64::from(seconds.unsigned_abs()))
+    }
+
+    /// The wait this refresh owes before its NEXT step, given that the step just
+    /// completed carried it from `from` percent complete to `to`.
+    ///
+    /// "Threshold values for each checkpoint in ascending order. Each number must be
+    /// unique" (`smithy_query(query="doc",shape="RefreshPreferences",
+    /// member="CheckpointPercentages")`): a threshold is reached by the step whose
+    /// replacement carried the refresh's progress up to or past it, and the refresh then
+    /// holds at that checkpoint — still replacing, so still reported `InProgress` at the
+    /// percentage it reached — for the delay it runs under ([`Self::checkpoint_delay`])
+    /// before continuing. A step that reached no threshold, and every step of a refresh
+    /// that states none, waits nothing beyond the replacement itself.
+    pub fn checkpoint_hold(&self, from: i32, to: i32) -> Duration {
+        let reached = self
+            .preferences
+            .as_ref()
+            .and_then(|preferences| preferences.checkpoint_percentages.as_ref())
+            .is_some_and(|thresholds| {
+                thresholds
+                    .iter()
+                    .any(|threshold| from < *threshold && *threshold <= to)
+            });
+        if reached {
+            self.checkpoint_delay()
+        } else {
+            Duration::ZERO
+        }
+    }
 }
 
 /// Per-service state for com-amazonaws-autoscaling-autoscaling-2011-01-01. A handler reaches it through [`service_state`].
@@ -2910,6 +2964,7 @@ impl AutoScalingState {
         let instance_refresh_id = refresh.instance_refresh_id.clone();
         let desired_configuration = refresh.desired_configuration.clone();
         let next_instance_id = refresh.pending_instance_ids.first().cloned();
+        let percentage_before = refresh.percentage_complete;
         let cancelling = refresh.status == REFRESH_CANCELLING;
         let rolling_back = refresh.is_rolling_back();
         let baking = refresh.is_baking();
@@ -3091,9 +3146,18 @@ impl AutoScalingState {
         // replacing the next instance after a new instance enters the `InService` state"
         // ([`StoredInstanceRefresh::instance_warmup`]). So the next step — the next
         // replacement, or this refresh's own completion once none is left — comes due at the
-        // end of that wait.
+        // end of that wait, plus the delay the refresh holds for where this step's progress
+        // reached a checkpoint it runs under
+        // ([`StoredInstanceRefresh::checkpoint_hold`]); a rollback replaces the refresh's
+        // own replacements back rather than making progress through it, so it passes no
+        // checkpoint.
         let warmup = refresh.instance_warmup();
-        refresh.next_step_due = Some(due + INSTANCE_REFRESH_REPLACEMENT + warmup);
+        let checkpoint_hold = if rolling_back {
+            Duration::ZERO
+        } else {
+            refresh.checkpoint_hold(percentage_before, refresh.percentage_complete)
+        };
+        refresh.next_step_due = Some(due + INSTANCE_REFRESH_REPLACEMENT + warmup + checkpoint_hold);
     }
 
     /// Replace ONE instance of a group: launch its replacement from the configuration
