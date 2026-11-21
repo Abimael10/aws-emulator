@@ -68,6 +68,14 @@
 use super::types::*;
 use crate::state;
 
+/// The sentence a request that may not delete the subscription it names is refused with: the
+/// one Amazon SNS answers an unsubscribe of a subscription that requires authentication for
+/// deletion with. Wholly fixed, with no variable parts — it reports nothing of the
+/// subscription or the caller, which is what keeps a refusal from telling whoever asked
+/// anything about either.
+const UNAUTHENTICATED_UNSUBSCRIBE_REFUSAL: &str =
+    "This subscription may only be deleted by an authorized user.";
+
 /// The refusal of a subscription that is still awaiting confirmation. The HTTP 400 and
 /// the `InvalidParameter` code are the requirement; the sentence is SNS's own wording
 /// for this reason.
@@ -173,6 +181,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The store's lock is taken and released by the delete below; the final cancellation
+        // an unauthenticated delete owes the endpoint is POSTed afterwards, because it is an
+        // in-process call into another service, which must not run under this store's lock.
+        let cancelled = self.unsubscribe_from_store(input, ctx)?;
+        if let Some(cancelled) = cancelled.as_ref() {
+            // The endpoint is NOT dialled: this POST is made over the in-process transport of
+            // the emulator this handler runs within, exactly as the confirmation request a
+            // `Subscribe` sends is ([`super::publish::endpoint_delivery`]).
+            super::publish::endpoint_delivery::send_cancellation(ctx, cancelled).await;
+        }
+        Ok(UnsubscribeOutput)
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> Unsubscribe<Eng> {
+    /// Delete the subscription the request names, and report the final cancellation its
+    /// endpoint is owed — `None` when this call owes none.
+    ///
+    /// The whole store-touching half of the operation, so the store's lock is taken and
+    /// released here and the caller POSTs with it released.
+    fn unsubscribe_from_store(
+        &self,
+        input: UnsubscribeInput,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+    ) -> Result<Option<super::publish::endpoint_delivery::Cancellation>, UnsubscribeError> {
         // Authorization, ahead of the store: AWS decides whether the caller may perform the
         // action on the subscription's topic before the service resolves the subscription, so
         // a refused call deletes nothing and is told it is not authorized rather than told
@@ -199,6 +232,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // WHO is asking, resolved before this store's lock is taken: the principal reading
+        // reaches the IAM store, and every store is read under its own lock.
+        let unauthenticated = state::deactivated_subscription::presents_no_credential(ctx);
+        let requester = state::authorization::requesting_principal_arn(&*self.engine, ctx);
         let mut store = store.lock();
 
         // The sentinel SNS publishes in place of an unconfirmed subscription's ARN is
@@ -250,12 +287,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(pending_confirmation_refusal());
         }
 
+        // A subscription whose owner asked for AUTHENTICATED unsubscribes is deleted by its
+        // owner and by nobody else: "if the subscription requires authentication for
+        // deletion, only the owner of the subscription or the topic's owner can unsubscribe,
+        // and an Amazon Web Services signature is required" (this operation's doc), which is
+        // what `ConfirmSubscription`'s `AuthenticateOnUnsubscribe` asks for — "disallows
+        // unauthenticated unsubscribes of the subscription". So a call that authenticated
+        // nobody, and one speaking for a principal of another account, are refused and the
+        // subscription stays; the subscription's own principal and the account that owns the
+        // topic are the two requesters it admits.
+        let requires_authentication = store
+            .subscriptions
+            .get(&input.subscription_arn)
+            .is_some_and(|held| {
+                held.authenticate_on_unsubscribe
+                    && state::deactivated_subscription::requester_may_not_delete(
+                        unauthenticated,
+                        &requester,
+                        &held.principal,
+                        &held.owner,
+                    )
+            });
+        if requires_authentication {
+            return Err(UnsubscribeErrorModeled::AuthorizationErrorException(
+                AuthorizationErrorException {
+                    message: Some(UNAUTHENTICATED_UNSUBSCRIBE_REFUSAL.to_string()),
+                },
+            )
+            .into());
+        }
+
         // Deleting a subscription is IDEMPOTENT in its ARN: a well-formed ARN whose
         // subscription is already gone — a repeated teardown, or one whose topic was
         // deleted with its subscriptions — leaves nothing to do and is answered the
         // same way as the delete that did the work.
         let Some(removed) = store.subscriptions.remove(&input.subscription_arn) else {
-            return Ok(UnsubscribeOutput);
+            return Ok(None);
         };
         // The messages delivered to a subscription go with it, but the topic keeps
         // counting the deletion: that is its `SubscriptionsDeleted` attribute, which the
@@ -266,6 +333,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             topic.count_deleted_subscription();
         }
 
-        Ok(UnsubscribeOutput)
+        // The FINAL CANCELLATION: "if the Unsubscribe call does not require authentication
+        // and the requester is not the subscription owner, a final cancellation message is
+        // delivered to the endpoint, so that the endpoint owner can easily resubscribe to the
+        // topic if the Unsubscribe request was unintended" (this operation's doc). A requester
+        // that is not the subscription's owner — one that authenticated nobody, which is what
+        // an endpoint owner following the link a delivered notification carries is, and one
+        // speaking for another principal — has the endpoint sent that message, with a token of
+        // its own that restores what was cancelled. The OWNER's own call is sent nothing: the
+        // owner asked for this.
+        let sent_one = state::deactivated_subscription::requester_is_not_the_owner(
+            unauthenticated,
+            &requester,
+            &removed.principal,
+        );
+        if !sent_one {
+            return Ok(None);
+        }
+        if !super::publish::endpoint_delivery::Cancellation::is_sent_one(&removed) {
+            return Ok(None);
+        }
+        // Minted only for a cancellation that is really sent, so a subscription nothing is
+        // POSTed to consumes neither a token nor an id.
+        let token = store.next_confirmation_token();
+        let message_id = store.next_unique_id();
+        let topic = store.topics.get(&removed.topic_arn).cloned();
+        let cancellation = super::publish::endpoint_delivery::Cancellation::of(
+            ctx,
+            &removed,
+            topic.as_ref(),
+            &token,
+            message_id,
+        );
+        // The subscription is kept against that token — and only where the message carrying it
+        // was really built — so the token the endpoint owner presents restores the
+        // subscription that was cancelled rather than a new one.
+        if cancellation.is_some() {
+            store.deactivated_subscriptions.keep(token, removed);
+        }
+
+        Ok(cancellation)
     }
 }

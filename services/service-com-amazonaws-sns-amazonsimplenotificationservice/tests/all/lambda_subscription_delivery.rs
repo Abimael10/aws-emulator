@@ -147,6 +147,47 @@ fn authorization(signing_name: &str) -> String {
 
 /// One awsQuery form call against SNS that must SUCCEED, as its body text.
 pub(crate) async fn sns(emulator: &Emulator, action: &str, params: &[(&str, &str)]) -> String {
+    let (status, text) = sns_signed(emulator, action, params).await;
+    assert_eq!(
+        status, 200,
+        "{action}: expected HTTP 200, got {status} / {text}"
+    );
+    text
+}
+
+/// The same call, with whatever status it was answered: a suite asserting what a call EARNS
+/// reads the status rather than requiring a success.
+pub(crate) async fn sns_signed(
+    emulator: &Emulator,
+    action: &str,
+    params: &[(&str, &str)],
+) -> (u16, String) {
+    sns_call(emulator, action, params, true).await
+}
+
+/// The same call made with NO credential of any kind — the ANONYMOUS flow of an operation,
+/// which is how the endpoint owner of a subscription follows a link SNS delivered to it —
+/// with whatever status it was answered.
+///
+/// `pub(crate)`: a suite asserting what an anonymous call earns makes the same request as
+/// every other suite does, minus the `Authorization` header, so the two forms of one call are
+/// written once ([`sns_call`]).
+pub(crate) async fn sns_unsigned(
+    emulator: &Emulator,
+    action: &str,
+    params: &[(&str, &str)],
+) -> (u16, String) {
+    sns_call(emulator, action, params, false).await
+}
+
+/// One awsQuery form call against SNS, signed or not, with the status and body text it was
+/// answered.
+async fn sns_call(
+    emulator: &Emulator,
+    action: &str,
+    params: &[(&str, &str)],
+    signed: bool,
+) -> (u16, String) {
     let mut body = format!("Action={action}&Version=2010-03-31");
     for (name, value) in params {
         body.push('&');
@@ -154,22 +195,21 @@ pub(crate) async fn sns(emulator: &Emulator, action: &str, params: &[(&str, &str
         body.push('=');
         body.push_str(&percent_encode(value));
     }
-    let request = http::Request::builder()
+    let mut request = http::Request::builder()
         .method("POST")
         .uri("/")
         .header("host", format!("sns.{REGION}.amazonaws.com"))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .header("authorization", authorization("sns"))
+        .header("content-type", "application/x-www-form-urlencoded");
+    if signed {
+        request = request.header("authorization", authorization("sns"));
+    }
+    let request = request
         .body(bytes::Bytes::from(body))
         .expect("the test request is well formed");
     let response = emulator.router.dispatch(request).await;
     let status = response.status().as_u16();
     let text = String::from_utf8_lossy(response.body()).to_string();
-    assert_eq!(
-        status, 200,
-        "{action}: expected HTTP 200, got {status} / {text}"
-    );
-    text
+    (status, text)
 }
 
 /// One `restJson1` call against Lambda, with whatever status it answered.
@@ -235,7 +275,10 @@ pub(crate) async fn sqs(emulator: &Emulator, operation: &str, body: &Value) -> V
 /// of that harness is a different one. Answers the status and the body as text: a URL a
 /// delivered record carries is only a URL if following it reaches a document, which is what
 /// the signing certificate a function's event record names is read with below.
-async fn fetch(emulator: &Emulator, url: &str) -> (u16, String) {
+///
+/// `pub(crate)`: a suite over this harness that FOLLOWS a link this service handed a
+/// subscriber — a `SubscribeURL`, an `UnsubscribeURL` — makes exactly this request.
+pub(crate) async fn fetch(emulator: &Emulator, url: &str) -> (u16, String) {
     let response = emulator
         .router
         .dispatch(crate::sqs_subscription_delivery::anonymous_get(url))

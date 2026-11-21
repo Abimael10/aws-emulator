@@ -40,7 +40,8 @@ use service_com_amazonaws_lambda_awsgirapiservice::state::ComAmazonawsLambdaAwsg
 
 use crate::lambda_subscription_dead_letter::{given_queue, held};
 use crate::lambda_subscription_delivery::{
-    emulator, given_function_running, lambda, publish, sns, sqs, subscribe, Emulator,
+    emulator, fetch, given_function_running, lambda, publish, sns, sns_signed, sns_unsigned, sqs,
+    subscribe, Emulator,
 };
 use crate::sqs_subscription_delivery::element;
 
@@ -804,5 +805,481 @@ async fn an_endpoint_that_is_not_up_yet_still_receives_the_confirmation() {
         element(&confirmed, "SubscriptionArn"),
         subscription,
         "expected the retried request's token to confirm {subscription:?}, got {confirmed}"
+    );
+}
+
+/// The `UnsubscribeConfirmation` POST, and what its token does.
+///
+/// RULE: an `Unsubscribe` whose requester is NOT the subscription's owner — "if the
+/// Unsubscribe call does not require authentication and the requester is not the subscription
+/// owner, a final cancellation message is delivered to the endpoint, so that the endpoint
+/// owner can easily resubscribe to the topic if the Unsubscribe request was unintended"
+/// (`Unsubscribe`) — has the cancelled subscription's endpoint POSTed that message, whose
+/// `Token` `ConfirmSubscription` restores the subscription with ("if the token is valid, the
+/// action creates a new subscription"); an `Unsubscribe` the owner SIGNED delivers none. And a
+/// subscription that REQUIRES authentication for deletion — "disallows unauthenticated
+/// unsubscribes of the subscription" (`ConfirmSubscriptionInput$AuthenticateOnUnsubscribe`) —
+/// is not deleted by such a call at all: it is refused, and nothing is delivered.
+///
+/// The rows differ along what the rule generalises over: whether the call presented a
+/// credential, whether the subscription requires authentication for deletion, and whether the
+/// subscription's endpoint is a URL at all — a subscriber reached another way is sent no such
+/// message, because there is no request to make.
+struct Ending {
+    case: &'static str,
+    /// The subscription's protocol, which decides what kind of endpoint it has.
+    protocol: &'static str,
+    /// The path on the sink this row's endpoint addresses, for the rows whose endpoint is a
+    /// URL — what tells one row's recorded requests from another's.
+    path: &'static str,
+    /// Whether the `Unsubscribe` presented a credential.
+    signed: bool,
+    /// Whether the subscription was confirmed asking that its unsubscribes be
+    /// authenticated.
+    authenticated_unsubscribes: bool,
+    /// The status the `Unsubscribe` must be answered with.
+    status: u16,
+    /// How many final cancellations the endpoint must then have recorded.
+    cancellations: usize,
+}
+
+const ENDINGS: &[Ending] = &[
+    Ending {
+        case: "an unsubscribe that presented no credential",
+        protocol: HTTPS_PROTOCOL,
+        path: "/take/cancelled",
+        signed: false,
+        authenticated_unsubscribes: false,
+        status: 200,
+        cancellations: 1,
+    },
+    Ending {
+        case: "an unsubscribe the owner signed",
+        protocol: HTTPS_PROTOCOL,
+        path: "/take/owned",
+        signed: true,
+        authenticated_unsubscribes: false,
+        status: 200,
+        cancellations: 0,
+    },
+    Ending {
+        // The same unauthenticated call on a subscription whose owner asked that its
+        // unsubscribes be authenticated: the call deletes nothing and is refused.
+        case: "an unsubscribe that presented no credential where the subscription requires one",
+        protocol: HTTPS_PROTOCOL,
+        path: "/take/protected",
+        signed: false,
+        authenticated_unsubscribes: true,
+        status: 403,
+        cancellations: 0,
+    },
+    Ending {
+        // The OWNER's own call on the same kind of subscription still deletes it.
+        case: "an unsubscribe the owner signed where the subscription requires one",
+        protocol: HTTPS_PROTOCOL,
+        path: "/take/protected-owned",
+        signed: true,
+        authenticated_unsubscribes: true,
+        status: 200,
+        cancellations: 0,
+    },
+    Ending {
+        // The same unauthenticated call on a subscription whose endpoint is a QUEUE: there is
+        // no URL to POST to, so nothing is sent anywhere.
+        case: "an unsubscribe that presented no credential on a queue subscription",
+        protocol: "sqs",
+        path: "/take/queued",
+        signed: false,
+        authenticated_unsubscribes: false,
+        status: 200,
+        cancellations: 0,
+    },
+];
+
+#[tokio::test]
+async fn only_an_unauthenticated_unsubscribe_posts_the_final_cancellation() {
+    let emulator = emulator();
+    let (capture_url, _capture_arn) = given_queue(&emulator, "https-cancel-capture").await;
+    let function = "https-cancellation-sink";
+    given_function_running(
+        &emulator,
+        function,
+        &SINK_HANDLER.replace("{queue_url}", &capture_url),
+    )
+    .await;
+    let sink = given_function_url(&emulator, function).await;
+
+    for (index, row) in ENDINGS.iter().enumerate() {
+        let case = row.case;
+        let topic = element(
+            &sns(
+                &emulator,
+                "CreateTopic",
+                &[("Name", &format!("https-cancellation-{index}"))],
+            )
+            .await,
+            "TopicArn",
+        );
+        // A URL subscription confirms through the token its endpoint is POSTed; a queue
+        // subscription is confirmed by SNS itself, so it has no token of its own.
+        let (subscription, endpoint) = if row.protocol == HTTPS_PROTOCOL {
+            let endpoint = format!("{sink}{}", row.path);
+            let subscription = subscribe(&emulator, &topic, row.protocol, &endpoint).await;
+            let requests = recorded_for(&emulator, &capture_url, row.path, 1).await;
+            assert_eq!(
+                requests.len(),
+                1,
+                "case {case:?}: expected the confirmation request, got {requests:?}"
+            );
+            let token = requests[0].document(case)["Token"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: no Token in {:?}", requests[0].body))
+                .to_string();
+            let mut confirming = vec![("TopicArn", topic.as_str()), ("Token", token.as_str())];
+            if row.authenticated_unsubscribes {
+                confirming.push(("AuthenticateOnUnsubscribe", "true"));
+            }
+            sns(&emulator, "ConfirmSubscription", &confirming).await;
+            (subscription, endpoint)
+        } else {
+            let (_url, arn) = given_queue(&emulator, &format!("https-cancel-queue-{index}")).await;
+            (
+                subscribe(&emulator, &topic, row.protocol, &arn).await,
+                arn,
+            )
+        };
+
+        let (status, answered) = if row.signed {
+            sns_signed(
+                &emulator,
+                "Unsubscribe",
+                &[("SubscriptionArn", &subscription)],
+            )
+            .await
+        } else {
+            sns_unsigned(
+                &emulator,
+                "Unsubscribe",
+                &[("SubscriptionArn", &subscription)],
+            )
+            .await
+        };
+        assert_eq!(
+            status, row.status,
+            "case {case:?}: expected the unsubscribe of {endpoint:?} to be answered {}, got \
+             {status} / {answered}",
+            row.status
+        );
+        if row.status != 200 {
+            // The refusal says what it is: the code and the sentence Amazon SNS answers an
+            // unsubscribe of a subscription that requires authentication for deletion with.
+            assert_eq!(
+                (
+                    element(&answered, "Code").as_str(),
+                    element(&answered, "Message").as_str(),
+                ),
+                (
+                    "AuthorizationError",
+                    "This subscription may only be deleted by an authorized user.",
+                ),
+                "case {case:?}: expected the refusal of an unauthenticated unsubscribe, got \
+                 {answered}"
+            );
+            // A refused unsubscribe deletes nothing: the subscription still receives what is
+            // published to its topic.
+            let message = "the body after a refused unsubscribe";
+            let message_id = publish(&emulator, &topic, &[("Message", message)]).await;
+            let delivered = recorded_for(&emulator, &capture_url, row.path, 1).await;
+            assert_eq!(
+                delivered.len(),
+                1,
+                "case {case:?}: a refused unsubscribe leaves the subscription in place, so it \
+                 is POSTed to, got {delivered:?}"
+            );
+            assert_eq!(
+                delivered[0].header("x-amz-sns-message-id"),
+                Some(message_id.as_str()),
+                "case {case:?}: expected the notification of {message_id:?}, got {:?}",
+                delivered[0].headers
+            );
+            continue;
+        }
+
+        // The POST an unsubscribe owes is made before it answers, so what the endpoint has
+        // recorded by now is the whole of what this call sent it.
+        let cancellations: Vec<Recorded> = drain_recorded(&emulator, &capture_url)
+            .await
+            .into_iter()
+            .filter(|recorded| recorded.path == row.path)
+            .collect();
+        assert_eq!(
+            cancellations.len(),
+            row.cancellations,
+            "case {case:?}: expected {} final cancellation(s), got {cancellations:?}",
+            row.cancellations
+        );
+        let Some(cancellation) = cancellations.first() else {
+            continue;
+        };
+        let posted_message_id = cancellation
+            .header("x-amz-sns-message-id")
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            (
+                cancellation.header("x-amz-sns-message-type"),
+                cancellation.header("x-amz-sns-topic-arn"),
+                cancellation.header("x-amz-sns-subscription-arn"),
+                cancellation.header("content-type"),
+            ),
+            (
+                Some("UnsubscribeConfirmation"),
+                Some(topic.as_str()),
+                Some(subscription.as_str()),
+                Some(DELIVERY_CONTENT_TYPE),
+            ),
+            "case {case:?}: expected the cancellation's headers, got {:?}",
+            cancellation.headers
+        );
+        assert!(
+            !posted_message_id.is_empty(),
+            "case {case:?}: expected a message-id header, got {:?}",
+            cancellation.headers
+        );
+        let document = cancellation.document(case);
+        assert_eq!(
+            (
+                document["Type"].as_str(),
+                document["TopicArn"].as_str(),
+                document["MessageId"].as_str(),
+            ),
+            (
+                Some("UnsubscribeConfirmation"),
+                Some(topic.as_str()),
+                Some(posted_message_id.as_str()),
+            ),
+            "case {case:?}: expected the cancellation document of {topic:?}, got {document}"
+        );
+        assert!(
+            document["Message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&subscription),
+            "case {case:?}: expected the cancellation's Message to name the subscription it \
+             deactivated, got {document}"
+        );
+        assert!(
+            document["Signature"].as_str().is_some()
+                && document["SigningCertURL"].as_str().is_some(),
+            "case {case:?}: expected the cancellation to be signed, got {document}"
+        );
+        let token = document["Token"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no Token in {document}"))
+            .to_string();
+        let subscribe_url = document["SubscribeURL"].as_str().unwrap_or_default();
+        assert!(
+            subscribe_url.contains("Action=ConfirmSubscription") && subscribe_url.contains(&token),
+            "case {case:?}: expected a SubscribeURL presenting the token, got {subscribe_url:?}"
+        );
+
+        // The subscription is really gone: a publish made now is delivered nowhere.
+        publish(&emulator, &topic, &[("Message", "after the cancellation")]).await;
+        let withheld = drain_recorded(&emulator, &capture_url).await;
+        assert!(
+            withheld.is_empty(),
+            "case {case:?}: a cancelled subscription receives nothing, got {withheld:?}"
+        );
+
+        // And the token restores it: the subscription the cancellation named is confirmed
+        // again, and the next publish reaches its endpoint.
+        let restored = sns(
+            &emulator,
+            "ConfirmSubscription",
+            &[("TopicArn", &topic), ("Token", &token)],
+        )
+        .await;
+        assert_eq!(
+            element(&restored, "SubscriptionArn"),
+            subscription,
+            "case {case:?}: expected the cancellation's token to restore {subscription:?}, got \
+             {restored}"
+        );
+        let message = "after the restoration";
+        let message_id = publish(&emulator, &topic, &[("Message", message)]).await;
+        let delivered = recorded_for(&emulator, &capture_url, row.path, 1).await;
+        assert_eq!(
+            delivered.len(),
+            1,
+            "case {case:?}: expected the restored subscription to be POSTed to, got {delivered:?}"
+        );
+        let document = delivered[0].document(case);
+        assert_eq!(
+            (
+                delivered[0].header("x-amz-sns-message-id"),
+                document["Message"].as_str(),
+            ),
+            (Some(message_id.as_str()), Some(message)),
+            "case {case:?}: expected the notification of {message_id:?}, got {document}"
+        );
+    }
+}
+
+/// The LINKS a subscriber is handed lead to the calls they write.
+///
+/// RULE: the URL members SNS delivers to an endpoint are addresses its owner FOLLOWS — "to
+/// confirm the subscription, visit the SubscribeURL included in this message", and the
+/// `UnsubscribeURL` a notification carries — so following one performs the call it writes,
+/// exactly as posting that call does: the `SubscribeURL` of a confirmation request confirms
+/// the subscription, and the `UnsubscribeURL` of a notification ends it, which is the
+/// unauthenticated unsubscribe a final cancellation is delivered for.
+///
+/// The rows this spans are the three links one subscription is handed, each followed in turn:
+/// its confirmation's `SubscribeURL`, its notification's `UnsubscribeURL`, and the
+/// cancellation's own `SubscribeURL`, which restores what the second ended.
+#[tokio::test]
+async fn the_links_a_subscriber_is_handed_perform_the_calls_they_write() {
+    let emulator = emulator();
+    let (capture_url, _capture_arn) = given_queue(&emulator, "https-link-capture").await;
+    let function = "https-link-sink";
+    given_function_running(
+        &emulator,
+        function,
+        &SINK_HANDLER.replace("{queue_url}", &capture_url),
+    )
+    .await;
+    let sink = given_function_url(&emulator, function).await;
+    let topic = element(
+        &sns(&emulator, "CreateTopic", &[("Name", "https-links")]).await,
+        "TopicArn",
+    );
+    let path = "/take/links";
+    let subscription = subscribe(
+        &emulator,
+        &topic,
+        HTTPS_PROTOCOL,
+        &format!("{sink}{path}"),
+    )
+    .await;
+
+    // The confirmation's SubscribeURL: following it confirms the subscription, which is what
+    // the sentence that request states tells the endpoint's owner to do.
+    let confirmations = recorded_for(&emulator, &capture_url, path, 1).await;
+    assert_eq!(
+        confirmations.len(),
+        1,
+        "expected the confirmation request, got {confirmations:?}"
+    );
+    let subscribe_url = confirmations[0].document("a visited SubscribeURL")["SubscribeURL"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !subscribe_url.is_empty(),
+        "expected a SubscribeURL in the confirmation request, got {:?}",
+        confirmations[0].body
+    );
+    let (status, answered) = fetch(&emulator, &subscribe_url).await;
+    assert_eq!(
+        status, 200,
+        "expected following the SubscribeURL to confirm the subscription, got {status} / \
+         {answered}"
+    );
+    assert_eq!(
+        element(&answered, "SubscriptionArn"),
+        subscription,
+        "expected the visited SubscribeURL to answer {subscription:?}, got {answered}"
+    );
+
+    // A confirmed subscription receives notifications, each carrying the link that ends it.
+    let message = "the body of a link-confirmed subscription";
+    let message_id = publish(&emulator, &topic, &[("Message", message)]).await;
+    let notifications = recorded_for(&emulator, &capture_url, path, 1).await;
+    assert_eq!(
+        notifications.len(),
+        1,
+        "expected one notification POST, got {notifications:?}"
+    );
+    let document = notifications[0].document("a visited UnsubscribeURL");
+    assert_eq!(
+        (
+            notifications[0].header("x-amz-sns-message-id"),
+            document["Message"].as_str(),
+        ),
+        (Some(message_id.as_str()), Some(message)),
+        "expected the notification of {message_id:?}, got {document}"
+    );
+    let unsubscribe_url = document["UnsubscribeURL"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        unsubscribe_url.contains(&subscription),
+        "expected the notification's own unsubscribe link, got {unsubscribe_url:?}"
+    );
+
+    // Following it ends the subscription — and, because whoever followed it authenticated
+    // nobody, the endpoint is sent the final cancellation that can restore it.
+    let (status, answered) = fetch(&emulator, &unsubscribe_url).await;
+    assert_eq!(
+        status, 200,
+        "expected following the UnsubscribeURL to end the subscription, got {status} / \
+         {answered}"
+    );
+    let cancellations = recorded_for(&emulator, &capture_url, path, 1).await;
+    assert_eq!(
+        cancellations.len(),
+        1,
+        "expected the final cancellation of an unauthenticated unsubscribe, got \
+         {cancellations:?}"
+    );
+    let cancellation = cancellations[0].document("a visited UnsubscribeURL");
+    assert_eq!(
+        (
+            cancellations[0].header("x-amz-sns-message-type"),
+            cancellations[0].header("x-amz-sns-subscription-arn"),
+            cancellation["Type"].as_str(),
+        ),
+        (
+            Some("UnsubscribeConfirmation"),
+            Some(subscription.as_str()),
+            Some("UnsubscribeConfirmation"),
+        ),
+        "expected the cancellation of {subscription:?}, got {cancellation}"
+    );
+
+    // And the cancellation's own SubscribeURL restores it: the subscription receives the next
+    // publish again.
+    let restore_url = cancellation["SubscribeURL"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let (status, answered) = fetch(&emulator, &restore_url).await;
+    assert_eq!(
+        status, 200,
+        "expected following the cancellation's SubscribeURL to restore the subscription, got \
+         {status} / {answered}"
+    );
+    assert_eq!(
+        element(&answered, "SubscriptionArn"),
+        subscription,
+        "expected the restored subscription {subscription:?}, got {answered}"
+    );
+    let message = "the body after a restored subscription";
+    let message_id = publish(&emulator, &topic, &[("Message", message)]).await;
+    let delivered = recorded_for(&emulator, &capture_url, path, 1).await;
+    assert_eq!(
+        delivered.len(),
+        1,
+        "expected the restored subscription to be POSTed to, got {delivered:?}"
+    );
+    let document = delivered[0].document("a restored subscription");
+    assert_eq!(
+        (
+            delivered[0].header("x-amz-sns-message-id"),
+            document["Message"].as_str(),
+        ),
+        (Some(message_id.as_str()), Some(message)),
+        "expected the notification of {message_id:?}, got {document}"
     );
 }

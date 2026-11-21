@@ -244,6 +244,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Whether this call asks that LATER unsubscribes of the subscription be
+        // authenticated: "disallows unauthenticated unsubscribes of the subscription"
+        // (`ConfirmSubscriptionInput$AuthenticateOnUnsubscribe`), which is a property of the
+        // subscription from this confirmation on, so it is written onto the record this call
+        // confirms. A call that names it neither way leaves what the subscription already
+        // holds, which for a subscription nobody has asked it of is "no".
+        let authenticate_on_unsubscribe = input
+            .authenticate_on_unsubscribe
+            .as_deref()
+            .and_then(state::flag_attribute_value)
+            .map(|value| value == state::attribute_flag(true));
+
         // The subscription of THIS topic whose endpoint was sent this token. The token
         // is compared whole: nothing is parsed out of it, so a token that is not one
         // this service minted matches nothing.
@@ -260,26 +272,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // token stays with the record, so presenting it again confirms the same
                 // subscription rather than failing.
                 subscription.pending_confirmation = false;
+                if let Some(asked) = authenticate_on_unsubscribe {
+                    subscription.authenticate_on_unsubscribe = asked;
+                }
                 subscription.arn.clone()
             });
 
         let Some(arn) = confirmed else {
-            return Err(ConfirmSubscriptionErrorModeled::InvalidParameterException(
-                InvalidParameterException {
-                    message: Some(state::INVALID_CONFIRMATION_TOKEN_REFUSAL.to_string()),
-                },
-            )
-            .into());
+            // A token that confirms no pending subscription may still be the one a FINAL
+            // CANCELLATION carried: "if the token is valid, the action creates a new
+            // subscription" (this operation's doc), and the token an unauthenticated
+            // `Unsubscribe` sent the endpoint is valid for exactly that — restoring the
+            // subscription it cancelled, which is why that message exists at all
+            // (`Unsubscribe`: "so that the endpoint owner can easily resubscribe to the topic
+            // if the Unsubscribe request was unintended").
+            let Some(mut restored) = store
+                .deactivated_subscriptions
+                .take(&input.topic_arn, &input.token)
+            else {
+                return Err(ConfirmSubscriptionErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(state::INVALID_CONFIRMATION_TOKEN_REFUSAL.to_string()),
+                    },
+                )
+                .into());
+            };
+            if store.subscriptions.len() >= state::MAX_RECORDS_PER_STORE {
+                return Err(
+                    ConfirmSubscriptionErrorModeled::SubscriptionLimitExceededException(
+                        SubscriptionLimitExceededException {
+                            message: Some(state::limit_exceeded_message("subscriptions")),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // The subscription is the one that was cancelled, delivering again from this call
+            // on; the token that restored it stays with the record, so presenting it again
+            // confirms the same subscription rather than failing — the reading a pending
+            // confirmation's token gets above. The token the subscription was originally
+            // confirmed with went with the cancellation and confirms nothing.
+            restored.pending_confirmation = false;
+            restored.confirmation_token = Some(input.token.clone());
+            if let Some(asked) = authenticate_on_unsubscribe {
+                restored.authenticate_on_unsubscribe = asked;
+            }
+            let arn = restored.arn.clone();
+            store.subscriptions.insert(arn.clone(), restored);
+            return Ok(ConfirmSubscriptionOutput {
+                subscription_arn: Some(arn),
+            });
         };
-
-        // `AuthenticateOnUnsubscribe` governs a LATER `Unsubscribe`: it "disallows
-        // unauthenticated unsubscribes of the subscription" (the member's doc). Every
-        // request this emulator serves is signed by the one identity its published
-        // credentials present — the principal `state::calling_principal_arn` names, and
-        // the topic and subscription owner both — so no unsubscribe of this subscription
-        // can be an unauthenticated one, and the flag withholds nothing from anybody.
-        // It is accepted for that reason, not ignored.
-        let _ = &input.authenticate_on_unsubscribe;
 
         Ok(ConfirmSubscriptionOutput {
             subscription_arn: Some(arn),

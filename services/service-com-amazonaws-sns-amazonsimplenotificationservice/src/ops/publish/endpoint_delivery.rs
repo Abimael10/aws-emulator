@@ -90,6 +90,10 @@ const NOTIFICATION_MESSAGE_TYPE: &str = "Notification";
 /// The same for the confirmation request a subscription to a URL is sent.
 const SUBSCRIPTION_CONFIRMATION_MESSAGE_TYPE: &str = "SubscriptionConfirmation";
 
+/// The same for the final cancellation the endpoint of a subscription ended by an
+/// unauthenticated `Unsubscribe` is sent.
+const UNSUBSCRIBE_CONFIRMATION_MESSAGE_TYPE: &str = "UnsubscribeConfirmation";
+
 /// The `User-Agent` Amazon SNS makes an HTTP/S delivery under.
 const DELIVERY_USER_AGENT: &str = "Amazon Simple Notification Service Agent";
 
@@ -661,9 +665,9 @@ fn confirmation_message(topic_arn: &str) -> String {
     )
 }
 
-/// The document a confirmation request POSTs: its type, its own id, the token that confirms
-/// the subscription, the topic, the sentence that says what to do with it, the call that
-/// presents the token, the instant it was sent and the signature a subscriber verifies it by.
+/// The document a confirmation request POSTs: the members every document that carries a
+/// token to an endpoint carries ([`token_document`]), with this request's own type and
+/// sentence.
 fn confirmation_document(
     topic_arn: &str,
     token: &str,
@@ -671,21 +675,45 @@ fn confirmation_document(
     sent_at: ::std::time::SystemTime,
     signer: &state::notification_signature::Signer,
 ) -> String {
+    token_document(
+        SUBSCRIPTION_CONFIRMATION_MESSAGE_TYPE,
+        &confirmation_message(topic_arn),
+        topic_arn,
+        token,
+        message_id,
+        sent_at,
+        signer,
+    )
+}
+
+/// The document a message that carries a TOKEN to an endpoint POSTs — the confirmation
+/// request a subscription starts with, and the final cancellation an unsubscribe by someone
+/// other than the owner delivers: its type, its own id, the token, the topic, the sentence
+/// that says what to do with it, the call that presents the token, the instant it was sent
+/// and the signature a subscriber verifies it by.
+///
+/// ONE builder, because the two documents are one kind: a token sent to an endpoint for
+/// `ConfirmSubscription`, differing in their `Type` and in the sentence they state. So their
+/// member set — which is also the set the signature is taken over
+/// ([`state::notification_signature`]) — cannot drift apart.
+fn token_document(
+    message_type: &str,
+    message: &str,
+    topic_arn: &str,
+    token: &str,
+    message_id: &str,
+    sent_at: ::std::time::SystemTime,
+    signer: &state::notification_signature::Signer,
+) -> String {
     let mut document = ::serde_json::Map::new();
-    document.insert(
-        "Type".to_string(),
-        ::serde_json::Value::from(SUBSCRIPTION_CONFIRMATION_MESSAGE_TYPE),
-    );
+    document.insert("Type".to_string(), ::serde_json::Value::from(message_type));
     document.insert(
         "MessageId".to_string(),
         ::serde_json::Value::from(message_id),
     );
     document.insert("Token".to_string(), ::serde_json::Value::from(token));
     document.insert("TopicArn".to_string(), ::serde_json::Value::from(topic_arn));
-    document.insert(
-        "Message".to_string(),
-        ::serde_json::Value::from(confirmation_message(topic_arn)),
-    );
+    document.insert("Message".to_string(), ::serde_json::Value::from(message));
     if let Some(url) = subscribe_url(topic_arn, token) {
         document.insert("SubscribeURL".to_string(), ::serde_json::Value::from(url));
     }
@@ -716,6 +744,116 @@ fn subscribe_url(topic_arn: &str, token: &str) -> Option<String> {
     ))
 }
 
+/// The FINAL CANCELLATION one subscription's endpoint is sent when the subscription was ended
+/// by a request that authenticated nobody: the token that restores it, and the call that
+/// presents that token.
+///
+/// "If the `Unsubscribe` call does not require authentication and the requester is not the
+/// subscription owner, a final cancellation message is delivered to the endpoint, so that the
+/// endpoint owner can easily resubscribe to the topic if the `Unsubscribe` request was
+/// unintended" (`Unsubscribe`). So the message exists for ONE purpose — to carry the token
+/// that undoes the cancellation — which is why the endpoint owner, and nobody else, can undo
+/// it: the token travels here and in no response of this service.
+#[derive(Debug, Clone)]
+pub(crate) struct Cancellation {
+    /// The URL the message is POSTed to.
+    target: EndpointLocation,
+    /// The topic the cancelled subscription was to, which the message carries in a header
+    /// and in its body.
+    topic_arn: String,
+    /// The subscription that was cancelled, which the message names in a header and in the
+    /// sentence it states.
+    subscription_arn: String,
+    /// The id of this message, as its own header reports it.
+    message_id: String,
+    /// The document POSTed.
+    body: String,
+}
+
+impl Cancellation {
+    /// Whether `subscription` is one whose endpoint is SENT a final cancellation: its
+    /// endpoint is a URL of its own protocol, which is the only endpoint kind this module
+    /// POSTs to at all.
+    ///
+    /// Asked before the token and the message id of such a message are minted, so a
+    /// subscription nothing is POSTed to consumes neither ([`Cancellation::of`] decides the
+    /// same thing over the value it then reads).
+    pub(crate) fn is_sent_one(subscription: &state::SubscriptionRecord) -> bool {
+        subscription
+            .endpoint
+            .as_deref()
+            .and_then(|endpoint| EndpointLocation::of_url(&subscription.protocol, endpoint))
+            .is_some()
+    }
+
+    /// The cancellation `subscription`'s endpoint is to be sent, or `None` when its endpoint
+    /// is no URL of its protocol and there is nothing to POST.
+    ///
+    /// `token` is the token minted for this cancellation — the one `ConfirmSubscription`
+    /// restores the subscription with — and `message_id` the id minted for the message;
+    /// `topic` is the topic the subscription was to, which selects the signature version the
+    /// document is signed under.
+    pub(crate) fn of(
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+        subscription: &state::SubscriptionRecord,
+        topic: Option<&state::TopicRecord>,
+        token: &str,
+        message_id: String,
+    ) -> Option<Self> {
+        let endpoint = subscription.endpoint.as_deref()?;
+        let target = EndpointLocation::of_url(&subscription.protocol, endpoint)?;
+        let signer = state::notification_signature::Signer::of_topic(ctx, topic);
+        Some(Self {
+            target,
+            topic_arn: subscription.topic_arn.clone(),
+            body: cancellation_document(
+                &subscription.topic_arn,
+                &subscription.arn,
+                token,
+                &message_id,
+                ::std::time::SystemTime::now(),
+                &signer,
+            ),
+            subscription_arn: subscription.arn.clone(),
+            message_id,
+        })
+    }
+}
+
+/// The sentence a final cancellation states as its `Message`: which subscription has been
+/// deactivated, and what to do with the message to undo it.
+///
+/// The variable part is the subscription, taken from the record that was cancelled; the rest
+/// is the fixed text Amazon SNS words such a message with.
+fn cancellation_message(subscription_arn: &str) -> String {
+    format!(
+        "You have chosen to deactivate subscription {subscription_arn}.\nTo cancel this \
+         operation and restore the subscription, visit the SubscribeURL included in this \
+         message."
+    )
+}
+
+/// The document a final cancellation POSTs: the members every document that carries a token
+/// to an endpoint carries ([`token_document`]), with this message's own type and sentence.
+fn cancellation_document(
+    topic_arn: &str,
+    subscription_arn: &str,
+    token: &str,
+    message_id: &str,
+    sent_at: ::std::time::SystemTime,
+    signer: &state::notification_signature::Signer,
+) -> String {
+    token_document(
+        UNSUBSCRIBE_CONFIRMATION_MESSAGE_TYPE,
+        &cancellation_message(subscription_arn),
+        topic_arn,
+        token,
+        message_id,
+        sent_at,
+        signer,
+    )
+}
+
 /// POST the confirmation request `pending` to the endpoint of the subscription it is about.
 ///
 /// Called with the store's lock RELEASED: it is an in-process call out of this service, like
@@ -723,6 +861,72 @@ fn subscribe_url(topic_arn: &str, token: &str) -> Option<String> {
 /// exists either way, awaiting its subscriber's confirmation — so an endpoint that did not
 /// take the request is logged and changes nothing about what the caller is told; the
 /// subscriber asks for another request by subscribing again.
+pub(crate) async fn send_confirmation(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    pending: &PendingConfirmation,
+) {
+    send_about_the_subscription(
+        ctx,
+        &AboutTheSubscription {
+            message_type: SUBSCRIPTION_CONFIRMATION_MESSAGE_TYPE,
+            named_in_a_header: false,
+            target: &pending.target,
+            topic_arn: &pending.topic_arn,
+            subscription_arn: &pending.subscription_arn,
+            message_id: &pending.message_id,
+            body: &pending.body,
+        },
+    )
+    .await;
+}
+
+/// POST the final cancellation `cancelled` to the endpoint of the subscription it is about.
+///
+/// Called with the store's lock RELEASED, for the reason [`send_confirmation`] is, and its
+/// outcome is not part of the unsubscribing call's answer either: the subscription is
+/// cancelled either way, and an endpoint that did not take the message simply never learns it
+/// can restore it.
+pub(crate) async fn send_cancellation(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    cancelled: &Cancellation,
+) {
+    send_about_the_subscription(
+        ctx,
+        &AboutTheSubscription {
+            message_type: UNSUBSCRIBE_CONFIRMATION_MESSAGE_TYPE,
+            named_in_a_header: true,
+            target: &cancelled.target,
+            topic_arn: &cancelled.topic_arn,
+            subscription_arn: &cancelled.subscription_arn,
+            message_id: &cancelled.message_id,
+            body: &cancelled.body,
+        },
+    )
+    .await;
+}
+
+/// One request a subscribed URL is sent about the SUBSCRIPTION ITSELF rather than about a
+/// published message: the confirmation a new subscription's endpoint is sent, and the final
+/// cancellation an unauthenticated `Unsubscribe` delivers. Both carry a token the endpoint
+/// owner presents to `ConfirmSubscription`, and both are POSTed the same way.
+struct AboutTheSubscription<'r> {
+    /// The kind of message, which the request's own header and the document's `Type` state.
+    message_type: &'r str,
+    /// Whether the request NAMES the subscription it is about in a header: a cancellation
+    /// does, because the endpoint has been receiving that subscription's notifications and
+    /// the message is about ending them, while a confirmation does not — the subscriber
+    /// learns the ARN from `ConfirmSubscription`.
+    named_in_a_header: bool,
+    /// The URL the request is POSTed to.
+    target: &'r EndpointLocation,
+    topic_arn: &'r str,
+    subscription_arn: &'r str,
+    message_id: &'r str,
+    /// The document POSTed.
+    body: &'r str,
+}
+
+/// POST `request` to the endpoint of the subscription it is about.
 ///
 /// An endpoint that could not take the request YET is attempted again along the phases the
 /// published delivery policy opens with ([`super::retry_waits`]), within one request's own
@@ -731,54 +935,58 @@ fn subscribe_url(topic_arn: &str, token: &str) -> Option<String> {
 /// request is not a delivery of a published message: a subscriber that is not up yet is
 /// exactly the condition those phases exist for, and the retry budget a client sizes governs
 /// the NOTIFICATIONS it will receive.
-pub(crate) async fn send_confirmation(
+async fn send_about_the_subscription(
     ctx: &smithy_server_runtime::OperationContext<'_>,
-    pending: &PendingConfirmation,
+    request: &AboutTheSubscription<'_>,
 ) {
     let transport = ctx.callback().http_connector();
     let mut waiting = RetryBudget::new();
     let mut waits = super::retry_waits();
+    let mut headers = vec![
+        (MESSAGE_TYPE_HEADER, request.message_type),
+        (MESSAGE_ID_HEADER, request.message_id),
+        (TOPIC_ARN_HEADER, request.topic_arn),
+    ];
+    if request.named_in_a_header {
+        headers.push((SUBSCRIPTION_ARN_HEADER, request.subscription_arn));
+    }
     loop {
         let posted = post(
             &transport,
-            &pending.target,
-            &[
-                (
-                    MESSAGE_TYPE_HEADER,
-                    SUBSCRIPTION_CONFIRMATION_MESSAGE_TYPE,
-                ),
-                (MESSAGE_ID_HEADER, &pending.message_id),
-                (TOPIC_ARN_HEADER, &pending.topic_arn),
-            ],
+            request.target,
+            &headers,
             &state::RequestPolicy::system_default().header_content_type,
-            &pending.body,
+            request.body,
         )
         .await;
         let outcome = match &posted {
             Posted::Answered { status, .. } if SUCCESS_STATUSES.contains(status) => {
                 ::tracing::info!(
-                    subscription = %pending.subscription_arn,
-                    endpoint = %pending.target.url,
-                    "the subscription's endpoint was sent the request that confirms it"
+                    subscription = %request.subscription_arn,
+                    endpoint = %request.target.url,
+                    message_type = %request.message_type,
+                    "a subscribed endpoint was sent the request about its own subscription"
                 );
                 return;
             }
             Posted::Answered { status, .. } => {
                 ::tracing::warn!(
-                    subscription = %pending.subscription_arn,
-                    endpoint = %pending.target.url,
+                    subscription = %request.subscription_arn,
+                    endpoint = %request.target.url,
+                    message_type = %request.message_type,
                     status = *status,
-                    "the subscription's endpoint did not take the request that confirms it"
+                    "a subscribed endpoint did not take the request about its own subscription"
                 );
                 refusal_of(Some(*status))
             }
             Posted::NotReached(detail) => {
                 ::tracing::warn!(
-                    subscription = %pending.subscription_arn,
-                    endpoint = %pending.target.url,
+                    subscription = %request.subscription_arn,
+                    endpoint = %request.target.url,
+                    message_type = %request.message_type,
                     detail = %detail,
-                    "the subscription's endpoint could not be reached, so the request that \
-                     confirms it was not delivered"
+                    "a subscribed endpoint could not be reached, so the request about its own \
+                     subscription was not delivered"
                 );
                 // NOT retried, for the reason a notification to such an endpoint is not:
                 // nothing is at that URL, so a further attempt of this call reaches the same

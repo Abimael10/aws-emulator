@@ -237,6 +237,26 @@ pub fn topic_refusal<Eng: Send + Sync + 'static>(
     topic_refusal_for(engine, ctx, action, topic_arn, Asked::default())
 }
 
+/// The ARN of the principal the request `ctx` is serving speaks for, as
+/// `sts:GetCallerIdentity` reports it: the role SESSION a temporary credential presents, the
+/// IAM user behind a long-term key, and the account's own published identity for a request
+/// carrying neither.
+///
+/// Read out of the SAME resolution the authorization decision is taken over
+/// ([`caller`]), so the principal a record names as its creator
+/// (`crate::state::calling_principal_arn`) and the principal a later call speaks for are
+/// compared on one reading rather than two.
+///
+/// Call it with this service's own store NOT locked: the IAM store is reached here, under its
+/// own lock.
+#[must_use]
+pub fn requesting_principal_arn<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+) -> String {
+    caller(engine, ctx).arn
+}
+
 /// [`topic_refusal`] for a call that names a SUBSCRIPTION of the topic, which answers for
 /// this service's own condition keys with the values `asked` carries.
 ///

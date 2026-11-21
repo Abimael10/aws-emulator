@@ -792,6 +792,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> Subscribe<Eng> {
                         attributes,
                         pending_confirmation,
                         confirmation_token,
+                        // Nobody has asked for an authenticated unsubscribe of this
+                        // subscription yet: `ConfirmSubscription` is the call that asks.
+                        authenticate_on_unsubscribe: false,
                         created_at: std::time::SystemTime::now(),
                         // No replay has been asked for yet: the write below is what starts
                         // the one a `ReplayPolicy` carried on this call asks for.

@@ -66,6 +66,12 @@ pub mod phone_number_form;
 /// What a subscription confirmation token LOOKS like, which is what tells the two refusals of
 /// `ConfirmSubscription` apart.
 pub mod confirmation_token;
+/// The subscription an unauthenticated `Unsubscribe` deactivated, held so the token its
+/// cancellation message carried can restore it.
+pub mod deactivated_subscription;
+/// The links this service hands a subscriber to FOLLOW — a `SubscribeURL`, an
+/// `UnsubscribeURL` — and the request following one is read as.
+pub mod visited_link;
 mod message_structure;
 /// The rules a topic's TAG set is held to, shared by the operations that write one.
 mod tags;
@@ -1466,6 +1472,13 @@ pub struct SubscriptionRecord {
     /// [`SandboxPhoneNumberRecord::one_time_password`] stands in for the SMS one. No
     /// response carries it and no refusal names it.
     pub confirmation_token: Option<String>,
+    /// Whether LATER unsubscribes of this subscription have to be authenticated:
+    /// "disallows unauthenticated unsubscribes of the subscription"
+    /// ([`crate::ops::confirm_subscription`]'s `AuthenticateOnUnsubscribe`), which that call
+    /// is what asks for. Held on the record rather than among the attributes because no
+    /// attribute of a subscription reports it: it is set by the confirmation and read by the
+    /// delete ([`deactivated_subscription::requester_is_not_the_owner`]).
+    pub authenticate_on_unsubscribe: bool,
     pub created_at: SystemTime,
     /// The message replay the subscription's current [`REPLAY_POLICY_ATTRIBUTE`] asked
     /// for, or `None` for a subscription no replay was ever asked for on.
@@ -4120,6 +4133,12 @@ pub struct ComAmazonawsSnsAmazonsimplenotificationserviceState {
     /// [`request_quota::RequestRates`] — and written only by the rate gate in front of the
     /// operations.
     pub request_rates: request_quota::RequestRates,
+    /// The subscriptions an unauthenticated `Unsubscribe` deactivated, keyed by the token
+    /// its cancellation message carried: what `ConfirmSubscription` restores when the
+    /// endpoint owner presents that token. Bounded at [`MAX_RECORDS_PER_STORE`]
+    /// cancellations and written through [`deactivated_subscription::Deactivated::keep`],
+    /// never by hand.
+    pub deactivated_subscriptions: deactivated_subscription::Deactivated,
     /// Backs the `SequenceNumber` a FIFO topic's `Publish` returns.
     pub sequence_counter: u64,
     /// Backs [`Self::next_unique_id`]: the monotone part of every minted id.

@@ -367,6 +367,59 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for WithRequestId<Eng> {
     }
 }
 
+/// A VISIT to one of the links this service hands a subscriber — the `SubscribeURL` of a
+/// confirmation request, the `UnsubscribeURL` of a delivered notification — served as the
+/// call that link writes ([`crate::state::visited_link`]).
+///
+/// It is served HERE rather than by the routing table because the model's routing key is the
+/// `Action` of an awsQuery FORM BODY, which the `GET` a link is followed with carries none
+/// of. The visit is turned into the POST of the same action and then served through
+/// [`WithRequestId`] — the one path every other call of this API takes — so a call a client
+/// posts and the same call written as a link are answered by the same operation, under the
+/// same quota and the same account resolution.
+struct VisitedLink<Eng: Send + Sync + 'static> {
+    /// The serving path every other request of this service goes through.
+    serving: WithRequestId<Eng>,
+}
+
+impl<Eng: Send + Sync + 'static> ErasedOperation for VisitedLink<Eng> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            match crate::state::visited_link::as_form_request(req) {
+                Some(rebuilt) => self.serving.run(svc, &rebuilt, ctx).await,
+                // Unreachable through `override_operation`, which hands this back only for a
+                // request that follows one of this service's links: state the protocol's own
+                // routing failure rather than panic.
+                None => svc.definition().routing_error_response(req),
+            }
+        })
+    }
+
+    /// `Some(&[])` — served to a caller presenting NO credential, because that is the ONE
+    /// caller these links exist for: they travel to a subscription's ENDPOINT, and its owner
+    /// follows the address it was given ("to confirm the subscription, visit the SubscribeURL
+    /// included in this message") holding no Amazon Web Services credential at all. A link
+    /// this service mints and then refuses for want of a signature leads nowhere, which is
+    /// why the sibling address a subscriber is handed declares the same thing
+    /// ([`SigningCertificate::auth_schemes`]).
+    ///
+    /// It widens nothing: this mounting is reached only by a request that follows one of the
+    /// two links this service minted, presenting no credential, at this emulator's own
+    /// endpoint ([`Service::can_handle`]), and what such a visit may then DO is the call's own
+    /// to say — an unsubscribe of a subscription that requires authentication for deletion is
+    /// refused by that operation ([`crate::ops::unsubscribe`]), exactly as Amazon SNS refuses
+    /// it. A visit carrying a credential is not claimed here at all: it is routed, verified
+    /// and served as every other call of this API is.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        Some(&[])
+    }
+}
+
 /// The media type the signing certificate is served as: it is a PEM certificate file.
 const CERTIFICATE_MEDIA_TYPE: &str = "application/x-pem-file";
 
@@ -429,6 +482,8 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
     /// Held, not built per request: `override_operation` returns a reference to it.
     with_request_id: WithRequestId<Eng>,
+    /// Held for the same reason: a visit to one of this service's links.
+    visited_link: VisitedLink<Eng>,
     /// Held for the same reason: the signing certificate's own answer.
     signing_certificate: SigningCertificate,
 }
@@ -443,7 +498,12 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         crate::state::notification_signature::prepare_signing_key();
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
-            with_request_id: WithRequestId { engine },
+            with_request_id: WithRequestId {
+                engine: Arc::clone(&engine),
+            },
+            visited_link: VisitedLink {
+                serving: WithRequestId { engine },
+            },
             signing_certificate: SigningCertificate,
         }
     }
@@ -478,6 +538,29 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         {
             return true;
         }
+        // A VISIT to one of the links this service hands a subscriber is this service's for
+        // the same reason and under the same narrowing: the URL travels to the ENDPOINT, whose
+        // owner follows it with no credential of its own, so nothing in the request names this
+        // service for the router. Only a request that follows one of the links this service
+        // MINTED, presenting no credential, is claimed
+        // ([`crate::state::visited_link::visits_a_link_with_no_credential`]), and only at the
+        // emulator's own endpoint — a link followed at this service's own host is claimed by
+        // the routing below, as every other request of this API is. The method is read first,
+        // so no request of any other shape is formatted for this question.
+        if parts.method == ::http::Method::GET
+            && crate::state::visited_link::visits_a_link_with_no_credential(
+                parts.method.as_str(),
+                &parts.uri.to_string(),
+                parts
+                    .headers
+                    .get(::http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok()),
+            )
+            && ::service_common::data_plane_addressing::reached_emulator_endpoint_of_parts(parts)
+                .is_some()
+        {
+            return true;
+        }
         // Claim a request whose resolved route key is this service's signing
         // name. Edit this for anything the model does not express — a signing
         // name shared by several services, or access-key-id-based routing.
@@ -496,6 +579,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // the routing table is consulted.
         if crate::state::notification_signature::addresses_certificate(req.method(), req.uri()) {
             return Some(&self.signing_certificate);
+        }
+        // A visit to one of the links this service hands a subscriber names its action in the
+        // query string of a `GET`, which the model's routing key cannot read, so it is
+        // answered as the call that link writes before the routing table is consulted. Only a
+        // visit presenting NO credential is served that way — the caller these links exist for
+        // — because that mounting is the one this service declares no auth scheme for; a visit
+        // that presents one is a client calling this API and is routed, verified and served as
+        // every other call of it is.
+        if crate::state::visited_link::visits_a_link_with_no_credential(
+            req.method(),
+            req.uri(),
+            req.headers().get(::http::header::AUTHORIZATION.as_str()),
+        ) {
+            return Some(&self.visited_link);
         }
         // Serve every modelled operation through [`WithRequestId`], which answers
         // from the generated routing table and then adds the `<RequestId>` element
