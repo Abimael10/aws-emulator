@@ -13,13 +13,14 @@
 use super::*;
 
 /// The document `request` goes on the wire as: every TOP-LEVEL member under the
-/// spelling the invoked service's model uses for it ([`MemberCase`]), and every
+/// spelling the invoked service's model uses for it ([`model_member`]), and every
 /// member the integration documents as a document the operation types as a string
 /// carried as that document's JSON text ([`Call::json_text`]).
 ///
 /// A `Task` state's integration parameters are the invoked operation's input, and
 /// they are written in the integration's own convention — PascalCase — whatever the
-/// invoked API spells its members in, so the spelling is settled here rather than
+/// invoked API spells its members in, and a universal target's input is an SDK request a
+/// client wrote, in the SDK's own spelling; so the spelling is settled here rather than
 /// handing a service a member name its model does not carry.
 ///
 /// Only the TOP level is re-spelled. Below it a document carries a caller's DATA
@@ -36,7 +37,7 @@ pub(super) fn wire_request(call: &Call, request: &Value) -> Value {
     };
     let mut wire = Map::new();
     for (member, value) in members {
-        let member = call.api.member_case.spell(member);
+        let member = model_member(call.api, member);
         let value = match call.json_text.contains(&member.as_str()) {
             true if !value.is_string() => Value::String(value.to_string()),
             _ => value.clone(),
@@ -50,9 +51,45 @@ pub(super) fn wire_request(call: &Call, request: &Value) -> Value {
     document
 }
 
-/// Replace the document the member `path` names in `document` with that document's JSON
-/// text, leaving `document` as it is where the path names nothing and leaving a value
-/// that is already text untouched.
+/// The member of the invoked operation that a request's `written` member names, under
+/// that operation's MODEL spelling of it.
+///
+/// A member is named ignoring case, because the spellings a request may write it in
+/// differ from the model's own in case alone: an integration's parameters are written in
+/// PascalCase whatever the invoked API spells its members in, and a universal target's
+/// `Target$Input` is an SDK request a CLIENT wrote, where an AWS SDK renames a member
+/// whose model name carries an acronym by lowercasing that acronym
+/// (`DBInstanceIdentifier` -> `dbInstanceIdentifier`). So a member is resolved against
+/// the model's own spelling where the invoked service's model is one that spells a member
+/// in a way case-folding its FIRST character does not produce ([`MODEL_MEMBERS`]), and
+/// otherwise under that service's case convention ([`MemberCase`]), which is both
+/// spellings of a plain-word member.
+///
+/// A member no entry names, of a service with no entries at all, is spelled exactly as
+/// before: the convention's own rendering of it.
+pub(super) fn model_member(api: &Api, written: &str) -> String {
+    MODEL_MEMBERS
+        .iter()
+        .find(|(namespace, _)| *namespace == api.namespace)
+        .and_then(|(_, members)| {
+            members
+                .iter()
+                .find(|member| member.eq_ignore_ascii_case(written))
+        })
+        .map_or_else(|| api.member_case.spell(written), |member| (*member).to_string())
+}
+
+/// The model's own spelling of the input members of the operations this crate calls on a
+/// service whose model spells a member in a way case-folding its first character does not
+/// produce, keyed by that service's own namespace.
+///
+/// Those spellings are facts of the INVOKED model, which this crate cannot read, so each
+/// entry states where it was read from — the same reason [`APIS`] is a list rather than a
+/// rule. A service whose members are plain words carries no entry: [`MemberCase`] already
+/// renders every spelling of such a member.
+const MODEL_MEMBERS: &[(&str, &[&str])] = &[(rds::RDS_NAMESPACE, rds::RDS_MODEL_MEMBERS)];
+
+
 ///
 /// The inverse of [`parse_in_place`], and the nested form of [`Call::json_text`]: a LIST
 /// on the way is walked element by element, so one path names the same member of every

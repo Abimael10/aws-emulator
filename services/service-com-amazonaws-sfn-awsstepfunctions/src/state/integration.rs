@@ -2160,9 +2160,11 @@ impl TargetResource {
     /// The ARN of the resource this call's `request` names, in the Region `region`
     /// the call is made in.
     ///
-    /// The member is read under both spellings a definition may write it in — the
-    /// integration's own PascalCase and the invoked model's ([`MemberCase`]) — because
-    /// either reaches the operation ([`wire_request`]). What the value spells is the
+    /// The member is read ignoring CASE, because the spellings a request may write it
+    /// in differ from the model's own in case alone — the integration's own PascalCase,
+    /// the invoked model's ([`MemberCase`]), and the spelling an AWS SDK gives a member
+    /// whose model name carries an acronym — and each of them reaches the operation
+    /// under the model's own name ([`model_member`]). What the value spells is the
     /// entry's own fact ([`TargetNaming`]): a NAME is the last field of this account's
     /// ARN for that resource in this Region, an ARN is the resource itself, and a url
     /// or one of a service's own shorter forms is read the way that service addresses
@@ -2188,10 +2190,13 @@ impl TargetResource {
         if self.named == TargetNaming::EveryResource {
             return Some(EVERY_RESOURCE.to_string());
         }
-        match [MemberCase::Pascal, MemberCase::LowerCamel]
-            .into_iter()
-            .find_map(|case| request.get(case.spell(self.member)))
-        {
+        let named = request.as_object().and_then(|members| {
+            members
+                .iter()
+                .find(|(written, _)| written.eq_ignore_ascii_case(self.member))
+                .map(|(_, value)| value)
+        });
+        match named {
             Some(named) => named.as_str().map(str::to_string),
             None => self.default.map(str::to_string),
         }

@@ -110,6 +110,32 @@ pub(super) const START_DB_INSTANCE_INTEGRATION: &str = "rds:startDBInstance";
 /// See [`STOP_DB_INSTANCE_INTEGRATION`].
 pub(super) const REBOOT_DB_INSTANCE_INTEGRATION: &str = "rds:rebootDBInstance";
 
+/// The model's OWN spelling of every input member of the instance operations above,
+/// which is the spelling a request to this service has to carry
+/// ([`super::model_member`]).
+///
+/// This service's model writes a member whose name opens with — or carries — an ACRONYM
+/// with that acronym in capitals (`DBInstanceIdentifier`), while an AWS SDK names the
+/// same member by lowercasing it (`dbInstanceIdentifier`), so the two spellings differ in
+/// more than the first character and neither [`MemberCase`] produces the other. A member
+/// whose name is plain words needs no entry, since case-folding its first character is
+/// already both spellings of it.
+///
+/// `smithy_query(query="operation",operation="StopDBInstance,StartDBInstance,
+/// RebootDBInstance",model_path="services/service-com-amazonaws-rds-amazonrdsv19/
+/// smithy-model/com-amazonaws-rds-amazonrdsv19.json")`: `StopDBInstanceMessage` takes
+/// `DBInstanceIdentifier`, `DBSnapshotIdentifier` and
+/// `DetachFromDBCapacityReservation`, `StartDBInstanceMessage` takes
+/// `DBInstanceIdentifier` and `DBCapacityReservationIdentifier`, and
+/// `RebootDBInstanceMessage` takes `DBInstanceIdentifier` and `ForceFailover`.
+pub(super) const RDS_MODEL_MEMBERS: &[&str] = &[
+    DB_INSTANCE_IDENTIFIER_MEMBER,
+    "DBSnapshotIdentifier",
+    "DetachFromDBCapacityReservation",
+    "DBCapacityReservationIdentifier",
+    "ForceFailover",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -86,6 +86,16 @@ pub const RETRY_INTERVAL: Duration = Duration::from_secs(60);
 /// has failed because of an unknown error, exception or failure".
 const UNREADABLE_FAILURE_CODE: &str = "InternalFailure";
 
+/// The element an XML refusal names its CLASS in, which is the code the answering
+/// service reports that class by.
+///
+/// A service whose protocol carries a refusal as an XML document writes the class in a
+/// `Code` element — a FORM (`awsQuery`) service wraps that element and the message in an
+/// `Error` element of an `<ErrorResponse>` envelope, and one whose model turns the
+/// wrapping off carries both as the root's own children; both are read to the same flat
+/// object ([`failure_of_answer`]).
+const XML_CODE_ELEMENT: &str = "Code";
+
 /// The error code of a call the invocation's own permissions withheld, for a service
 /// whose protocol spells AWS's authorization refusal in its modern form, which is the
 /// one AWS's authorization layer answers such a call with.
@@ -374,9 +384,12 @@ pub(crate) fn failure_of_entry(code: &str, message: &str, retryable: bool) -> Fa
 /// A universal target's invocation is the invoked operation's own call
 /// ([`super::universal_target`]), made over the in-process transport rather than
 /// through one service's generated client, so what the answer reports is read off the
-/// answer: an AWS JSON refusal names its error shape in the `x-amzn-errortype` header
-/// and in the body's `__type` discriminator — read through the one reading of those two
-/// places this tree has ([`::service_common::error_type_locator`]) — and carries its
+/// answer, in the place the protocol that answer came in names its class: an AWS JSON
+/// refusal names its error shape in the `x-amzn-errortype` header and in the body's
+/// `__type` discriminator — read through the one reading of those two places this tree
+/// has ([`::service_common::error_type_locator`]) — while a refusal carried as an XML
+/// document names it in a `Code` element, which is the code a service whose protocol
+/// answers XML (a FORM service among them) reports the class by. Either carries its
 /// message under either spelling the protocol allows. An answer naming no class at all
 /// is reported under [`UNREADABLE_FAILURE_CODE`], and one carrying no message of its own
 /// is reported as the text that came back.
@@ -386,14 +399,34 @@ pub(crate) fn failure_of_entry(code: &str, message: &str, retryable: bool) -> Fa
 pub(crate) fn failure_of_answer(status: u16, error_type: Option<&str>, payload: &[u8]) -> Failure {
     use ::service_common::error_type_locator::{shape_named, SHAPE_DISCRIMINATOR};
 
-    let document: Option<::serde_json::Value> = ::serde_json::from_slice(payload).ok();
-    let named = error_type.map(ToString::to_string).or_else(|| {
-        document
-            .as_ref()?
-            .get(SHAPE_DISCRIMINATOR)
-            .and_then(::serde_json::Value::as_str)
-            .map(ToString::to_string)
-    });
+    // The body as the document it carries, whichever of the two forms a refusal of one
+    // of this emulator's services comes in: the JSON document itself, or the flat object
+    // an XML refusal's own elements make — read through the ONE reading of an XML answer
+    // this tree has, which is the same one a `Task` state's refusals are read with.
+    let (document, element_code) = match ::serde_json::from_slice(payload).ok() {
+        Some(document) => (Some(document), None),
+        None => {
+            let document =
+                ::service_com_amazonaws_sfn_awsstepfunctions::state::xml_answer::as_document(
+                    payload,
+                );
+            let named = document
+                .as_ref()
+                .and_then(|document| document.get(XML_CODE_ELEMENT))
+                .and_then(::serde_json::Value::as_str)
+                .map(ToString::to_string);
+            (document, named)
+        }
+    };
+    let named = element_code
+        .or_else(|| error_type.map(ToString::to_string))
+        .or_else(|| {
+            document
+                .as_ref()?
+                .get(SHAPE_DISCRIMINATOR)
+                .and_then(::serde_json::Value::as_str)
+                .map(ToString::to_string)
+        });
     // The header may carry a URL after the class, which is no part of the name, and
     // either place may qualify the shape by its namespace.
     let code = named
