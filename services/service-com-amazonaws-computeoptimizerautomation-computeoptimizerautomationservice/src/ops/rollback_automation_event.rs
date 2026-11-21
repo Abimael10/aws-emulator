@@ -3,8 +3,13 @@
 //! @op RollbackAutomationEvent
 //!
 //! IMPLEMENTED. Resolves `eventId` against the automation events this service
-//! holds: an id no event has is `ResourceNotFoundException` (404); an event of
-//! an account the caller may no longer initiate work in — a member account
+//! can still reach by id (`crate::state::EventStore::retrievable_mut`, the same
+//! lookup every other `eventId`-scoped path uses): an id no retrievable event
+//! has — one the store never held, and one created before the event retrieval
+//! window — is `ResourceNotFoundException` (404), refused before anything is
+//! written, so no rollback is ever started on an event the readers of this
+//! service report as not found; an event of an account the caller may no longer
+//! initiate work in — a member account
 //! whose association has been removed — is `AccessDeniedException` (403),
 //! because a rollback is initiated only for events belonging to ASSOCIATED
 //! member accounts; and an event whose automation was not carried out — one
@@ -218,16 +223,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .as_ref()
                     .and_then(crate::state::TokenSubject::event_id)
                     .map(str::to_string);
-                return match replayed.and_then(|id| guard.events.get_mut(&id)) {
-                    Some(event) => {
-                        // Report the status the clock has already made due, so a
-                        // replay never claims a rollback is still running after
-                        // it has settled.
-                        event.settle(now);
-                        Ok(output_for(event))
-                    }
-                    // The event the token acted on is no longer in the store, so
-                    // there is nothing to replay.
+                return match replayed.and_then(|id| guard.events.retrievable_mut(&id, now)) {
+                    // The retrievable lookup has already materialised the status
+                    // the clock made due, so a replay never claims a rollback is
+                    // still running after it has settled.
+                    Some(event) => Ok(output_for(event)),
+                    // The event the token acted on is out of every query's reach
+                    // — the store no longer holds the id, or the event was
+                    // created before the retrieval window — so there is nothing
+                    // to replay.
                     None => Err(not_found()),
                 };
             }
@@ -256,12 +260,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The rollback is initiated for an AUTOMATION EVENT, so the event is
-        // what the request has to name; an id no stored event carries names no
-        // resource of this service. The event records the account its
-        // automation ran in, which is what the caller's standing is judged on.
+        // what the request has to name, and it is reached through the store's
+        // retrievable lookup — the one every other `eventId`-scoped path uses
+        // (`crate::state::EventStore::retrievable_mut`). An event this store
+        // cannot reach by id is no resource of this service, whether the store
+        // never held the id or the event was created before the retrieval
+        // window: a rollback cannot be initiated for one every reader reports as
+        // not found, and the refusal comes BEFORE anything is written, so an
+        // unreachable event is never mutated behind a 404. The event records the
+        // account its automation ran in, which is what the caller's standing is
+        // judged on.
         let Some(account_id) = guard
             .events
-            .get(&input.event_id)
+            .retrievable_mut(&input.event_id, now)
             .map(|event| event.account_id.clone())
         else {
             return Err(not_found());
@@ -278,13 +289,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(access_denied());
         }
 
-        let Some(event) = guard.events.get_mut(&input.event_id) else {
+        let Some(event) = guard.events.retrievable_mut(&input.event_id, now) else {
             return Err(not_found());
         };
-        // The clock's own transition first, so eligibility is judged on the
-        // status the event ALREADY has: an automation whose run window has
-        // passed is completed whether or not anybody read it since.
-        event.settle(now);
+        // The lookup above has already made the clock's own transition, so
+        // eligibility is judged on the status the event ALREADY has: an
+        // automation whose run window has passed is completed whether or not
+        // anybody read it since.
         if !event.rollback_can_start() {
             return Err(
                 RollbackAutomationEventErrorModeled::InvalidParameterValueException(

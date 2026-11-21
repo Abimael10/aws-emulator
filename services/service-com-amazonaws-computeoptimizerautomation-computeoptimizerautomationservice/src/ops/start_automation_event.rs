@@ -216,16 +216,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .as_ref()
                     .and_then(crate::state::TokenSubject::event_id)
                     .map(str::to_string);
-                return match replayed.and_then(|id| guard.events.get_mut(&id)) {
-                    Some(event) => {
-                        // Report the status the clock has already made due, so a
-                        // replay never claims an automation is still running
-                        // after it has settled.
-                        event.settle(::std::time::SystemTime::now());
-                        Ok(output_for(event))
-                    }
-                    // The event the token started is no longer in the store, so
-                    // there is nothing to replay.
+                let now = ::std::time::SystemTime::now();
+                return match replayed.and_then(|id| guard.events.retrievable_mut(&id, now)) {
+                    // The retrievable lookup has already materialised the status
+                    // the clock made due, so a replay never claims an automation
+                    // is still running after it has settled.
+                    Some(event) => Ok(output_for(event)),
+                    // The event the token started is out of every query's reach
+                    // — the store no longer holds the id, or the event was
+                    // created before the retrieval window — so there is nothing
+                    // to replay.
                     None => Err(not_found()),
                 };
             }
