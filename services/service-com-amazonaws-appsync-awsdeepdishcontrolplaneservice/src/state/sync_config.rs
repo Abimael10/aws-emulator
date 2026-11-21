@@ -163,7 +163,7 @@ pub fn versioned_data_source_refusal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ops::types::LambdaConflictHandlerConfig;
+    use crate::ops::types::{DynamodbDataSourceConfig, LambdaConflictHandlerConfig};
 
     /// One case of the handler table: what it exercises, the `conflictHandler` the
     /// configuration names (`None` where it names none), and the Lambda configuration it
@@ -284,5 +284,81 @@ mod tests {
             refusal.is_none(),
             "case a request carrying no syncConfig: expected no refusal, got {refusal:?}"
         );
+    }
+
+    /// A stored data source of `type`, carrying `dynamodb_config` when it is a DynamoDB
+    /// one.
+    fn data_source(
+        r#type: &str,
+        dynamodb_config: Option<DynamodbDataSourceConfig>,
+    ) -> DataSourceRecord {
+        DataSourceRecord {
+            name: "items".to_string(),
+            arn: "arn:aws:appsync:us-west-2:000000000000:apis/abc/datasources/items".to_string(),
+            description: None,
+            r#type: r#type.to_string(),
+            service_role_arn: None,
+            dynamodb_config,
+            lambda_config: None,
+            elasticsearch_config: None,
+            open_search_service_config: None,
+            http_config: None,
+            relational_database_config: None,
+            event_bridge_config: None,
+            metrics_config: None,
+        }
+    }
+
+    /// A DynamoDB configuration with versioning turned on or off
+    /// (`DynamodbDataSourceConfig$versioned`).
+    fn dynamodb(versioned: bool) -> DynamodbDataSourceConfig {
+        DynamodbDataSourceConfig {
+            table_name: "items".to_string(),
+            aws_region: "us-west-2".to_string(),
+            use_caller_credentials: false,
+            delta_sync_config: None,
+            versioned,
+        }
+    }
+
+    #[test]
+    fn a_sync_configuration_needs_a_data_source_that_keeps_versioned_items() {
+        let versioned = data_source("AMAZON_DYNAMODB", Some(dynamodb(true)));
+        let unversioned = data_source("AMAZON_DYNAMODB", Some(dynamodb(false)));
+        // A type with no versioning member of its own
+        // (`smithy_query(query="shape", shape="DataSourceType")`).
+        let lambda = data_source("AWS_LAMBDA", None);
+        let sync_config = config(Some("OPTIMISTIC_CONCURRENCY"), None);
+        // The rows differ along the DATA SOURCE the resolver resolves against, with and
+        // without a sync configuration asked for.
+        let refused: &[(&str, Option<&DataSourceRecord>)] = &[
+            ("an unversioned DynamoDB data source", Some(&unversioned)),
+            ("a data source of another type", Some(&lambda)),
+            ("no data source at all", None),
+        ];
+        for (case, data_source) in refused {
+            let refusal = versioned_data_source_refusal(Some(&sync_config), *data_source);
+            assert_eq!(
+                refusal.as_deref(),
+                Some(UNVERSIONED_DATA_SOURCE_MESSAGE),
+                "case {case:?}: expected {UNVERSIONED_DATA_SOURCE_MESSAGE:?}, got {refusal:?}"
+            );
+        }
+        let admitted: &[(&str, Option<&SyncConfig>, Option<&DataSourceRecord>)] = &[
+            (
+                "a versioned DynamoDB data source",
+                Some(&sync_config),
+                Some(&versioned),
+            ),
+            ("no sync configuration asked for", None, Some(&unversioned)),
+            ("neither of the two", None, None),
+        ];
+        for (case, sync_config, data_source) in admitted {
+            let refusal = versioned_data_source_refusal(*sync_config, *data_source);
+            assert!(
+                refusal.is_none(),
+                "case {case:?}: expected no refusal, got {refusal:?}"
+            );
+        }
     }
 }
