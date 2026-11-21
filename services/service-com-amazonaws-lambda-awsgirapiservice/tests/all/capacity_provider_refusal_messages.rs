@@ -428,7 +428,7 @@ async fn an_update_during_a_deletion_is_refused_by_its_own_sentence() {
 /// Move every stored provider's removal instant into the past, so the next request
 /// materialises the removal the clock owes. This is what waiting would do, without
 /// waiting.
-fn make_removal_due(engine: &Arc<engine::InMemoryEngine>) {
+pub(crate) fn make_removal_due(engine: &Arc<engine::InMemoryEngine>) {
     let state = engine.state::<ComAmazonawsLambdaAwsgirapiserviceState>();
     let mut store = state.lock();
     let past = SystemTime::now() - Duration::from_secs(1);

@@ -83,7 +83,7 @@ fn router_without_iam() -> MultiServiceRouter {
 
 /// Lambda over the SAME engine as IAM, so the create resolves the operator role in the
 /// service that owns it — exactly what `core/router` assembles.
-fn router_with_iam() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn router_with_iam() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -97,7 +97,7 @@ fn router_with_iam() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// Create one role through IAM's own `CreateRole`, and answer the ARN IAM persisted.
-async fn given_role(
+pub(crate) async fn given_role(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
@@ -133,7 +133,7 @@ async fn given_role(
 }
 
 /// A trust policy with one statement: `effect` on `sts:AssumeRole` for `principal`.
-fn trust(effect: &str, principal: &str) -> Value {
+pub(crate) fn trust(effect: &str, principal: &str) -> Value {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
