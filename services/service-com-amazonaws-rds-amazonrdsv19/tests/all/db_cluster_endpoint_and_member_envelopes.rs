@@ -10,10 +10,11 @@
 //!    `DBCluster$Port` ("the port that the database engine is listening on") beside its two
 //!    endpoint members, so neither `Endpoint` nor `ReaderEndpoint` carries a port of its own
 //!    and neither is ever written as a `host:port` authority; a client composes the address
-//!    it dials from an endpoint and that one port. A cluster whose data plane this emulator
-//!    SERVES publishes the host that plane is reached at, and every other cluster the
-//!    documented DNS name — `<identifier>.cluster-<label>` for the writer and
-//!    `<identifier>.cluster-ro-<label>` for the reader.
+//!    it dials from an endpoint and that one port. Both are the documented DNS names the
+//!    CLUSTER mints from its identifier — `<identifier>.cluster-<label>` for the writer and
+//!    `<identifier>.cluster-ro-<label>` for the reader — over one shared suffix: the zone a
+//!    cluster whose data plane this emulator SERVES is reached in, and the endpoint domain of
+//!    the control plane that owns the engine for every other cluster.
 //!
 //! 2. `DBClusterMember$PromotionTier` is "the order in which an Aurora Replica is promoted
 //!    to the primary instance": a property of the MEMBER instance — the value its request
@@ -34,7 +35,7 @@
 //! and two clusters whose managed secrets must not share a name.
 
 use crate::db_clusters::{describe_one, the_cluster};
-use crate::db_instances::{call, emulator, expect_ok, optional_text, subtrees, text};
+use crate::db_instances::{call, emulator, expect_ok, optional_text, subtrees, text, REGION};
 use crate::lifecycle_poll_loops::poll_until;
 use crate::managed_master_user_password::{
     emulator as emulator_with_secrets, master_user_secret, the_resource,
@@ -169,17 +170,15 @@ fn the_published_address(case: &str, row: &EndpointCase, which: &str, cluster: &
         );
     }
     if row.served {
-        // The address a client dials: the host the cluster's own engine listener is reached
-        // at, which the core binds on loopback, for both of the cluster's endpoints.
-        assert_eq!(
-            endpoint, "127.0.0.1",
-            "case {case:?} ({which}): expected the host the cluster's data plane is reached \
-             at, got {endpoint:?}"
-        );
-        assert_eq!(
-            reader, endpoint,
-            "case {case:?} ({which}): expected the reader endpoint on the host the cluster's \
-             data plane is reached at, got {reader:?}"
+        // A cluster whose engine wire this emulator serves announces both names in the zone
+        // its own listener is reached in.
+        crate::db_clusters::assert_endpoint_name_pair(
+            &format!("{case} ({which})"),
+            row.identifier,
+            REGION,
+            crate::db_clusters::SERVED_SUFFIX,
+            &endpoint,
+            &reader,
         );
         return;
     }

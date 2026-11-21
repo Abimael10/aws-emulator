@@ -1155,7 +1155,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Filled in below from the cluster's own engine listener, for a cluster whose
             // engine speaks a wire this emulator serves.
             served_endpoint: None,
-            served_reader_endpoint: None,
             // A newly created DB cluster is not yet usable: RDS answers `creating`, and the
             // cluster reaches `available` on its own. The due instant is stored on the
             // record, so nothing sleeps on this thread.
@@ -1393,7 +1392,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
         record.served_endpoint = endpoint.as_ref().map(|endpoint| endpoint.endpoint.clone());
-        record.served_reader_endpoint = endpoint.as_ref().and_then(|endpoint| endpoint.reader.clone());
         // A cluster whose engine speaks no native wire can still have a data plane this
         // emulator serves: an Amazon Neptune cluster's is its graph API, served on this
         // emulator's own endpoint, so the cluster publishes THAT address — the one a client

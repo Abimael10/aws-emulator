@@ -410,11 +410,23 @@ async fn deleting_a_cluster_closes_the_port_it_published() {
         described.0, 404,
         "the deleted cluster must be gone from the store, got {described:?}"
     );
-    // The port the cluster published was the core's own listener, bound on loopback, which
-    // is why the address this dials is that loopback literal.
-    assert_eq!(
-        address, "127.0.0.1",
-        "the published endpoint must be this machine's loopback address, got {address:?}"
+    // The port the cluster published was the core's own listener, bound on loopback — the
+    // interface the name the cluster published resolves to — which is where this dials.
+    let resolved: Vec<std::net::SocketAddr> = tokio::net::lookup_host((address.as_str(), port))
+        .await
+        .unwrap_or_else(|error| {
+            panic!("the published endpoint {address:?} must resolve, got {error}")
+        })
+        .collect();
+    assert!(
+        !resolved.is_empty() && resolved.iter().all(|address| address.ip().is_loopback()),
+        "the published endpoint must resolve to this machine's loopback interface, got \
+         {resolved:?} for {address:?}"
+    );
+    assert!(
+        resolved.iter().any(|address| address.is_ipv4()),
+        "the published endpoint must resolve to this machine's IPv4 loopback address, which \
+         is the one the core binds on, got {resolved:?}"
     );
     let connected = tokio::net::TcpStream::connect(("127.0.0.1", port)).await;
     assert!(

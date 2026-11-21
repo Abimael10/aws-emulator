@@ -208,41 +208,24 @@ fn assert_engine_defaults(case: &str, label: &str, cluster: &str, row: &EngineCa
         "case {case:?}: expected <AllocatedStorage> {:?}, got {allocated:?} in {cluster}",
         row.expected_allocated_storage
     );
-    let suffix = format!(".{REGION}.{}", row.expected_domain);
-    // The WRITER endpoint of a cluster this emulator serves the engine's wire for is the
-    // host its listener is bound to, which the core binds on loopback; every other cluster
-    // endpoint is the published DNS form of its own control plane's domain.
-    let writer = text(cluster, "Endpoint");
-    if row.serves_the_engines_wire {
-        assert_eq!(
-            writer, "127.0.0.1",
-            "case {case:?}: expected the host the cluster's engine listener is bound to, got \
-             {writer:?} in {cluster}"
-        );
+    let identifier = text(cluster, "DBClusterIdentifier");
+    // Both endpoint names are minted by the CLUSTER from its identifier, over one shared
+    // suffix: the engine's service label in the zone this emulator announces a served
+    // cluster's names in, and the endpoint domain of the control plane that owns the engine
+    // for a cluster this emulator serves no data plane for.
+    let suffix = if row.serves_the_engines_wire {
+        crate::db_clusters::SERVED_SUFFIX
     } else {
-        assert!(
-            writer.contains(".cluster-") && writer.ends_with(&suffix),
-            "case {case:?}: expected an <Endpoint> of the form \
-             <identifier>.cluster-<label>{suffix}, got {writer:?}"
-        );
-    }
-    let reader = text(cluster, "ReaderEndpoint");
-    // The READER endpoint of such a cluster is a HOST too — the one the cluster's data plane
-    // is reached at, since the `Port` beside it is the pair's; every other cluster's is the
-    // published DNS form.
-    if row.serves_the_engines_wire {
-        assert_eq!(
-            reader, "127.0.0.1",
-            "case {case:?}: expected the host the cluster's data plane is reached at, got \
-             {reader:?} in {cluster}"
-        );
-    } else {
-        assert!(
-            reader.contains(".cluster-ro-") && reader.ends_with(&suffix),
-            "case {case:?}: expected a <ReaderEndpoint> of the form \
-             <identifier>.cluster-ro-<label>{suffix}, got {reader:?}"
-        );
-    }
+        row.expected_domain
+    };
+    crate::db_clusters::assert_endpoint_name_pair(
+        &case,
+        &identifier,
+        REGION,
+        suffix,
+        &text(cluster, "Endpoint"),
+        &text(cluster, "ReaderEndpoint"),
+    );
 }
 
 #[tokio::test]

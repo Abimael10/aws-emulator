@@ -312,6 +312,62 @@ pub(crate) async fn describe_one(
 /// The query parameters of one call, owned so a table row can hold them.
 type Params = Vec<(&'static str, String)>;
 
+/// The DNS suffix the endpoint names of a cluster whose engine WIRE this emulator serves sit
+/// in: the service label of the control plane that owns the engine, in the loopback zone RFC
+/// 6761 reserves for the interface the core binds its listeners on.
+///
+/// A cluster this emulator serves no data plane for keeps the published AWS form instead, so
+/// a row for such a cluster passes its own control plane's endpoint domain.
+pub(crate) const SERVED_SUFFIX: &str = "rds.localhost";
+
+/// RULE: the two endpoint names a DB cluster publishes are minted by the CLUSTER from its own
+/// identifier — the writer under `cluster-`, the reader under `cluster-ro-` — with one
+/// server-assigned label and ONE shared suffix behind them, and neither carries a port. They
+/// are therefore non-empty and distinct whatever the cluster's membership is.
+///
+/// `pub(crate)` so every suite that reads a cluster's endpoints asserts the one rule rather
+/// than a copy of it.
+pub(crate) fn assert_endpoint_name_pair(
+    case: &str,
+    identifier: &str,
+    region: &str,
+    suffix: &str,
+    writer: &str,
+    reader: &str,
+) {
+    let writer_label = format!("{identifier}.cluster-");
+    let reader_label = format!("{identifier}.cluster-ro-");
+    let tail = format!(".{region}.{suffix}");
+    assert_ne!(
+        writer, reader,
+        "case {case:?}: a cluster's reader endpoint must be distinct from its writer \
+         endpoint, got {writer:?} for both"
+    );
+    for (which, name, label) in [
+        ("writer", writer, &writer_label),
+        ("reader", reader, &reader_label),
+    ] {
+        assert!(
+            name.starts_with(label.as_str()) && name.ends_with(&tail),
+            "case {case:?}: expected a {which} endpoint of the form {label}<label>{tail}, got \
+             {name:?}"
+        );
+        assert!(
+            !name.contains(':'),
+            "case {case:?}: an endpoint member carries no port of its own, got {name:?}"
+        );
+    }
+    // The server-assigned label and the suffix are the CLUSTER's: both names carry the same
+    // ones, so the role label is the only thing that differs between them.
+    let writer_rest = writer.strip_prefix(writer_label.as_str());
+    let reader_rest = reader.strip_prefix(reader_label.as_str());
+    assert_eq!(
+        writer_rest, reader_rest,
+        "case {case:?}: both endpoints must carry one label and one suffix, got {writer:?} and \
+         {reader:?}"
+    );
+}
+
 /// One filter row: the case, the filter the request carries, and the clusters it selects.
 type FilterRow = (&'static str, Params, Vec<&'static str>);
 
@@ -373,28 +429,26 @@ fn assert_reported(case: &str, label: &str, xml: &str, row: &ClusterCase) {
             "case {case:?}: expected <{element}> {expected:?}, got {actual:?} in {xml}"
         );
     }
-    // The cluster's WRITER endpoint is the address a client dials, so a cluster whose
-    // engine this emulator serves publishes the host its own engine listener is bound to —
-    // the core binds on loopback — and the port that listener answers on. Its READER
-    // endpoint is a HOST too: the model gives a cluster ONE `Port` for both of its
-    // endpoints, so neither endpoint member carries a port of its own.
+    // The cluster's WRITER endpoint is a DNS name the cluster mints from its own identifier,
+    // and its READER endpoint the same name under the `cluster-ro-` label: a client dials
+    // what it resolves either of them to with the one `Port` beside them, so neither endpoint
+    // member carries a port of its own. A cluster whose engine wire this emulator serves
+    // announces both in the zone its own listener is reached in.
     let endpoint = text(xml, "Endpoint");
-    assert_eq!(
-        endpoint, "127.0.0.1",
-        "case {case:?}: expected the endpoint the cluster's engine listener is bound to, \
-         got {endpoint:?} in {xml}"
+    let reader = text(xml, "ReaderEndpoint");
+    assert_endpoint_name_pair(
+        &case,
+        row.stored_identifier,
+        REGION,
+        SERVED_SUFFIX,
+        &endpoint,
+        &reader,
     );
     let port = text(xml, "Port");
     assert!(
         port.parse::<u16>().is_ok_and(|port| port != 0),
         "case {case:?}: expected the port the cluster's engine listener answers on, got \
          {port:?} in {xml}"
-    );
-    let reader = text(xml, "ReaderEndpoint");
-    assert_eq!(
-        reader, endpoint,
-        "case {case:?}: expected the host the cluster's data plane is reached at, got \
-         {reader:?} in {xml}"
     );
     let resource_id = text(xml, "DbClusterResourceId");
     assert!(

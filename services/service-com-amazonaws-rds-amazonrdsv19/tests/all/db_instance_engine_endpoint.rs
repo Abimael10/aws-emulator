@@ -228,15 +228,31 @@ impl Rows {
 
 /// Open a TCP connection to an engine endpoint of THIS emulator.
 ///
-/// The endpoint the control plane published is the core's own listener, which the core
-/// binds on loopback (`EMULATOR_BIND_ADDRESS`, `127.0.0.1` by default), so the dial below
-/// is to this machine — and the assertion is what pins it there: the address the control
-/// plane published has to be that loopback address, and that is the address dialled.
+/// The endpoint the control plane published is a HOST a client RESOLVES and then dials: the
+/// address of the core's own listener for a resource that publishes one, and the DNS name a
+/// DB cluster mints from its identifier — which the emulator announces in the loopback zone
+/// RFC 6761 reserves for the interface the core binds on. Both are dialled exactly as a
+/// client does, and the assertion is what pins the published host to this machine: whatever
+/// it resolves to has to be a loopback address, or it is no endpoint of this emulator.
 async fn connect(address: &str, port: u16) -> Client {
-    assert_eq!(
-        address, "127.0.0.1",
-        "the published endpoint must be this machine's loopback address, got {address:?}"
+    let resolved: Vec<std::net::SocketAddr> = tokio::net::lookup_host((address, port))
+        .await
+        .unwrap_or_else(|error| {
+            panic!("the published endpoint {address:?} must resolve, got {error}")
+        })
+        .collect();
+    assert!(
+        !resolved.is_empty() && resolved.iter().all(|address| address.ip().is_loopback()),
+        "the published endpoint must resolve to this machine's loopback interface, got \
+         {resolved:?} for {address:?}"
     );
+    assert!(
+        resolved.iter().any(|address| address.is_ipv4()),
+        "the published endpoint must resolve to this machine's IPv4 loopback address, which \
+         is the one the core binds on, got {resolved:?} for {address:?}"
+    );
+    // So the dial goes to the address the name resolved to: this machine's loopback
+    // interface, with the published port.
     let stream = TcpStream::connect(("127.0.0.1", port))
         .await
         .unwrap_or_else(|error| {

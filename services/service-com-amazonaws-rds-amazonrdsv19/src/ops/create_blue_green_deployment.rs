@@ -659,11 +659,9 @@ async fn open_the_green_endpoint<Eng: Send + Sync + 'static>(
     }
     let mut store = state.lock();
     let served = endpoint.endpoint.clone();
-    let reader = endpoint.reader.clone();
     if green.is_cluster {
         if let Some(record) = store.db_clusters.get_mut(&green.key) {
             record.served_endpoint = Some(served);
-            record.served_reader_endpoint = reader;
         }
         store
             .db_cluster_engine_endpoints

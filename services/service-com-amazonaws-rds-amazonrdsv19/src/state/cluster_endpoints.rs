@@ -387,32 +387,22 @@ impl DbClusterEndpointRecord {
     }
 
     /// `Endpoint`: "the DNS address of the endpoint", whose published form is
-    /// `<endpoint identifier>.cluster-custom-<server-assigned label>.<region>.<domain>` —
-    /// the cluster's own label and the domain of the control plane that owns its engine, so
-    /// a custom endpoint sits beside the two endpoints the cluster itself publishes
-    /// ([`DbClusterRecord::endpoint`]).
+    /// `<endpoint identifier>.cluster-custom-<server-assigned label>.<region>.<suffix>` —
+    /// the endpoint's own identifier in front of the CLUSTER's label, region and endpoint
+    /// suffix, so a custom endpoint sits beside the two endpoints the cluster itself
+    /// publishes ([`DbClusterRecord::endpoint`]) and resolves where they do.
     ///
-    /// A cluster whose data plane this emulator SERVES publishes the address that plane is
-    /// reached at instead, and a custom endpoint is one name in FRONT of that same data
-    /// plane, so it publishes what the cluster publishes — reusing the cluster's own
-    /// accessor rather than copying it, so the two can never disagree. Reporting a name
-    /// this machine does not resolve would be no endpoint at all.
+    /// The suffix is read off the cluster's own name rather than composed a second time
+    /// ([`DbClusterRecord::custom_endpoint_host`]), so a custom endpoint and the cluster it
+    /// fronts cannot disagree about the zone they are announced in: for a cluster whose data
+    /// plane this emulator serves that is the zone its listener is reached in, and for every
+    /// other cluster the endpoint domain of the control plane that owns its engine.
     ///
-    /// That is the host the cluster's `Port` goes with, for a `READER` endpoint as much as
-    /// for the other two types: no endpoint member of this control plane carries a port of
-    /// its own, so every name in front of a cluster's data plane publishes the host that
-    /// plane is reached at, exactly as the cluster's own two endpoints do.
+    /// A HOST, as the cluster's own two endpoint members are: no endpoint member of this
+    /// control plane carries a port of its own, so a client dials what it resolves this name
+    /// to with the cluster's `Port`.
     fn address_on(&self, cluster: &DbClusterRecord) -> String {
-        if cluster.served_endpoint.is_some() {
-            return cluster.endpoint();
-        }
-        format!(
-            "{}.cluster-custom-{}.{}.{}",
-            self.identifier,
-            cluster.endpoint_host,
-            cluster.region,
-            endpoint_domain(&cluster.engine)
-        )
+        cluster.custom_endpoint_host(&self.identifier)
     }
 }
 

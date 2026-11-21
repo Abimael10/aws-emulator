@@ -336,16 +336,17 @@ async fn available_cluster(
             text(&settled, "Port")
         )
     });
-    // Both endpoint members are HOSTS: the model gives a DB cluster ONE `Port` for the
-    // pair, so the reader endpoint carries no port of its own and publishes the host the
-    // cluster's data plane is reached at, as the writer endpoint does.
+    // Both endpoint members are HOSTS the cluster mints from its own identifier: the model
+    // gives a DB cluster ONE `Port` for the pair, so neither carries a port of its own, and
+    // the `cluster-`/`cluster-ro-` label is what tells the read path from the write path.
     let reader_host = text(&settled, "ReaderEndpoint");
-    assert_eq!(
-        reader_host,
-        text(&settled, "Endpoint"),
-        "case {:?}: the reader endpoint publishes the host the cluster's data plane is \
-         reached at",
-        row.case
+    crate::db_clusters::assert_endpoint_name_pair(
+        row.case,
+        row.identifier,
+        REGION,
+        crate::db_clusters::SERVED_SUFFIX,
+        &text(&settled, "Endpoint"),
+        &reader_host,
     );
     (
         (text(&settled, "Endpoint"), writer_port),
@@ -391,11 +392,10 @@ async fn a_clusters_reader_endpoint_serves_the_writers_rows_and_refuses_every_wr
     let (router, engine) = emulator_with_engine();
     for row in CLUSTERS {
         let (writer, reader) = available_cluster(&router, &engine, row).await;
-        assert_eq!(
+        assert_ne!(
             reader.0, writer.0,
-            "case {:?}: both of a cluster's endpoints are listeners of this machine, got \
-             {:?} and {:?}",
-            row.case, writer.0, reader.0
+            "case {:?}: a cluster's reader endpoint is a name of its own, got {:?} for both",
+            row.case, writer.0
         );
         assert_ne!(
             reader.1, writer.1,
@@ -458,11 +458,29 @@ async fn deleting_a_cluster_closes_the_reader_port_with_the_writer_one() {
     );
     for (endpoint, which) in [(writer, "writer"), (reader, "reader")] {
         // The ports the cluster published were the core's own listeners, which it binds on
-        // loopback: that is the address this dials, and the assertion is what pins it there.
-        assert_eq!(
-            endpoint.0, "127.0.0.1",
-            "case {:?}: the {which} endpoint must be this machine's loopback address, got {:?}",
-            row.case, endpoint.0
+        // loopback — the interface the names the cluster published resolve to — so that is
+        // the address this dials, and nothing may answer there any more.
+        let resolved: Vec<std::net::SocketAddr> =
+            tokio::net::lookup_host((endpoint.0.as_str(), endpoint.1))
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "case {:?}: the {which} endpoint {:?} must resolve, got {error}",
+                        row.case, endpoint.0
+                    )
+                })
+                .collect();
+        assert!(
+            !resolved.is_empty() && resolved.iter().all(|address| address.ip().is_loopback()),
+            "case {:?}: the {which} endpoint must resolve to this machine's loopback \
+             interface, got {resolved:?}",
+            row.case
+        );
+        assert!(
+            resolved.iter().any(|address| address.is_ipv4()),
+            "case {:?}: the {which} endpoint must resolve to this machine's IPv4 loopback \
+             address, which is the one the core binds on, got {resolved:?}",
+            row.case
         );
         let connected = tokio::net::TcpStream::connect(("127.0.0.1", endpoint.1)).await;
         assert!(

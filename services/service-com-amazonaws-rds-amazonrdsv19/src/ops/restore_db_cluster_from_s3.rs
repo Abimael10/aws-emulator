@@ -855,7 +855,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             endpoint_host: crate::state::mint_endpoint_host(mint),
             // Filled in below from the cluster's own engine listener.
             served_endpoint: None,
-            served_reader_endpoint: None,
             // A restored DB cluster is not usable the instant the call returns: RDS answers
             // `creating` and the cluster reaches `available` on its own — "You can create DB
             // instances only after the RestoreDBClusterFromS3 operation has completed and the
@@ -1071,8 +1070,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
         record.served_endpoint = endpoint.as_ref().map(|endpoint| endpoint.endpoint.clone());
-        record.served_reader_endpoint =
-            endpoint.as_ref().and_then(|endpoint| endpoint.reader.clone());
         if record.served_endpoint.is_none() {
             record.served_endpoint = crate::state::api_plane_endpoint(&record.engine, ctx);
         }

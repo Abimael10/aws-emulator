@@ -119,8 +119,13 @@ pub fn addresses_of(inside: Option<&VpcAttachment>, host: &str) -> Vec<IpAddr> {
 /// Whether `host` names THIS machine: one of the loopback names the core answers for, or a
 /// name under the `localhost` domain — "the domain name 'localhost.' and any names falling
 /// within '.localhost.' … resolve to loopback addresses" (RFC 6761 §6.3).
+///
+/// The tree's one reading of that question
+/// (`service_common::data_plane_addressing::names_the_loopback_interface`), so a name this
+/// resolver answers with the loopback address is the same set of names the register of the
+/// planes this emulator serves resolves there (`service_common::dialable_data_planes`).
 fn loopback_name(host: &str) -> bool {
-    ::emulator_server::is_loopback_host(host) || host.ends_with(".localhost")
+    ::service_common::data_plane_addressing::names_the_loopback_interface(host)
 }
 
 /// Whether `host` is one of the documentation domains ([`DOCUMENTATION_DOMAINS`]) or the one

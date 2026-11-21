@@ -315,21 +315,23 @@ impl DialablePlanes {
     /// `None` when this emulator has opened no plane there.
     ///
     /// The address as written is resolved first. A client that reached one of this machine's
-    /// own LOOPBACK spellings (`localhost`, `127.0.0.1`, `::1`) is resolved against the other
-    /// spellings of the same interface too, because the listener was opened on one of them and
-    /// all of them name it: the port is what picks the plane out, and an address on another
-    /// host resolves only as itself.
+    /// own LOOPBACK spellings is resolved against the other spellings of the same interface
+    /// too (`crate::data_plane_addressing::names_the_loopback_interface`, the tree's one
+    /// reading of that question), because the listener was opened on one of them and all of
+    /// them name it: the port is what picks the plane out, and an address on another host
+    /// resolves only as itself.
     #[must_use]
     pub fn dialable(&self, host: &str, port: u16) -> Option<Dialed> {
+        let names_this_machine = crate::data_plane_addressing::names_the_loopback_interface;
         let asked = crate::data_plane_addressing::host_port_authority(host, port);
         let held = self.0.lock();
         let found = held.open.get_key_value(&key(&asked)).or_else(|| {
-            if !::emulator_server::is_loopback_host(trimmed(host)) {
+            if !names_this_machine(trimmed(host)) {
                 return None;
             }
             held.open.iter().find(|(authority, _open)| {
                 let (held_host, held_port) = split_authority(authority);
-                held_port == Some(port) && ::emulator_server::is_loopback_host(trimmed(held_host))
+                held_port == Some(port) && names_this_machine(trimmed(held_host))
             })
         });
         found.map(|(authority, open)| Dialed {
@@ -447,9 +449,10 @@ mod tests {
     ///
     /// The rows span what the reading generalises over: the address shapes a core listener is
     /// published at (an IPv4 literal, a bracketed IPv6 one), the case a client writes one in,
-    /// the other spellings of the SAME loopback interface, two planes of two services on one
-    /// engine, and the addresses that resolve to nothing (another port of the same host, a
-    /// routable host nothing was opened at).
+    /// the other spellings of the SAME loopback interface — including a name a service
+    /// ANNOUNCED under the loopback zone, which RFC 6761 reserves for that interface — two
+    /// planes of two services on one engine, and the addresses that resolve to nothing
+    /// (another port of the same host, a routable host nothing was opened at).
     #[tokio::test]
     async fn a_connection_to_a_recorded_address_is_served_by_that_planes_handler() {
         let engine = ::engine::InMemoryEngine::new();
@@ -463,6 +466,18 @@ mod tests {
             ("an address recorded in another case", "localhost", 8443, Some("localhost:8443")),
             ("the loopback name for an IPv4 listener", "localhost", 37333, Some("127.0.0.1:37333")),
             ("the IPv4 literal for an IPv6 listener", "127.0.0.1", 40127, Some("[::1]:40127")),
+            (
+                "a name announced in the loopback zone",
+                "db.cluster-ro-abcdefghijkl.us-west-2.rds.localhost",
+                37333,
+                Some("127.0.0.1:37333"),
+            ),
+            (
+                "an announced name on a port nothing was opened on",
+                "db.cluster-abcdefghijkl.us-west-2.rds.localhost",
+                37334,
+                None,
+            ),
             ("another port of the same host", "127.0.0.1", 37334, None),
             ("a routable host nothing was opened at", "10.0.0.1", 37333, None),
         ];

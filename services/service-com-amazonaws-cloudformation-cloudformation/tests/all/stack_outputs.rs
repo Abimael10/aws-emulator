@@ -273,7 +273,7 @@ fn rds_instance_arn(identifier: &str) -> String {
 }
 
 /// Whether `value` is an Amazon RDS endpoint DNS name of the published form
-/// `<identifier><infix><service-assigned label>.<region>.rds.amazonaws.com`: the cluster
+/// `<identifier><infix><service-assigned label>.<region>.<suffix>`: the cluster
 /// endpoint's infix is `.cluster-`, the reader endpoint's `.cluster-ro-` and a DB
 /// instance's a plain `.` ("Amazon Aurora connection management" / "Finding the connection
 /// information for an RDS DB instance").
@@ -281,17 +281,36 @@ fn rds_instance_arn(identifier: &str) -> String {
 /// The label is SERVICE-ASSIGNED — for a DB instance the stack really creates it is the one
 /// Amazon RDS minted and reported, not a value CloudFormation computed — so the only thing
 /// asserted about it is the alphabet AWS's own endpoints use: lowercase alphanumeric.
-fn is_rds_endpoint(value: &str, identifier: &str, infix: &str) -> bool {
-    let suffix = format!(".{REGION}.rds.amazonaws.com");
+fn is_endpoint_name(value: &str, identifier: &str, infix: &str, suffix: &str) -> bool {
     value
         .strip_prefix(&format!("{identifier}{infix}"))
-        .and_then(|rest| rest.strip_suffix(&suffix))
+        .and_then(|rest| rest.strip_suffix(suffix))
         .is_some_and(|label| {
             !label.is_empty()
                 && label
                     .chars()
                     .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase())
         })
+}
+
+/// [`is_endpoint_name`] in the zone AWS publishes its database endpoints in, which is where
+/// the endpoint of a resource this emulator serves no data plane for sits.
+fn is_rds_endpoint(value: &str, identifier: &str, infix: &str) -> bool {
+    is_endpoint_name(
+        value,
+        identifier,
+        infix,
+        &format!(".{REGION}.rds.amazonaws.com"),
+    )
+}
+
+/// [`is_endpoint_name`] in the zone this emulator ANNOUNCES a name of its own in, which is
+/// where the endpoints of a DB CLUSTER whose engine wire it SERVES sit: the same published
+/// form, over the loopback zone RFC 6761 reserves for the interface the core binds its
+/// listeners on, so the name a stack output carries resolves to the port the cluster's own
+/// engine listener answers on (pinned in the RDS crate's own suites).
+fn is_served_rds_cluster_endpoint(value: &str, identifier: &str, infix: &str) -> bool {
+    is_endpoint_name(value, identifier, infix, &format!(".{REGION}.rds.localhost"))
 }
 
 /// Whether `value` is an Amazon RDS immutable resource id: `prefix-` and 26 UPPERCASE
@@ -1081,22 +1100,32 @@ fn output_cases() -> Vec<OutputCase> {
                 ),
                 (
                     // The cluster's engine is one this emulator SERVES a native wire for, so
-                    // Amazon RDS publishes the host its own engine listener is bound to and
-                    // the stack's output carries that — the address a client dials, exactly as
-                    // the served DB instance row below does.
+                    // Amazon RDS publishes the name the CLUSTER mints from its identifier in
+                    // the zone its own listener is reached in, and the stack's output carries
+                    // that — the writer endpoint under `.cluster-` and the reader endpoint
+                    // under `.cluster-ro-`, as the served DB instance row below carries the
+                    // instance's own endpoint.
                     "ClusterEndpoint",
                     Expected::Form {
-                        described: "the loopback host the cluster's engine listener is bound \
-                                    to",
-                        check: |value| value == "127.0.0.1",
+                        described: "the cluster's writer endpoint name, in the zone its engine \
+                                    listener is reached in",
+                        check: |value| {
+                            is_served_rds_cluster_endpoint(value, "probe-app-cluster", ".cluster-")
+                        },
                     },
                 ),
                 (
                     "ClusterReaderEndpoint",
                     Expected::Form {
-                        described: "the loopback host the cluster's reader endpoint is served \
-                                    on",
-                        check: |value| value == "127.0.0.1",
+                        described: "the cluster's reader endpoint name, which carries the \
+                                    `cluster-ro-` label over the same suffix",
+                        check: |value| {
+                            is_served_rds_cluster_endpoint(
+                                value,
+                                "probe-app-cluster",
+                                ".cluster-ro-",
+                            )
+                        },
                     },
                 ),
                 (

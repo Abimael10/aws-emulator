@@ -263,11 +263,28 @@ impl Session {
     /// Open a session on `address:port` as libpq does: the startup message, the cleartext
     /// password, and then the parameters the server reports.
     pub(crate) async fn open(case: &str, address: &str, port: u16) -> Self {
-        assert_eq!(
-            address, "127.0.0.1",
-            "case {case:?}: the published endpoint must be this machine's loopback address, \
-             got {address:?}"
+        // The endpoint the control plane published is a HOST a client RESOLVES and then
+        // dials: a DB cluster publishes the DNS name it mints from its identifier, which
+        // this emulator announces in the zone reserved for the interface the core binds its
+        // listeners on. The assertion is what pins the name to this machine.
+        let resolved: Vec<std::net::SocketAddr> = tokio::net::lookup_host((address, port))
+            .await
+            .unwrap_or_else(|error| {
+                panic!("case {case:?}: the published endpoint {address:?} must resolve, got {error}")
+            })
+            .collect();
+        assert!(
+            !resolved.is_empty() && resolved.iter().all(|address| address.ip().is_loopback()),
+            "case {case:?}: the published endpoint must resolve to this machine's loopback \
+             interface, got {resolved:?} for {address:?}"
         );
+        assert!(
+            resolved.iter().any(|address| address.is_ipv4()),
+            "case {case:?}: the published endpoint must resolve to this machine's IPv4 loopback \
+             address, which is the one the core binds on, got {resolved:?}"
+        );
+        // So the dial goes to the address the name resolved to: this machine's loopback
+        // interface, with the published port.
         let mut conn = TcpStream::connect(("127.0.0.1", port))
             .await
             .unwrap_or_else(|error| {

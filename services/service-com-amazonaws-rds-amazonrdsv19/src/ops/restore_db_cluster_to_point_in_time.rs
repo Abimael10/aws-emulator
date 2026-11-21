@@ -972,7 +972,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Filled in below from the cluster's own engine listener, for a cluster whose
             // engine speaks a wire this emulator serves.
             served_endpoint: None,
-            served_reader_endpoint: None,
             // A restored DB cluster is not usable the instant the call returns: RDS answers
             // `creating` and the cluster reaches `available` on its own — "You can create DB
             // instances only after the RestoreDBClusterToPointInTime operation has completed
@@ -1226,8 +1225,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
         record.served_endpoint = endpoint.as_ref().map(|endpoint| endpoint.endpoint.clone());
-        record.served_reader_endpoint =
-            endpoint.as_ref().and_then(|endpoint| endpoint.reader.clone());
         // An engine whose data plane this emulator serves as an API rather than as a native
         // wire (Amazon Neptune's graph API) publishes this emulator's own endpoint, the
         // address that API answers on ([`crate::state::api_plane_endpoint`]).

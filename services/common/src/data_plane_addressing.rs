@@ -291,6 +291,40 @@ pub fn announced_zone_of_authority(authority: &str) -> String {
     host
 }
 
+/// Whether `host` names the LOOPBACK interface this emulator's listeners are bound on — the
+/// one interface whose spellings all name the same socket.
+///
+/// The core's own reading of a loopback address (`127.0.0.0/8`, `::1`, `localhost`), widened by
+/// the names UNDER the loopback zone: RFC 6761 reserves `localhost` AND "any names falling
+/// within '.localhost.'" for the loopback interface, so a resolver answers such a name with the
+/// address the core bound, and a service that ANNOUNCES a name of its own in that zone
+/// ([`announced_zone_of_authority`]) is naming this interface.
+///
+/// The reading for an ADDRESS — one a client dials, or one a plane is published at
+/// (`crate::dialable_data_planes`): an IP literal is a spelling of the interface here, and a
+/// bracketed IPv6 literal or a trailing root dot is read as written. A reading of a MODELLED
+/// member that must admit NAMES ONLY, because an address literal is judged as an address
+/// elsewhere, is a different question and keeps its own predicate — the SPEKE key-provider URL
+/// of `service-com-amazonaws-mediapackagev2-mediapackagev2` and the alternate-domain-name check
+/// of `service-com-amazonaws-cloudfront-cloudfront2020-05-31`, both of which reject every IP
+/// literal on their own line.
+#[must_use]
+pub fn names_the_loopback_interface(host: &str) -> bool {
+    let host = host.trim();
+    // The address as written, which is the form an IPv6 literal carrying no port is in, and
+    // then the host without its userinfo or port.
+    if ::emulator_server::is_loopback_host(host) {
+        return true;
+    }
+    let named = host_only(host).trim_end_matches('.');
+    if ::emulator_server::is_loopback_host(named) {
+        return true;
+    }
+    named
+        .to_ascii_lowercase()
+        .ends_with(&format!(".{LOOPBACK_ZONE}"))
+}
+
 /// The `host[:port]` this emulator is SERVED at, read off the base URL
 /// [`::smithy_server_runtime::OperationContext::endpoint`] reports ("the base URL a later
 /// request addresses… Callers send normally signed requests to it"), or `None` for an
@@ -804,7 +838,46 @@ mod tests {
     }
 
     #[test]
-    fn a_listeners_address_is_written_as_a_url_parses_it() {        // The rows span the bind addresses a core listener reports: an IPv4 literal, an
+    fn a_host_names_this_machines_loopback_interface_when_it_is_a_spelling_of_it() {
+        // The rows span what the reading generalises over: the loopback literals and the
+        // loopback name the core answers for, the names a service ANNOUNCES under the
+        // loopback zone (one label and several, in either case, rooted, and carrying a
+        // port), and the hosts that name another interface — a routable address, an
+        // operator's own name, a zone AWS serves, and a name that only CONTAINS the zone
+        // without being under it.
+        let cases: &[(&str, bool)] = &[
+            ("127.0.0.1", true),
+            ("127.0.0.1:9297", true),
+            ("127.0.0.53", true),
+            ("::1", true),
+            ("[::1]:9297", true),
+            ("localhost", true),
+            ("LOCALHOST:8443", true),
+            ("db.localhost", true),
+            ("emu-x.cluster-ro-abcdefghijkl.us-west-2.rds.localhost", true),
+            ("emu-x.cluster-abcdefghijkl.us-west-2.rds.localhost:5432", true),
+            ("Deviceadvisor.IOT.us-west-2.localhost.", true),
+            ("10.0.0.1", false),
+            ("192.168.1.10:9297", false),
+            ("emulator.internal", false),
+            ("rds.us-west-2.amazonaws.com", false),
+            ("localhost.example.com", false),
+            ("notlocalhost", false),
+            ("", false),
+        ];
+        for (host, expected) in cases {
+            let answered = names_the_loopback_interface(host);
+            assert_eq!(
+                answered, *expected,
+                "case {host:?}: expected names_the_loopback_interface {expected}, got \
+                 {answered}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_listeners_address_is_written_as_a_url_parses_it() {
+        // The rows span the bind addresses a core listener reports: an IPv4 literal, an
         // IPv6 literal (bracketed here), one already bracketed, and a name.
         let cases: &[(&str, u16, &str)] = &[
             ("127.0.0.1", 9297, "127.0.0.1:9297"),

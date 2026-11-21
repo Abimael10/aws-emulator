@@ -46,8 +46,9 @@ const CLUSTER_MEMBER_CLASS: &str = "db.r5.large";
 enum Expected {
     /// The exact host and port this emulator answers the cluster's data plane on.
     Address(&'static str, &'static str),
-    /// A listener of the cluster's own: the loopback host the core binds, on a port it
-    /// assigned, with the reader endpoint written whole as `host:port`.
+    /// A listener of the cluster's own: the two DNS names the cluster mints from its
+    /// identifier, in the zone the interface that listener is bound on is named by, with the
+    /// listener's port beside them.
     OwnListener,
     /// The DNS form of the engine's own control plane, with the port given.
     DnsName(&'static str, &'static str),
@@ -161,15 +162,15 @@ fn assert_published_address(case: &str, label: &str, cluster: &str, row: &Addres
             );
         }
         Expected::OwnListener => {
-            assert_eq!(
-                endpoint, "127.0.0.1",
-                "case {case:?}: expected the host the cluster's own engine listener is bound \
-                 to, got {endpoint:?} in {cluster}"
-            );
-            assert_eq!(
-                reader, "127.0.0.1",
-                "case {case:?}: expected the host the cluster's data plane is reached at, got \
-                 {reader:?} in {cluster}"
+            // A cluster whose own engine listener serves its data plane publishes the two
+            // names it mints from its identifier, in the zone that listener is reached in.
+            crate::db_clusters::assert_endpoint_name_pair(
+                &case,
+                &text(cluster, "DBClusterIdentifier"),
+                REGION,
+                crate::db_clusters::SERVED_SUFFIX,
+                &endpoint,
+                &reader,
             );
             assert!(
                 port.parse::<u16>().is_ok_and(|port| port != 0),

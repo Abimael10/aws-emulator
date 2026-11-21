@@ -314,6 +314,8 @@ pub mod ec2_images;
 pub mod parameter_formula;
 mod instances;
 mod clusters;
+// The DNS host names a DB cluster publishes as its two endpoints, and the suffix they share.
+mod cluster_endpoint_names;
 // The AUTOMATED BACKUP of a DB instance: the one every instance that keeps continuous
 // backups has, and the record a delete that asked to keep it leaves behind.
 mod instance_automated_backups;
@@ -389,6 +391,7 @@ pub use ca_certificates::*;
 pub use engine_defaults::*;
 pub use minted_values::*;
 pub use published_values::*;
+pub use cluster_endpoint_names::*;
 pub use clusters::*;
 pub use api_plane_address::*;
 pub use data_api_endpoint::*;
