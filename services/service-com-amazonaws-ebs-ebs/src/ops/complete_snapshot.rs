@@ -92,7 +92,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::sync::LazyLock;
 use std::time::SystemTime;
+
+use ::aws_smithy_schema::serde::ShapeSerializer as _;
+use ::aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
+use ::aws_smithy_schema_server::constraints::{
+    EnumTrait, LengthTrait, PatternTrait, RangeTrait, ValidatingSerializer,
+};
 
 use crate::state::{
     is_well_formed_snapshot_id, malformed_snapshot_id_message, snapshot_not_found_message,
@@ -188,11 +195,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(CompleteSnapshotErrorModeled::AccessDeniedException)?;
 
-        let state = crate::state::service_state(&*self.engine).ok_or_else(no_state)?;
-        let now = SystemTime::now();
-        let mut store = state.lock();
-        store.apply_due_transitions(now);
-
+        // The HEADER-bound members this operation takes off the boundary are judged
+        // first, which is where the boundary would have judged them — before any state is
+        // read, so a request the boundary would have refused still reaches no snapshot.
+        //
         // `ChecksumAlgorithm` is checked HERE rather than at the boundary (the member
         // carries `skip_validation` on `CompleteSnapshotInput`): the service answers an
         // algorithm it does not support with its own modelled `ValidationException`,
@@ -207,6 +213,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             }
         }
+        // The operation's other HEADER-bound members, for the same reason and in the same
+        // place: `ChangedBlocksCount`, `Checksum` and `ChecksumAggregationMethod` all
+        // carry `skip_validation`, so the constraints are the MODEL's and so is the
+        // report — the same walk and the same sentence the boundary would have produced —
+        // but it travels in the modelled error, which carries the `Reason` a client
+        // branches on.
+        if let Some(message) = header_constraint_refusal(&input) {
+            return Err(validation("INVALID_PARAMETER_VALUE", message));
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(no_state)?;
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        store.apply_due_transitions(now);
 
         let Some(snapshot) = store.snapshots.get_mut(&input.snapshot_id) else {
             // A value that is not even shaped like a snapshot id is a malformed
@@ -220,24 +240,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found(snapshot_not_found_message(&input.snapshot_id)));
         };
 
-        // DECLINED, deliberately: the optional aggregate `Checksum` /
-        // `ChecksumAggregationMethod` headers are NOT verified here. Their values are
-        // constrained by the model (`LINEAR`) and the boundary validator already refuses
-        // anything else, but the rule that turns the per-block checksums into the
-        // aggregate is not in the model and the published prose does not pin the
-        // byte-level composition (whether the per-block checksums are concatenated as
-        // their Base64 text or as their raw digests).
+        // DECLINED, deliberately: the aggregate `Checksum` a well-formed request carries
+        // is not recomputed from the blocks the snapshot holds. Its FORM is judged above,
+        // with the modelled constraints its member declares, but the rule that turns the
+        // per-block checksums into the aggregate is not in the model and the published
+        // prose does not pin the byte-level composition (whether the per-block checksums
+        // are concatenated as their Base64 text or as their raw digests).
         // Refusing on a guessed composition would reject requests a real client builds
         // correctly, which is worse than not checking; so the snapshot is sealed on the
         // evidence this service does have — the blocks it actually stored, checksum-
         // verified one by one as `PutSnapshotBlock` persisted them.
-        let _ = (&input.checksum, &input.checksum_aggregation_method);
 
         // `ChangedBlocksCount` is the caller's own accounting of the writes it made ("The
         // number of blocks that were written to the snapshot"), bounded only by the
-        // model's `range` min 0 and already checked against it at the boundary. It is NOT
-        // a precondition of the REQUEST: whatever it says, the request is accepted — the
-        // 202 below, never a refusal. What it decides is the status the record FINALISES
+        // model's `range` min 0 and already judged against it above. It is NOT
+        // a precondition of the REQUEST: whatever it says WITHIN that range, the request is
+        // accepted — the 202 below, never a refusal. What it decides is the status the
+        // record FINALISES
         // to: a snapshot whose declared count is the number of blocks that were written to
         // it completes, and one whose count disagrees was not filled as its producer
         // claimed and finalises to `error`, which no read then resolves
@@ -287,6 +306,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status: Some(accepted_status.as_wire().to_string()),
         })
     }
+}
+
+/// The modelled constraint traits of the header members this operation judges itself, as
+/// `smithy_query(query="shape",shape="com.amazonaws.ebs#CompleteSnapshotRequest")`
+/// reports them: `Checksum`'s `@length` 0..64 and `@pattern`,
+/// `ChecksumAggregationMethod`'s `@length` 0..32, `@pattern` and the value set its enum
+/// declares, and `ChangedBlocksCount`'s `@range` min 0.
+///
+/// Restated here because `skip_validation` takes them off the generated member schemas,
+/// so there is none left at the boundary to read them from.
+static CHECKSUM_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(PatternTrait::new("^[A-Za-z0-9+/=]+$")));
+    traits.insert(Box::new(LengthTrait::new(Some(0), Some(64))));
+    traits
+});
+
+static CHECKSUM_AGGREGATION_METHOD_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(PatternTrait::new("^[A-Za-z0-9]+$")));
+    traits.insert(Box::new(LengthTrait::new(Some(0), Some(32))));
+    // The one aggregation method the modelled enum declares, read from the generated
+    // value set rather than spelled again here.
+    traits.insert(Box::new(EnumTrait::new(
+        CHECKSUM_AGGREGATION_METHOD_VALUES,
+    )));
+    traits
+});
+
+static CHANGED_BLOCKS_COUNT_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
+    let mut traits = TraitMap::new();
+    traits.insert(Box::new(RangeTrait::new(Some(0.0), None)));
+    traits
+});
+
+/// Each of those members as a MEMBER schema carrying its modelled constraints, so the
+/// check is the framework's walk and the violation it reports — its kind, its
+/// lower-camelled path and its ceiling on how much of the rejected value is echoed — is
+/// the framework's too.
+static CHECKSUM_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
+    Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.ebs#CompleteSnapshotRequest$Checksum",
+            "com.amazonaws.ebs",
+            "Checksum",
+        ),
+        ShapeType::String,
+        "Checksum",
+        0,
+    )
+    .with_traits(&CHECKSUM_TRAITS)
+});
+
+static CHECKSUM_AGGREGATION_METHOD_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
+    Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.ebs#CompleteSnapshotRequest$ChecksumAggregationMethod",
+            "com.amazonaws.ebs",
+            "ChecksumAggregationMethod",
+        ),
+        ShapeType::String,
+        "ChecksumAggregationMethod",
+        0,
+    )
+    .with_traits(&CHECKSUM_AGGREGATION_METHOD_TRAITS)
+});
+
+static CHANGED_BLOCKS_COUNT_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
+    Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.ebs#CompleteSnapshotRequest$ChangedBlocksCount",
+            "com.amazonaws.ebs",
+            "ChangedBlocksCount",
+        ),
+        ShapeType::Integer,
+        "ChangedBlocksCount",
+        0,
+    )
+    .with_traits(&CHANGED_BLOCKS_COUNT_TRAITS)
+});
+
+/// The message refusing this request's header members, or `None` when they satisfy the
+/// constraints the model declares for them.
+///
+/// The sentence is the framework's `ValidationException` report — `N validation error(s)
+/// detected: Value '<v>' at '<member>' failed to satisfy constraint: <requirement>` — so a
+/// member the service judges is worded exactly as one the boundary judges; only the
+/// envelope it travels in differs. Every member is judged on the value the request
+/// carried, in the order the input shape declares them, so an absent optional header
+/// contributes nothing and a request breaking more than one constraint is reported as the
+/// boundary would have reported it.
+fn header_constraint_refusal(input: &CompleteSnapshotInput) -> Option<String> {
+    let mut validator = ValidatingSerializer::new();
+    // Infallible: the validator accumulates violations instead of failing.
+    let _ = validator.write_integer(&CHANGED_BLOCKS_COUNT_SCHEMA, input.changed_blocks_count);
+    if let Some(checksum) = input.checksum.as_deref() {
+        let _ = validator.write_string(&CHECKSUM_SCHEMA, checksum);
+    }
+    if let Some(method) = input.checksum_aggregation_method.as_deref() {
+        let _ = validator.write_string(&CHECKSUM_AGGREGATION_METHOD_SCHEMA, method);
+    }
+    ::aws_smithy_schema_server::envelope(&validator.into_violations())
 }
 
 /// The modelled server error for an engine that holds no state for this service.

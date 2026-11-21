@@ -11,8 +11,10 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-ebs-ebs.json");
 
-// `skip_validation` names the HEADER-bound `ChecksumAlgorithm`, which is where the
-// recorded refusals show the service wording them: an algorithm it does not support is
+// `skip_validation` names the HEADER-bound members this operation judges itself, which is
+// where the recorded refusals show the service wording them: an algorithm it does not
+// support, a `Checksum` outside its modelled form, an aggregation method outside the set
+// its enum declares and a `ChangedBlocksCount` outside its modelled range are all
 // answered with the service's OWN modelled `ValidationException`, carrying the `Message`
 // and the `Reason` a client reads, where the boundary's synthetic envelope carries
 // neither.
@@ -26,10 +28,11 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ebs-ebs.json");
 // `x-amz-ChangedBlocksCount` header is refused BEFORE deserialization, by the guard this
 // service's `service.rs` routes the operation behind, because the generated REST route
 // declines such a request and the router would otherwise answer it as an operation the
-// emulator does not serve.
+// emulator does not serve. Reaching the handler therefore means it arrived, and the
+// handler judges the value it carried.
 #[smithy_macros::smithy(
     shape = "com.amazonaws.ebs#CompleteSnapshotRequest",
-    skip_validation = ["ChecksumAlgorithm"]
+    skip_validation = ["ChangedBlocksCount", "Checksum", "ChecksumAlgorithm", "ChecksumAggregationMethod"]
 )]
 #[derive(Debug, Clone, Default)]
 pub struct CompleteSnapshotInput {

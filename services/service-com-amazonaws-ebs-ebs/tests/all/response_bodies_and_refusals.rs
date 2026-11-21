@@ -21,12 +21,18 @@
 //!    template, naming only the rejected value.
 //! 7. Every "that snapshot is not stored" refusal uses ONE template, in every operation
 //!    that resolves a snapshot id.
+//! 8. Every HEADER-bound member whose modelled constraints this service takes off the
+//!    request boundary is judged by the operation that owns it, so a value outside the
+//!    member's modelled form is refused with the service's OWN modelled
+//!    `ValidationException` — carrying both the `Message` and the `Reason` a client reads.
 
-use crate::declared_block_inputs::invalid_volume_size_message;
+use smithy_server_runtime::MultiServiceRouter;
+
+use crate::declared_block_inputs::{assert_validation, invalid_volume_size_message};
 use crate::snapshot_block_loop::{
     block_bytes, checksum, complete_snapshot, complete_snapshot_with_algorithm, get_block,
     list_blocks, listed_blocks, member, put_block, put_block_with_algorithm,
-    put_block_with_progress, router, start_snapshot, write_snapshot, Reply, BLOCK_SIZE,
+    put_block_with_progress, router, send, start_snapshot, write_snapshot, Reply, BLOCK_SIZE,
 };
 
 /// The expression the service enforces on a `blockToken`, which is also the one its
@@ -933,4 +939,312 @@ async fn a_snapshot_id_of_the_wrong_shape_is_a_malformed_parameter() {
             reply.json()
         );
     }
+}
+
+/// The modelled form of `com.amazonaws.ebs#Checksum`, which `CompleteSnapshot` and
+/// `PutSnapshotBlock` both bind to `x-amz-Checksum`
+/// (`smithy_query(query="shape",shape="com.amazonaws.ebs#Checksum")`: `@length` 0..64 and
+/// this `@pattern`).
+const CHECKSUM_PATTERN: &str = "^[A-Za-z0-9+/=]+$";
+const CHECKSUM_MAX_LENGTH: usize = 64;
+
+/// The modelled form of `com.amazonaws.ebs#ChecksumAggregationMethod`
+/// (`smithy_query(query="shape",shape="com.amazonaws.ebs#ChecksumAggregationMethod")`:
+/// `@length` 0..32, this `@pattern`, and the one value the enum declares).
+const AGGREGATION_METHOD_PATTERN: &str = "^[A-Za-z0-9]+$";
+const AGGREGATION_METHODS: &[&str] = &["LINEAR"];
+
+/// The modelled minimum of `com.amazonaws.ebs#ChangedBlocksCount`
+/// (`smithy_query(query="shape",shape="com.amazonaws.ebs#ChangedBlocksCount")`: `@range`
+/// min 0, with no maximum).
+const CHANGED_BLOCKS_COUNT_MIN: i64 = 0;
+
+/// One clause of a constraint report: the value echoed, the member as the report names it
+/// (its Smithy name lower-camelled) and the requirement the value failed.
+fn clause(value: &str, member_path: &str, requirement: &str) -> String {
+    format!("Value '{value}' at '{member_path}' failed to satisfy constraint: {requirement}")
+}
+
+/// The envelope the constraint report travels in, which is the one the request boundary
+/// renders for the members it judges itself: one clause per rejected value, in the order
+/// the input shape declares its members.
+fn constraint_report(clauses: &[String]) -> String {
+    match clauses.len() {
+        1 => format!("1 validation error detected: {}", clauses[0]),
+        n => format!(
+            "{n} validation errors detected: {}",
+            clauses.join("; ")
+        ),
+    }
+}
+
+/// The requirement a value outside a member's `@pattern` failed.
+fn pattern_requirement(pattern: &str) -> String {
+    format!("Member must satisfy regular expression pattern: {pattern}")
+}
+
+/// The requirement a value longer than a member's `@length` maximum failed.
+fn max_length_requirement(max: usize) -> String {
+    format!("Member must have length less than or equal to {max}")
+}
+
+/// The requirement a value outside a member's enum value set failed.
+fn enum_requirement(values: &[&str]) -> String {
+    format!("Member must satisfy enum value set: [{}]", values.join(", "))
+}
+
+/// The requirement a number below a member's `@range` minimum failed.
+fn min_value_requirement(min: i64) -> String {
+    format!("Member must have value greater than or equal to {min}")
+}
+
+/// `CompleteSnapshot` with the header members this operation judges itself set to
+/// whatever the row carries; an optional header the row leaves `None` is not sent at all.
+async fn complete_snapshot_with_headers(
+    router: &MultiServiceRouter,
+    snapshot_id: &str,
+    changed_blocks_count: i32,
+    checksum_value: Option<&str>,
+    aggregation_method: Option<&str>,
+) -> Reply {
+    let mut headers = vec![(
+        "x-amz-ChangedBlocksCount",
+        changed_blocks_count.to_string(),
+    )];
+    if let Some(value) = checksum_value {
+        headers.push(("x-amz-Checksum", value.to_string()));
+    }
+    if let Some(value) = aggregation_method {
+        headers.push(("x-amz-Checksum-Aggregation-Method", value.to_string()));
+    }
+    send(
+        router,
+        "POST",
+        &format!("/snapshots/completion/{snapshot_id}"),
+        &headers,
+        Vec::new(),
+    )
+    .await
+}
+
+/// One row of the judged-header table: what the request carries beside its snapshot id,
+/// and the clauses the refusal must report.
+struct JudgedHeaders {
+    case: String,
+    changed_blocks_count: i32,
+    checksum: Option<String>,
+    aggregation_method: Option<String>,
+    clauses: Vec<String>,
+}
+
+/// RULE 8: a `CompleteSnapshot` header member outside its MODELLED form is refused with
+/// this service's own modelled `ValidationException` — HTTP 400, the `ValidationException`
+/// error code, `Reason` `INVALID_PARAMETER_VALUE` and the constraint report as the
+/// `Message` — exactly as the identical members on `PutSnapshotBlock` are (asserted
+/// above). A client branches on `Reason`, so a refusal that carries none tells it nothing
+/// about whether to fix its request or retry it.
+///
+/// Rows differ along what the rule generalises over: which member carries the bad value,
+/// which modelled constraint it breaks (a pattern, a length maximum, an enum value set, a
+/// range minimum), how far outside it is, and how many members are wrong at once.
+#[tokio::test]
+async fn a_judged_complete_snapshot_header_is_refused_through_the_modelled_error() {
+    let router = router();
+    let started = start_snapshot(&router, &serde_json::json!({ "VolumeSize": 1 })).await;
+    assert_eq!(
+        started.status, 201,
+        "the fixture snapshot must start, got {} with body {}",
+        started.status,
+        String::from_utf8_lossy(&started.body)
+    );
+    let snapshot_id = member(&started, "SnapshotId");
+
+    // Inside the modelled form: base64 of a SHA256 digest, which is what an aggregate
+    // checksum is, so the control at the end is refused by nothing.
+    let aggregate = checksum(&block_bytes(3));
+    let over_long = "A".repeat(CHECKSUM_MAX_LENGTH + 1);
+    let malformed_checksum = "not*a*checksum";
+    let outside_the_set = "NOTLINEAR";
+    let malformed_method = "NOT_LINEAR";
+
+    let rows: Vec<JudgedHeaders> = vec![
+        JudgedHeaders {
+            case: "a Checksum outside the modelled pattern".to_string(),
+            changed_blocks_count: 0,
+            checksum: Some(malformed_checksum.to_string()),
+            aggregation_method: None,
+            clauses: vec![clause(
+                malformed_checksum,
+                "checksum",
+                &pattern_requirement(CHECKSUM_PATTERN),
+            )],
+        },
+        JudgedHeaders {
+            case: "an empty Checksum, which the modelled pattern admits no value of"
+                .to_string(),
+            changed_blocks_count: 0,
+            checksum: Some(String::new()),
+            aggregation_method: None,
+            clauses: vec![clause(
+                "",
+                "checksum",
+                &pattern_requirement(CHECKSUM_PATTERN),
+            )],
+        },
+        JudgedHeaders {
+            case: "a Checksum one character past the modelled maximum length".to_string(),
+            changed_blocks_count: 0,
+            checksum: Some(over_long.clone()),
+            aggregation_method: None,
+            clauses: vec![clause(
+                &over_long,
+                "checksum",
+                &max_length_requirement(CHECKSUM_MAX_LENGTH),
+            )],
+        },
+        JudgedHeaders {
+            case: "a ChecksumAggregationMethod outside the set its enum declares"
+                .to_string(),
+            changed_blocks_count: 0,
+            checksum: None,
+            aggregation_method: Some(outside_the_set.to_string()),
+            clauses: vec![clause(
+                outside_the_set,
+                "checksumAggregationMethod",
+                &enum_requirement(AGGREGATION_METHODS),
+            )],
+        },
+        JudgedHeaders {
+            case: "a ChecksumAggregationMethod outside the modelled pattern AND the set"
+                .to_string(),
+            changed_blocks_count: 0,
+            checksum: None,
+            aggregation_method: Some(malformed_method.to_string()),
+            clauses: vec![
+                clause(
+                    malformed_method,
+                    "checksumAggregationMethod",
+                    &pattern_requirement(AGGREGATION_METHOD_PATTERN),
+                ),
+                clause(
+                    malformed_method,
+                    "checksumAggregationMethod",
+                    &enum_requirement(AGGREGATION_METHODS),
+                ),
+            ],
+        },
+        JudgedHeaders {
+            case: "a ChangedBlocksCount one below the modelled minimum".to_string(),
+            changed_blocks_count: -1,
+            checksum: None,
+            aggregation_method: None,
+            clauses: vec![clause(
+                "-1",
+                "changedBlocksCount",
+                &min_value_requirement(CHANGED_BLOCKS_COUNT_MIN),
+            )],
+        },
+        JudgedHeaders {
+            case: "a ChangedBlocksCount far below the modelled minimum".to_string(),
+            changed_blocks_count: -524_288,
+            checksum: None,
+            aggregation_method: None,
+            clauses: vec![clause(
+                "-524288",
+                "changedBlocksCount",
+                &min_value_requirement(CHANGED_BLOCKS_COUNT_MIN),
+            )],
+        },
+        JudgedHeaders {
+            case: "every judged member outside its modelled form at once".to_string(),
+            changed_blocks_count: -1,
+            checksum: Some(malformed_checksum.to_string()),
+            aggregation_method: Some(outside_the_set.to_string()),
+            clauses: vec![
+                clause(
+                    "-1",
+                    "changedBlocksCount",
+                    &min_value_requirement(CHANGED_BLOCKS_COUNT_MIN),
+                ),
+                clause(
+                    malformed_checksum,
+                    "checksum",
+                    &pattern_requirement(CHECKSUM_PATTERN),
+                ),
+                clause(
+                    outside_the_set,
+                    "checksumAggregationMethod",
+                    &enum_requirement(AGGREGATION_METHODS),
+                ),
+            ],
+        },
+        JudgedHeaders {
+            case: "a well-formed aggregate Checksum beside a method outside the set"
+                .to_string(),
+            changed_blocks_count: 0,
+            checksum: Some(aggregate.clone()),
+            aggregation_method: Some(outside_the_set.to_string()),
+            clauses: vec![clause(
+                outside_the_set,
+                "checksumAggregationMethod",
+                &enum_requirement(AGGREGATION_METHODS),
+            )],
+        },
+    ];
+
+    for row in &rows {
+        let reply = complete_snapshot_with_headers(
+            &router,
+            &snapshot_id,
+            row.changed_blocks_count,
+            row.checksum.as_deref(),
+            row.aggregation_method.as_deref(),
+        )
+        .await;
+        assert_validation(
+            &row.case,
+            &reply,
+            "INVALID_PARAMETER_VALUE",
+            &constraint_report(&row.clauses),
+        );
+    }
+
+    // The control that makes every row above mean something: the SAME request with each
+    // judged member inside its modelled form is served — and it reports `pending`, the
+    // status the snapshot was in when it arrived, so not one of the refusals above sealed
+    // it on the way out.
+    let accepted =
+        complete_snapshot_with_headers(&router, &snapshot_id, 0, Some(&aggregate), Some("LINEAR"))
+            .await;
+    assert_eq!(
+        accepted.status, 202,
+        "case \"every judged member inside its modelled form\": CompleteSnapshot must answer \
+         202, got {} with body {}",
+        accepted.status,
+        String::from_utf8_lossy(&accepted.body)
+    );
+    assert_eq!(
+        member(&accepted, "Status"),
+        "pending",
+        "case \"every judged member inside its modelled form\": the 202 must report the status \
+         the snapshot was in when the completion was accepted, got {}",
+        accepted.json()
+    );
+
+    // And the seal that completion applied is what every later call reads back, so the
+    // accepted request really did the work the refused ones did not.
+    let repeated = complete_snapshot(&router, &snapshot_id, 0).await;
+    assert_eq!(
+        repeated.status, 202,
+        "case \"the snapshot read back after it was sealed\": expected 202, got {} with body {}",
+        repeated.status,
+        String::from_utf8_lossy(&repeated.body)
+    );
+    assert_eq!(
+        member(&repeated, "Status"),
+        "completed",
+        "case \"the snapshot read back after it was sealed\": the stored snapshot must read \
+         back completed, got {}",
+        repeated.json()
+    );
 }
