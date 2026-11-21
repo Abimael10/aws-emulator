@@ -52,7 +52,10 @@ const ASSOCIATION_NOT_FOUND: &str = "No source API association was found";
 const API_NOT_FOUND: &str = "API not found.";
 
 /// Send one `ListTypes` for `api_id`, in `format`, with the paging the row selects.
-async fn list_types(
+///
+/// Shared with the suites that page a type listing over other inputs, so the request is
+/// built exactly one way across this crate.
+pub(crate) async fn list_types(
     router: &MultiServiceRouter,
     api_id: &str,
     format: &str,
@@ -107,24 +110,28 @@ fn message(answer: &Answer) -> &str {
 }
 
 /// The types one answer carries.
-fn listed(answer: &Answer) -> Vec<Value> {
+pub(crate) fn listed(answer: &Answer) -> Vec<Value> {
     answer.body["types"].as_array().cloned().unwrap_or_default()
 }
 
 /// Walk the whole listing from the first page with `max_results` per page, and return
 /// every type reported, in the order the pages reported them.
-async fn walk(
+///
+/// `held` is how many types the API holds, which bounds how many pages a cursor that is
+/// resuming can take. Shared with the suites that walk a listing of other types.
+pub(crate) async fn walk(
     router: &MultiServiceRouter,
     api_id: &str,
     format: &str,
     max_results: Option<usize>,
+    held: usize,
     case: &str,
 ) -> Vec<Value> {
     let mut collected: Vec<Value> = Vec::new();
     let mut next_token: Option<String> = None;
     // One page per type held, plus the page that closes the walk: a cursor that would
     // need more than that is not resuming.
-    for page in 0..=rows().len() + 1 {
+    for page in 0..=held + 1 {
         let answer = list_types(router, api_id, format, max_results, next_token.as_deref()).await;
         assert_eq!(
             answer.status, 200,
@@ -177,7 +184,7 @@ async fn a_listing_answers_every_type_the_api_holds_across_page_sizes() {
     for format in FORMATS {
         for size in &sizes {
             let case = format!("{format}, page size {size:?}");
-            let collected = walk(&router, &api_id, format, *size, &case).await;
+            let collected = walk(&router, &api_id, format, *size, held.len(), &case).await;
             let names: Vec<&str> = collected
                 .iter()
                 .map(|listed| listed["name"].as_str().unwrap_or_default())
@@ -234,7 +241,8 @@ async fn an_update_replaces_a_listed_definition_without_moving_it() {
             "case {case}: expected UpdateType 200, got {updated:?}"
         );
 
-        let collected = walk(&router, &api_id, state::SDL_FORMAT, Some(2), &case).await;
+        let collected =
+            walk(&router, &api_id, state::SDL_FORMAT, Some(2), held.len(), &case).await;
         let names: Vec<&str> = collected
             .iter()
             .map(|listed| listed["name"].as_str().unwrap_or_default())
@@ -331,7 +339,13 @@ async fn a_listing_of_nothing_is_empty_and_an_unresumable_one_is_refused() {
 }
 
 /// Associate `source` with `merged` and return the association's id.
-async fn associate(router: &MultiServiceRouter, source_id: &str, merged_id: &str) -> String {
+///
+/// Shared with the suites that list or read the types of an association.
+pub(crate) async fn associate(
+    router: &MultiServiceRouter,
+    source_id: &str,
+    merged_id: &str,
+) -> String {
     let answer = call(
         router,
         "POST",

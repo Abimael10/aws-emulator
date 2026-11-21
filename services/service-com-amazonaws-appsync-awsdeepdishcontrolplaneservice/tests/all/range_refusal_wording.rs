@@ -25,8 +25,10 @@ use crate::error_contract::{call, create_api, router, Answer};
 
 /// AppSync's own modelled error for a request that is not well formed, and its status
 /// (`smithy_query(query="shape", shape="BadRequestException")`, `@httpError` 400).
-const BAD_REQUEST: &str = "BadRequestException";
-const BAD_REQUEST_STATUS: u16 = 400;
+///
+/// Shared with the suites that assert the same refusal on other operations.
+pub(crate) const BAD_REQUEST: &str = "BadRequestException";
+pub(crate) const BAD_REQUEST_STATUS: u16 = 400;
 
 /// `MaxBatchSize`'s published bounds (`@range` 0..2000,
 /// `smithy_query(query="shape", shape="MaxBatchSize")`).
@@ -35,8 +37,11 @@ const MAX_BATCH_SIZE_MAX: i64 = 2_000;
 
 /// `MaxResults`'s published bounds (`@range` 0..25,
 /// `smithy_query(query="shape", shape="MaxResults")`).
-const MAX_RESULTS_MIN: i64 = 0;
-const MAX_RESULTS_MAX: i64 = 25;
+///
+/// Shared with the suites that assert the same range on the other operations carrying the
+/// member, so the published bounds are stated in one place.
+pub(crate) const MAX_RESULTS_MIN: i64 = 0;
+pub(crate) const MAX_RESULTS_MAX: i64 = 25;
 
 /// The sentence the service states a `maxBatchSize` outside its range in: the bounds
 /// written plainly, with no thousands separator.
@@ -48,7 +53,10 @@ fn batch_size_sentence() -> String {
 }
 
 /// The sentence the service states a `maxResults` outside its range in.
-fn page_size_sentence() -> String {
+///
+/// Shared with the suites that assert the same rule on the other operations carrying the
+/// member, so the wording lives in one place.
+pub(crate) fn page_size_sentence() -> String {
     format!(
         "maxResults must be greater than {MAX_RESULTS_MIN} and less than or equal to \
          {MAX_RESULTS_MAX}."
