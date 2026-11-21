@@ -122,7 +122,7 @@ pub struct BackupRuleInput {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.backup#Lifecycle")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Lifecycle {
     pub move_to_cold_storage_after_days: Option<i64>,
     pub delete_after_days: Option<i64>,
@@ -131,34 +131,34 @@ pub struct Lifecycle {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.backup#CopyAction")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CopyAction {
     pub lifecycle: Option<Lifecycle>,
     pub destination_backup_vault_arn: String,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.backup#IndexAction")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IndexAction {
     pub resource_types: Option<Vec<String>>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.backup#ScanAction")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScanAction {
     pub malware_scanner: Option<String>,
     pub scan_mode: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.backup#AdvancedBackupSetting")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AdvancedBackupSetting {
     pub resource_type: Option<String>,
     pub backup_options: Option<std::collections::HashMap<String, String>>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.backup#ScanSetting")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScanSetting {
     pub malware_scanner: Option<String>,
     pub resource_types: Option<Vec<String>>,
@@ -405,7 +405,7 @@ pub struct BackupPlan {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.backup#BackupRule")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BackupRule {
     pub rule_name: String,
     pub target_backup_vault_name: String,

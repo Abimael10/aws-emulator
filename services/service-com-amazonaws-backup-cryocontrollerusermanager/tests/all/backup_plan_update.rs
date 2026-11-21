@@ -207,8 +207,19 @@ fn update_cases() -> Vec<(&'static str, Value)> {
             }),
         ),
         (
-            "the same body the plan was created with",
-            created_plan("superseded-plan"),
+            // The SMALLEST change a body can state: one member of the plan's one
+            // rule, left otherwise as created. A body that states no change at
+            // all is a different case — it stores no version — and lives in
+            // `plan_update_restated_body.rs`.
+            "the created body with its schedule moved by an hour",
+            json!({
+                "BackupPlanName": "superseded-plan",
+                "Rules": [{
+                    "RuleName": "daily",
+                    "TargetBackupVaultName": "plan-vault",
+                    "ScheduleExpression": "cron(0 6 * * ? *)",
+                }],
+            }),
         ),
         (
             "a renamed plan, which the body carries",

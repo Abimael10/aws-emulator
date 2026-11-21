@@ -318,10 +318,14 @@ async fn a_plan_body_is_stored_only_with_a_lifecycle_that_leaves_the_cold_storag
 
         // The update stores the NEXT version of a plan whose first version
         // carried no lifecycle at all, so what is judged is the body being
-        // stored rather than the one already there.
+        // stored rather than the one already there. The first version is stored
+        // under another NAME, so every row's update states a document that
+        // differs from the one in force — the condition for a version to be
+        // stored at all (`plan_update_restated_body.rs`).
         let router = router();
         vault(&router).await;
-        let (status, created) = create_plan(&router, &plan_body("update-plan", None, true)).await;
+        let (status, created) =
+            create_plan(&router, &plan_body("update-plan-before", None, true)).await;
         assert_eq!(
             status, 200,
             "setup: the first version should be created, got {status} {created:?}"

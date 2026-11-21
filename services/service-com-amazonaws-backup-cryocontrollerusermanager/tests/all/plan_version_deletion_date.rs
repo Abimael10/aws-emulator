@@ -148,13 +148,16 @@ fn version_histories() -> Vec<(&'static str, Vec<Value>)> {
             ],
         ),
         (
-            "four updates, the last storing the body the plan already had",
+            // The longest history: each update states another document, so each
+            // one stores a version. (An update that states the document already
+            // in force stores none — `plan_update_restated_body.rs`.)
+            "four updates, each storing another body",
             vec![
                 plan_body("four-updates", 60),
                 plan_body("four-updates", 120),
                 plan_body("four-updates", 240),
                 plan_body("four-updates", 300),
-                plan_body("four-updates", 300),
+                plan_body("four-updates", 360),
             ],
         ),
     ]

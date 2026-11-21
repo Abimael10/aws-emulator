@@ -295,13 +295,15 @@ async fn every_version_of_one_plan_gets_an_independently_drawn_token() {
             }),
         ),
         (
-            "an update that stores the body it already had",
+            // A body an EARLIER version held, which is not the one in force, so
+            // it is another document than the plan's: the version it stores
+            // draws its own token rather than reusing the one that body was
+            // stored under before. (A body the plan holds NOW stores no version
+            // at all — `plan_update_restated_body.rs`.)
+            "an update that returns the plan to a body an earlier version held",
             json!({
                 "BackupPlanName": "versioned-plan-renamed",
-                "Rules": [
-                    {"RuleName": "daily", "TargetBackupVaultName": "plan-vault"},
-                    {"RuleName": "weekly", "TargetBackupVaultName": "other-vault"},
-                ],
+                "Rules": [{"RuleName": "daily", "TargetBackupVaultName": "plan-vault"}],
             }),
         ),
     ];

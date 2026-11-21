@@ -3182,6 +3182,41 @@ impl BackupPlanVersion {
     pub fn scan_settings_view(&self) -> Option<Vec<ScanSetting>> {
         (!self.scan_settings.is_empty()).then(|| self.scan_settings.clone())
     }
+
+    /// Whether this stored version ALREADY carries the plan document `plan`
+    /// states — so storing `plan` would add a version indistinguishable from
+    /// this one.
+    ///
+    /// Compared on the STORED form of the document
+    /// ([`stored_backup_rule`]), because that is the plan the service holds: a
+    /// body that spells out a window, a time zone or an empty collection the
+    /// service would have filled in itself states the same plan as one that
+    /// leaves it out, so the two are the same document. The per-rule `RuleId`
+    /// is the service's own name for a rule rather than part of the document,
+    /// so a rule is compared under the id this version already gave it; the
+    /// rules are matched in ORDER, since the order a plan lists its rules in is
+    /// part of the document a read reports back.
+    pub fn restates(&self, plan: &BackupPlanInput) -> bool {
+        self.name == plan.backup_plan_name
+            && self.advanced_backup_settings.as_slice()
+                == plan
+                    .advanced_backup_settings
+                    .as_deref()
+                    .unwrap_or_default()
+            && self.scan_settings.as_slice()
+                == plan.scan_settings.as_deref().unwrap_or_default()
+            && self.rules.len() == plan.rules.len()
+            && self
+                .rules
+                .iter()
+                .zip(plan.rules.iter())
+                .all(|(stored, stated)| {
+                    stored_backup_rule(
+                        stated.clone(),
+                        stored.rule_id.clone().unwrap_or_default(),
+                    ) == *stored
+                })
+    }
 }
 
 /// A backup plan as `CreateBackupPlan` stored it: the identifiers this service

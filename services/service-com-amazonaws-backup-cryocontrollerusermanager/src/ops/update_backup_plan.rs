@@ -10,6 +10,18 @@
 //! supersedes stays readable by the id it was stored under
 //! ([`crate::state::BackupPlanRecord::supersede_current_version`]).
 //!
+//! A version is stored only for a body that states ANOTHER plan document than
+//! the one in force ([`crate::state::BackupPlanVersion::restates`]): the
+//! sentence above is about the version an update ADDS, and an update that
+//! restates the document the account already holds adds none — the plan keeps
+//! the `VersionId` it holds, that version keeps its `RuleId`s and its creation
+//! instant, nothing supersedes it, and this call answers with it. RECORDED
+//! behaviour (corpus `simparity-wire-aws-v1`, fixture
+//! `backup-rbx-traj-update-plan-refusals`): of two successful updates of one
+//! plan, the one restating the stored document answered with the `VersionId` the
+//! plan already held, while the one that changed the document answered with a
+//! new one.
+//!
 //! A plan body is accepted or refused by the ONE check this operation shares
 //! with `CreateBackupPlan`
 //! ([`crate::state::rejected_backup_plan_body`]), so the body an update stores
@@ -26,8 +38,8 @@
 //! `MODIFIED` for the plan it updated
 //! ([`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::record_backup_plan_state_changes`]
 //! decides which mutations owe an event, [`crate::state::publish_job_state_changes`]
-//! publishes it). An update this operation REFUSES stores no version, so it announces
-//! nothing.
+//! publishes it). An update this operation REFUSES stores no version, and neither does
+//! one that restates the document in force, so neither announces anything.
 //!
 //! ## Shape of an operation
 //!
@@ -225,12 +237,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // recorded, are the same condition: there is no live plan of that id to
             // update. Resolved BEFORE anything is minted, so a refused update
             // stores nothing.
-            if store.live_backup_plan(&input.backup_plan_id).is_none() {
+            let Some(record) = store.live_backup_plan(&input.backup_plan_id) else {
                 return Err(UpdateBackupPlanErrorModeled::ResourceNotFoundException(
                     crate::state::backup_plan_update_not_found(),
                 )
                 .into());
-            }
+            };
+            // Whether the plan already IS what this call states: an update that
+            // restates the document in force leaves the plan at the version it
+            // already holds (see below). Read under the same lock as the
+            // version this call may store, so the two cannot disagree.
+            let restated = record.current.restates(&plan);
             // Every rule of the body names the vault its backups are stored in,
             // and the version is stored only once all of them resolve in this
             // request's region: validate, THEN commit, so an update this
@@ -241,7 +258,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     UpdateBackupPlanErrorModeled::InvalidParameterValueException(refusal).into(),
                 );
             }
-            let version = store.minted_backup_plan_version(plan, now);
+            // A version is MINTED only for a document that differs from the one
+            // in force: "the new version is uniquely identified by its ID"
+            // (model doc) is about the version an update ADDS, and an update
+            // that states the plan the account already holds adds none — so the
+            // plan keeps its version id, its per-rule ids and that version's
+            // creation date, and this call answers with the version in force.
+            // Nothing moved, so nothing is announced either
+            // (`record_backup_plan_state_changes` diffs what is stored).
+            let stored = (!restated).then(|| store.minted_backup_plan_version(plan, now));
             let Some(record) = store.live_backup_plan_mut(&input.backup_plan_id) else {
                 // Unreachable: the lookup above resolved the plan under this same
                 // lock. Answered as the absent resource it would be rather than
@@ -251,7 +276,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             };
-            record.supersede_current_version(version);
+            if let Some(version) = stored {
+                record.supersede_current_version(version);
+            }
             let output = UpdateBackupPlanOutput {
                 backup_plan_id: Some(record.plan_id.clone()),
                 backup_plan_arn: Some(record.arn.clone()),
