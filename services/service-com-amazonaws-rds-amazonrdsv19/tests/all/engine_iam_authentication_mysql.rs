@@ -40,10 +40,10 @@ macro_rules! params {
 }
 
 /// The database user every IAM login below is made as.
-const IAM_USER: &str = "iamuser";
+pub(crate) const IAM_USER: &str = "iamuser";
 
 /// Open a session as the master user on a MySQL instance's published endpoint.
-async fn master_session(address: &str, port: u16) -> MySqlSession {
+pub(crate) async fn master_session(address: &str, port: u16) -> MySqlSession {
     mysql_login(
         address,
         port,
@@ -57,14 +57,14 @@ async fn master_session(address: &str, port: u16) -> MySqlSession {
 }
 
 /// Run a statement that must succeed.
-async fn run(case: &str, session: &mut MySqlSession, sql: &str) {
+pub(crate) async fn run(case: &str, session: &mut MySqlSession, sql: &str) {
     if let Err(refusal) = session.query(sql).await {
         panic!("case {case:?}: {sql:?} must run, got {refusal:?}");
     }
 }
 
 /// The one value a statement answered with, or `None` for an answer with no rows.
-async fn value(case: &str, session: &mut MySqlSession, sql: &str) -> Option<String> {
+pub(crate) async fn value(case: &str, session: &mut MySqlSession, sql: &str) -> Option<String> {
     session
         .query(sql)
         .await
@@ -74,7 +74,7 @@ async fn value(case: &str, session: &mut MySqlSession, sql: &str) -> Option<Stri
 }
 
 /// Every row of the single column `SHOW GRANTS` answers with.
-async fn grants(case: &str, session: &mut MySqlSession, sql: &str) -> Vec<String> {
+pub(crate) async fn grants(case: &str, session: &mut MySqlSession, sql: &str) -> Vec<String> {
     session
         .query(sql)
         .await

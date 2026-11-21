@@ -596,7 +596,8 @@ async fn a_mariadb_endpoint_names_itself_and_its_indexes_as_mariadb_does() {
     );
 
     // The master user is not a superuser on a managed instance, so a server-wide variable
-    // write is refused however the session spells it.
+    // write is refused however the session spells it. MariaDB names SUPER alone, where MySQL 8
+    // also accepts the dynamic privilege it split out of SUPER.
     for (case, statement) in [
         ("a global write", "SET GLOBAL max_connections = 10"),
         ("a persisted write", "SET PERSIST max_connections = 10"),
@@ -609,8 +610,8 @@ async fn a_mariadb_endpoint_names_itself_and_its_indexes_as_mariadb_does() {
             (refusal.code.as_str(), refusal.message.as_str()),
             (
                 "1227",
-                "Access denied; you need (at least one of) the SUPER or \
-                 SYSTEM_VARIABLES_ADMIN privilege(s) for this operation"
+                "Access denied; you need (at least one of) the SUPER privilege(s) for this \
+                 operation"
             ),
             "case {case:?}: expected the privilege refusal, got {refusal:?}"
         );

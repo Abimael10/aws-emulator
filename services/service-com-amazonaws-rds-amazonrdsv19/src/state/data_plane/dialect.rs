@@ -32,7 +32,10 @@ pub fn render_for_engine(facts: &SessionFacts, tokens: &[Token]) -> String {
 
 /// How a reference to a system variable is written in the MySQL family's grammar: `@@name`,
 /// or `@@` on its own followed by the name.
-const MYSQL_SYSTEM_VARIABLE_PREFIX: &str = "@@";
+///
+/// `pub(super)` so the server that decides what an ASSIGNMENT to one means reads the same
+/// prefix this pass does ([`super::wire_session`]).
+pub(super) const MYSQL_SYSTEM_VARIABLE_PREFIX: &str = "@@";
 
 /// The refusal a statement written in a form the SESSION'S OWN dialect does not define is
 /// answered with, or `None` for a statement its dialect reads.

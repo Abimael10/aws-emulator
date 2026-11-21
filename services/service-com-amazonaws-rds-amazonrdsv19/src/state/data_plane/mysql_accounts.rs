@@ -106,7 +106,7 @@ pub fn account_statement(
         ("CREATE", "USER") => create_user(database, facts, tokens).map(Some),
         ("ALTER", "USER") => alter_user(database, facts, tokens).map(Some),
         ("DROP", "USER") => drop_user(database, facts, tokens).map(Some),
-        ("GRANT", _) | ("REVOKE", _) => match parsed_privileges(tokens) {
+        ("GRANT", _) | ("REVOKE", _) => match parsed_privileges(&session_account(facts), tokens) {
             Some(statement) => {
                 privilege_statement(database, facts, first, &statement).map(Some)
             }
@@ -141,7 +141,7 @@ fn create_user(
     tokens: &[Token],
 ) -> Result<StatementAnswer, EngineError> {
     ensure_catalogs(database, facts)?;
-    let statement = parsed(tokens);
+    let statement = parsed(&session_account(facts), tokens);
     if statement.accounts.is_empty() {
         return Err(syntax_error(tokens));
     }
@@ -190,7 +190,7 @@ fn alter_user(
     tokens: &[Token],
 ) -> Result<StatementAnswer, EngineError> {
     ensure_catalogs(database, facts)?;
-    let statement = parsed(tokens);
+    let statement = parsed(&session_account(facts), tokens);
     if statement.accounts.is_empty() {
         return Err(syntax_error(tokens));
     }
@@ -226,7 +226,7 @@ fn drop_user(
     tokens: &[Token],
 ) -> Result<StatementAnswer, EngineError> {
     ensure_catalogs(database, facts)?;
-    let statement = parsed(tokens);
+    let statement = parsed(&session_account(facts), tokens);
     if statement.accounts.is_empty() {
         return Err(syntax_error(tokens));
     }
@@ -553,7 +553,7 @@ struct UserStatement {
 /// An account is `'<user>'@'<host>'`, `<user>@<host>` or a bare `<user>` (whose host pattern
 /// is `%`, as MySQL gives it), written quoted or not; the plugin is the word after
 /// `IDENTIFIED WITH` and the authentication string is what follows `AS`.
-fn parsed(tokens: &[Token]) -> UserStatement {
+fn parsed(session: &Account, tokens: &[Token]) -> UserStatement {
     let mut statement = UserStatement::default();
     let mut at_host = false;
     let mut after_with = false;
@@ -634,7 +634,7 @@ fn parsed(tokens: &[Token]) -> UserStatement {
             at_host = false;
             continue;
         }
-        statement.accounts.push(account_from(token, &value));
+        statement.accounts.push(account_from(session, token, &value));
     }
     statement
 }
@@ -655,7 +655,7 @@ struct PrivilegeStatement {
 /// `None` for a statement with no account list — `GRANT <role> TO <role>`, which grants a
 /// ROLE rather than privileges, and anything else this server does not read as a privilege
 /// grant: it is answered as the success MySQL answers rather than refused, and writes nothing.
-fn parsed_privileges(tokens: &[Token]) -> Option<PrivilegeStatement> {
+fn parsed_privileges(session: &Account, tokens: &[Token]) -> Option<PrivilegeStatement> {
     let mut privileges: Vec<String> = Vec::new();
     let mut scope: Vec<String> = Vec::new();
     let mut accounts: Vec<Account> = Vec::new();
@@ -720,7 +720,7 @@ fn parsed_privileges(tokens: &[Token]) -> Option<PrivilegeStatement> {
                     }
                     at_host = false;
                 } else {
-                    accounts.push(account_from(token, &value));
+                    accounts.push(account_from(session, token, &value));
                 }
             }
         }
@@ -788,14 +788,42 @@ fn host_word(token: &Token) -> Option<String> {
     }
 }
 
-/// The account the name `value` stands for, as the token `token` carried it.
+/// The one FUNCTION form MySQL's account grammar takes in place of a written name:
+/// `CURRENT_USER`, with or without an empty argument list.
 ///
-/// An UNQUOTED name carrying an `@` names both halves at once ([`host_word`]); every other
-/// name is the user's alone, and takes the `%` host pattern MySQL gives an account written
-/// without one — so a quoted name keeps every character it was written with, `@` included.
-fn account_from(token: &Token, value: &str) -> Account {
+/// Source: the MySQL Reference Manual's `user` value — "`SHOW GRANTS FOR CURRENT_USER` (or
+/// the equivalent, `SHOW GRANTS FOR CURRENT_USER()`)" — so every statement that names an
+/// account (`SHOW GRANTS FOR`, `GRANT`/`REVOKE`, `SET PASSWORD FOR`, `CREATE`/`ALTER`/`DROP
+/// USER`) takes it, and the server EVALUATES it to the account the session holds the
+/// privileges of rather than reading it as a user of that name. Only an UNQUOTED word is the
+/// keyword: `'current_user'` names a user spelled that way.
+const SESSION_ACCOUNT_KEYWORD: &str = "current_user";
+
+/// The account the session holds the privileges of, which is what the session's own name for
+/// it ([`SESSION_ACCOUNT_KEYWORD`]) stands for and what `CURRENT_USER()` reports: the user the
+/// session authenticated as, on the host pattern the privileges are granted to it on.
+#[must_use]
+pub fn session_account(facts: &SessionFacts) -> Account {
+    Account {
+        user: facts.user.clone(),
+        host: MYSQL_MASTER_HOST_PATTERN.to_string(),
+    }
+}
+
+/// The account the name `value` stands for, as the token `token` carried it, in a session
+/// whose own account is `session`.
+///
+/// The session's own account is named by the keyword ([`SESSION_ACCOUNT_KEYWORD`]) rather
+/// than written out. An UNQUOTED name carrying an `@` names both halves at once
+/// ([`host_word`]); every other name is the user's alone, and takes the `%` host pattern
+/// MySQL gives an account written without one — so a quoted name keeps every character it was
+/// written with, `@` included.
+fn account_from(session: &Account, token: &Token, value: &str) -> Account {
     let unquoted = matches!(token, Token::Word(word) if word.quote_style.is_none());
     if unquoted {
+        if value.eq_ignore_ascii_case(SESSION_ACCOUNT_KEYWORD) {
+            return session.clone();
+        }
         if let Some((user, host)) = value.split_once('@') {
             if !user.is_empty() && !host.is_empty() {
                 return Account {
@@ -825,10 +853,8 @@ pub fn named_account(facts: &SessionFacts, tokens: &[Token]) -> Account {
         )
         .skip(1)
         .collect();
-    let mut account = Account {
-        user: facts.user.clone(),
-        host: MYSQL_MASTER_HOST_PATTERN.to_string(),
-    };
+    let session = session_account(facts);
+    let mut account = session.clone();
     let mut at_host = false;
     let mut named_user = false;
     for token in after_for {
@@ -846,7 +872,7 @@ pub fn named_account(facts: &SessionFacts, tokens: &[Token]) -> Account {
             break;
         }
         if !named_user {
-            let named = account_from(token, &value);
+            let named = account_from(&session, token, &value);
             account.user = named.user;
             account.host = named.host;
             named_user = true;
@@ -868,9 +894,19 @@ mod tests {
             .expect("the statement tokenizes")
     }
 
+    /// The account the session reading every statement below holds the privileges of.
+    fn session() -> Account {
+        Account {
+            user: "dbadmin".to_string(),
+            host: MYSQL_MASTER_HOST_PATTERN.to_string(),
+        }
+    }
+
     /// RULE: an account is read from every form MySQL writes one in — quoted with a host
     /// pattern, quoted without one, unquoted, and backquoted — and an account written without
-    /// a host pattern takes the `%` MySQL gives it.
+    /// a host pattern takes the `%` MySQL gives it. The keyword `CURRENT_USER`, with or
+    /// without an empty argument list, is the SESSION's own account rather than a user of
+    /// that name; quoted, it is a user of that name.
     #[test]
     fn an_account_is_read_from_every_form_it_is_written_in() {
         let rows: &[(&str, &str, &str, &str)] = &[
@@ -905,9 +941,27 @@ mod tests {
                 "appuser",
                 "localhost",
             ),
+            (
+                "the session's own account, by keyword",
+                "DROP USER CURRENT_USER",
+                "dbadmin",
+                "%",
+            ),
+            (
+                "the session's own account, by keyword with an empty argument list",
+                "DROP USER current_user()",
+                "dbadmin",
+                "%",
+            ),
+            (
+                "a user whose name is spelled like the keyword, quoted",
+                "DROP USER 'current_user'",
+                "current_user",
+                "%",
+            ),
         ];
         for (case, statement, user, host) in rows {
-            let read = parsed(&tokens(statement));
+            let read = parsed(&session(), &tokens(statement));
             let expected = vec![Account {
                 user: (*user).to_string(),
                 host: (*host).to_string(),
@@ -968,10 +1022,18 @@ mod tests {
                 user: "reporting",
                 host: "%",
             },
+            PrivilegeRow {
+                case: "a privilege granted to the session's own account, by keyword",
+                statement: "GRANT SELECT ON appdb.* TO CURRENT_USER()",
+                privileges: &["SELECT"],
+                scope: "appdb.*",
+                user: "dbadmin",
+                host: "%",
+            },
         ];
         for row in &rows {
             let case = row.case;
-            let read = parsed_privileges(&tokens(row.statement))
+            let read = parsed_privileges(&session(), &tokens(row.statement))
                 .unwrap_or_else(|| panic!("case {case:?}: the statement must be read"));
             assert_eq!(
                 read.privileges, row.privileges,
@@ -1011,7 +1073,7 @@ mod tests {
             ("a grant naming no account", "GRANT SELECT ON *.*"),
         ];
         for (case, statement) in rows {
-            let read = parsed_privileges(&tokens(statement));
+            let read = parsed_privileges(&session(), &tokens(statement));
             assert!(
                 read.is_none(),
                 "case {case:?}: expected the statement to be left to the engine, got {read:?}"

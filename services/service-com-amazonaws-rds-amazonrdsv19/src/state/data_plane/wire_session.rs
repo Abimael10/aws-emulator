@@ -759,6 +759,44 @@ fn mysql_version_comment(engine: &str) -> &'static str {
     "Source distribution"
 }
 
+/// The privileges a MySQL-family server NAMES in the access-denied refusal of a statement that
+/// would change a global system variable.
+///
+/// Source: each family's own privilege model. MySQL 8 took the administrative privileges out
+/// of `SUPER` and defines the dynamic privilege `SYSTEM_VARIABLES_ADMIN` for changing a global
+/// system variable, either of which is enough, so its refusal names both; MariaDB defines no
+/// such dynamic privilege and names `SUPER` alone. The refusal is the same condition on both —
+/// the privileges it lists are the ones that server would accept.
+#[must_use]
+fn global_variable_privileges(engine: &str) -> &'static str {
+    if engine.eq_ignore_ascii_case(MARIADB_ENGINE) {
+        return "SUPER";
+    }
+    "SUPER or SYSTEM_VARIABLES_ADMIN"
+}
+
+/// The SCOPE words a MySQL assignment names a server-wide variable with, as the
+/// system-variable form writes them (`SET @@GLOBAL.<name> = …`).
+///
+/// Source: the MySQL Reference Manual's "System Variables" — `GLOBAL` is the server's own
+/// value, and `PERSIST`/`PERSIST_ONLY` write that value to the server's configuration as well,
+/// so all three change the server rather than the session.
+const GLOBAL_VARIABLE_SCOPES: [&str; 3] = ["global", "persist", "persist_only"];
+
+/// `ER_SPECIFIC_ACCESS_DENIED_ERROR` for a statement that would change a global system
+/// variable: the privilege the Amazon RDS master user is not given, in the words the engine
+/// `engine` refuses it with ([`global_variable_privileges`]).
+#[must_use]
+fn global_variable_write_denied(engine: &str) -> EngineError {
+    EngineError::new(
+        EngineErrorKind::InsufficientPrivilege,
+        format!(
+            "Access denied; you need (at least one of) the {} privilege(s) for this operation",
+            global_variable_privileges(engine)
+        ),
+    )
+}
+
 /// `runtime` with the endpoint's write role written into it.
 ///
 /// An endpoint that serves no writes is served by an engine that is REPLAYING someone
@@ -1384,10 +1422,13 @@ impl SessionFacts {
     ///
     /// A MySQL privilege is granted to an account, not to a bare user name, and the master
     /// user Amazon RDS creates is granted to `'<master>'@'%'` — the account whose grants
-    /// `SHOW GRANTS` lists and which `CURRENT_USER()` reports.
+    /// `SHOW GRANTS` lists, which `CURRENT_USER()` reports, and which the account grammar's
+    /// own keyword stands for ([`super::mysql_accounts::session_account`], the one place that
+    /// account is decided, so the two readings cannot drift).
     #[must_use]
     pub fn mysql_account(&self) -> String {
-        format!("{}@{}", self.user, MYSQL_MASTER_HOST_PATTERN)
+        let account = super::mysql_accounts::session_account(self);
+        format!("{}@{}", account.user, account.host)
     }
 
     /// The sessions open on this endpoint right now, which is what `pg_stat_activity`
@@ -2387,13 +2428,10 @@ fn server_command(
         (EngineWire::MySql, "SHOW", _) => mysql_show(database, facts, words, tokens).map(Some),
         // Setting a GLOBAL system variable is a server-wide change, which the RDS master
         // user does not hold the privilege for; a parameter group is how it is changed.
-        (EngineWire::MySql, "SET", "GLOBAL") | (EngineWire::MySql, "SET", "PERSIST") => {
-            Err(EngineError::new(
-                EngineErrorKind::InsufficientPrivilege,
-                "Access denied; you need (at least one of) the SUPER or SYSTEM_VARIABLES_ADMIN \
-                 privilege(s) for this operation"
-                    .to_string(),
-            ))
+        (EngineWire::MySql, "SET", "GLOBAL")
+        | (EngineWire::MySql, "SET", "PERSIST")
+        | (EngineWire::MySql, "SET", "PERSIST_ONLY") => {
+            Err(global_variable_write_denied(&facts.engine))
         }
         (EngineWire::MySql, "SET", _) => Ok(Some(mysql_set(facts, tokens)?)),
         (EngineWire::MySql, "USE", _) => {
@@ -2528,6 +2566,18 @@ fn mysql_set(facts: &SessionFacts, tokens: &[Token]) -> Result<StatementAnswer, 
     let mut answer = StatementAnswer::new("SET", ResultSet::default());
     if let Some((name, value)) = assignment(tokens) {
         let lowered = name.trim_start_matches('@').to_ascii_lowercase();
+        // The same server-wide change, written in the SYSTEM-VARIABLE form
+        // (`SET @@GLOBAL.<name> = …`): what decides it is the scope the assignment names, not
+        // which of the two spellings the client used, so it takes the same refusal. Only a
+        // `@@`-prefixed name is a system variable at all — a `@name` is the session's own user
+        // variable, whatever it is called.
+        let scoped_globally = name.starts_with(dialect::MYSQL_SYSTEM_VARIABLE_PREFIX)
+            && lowered
+                .split_once('.')
+                .is_some_and(|(scope, _)| GLOBAL_VARIABLE_SCOPES.contains(&scope));
+        if scoped_globally {
+            return Err(global_variable_write_denied(&facts.engine));
+        }
         // `read_only` and `super_read_only` have no session scope at all: "Variable
         // 'read_only' is a GLOBAL variable and should be set with SET GLOBAL" is what the
         // server answers a session that assigns one, so a session cannot give itself the
