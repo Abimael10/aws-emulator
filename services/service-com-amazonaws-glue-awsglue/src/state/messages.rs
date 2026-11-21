@@ -1921,6 +1921,21 @@ pub fn ml_task_run_not_found(task_run_id: &str, transform_id: &str) -> String {
     )
 }
 
+/// The label file path a label task run names (`StartImportLabelsTaskRun$InputS3Path`,
+/// `StartExportLabelsTaskRun$OutputS3Path`) when it is no Amazon S3 path at all: the
+/// labels travel in an object, so a value naming no bucket names nowhere to read them from
+/// or write them to.
+///
+/// NOT recorded: what is pinned is the behaviour — 400 with the operation's modelled
+/// `InvalidInputException`, no task run started — and the message states the member the
+/// request filled in and the value it filled it with, as this service's other
+/// input-validation refusals do. WHERE the object store could not serve an otherwise
+/// well-formed path is a condition on the RUN, reported as the status that run comes to rest
+/// in rather than as a refusal of the start.
+pub fn invalid_label_file_path(member: &str, path: &str) -> String {
+    format!("{member} {path} is not a valid Amazon S3 path of the form s3://bucket/key")
+}
+
 /// `CancelMLTaskRun` against a task run whose task the service is no longer working
 /// through ([`super::MlTaskRunEntry::is_cancellable`]): a run that has already stopped,
 /// finished or been terminated, and one already stopping, has no task left for a cancel

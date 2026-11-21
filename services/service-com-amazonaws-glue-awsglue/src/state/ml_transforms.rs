@@ -228,6 +228,15 @@ pub struct MlTransformEntry {
     /// whichever direction a listing reports it in, and bounded by
     /// [`MAX_TASK_RUNS_PER_TRANSFORM`].
     pub task_runs: Vec<MlTaskRunEntry>,
+    /// The labels this transform has been taught, as the label file they were uploaded in
+    /// laid them out ([`MlLabelSet`]).
+    ///
+    /// Held ON the transform, beside the runs that move them: `StartImportLabelsTaskRun`
+    /// folds an uploaded file into this set and `StartExportLabelsTaskRun` writes "all
+    /// labeled data for a particular transform" back out of it, so the labels one of them
+    /// stored are the labels the other exports. Empty on a create, which uploads none, and
+    /// bounded by [`MAX_LABELS_PER_TRANSFORM`].
+    pub labels: MlLabelSet,
 }
 
 impl MlTransformEntry {
@@ -276,6 +285,9 @@ impl MlTransformEntry {
             // A create starts no task run: "Call this operation as the first step in the
             // process of using a machine learning transform" (`CreateMLTransform`).
             task_runs: Vec::new(),
+            // And it uploads no label: a transform "holds no labels and has been taught
+            // nothing" until a label file is imported.
+            labels: MlLabelSet::default(),
         }
     }
 
@@ -601,10 +613,53 @@ pub const MAX_TASK_RUNS_PER_TRANSFORM: usize = 100;
 /// transform to improve the transform's quality by generating label sets").
 pub const ML_TASK_TYPE_LABELING_SET_GENERATION: &str = "LABELING_SET_GENERATION";
 
+/// The `TaskType` of a run `StartImportLabelsTaskRun` starts: of the same modelled enum,
+/// the one that names importing labels, which is what that operation starts ("users upload
+/// their answers/labels with a call to StartImportLabelsTaskRun").
+pub const ML_TASK_TYPE_IMPORT_LABELS: &str = "IMPORT_LABELS";
+
+/// The `TaskType` of a run `StartExportLabelsTaskRun` starts: of the same modelled enum,
+/// the one that names exporting labels ("Begins an asynchronous task to export all labeled
+/// data for a particular transform").
+pub const ML_TASK_TYPE_EXPORT_LABELS: &str = "EXPORT_LABELS";
+
 /// The `TaskStatusType` a task run is recorded in by the call that starts it: of the
 /// modelled enum (`STARTING | RUNNING | STOPPING | STOPPED | SUCCEEDED | FAILED |
 /// TIMEOUT`), the one that says the run has been accepted and no task has begun yet.
 pub const ML_TASK_RUN_STATUS_STARTING: &str = "STARTING";
+
+/// See [`ML_TASK_RUN_STATUS_STARTING`]: of the modelled enum, the terminal status of a run
+/// whose task was carried out — the end of a run that finished the work its start asked
+/// for. A run that reaches it failed on nothing, so it carries no error string.
+pub const ML_TASK_RUN_STATUS_SUCCEEDED: &str = "SUCCEEDED";
+
+/// See [`ML_TASK_RUN_STATUS_STARTING`]: of the modelled enum, the terminal status of a run
+/// Glue could not carry out — "the list of error strings associated with this task run"
+/// (`TaskRun$ErrorString`) is what says why, and a client answers it by fixing what the run
+/// could not read or write rather than by waiting.
+pub const ML_TASK_RUN_STATUS_FAILED: &str = "FAILED";
+
+/// Where a task run is owed its END, decided by the call that started it rather than by
+/// whoever reads the run later.
+///
+/// A start that CARRIED THE TASK OUT records what came of it here, and
+/// [`MlTaskRunEntry::settle_if_due`] materialises that end when the span the clock owes the
+/// run elapses — so a run is reported in flight for that span either way, and the status it
+/// comes to rest in is the one the work it names really reached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MlTaskRunEnd {
+    /// The end of a run NOTHING performed: it consumes the resource budget its transform's
+    /// `Timeout` grants and is terminated there ([`ML_TASK_RUN_STATUS_TIMEOUT`],
+    /// [`ML_TASK_RUN_TIMED_OUT_MESSAGE`]) — which is every machine learning task this
+    /// emulator runs no model for.
+    Unperformed,
+    /// The end of a run whose task WAS carried out: [`ML_TASK_RUN_STATUS_SUCCEEDED`],
+    /// carrying no error string.
+    Succeeded,
+    /// The end of a run whose task was attempted and could not be carried out:
+    /// [`ML_TASK_RUN_STATUS_FAILED`], carrying this reason as its `ErrorString`.
+    Failed(String),
+}
 
 /// See [`ML_TASK_RUN_STATUS_STARTING`]: the terminal status of a run that was "terminated
 /// and enters `TIMEOUT` status" (`CreateMLTransform$Timeout`) — the end of a run that spent
@@ -758,6 +813,9 @@ pub struct MlTaskRunEntry {
     /// "The list of error strings associated with this task run"
     /// (`TaskRun$ErrorString`), absent until the run has failed.
     pub error_string: Option<String>,
+    /// The end the clock owes this run when [`Self::settles_at`] falls due
+    /// ([`MlTaskRunEnd`]).
+    pub owed_end: MlTaskRunEnd,
 }
 
 impl MlTaskRunEntry {
@@ -785,7 +843,23 @@ impl MlTaskRunEntry {
             completed_on: None,
             // Nothing has failed yet: a run carries an error string only once it has.
             error_string: None,
+            // A start that performed its task says so ([`Self::ending`]); one that did not
+            // leaves the run to the end its budget running out gives it.
+            owed_end: MlTaskRunEnd::Unperformed,
         }
+    }
+
+    /// The same run, with the end its start already knows the clock owes it
+    /// ([`MlTaskRunEnd`]).
+    ///
+    /// For a task this emulator really carries out — moving a label file between the
+    /// transform and the object store — the start does the work and records what came of
+    /// it here, so the run comes to rest in the status that work reached rather than in the
+    /// one a task nobody performed is terminated in.
+    #[must_use]
+    pub fn ending(mut self, owed_end: MlTaskRunEnd) -> Self {
+        self.owed_end = owed_end;
+        self
     }
 
     /// This run's `TaskType`, the one a filter and a sort select and order on: the type
@@ -804,17 +878,17 @@ impl MlTaskRunEntry {
     /// DUE instant, not the instant somebody read it, so two reads of a settled run report
     /// the same run.
     ///
-    /// Nothing here performs the task the run names, so a run never finishes work of its
-    /// own: the end it reaches is the one its budget running out puts it in
-    /// ([`ML_TASK_RUN_STATUS_TIMEOUT`]).
+    /// Nothing here performs the task the run names, so a run whose task was NOT carried
+    /// out by the call that started it never finishes work of its own: the end it reaches
+    /// is the one its budget running out puts it in ([`ML_TASK_RUN_STATUS_TIMEOUT`]). A run
+    /// whose start DID carry its task out comes to rest in the end that start recorded
+    /// ([`MlTaskRunEnd`]) — unless its budget ran out first, which terminates any run.
     pub fn settle_if_due(&mut self, now: SystemTime, budget: Duration) {
         let Some(owed) = self.settles_at else {
             return;
         };
-        let due = self
-            .started_on
-            .checked_add(budget)
-            .map_or(owed, |terminated_at| owed.min(terminated_at));
+        let terminated_at = self.started_on.checked_add(budget);
+        let due = terminated_at.map_or(owed, |terminated_at| owed.min(terminated_at));
         if due > now {
             return;
         }
@@ -824,9 +898,25 @@ impl MlTaskRunEntry {
         // carries no error string.
         if self.status == ML_TASK_RUN_STATUS_STOPPING {
             self.status = ML_TASK_RUN_STATUS_STOPPED.to_string();
-        } else {
+        } else if terminated_at.is_some_and(|terminated_at| terminated_at < owed) {
+            // The budget came first: the run spent what its transform's `Timeout` grants
+            // before it was owed its own end, so it is terminated whatever that end was.
             self.status = ML_TASK_RUN_STATUS_TIMEOUT.to_string();
             self.error_string = Some(ML_TASK_RUN_TIMED_OUT_MESSAGE.to_string());
+        } else {
+            match &self.owed_end {
+                MlTaskRunEnd::Unperformed => {
+                    self.status = ML_TASK_RUN_STATUS_TIMEOUT.to_string();
+                    self.error_string = Some(ML_TASK_RUN_TIMED_OUT_MESSAGE.to_string());
+                }
+                MlTaskRunEnd::Succeeded => {
+                    self.status = ML_TASK_RUN_STATUS_SUCCEEDED.to_string();
+                }
+                MlTaskRunEnd::Failed(reason) => {
+                    self.status = ML_TASK_RUN_STATUS_FAILED.to_string();
+                    self.error_string = Some(reason.clone());
+                }
+            }
         }
         self.completed_on = Some(due);
         self.last_modified_on = due;

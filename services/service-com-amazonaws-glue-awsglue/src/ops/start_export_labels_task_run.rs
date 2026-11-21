@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartExportLabelsTaskRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartExportLabelsTaskRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartExportLabelsTaskRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Exports the labels one machine learning transform holds: "Begins an asynchronous task to
+//! export all labeled data for a particular transform… This API operation accepts the
+//! TransformId whose labels you want to export and an Amazon Simple Storage Service (Amazon
+//! S3) path to export the labels to. The operation returns a TaskRunId." The call WRITES
+//! the label file of the labels the transform holds ([`crate::state::MlLabelSet`]) into the
+//! emulator's own Amazon S3 under the `OutputS3Path`, records the `EXPORT_LABELS` task run
+//! that did it and answers the `TaskRunId` that addresses it — "you can check on the status
+//! of your task run by calling the GetMLTaskRun API".
+//!
+//! The labels it writes are the ones `StartImportLabelsTaskRun` stored, so a label file
+//! round-trips through the transform.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +158,150 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartExportLabelsTaskRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartExportLabelsTaskRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartExportLabelsTaskRun"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported as
+            // that rather than as a client error the caller could act on.
+            return Err(internal("the Glue machine learning transform store is unavailable"));
+        };
+
+        // `TransformId` and `OutputS3Path` are both `@required`, and the id's
+        // `length 1..255` is refused at the boundary — so the only question left about the
+        // request itself is whether the path names somewhere in the object store at all. A
+        // path that names no bucket is the request being wrong, not the labels being
+        // unwritable, so it is refused here and starts no run. It may name the bucket
+        // alone: the labels are exported UNDER the path, so it is a prefix and not an
+        // object ([`crate::state::exported_label_file_key`]).
+        if crate::state::split_s3_location(&input.output_s3_path).is_none() {
+            return Err(invalid_path(&input.output_s3_path));
+        }
+
+        // What the export has to write is resolved under the store's guard, and the guard
+        // is released before the object is written: nothing is awaited while the store is
+        // held, and the run exports the labels the transform held when it started.
+        let (run_id, labels) = {
+            let store = state.lock();
+            // Whether this account holds the transform whose labels would be exported is
+            // decided BEFORE anything is written: the labels live ON that transform, so an
+            // id this account holds none under has none to export.
+            let Some(transform) = store.ml_transforms.get(&input.transform_id) else {
+                return Err(not_found(&input.transform_id));
+            };
+            // The id is minted only once the request is going to be served, so the
+            // refusals above hand out none. The object the export writes is named for the
+            // run, so the id is minted before the write rather than after it.
+            (
+                crate::state::new_ml_task_run_id(),
+                transform.exported_label_file(),
+            )
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let written =
+            crate::state::write_label_file(ctx, &region, &input.output_s3_path, &run_id, &labels)
+                .await;
+
+        // The instants the run reports are stamped AFTER the write, so the span the clock
+        // owes the run starts when the run was recorded: a caller that reads the run
+        // straight after this call still observes it in flight, however long the write
+        // took.
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The store is re-read under the guard the run is recorded under: a delete that
+        // landed while the file was being written decides this start, and the start is
+        // refused because the transform the run would belong to is gone — a `TaskRunId` is
+        // addressed by the pair, so there is nowhere left to record one. The label file
+        // written just before that delete is NOT unwritten: the labels the transform held
+        // were exported while it was still there, and the object is the caller's from then
+        // on, exactly as an export that finished a moment earlier would have left it.
+        let Some(transform) = store.ml_transforms.get_mut(&input.transform_id) else {
+            return Err(not_found(&input.transform_id));
+        };
+
+        // What the run IS, in the modelled shape every reader of it reports: an exporting
+        // labels task, carrying the one property that kind of task has — "the Amazon Simple
+        // Storage Service (Amazon S3) path where you will export the labels", as the
+        // request named it.
+        let properties = TaskRunProperties {
+            task_type: Some(crate::state::ML_TASK_TYPE_EXPORT_LABELS.to_string()),
+            export_labels_task_run_properties: Some(ExportLabelsTaskRunProperties {
+                output_s3_path: Some(input.output_s3_path.clone()),
+            }),
+            // The properties of the other task kinds belong to the runs those starts
+            // record, not to this one.
+            import_labels_task_run_properties: None,
+            labeling_set_generation_task_run_properties: None,
+            find_matches_task_run_properties: None,
+        };
+        // The task was really carried out here, so the run is owed the end that work
+        // reached rather than the one a task nobody performed is terminated in.
+        let owed_end = match written {
+            Ok(object) => {
+                ::tracing::info!(
+                    operation = "StartExportLabelsTaskRun",
+                    transform = %input.transform_id,
+                    run = %run_id,
+                    object = %object,
+                    "exported a Glue machine learning transform's labels"
+                );
+                crate::state::MlTaskRunEnd::Succeeded
+            }
+            Err(reason) => {
+                ::tracing::debug!(
+                    operation = "StartExportLabelsTaskRun",
+                    transform = %input.transform_id,
+                    run = %run_id,
+                    reason = %reason,
+                    "a Glue machine learning transform's labels could not be exported"
+                );
+                crate::state::MlTaskRunEnd::Failed(reason)
+            }
+        };
+        // The transform itself is untouched: an export reads the labels it holds and writes
+        // them somewhere else, so neither its definition nor its label count moves.
+        transform.record_task_run(
+            crate::state::MlTaskRunEntry::start(
+                &input.transform_id,
+                run_id.clone(),
+                properties,
+                now,
+            )
+            .ending(owed_end),
+        );
+
+        Ok(StartExportLabelsTaskRunOutput {
+            // "The unique identifier for the task run."
+            task_run_id: Some(run_id),
+        })
     }
+}
+
+/// This operation's modelled miss: "A specified entity does not exist" — worded in the one
+/// sentence every operation of this service states a transform miss in.
+fn not_found(transform_id: &str) -> StartExportLabelsTaskRunError {
+    StartExportLabelsTaskRunErrorModeled::EntityNotFoundException(EntityNotFoundException {
+        message: Some(crate::state::messages::ml_transform_not_found(transform_id)),
+        from_federation_source: None,
+    })
+    .into()
+}
+
+/// This operation's modelled refusal of a path the labels cannot be written to: "The input
+/// provided was not valid."
+fn invalid_path(path: &str) -> StartExportLabelsTaskRunError {
+    StartExportLabelsTaskRunErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(crate::state::messages::invalid_label_file_path(
+            "OutputS3Path",
+            path,
+        )),
+        from_federation_source: None,
+    })
+    .into()
+}
+
+/// This operation's modelled server fault: "An internal service error occurred."
+fn internal(message: &str) -> StartExportLabelsTaskRunError {
+    StartExportLabelsTaskRunErrorModeled::InternalServiceException(InternalServiceException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }
