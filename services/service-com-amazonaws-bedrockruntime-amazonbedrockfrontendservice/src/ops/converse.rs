@@ -329,9 +329,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // A conversation needs a turn to answer; the ORDER its roles appear in
-        // is not a precondition — the rule `ConverseStream` states too, so both
-        // read it from `crate::state`.
+        // A conversation is answered only when it OPENS on a `user` turn, and
+        // only once each of its turns carries content: both are preconditions of
+        // being served, decided over the submitted conversation before anything
+        // is generated for it or recorded about it. `ConverseStream` states the
+        // same rule, so both read it from `crate::state`.
         let messages =
             crate::state::validate_conversation(input.messages.as_ref()).map_err(validation)?;
         // Every tool result in that conversation has to address a tool request

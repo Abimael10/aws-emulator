@@ -8,6 +8,11 @@
 //!   conversation whose first `Message.role` is `user` is answered whatever
 //!   sequence the roles after it form, and one that opens on any other
 //!   `ConversationRole` value — or carries no turn at all — is refused;
+//! * that precondition is decided over the SUBMITTED conversation alone, before
+//!   the turn is generated and before anything about the call is recorded, so the
+//!   refusal carries the same sentence whatever else the request binds and the
+//!   refused call leaves the service's inference log untouched — asserted over
+//!   the one refusal table the rule above is asserted over;
 //! * a streamed content block arrives as the INCREMENTS a client appends: several
 //!   `contentBlockDelta` events, each carrying that block's own
 //!   `contentBlockIndex`, which reassemble to exactly what `Converse` answers
@@ -23,9 +28,10 @@
 
 use serde_json::{json, Value};
 
-use crate::bedrock_runtime_inference::{emulator, post_json};
+use crate::bedrock_runtime_inference::{emulator, emulator_with_engine, post_json};
 use crate::bedrock_runtime_streaming::decode_frames;
 use service_com_amazonaws_bedrockruntime_amazonbedrockfrontendservice::state;
+use service_com_amazonaws_bedrockruntime_amazonbedrockfrontendservice::ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState as ServiceState;
 
 /// The modelled `StopReason` values, which is what a served turn has to end on
 /// (smithy_query(query="shape", shape="StopReason")).
@@ -213,43 +219,152 @@ async fn a_conversation_is_served_whatever_order_its_roles_appear_in() {
     }
 }
 
-/// RULE: a conversation that does not open on a `user` turn — one with no turn at
-/// all, or one whose leading `Message.role` is another `ConversationRole` value —
-/// is refused `400 ValidationException`, with the same sentence on both Converse
-/// surfaces.
-#[tokio::test]
-async fn a_conversation_that_does_not_open_on_a_user_turn_is_refused() {
-    let router = emulator();
-    let model_id = "amazon.nova-lite-v1:0";
+/// One conversation that does not open on a `user` turn, with the rest of the
+/// request a client submitted it inside.
+struct OpeningRefusalRow {
+    case: &'static str,
+    /// A model the registry serves the Converse API for; the rows span several
+    /// model families, which the opening-turn rule generalises over.
+    model_id: &'static str,
+    request: Value,
+}
 
-    for (case, request) in [
-        ("no messages member at all", json!({})),
-        ("an empty conversation", json!({ "messages": [] })),
-        (
-            "an empty conversation beside an inference configuration",
-            json!({ "messages": [], "inferenceConfig": {"maxTokens": 32} }),
-        ),
-        (
-            "a single assistant turn and nothing else",
-            json!({ "messages": [turn("assistant", "hi")] }),
-        ),
-        (
-            "a conversation that opens on the assistant",
-            json!({ "messages": [
+/// The ONE opening-turn refusal table, which both tests of that rule below read:
+/// every row submits a conversation whose FIRST turn is not a `user` turn, and
+/// the rows differ along which other `ConversationRole` value opens it, whether
+/// it carries a turn at all, how many turns follow, what kind of `ContentBlock`
+/// that opening turn carries, which model family serves it, and how much of the
+/// rest of the request is bound — a tool configuration obliging a tool, a
+/// guardrail configuration, system blocks, an inference configuration — each of
+/// which is a stage the request would otherwise be worked on by.
+fn opening_refusal_rows() -> Vec<OpeningRefusalRow> {
+    vec![
+        OpeningRefusalRow {
+            case: "no messages member at all",
+            model_id: "amazon.nova-lite-v1:0",
+            request: json!({}),
+        },
+        OpeningRefusalRow {
+            case: "an empty conversation",
+            model_id: "moonshotai.kimi-k2.5",
+            request: json!({ "messages": [] }),
+        },
+        OpeningRefusalRow {
+            case: "an empty conversation beside an inference configuration",
+            model_id: "anthropic.claude-3-haiku-20240307-v1:0",
+            request: json!({ "messages": [], "inferenceConfig": {"maxTokens": 32} }),
+        },
+        OpeningRefusalRow {
+            case: "a single assistant turn and nothing else",
+            model_id: "amazon.nova-pro-v1:0",
+            request: json!({ "messages": [turn("assistant", "hi")] }),
+        },
+        OpeningRefusalRow {
+            case: "a conversation that opens on the assistant",
+            model_id: "meta.llama4-scout-17b-instruct-v1:0",
+            request: json!({ "messages": [
                 turn("assistant", "Shall I continue?"),
                 turn("user", "Yes."),
             ] }),
-        ),
-        (
-            "a conversation that opens on a system turn",
-            json!({ "messages": [
+        },
+        OpeningRefusalRow {
+            case: "a conversation that opens on a system turn",
+            model_id: "mistral.mistral-7b-instruct-v0:2",
+            request: json!({ "messages": [
                 turn("system", "Answer in one sentence."),
                 turn("user", "Why are cursors opaque?"),
             ] }),
-        ),
-    ] {
+        },
+        OpeningRefusalRow {
+            case: "an assistant turn opening a request that obliges a tool",
+            model_id: "amazon.nova-lite-v1:0",
+            request: json!({
+                "messages": [turn("assistant", "Shall I look it up?")],
+                "toolConfig": {
+                    "tools": [tool_spec("get_stock_price")],
+                    "toolChoice": {"any": {}},
+                },
+            }),
+        },
+        OpeningRefusalRow {
+            case: "an assistant turn opening a request that names a guardrail this \
+                   account does not hold",
+            model_id: "anthropic.claude-3-haiku-20240307-v1:0",
+            request: json!({
+                "messages": [turn("assistant", "hello"), turn("user", "hi")],
+                "guardrailConfig": {
+                    "guardrailIdentifier": "abcd1234efgh",
+                    "guardrailVersion": "DRAFT",
+                    "trace": "enabled",
+                },
+            }),
+        },
+        OpeningRefusalRow {
+            case: "an opening turn whose content block is a tool result nothing issued",
+            model_id: "meta.llama4-scout-17b-instruct-v1:0",
+            request: json!({ "messages": [{
+                "role": "assistant",
+                "content": [{"toolResult": {
+                    "toolUseId": "tooluse_emulator000000001",
+                    "content": [{"text": "41.5"}],
+                }}],
+            }] }),
+        },
+        OpeningRefusalRow {
+            case: "a system turn opening a request with system blocks and an \
+                   inference configuration",
+            model_id: "mistral.mistral-7b-instruct-v0:2",
+            request: json!({
+                "system": [{"text": "You are terse."}],
+                "messages": [
+                    turn("system", "Answer in one sentence."),
+                    turn("user", "Why are cursors opaque?"),
+                ],
+                "inferenceConfig": {"maxTokens": 16, "temperature": 0.2},
+            }),
+        },
+        OpeningRefusalRow {
+            case: "an opening assistant turn whose content list is empty",
+            model_id: "amazon.nova-pro-v1:0",
+            request: json!({ "messages": [{"role": "assistant", "content": []}] }),
+        },
+        OpeningRefusalRow {
+            case: "a long conversation that opens on the assistant",
+            model_id: "cohere.command-r-plus-v1:0",
+            request: json!({ "messages": [
+                turn("assistant", "Mars."),
+                turn("user", "And one moon?"),
+                turn("assistant", "Phobos."),
+                turn("user", "And one star?"),
+                turn("assistant", "Sol."),
+            ] }),
+        },
+        OpeningRefusalRow {
+            case: "no messages member at all beside a tool configuration",
+            model_id: "moonshotai.kimi-k2.5",
+            request: json!({ "toolConfig": {"tools": [tool_spec("get_stock_price")]} }),
+        },
+    ]
+}
+
+/// RULE: a conversation that does not open on a `user` turn — one with no turn at
+/// all, or one whose leading `Message.role` is another `ConversationRole` value —
+/// is refused `400 ValidationException` carrying the service's one fixed
+/// sentence, the same on both Converse surfaces and whatever else the request
+/// binds.
+#[tokio::test]
+async fn a_conversation_that_does_not_open_on_a_user_turn_is_refused() {
+    let router = emulator();
+
+    for row in opening_refusal_rows() {
+        let case = row.case;
         for surface in ["converse", "converse-stream"] {
-            let call = post_json(&router, &format!("/model/{model_id}/{surface}"), &request).await;
+            let call = post_json(
+                &router,
+                &format!("/model/{}/{surface}", row.model_id),
+                &row.request,
+            )
+            .await;
             assert_eq!(
                 call.status,
                 400,
@@ -257,20 +372,89 @@ async fn a_conversation_that_does_not_open_on_a_user_turn_is_refused() {
                 call.status,
                 String::from_utf8_lossy(&call.body)
             );
+            // The wire error identity a client branches on, which restJson1
+            // reports on `x-amzn-errortype`.
             assert_eq!(
                 call.error_code(),
                 "ValidationException",
                 "case {case:?} on {surface}: expected ValidationException, got {:?}",
                 call.error_code()
             );
+            let body = call.json();
+            let message = body["message"].as_str().unwrap_or_default();
             assert_eq!(
-                call.json()["message"].as_str(),
-                Some(state::NO_OPENING_USER_TURN),
-                "case {case:?} on {surface}: expected the opening-turn refusal, got {}",
+                message,
+                state::NO_OPENING_USER_TURN,
+                "case {case:?} on {surface}: expected the opening-turn refusal, got {body}"
+            );
+            // The sentence is FIXED: nothing in it is filled from the request, so
+            // it names neither the offending turn's path nor the model the
+            // request was sent to.
+            assert!(
+                !message.contains("messages.") && !message.contains(row.model_id),
+                "case {case:?} on {surface}: the refusal names no part of the request, got \
+                 {message:?}"
+            );
+        }
+    }
+}
+
+/// RULE: that precondition is decided over the submitted conversation alone,
+/// BEFORE the turn is generated and before anything about the call is recorded —
+/// so none of the conversations the table above is refused for contributes to the
+/// log every served inference appends to.
+#[tokio::test]
+async fn a_refused_conversation_is_generated_for_nothing_and_recorded_nowhere() {
+    let (engine, router) = emulator_with_engine();
+
+    for row in opening_refusal_rows() {
+        let case = row.case;
+        for surface in ["converse", "converse-stream"] {
+            let call = post_json(
+                &router,
+                &format!("/model/{}/{surface}", row.model_id),
+                &row.request,
+            )
+            .await;
+            assert_eq!(
+                call.status,
+                400,
+                "case {case:?} on {surface}: expected the conversation to be refused, got {} / {}",
+                call.status,
                 String::from_utf8_lossy(&call.body)
             );
         }
     }
+
+    // Nothing was generated and nothing was recorded: a refused conversation is
+    // not an inference, so it is absent from the log a served call appends to.
+    let logged = engine.state::<ServiceState>().lock().invocations.clone();
+    assert!(
+        logged.is_empty(),
+        "expected a refused conversation to be recorded nowhere, got {logged:?}"
+    );
+
+    // And that log is where a SERVED conversation lands, so the emptiness above
+    // is the refusal's doing rather than a log nothing ever reaches.
+    let served = post_json(
+        &router,
+        "/model/amazon.nova-lite-v1:0/converse",
+        &json!({ "messages": [turn("user", "Name one planet.")] }),
+    )
+    .await;
+    assert_eq!(
+        served.status,
+        200,
+        "the same emulator serves a conversation that opens on a user turn, got {} / {}",
+        served.status,
+        String::from_utf8_lossy(&served.body)
+    );
+    let logged = engine.state::<ServiceState>().lock().invocations.clone();
+    assert_eq!(
+        logged.len(),
+        1,
+        "expected the served conversation to be the one logged call, got {logged:?}"
+    );
 }
 
 /// One streamed turn: the request, and where the content block it delivers is

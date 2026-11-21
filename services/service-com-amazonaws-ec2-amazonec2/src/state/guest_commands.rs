@@ -160,6 +160,14 @@ struct Performed {
 /// thread this process could not start, or one that ended without answering, is `None` — a run
 /// that performed nothing, which leaves the machine's storage exactly as it was rather than
 /// reporting an outcome nothing produced.
+///
+/// "Ended without answering" includes a run that unwound: the run is performed inside
+/// [`::std::panic::catch_unwind`] ON that thread, so an unwind becomes the `None` above
+/// instead of travelling anywhere. Joining the thread is not what contains it — a scope
+/// re-raises a scoped thread's unwind when its closure returns, however the handle was
+/// joined — and this is performed with the store's guard held, so an unwind reaching the
+/// thread that served the request would leave that guard poisoned for every later caller
+/// of the store: one script would take the whole emulator's EC2 state with it.
 fn performed(mut session: ShellSession, script: &str) -> Option<Performed> {
     let run = move || {
         let mut status = session.run(script);
@@ -181,12 +189,16 @@ fn performed(mut session: ShellSession, script: &str) -> Option<Performed> {
             volume: session.into_volume().unwrap_or_default(),
         }
     };
+    // The run, contained on the thread it happens on: whatever the script made the session
+    // do, this thread answers either what it produced or nothing at all.
+    let contained = move || ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(run)).ok();
     ::std::thread::scope(|scope| {
         ::std::thread::Builder::new()
             .stack_size(MAX_GUEST_SCRIPT_STACK_BYTES)
-            .spawn_scoped(scope, run)
+            .spawn_scoped(scope, contained)
             .ok()
             .and_then(|thread| thread.join().ok())
+            .flatten()
     })
 }
 

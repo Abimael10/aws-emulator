@@ -181,6 +181,9 @@ impl<Eng: Send + Sync + 'static> ConverseStream<Eng> {
                 model.model_id
             )));
         }
+        // The preconditions `Converse` decides too, over the submitted
+        // conversation and before anything is generated for it: it OPENS on a
+        // `user` turn, and each of its turns carries content.
         let messages = crate::state::validate_conversation(input.messages.as_ref())
             .map_err(validation)?;
         // Every tool result in the conversation has to address a tool request the

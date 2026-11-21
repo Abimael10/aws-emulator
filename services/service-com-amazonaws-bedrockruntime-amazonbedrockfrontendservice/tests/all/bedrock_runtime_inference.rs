@@ -224,7 +224,11 @@ struct InvokeRefusalRow {
 /// on a shared engine, exactly as `core/router` assembles it. The engine is
 /// returned too, so a test can read the service's own state the way the next
 /// request would.
-fn emulator_with_engine() -> (Arc<engine::InMemoryEngine>, MultiServiceRouter) {
+///
+/// `pub(crate)` for the same reason [`emulator`] is: a suite that has to read the
+/// state a call left behind drives THIS harness rather than growing its own copy
+/// of it.
+pub(crate) fn emulator_with_engine() -> (Arc<engine::InMemoryEngine>, MultiServiceRouter) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
