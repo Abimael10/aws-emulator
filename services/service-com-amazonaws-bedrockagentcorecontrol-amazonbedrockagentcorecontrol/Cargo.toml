@@ -45,6 +45,10 @@ aws-sdk-lambda = { version = "1", default-features = false }
 # Resolves an agent runtime's code artifact against the emulator's own object
 # storage, through the in-process callback (src/state.rs).
 aws-sdk-s3 = { version = "1", default-features = false }
+# Resolves the subnets and security groups a caller-supplied VPC configuration
+# names against the emulator's own EC2, through the in-process callback
+# (src/state/ec2_vpc_placement.rs).
+aws-sdk-ec2 = { version = "1", default-features = false }
 # Creates the log group this service vends for an agent runtime in the emulator's
 # own CloudWatch Logs, through the in-process callback
 # (src/state/runtime_logs.rs).
@@ -83,6 +87,9 @@ service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # references is one it really holds, sealed under a real KMS key.
 service-com-amazonaws-secretsmanager-secretsmanager = { workspace = true }
 service-com-amazonaws-kms-trentservice = { workspace = true }
+# Mounted beside this service in the VPC-placement suite, so the subnets and security
+# groups a create resolves are ones the emulator's own EC2 really holds.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 # Generates the credential-provider names the API-key-credential-provider deletion
 # suite drives its idempotence property over, from a seed it reports.
 rand = "0.9"

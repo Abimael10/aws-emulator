@@ -246,6 +246,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The runtime reaches the network only through the elastic network
+        // interfaces the service places in the subnets, under the security
+        // groups, a VPC-mode `networkConfiguration` names — EC2's resources, not
+        // this service's — so every id is resolved against the emulator's own
+        // EC2 before anything is written, exactly as `CreateBrowser` resolves
+        // the placement it stores (`crate::state::unresolved_vpc_placement`).
+        if let Some(refusal) = crate::state::unresolved_vpc_placement(
+            ctx,
+            &region,
+            crate::state::RUNTIME_VPC_CONFIG_MEMBER,
+            input
+                .network_configuration
+                .as_ref()
+                .and_then(|configuration| configuration.network_mode_config.as_ref()),
+        )
+        .await
+        {
+            return Err(CreateAgentRuntimeErrorModeled::ValidationException(refusal).into());
+        }
+
         // Everything this request decides and writes happens under ONE guard, which
         // lives only in this block: it is released before the cross-service call
         // below, because a lock is not held across an await.

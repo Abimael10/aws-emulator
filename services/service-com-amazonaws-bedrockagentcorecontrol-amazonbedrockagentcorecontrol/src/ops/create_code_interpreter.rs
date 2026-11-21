@@ -202,6 +202,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The interpreter reaches the network only through the elastic network
+        // interfaces the service places in the subnets, under the security
+        // groups, this configuration names — EC2's resources, not this
+        // service's — so every id is resolved against the emulator's own EC2
+        // before anything is written, exactly as `CreateBrowser` resolves the
+        // placement it stores (`crate::state::unresolved_vpc_placement`). Made
+        // before the store guard is taken: a lock is not held across an await.
+        if let Some(refusal) = crate::state::unresolved_vpc_placement(
+            ctx,
+            &region,
+            crate::state::CODE_INTERPRETER_VPC_CONFIG_MEMBER,
+            input.network_configuration.vpc_config.as_ref(),
+        )
+        .await
+        {
+            return Err(CreateCodeInterpreterErrorModeled::ValidationException(refusal).into());
+        }
+
         let mut store = state.lock();
 
         // A replayed request carrying the same `clientToken` answers with the

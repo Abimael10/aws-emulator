@@ -253,6 +253,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The version this request would publish reaches the network through the
+        // interfaces the service places in the subnets, under the security
+        // groups, its `networkConfiguration` names, so every id is resolved
+        // against the emulator's own EC2 before anything is written — the same
+        // gate `CreateAgentRuntime` applies to the placement it stores.
+        if let Some(refusal) = crate::state::unresolved_vpc_placement(
+            ctx,
+            &region,
+            crate::state::RUNTIME_VPC_CONFIG_MEMBER,
+            input
+                .network_configuration
+                .as_ref()
+                .and_then(|configuration| configuration.network_mode_config.as_ref()),
+        )
+        .await
+        {
+            return Err(UpdateAgentRuntimeErrorModeled::ValidationException(refusal).into());
+        }
+
         let mut store = state.lock();
         // A runtime whose deletion the clock has already made due is gone before this
         // update looks for it.

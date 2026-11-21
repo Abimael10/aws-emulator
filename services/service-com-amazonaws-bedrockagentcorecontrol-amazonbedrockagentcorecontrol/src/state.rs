@@ -1757,7 +1757,13 @@ pub mod harness_updates;
 /// it with. Re-exported, so a handler names `crate::state::…` for it exactly as
 /// it does for the resource itself.
 pub mod name_conflicts;
+/// The EC2 subnets and security groups a caller-supplied `VpcConfig` names,
+/// resolved against the service that owns them before a resource bound to that
+/// network is stored. Re-exported, so a handler names `crate::state::…` for it
+/// exactly as it does for the record it is about.
+pub mod ec2_vpc_placement;
 mod harnesses;
+pub use ec2_vpc_placement::*;
 pub use harnesses::*;
 pub use name_conflicts::*;
 pub use agent_runtime_default_endpoint::*;
