@@ -140,11 +140,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // A domain is a regional resource, so it is reached only through the Region it was
+        // created in.
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
 
         let mut store = state.lock();
-        let domain = store.domains.get_mut(&input.domain_name).ok_or_else(|| {
+        let domain = store.domain_mut(&region, &input.domain_name).ok_or_else(|| {
             DeleteProfileError::from(DeleteProfileErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::domain_not_found(&input.domain_name)),

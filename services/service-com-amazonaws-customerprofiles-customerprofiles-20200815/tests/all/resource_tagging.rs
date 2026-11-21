@@ -31,7 +31,7 @@ use service_com_amazonaws_customerprofiles_customerprofiles_20200815::state::{
     ARN_SERVICE, MAX_TAGS_PER_RESOURCE,
 };
 
-use crate::calculated_attribute_definitions::definition;
+use crate::calculated_attribute_definitions::{define_object_type, definition};
 use crate::domain_profile_lifecycle::{error_code, error_message, Emulator};
 use crate::profile_objects::put_contact_type;
 
@@ -173,6 +173,7 @@ async fn every_resource_kind_an_arn_names_tags_lists_and_untags() {
     assert_eq!(status, 200, "CreateDomain tagdom: got {status} {body:?}");
     emulator.create_domain("plaindom", 366).await;
     put_contact_type(&emulator, "tagdom", "Contact_Record", true).await;
+    define_object_type(&emulator, "tagdom").await;
     let (status, body) = crate::calculated_attribute_definitions::create(
         &emulator,
         "tagdom",

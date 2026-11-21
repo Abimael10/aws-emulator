@@ -164,7 +164,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // A domain is a regional resource, so it is read only through the Region it was
+        // created in.
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
 
         let now = ::std::time::SystemTime::now();
@@ -185,8 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => None,
             };
             let domain = store
-                .domains
-                .get_mut(&input.domain_name)
+                .domain_mut(&region, &input.domain_name)
                 .ok_or_else(|| not_found(crate::state::domain_not_found(&input.domain_name)))?;
             // The retention the clock has already run out is materialised before the page
             // is picked, so the `EXPIRED` records it owes are part of the history this

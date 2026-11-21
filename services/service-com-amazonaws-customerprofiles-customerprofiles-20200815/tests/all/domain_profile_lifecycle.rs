@@ -34,6 +34,10 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDEXAMPLE/20260101/us-east-1/profile/aws4_request, \
      SignedHeaders=host, Signature=0";
 
+/// The Region the header above signs for — the Region every domain these tests create
+/// therefore belongs to, and the one a test seeding the store directly stores into.
+pub(crate) const REGION: &str = "us-east-1";
+
 /// One emulator: a single shared engine behind the router, so every request in a test
 /// observes the same state.
 pub(crate) struct Emulator {
@@ -1168,8 +1172,7 @@ async fn a_create_is_refused_once_its_collection_is_at_its_cap() {
         let name = format!("seeded_{index}");
         state
             .lock()
-            .domains
-            .insert(name.clone(), Domain::new(name, 90, now));
+            .insert_domain(REGION, Domain::new(name, 90, now));
     }
     let (status, body) = emulator
         .post("/domains/at_the_cap", json!({ "DefaultExpirationDays": 90 }))
@@ -1196,7 +1199,7 @@ async fn a_create_is_refused_once_its_collection_is_at_its_cap() {
         "case \"at-the-domain-cap\": the refusal must name the limit, got {body:?}"
     );
     assert_eq!(
-        state.lock().domains.len(),
+        state.lock().domain_count(REGION),
         MAX_DOMAINS,
         "case \"at-the-domain-cap\": a refused create must not store anything"
     );
@@ -1205,8 +1208,7 @@ async fn a_create_is_refused_once_its_collection_is_at_its_cap() {
     {
         let mut store = state.lock();
         let domain = store
-            .domains
-            .get_mut("at_the_cap")
+            .domain_mut(REGION, "at_the_cap")
             .expect("the domain created above");
         for index in 0..MAX_PROFILES_PER_DOMAIN - 1 {
             domain.put_profile(StoredProfile {
@@ -1238,8 +1240,7 @@ async fn a_create_is_refused_once_its_collection_is_at_its_cap() {
     assert_eq!(
         state
             .lock()
-            .domains
-            .get("at_the_cap")
+            .domain(REGION, "at_the_cap")
             .map(|domain| domain.profiles.len()),
         Some(MAX_PROFILES_PER_DOMAIN),
         "case \"at-the-profile-cap\": a refused create must not store anything"

@@ -143,13 +143,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // A domain is a regional resource, so it is read only through the Region it was
+        // created in.
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
 
         // A reporting operation: it only reads the domain's profiles, so nothing here
         // writes to the store.
         let store = state.lock();
-        let domain = store.domains.get(&input.domain_name).ok_or_else(|| {
+        let domain = store.domain(&region, &input.domain_name).ok_or_else(|| {
             BatchGetProfileError::from(BatchGetProfileErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::domain_not_found(&input.domain_name)),

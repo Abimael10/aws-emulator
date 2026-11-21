@@ -27,7 +27,7 @@ use service_com_amazonaws_customerprofiles_customerprofiles_20200815::state::{
     service_state, SECONDS_PER_DAY,
 };
 
-use crate::domain_profile_lifecycle::{error_code, item_ids, Emulator};
+use crate::domain_profile_lifecycle::{error_code, item_ids, Emulator, REGION};
 use crate::profile_object_types::error_message;
 
 /// The acknowledgement a completed delete reports: fixed text, interpolating nothing.
@@ -1003,8 +1003,7 @@ async fn an_object_is_reported_only_until_its_retention_runs_out() {
             let state = service_state(&*emulator.engine).expect("the service's store");
             let mut store = state.lock();
             let domain = store
-                .domains
-                .get_mut("expiredom")
+                .domain_mut(REGION, "expiredom")
                 .expect("the domain created above");
             let stored = domain
                 .profile_objects

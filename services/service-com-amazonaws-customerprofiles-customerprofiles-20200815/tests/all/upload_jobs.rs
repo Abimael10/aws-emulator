@@ -30,7 +30,9 @@ use service_com_amazonaws_customerprofiles_customerprofiles_20200815::state::{
     service_state, MAX_UPLOAD_FILE_BYTES,
 };
 
-use crate::domain_profile_lifecycle::{error_code, error_message, upload_job_fields, Emulator};
+use crate::domain_profile_lifecycle::{
+    error_code, error_message, upload_job_fields, Emulator, REGION,
+};
 
 /// `CreateUploadJobRequest$DataExpiry`: "If not provided, the system default of 2 weeks
 /// is used."
@@ -427,8 +429,7 @@ fn stored_file(emulator: &Emulator, domain: &str, job_id: &str) -> Option<Vec<u8
     let state = service_state(&*emulator.engine).expect("the service store");
     let store = state.lock();
     store
-        .domains
-        .get(domain)?
+        .domain(REGION, domain)?
         .upload_jobs
         .get(job_id)?
         .uploaded_file

@@ -196,15 +196,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // A domain is a regional resource, so it is reached only through the Region it was
+        // created in.
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         let domain = store
-            .domains
-            .get_mut(&input.domain_name)
+            .domain_mut(&region, &input.domain_name)
             .ok_or_else(|| not_found(crate::state::domain_not_found(&input.domain_name)))?;
+
+        // A calculated attribute aggregates an attribute OF a profile object type, so every
+        // object type its `AttributeDetails` names has to be one the domain already defines:
+        // a definition over a type the domain has never seen could never compute anything,
+        // so the name is resolved here rather than discovered as a permanently empty
+        // attribute. The first name the domain does not define is the one reported.
+        if let Some(object_type_name) =
+            crate::state::attribute_details_object_types(&input.attribute_details)
+                .into_iter()
+                .find(|object_type_name| !domain.defines_object_type(object_type_name))
+        {
+            return Err(bad_request(crate::state::invalid_object_type_name(
+                object_type_name,
+            )));
+        }
 
         // The name identifies the definition within the domain, so a name the domain
         // already holds is a conflict and never an overwrite. The lookup and the insert

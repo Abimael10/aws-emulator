@@ -29,7 +29,7 @@ use service_com_amazonaws_customerprofiles_customerprofiles_20200815::state::{
     MAX_PROFILE_HISTORY_RECORDS, SECONDS_PER_DAY, STANDARD_PROFILE_OBJECT_TYPE,
 };
 
-use crate::domain_profile_lifecycle::{error_code, error_message, Emulator};
+use crate::domain_profile_lifecycle::{error_code, error_message, Emulator, REGION};
 use crate::profile_objects::{contact, ingest, put_contact_type};
 use crate::update_profile::update;
 
@@ -388,8 +388,7 @@ async fn an_expired_object_records_an_action_nobody_performed() {
         let state = service_state(&*emulator.engine).expect("the service's store");
         let mut store = state.lock();
         let stored = store
-            .domains
-            .get_mut(domain)
+            .domain_mut(REGION, domain)
             .expect("the domain created above")
             .profile_objects
             .get_mut(&(CONTACT_TYPE.to_string(), profile.clone(), unique_key.clone()))
@@ -705,8 +704,7 @@ async fn a_profiles_history_is_bounded_by_dropping_its_oldest_records() {
         let state = service_state(&*emulator.engine).expect("the service's store");
         let mut store = state.lock();
         let held = store
-            .domains
-            .get_mut(domain)
+            .domain_mut(REGION, domain)
             .expect("the domain created above");
         for _ in 0..overflow {
             held.record_profile_action(

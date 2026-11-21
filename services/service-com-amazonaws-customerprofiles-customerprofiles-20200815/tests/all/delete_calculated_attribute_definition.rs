@@ -16,7 +16,8 @@
 use serde_json::{json, Value};
 
 use crate::calculated_attribute_definitions::{
-    attribute_details, create, definition, exists_message, get, item_names, list,
+    attribute_details, create, create_domain_with_object_type, definition, exists_message, get,
+    item_names, list,
 };
 use crate::domain_profile_lifecycle::{error_code, Emulator};
 use crate::profile_object_types::error_message;
@@ -139,7 +140,7 @@ fn rows() -> Vec<(&'static str, String, Value)> {
 #[tokio::test]
 async fn a_delete_removes_exactly_the_named_definition() {
     let emulator = Emulator::new();
-    emulator.create_domain("deldom", 30).await;
+    create_domain_with_object_type(&emulator, "deldom", 30).await;
 
     let rows = rows();
     for (case, name, body) in &rows {
@@ -278,7 +279,7 @@ async fn a_delete_is_scoped_to_the_domain_it_names() {
     let emulator = Emulator::new();
     let domains = ["alpha", "beta", "gamma"];
     for domain in domains {
-        emulator.create_domain(domain, 30).await;
+        create_domain_with_object_type(&emulator, domain, 30).await;
     }
 
     let shared = "Shared_Name";
@@ -326,7 +327,7 @@ async fn a_delete_is_scoped_to_the_domain_it_names() {
 #[tokio::test]
 async fn a_delete_of_an_absent_pair_is_resource_not_found() {
     let emulator = Emulator::new();
-    emulator.create_domain("holder", 30).await;
+    create_domain_with_object_type(&emulator, "holder", 30).await;
     emulator.create_domain("empty", 30).await;
     create(&emulator, "holder", "Held", definition("SUM")).await;
     create(&emulator, "holder", "Transient", definition("COUNT")).await;

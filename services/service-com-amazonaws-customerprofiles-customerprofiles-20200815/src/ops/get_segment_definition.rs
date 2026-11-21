@@ -159,13 +159,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // A domain is a regional resource, so it is read only through the Region it was
+        // created in.
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
 
         let store = state.lock();
         let domain = store
-            .domains
-            .get(&input.domain_name)
+            .domain(&region, &input.domain_name)
             .ok_or_else(|| not_found(crate::state::domain_not_found(&input.domain_name)))?;
         let stored = domain
             .segment_definitions

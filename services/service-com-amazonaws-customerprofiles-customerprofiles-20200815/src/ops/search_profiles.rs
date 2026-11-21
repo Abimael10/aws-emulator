@@ -170,7 +170,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // A domain is a regional resource, so the search resolves it in the Region the
+        // request was signed for: a domain of this name in another Region is not this
+        // request's, and the search is refused before any matching runs.
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
 
         // A search takes ONE value per key name: `Values` carries no modelled maximum, and
@@ -218,7 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
                 None => None,
             };
-            let domain = store.domains.get(&input.domain_name).ok_or_else(|| {
+            let domain = store.domain(&region, &input.domain_name).ok_or_else(|| {
                 SearchProfilesError::from(SearchProfilesErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: Some(crate::state::profile_collection_domain_not_found(

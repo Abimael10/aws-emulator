@@ -18,9 +18,7 @@
 
 use serde_json::{json, Value};
 use std::sync::Arc;
-use std::time::Duration;
-
-use service_com_amazonaws_customerprofiles_customerprofiles_20200815::state::HISTORICAL_DATA_INDEXING_SPAN;
+use std::time::{Duration, Instant};
 
 use crate::domain_profile_lifecycle::{error_code, Emulator};
 use crate::profile_object_types::error_message;
@@ -102,6 +100,82 @@ pub(crate) fn item_names(body: &Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// How long a poll waits between two reads of a definition.
+const POLL_EVERY: Duration = Duration::from_millis(50);
+
+/// The longest a poll waits for a transition the clock owes: far longer than any span this
+/// service measures one in, so a loaded or slow host has generous room, while a poll that
+/// never sees the transition still ends with a message naming what it waited for.
+const POLL_BUDGET: Duration = Duration::from_secs(120);
+
+/// Read the definition until it reports `wanted` as its `Status`, and answer that response.
+///
+/// Waits for the CONDITION rather than for a span: each pass re-reads, so a host that takes
+/// longer than the span to get there only polls more often. Panics when [`POLL_BUDGET`] runs
+/// out without the status ever being reported.
+pub(crate) async fn poll_until_status(
+    emulator: &Emulator,
+    domain: &str,
+    name: &str,
+    wanted: &str,
+) -> Value {
+    let deadline = Instant::now() + POLL_BUDGET;
+    loop {
+        let (status, read) = get(emulator, domain, name).await;
+        assert_eq!(
+            status, 200,
+            "polling {name:?} in {domain:?}: expected 200, got {status} {read:?}"
+        );
+        if read.get("Status").and_then(Value::as_str) == Some(wanted) {
+            return read;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "polling {name:?} in {domain:?}: Status never reached {wanted:?} within \
+             {POLL_BUDGET:?}, last read {read:?}"
+        );
+        tokio::time::sleep(POLL_EVERY).await;
+    }
+}
+
+/// The profile object type the definitions in these suites aggregate an attribute of. A
+/// calculated attribute names an object type its domain already defines, so a domain that
+/// holds one of these definitions holds this type.
+pub(crate) const OBJECT_TYPE: &str = "Orders";
+
+/// Define [`OBJECT_TYPE`] in a domain through `PutProfileObjectType`, asserting it
+/// succeeded: a calculated attribute names an object type its domain already defines.
+pub(crate) async fn define_object_type(emulator: &Emulator, domain: &str) {
+    let (status, body) = emulator
+        .send(
+            "PUT",
+            &format!("/domains/{domain}/object-types/{OBJECT_TYPE}"),
+            Some(json!({
+                "Description": "the orders a profile placed",
+                "Fields": {
+                    "Amount": { "ContentType": "NUMBER", "Source": "_source.amount" },
+                    "Discount": { "ContentType": "NUMBER", "Source": "_source.discount" },
+                },
+            })),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "seeding object type {OBJECT_TYPE:?} in {domain:?}: expected 200, got {status} {body:?}"
+    );
+}
+
+/// A domain ready to hold a calculated attribute: created with the given expiration, and
+/// with [`OBJECT_TYPE`] defined in it.
+pub(crate) async fn create_domain_with_object_type(
+    emulator: &Emulator,
+    domain: &str,
+    expiration_days: u32,
+) {
+    emulator.create_domain(domain, expiration_days).await;
+    define_object_type(emulator, domain).await;
 }
 
 /// An `AttributeDetails`: the attribute items named in the expression, and the expression
@@ -227,7 +301,7 @@ fn success_rows() -> Vec<(&'static str, String, Value)> {
 #[tokio::test]
 async fn a_create_persists_the_definition_and_the_readers_report_it() {
     let emulator = Emulator::new();
-    emulator.create_domain("cadom", 30).await;
+    create_domain_with_object_type(&emulator, "cadom", 30).await;
 
     let rows = success_rows();
     let mut expected_names: Vec<String> = Vec::new();
@@ -351,7 +425,7 @@ async fn a_create_persists_the_definition_and_the_readers_report_it() {
 #[tokio::test]
 async fn a_definition_that_asked_for_historical_data_completes_when_the_span_has_passed() {
     let emulator = Emulator::new();
-    emulator.create_domain("spandom", 30).await;
+    create_domain_with_object_type(&emulator, "spandom", 30).await;
 
     let body = json!({
         "AttributeDetails": attribute_details("Orders", &["Amount"]),
@@ -369,13 +443,9 @@ async fn a_definition_that_asked_for_historical_data_completes_when_the_span_has
         "case \"the create\": expected the transient status, got {created:?}"
     );
 
-    tokio::time::sleep(HISTORICAL_DATA_INDEXING_SPAN + Duration::from_millis(250)).await;
-
-    let (status, read) = get(&emulator, "spandom", "Indexed").await;
-    assert_eq!(
-        status, 200,
-        "case \"after the span\": expected 200, got {status} {read:?}"
-    );
+    // The indexing is owed to the clock, so the definition reaches COMPLETED on its own:
+    // this waits for that CONDITION rather than for the span, re-reading until it holds.
+    let read = poll_until_status(&emulator, "spandom", "Indexed", "COMPLETED").await;
     assert_eq!(
         read.get("Status").and_then(Value::as_str),
         Some("COMPLETED"),
@@ -403,7 +473,7 @@ async fn a_definition_that_asked_for_historical_data_completes_when_the_span_has
 #[tokio::test]
 async fn a_create_of_a_held_name_is_refused_and_changes_nothing() {
     let emulator = Emulator::new();
-    emulator.create_domain("dupdom", 30).await;
+    create_domain_with_object_type(&emulator, "dupdom", 30).await;
 
     let rows: Vec<(&str, String, Value, Value)> = vec![
         (
@@ -546,7 +616,7 @@ async fn a_create_of_a_held_name_is_refused_and_changes_nothing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exactly_one_of_many_concurrent_creates_of_one_name_wins() {
     let emulator = Arc::new(Emulator::new());
-    emulator.create_domain("racedom", 30).await;
+    create_domain_with_object_type(&emulator, "racedom", 30).await;
 
     let rows: Vec<(&str, usize, String)> = vec![
         ("two racers", 2, "Two_Racers".to_string()),
@@ -649,7 +719,7 @@ async fn a_calculated_attribute_name_is_unique_within_one_domain_only() {
 
     let domains = ["scopeone", "scopetwo", "scope-three"];
     for (index, domain) in domains.iter().enumerate() {
-        emulator.create_domain(domain, 30).await;
+        create_domain_with_object_type(&emulator, domain, 30).await;
         let statistic = STATISTICS[index];
         let (status, created) = create(&emulator, domain, "Shared_Name", definition(statistic))
             .await;
@@ -696,7 +766,7 @@ async fn a_calculated_attribute_name_is_unique_within_one_domain_only() {
 #[tokio::test]
 async fn the_listing_pages_through_the_definitions_in_name_order() {
     let emulator = Emulator::new();
-    emulator.create_domain("pagedom", 30).await;
+    create_domain_with_object_type(&emulator, "pagedom", 30).await;
 
     let mut stored: Vec<String> = Vec::new();
     for index in 0..7 {
@@ -760,7 +830,7 @@ async fn the_listing_pages_through_the_definitions_in_name_order() {
 #[tokio::test]
 async fn the_calculated_attribute_operations_refuse_absent_resources_and_invalid_input() {
     let emulator = Emulator::new();
-    emulator.create_domain("bounddom", 30).await;
+    create_domain_with_object_type(&emulator, "bounddom", 30).await;
 
     for (case, status_and_code) in [
         (

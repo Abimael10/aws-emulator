@@ -120,6 +120,16 @@ fn resource_part(resource_arn: &str) -> Option<&str> {
     resource_arn.splitn(6, ':').nth(5)
 }
 
+/// The Region part of an ARN: the fourth field, which names the Region the resource it
+/// addresses lives in.
+///
+/// Every resource this surface tags is nested under a domain, and a domain is a regional
+/// resource, so the Region the ARN names is the Region its record is looked for in: an ARN
+/// naming another Region addresses no resource of this one.
+fn region_part(resource_arn: &str) -> Option<&str> {
+    resource_arn.split(':').nth(3)
+}
+
 /// One resource the tagging operations can address, as its ARN's resource part names it.
 #[derive(Debug, PartialEq, Eq)]
 enum Addressed<'a> {
@@ -164,30 +174,28 @@ pub fn resource_tags_mut<'s>(
     store: &'s mut ServiceState,
     resource_arn: &str,
 ) -> Option<&'s mut Option<HashMap<String, String>>> {
+    let region = region_part(resource_arn)?.to_string();
     match addressed(resource_part(resource_arn)?)? {
         Addressed::Domain(domain_name) => {
-            Some(&mut store.domains.get_mut(domain_name)?.tags)
+            Some(&mut store.domain_mut(&region, domain_name)?.tags)
         }
         Addressed::ObjectType(domain_name, object_type_name) => Some(
             &mut store
-                .domains
-                .get_mut(domain_name)?
+                .domain_mut(&region, domain_name)?
                 .object_types
                 .get_mut(object_type_name)?
                 .tags,
         ),
         Addressed::CalculatedAttribute(domain_name, calculated_attribute_name) => Some(
             &mut store
-                .domains
-                .get_mut(domain_name)?
+                .domain_mut(&region, domain_name)?
                 .calculated_attributes
                 .get_mut(calculated_attribute_name)?
                 .tags,
         ),
         Addressed::RecommenderSchema(domain_name, recommender_schema_name) => Some(
             &mut store
-                .domains
-                .get_mut(domain_name)?
+                .domain_mut(&region, domain_name)?
                 .recommender_schemas
                 .get_mut(recommender_schema_name)?
                 .tags,
@@ -203,28 +211,26 @@ pub fn reported_resource_tags(
     store: &ServiceState,
     resource_arn: &str,
 ) -> Option<HashMap<String, String>> {
+    let region = region_part(resource_arn)?;
     let held = match addressed(resource_part(resource_arn)?)? {
-        Addressed::Domain(domain_name) => &store.domains.get(domain_name)?.tags,
+        Addressed::Domain(domain_name) => &store.domain(region, domain_name)?.tags,
         Addressed::ObjectType(domain_name, object_type_name) => {
             &store
-                .domains
-                .get(domain_name)?
+                .domain(region, domain_name)?
                 .object_types
                 .get(object_type_name)?
                 .tags
         }
         Addressed::CalculatedAttribute(domain_name, calculated_attribute_name) => {
             &store
-                .domains
-                .get(domain_name)?
+                .domain(region, domain_name)?
                 .calculated_attributes
                 .get(calculated_attribute_name)?
                 .tags
         }
         Addressed::RecommenderSchema(domain_name, recommender_schema_name) => {
             &store
-                .domains
-                .get(domain_name)?
+                .domain(region, domain_name)?
                 .recommender_schemas
                 .get(recommender_schema_name)?
                 .tags

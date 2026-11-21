@@ -151,6 +151,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // A domain is a regional resource, so it is read only through the Region it was
+        // created in.
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
 
         // A read: the data key is reported as the job stores it (`CreateUploadJob` minted
@@ -159,7 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // signed, so nothing else waits on this store while it is.
         let (client_token, path) = {
             let store = state.lock();
-            let domain = store.domains.get(&input.domain_name).ok_or_else(|| {
+            let domain = store.domain(&region, &input.domain_name).ok_or_else(|| {
                 not_found(crate::state::upload_job_domain_not_found(
                     &input.domain_name,
                 ))

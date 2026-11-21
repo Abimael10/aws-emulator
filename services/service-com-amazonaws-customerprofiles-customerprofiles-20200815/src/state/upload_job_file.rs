@@ -164,11 +164,16 @@ pub fn parse_upload_path(path: &str) -> Option<UploadTarget> {
 impl super::ComAmazonawsCustomerprofilesCustomerprofiles20200815State {
     /// The upload job `target` names, to write its file onto, or `None` when the domain or
     /// the job it names is not stored.
+    ///
+    /// The target is an ADDRESS this service minted for one job and handed to one caller,
+    /// authorised by that job's own data key rather than by a credential scope, so it is
+    /// resolved by the address alone: the domain and job it names are looked for wherever
+    /// this store holds them.
     pub fn upload_job_mut(&mut self, target: &UploadTarget) -> Option<&mut super::StoredUploadJob> {
-        self.domains
-            .get_mut(&target.domain_name)?
-            .upload_jobs
-            .get_mut(&target.job_id)
+        self.regions
+            .values_mut()
+            .filter_map(|domains| domains.get_mut(&target.domain_name))
+            .find_map(|domain| domain.upload_jobs.get_mut(&target.job_id))
     }
 
     /// How many bytes of upload file this store already holds, apart from the job `target`
@@ -177,8 +182,7 @@ impl super::ComAmazonawsCustomerprofilesCustomerprofiles20200815State {
     /// What [`MAX_STORED_UPLOAD_FILE_BYTES`] is measured against, so a write is sized
     /// against the whole store and not just its own job.
     pub fn stored_upload_file_bytes_apart_from(&self, target: &UploadTarget) -> usize {
-        self.domains
-            .iter()
+        self.all_domains()
             .flat_map(|(domain_name, domain)| {
                 domain
                     .upload_jobs

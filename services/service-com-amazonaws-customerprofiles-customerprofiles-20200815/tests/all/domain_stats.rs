@@ -21,7 +21,7 @@
 
 use serde_json::{json, Value};
 
-use crate::domain_profile_lifecycle::Emulator;
+use crate::domain_profile_lifecycle::{Emulator, REGION};
 use crate::profile_objects::{contact, ingest, put_contact_type};
 
 /// The four members `DomainStats` declares, as a response reports them.
@@ -222,7 +222,7 @@ async fn metering_counts_a_profile_once_more_per_hundred_objects_past_the_first_
         {
             let state = service_state(&*emulator.engine).expect("this service's store");
             let mut store = state.lock();
-            let domain = store.domains.get_mut("meterdom").expect("the domain");
+            let domain = store.domain_mut(REGION, "meterdom").expect("the domain");
             domain.profile_objects.clear();
             let now = SystemTime::now();
             for index in 0..held {

@@ -141,24 +141,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // A domain is a regional resource, so a listing reports the domains of the Region
+        // the request was signed for and none of another's.
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
 
-        // Domains are stored in name order, so one page's cursor resumes the next. The
-        // store lock is released at the end of this block, before the response is built.
+        // Domains are stored in name order within their Region, so one page's cursor
+        // resumes the next. The store lock is released at the end of this block, before the
+        // response is built.
         let (items, next_token) = {
             let store = state.lock();
-            let listed = store.domains.iter().map(|(name, domain)| {
-                (
-                    name.clone(),
-                    ListDomainItem {
-                        domain_name: domain.name.clone(),
-                        created_at: crate::state::to_date_time(domain.created_at),
-                        last_updated_at: crate::state::to_date_time(domain.last_updated_at),
-                        tags: domain.tags.clone(),
-                    },
-                )
-            });
+            let listed = store
+                .domains_in(&region)
+                .into_iter()
+                .flatten()
+                .map(|(name, domain)| {
+                    (
+                        name.clone(),
+                        ListDomainItem {
+                            domain_name: domain.name.clone(),
+                            created_at: crate::state::to_date_time(domain.created_at),
+                            last_updated_at: crate::state::to_date_time(domain.last_updated_at),
+                            tags: domain.tags.clone(),
+                        },
+                    )
+                });
             crate::state::paginate(listed, input.next_token.as_deref(), input.max_results)
         };
 

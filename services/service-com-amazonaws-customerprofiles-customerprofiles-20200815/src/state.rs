@@ -9,9 +9,10 @@
 //! of its customer data, such as customer profile attributes and their related objects")
 //! drops the whole subtree by removing one map entry.
 //!
-//! Domains are held in a `BTreeMap` and a domain's profiles in a `BTreeMap` keyed by
-//! profile id, so every listing and search walks state in one stable order — which is
-//! what makes the `NextToken` cursor below resumable.
+//! A domain is a REGIONAL resource, so the domains are held per Region — the Region the
+//! call that created one was signed for — in a `BTreeMap` per Region, and a domain's
+//! profiles in a `BTreeMap` keyed by profile id, so every listing and search walks state in
+//! one stable order, which is what makes the `NextToken` cursor below resumable.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
@@ -107,15 +108,27 @@ pub const MAX_SEARCH_VALUES: usize = 100;
 // each growth site carries a cap checked BEFORE the insert and nothing caller-sized
 // reaches the store unchecked.
 //
-// The product is therefore finite: at most MAX_DOMAINS domains, each holding at most
-// MAX_PROFILES_PER_DOMAIN profiles, each profile indexed under at most the handful of
-// standard keys `standard_search_keys` can derive from it, and each caller-sized map on
-// a record (`Tags` 1..50, `Attributes` entries 1..255 characters) bounded by the length
-// the model declares for it and refused at the boundary before a handler runs.
+// The product is therefore finite: at most MAX_REGIONS Regions, each holding at most
+// MAX_DOMAINS domains, each holding at most MAX_PROFILES_PER_DOMAIN profiles, each profile
+// indexed under at most the handful of standard keys `standard_search_keys` can derive from
+// it, and each caller-sized map on a record (`Tags` 1..50, `Attributes` entries 1..255
+// characters) bounded by the length the model declares for it and refused at the boundary
+// before a handler runs.
 // ---------------------------------------------------------------------------
 
-/// Customer Profiles' published quota "Domains per AWS account per Region: 100".
+/// Customer Profiles' published quota "Domains per AWS account per Region: 100", counted
+/// per Region because that is how the quota is stated and how the store is keyed.
 pub const MAX_DOMAINS: usize = 100;
+
+/// Emulator resource guard, NOT an AWS quota: the most Regions this emulator keeps domains
+/// for at once.
+///
+/// The Region a domain lands in comes from the caller's own credential scope, so
+/// [`MAX_DOMAINS`] alone would not bound the store — a caller that varies the Region it
+/// signs for could open a fresh per-Region budget for every name it invents. The product of
+/// the two is what bounds the domains this emulator holds, and this factor is set well above
+/// the number of Regions any emulator workload signs for.
+pub const MAX_REGIONS: usize = 32;
 
 /// Emulator resource guard, NOT an AWS quota (the service publishes no per-domain
 /// profile limit): the most profiles this emulator stores for one domain. Set well above
@@ -350,11 +363,18 @@ pub fn indexed_key_value(key_name: &str, value: &str) -> String {
 }
 
 /// Per-service state for com-amazonaws-customerprofiles-customerprofiles-20200815. A handler reaches it through [`service_state`].
+///
+/// A Customer Profiles domain is a REGIONAL resource: it belongs to the Region the
+/// `CreateDomain` call was signed for, one `DomainName` is unique within that Region (the
+/// same name may name a different domain in another), and the published quota is counted
+/// per Region. The store is therefore keyed by Region first, and each Region's own map is
+/// keyed by `DomainName`; a request signed for another Region reaches none of it.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCustomerprofilesCustomerprofiles20200815State {
-    /// Every domain this emulator holds, keyed by `DomainName` — the name is the
-    /// domain's identity (`@httpLabel` on every domain-scoped operation).
-    pub domains: BTreeMap<String, Domain>,
+    /// Region -> (`DomainName` -> the domain of that name in that Region). `BTreeMap`s
+    /// throughout, so every listing and search walks one Region's domains in one stable
+    /// order — which is what makes the `NextToken` cursor below resumable.
+    pub regions: BTreeMap<String, BTreeMap<String, Domain>>,
     /// The secret this store's continuation tokens are authenticated under, so a
     /// `NextToken` a caller BUILT is told from one a read ISSUED ([`page_cursor`]).
     ///
@@ -362,6 +382,77 @@ pub struct ComAmazonawsCustomerprofilesCustomerprofiles20200815State {
     /// `PageTokenKey`'s own `Debug` renders nothing of it, so this state's `Debug` carries
     /// no key material either.
     pub page_tokens: ::service_common::page_tokens::PageTokenKey,
+}
+
+impl ComAmazonawsCustomerprofilesCustomerprofiles20200815State {
+    /// The domains `region` holds, keyed by name, or `None` when it holds none.
+    pub fn domains_in(&self, region: &str) -> Option<&BTreeMap<String, Domain>> {
+        self.regions.get(region)
+    }
+
+    /// The domain of this name in `region`, or `None` when that Region holds no domain of
+    /// that name — which is what a request signed for another Region sees.
+    pub fn domain(&self, region: &str, domain_name: &str) -> Option<&Domain> {
+        self.regions.get(region)?.get(domain_name)
+    }
+
+    /// The domain of this name in `region` for mutation, or `None` when that Region holds
+    /// no domain of that name. Creates nothing: a read or a refused write leaves the store
+    /// exactly as it found it.
+    pub fn domain_mut(&mut self, region: &str, domain_name: &str) -> Option<&mut Domain> {
+        self.regions.get_mut(region)?.get_mut(domain_name)
+    }
+
+    /// Whether `region` holds a domain of this name.
+    pub fn holds_domain(&self, region: &str, domain_name: &str) -> bool {
+        self.domain(region, domain_name).is_some()
+    }
+
+    /// How many domains `region` holds — what [`MAX_DOMAINS`] is counted against.
+    pub fn domain_count(&self, region: &str) -> usize {
+        self.regions.get(region).map_or(0, BTreeMap::len)
+    }
+
+    /// Store `domain` in `region`, answering `false` without storing anything when the
+    /// store already holds [`MAX_REGIONS`] Regions and this is not one of them: the Region
+    /// comes from the caller's own credential scope, so the number of per-Region budgets it
+    /// can open is capped. For a create path only, AFTER the request is known to be
+    /// acceptable.
+    pub fn insert_domain(&mut self, region: &str, domain: Domain) -> bool {
+        if !self.regions.contains_key(region) && self.regions.len() >= MAX_REGIONS {
+            return false;
+        }
+        self.regions
+            .entry(region.to_string())
+            .or_default()
+            .insert(domain.name.clone(), domain);
+        true
+    }
+
+    /// Drop the domain of this name in `region`, and everything nested under it, answering
+    /// the record removed or `None` when that Region held no domain of that name.
+    pub fn remove_domain(&mut self, region: &str, domain_name: &str) -> Option<Domain> {
+        let removed = self.regions.get_mut(region)?.remove(domain_name);
+        // A Region that holds nothing is not a Region this store keeps a budget for, so the
+        // emptied bucket goes with its last domain.
+        if self.regions.get(region).is_some_and(BTreeMap::is_empty) {
+            self.regions.remove(region);
+        }
+        removed
+    }
+
+    /// Every domain this store holds, in every Region. For the store-wide accounting that
+    /// bounds what this emulator keeps at once, never for answering a request: an operation
+    /// reads the Region it was signed for.
+    pub fn all_domains(&self) -> impl Iterator<Item = (&String, &Domain)> {
+        self.regions.values().flat_map(BTreeMap::iter)
+    }
+
+    /// Every domain this store holds, in every Region, for mutation. Same contract as
+    /// [`Self::all_domains`].
+    pub fn all_domains_mut(&mut self) -> impl Iterator<Item = (&String, &mut Domain)> {
+        self.regions.values_mut().flat_map(BTreeMap::iter_mut)
+    }
 }
 
 /// One span of asynchronous work the clock owes a resource: when the call that started
@@ -401,7 +492,8 @@ impl AsyncWork {
 /// generated, and the customer data nested under it.
 #[derive(Debug, Clone)]
 pub struct Domain {
-    /// `DomainName`, as stored (also this domain's key in [`ComAmazonawsCustomerprofilesCustomerprofiles20200815State::domains`]).
+    /// `DomainName`, as stored (also this domain's key within its Region's own map in
+    /// [`ComAmazonawsCustomerprofilesCustomerprofiles20200815State::regions`]).
     pub name: String,
     /// `DefaultExpirationDays`, as stored.
     pub default_expiration_days: i32,
@@ -765,6 +857,53 @@ impl StoredCalculatedAttribute {
     pub fn reported_tags(&self) -> Option<HashMap<String, String>> {
         Some(self.tags.clone().unwrap_or_default())
     }
+}
+
+/// Every profile object type one `AttributeDetails` names, in the order the request states
+/// them.
+///
+/// `AttributeDetails$Expression` is documented as "Mathematical expression that is performed
+/// on attribute items provided in the attribute list. Each element in the expression should
+/// follow the structure of `{ObjectTypeName.AttributeName}`"
+/// (`smithy_query(query="doc", shape="AttributeDetails", member="Expression")`), so the
+/// object type a calculated attribute aggregates over is named by the part of each element
+/// before the member separator. An `AttributeItem$Name` is "the name of an attribute defined
+/// in a profile object type" and its pattern admits that separator, so a request that
+/// qualifies an item with its object type names one there too, and it is read the same way.
+///
+/// Returned in request order and WITHOUT deduplication, so a caller is told about the first
+/// name it wrote that nothing defines.
+pub fn attribute_details_object_types(details: &AttributeDetails) -> Vec<&str> {
+    let named = details
+        .attributes
+        .iter()
+        .filter_map(|item| qualifying_object_type(&item.name));
+    let in_expression = details
+        .expression
+        .split('{')
+        .skip(1)
+        .filter_map(|element| element.split_once('}'))
+        .filter_map(|(element, _)| qualifying_object_type(element));
+    named.chain(in_expression).collect()
+}
+
+/// The object type `element` qualifies an attribute with — everything before the first
+/// member separator — or `None` when it names no object type at all.
+fn qualifying_object_type(element: &str) -> Option<&str> {
+    let (object_type_name, attribute_name) = element.split_once(OBJECT_TYPE_MEMBER_SEPARATOR)?;
+    (!object_type_name.is_empty() && !attribute_name.is_empty()).then_some(object_type_name)
+}
+
+/// What separates an object type from the attribute of it a calculated attribute names:
+/// the `.` of `{ObjectTypeName.AttributeName}`, which is also the separator an object
+/// type field's `Target` is written with (`_profile.Address.PostalCode`).
+const OBJECT_TYPE_MEMBER_SEPARATOR: char = '.';
+
+/// The `BadRequestException` message for an object type name the domain does not define, as
+/// the service words that refusal: the fixed text and the offending name, which is the one
+/// the request's own `AttributeDetails` carried.
+pub fn invalid_object_type_name(object_type_name: &str) -> String {
+    format!("Invalid object type name: {object_type_name}")
 }
 
 /// One stored recommender schema: "the set of data columns available for training
@@ -1200,6 +1339,18 @@ impl Domain {
             .flatten()
             .cloned()
             .collect()
+    }
+
+    /// Whether `object_type_name` names a profile object type DEFINED in this domain — the
+    /// types the data a domain holds is ingested through.
+    ///
+    /// A type is defined when the domain holds a definition of that name
+    /// (`PutProfileObjectType`, "defines a ProfileObjectType"), or when it names the
+    /// standard profile model [`STANDARD_PROFILE_OBJECT_TYPE`], which every domain holds its
+    /// profiles' own data under.
+    pub fn defines_object_type(&self, object_type_name: &str) -> bool {
+        object_type_name == STANDARD_PROFILE_OBJECT_TYPE
+            || self.object_types.contains_key(object_type_name)
     }
 
     /// Whether `key_name` is a search key DEFINED in this domain — the keys
@@ -2481,13 +2632,38 @@ pub fn recommender_schema_arn(
     )
 }
 
-/// The region to build a new resource's ARN in: the one the caller signed for, else
-/// [`DEFAULT_REGION`]. An ARN is minted once and stored, so a later read from another
-/// region still reports the ARN the resource was created with.
+/// The Region a request is attributed to: the Region field of its SigV4 credential scope
+/// when that field is a Region NAME, else [`DEFAULT_REGION`].
+///
+/// This is both the Region a new resource's ARN is minted in and the Region a domain is
+/// stored in and looked up under, so one reading of the request decides both: an ARN is
+/// minted once and stored, so a later read from another Region still reports the ARN the
+/// resource was created with.
+///
+/// The scope is caller-written and the framework's parser accepts any non-empty field there,
+/// so a value that is not shaped like a Region name is not treated as one ([`is_region_name`]):
+/// it is attributed to the default Region rather than opening a store partition of its own.
 pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
     ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
         .map(|scope| scope.region)
+        .filter(|region| is_region_name(region))
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// Whether `name` is shaped like a published AWS Region name: three or four
+/// hyphen-separated segments, the last a one- or two-digit number and the rest lower-case
+/// letters — `us-east-1`, `ap-southeast-2`, `us-gov-west-1`, `cn-north-1`.
+pub fn is_region_name(name: &str) -> bool {
+    let segments: Vec<&str> = name.split('-').collect();
+    let Some((number, words)) = segments.split_last() else {
+        return false;
+    };
+    (3..=4).contains(&segments.len())
+        && words
+            .iter()
+            .all(|word| !word.is_empty() && word.chars().all(|letter| letter.is_ascii_lowercase()))
+        && (1..=2).contains(&number.len())
+        && number.chars().all(|digit| digit.is_ascii_digit())
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

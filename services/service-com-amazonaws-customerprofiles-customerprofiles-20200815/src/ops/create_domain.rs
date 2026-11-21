@@ -204,7 +204,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // A domain belongs to the Region its create was signed for: the name is unique
+        // within that Region, the published quota is counted there, and no other Region's
+        // request reaches the record this stores.
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
 
         // Both timestamps are generated ONCE, here, from one reading of the clock, so
@@ -213,7 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
-        if store.domains.contains_key(&input.domain_name) {
+        if store.holds_domain(&region, &input.domain_name) {
             // The domain name is the domain's identity, so a second create of the same
             // name is not a create. `BadRequestException` ("The input you provided is
             // invalid") is the only client error this operation models for it, and the
@@ -225,16 +228,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
-        // One domain per request, and at most this many in the store: however many
-        // requests arrive, the store cannot grow past the service's domain quota.
-        if store.domains.len() >= crate::state::MAX_DOMAINS {
-            return Err(CreateDomainErrorModeled::BadRequestException(BadRequestException {
-                message: Some(format!(
-                    "The maximum number of domains for this account has been reached: {}",
-                    crate::state::MAX_DOMAINS
-                )),
-            })
-            .into());
+        // One domain per request, and at most this many in the Region: however many
+        // requests arrive, a Region cannot grow past the service's domain quota.
+        if store.domain_count(&region) >= crate::state::MAX_DOMAINS {
+            return Err(domain_quota_reached());
         }
 
         let mut domain =
@@ -263,9 +260,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_updated_at: crate::state::to_date_time(domain.last_updated_at),
             tags: domain.reported_tags(),
         };
-        store.domains.insert(domain.name.clone(), domain);
+        // The Region comes from the caller's own credential scope, so the store keeps a
+        // budget for only so many of them at once ([`crate::state::MAX_REGIONS`]). A
+        // request that would open one past that budget is refused as the same quota
+        // refusal, because it is the same thing from the caller's side: no further domain
+        // is stored for it.
+        if !store.insert_domain(&region, domain) {
+            return Err(domain_quota_reached());
+        }
         Ok(output)
     }
+}
+
+/// This account can hold no further domain here: the service's domain quota for one
+/// Region, whose only variable part is that quota.
+fn domain_quota_reached() -> CreateDomainError {
+    CreateDomainErrorModeled::BadRequestException(BadRequestException {
+        message: Some(format!(
+            "The maximum number of domains for this account has been reached: {}",
+            crate::state::MAX_DOMAINS
+        )),
+    })
+    .into()
 }
 
 /// The store is unreachable — a server fault, not a bad request.

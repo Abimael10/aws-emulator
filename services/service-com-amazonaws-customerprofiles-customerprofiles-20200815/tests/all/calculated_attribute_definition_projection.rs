@@ -26,7 +26,9 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::calculated_attribute_definitions::{attribute_details, create, definition, get};
+use crate::calculated_attribute_definitions::{
+    attribute_details, create, create_domain_with_object_type, definition, get,
+};
 use crate::domain_profile_lifecycle::Emulator;
 
 /// `Readiness$Message` for a definition whose historical data is all indexed: the
@@ -238,7 +240,7 @@ fn rows() -> Vec<Row> {
 #[tokio::test]
 async fn both_projections_report_every_member_the_definition_keeps() {
     let emulator = Emulator::new();
-    emulator.create_domain("reportdom", 30).await;
+    create_domain_with_object_type(&emulator, "reportdom", 30).await;
 
     for row in rows() {
         let Row {
@@ -310,7 +312,7 @@ async fn both_projections_report_every_member_the_definition_keeps() {
 #[tokio::test]
 async fn the_readiness_message_is_the_services_fixed_ready_sentence() {
     let emulator = Emulator::new();
-    emulator.create_domain("readymsgdom", 30).await;
+    create_domain_with_object_type(&emulator, "readymsgdom", 30).await;
 
     for row in rows() {
         let Row {

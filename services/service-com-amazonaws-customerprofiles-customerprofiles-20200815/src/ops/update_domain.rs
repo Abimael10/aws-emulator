@@ -199,7 +199,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // A domain is a regional resource, so it is updatable only through the Region it
+        // was created in.
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
 
         // One reading of the clock: `LastUpdatedAt` and any asynchronous work this call
@@ -212,7 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // hold is `ResourceNotFoundException`. This operation's refusal carries NO prose:
         // the optional `Message` member is left off the body entirely, rather than filled
         // from the sentence the domain-scoped READS word their own refusal with.
-        let domain = store.domains.get_mut(&input.domain_name).ok_or_else(|| {
+        let domain = store.domain_mut(&region, &input.domain_name).ok_or_else(|| {
             UpdateDomainError::from(UpdateDomainErrorModeled::ResourceNotFoundException(
                 crate::state::not_found_without_message(),
             ))

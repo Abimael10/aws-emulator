@@ -139,14 +139,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // A domain is a regional resource, so it is deletable only through the Region it
+        // was created in.
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
 
         // Removing the domain's entry removes its profiles and its key index with it:
         // they are owned by the domain, which is what "deletes a specific domain and all
         // of its customer data" describes.
         let mut store = state.lock();
-        store.domains.remove(&input.domain_name).ok_or_else(|| {
+        store.remove_domain(&region, &input.domain_name).ok_or_else(|| {
             DeleteDomainError::from(DeleteDomainErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::domain_not_found(&input.domain_name)),
