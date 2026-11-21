@@ -6,7 +6,9 @@
 //! [`ComAmazonawsAthenaAmazonathenaState::calculations`]: `StartCalculationExecution` writes
 //! a [`CalculationRecord`] there and `GetCalculationExecutionCode` answers out of that same
 //! record, so the code a read reports is the code the submission persisted rather than
-//! anything rebuilt from the reading request.
+//! anything rebuilt from the reading request. `ListCalculationExecutions` reports the same
+//! records as the summaries each one projects to ([`CalculationRecord::to_summary`]), in the
+//! order they were submitted in ([`CalculationRegistry::session_summaries`]).
 //!
 //! WHICH SESSION may take one is the session's own notebook. "Submits calculations for
 //! execution within a session" (`StartCalculationExecution`) and the code block it carries
@@ -28,6 +30,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::SystemTime;
 
 use super::*;
+
+use crate::ops::types::{CalculationStatus, CalculationSummary};
 
 /// The `CalculationExecutionState` of a calculation that has been created: "CREATED - The
 /// calculation has been created and is ready to run"
@@ -80,6 +84,37 @@ impl CalculationRecord {
     /// no read derives a later state from the clock.
     pub fn state(&self) -> &'static str {
         CALCULATION_STATE_CREATED
+    }
+
+    /// The `CalculationStatus` a read of this calculation reports.
+    ///
+    /// `SubmissionDateTime` is "the date and time the calculation was submitted for
+    /// processing", which is the instant the submission persisted. There is no
+    /// `CompletionDateTime` and no `StateChangeReason`: nothing has run the calculation (see
+    /// the module docs) and nothing has asked it to stop, so neither a completion instant nor
+    /// a reason for a change of state exists to report.
+    ///
+    /// Built on the record rather than in a handler, so every read of a calculation's status
+    /// reports the same members out of the same record.
+    pub fn to_status(&self) -> CalculationStatus {
+        CalculationStatus {
+            submission_date_time: Some(reported_time(self.submitted_at)),
+            completion_date_time: None,
+            state: Some(self.state().to_string()),
+            state_change_reason: None,
+        }
+    }
+
+    /// This calculation as the `CalculationSummary` a listing reports it as: "Summary
+    /// information for a notebook calculation" — the id it was minted under, the description
+    /// the submission carried (absent where it carried none, the modelled `DescriptionString`
+    /// holding at least one character) and its status.
+    pub fn to_summary(&self) -> CalculationSummary {
+        CalculationSummary {
+            calculation_execution_id: Some(self.id.clone()),
+            description: self.description.clone(),
+            status: Some(self.to_status()),
+        }
     }
 
     /// Whether this record is the calculation a repeat of `session_id`, `code_block` and
@@ -173,6 +208,25 @@ impl CalculationRegistry {
         self.calculations.insert(id, record);
     }
 
+    /// The calculations submitted into the session `session_id`, newest first, as the
+    /// summaries a listing reports.
+    ///
+    /// The order `ListCalculationExecutions` documents: "Lists the calculations that have
+    /// been submitted to a session in descending order. Newer calculations are listed first;
+    /// older calculations are listed later." Submission order is what this registry's own
+    /// index already records, so the walk reads that index backwards rather than re-sorting
+    /// the submission instants, which two submissions inside one tick of the clock could not
+    /// separate.
+    pub fn session_summaries(&self, session_id: &str) -> Vec<CalculationSummary> {
+        self.order
+            .iter()
+            .rev()
+            .filter_map(|id| self.calculations.get(id))
+            .filter(|record| record.session_id == session_id)
+            .map(CalculationRecord::to_summary)
+            .collect()
+    }
+
     /// Remove every calculation submitted into a session of `work_group`, as a delete of
     /// that workgroup does, and answer with how many were removed.
     ///
@@ -193,6 +247,34 @@ impl CalculationRegistry {
         self.request_tokens
             .retain(|_, minted| !removed.iter().any(|id| id == minted));
         removed.len()
+    }
+}
+
+/// The cursor a `ListCalculationExecutions` page hands back: the session whose calculations
+/// it is listing and the position to resume at.
+///
+/// Scoped by session for the reason every other cursor of this service is scoped by what its
+/// listing was narrowed to: a token minted while listing one session's calculations names no
+/// page of another session's listing.
+fn calculations_cursor(session_id: &str, position: usize) -> String {
+    format!("calculations{CURSOR_SEPARATOR}{session_id}{CURSOR_SEPARATOR}{position}")
+}
+
+impl ComAmazonawsAthenaAmazonathenaState {
+    /// The `NextToken` a `ListCalculationExecutions` page of session `session_id` resumed at
+    /// `position` hands back.
+    pub fn calculations_page_token(&self, session_id: &str, position: usize) -> String {
+        ::hex::encode(
+            self.page_token_key
+                .mint(&calculations_cursor(session_id, position)),
+        )
+    }
+
+    /// The position `token` resumes a calculation listing of session `session_id` at, or
+    /// `None` for a token this store did not mint for THAT session's listing.
+    pub fn calculations_page_position(&self, session_id: &str, token: &str) -> Option<usize> {
+        let cursor = self.page_cursor(token)?;
+        cursor_position(&cursor, "calculations", session_id)
     }
 }
 
