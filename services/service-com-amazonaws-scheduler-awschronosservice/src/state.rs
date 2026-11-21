@@ -10,7 +10,11 @@
 //! The rules a schedule's own definition has to satisfy — its expression, the
 //! zone that expression is read in, and the window its instants bound — live in
 //! [`schedule_definition`] and are re-exported here, so both operations that
-//! write a schedule reach them the way they reach the rest of this module.
+//! write a schedule reach them the way they reach the rest of this module. The
+//! FORM of the ARN its target names — the one ARN-valued member of a schedule
+//! the model leaves without a `@pattern` — is [`target_arn`], and the values the
+//! service FILLS IN for the optional members a write leaves out, so a stored
+//! schedule is its effective configuration, are [`server_defaults`].
 //!
 //! What the control plane persists is only half of this service: a schedule is
 //! also INVOKED. Which instants one runs at lives in [`occurrence`], and the clock
@@ -36,6 +40,8 @@ mod dead_letter;
 mod event_bridge_target;
 mod occurrence;
 mod schedule_definition;
+mod server_defaults;
+mod target_arn;
 mod target_input;
 mod universal_target;
 
@@ -49,6 +55,11 @@ pub(crate) use event_bridge_target::event_bridge_target_violation;
 pub use invocation::{drive_invocation_clock, Invocations};
 pub use occurrence::Occurrences;
 pub use schedule_definition::*;
+pub use server_defaults::{
+    fill_server_defaults, DEFAULT_ACTION_AFTER_COMPLETION, DEFAULT_MAXIMUM_EVENT_AGE_IN_SECONDS,
+    DEFAULT_MAXIMUM_RETRY_ATTEMPTS, DEFAULT_SCHEDULE_EXPRESSION_TIMEZONE,
+};
+pub use target_arn::target_arn_violation;
 pub use target_input::{target_input_violation, MAX_TARGET_INPUT_BYTES};
 pub use universal_target::universal_target_violation;
 
@@ -470,6 +481,21 @@ pub fn reserved_group_refusal(name: &str) -> Option<String> {
 /// hold, worded as AWS words it.
 pub fn group_does_not_exist(name: &str) -> String {
     format!("Schedule group {name} does not exist.")
+}
+
+/// The `ResourceNotFoundException` message for a request addressed by the ARN of
+/// a schedule group this account does not hold.
+///
+/// The resource the request named is a GROUP, so the refusal is the group's own
+/// ([`group_does_not_exist`]) and names the group rather than the ARN that
+/// carried it: a tagging operation is addressed by ARN, but what is missing is
+/// the group that ARN identifies, and the name is the part of the ARN a caller
+/// knows the resource by. An ARN this service cannot read a group name out of —
+/// one of another resource type, which the modelled `@pattern` on the member
+/// already refuses before a handler runs — has no name to report, so the value
+/// as submitted is what the refusal names.
+pub fn group_arn_does_not_exist(arn: &str) -> String {
+    group_does_not_exist(schedule_group_name_from_arn(arn).unwrap_or(arn))
 }
 
 /// The `ValidationException` message for a request addressed at a schedule group

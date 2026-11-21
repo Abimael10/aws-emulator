@@ -55,6 +55,11 @@ const ACCOUNT_ID: &str = "000000000000";
 /// this, the default schedule group is used"), which AWS creates with the account.
 const DEFAULT_GROUP: &str = "default";
 
+/// The `ScheduleExpressionTimezone` EventBridge Scheduler supplies for a schedule that
+/// states none — the zone its expression is then evaluated in — so a read of a declaration
+/// naming no zone reports this rather than nothing.
+const DEFAULT_TIMEZONE: &str = "UTC";
+
 /// What a stack reports when CloudFormation refuses a deployment at one of its pre-deployment
 /// validations: the count of errors that stage found and where their detail is read. Source:
 /// `state::early_validation::validation_failure_summary`.
@@ -238,6 +243,10 @@ struct ExpectedSchedule {
     /// The optional members the declaration carries, each of which the read must report
     /// back; `None` is a member the declaration leaves out, which the read must not report.
     description: Option<&'static str>,
+    /// The `ScheduleExpressionTimezone` the declaration carries, or `None` for one that
+    /// names no zone — which EventBridge Scheduler answers with the zone it supplies for a
+    /// schedule stating none (`UTC`), since a read reports the schedule's effective
+    /// configuration rather than only the declared subset.
     timezone: Option<&'static str>,
     input: Option<&'static str>,
     /// Whether the declaration dates the schedule ([`START_DATE`], [`END_DATE`]).
@@ -708,13 +717,13 @@ async fn a_stack_provisions_the_scheduler_resources_its_template_declares() {
                 "case {case:?}: expected the declared description {:?}, got {schedule}",
                 expected.description
             );
+            let wanted_timezone = expected.timezone.unwrap_or(DEFAULT_TIMEZONE);
             assert_eq!(
                 schedule
                     .get("ScheduleExpressionTimezone")
                     .and_then(Value::as_str),
-                expected.timezone,
-                "case {case:?}: expected the declared timezone {:?}, got {schedule}",
-                expected.timezone
+                Some(wanted_timezone),
+                "case {case:?}: expected the timezone {wanted_timezone:?}, got {schedule}"
             );
             let target = schedule.get("Target").cloned().unwrap_or(Value::Null);
             assert_eq!(
@@ -1522,8 +1531,10 @@ fn declared_group(properties: &Value, group: &str) -> String {
 /// The expectation is the DECLARATION itself, member by member: a member it states must be
 /// reported with that value, and one it does not state must not be reported at all — which
 /// is what makes a declaration that drops a member a real assertion rather than a weaker
-/// one. `State` is the one member with a system default (`ENABLED`), so a declaration that
-/// drops it expects that default.
+/// one. The members with a system default are the exception: a declaration that drops
+/// `State` expects `ENABLED`, and one that drops `ScheduleExpressionTimezone` expects
+/// [`DEFAULT_TIMEZONE`], because EventBridge Scheduler reports a schedule's effective
+/// configuration.
 async fn assert_holds_declared_schedule(
     router: &MultiServiceRouter,
     region: &str,
@@ -1556,7 +1567,7 @@ async fn assert_holds_declared_schedule(
         Some(schedule_arn(region, group, name).as_str()),
         "case {case:?}: expected the ARN of {name:?} in {group:?}, got {schedule}"
     );
-    for member in ["Description", "ScheduleExpression", "ScheduleExpressionTimezone"] {
+    for member in ["Description", "ScheduleExpression"] {
         let wanted = declared.get(member).and_then(Value::as_str);
         assert_eq!(
             schedule.get(member).and_then(Value::as_str),
@@ -1564,6 +1575,17 @@ async fn assert_holds_declared_schedule(
             "case {case:?}: expected {member} to be the declared {wanted:?}, got {schedule}"
         );
     }
+    let wanted_timezone = declared
+        .get("ScheduleExpressionTimezone")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_TIMEZONE);
+    assert_eq!(
+        schedule
+            .get("ScheduleExpressionTimezone")
+            .and_then(Value::as_str),
+        Some(wanted_timezone),
+        "case {case:?}: expected the timezone {wanted_timezone:?}, got {schedule}"
+    );
     let wanted_state = declared
         .get("State")
         .and_then(Value::as_str)

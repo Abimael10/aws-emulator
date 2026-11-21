@@ -111,6 +111,22 @@ pub fn parse(value: &str) -> Option<Arn<'_>> {
 /// partition, the vendor, the Region, the account and the resource.
 pub const ARN_FIELDS: usize = 6;
 
+/// How the Amazon EventBridge family states that a member documented as an ARN holds text
+/// that is not one: the value the request carried, and the form that was expected.
+///
+/// Those services bind ARN-valued members the model constrains by LENGTH alone — no
+/// `@pattern` the request boundary could apply — so the ARN form is checked by the service
+/// and refused in its own sentence. The sentence is the family's, shared by every service
+/// in it (Amazon EventBridge's rule targets and Amazon EventBridge Scheduler's schedule
+/// targets), so it is stated here once rather than per service; the ENVELOPE it travels in
+/// (the error shape and its status) stays with each service, as the module header says.
+///
+/// The value half is taken from the request, so a caller reads back what it submitted.
+#[must_use]
+pub fn not_an_arn_refusal(value: &str) -> String {
+    format!("Parameter {value} is not valid. Reason: Provided Arn is not in correct format.")
+}
+
 /// Whether `value` carries the [`ARN_FIELDS`] colon-separated fields an ARN is written
 /// with at all.
 ///

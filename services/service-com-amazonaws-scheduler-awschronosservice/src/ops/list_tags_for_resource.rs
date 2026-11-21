@@ -171,7 +171,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(group_name) = store.group_name_for_arn(&input.resource_arn, &region) else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("Resource not found: {}", input.resource_arn),
+                    message: crate::state::group_arn_does_not_exist(&input.resource_arn),
                 },
             )
             .into());

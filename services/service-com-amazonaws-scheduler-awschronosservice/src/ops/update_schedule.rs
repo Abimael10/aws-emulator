@@ -259,6 +259,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .or_else(|| {
                 crate::state::schedule_window_violation(input.start_date, input.end_date, now)
             })
+            // `Target$Arn` is the one ARN-valued member of a schedule the model leaves
+            // without a `@pattern`, so the ARN FORM is this service's own check: an update
+            // that would leave a target naming no ARN is refused rather than applied.
+            .or_else(|| crate::state::target_arn_violation(&input.target.arn))
             // A universal target names the CALL each occurrence makes rather than a
             // resource, so the service and operation it names are request validation
             // too: an update that would leave a target naming no call is refused
@@ -328,6 +332,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.target = input.target;
         record.flexible_time_window = input.flexible_time_window;
         record.last_modification_date = now;
+        // A full replace is a fresh statement of the schedule's configuration, so the
+        // service supplies a value for every optional member this request omitted exactly
+        // as it does on a create: what is stored stays the effective configuration.
+        crate::state::fill_server_defaults(record);
         let arn = record.arn.clone();
 
         // The update may have re-expressed, re-pointed, enabled or disabled the

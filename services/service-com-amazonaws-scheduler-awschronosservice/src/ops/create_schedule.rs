@@ -232,6 +232,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .or_else(|| {
                 crate::state::schedule_window_violation(input.start_date, input.end_date, now)
             })
+            // `Target$Arn` is the one ARN-valued member of a schedule the model leaves
+            // without a `@pattern`, so the ARN FORM is this service's own check: a target
+            // naming no ARN names nothing an occurrence could be delivered to, and is
+            // refused rather than stored.
+            .or_else(|| crate::state::target_arn_violation(&input.target.arn))
             // A universal target names the CALL the occurrence makes rather than a
             // resource, so the service and operation it names are request validation
             // too: a schedule whose target names no call is refused rather than
@@ -331,31 +336,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let arn = crate::state::schedule_arn(&region, &group_name, &input.name);
-        store.schedules.insert(
-            key,
-            crate::state::ScheduleRecord {
-                name: input.name,
-                group_name,
-                arn: arn.clone(),
-                schedule_expression: input.schedule_expression,
-                schedule_expression_timezone: input.schedule_expression_timezone,
-                // Both instants are held at the resolution the service reports
-                // them at, so every later read answers the instant that was
-                // stored rather than the finer one the request stated.
-                start_date: input.start_date.map(crate::state::to_millisecond_precision),
-                end_date: input.end_date.map(crate::state::to_millisecond_precision),
-                description: input.description,
-                state: input
-                    .state
-                    .unwrap_or_else(|| crate::state::DEFAULT_SCHEDULE_STATE.to_string()),
-                kms_key_arn: input.kms_key_arn,
-                action_after_completion: input.action_after_completion,
-                target: input.target,
-                flexible_time_window: input.flexible_time_window,
-                creation_date: now,
-                last_modification_date: now,
-            },
-        );
+        let mut record = crate::state::ScheduleRecord {
+            name: input.name,
+            group_name,
+            arn: arn.clone(),
+            schedule_expression: input.schedule_expression,
+            schedule_expression_timezone: input.schedule_expression_timezone,
+            // Both instants are held at the resolution the service reports
+            // them at, so every later read answers the instant that was
+            // stored rather than the finer one the request stated.
+            start_date: input.start_date.map(crate::state::to_millisecond_precision),
+            end_date: input.end_date.map(crate::state::to_millisecond_precision),
+            description: input.description,
+            state: input
+                .state
+                .unwrap_or_else(|| crate::state::DEFAULT_SCHEDULE_STATE.to_string()),
+            kms_key_arn: input.kms_key_arn,
+            action_after_completion: input.action_after_completion,
+            target: input.target,
+            flexible_time_window: input.flexible_time_window,
+            creation_date: now,
+            last_modification_date: now,
+        };
+        // The schedule is stored as its EFFECTIVE configuration: the service supplies a
+        // value for every optional member the request omitted, so a later read answers
+        // what the schedule will be invoked under rather than only what was stated.
+        crate::state::fill_server_defaults(&mut record);
+        store.schedules.insert(key, record);
         // A schedule is INVOKED, not just stored: the clock that performs the
         // occurrences its expression names is armed here, so a client that writes
         // a schedule and then watches the target observes the invocations the

@@ -4268,12 +4268,14 @@ pub fn target_arn_violation(target: &Target) -> Option<String> {
 /// What a refusal states for an ARN-valued member holding text that is not an
 /// ARN: the value that was rejected and the form that was expected.
 ///
-/// Stated once, so every member of this service that has to hold an ARN is
-/// refused in the same words — the ones [`target_arn_violation`] answers for a
-/// target's own members and [`request_validation::dead_letter_arn_violation`]
-/// for a dead-letter destination that names no service at all.
+/// The sentence is the EventBridge family's and is stated once for the whole
+/// family in [`::service_common::arn::not_an_arn_refusal`], so every member of
+/// this service that has to hold an ARN is refused in the same words — the ones
+/// [`target_arn_violation`] answers for a target's own members and
+/// [`request_validation::dead_letter_arn_violation`] for a dead-letter
+/// destination that names no service at all.
 pub fn invalid_arn_violation(value: &str) -> String {
-    format!("Parameter {value} is not valid. Reason: Provided Arn is not in correct format.")
+    ::service_common::arn::not_an_arn_refusal(value)
 }
 
 /// Why one published event entry names no event, or `None` when it names one.

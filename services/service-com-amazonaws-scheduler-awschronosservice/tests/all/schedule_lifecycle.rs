@@ -115,9 +115,55 @@ async fn ensure_group(router: &MultiServiceRouter, group: Option<&str>) {
 }
 
 /// The value a member should have in a `GetSchedule` response: the one the
-/// create request sent, or absent when it sent none.
+/// create request sent, the server-side default where it sent none, and absent
+/// only for a member the service does not default.
+///
+/// EventBridge Scheduler answers a schedule's EFFECTIVE configuration, so a
+/// write that omits `ScheduleExpressionTimezone`, `ActionAfterCompletion` or
+/// `Target.RetryPolicy` reads back with the value the service supplied for it.
 fn expected_member(create: &serde_json::Value, member: &str) -> Option<serde_json::Value> {
-    create.get(member).cloned()
+    match member {
+        "ScheduleExpressionTimezone" => Some(
+            create
+                .get(member)
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!("UTC")),
+        ),
+        "ActionAfterCompletion" => Some(
+            create
+                .get(member)
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!("NONE")),
+        ),
+        "Target" => Some(effective_target(create.get(member)?)),
+        _ => create.get(member).cloned(),
+    }
+}
+
+/// `target` as the service holds it: the retry policy filled in to the maxima of
+/// the modelled ranges (`smithy_query(query="shape",
+/// shape="com.amazonaws.scheduler#RetryPolicy")`: `MaximumEventAgeInSeconds`
+/// `range 60..86400`, `MaximumRetryAttempts` `range 0..185`) for each member the
+/// request left out.
+fn effective_target(target: &serde_json::Value) -> serde_json::Value {
+    let mut target = target.clone();
+    let policy = target
+        .get("RetryPolicy")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let age = policy
+        .get("MaximumEventAgeInSeconds")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!(86_400));
+    let attempts = policy
+        .get("MaximumRetryAttempts")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!(185));
+    target["RetryPolicy"] = serde_json::json!({
+        "MaximumEventAgeInSeconds": age,
+        "MaximumRetryAttempts": attempts,
+    });
+    target
 }
 
 #[tokio::test]
@@ -284,20 +330,28 @@ async fn create_get_update_delete_round_trips_every_schedule_shape() {
         );
         assert_eq!(
             got.get("Target").cloned(),
-            Some(serde_json::json!({
+            Some(effective_target(&serde_json::json!({
                 "Arn": "arn:aws:sqs:eu-west-2:000000000000:updated",
                 "RoleArn": "arn:aws:iam::000000000000:role/updated"
-            })),
+            }))),
             "case {label:?}: expected the Target replaced wholesale, got {got}"
         );
-        for cleared in [
-            "ScheduleExpressionTimezone",
-            "Description",
-            "KmsKeyArn",
-            "ActionAfterCompletion",
-            "StartDate",
-            "EndDate",
+        // A full replace clears every member the request omitted that the service
+        // does not default; the ones it DOES default come back at their default,
+        // because an update restates the effective configuration as a create does.
+        for (defaulted, expected) in [
+            ("ScheduleExpressionTimezone", "UTC"),
+            ("ActionAfterCompletion", "NONE"),
         ] {
+            assert_eq!(
+                got.get(defaulted).and_then(serde_json::Value::as_str),
+                Some(expected),
+                "case {label:?}: expected {defaulted} to be defaulted to {expected} by a \
+                 full-replace update, got {:?}",
+                got.get(defaulted)
+            );
+        }
+        for cleared in ["Description", "KmsKeyArn", "StartDate", "EndDate"] {
             assert_eq!(
                 got.get(cleared),
                 None,

@@ -42,13 +42,17 @@ use crate::ops::types::RetryPolicy;
 ///
 /// Every schedule has a retry policy, whether or not it states one, and the figure
 /// AWS applies to a schedule that states none is the largest the member admits
-/// (`RetryPolicy$MaximumRetryAttempts`, modelled `range 0..185`).
-pub(crate) const DEFAULT_MAXIMUM_RETRY_ATTEMPTS: u32 = 185;
+/// (`RetryPolicy$MaximumRetryAttempts`, modelled `range 0..185`). The figure itself
+/// is [`super::server_defaults`]'s, which is also the one a stored schedule reports,
+/// so the attempts an invocation makes and the policy a reader answers agree.
+pub(crate) const DEFAULT_MAXIMUM_RETRY_ATTEMPTS: u32 =
+    super::server_defaults::DEFAULT_MAXIMUM_RETRY_ATTEMPTS as u32;
 
 /// How long retries continue for an invocation of a schedule that states no
 /// `MaximumEventAgeInSeconds`: likewise the largest that member admits
 /// (modelled `range 60..86400`), which is 24 hours.
-pub(crate) const DEFAULT_MAXIMUM_EVENT_AGE: Duration = Duration::from_secs(86_400);
+pub(crate) const DEFAULT_MAXIMUM_EVENT_AGE: Duration =
+    Duration::from_secs(super::server_defaults::DEFAULT_MAXIMUM_EVENT_AGE_IN_SECONDS as u64);
 
 /// How long after a failed attempt the next attempt falls due.
 ///
