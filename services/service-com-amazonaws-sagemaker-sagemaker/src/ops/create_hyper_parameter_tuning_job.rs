@@ -647,6 +647,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // answers the training jobs the tuning job launches, which are built only once the
         // request has been ADMITTED — a request past a quota or breaking a documented rule is
         // refused before anything is built for it.
+        //
+        // The container image each launched job RUNS, collected inside that block in the
+        // order the children are launched and resolved to its digest once the guard is
+        // released.
+        let child_images: Vec<Option<String>>;
         let children: Vec<(crate::state::LaunchedTrainingJob, String)> = {
             let mut store = state.lock();
         // The capacity the request asks for, against the account's published quotas on the
@@ -737,7 +742,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .chain(input.training_job_definitions.iter().flatten())
             .collect();
-        let children: Vec<(crate::state::LaunchedTrainingJob, String)> =
+        let mut children: Vec<(crate::state::LaunchedTrainingJob, String)> =
             crate::state::launched_training_jobs(
                 &input.hyper_parameter_tuning_job_name,
                 &input.hyper_parameter_tuning_job_config,
@@ -751,6 +756,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &child.request.training_job_name,
                 );
                 (child, child_arn)
+            })
+            .collect();
+
+        // A definition may name a REGISTERED algorithm instead of a training image of its
+        // own. Then the child RUNS that algorithm: it is reported with the metric set that
+        // algorithm declares (`TrainingSpecification$MetricDefinitions`) and with the image
+        // that algorithm trains with — the same resolution `CreateTrainingJob` makes for a
+        // caller's own job, so one training job reports alike whichever create launched it.
+        // The set of a definition that names an IMAGE is resolved where the child is built
+        // (`crate::state::child_request`), which needs no store.
+        //
+        // The image is only COLLECTED here, in the order the children are launched, and
+        // resolved to its digest once the guard is released: that digest is read out of
+        // Amazon ECR's own store on the same engine.
+        child_images = children
+            .iter_mut()
+            .map(|(child, _)| {
+                let specification = child.request.algorithm_specification.as_mut()?;
+                let mut image = specification.training_image.clone();
+                let registered = specification
+                    .algorithm_name
+                    .as_deref()
+                    .map(crate::state::name_from_arn_or_name)
+                    .and_then(|key| store.algorithms.get(key))
+                    .map(|algorithm| {
+                        (
+                            algorithm.training_specification.metric_definitions.clone(),
+                            algorithm.training_specification.training_image.clone(),
+                        )
+                    });
+                if let Some((metrics, training_image)) = registered {
+                    if specification.metric_definitions.is_none() {
+                        specification.metric_definitions = metrics;
+                    }
+                    image = image.or(Some(training_image));
+                }
+                image
             })
             .collect();
 
@@ -790,6 +832,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         children
         };
+
+        // The image detail every read of a launched job reports, resolved ONCE here through
+        // the one writer of it: the digest comes from Amazon ECR's own store on the same
+        // engine, so it is asked for with no guard of this service's store held.
+        for ((child, _), image) in children.iter().zip(&child_images) {
+            crate::state::record_training_job_image(
+                &*self.engine,
+                ctx,
+                &state,
+                &child.request.training_job_name,
+                image.as_deref(),
+                now,
+            );
+        }
 
         // The tuning job's own WORK: each launched training job's run, performed with the one
         // training runner a caller's own job gets, and then recorded on the stored jobs. The

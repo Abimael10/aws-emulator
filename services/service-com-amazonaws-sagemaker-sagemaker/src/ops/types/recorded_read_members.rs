@@ -34,8 +34,8 @@ use ::aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer
 use ::aws_smithy_schema::{Schema, ShapeId, ShapeType};
 
 use super::{
-    Channel, DescribeFeatureGroupOutput, DescribeTrainingJobOutput, OutputDataConfig,
-    ResourceConfig,
+    Channel, DeployedImage, DescribeFeatureGroupOutput, DescribeTrainingJobOutput,
+    OutputDataConfig, ResourceConfig,
 };
 
 /// The namespace the members the on-disk model does not declare sit in: NOT this service's
@@ -290,8 +290,9 @@ impl SerializableStruct for RecordedTrainingJobOutput {
 }
 
 /// `DescribeTrainingJob`'s answer: the modelled response, plus the members the recorded
-/// service carries — the job's own `DisableEFA`, and the channels and configurations whose
-/// recorded members live inside them.
+/// service carries — the job's own `DisableEFA`, the output its run left behind, the detail of
+/// the image it runs, and the channels and configurations whose recorded members live inside
+/// them.
 ///
 /// The channel list and the two configurations are MOVED out of the modelled response (see
 /// [`Self::new`]), so each is written exactly once: the modelled delegation below cannot
@@ -312,6 +313,11 @@ pub struct DescribeTrainingJobRecordedOutput {
     pub disable_efa: Option<bool>,
     /// What the job's run left behind in Amazon S3.
     pub training_job_output: Option<RecordedTrainingJobOutput>,
+    /// The CONTAINER IMAGE the job runs, as the create that launched it resolved the
+    /// reference: reported through the shape the model declares for exactly that fact — an
+    /// image as specified, the same image at the digest it resolved to, and when it was
+    /// resolved (`DeployedImage`).
+    pub image_metadata: Option<DeployedImage>,
 }
 
 impl DescribeTrainingJobRecordedOutput {
@@ -345,6 +351,12 @@ impl DescribeTrainingJobRecordedOutput {
         ShapeType::Structure,
         51
     );
+    const M_IMAGE_METADATA: Schema = recorded_member!(
+        "DescribeTrainingJobResponse",
+        "ImageMetadata",
+        ShapeType::Structure,
+        52
+    );
 
     /// Take the channel list and the output and resource configurations OUT of the modelled
     /// response, so each is reported through its own wrapper and never twice.
@@ -368,6 +380,7 @@ impl DescribeTrainingJobRecordedOutput {
             resource_config,
             disable_efa: None,
             training_job_output: None,
+            image_metadata: None,
         }
     }
 }
@@ -394,6 +407,9 @@ impl SerializableStruct for DescribeTrainingJobRecordedOutput {
         }
         if let Some(output) = self.training_job_output.as_ref() {
             s.write_struct(&Self::M_TRAINING_JOB_OUTPUT, output)?;
+        }
+        if let Some(image) = self.image_metadata.as_ref() {
+            s.write_struct(&Self::M_IMAGE_METADATA, image)?;
         }
         Ok(())
     }

@@ -168,6 +168,32 @@ pub fn training_job_not_running(name: &str, status: &str) -> String {
 pub const INTERNAL_FAILURE_REASON: &str =
     "InternalServerError: We encountered an internal error. Please try again.";
 
+/// Record onto the stored training job `name` the CONTAINER IMAGE it runs, as resolved at the
+/// instant `at`: the reference `image` as given, that reference at the digest it resolves to,
+/// and when the resolution was made ([`crate::state::deployed_image`]).
+///
+/// The ONE writer of a job's image detail, so a job a caller's own `CreateTrainingJob` admits
+/// and one a hyperparameter tuning job launches report it alike. Called by the create that
+/// launched the job and with NO guard of this service's store held when it runs: the digest is
+/// read out of Amazon ECR's own store on the same engine, which this service never asks for
+/// under its own guard. A job whose algorithm names no image reference records none.
+pub fn record_training_job_image<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    state: &::engine::ServiceState<ComAmazonawsSagemakerSagemakerState>,
+    name: &str,
+    image: Option<&str>,
+    at: SystemTime,
+) {
+    let Some(image) = image else {
+        return;
+    };
+    let resolved = crate::state::deployed_image(engine, ctx, image, at);
+    if let Some(job) = state.lock().training_jobs.get_mut(name) {
+        job.image = Some(resolved);
+    }
+}
+
 /// A training job created by `CreateTrainingJob`, as `DescribeTrainingJob` replays it and
 /// `ListTrainingJobs` summarises it.
 ///
@@ -248,6 +274,13 @@ pub struct TrainingJob {
     /// The `CreateTrainingJob` request the job was accepted with, kept verbatim so
     /// `DescribeTrainingJob` replays what was stored rather than a reconstruction of it.
     pub request: crate::ops::types::CreateTrainingJobInput,
+    /// The CONTAINER IMAGE this job runs, as the create that launched it RESOLVED the
+    /// reference: the path the request named, that path at the digest it resolves to and the
+    /// instant the resolution was made ([`crate::state::deployed_image`]). Resolved on the
+    /// write path, so every read of the job replays one resolution and an image pushed to the
+    /// same tag afterwards does not change what the job reports. `None` for a job whose
+    /// algorithm names no image reference at all.
+    pub image: Option<crate::ops::types::DeployedImage>,
     /// The request's `Tags`, projected out of [`Self::request`] so the one tag resolution
     /// (`tag_accessors!`) reaches this record's tag set through the `tags` field every
     /// other taggable record exposes.
@@ -318,6 +351,10 @@ impl TrainingJob {
             pending_checkpoints: Vec::new(),
             entered: 1,
             tuning_job_arn,
+            // Resolved by the create that launched the job, right after the record exists
+            // ([`crate::state::deployed_image`] asks Amazon ECR for the digest, which is a
+            // read of another service's store and so is never made under this one's guard).
+            image: None,
             tags: request.tags.clone().unwrap_or_default(),
             request: request.clone(),
         }
@@ -1280,6 +1317,8 @@ mod tests {
             pending_checkpoints: Vec::new(),
             entered: 1,
             tuning_job_arn: None,
+            // This fixture probes the clock, not the image: the job names no image reference.
+            image: None,
             request: crate::ops::types::CreateTrainingJobInput::default(),
             tags: Vec::new(),
         }

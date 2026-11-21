@@ -1191,6 +1191,11 @@ pub use training_run::*;
 pub mod training_algorithm;
 pub use training_algorithm::*;
 
+/// The metric set a BUILT-IN algorithm publishes, resolved onto a job launched from that
+/// algorithm's image: see `state/builtin_algorithm_metrics.rs`.
+pub mod builtin_algorithm_metrics;
+pub use builtin_algorithm_metrics::*;
+
 /// The PUBLICATION of what a training run produced — the model artifact it built and the
 /// stage of the work at which it appears in Amazon S3: see `state/training_artifact.rs`.
 pub mod training_artifact;

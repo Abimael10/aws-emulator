@@ -283,7 +283,16 @@ fn child_request(
             training_image: specification.training_image.clone(),
             algorithm_name: specification.algorithm_name.clone(),
             training_input_mode: specification.training_input_mode.clone(),
-            metric_definitions: specification.metric_definitions.clone(),
+            // The definition's own metric set when it declares one, and otherwise the set the
+            // built-in algorithm its image names publishes — the same resolution a caller's
+            // own `CreateTrainingJob` gets, because the child IS a training job of that
+            // algorithm (`crate::state::builtin_algorithm_metrics`).
+            metric_definitions: specification.metric_definitions.clone().or_else(|| {
+                specification
+                    .training_image
+                    .as_deref()
+                    .and_then(super::builtin_image_metric_definitions)
+            }),
             ..AlgorithmSpecification::default()
         }),
         role_arn: definition.role_arn.clone(),

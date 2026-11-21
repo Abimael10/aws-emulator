@@ -18,9 +18,9 @@
 //! profiler rule evaluations stay absent: no rule container is evaluated against the run.
 //!
 //! Beside the modelled members, the response carries the ones the recorded service answers
-//! that this service's on-disk model does not declare — the job's `DisableEFA` and
-//! `TrainingJobOutput`, each input channel's `EnableFFM`, its output configuration's
-//! `DisableModelUpload` and `RemoveJobNameFromS3OutputPath`, and its resource
+//! that this service's on-disk model does not declare — the job's `DisableEFA`,
+//! `TrainingJobOutput` and `ImageMetadata`, each input channel's `EnableFFM`, its output
+//! configuration's `DisableModelUpload` and `RemoveJobNameFromS3OutputPath`, and its resource
 //! configuration's `UseReservedCapacity`. See `super::types::recorded_read_members` for how
 //! such a member reaches the wire, and the block at the end of `handle` for what each one is
 //! read off.
@@ -359,6 +359,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let request = job.request.clone();
         let model_artifacts = job.reported_model_artifacts();
         let job_output_path = job.job_output_path();
+        let image_metadata = job.image.clone();
         let output = DescribeTrainingJobOutput {
             training_job_name: job.name.clone(),
             training_job_arn: job.arn.clone(),
@@ -458,6 +459,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`crate::state::TrainingJob::job_output_path`, derived from the stored request the
         // way `ModelArtifacts` is).
         output.training_job_output = Some(RecordedTrainingJobOutput::new(job_output_path));
+        // "ImageMetadata": the detail of the container image the job RUNS, as the create that
+        // launched it resolved the reference ([`crate::state::record_training_job_image`]) —
+        // the path it was given, the same path at the digest it resolved to and the instant of
+        // that resolution. Replayed from the stored record, so every read of the job reports
+        // one resolution; a job whose algorithm names no image reference reports none.
+        output.image_metadata = image_metadata;
+        // The channel list is a member the recorded service carries on EVERY describe of a
+        // job: for a job created with no channel at all it answers it as an EMPTY list, not
+        // as an absent member, so a client reading a job's inputs always reads a list and
+        // never has to tell "no channels" from "not reported". Recorded behaviour, like the
+        // members beside it here — and written through the same recorded-member schema
+        // (`super::types::recorded_read_members`), not through the modelled member, whose
+        // `@length 1..20` is what the validating walk holds a REQUEST's channel list to.
+        if output.input_data_config.is_none() {
+            output.input_data_config = Some(Vec::new());
+        }
         // The mode the job's algorithm specification reads its data in, which is the mode a
         // channel that overrides it with none runs in.
         let training_input_mode = output

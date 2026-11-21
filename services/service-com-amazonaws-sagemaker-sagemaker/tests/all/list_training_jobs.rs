@@ -152,6 +152,9 @@ fn job(name: &str, status: &str, created: u64, modified: u64) -> TrainingJob {
         pending_checkpoints: Vec::new(),
         entered: 1,
         tuning_job_arn: None,
+        // A seeded row names no container image, so there is no image reference for a read
+        // to report the resolution of.
+        image: None,
         request: CreateTrainingJobInput::default(),
         tags: Vec::new(),
     }

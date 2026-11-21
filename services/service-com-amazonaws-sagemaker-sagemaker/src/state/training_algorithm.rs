@@ -260,7 +260,11 @@ impl TrainingAlgorithm {
 /// segment with its tag and digest cut off; a built-in algorithm's repository is
 /// `sagemaker-<algorithm>`, so the segment is matched on the algorithm's own name inside it
 /// rather than on the whole segment.
-fn names_repository(value: &str, repository: &str) -> bool {
+///
+/// The ONE reading of which algorithm an image path names, so the metric set that algorithm
+/// publishes ([`super::builtin_algorithm_metrics`]) is resolved off the same reading as the
+/// file its container writes the model into.
+pub(super) fn names_repository(value: &str, repository: &str) -> bool {
     let segment = value.rsplit('/').next().unwrap_or(value);
     let segment = segment.split_once('@').map_or(segment, |(name, _)| name);
     let segment = segment.split_once(':').map_or(segment, |(name, _)| name);
