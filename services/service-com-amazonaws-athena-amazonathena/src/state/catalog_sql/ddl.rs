@@ -180,7 +180,13 @@ pub fn create_database(
     let input = DatabaseInput {
         name: database.clone(),
         description: statement.comment.clone(),
-        location_uri: statement.location.as_deref().map(trimmed_location),
+        // The LOCATION as the statement WROTE it: a database's location URI is the value
+        // the catalog records for it, not a path a metastore client normalises — so the
+        // separator that closed it is part of the stored value, and a client that composes
+        // table locations by appending to it, or compares what it submitted against what the
+        // catalog holds, reads back exactly what it asked for. (A TABLE's storage location
+        // is a Hadoop path and IS normalised; see [`trimmed_location`].)
+        location_uri: statement.location.clone(),
         parameters: (!statement.properties.is_empty()).then(|| {
             statement
                 .properties

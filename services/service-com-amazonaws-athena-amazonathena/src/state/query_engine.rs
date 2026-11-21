@@ -32,6 +32,7 @@ mod projection;
 /// has no production for.
 mod table_functions;
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -142,6 +143,19 @@ pub const MAX_MATERIALISED_ROWS: usize = 200_000;
 /// How many BYTES of object data one query may read while materialising the catalog
 /// tables it reads; the byte counterpart of [`MAX_MATERIALISED_ROWS`].
 pub const MAX_MATERIALISED_BYTES: usize = 8 * 1024 * 1024;
+
+/// The CEILING on the object data one query may read, whatever data usage cutoff the
+/// workgroup it runs in configures.
+///
+/// A workgroup cutoff is a limit the caller sets, and the smallest one the model admits
+/// (`WorkGroupConfiguration$BytesScannedCutoffPerQuery`, `@range` min 10000000) is already
+/// above [`MAX_MATERIALISED_BYTES`] — so a query in such a workgroup reads up to its cutoff
+/// rather than stopping at this emulator's default cap, which would pre-empt the limit the
+/// caller asked to be held to. The cutoff itself is a caller-chosen number of no upper
+/// bound, so this is where that raising stops: the EMULATOR's own ceiling on what one query
+/// can make this process read. What a read then holds is bounded as before, by the rows and
+/// the values one query may materialise.
+pub const MAX_SCAN_BYTES: usize = 16 * 1024 * 1024;
 
 /// How many VALUES (rows times columns) one query may materialise from the Data Catalog.
 ///
@@ -522,6 +536,18 @@ pub enum Outcome {
         /// follows from.
         cause: FailureCause,
     },
+    /// The run was ABORTED by a limit in force on the query rather than by anything the
+    /// statement itself did, so the query is INTERRUPTED rather than failed: it reaches
+    /// the cancelled state ([`crate::state::QUERY_STATE_CANCELLED`]) carrying the reason
+    /// that limit publishes, and the data usage the limit accounts for.
+    Aborted {
+        /// The execution's `StateChangeReason`: what the limit that stopped the run
+        /// publishes about it.
+        reason: String,
+        /// What `DataScannedInBytes` reports for the aborted run, which for a data usage
+        /// limit is the limit itself — the run was stopped at it.
+        data_scanned_bytes: i64,
+    },
 }
 
 /// Whose doing a failed query's failure was.
@@ -682,11 +708,15 @@ pub fn run_over(
     }
 
     let input_rows = materialised_rows(objects);
+    // What type each column of the stored data this run reads is DECLARED as, which is
+    // the type an expression over one of those columns has whatever values it produced
+    // (see [`projection`]).
+    let source_types = source_column_types(objects);
     let started = Instant::now();
     guard.arm(MAX_QUERY_DEADLINE, step_budget());
     database.reads_stored_data.store(false, Ordering::SeqCst);
     let produced = materialise(&database.connection, objects)
-        .and_then(|()| execute_once(&database.connection, sql, parameters));
+        .and_then(|()| execute_once(&database.connection, sql, parameters, &source_types));
     guard.disarm();
     let engine_time = started.elapsed();
     let read_stored_data = database.reads_stored_data.load(Ordering::SeqCst);
@@ -760,6 +790,50 @@ fn materialised_rows(objects: &[LocalObject]) -> i64 {
         .sum();
     i64::try_from(rows).unwrap_or(i64::MAX)
 }
+
+/// The type each column of the objects one run reads is DECLARED as, keyed by the column's
+/// name folded to lower case — a column name resolves without regard to case.
+///
+/// A name two of the objects declare DIFFERENTLY carries no type here: an expression over it
+/// names no one column, so nothing about its type follows from the declarations. A view
+/// contributes none: its columns are the ones of the tables it reads.
+fn source_column_types(objects: &[LocalObject]) -> SourceColumnTypes {
+    let mut types: SourceColumnTypes = HashMap::new();
+    let declared = |columns: &[LocalColumn]| -> Vec<(String, Option<ColumnType>)> {
+        columns
+            .iter()
+            .map(|column| {
+                (
+                    column.name.to_ascii_lowercase(),
+                    ColumnType::declared(column.declared),
+                )
+            })
+            .collect()
+    };
+    let columns: Vec<(String, Option<ColumnType>)> = objects
+        .iter()
+        .flat_map(|object| match object {
+            LocalObject::Table(table) => declared(&table.columns),
+            LocalObject::Filtered { table, .. } => declared(&table.columns),
+            LocalObject::View { .. } => Vec::new(),
+        })
+        .collect();
+    for (name, column_type) in columns {
+        types
+            .entry(name)
+            .and_modify(|held| {
+                if *held != column_type {
+                    *held = None;
+                }
+            })
+            .or_insert(column_type);
+    }
+    types
+}
+
+/// What type each column of the stored data a run reads is declared as, by its folded name
+/// ([`source_column_types`]).
+type SourceColumnTypes = HashMap<String, Option<ColumnType>>;
 
 /// Either the rows a query returned, or the row count a statement that returns no
 /// columns affected.
@@ -978,6 +1052,7 @@ fn execute_once(
     connection: &rusqlite::Connection,
     sql: &str,
     parameters: &[String],
+    source_types: &SourceColumnTypes,
 ) -> Result<Produced, RunFailure> {
     let mut statement = connection.prepare(sql)?;
 
@@ -1009,7 +1084,7 @@ fn execute_once(
     // used only where the projection's columns can be matched up with the result's one for
     // one: a projection carrying a wildcard stands for as many columns as the relations it
     // reads hold.
-    let fixed_types = projection::fixed_column_types(sql);
+    let fixed_types = projection::fixed_column_types(sql, source_types);
     let fixed_types = if fixed_types.len() == columns.len() {
         fixed_types
     } else {

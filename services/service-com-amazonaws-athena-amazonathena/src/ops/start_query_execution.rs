@@ -358,6 +358,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let id = crate::state::new_query_execution_id();
         let submitted_at = SystemTime::now();
+        // WHO this submission speaks for, as the credential the request presented names the
+        // principal: what a statement may read is resolved for that principal, so it is what
+        // a later submission's result reuse is keyed to (`crate::state::result_reuse`). Held
+        // on the record, compared there, and reported nowhere.
+        let submitted_by = ::engine::extract_akid(&ctx.parts().headers);
         // What this submission would RUN UNDER is judged first, out of the registry alone:
         // the workgroup it names, whether that workgroup runs queries at all, and where the
         // results it produces would be written. The guard is released before the object
@@ -400,6 +405,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (group, managed_query_results, result_configuration)
         };
 
+        // The data usage CUTOFF the workgroup sets for one of its queries, which the run is
+        // held to: "the upper data usage limit (cutoff) for the amount of bytes a single
+        // query in a workgroup is allowed to scan"
+        // (`WorkGroupConfiguration$BytesScannedCutoffPerQuery`). A query that would scan past
+        // it is aborted at the cutoff rather than run to an end.
+        let scan_cutoff = group
+            .as_ref()
+            .and_then(|group| group.configuration.bytes_scanned_cutoff_per_query);
+
         // The resolved results location is VERIFIED before the submission is accepted:
         // Athena writes a query's results into a bucket of this account, and a location
         // naming one this account does not hold is neither verifiable nor creatable — so
@@ -424,13 +438,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the results, and it is APPLIED to the run's outcome below — a query whose results
         // the caller may not persist settles FAILED carrying that refusal rather than
         // reporting a success that saved nothing.
+        //
+        // The OWNER the submission expects the destination to have is judged first: it is a
+        // condition on the write Athena itself would make (see
+        // `crate::state::result_access::expected_owner_refusal`), so a destination owned by
+        // another account is refused whatever the caller's own policies allow.
         let result_write_refusal = crate::state::result_object_uri(
             statement_type,
             result_configuration.output_location.as_deref(),
             &id,
         )
         .and_then(|uri| {
-            crate::state::result_access::write_refusal(&*self.engine, ctx, &uri)
+            crate::state::result_access::expected_owner_refusal(
+                result_configuration.expected_bucket_owner.as_deref(),
+                &uri,
+            )
+            .or_else(|| crate::state::result_access::write_refusal(&*self.engine, ctx, &uri))
         });
 
         // Everything that reads or writes the registry happens here, and the lock is
@@ -439,9 +462,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // execution and its token are RESERVED here too, before the SQL runs, so a
         // concurrent call carrying the same token answers with this id rather than
         // running the statement a second time.
-        let prepared = {
+        let (prepared, reused) = {
             let mut store = state.lock();
-
             // "If another StartQueryExecution request is received, the same response is
             // returned and another query is not created." The answer comes from the
             // token the earlier call stored, so no second execution is minted and no
@@ -484,6 +506,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Err(message) => return Err(internal_server(&message)),
             };
 
+            // WHETHER THIS SUBMISSION RUNS THE STATEMENT AT ALL: one that asked for result
+            // reuse is answered out of an earlier execution's results where there is one of
+            // the same query inside the window it asked for, which is what reuse IS (see
+            // `crate::state::result_reuse`). Decided here, under the same guard that
+            // reserves the execution, so two submissions of one query cannot each decide
+            // they are the first — and only for a submission the Data Catalog's permissions
+            // let through, because a result nobody may read is no answer to it.
+            let reused = catalog_refusal
+                .is_none()
+                .then(|| crate::state::reuse_window(input.result_reuse_configuration.as_ref()))
+                .flatten()
+                .and_then(|max_age| {
+                    store.reusable_result(
+                        &crate::state::ReuseRequest {
+                            query_string: &query_string,
+                            work_group: &work_group,
+                            context: &context,
+                            execution_parameters: &execution_parameters,
+                            statement_type,
+                            submitted_by: &submitted_by,
+                            max_age,
+                        },
+                        submitted_at,
+                    )
+                });
+
             // The completion is due a span after the submit; `complete_query_execution`
             // moves it out if the engine was still running then, so a query is reported
             // complete because its work is over and not because a span elapsed.
@@ -515,6 +563,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 planning_time: read_time,
                 engine_reported_at: None,
                 cancelled_at: None,
+                // Which earlier execution this one is answered out of, where its submission
+                // asked for result reuse and there was a result to reuse.
+                reused_from: reused.as_ref().map(|reused| reused.id.clone()),
+                // WHO submitted it, which is what a later submission's reuse is keyed to.
+                submitted_by: submitted_by.clone(),
                 // Nothing has been published for this query yet: the state it is created in
                 // is the first event its own transitions owe (see
                 // `crate::state::query_events`).
@@ -523,20 +576,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             store.record_query_execution(record, input.client_request_token);
 
-            handle
+            (handle, reused)
         };
 
-        let completion = match catalog_refusal {
+        let completion = match (catalog_refusal, reused) {
             // The catalog this statement addresses is not one this caller may reach, so
             // nothing is planned against it and nothing is read: the execution this
             // submission minted settles FAILED carrying IAM's refusal, which is where
-            // Athena reports a catalog permission the caller does not hold.
-            Some(reason) => query_engine::Completion {
+            // Athena reports a catalog permission the caller does not hold. Judged before
+            // the reuse below, so a caller the catalog refuses is answered out of no
+            // earlier execution's results.
+            (Some(reason), _) => query_engine::Completion {
                 outcome: catalog_sql::Failure::user(reason).outcome(),
                 engine_time: Duration::ZERO,
                 planning_time: Duration::ZERO,
             },
-            None => match reading.statements {
+            // The statement was NOT run: this execution is answered out of the earlier
+            // execution's own result, which is what its submission asked for. No engine ran
+            // and no catalog was read, so neither span is charged to it.
+            (None, Some(reused)) => query_engine::Completion {
+                outcome: reused.outcome,
+                engine_time: Duration::ZERO,
+                planning_time: Duration::ZERO,
+            },
+            (None, None) => match reading.statements {
                 // One statement, or text this parser could not read at all — in which case
                 // the engine is the one that reports why.
                 Some(1) | None => {
@@ -558,6 +621,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 parameters: &parameters,
                                 access: &access,
                                 now: SystemTime::now(),
+                                scan_cutoff,
                             },
                         )
                     })

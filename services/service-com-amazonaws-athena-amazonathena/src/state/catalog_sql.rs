@@ -93,7 +93,12 @@ pub const ERROR_TYPE_VIEW: i32 = 1502;
 
 /// The `AthenaError$ErrorType` Athena publishes for the GENERIC user-error class: a
 /// statement the caller has to change, of no narrower published class — which is the
-/// class whose messages carry the `GENERIC_USER_ERROR` prefix.
+/// class whose messages carry the `GENERIC_USER_ERROR` prefix, and the type every
+/// user-caused failure this service reports no narrower class for carries
+/// ([`Failure::user`]).
+///
+/// RECORDED behaviour: a wire fixture reads a Data Catalog entry a query cannot be planned
+/// against and the execution settles FAILED with this type beside [`ERROR_CATEGORY_USER`].
 pub const ERROR_TYPE_GENERIC_USER: i32 = 1000;
 
 /// The `AthenaError$ErrorType` Athena publishes for a table DEFINITION the caller got
@@ -194,6 +199,11 @@ pub struct Failure {
     pub reason: Option<String>,
     /// Whose doing the failure was, and the error type Athena publishes for it.
     pub cause: FailureCause,
+    /// The data usage a LIMIT in force on the query accounts for, where what stopped the
+    /// run was such a limit rather than the statement: the run is then ABORTED rather than
+    /// failed ([`query_engine::Outcome::Aborted`]), so the query is interrupted at that
+    /// limit and reports it as the data it scanned. `None` for every failure.
+    pub aborted_scan: Option<i64>,
 }
 
 impl Failure {
@@ -205,19 +215,38 @@ impl Failure {
             message: message.into(),
             reason: None,
             cause: FailureCause::Emulator,
+            aborted_scan: None,
         }
     }
 
     /// A failure the submitted statement is the cause of, of no error class Athena
-    /// publishes a type for.
+    /// publishes a NARROWER type for, so it carries the type published for the generic
+    /// user-error class ([`ERROR_TYPE_GENERIC_USER`]).
     pub fn user(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             reason: None,
             cause: FailureCause::Athena {
                 category: ERROR_CATEGORY_USER,
-                error_type: None,
+                error_type: Some(ERROR_TYPE_GENERIC_USER),
             },
+            aborted_scan: None,
+        }
+    }
+
+    /// The run scanned more data than the cutoff its workgroup configured, so Athena
+    /// aborted it at that cutoff.
+    ///
+    /// Not a failure of the statement: the query is INTERRUPTED (the cancelled state), its
+    /// `StateChangeReason` is the wholly fixed sentence the limit publishes
+    /// ([`BYTES_SCANNED_LIMIT_EXCEEDED`]) and the data it reports scanning is the cutoff it
+    /// was stopped at.
+    pub fn scan_cutoff_exceeded(cutoff: usize) -> Self {
+        Self {
+            message: BYTES_SCANNED_LIMIT_EXCEEDED.to_string(),
+            reason: None,
+            cause: FailureCause::Emulator,
+            aborted_scan: Some(i64::try_from(cutoff).unwrap_or(i64::MAX)),
         }
     }
 
@@ -230,6 +259,7 @@ impl Failure {
                 category,
                 error_type: Some(error_type),
             },
+            aborted_scan: None,
         }
     }
 
@@ -245,6 +275,7 @@ impl Failure {
                 category: ERROR_CATEGORY_USER,
                 error_type: Some(ERROR_TYPE_DDL_TASK),
             },
+            aborted_scan: None,
         }
     }
 
@@ -360,6 +391,7 @@ impl Failure {
                 category: ERROR_CATEGORY_USER,
                 error_type: Some(ERROR_TYPE_ENTITY_NOT_FOUND),
             },
+            aborted_scan: None,
         }
     }
 
@@ -487,6 +519,14 @@ impl Failure {
 
     /// This failure as the outcome of a run that produced nothing.
     pub fn outcome(self) -> Outcome {
+        // A LIMIT in force on the query stopped the run, which interrupts the query rather
+        // than failing it (see [`Self::aborted_scan`]).
+        if let Some(data_scanned_bytes) = self.aborted_scan {
+            return Outcome::Aborted {
+                reason: self.message,
+                data_scanned_bytes,
+            };
+        }
         Outcome::Failed {
             message: self.message,
             reason: self.reason,
@@ -494,6 +534,11 @@ impl Failure {
         }
     }
 }
+
+/// What Athena publishes as the `StateChangeReason` of a query it aborted because the query
+/// scanned more data than its workgroup's cutoff allows: wholly fixed text, naming neither
+/// the cutoff, the workgroup nor the data the query read.
+pub const BYTES_SCANNED_LIMIT_EXCEEDED: &str = "Bytes scanned limit was exceeded";
 
 /// What the Hive DDL engine writes in front of the metastore exception a failed task
 /// wrapped: the task that failed and the return code it failed with. The text is the
@@ -523,6 +568,10 @@ pub struct Submission<'r> {
     pub access: &'r DataLakeAccess,
     /// When the submission was made, which is what a catalog write it performs records.
     pub now: SystemTime,
+    /// How many bytes of data this ONE query may scan, where the workgroup it runs in sets a
+    /// cutoff: a query that would scan past it is aborted at the cutoff rather than run to
+    /// an end (`WorkGroupConfiguration$BytesScannedCutoffPerQuery`).
+    pub scan_cutoff: Option<i64>,
 }
 
 /// Run the statement `reading` planned, and report what it produced.
@@ -547,6 +596,7 @@ pub fn execute<Eng: Send + Sync + 'static>(
         parameters,
         access,
         now,
+        scan_cutoff,
     } = *submission;
     match reading.plan {
         Plan::Engine => query_engine::run(handle, sql, reading.counts_rows, parameters),
@@ -582,7 +632,7 @@ pub fn execute<Eng: Send + Sync + 'static>(
         }
         Plan::Relations(relational) => {
             let started = Instant::now();
-            match resolved_sql(engine, handle, *relational, context, access) {
+            match resolved_sql(engine, handle, *relational, context, access, scan_cutoff) {
                 Ok(prepared) => {
                     // Resolving the statement's relations against the catalog and reading
                     // the objects at their locations is what Athena measures as the query
@@ -1035,6 +1085,7 @@ fn resolved_sql<Eng: Send + Sync + 'static>(
     relational: RelationalStatement,
     context: &QueryContext,
     access: &DataLakeAccess,
+    scan_cutoff: Option<i64>,
 ) -> Result<Prepared, Failure> {
     let RelationalStatement {
         mut statement,
@@ -1042,9 +1093,10 @@ fn resolved_sql<Eng: Send + Sync + 'static>(
     } = relational;
     // ONE budget for the whole statement: how many relations may be resolved at all
     // (which is what bounds the PRODUCT of the relations a statement names and the levels
-    // of view they are defined over), how many rows and bytes may be materialised, and
-    // when the resolution must stop whatever it has reached.
-    let mut budget = Budget::default();
+    // of view they are defined over), how many rows and bytes may be materialised, how much
+    // data the workgroup's own cutoff lets the query scan, and when the resolution must stop
+    // whatever it has reached.
+    let mut budget = Budget::for_scan_cutoff(scan_cutoff);
     let mut resolution = Resolution::default();
     let resolved = resolve(engine, &relations, 0, &mut resolution, &mut budget, access)?;
 

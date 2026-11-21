@@ -728,9 +728,9 @@ async fn database_ddl_writes_the_catalog_database_glue_reads_report() {
             context: "ddl_shop",
             sql: "CREATE DATABASE ddl_located LOCATION 's3://athena-catalog-data/located/'",
             name: "ddl_located",
-            // A location names a PREFIX, which the catalog records without the separator
-            // that closed it.
-            location: Some("s3://athena-catalog-data/located"),
+            // A database's location URI is recorded as the statement declared it, the
+            // separator that closed it included.
+            location: Some("s3://athena-catalog-data/located/"),
         },
     ];
 

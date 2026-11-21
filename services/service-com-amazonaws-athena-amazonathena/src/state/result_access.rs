@@ -20,6 +20,12 @@
 //!    in force refuse is a write that does not happen, so the execution settles FAILED
 //!    carrying that refusal ([`access_denied`]) and the location is left as it was — rather
 //!    than reporting a success whose results were never persisted.
+//! 3. **The bucket has to be owned by the account the submission expects.** A submission may
+//!    name the account it expects to own the destination, and Athena makes its Amazon S3
+//!    calls under that expectation ([`expected_owner_refusal`]): a destination owned by
+//!    anyone else is a write Amazon S3 refuses, so the execution settles FAILED carrying
+//!    that refusal and writes nothing — which is the whole point of a guard against writing
+//!    results into a bucket another account has taken over.
 //!
 //! The action and the ARN are Amazon S3's own, named from that service's crate rather than
 //! spelled again here, so a statement that covers one of its object writes covers this one.
@@ -71,6 +77,45 @@ pub fn unverifiable_output_bucket(bucket: &str) -> String {
 /// not written, which is the key the submission resolved for it.
 pub fn access_denied(location: &str) -> String {
     format!("Access denied when writing to location: {location}")
+}
+
+/// Why the account a submission EXPECTS to own its output bucket is not the account that
+/// owns it, or `None` when the submission names the owner or names no account at all.
+///
+/// `ResultConfiguration$ExpectedBucketOwner` documents the rule: "The Amazon Web Services
+/// account ID that you expect to be the owner of the Amazon S3 bucket specified by
+/// `ResultConfiguration$OutputLocation`. If set, Athena uses the value for
+/// `ExpectedBucketOwner` when it makes Amazon S3 calls to your specified output location. If
+/// the `ExpectedBucketOwner` Amazon Web Services account ID does not match the actual owner
+/// of the Amazon S3 bucket, the call fails with a permissions error." So the write Athena
+/// would make is refused, the query settles FAILED carrying that refusal, and nothing is
+/// written at the location. This emulator serves ONE account, so that account owns every
+/// bucket it holds and any other id names an owner no bucket here has — the same reading the
+/// object store itself applies to the header this member becomes
+/// (`s3_state`'s own expected-owner guard).
+///
+/// The sentence is Athena's own for a result write its permissions refused: fixed text with
+/// the object the write addressed in it, which is the only part the request and the state
+/// decide. It names what the caller has to check — the bucket's permissions, the expected
+/// owner, and the key results are encrypted under — because the refusal says only that the
+/// write was denied.
+pub fn expected_owner_refusal(expected: Option<&str>, uri: &str) -> Option<String> {
+    let expected = expected?.trim();
+    if expected.is_empty() || expected == ::engine::emulator_account_id() {
+        return None;
+    }
+    Some(output_access_denied(uri))
+}
+
+/// The `StateChangeReason` an execution settles FAILED with when Athena's own write of its
+/// results to `uri` was denied: wholly fixed text around that object.
+pub fn output_access_denied(uri: &str) -> String {
+    format!(
+        "Access denied when writing output to url: {uri} . Please ensure you are allowed to \
+         access the S3 bucket. If specifying an expected bucket owner, confirm the bucket is \
+         owned by the expected account. If you are encrypting query results with KMS key, \
+         please ensure you are allowed to access your KMS key"
+    )
 }
 
 /// Why the caller may not write the result object `uri` names, or `None` when the policies in

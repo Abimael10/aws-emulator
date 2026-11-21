@@ -233,6 +233,9 @@ impl QueryExecutionRecord {
             match outcome {
                 query_engine::Outcome::Succeeded { .. } => QUERY_STATE_SUCCEEDED,
                 query_engine::Outcome::Failed { .. } => QUERY_STATE_FAILED,
+                // A run a LIMIT in force stopped was interrupted, which is the state
+                // `state_at` derives for it too.
+                query_engine::Outcome::Aborted { .. } => QUERY_STATE_CANCELLED,
             },
             self.completion_due_at,
         ));

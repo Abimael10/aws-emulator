@@ -3,16 +3,20 @@
 //! How the Data Catalog RECORDS the `LOCATION` a Hive DDL statement declares, as Glue's own
 //! reads report it.
 //!
-//! The rule under test: a declared location names a PLACE in a store, and the catalog
-//! records that place — the path the statement wrote, without the separator that closed it,
-//! because the separator follows the path rather than belonging to it. What is dropped is a
-//! separator INSIDE the path, so a location whose whole path IS that separator — the ROOT of
-//! the store it addresses — keeps it: dropping it there would record the store itself
-//! instead of a place in it, and a consumer that joins a key under the recorded location
-//! would address a different store path. This is how the Hadoop path a Hive metastore client
-//! writes normalises, and it holds for every location such a statement records: a table's
-//! (`StorageDescriptor$Location`, "the physical location of the table") and a database's
-//! (`Database$LocationUri`).
+//! The rule under test: a TABLE's declared location names a PLACE in a store, and the
+//! catalog records that place — the path the statement wrote, without the separator that
+//! closed it, because the separator follows the path rather than belonging to it. What is
+//! dropped is a separator INSIDE the path, so a location whose whole path IS that separator —
+//! the ROOT of the store it addresses — keeps it: dropping it there would record the store
+//! itself instead of a place in it, and a consumer that joins a key under the recorded
+//! location would address a different store path. This is how the Hadoop path a Hive
+//! metastore client writes normalises, and it holds for a table's own location
+//! (`StorageDescriptor$Location`, "the physical location of the table").
+//!
+//! A DATABASE's location is recorded by the other rule: its `Database$LocationUri` is the
+//! URI the statement declared, byte for byte, separator and all — nothing normalises it, so a
+//! client that composes table locations by appending to it reads back exactly the value it
+//! submitted.
 //!
 //! Each suite is a TABLE whose rows differ along what the rule generalises over: how the
 //! declared path closes (with one separator, with several, with none), how deep it is, the
@@ -323,29 +327,35 @@ async fn hive_ddl_records_the_place_a_table_location_names() {
     }
 }
 
-/// A database's `LocationUri` is recorded by the same rule a table's location is: the
-/// declared path without the separator that closed it, and the bare separator where the
-/// location names the root of its store.
+/// A database's `LocationUri` is the URI the statement DECLARED, byte for byte: unlike a
+/// table's storage path, it is recorded without normalisation, so the separator that closed
+/// it is part of the stored value.
 #[tokio::test]
 async fn hive_ddl_records_the_place_a_database_location_names() {
     let router = emulator();
     create_bucket(&router).await;
     create_database(&router).await;
 
-    // The rows differ the same way the table rows do: how the declared path closes, and
-    // whether it names the store's root or a place inside it.
+    // The rows differ along how the declared path closes, how deep it is, whether it names
+    // the store's root or a place inside it, and which store it addresses.
     let cases: Vec<LocationCase> = vec![
         LocationCase {
             case: "a prefix closed with the separator",
             name: "located_closed",
             declared: "s3://athena-location-recording/warehouse/",
-            recorded: "s3://athena-location-recording/warehouse",
+            recorded: "s3://athena-location-recording/warehouse/",
         },
         LocationCase {
             case: "the same prefix written without one",
             name: "located_bare",
             declared: "s3://athena-location-recording/warehouse",
             recorded: "s3://athena-location-recording/warehouse",
+        },
+        LocationCase {
+            case: "a deeper prefix closed with the separator",
+            name: "located_deep",
+            declared: "s3://athena-location-recording/warehouse/eu/2026/",
+            recorded: "s3://athena-location-recording/warehouse/eu/2026/",
         },
         LocationCase {
             case: "the bucket root, whose whole path is the separator",

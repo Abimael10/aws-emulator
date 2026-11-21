@@ -118,6 +118,10 @@ pub mod query_results;
 /// Whether the resolved output location is one the caller may write a query's results to.
 pub mod result_access;
 
+/// Whether a submission is answered out of an earlier query's results, and which.
+mod result_reuse;
+pub use result_reuse::*;
+
 /// The runtime statistics of one query execution: its timeline, its counters and its stage.
 mod runtime_statistics;
 
@@ -1547,6 +1551,17 @@ pub struct QueryExecutionRecord {
     /// When a `StopQueryExecution` call interrupted it, if one did. Only a query that
     /// had not reached a terminal state can carry this.
     pub cancelled_at: Option<SystemTime>,
+    /// The execution whose result this one REUSED instead of running the statement again,
+    /// where the submission asked for result reuse and a previous result was inside the
+    /// window it asked for (see [`Self::reusable_result`]). `None` for a query that ran the
+    /// statement itself, which is what `ReusedPreviousResult` reports as false.
+    pub reused_from: Option<String>,
+    /// WHO submitted this execution, as the credential the request presented names the
+    /// principal it speaks for. Compared and never reported: what a statement may read is
+    /// decided per caller (the Data Catalog's permissions and Lake Formation's grants), so a
+    /// previous result answers only a submission by the SAME principal (see
+    /// [`Self::reusable_result`]).
+    pub(crate) submitted_by: String,
     /// The `QueryExecutionState` last PUBLISHED for this query as an `Athena Query State
     /// Change` event, and `None` while none has been. Read and written by the event path
     /// alone ([`query_events`]), which is what keeps every transition published exactly
@@ -1588,6 +1603,9 @@ impl QueryExecutionRecord {
         match outcome {
             query_engine::Outcome::Succeeded { .. } => QUERY_STATE_SUCCEEDED,
             query_engine::Outcome::Failed { .. } => QUERY_STATE_FAILED,
+            // A run a LIMIT in force stopped was interrupted rather than failed, which is
+            // the state Athena reports for a query it aborted.
+            query_engine::Outcome::Aborted { .. } => QUERY_STATE_CANCELLED,
         }
     }
 
@@ -1618,7 +1636,7 @@ impl QueryExecutionRecord {
         }
         match self.outcome.as_ref()? {
             query_engine::Outcome::Succeeded { result, .. } => Some(result),
-            query_engine::Outcome::Failed { .. } => None,
+            query_engine::Outcome::Failed { .. } | query_engine::Outcome::Aborted { .. } => None,
         }
     }
 
@@ -1637,7 +1655,7 @@ impl QueryExecutionRecord {
             query_engine::Outcome::Succeeded { result, .. } => {
                 (!result.column_info.is_empty()).then_some(0)
             }
-            query_engine::Outcome::Failed { .. } => None,
+            query_engine::Outcome::Failed { .. } | query_engine::Outcome::Aborted { .. } => None,
         }
     }
 
@@ -1777,7 +1795,19 @@ impl QueryExecutionRecord {
                 reason,
                 cause,
             } => Some((message, reason.as_deref(), *cause)),
-            query_engine::Outcome::Succeeded { .. } => None,
+            query_engine::Outcome::Succeeded { .. } | query_engine::Outcome::Aborted { .. } => None,
+        }
+    }
+
+    /// Why this query is in state [`QUERY_STATE_CANCELLED`]: the reason the limit that
+    /// ABORTED its run publishes, and otherwise the one Athena reports for a query a caller
+    /// interrupted — which is what every other cancelled query was stopped by.
+    fn cancellation_reason(&self) -> String {
+        match self.outcome.as_ref() {
+            Some(query_engine::Outcome::Aborted { reason, .. }) if self.cancelled_at.is_none() => {
+                reason.clone()
+            }
+            _ => QUERY_CANCELLED_BY_USER.to_string(),
         }
     }
 
@@ -1786,7 +1816,7 @@ impl QueryExecutionRecord {
         let state = self.state_at(now);
         let failure = (state == QUERY_STATE_FAILED).then(|| self.failure()).flatten();
         let state_change_reason = match state {
-            QUERY_STATE_CANCELLED => Some(QUERY_CANCELLED_BY_USER.to_string()),
+            QUERY_STATE_CANCELLED => Some(self.cancellation_reason()),
             // The reason a failed query reports is what performed the statement wrote
             // about the failure, which for a DDL task is the task's own line and for
             // every other class is the failure's own message.
@@ -1850,10 +1880,12 @@ impl QueryExecutionRecord {
             }),
             // Athena's error TYPE is a published code per failure class: the one
             // reported is the one the failure's own class carries, and a failure the
-            // engine reported carries none, so none is invented for it.
+            // engine itself reported is the SQL the caller submitted — a user error of no
+            // narrower published class, which is the generic user code.
             error_type: match cause {
                 query_engine::FailureCause::Athena { error_type, .. } => error_type,
-                _ => None,
+                query_engine::FailureCause::Sql => Some(catalog_sql::ERROR_TYPE_GENERIC_USER),
+                query_engine::FailureCause::Emulator => None,
             },
             // "The FAILED state is always terminal with no automatic retry."
             retryable: false,
@@ -1962,22 +1994,24 @@ impl QueryExecutionRecord {
         // publishing the results — exactly when they become readable. Reported once the
         // query is terminal, when both spans are over; a query whose run never reported has
         // neither.
-        let planning_millis = millis_of(self.planning_time);
+        let planning_millis = measured_millis(self.planning_time);
         let engine_started_at = self
             .engine_reported_at
             .and_then(|reported| reported.checked_sub(self.engine_time));
         let pre_processing = engine_started_at.filter(|_| terminal).map(|started| {
             // The planning is its own phase, so the pre-processing span is what came
-            // before the engine BESIDE it rather than the whole of it.
+            // before the engine BESIDE it rather than the whole of it — and never less
+            // than nothing, which is what a planning span measured at a finer resolution
+            // than the millisecond it is reported in would otherwise leave.
             millis_between(self.submitted_at, started)
                 .saturating_sub(planning_millis)
-                .min(remaining)
+                .clamp(0, remaining)
         });
         remaining -= pre_processing.unwrap_or(0);
         let planning = terminal.then(|| planning_millis.min(remaining));
         remaining -= planning.unwrap_or(0);
         let engine = if terminal {
-            millis_of(self.engine_time).min(remaining)
+            measured_millis(self.engine_time).min(remaining)
         } else {
             0
         };
@@ -1988,10 +2022,18 @@ impl QueryExecutionRecord {
             .zip(self.completion_at(now))
             .map(|_| remaining);
         let data_scanned = match (self.outcome.as_ref(), terminal) {
+            // What the run read, as the outcome recorded it — and for a run a data usage
+            // limit ABORTED, what that limit accounts for: it was stopped at the limit,
+            // which is the data it is reported as having scanned.
             (
-                Some(query_engine::Outcome::Succeeded {
-                    data_scanned_bytes, ..
-                }),
+                Some(
+                    query_engine::Outcome::Succeeded {
+                        data_scanned_bytes, ..
+                    }
+                    | query_engine::Outcome::Aborted {
+                        data_scanned_bytes, ..
+                    },
+                ),
                 true,
             ) => *data_scanned_bytes,
             _ => 0,
@@ -2016,10 +2058,11 @@ impl QueryExecutionRecord {
             // query is terminal, exactly as the engine's own span is.
             query_planning_time_in_millis: planning,
             service_processing_time_in_millis: processing,
-            // Every query here is RUN: no read of a result set is answered out of an
-            // earlier query's results, so no run reused a previous result.
+            // Whether this execution was answered out of an EARLIER query's results rather
+            // than by running the statement: "true if a previous query result was reused;
+            // false if the result was generated from a new run of the query".
             result_reuse_information: Some(ResultReuseInformation {
-                reused_previous_result: false,
+                reused_previous_result: self.reused_from.is_some(),
             }),
             dpu_count: None,
         }
@@ -2030,6 +2073,24 @@ impl QueryExecutionRecord {
 fn millis_of(duration: Duration) -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
+
+/// A MEASURED span in whole milliseconds: the milliseconds it occupied, a part-millisecond
+/// counting as the one it ran inside.
+///
+/// Athena reports its phases as whole milliseconds, and a phase that really ran spent part
+/// of a millisecond at the least — so truncating such a span to zero would report work that
+/// was done as work that took no time at all. Zero is reported for a phase that did not
+/// happen, which is the one span of no duration.
+fn measured_millis(duration: Duration) -> i64 {
+    if duration.is_zero() {
+        return 0;
+    }
+    i64::try_from(duration.as_nanos().div_ceil(NANOS_PER_MILLI)).unwrap_or(i64::MAX)
+}
+
+/// How many nanoseconds one millisecond holds, which is what [`measured_millis`] reads a
+/// measured span in.
+const NANOS_PER_MILLI: u128 = 1_000_000;
 
 /// The whole milliseconds from `from` to `until`, or 0 when `until` is not after `from`.
 fn millis_between(from: SystemTime, until: SystemTime) -> i64 {

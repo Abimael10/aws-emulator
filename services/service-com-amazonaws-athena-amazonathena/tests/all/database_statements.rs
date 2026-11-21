@@ -229,7 +229,7 @@ async fn a_database_definition_is_performed_against_the_data_catalog() {
              WITH DBPROPERTIES ('owner' = 'shop')",
             "ddl-clauses",
             Some("the shop"),
-            Some("s3://athena-database-ddl/shop"),
+            Some("s3://athena-database-ddl/shop/"),
             Some(("owner", "shop")),
         ),
     ];

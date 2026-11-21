@@ -257,6 +257,15 @@ pub struct Budget {
     pub cells_left: usize,
     /// How many bytes of object data one query may still read.
     pub bytes_left: usize,
+    /// How many bytes of object data this query may scan in all, where the workgroup it
+    /// runs in sets a cutoff (`WorkGroupConfiguration$BytesScannedCutoffPerQuery`, "the
+    /// upper data usage limit (cutoff) for the amount of bytes a single query in a
+    /// workgroup is allowed to scan"). `None` for a query whose workgroup sets none.
+    pub scan_cutoff: Option<usize>,
+    /// How many bytes of object data this query has scanned so far, which is what the
+    /// cutoff above is measured against: the cutoff bounds the whole query, so every
+    /// relation it reads charges the same running total.
+    pub scanned: usize,
     /// When the resolution must stop, whatever is left of the counts above.
     pub deadline: ::std::time::Instant,
 }
@@ -268,12 +277,62 @@ impl Default for Budget {
             rows_left: query_engine::MAX_MATERIALISED_ROWS,
             cells_left: query_engine::MAX_MATERIALISED_CELLS,
             bytes_left: query_engine::MAX_MATERIALISED_BYTES,
+            scan_cutoff: None,
+            scanned: 0,
             deadline: ::std::time::Instant::now() + query_engine::MAX_QUERY_DEADLINE,
         }
     }
 }
 
 impl Budget {
+    /// The budget one query runs under, given the data usage cutoff its workgroup sets.
+    ///
+    /// A cutoff in force is what the query is held to, so the emulator's own cap on the
+    /// object data one query reads is raised to it: a limit the caller configured must
+    /// decide where the read stops, rather than being pre-empted by a lower cap of this
+    /// emulator's — the smallest cutoff the model admits is already above that cap. It is
+    /// raised no further than [`query_engine::MAX_SCAN_BYTES`], the ceiling on what one
+    /// query can make this process read whatever cutoff is configured.
+    pub fn for_scan_cutoff(scan_cutoff: Option<i64>) -> Self {
+        let scan_cutoff = scan_cutoff
+            .and_then(|cutoff| usize::try_from(cutoff).ok())
+            .filter(|cutoff| *cutoff > 0);
+        let bytes_left = match scan_cutoff {
+            Some(cutoff) => cutoff.clamp(
+                query_engine::MAX_MATERIALISED_BYTES,
+                query_engine::MAX_SCAN_BYTES,
+            ),
+            None => query_engine::MAX_MATERIALISED_BYTES,
+        };
+        Self {
+            bytes_left,
+            scan_cutoff,
+            ..Self::default()
+        }
+    }
+
+    /// Charge `bytes` of STORED OBJECT data this query scanned, before it is read.
+    ///
+    /// Two limits, in this order, because they end the query differently: the cutoff the
+    /// workgroup configured ABORTS it — the query is interrupted at the limit it was given
+    /// ([`Failure::scan_cutoff_exceeded`]) — while this emulator's own cap on what one query
+    /// reads FAILS it ([`Self::too_many_bytes`]). The configured limit is judged first, so a
+    /// scan past it reports the limit the caller set rather than a bound of this emulator.
+    pub fn charge_scan(&mut self, relation: &Relation, bytes: usize) -> Result<(), Failure> {
+        self.charge_deadline()?;
+        self.scanned = self.scanned.saturating_add(bytes);
+        if let Some(cutoff) = self.scan_cutoff {
+            if self.scanned > cutoff {
+                return Err(Failure::scan_cutoff_exceeded(cutoff));
+            }
+        }
+        if bytes > self.bytes_left {
+            return Err(Self::too_many_bytes(relation));
+        }
+        self.bytes_left -= bytes;
+        Ok(())
+    }
+
     /// Charge ONE relation against this budget, or say that the statement has reached
     /// what this emulator resolves for one query.
     pub fn charge_relation(&mut self) -> Result<(), Failure> {
@@ -598,10 +657,11 @@ impl DataSource {
                         None => continue,
                     },
                 };
-                if object.body.len() > budget.bytes_left {
-                    return Err(Budget::too_many_bytes(&self.relation));
-                }
-                budget.bytes_left -= object.body.len();
+                // What this read SCANNED is charged before the object is decoded: the
+                // cutoff the query's workgroup sets and this emulator's own cap are both
+                // measured on the stored data a read goes through
+                // ([`Budget::charge_scan`]).
+                budget.charge_scan(&self.relation, object.body.len())?;
                 scanned = scanned.saturating_add(object.body.len());
                 let split = format!("s3://{bucket_name}/{key}");
                 // What the hidden metadata columns carry is a property of THIS object, so it

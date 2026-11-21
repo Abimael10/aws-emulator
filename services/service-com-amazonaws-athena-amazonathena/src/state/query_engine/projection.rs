@@ -30,7 +30,7 @@ use ::sqlparser::ast::{
 };
 
 use super::exact_decimal::EXACT_DECIMAL_FUNCTION;
-use super::ColumnType;
+use super::{ColumnType, SourceColumnTypes};
 use crate::state::catalog_sql::statement::{parse_statements, unnamed_column};
 
 /// The aggregate and window functions whose result type Athena fixes whatever they are
@@ -53,6 +53,33 @@ const FIXED_RESULT_FUNCTIONS: &[(&str, ColumnType)] = &[
     ("avg", ColumnType::Double),
 ];
 
+/// The aggregate and window functions whose result type is their ARGUMENT's, so a call of
+/// one over a column of stored data has the type that column is declared as.
+///
+/// Source: the same SQL reference — its aggregate functions chapter words `min(x)` and
+/// `max(x)` as "the minimum/maximum value of all input values" and `arbitrary(x)` as "an
+/// arbitrary non-null value", and its window functions chapter words the value functions
+/// (`first_value`, `last_value`, `nth_value`, `lag`, `lead`) as a value of the window's own
+/// rows: each answers one of the values it was given, which is a value of the argument's own
+/// type. `sum` is NOT one of them: it accumulates, which is why it has a rule of its own
+/// ([`SUMMED_RESULT_FUNCTION`]).
+const ARGUMENT_TYPED_FUNCTIONS: &[&str] = &[
+    "min",
+    "max",
+    "arbitrary",
+    "first_value",
+    "last_value",
+    "nth_value",
+    "lag",
+    "lead",
+];
+
+/// The aggregate that ADDS its argument up, whose result type is the argument's own except
+/// over the exact-integer types: the same reference gives the sum over an integer argument
+/// the 64-bit integer type, because that is the width the sum accumulates in — a total of
+/// 32-bit values is not held to 32 bits.
+const SUMMED_RESULT_FUNCTION: &str = "sum";
+
 /// The type each column of the statement `sql` projects has by its own expression, in
 /// projection order — `None` for a column whose type the statement does not fix, which is
 /// the one left to the values the run produced.
@@ -61,7 +88,10 @@ const FIXED_RESULT_FUNCTIONS: &[(&str, ColumnType)] = &[
 /// one for one: text that is no single query, a set operation, and a projection carrying a
 /// wildcard, which stands for as many columns as the relations it reads hold. A caller uses
 /// the answer only when it is as long as the result set is wide.
-pub(super) fn fixed_column_types(sql: &str) -> Vec<Option<ColumnType>> {
+pub(super) fn fixed_column_types(
+    sql: &str,
+    source_types: &SourceColumnTypes,
+) -> Vec<Option<ColumnType>> {
     let Some(items) = projected_items(sql) else {
         return Vec::new();
     };
@@ -72,7 +102,7 @@ pub(super) fn fixed_column_types(sql: &str) -> Vec<Option<ColumnType>> {
             SelectItem::ExprWithAlias { expr, .. } => expr,
             SelectItem::Wildcard(..) | SelectItem::QualifiedWildcard(..) => return Vec::new(),
         };
-        types.push(fixed_type_of(projected));
+        types.push(fixed_type_of(projected, source_types));
     }
     types
 }
@@ -128,7 +158,7 @@ fn projected_items(sql: &str) -> Option<Vec<SelectItem>> {
 /// The type `expression` has whatever it evaluates to, where Athena's own signature for it
 /// gives it one.
 ///
-/// Four readings, each a property of the EXPRESSION and not of a value:
+/// Five readings, each a property of the EXPRESSION and not of a value:
 ///
 /// * a CAST names the type its value is read to, which is the type the column has;
 /// * a BOOLEAN-valued expression — the `TRUE`/`FALSE` literal, a comparison, a logical
@@ -136,12 +166,17 @@ fn projected_items(sql: &str) -> Option<Vec<SelectItem>> {
 ///   the answer (it has no boolean type and answers 1 and 0);
 /// * an exact-decimal reading ([`super::exact_decimal`]) is the `DECIMAL` of the precision
 ///   and scale that reading names;
-/// * a function whose result type Athena fixes ([`FIXED_RESULT_FUNCTIONS`]) has that type.
-fn fixed_type_of(expression: &Expr) -> Option<ColumnType> {
+/// * a function whose result type Athena fixes ([`FIXED_RESULT_FUNCTIONS`]) has that type;
+/// * a function whose result type is its ARGUMENT's ([`ARGUMENT_TYPED_FUNCTIONS`],
+///   [`SUMMED_RESULT_FUNCTION`]) over a column of stored data has the type that column is
+///   DECLARED as, which is a property of the catalog entry and not of the values the run
+///   happened to read.
+fn fixed_type_of(expression: &Expr, source_types: &SourceColumnTypes) -> Option<ColumnType> {
     match expression {
         // A parenthesised expression is the expression inside it.
-        Expr::Nested(inner) => fixed_type_of(inner),
-        Expr::Function(function) => fixed_result_type(function),
+        Expr::Nested(inner) => fixed_type_of(inner, source_types),
+        Expr::Function(function) => fixed_result_type(function)
+            .or_else(|| argument_typed_result(function, source_types)),
         Expr::Cast { data_type, .. } => cast_type(data_type),
         Expr::Value(value) => matches!(value.value, SqlValue::Boolean(..))
             .then_some(ColumnType::Boolean),
@@ -227,13 +262,7 @@ fn cast_type(data_type: &DataType) -> Option<ColumnType> {
 /// function — read without its quoting and folded, because a function name is matched
 /// without regard to case.
 fn fixed_result_type(function: &Function) -> Option<ColumnType> {
-    let name = function
-        .name
-        .0
-        .last()?
-        .to_string()
-        .trim_matches('"')
-        .to_ascii_lowercase();
+    let name = folded_function_name(function)?;
     if name == EXACT_DECIMAL_FUNCTION {
         return exact_decimal_type(function);
     }
@@ -241,6 +270,80 @@ fn fixed_result_type(function: &Function) -> Option<ColumnType> {
         .iter()
         .find(|(fixed, _)| *fixed == name.as_str())
         .map(|(_, column_type)| *column_type)
+}
+
+/// The type a call whose result type is its ARGUMENT's has, read off the declared type of the
+/// column that argument names — `None` for any other function, for a call over an expression
+/// that is no column reference, and for a column the run read no declaration of.
+///
+/// The argument is read as a column REFERENCE alone: an expression computed from a column has
+/// the type of that computation, which no declaration decides. A `sum` over one of the
+/// exact-integer types is the one call whose type is not literally its argument's — it
+/// accumulates into the 64-bit integer type ([`SUMMED_RESULT_FUNCTION`]).
+fn argument_typed_result(
+    function: &Function,
+    source_types: &SourceColumnTypes,
+) -> Option<ColumnType> {
+    let name = folded_function_name(function)?;
+    let summed = name == SUMMED_RESULT_FUNCTION;
+    if !summed && !ARGUMENT_TYPED_FUNCTIONS.contains(&name.as_str()) {
+        return None;
+    }
+    let declared = declared_argument_type(function, source_types)?;
+    Some(match declared {
+        ColumnType::Integer | ColumnType::BigInt if summed => ColumnType::BigInt,
+        declared => declared,
+    })
+}
+
+/// The declared type of the column one call's FIRST argument names, where that argument is a
+/// reference to a column of the stored data the run read.
+fn declared_argument_type(
+    function: &Function,
+    source_types: &SourceColumnTypes,
+) -> Option<ColumnType> {
+    use ::sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments};
+
+    let FunctionArguments::List(FunctionArgumentList { args, .. }) = &function.args else {
+        return None;
+    };
+    let [FunctionArg::Unnamed(FunctionArgExpr::Expr(argument)), ..] = &args[..] else {
+        return None;
+    };
+    declared_column_type(argument, source_types)
+}
+
+/// The declared type of the column `expression` REFERS to, and `None` where it refers to no
+/// one column of the stored data the run read.
+///
+/// A qualified name's LAST part is the column; the ones in front of it name the relation it is
+/// read from. The name is folded, because a column name resolves without regard to case.
+fn declared_column_type(
+    expression: &Expr,
+    source_types: &SourceColumnTypes,
+) -> Option<ColumnType> {
+    let named = match expression {
+        Expr::Nested(inner) => return declared_column_type(inner, source_types),
+        Expr::Identifier(ident) => ident.value.clone(),
+        Expr::CompoundIdentifier(parts) => parts.last()?.value.clone(),
+        _ => return None,
+    };
+    *source_types.get(&named.to_ascii_lowercase())?
+}
+
+/// The name of `function` as a call is matched by: the LAST part of its name — a qualified name
+/// names the same function — read without its quoting and folded, because a function name is
+/// matched without regard to case.
+fn folded_function_name(function: &Function) -> Option<String> {
+    Some(
+        function
+            .name
+            .0
+            .last()?
+            .to_string()
+            .trim_matches('"')
+            .to_ascii_lowercase(),
+    )
 }
 
 /// The `DECIMAL` type an exact-decimal reading produces: the precision and the scale its
@@ -272,6 +375,139 @@ fn exact_decimal_type(function: &Function) -> Option<ColumnType> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The declared types of the columns the cases below read, as the stored objects a run
+    /// materialises declare them.
+    fn source_types() -> SourceColumnTypes {
+        [
+            ("amount", Some(ColumnType::BigInt)),
+            ("quantity", Some(ColumnType::Integer)),
+            ("price", Some(ColumnType::Double)),
+            ("label", Some(ColumnType::VarChar)),
+            ("active", Some(ColumnType::Boolean)),
+            // A name two of the objects declare differently carries no type.
+            ("mixed", None),
+        ]
+        .into_iter()
+        .map(|(name, column_type)| (name.to_string(), column_type))
+        .collect()
+    }
+
+    /// RULE: an aggregate or window function whose result type is its ARGUMENT's reports the
+    /// type the stored column that argument names is declared as — except for the sum of an
+    /// exact-integer column, which accumulates in the 64-bit integer type.
+    ///
+    /// The rows span what the rule generalises over: which function is called, the declared
+    /// type of the argument (both integer widths, an approximate type, character data, a
+    /// boolean), how the argument is written (bare, qualified, quoted, parenthesised), the
+    /// case the call is written in, whether the call carries a window, a column no object
+    /// declares and one two objects declare differently, and the expressions the rule does
+    /// not reach (a computed argument, another function).
+    #[test]
+    fn an_argument_typed_aggregate_reports_the_declared_type_of_its_argument() {
+        // (case, the statement, the types its projection fixes)
+        let cases: Vec<(&str, &str, Vec<Option<ColumnType>>)> = vec![
+            (
+                "the sum of a 64-bit integer column",
+                "SELECT sum(amount) AS total FROM items",
+                vec![Some(ColumnType::BigInt)],
+            ),
+            (
+                "the sum of a 32-bit integer column, which accumulates wider",
+                "SELECT sum(quantity) AS total FROM items",
+                vec![Some(ColumnType::BigInt)],
+            ),
+            (
+                "the sum of an approximate column, which stays approximate",
+                "SELECT sum(price) AS total FROM items",
+                vec![Some(ColumnType::Double)],
+            ),
+            (
+                "the least and greatest of an integer column",
+                "SELECT min(amount) AS lo, max(amount) AS hi FROM items",
+                vec![Some(ColumnType::BigInt), Some(ColumnType::BigInt)],
+            ),
+            (
+                "the least of a 32-bit integer column, which stays as declared",
+                "SELECT min(quantity) AS lo FROM items",
+                vec![Some(ColumnType::Integer)],
+            ),
+            (
+                "the greatest of a character column",
+                "SELECT max(label) AS last FROM items",
+                vec![Some(ColumnType::VarChar)],
+            ),
+            (
+                "the greatest of a boolean column",
+                "SELECT max(active) AS any_active FROM items",
+                vec![Some(ColumnType::Boolean)],
+            ),
+            (
+                "a windowed sum",
+                "SELECT sum(amount) OVER (PARTITION BY label) AS running FROM items",
+                vec![Some(ColumnType::BigInt)],
+            ),
+            (
+                "a value window function",
+                "SELECT first_value(price) OVER (ORDER BY amount) AS first FROM items",
+                vec![Some(ColumnType::Double)],
+            ),
+            (
+                "a qualified argument",
+                "SELECT sum(items.amount) AS total FROM items",
+                vec![Some(ColumnType::BigInt)],
+            ),
+            (
+                "a quoted argument",
+                "SELECT sum(\"amount\") AS total FROM items",
+                vec![Some(ColumnType::BigInt)],
+            ),
+            (
+                "a parenthesised argument",
+                "SELECT sum((amount)) AS total FROM items",
+                vec![Some(ColumnType::BigInt)],
+            ),
+            (
+                "the call written in upper case",
+                "SELECT SUM(amount) AS total FROM items",
+                vec![Some(ColumnType::BigInt)],
+            ),
+            (
+                "a column no stored object declares",
+                "SELECT sum(unknown_column) AS total FROM items",
+                vec![None],
+            ),
+            (
+                "a column two stored objects declare differently",
+                "SELECT max(mixed) AS latest FROM items",
+                vec![None],
+            ),
+            (
+                "an argument computed from a column, whose type no declaration decides",
+                "SELECT sum(amount * 2) AS total FROM items",
+                vec![None],
+            ),
+            (
+                "a counting aggregate, whose type its own signature fixes",
+                "SELECT count(amount) AS n FROM items",
+                vec![Some(ColumnType::BigInt)],
+            ),
+            (
+                "an average over an integer column, which is approximate",
+                "SELECT avg(amount) AS mean FROM items",
+                vec![Some(ColumnType::Double)],
+            ),
+        ];
+
+        let source_types = source_types();
+        for (case, sql, expected) in &cases {
+            let actual = fixed_column_types(sql, &source_types);
+            assert_eq!(
+                &actual, expected,
+                "case {case:?}: expected the fixed types {expected:?}, got {actual:?}"
+            );
+        }
+    }
 
     /// A projected expression whose signature fixes its type is typed by that signature, one
     /// whose type depends on its argument is left to the values, and a projection that
@@ -337,7 +573,7 @@ mod tests {
         ];
 
         for (case, sql, expected) in &cases {
-            let actual = fixed_column_types(sql);
+            let actual = fixed_column_types(sql, &SourceColumnTypes::new());
             assert_eq!(
                 &actual, expected,
                 "case {case:?}: expected the fixed types {expected:?}, got {actual:?}"
