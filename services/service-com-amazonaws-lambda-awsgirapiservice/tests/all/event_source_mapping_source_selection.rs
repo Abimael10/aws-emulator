@@ -18,6 +18,13 @@
 //! consequences of the records having arrived and of the report having been read. Nothing
 //! here invokes the function itself.
 //!
+//! The same run is also read OUT OF BAND, where a client of such a pipeline reads it: the
+//! handler forwards the body of every record it is handed to a queue of its own, with the SDK
+//! its managed runtime supplies, and that queue is one no mapping names. So each row reads
+//! back the bodies that really reached a running handler — which must be exactly the ones sent
+//! to the mapped queue and never a body of another queue, for the mapping whose own queue is
+//! empty not a single body — rather than only what the mapping reports about its attempt.
+//!
 //! Every row drives real HTTP requests through the production `MultiServiceRouter` with
 //! Lambda and Amazon SQS on ONE engine, as `core/router` assembles them. No row sleeps and
 //! no row waits out a span: the poll passes are the suite's own
@@ -40,7 +47,7 @@ use service_com_amazonaws_lambda_awsgirapiservice::state::{
 use crate::event_source_mappings::{
     await_mapping_state, create_mapping, create_queue, create_running_function,
     driven_router_with_queues, get_mapping, held_until, messages_held, queue_message_counts,
-    send_message, STATE_ENABLED,
+    send_message, taken_bodies, STATE_ENABLED,
 };
 
 /// The mapped function's `Timeout` and the `VisibilityTimeout` of every queue below: the
@@ -60,17 +67,23 @@ const TIMEOUT_SECONDS: i64 = 30;
 const POISON: &str = "poison";
 
 /// The handler every row runs: it refuses a record that came from any queue but the one its
-/// mapping names, and reports as unprocessed the records whose body carries [`POISON`].
+/// mapping names, forwards the body of every record it is handed to the queue its environment
+/// names, and reports as unprocessed the records whose body carries [`POISON`].
 ///
 /// So an attempt that is recorded as having succeeded is one where every record handed over
-/// belonged to the mapped queue, and the messages deleted are the ones that batch processed.
+/// belonged to the mapped queue, the messages deleted are the ones that batch processed, and
+/// the bodies on the forwarding queue are the ones that reached this handler's own run.
 fn selecting_handler() -> String {
     format!(
         r#"
 import os
 
+import boto3
+
 QUEUE_ARN = os.environ["QUEUE_ARN"]
+SINK_URL = os.environ["{SINK_VARIABLE}"]
 POISON = "{POISON}"
+QUEUES = boto3.client("sqs")
 
 
 def lambda_handler(event, context):
@@ -82,6 +95,7 @@ def lambda_handler(event, context):
             raise ValueError("eventSource is " + repr(record["eventSource"]))
         if record["eventSourceARN"] != QUEUE_ARN:
             raise ValueError("eventSourceARN is " + repr(record["eventSourceARN"]))
+        QUEUES.send_message(QueueUrl=SINK_URL, MessageBody=record["body"])
     return {{
         "batchItemFailures": [
             {{"itemIdentifier": record["messageId"]}}
@@ -92,6 +106,10 @@ def lambda_handler(event, context):
 "#
     )
 }
+
+/// The environment variable [`selecting_handler`] reads the queue it forwards each record's
+/// body to from.
+const SINK_VARIABLE: &str = "SINK_URL";
 
 /// One queue of a row: a label for its name, whether it is FIFO, and the bodies waiting on
 /// it when the passes are made.
@@ -257,6 +275,17 @@ async fn a_mapping_consumes_only_the_queue_its_event_source_arn_names() {
         }
         let (mapped_url, mapped_arn) = queues[row.mapped].clone();
 
+        // The queue the handler forwards every record it is handed to: a queue of this row
+        // that no mapping names, which is where the records that reached the function's own
+        // run are read back.
+        let (sink_url, _) = create_queue(
+            &router,
+            case,
+            &format!("esm-select-{index}-sink"),
+            &json!({}),
+        )
+        .await;
+
         let function = format!("esm-select-fn-{index}");
         create_running_function(
             &router,
@@ -264,7 +293,7 @@ async fn a_mapping_consumes_only_the_queue_its_event_source_arn_names() {
             &function,
             &selecting_handler(),
             TIMEOUT_SECONDS,
-            &json!({ "QUEUE_ARN": mapped_arn }),
+            &json!({ "QUEUE_ARN": mapped_arn, SINK_VARIABLE: sink_url }),
         )
         .await;
         let created = create_mapping(
@@ -374,6 +403,28 @@ async fn a_mapping_consumes_only_the_queue_its_event_source_arn_names() {
                 queue.label
             );
         }
+
+        // And what REACHED the function, read where a client of such a pipeline reads it:
+        // every body sent to the mapped queue, and no body of any other queue — so a mapping
+        // whose own queue was empty forwarded nothing at all.
+        let mut forwarded: BTreeSet<String> = BTreeSet::new();
+        loop {
+            let taken = taken_bodies(&router, case, &sink_url).await;
+            if taken.is_empty() {
+                break;
+            }
+            forwarded.extend(taken);
+        }
+        let delivered: BTreeSet<String> = row.queues[row.mapped]
+            .bodies
+            .iter()
+            .map(|body| (*body).to_string())
+            .collect();
+        assert_eq!(
+            forwarded, delivered,
+            "case {case:?}: the handler must be handed exactly the bodies of the queue the \
+             mapping names, so it forwards {delivered:?}, got {forwarded:?}"
+        );
 
         // And what the mapping says it did: an attempt for the batch it took, and none at
         // all for the mapping whose own queue was empty — "the result of the event source
