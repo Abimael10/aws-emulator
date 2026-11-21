@@ -53,6 +53,7 @@ mod dax;
 mod directconnect;
 mod dms;
 mod docdb;
+mod kms;
 mod quicksight;
 mod sns;
 mod sqs;
@@ -95,6 +96,7 @@ pub(super) use dax::dax_quotas;
 pub(super) use directconnect::directconnect_quotas;
 pub(super) use dms::dms_quotas;
 pub(super) use docdb::docdb_quotas;
+pub(super) use kms::kms_quotas;
 pub(super) use quicksight::quicksight_quotas;
 pub(super) use sns::sns_quotas;
 pub(super) use sqs::sqs_quotas;
@@ -4110,29 +4112,5 @@ pub(super) fn cloudwatch_request_rate(api_name: &str, requests_per_second: f64) 
     ))
 }
 
-/// One AWS KMS API REQUEST-RATE quota: `<api> request rate`, the most requests to that
-/// one operation KMS serves per second.
-///
-/// KMS publishes a rate quota for each of its API operations, and every member of such
-/// a row but the operation's own name and the value is the same across the class: the
-/// `QuotaName` is the operation's name followed by `request rate`, the window is one
-/// second, the usage metric is that operation's `AWS/Usage` `CallCount`
-/// ([`call_count_metric`]) under the `KMS` service dimension, and the `Description` is
-/// the sentence KMS publishes for the class with the operation it throttles named in
-/// it. Those are the quota's PUBLISHED members, so one constructor fills them and two
-/// rows of the class cannot drift apart.
-///
-/// SOURCE: AWS KMS's published request quotas (the per-operation request-quota table of
-/// the KMS Developer Guide, which is what the service's default-quota listing reports),
-/// and the recorded default-quota listing of `kms` for the wording and for which
-/// `QuotaCode` names which operation's rate.
-pub(super) fn kms_request_rate(api_name: &str, requests_per_second: f64) -> QuotaRow {
-    quota(format!("{api_name} request rate"), requests_per_second)
-        .period(1, "SECOND")
-        .metric(call_count_metric(KMS_USAGE_SERVICE, api_name))
-        .describe(&interval_rate_description(KMS_USAGE_SERVICE, api_name))
-}
-
-/// The name AWS KMS rejects throttled requests under, which is also the `AWS/Usage` display
-/// name its call counts are published under.
-const KMS_USAGE_SERVICE: &str = "KMS";
+// AWS KMS's per-operation request-rate class and the rows that use it live in the `kms`
+// module beside this service's other published rows.

@@ -33,6 +33,10 @@ use serde_json::json;
 // in that namespace is published only where this catalog cites it, so the two suites
 // cannot disagree about what the namespace is or carry a second copy of the test.
 use crate::catalog_identity::is_aws_minted_shape;
+// The KMS rate rows are read out of the ONE table of this catalog's published KMS facts,
+// owned by `kms_published_default_rows.rs`, so the two suites cannot drift apart about
+// what KMS publishes.
+use crate::kms_published_default_rows::{PublishedRow, KMS_ROWS};
 use crate::quota_workflow::{client, default_quotas as defaults, emulator, walk_pages, Client};
 
 /// The services whose published default quotas AWS keys ENTIRELY on its own `L-` codes,
@@ -71,12 +75,13 @@ fn covered_services() -> BTreeSet<&'static str> {
     DERIVED_CODES.iter().map(|(code, _)| *code).collect()
 }
 
-/// One KMS per-operation request-rate quota, as AWS publishes it.
-struct RequestRate {
-    quota_code: &'static str,
-    /// The API operation the rate throttles — the variable part of every member.
-    api_name: &'static str,
-    requests_per_second: f64,
+/// The KMS per-operation request rates this catalog publishes: the rows of the shared
+/// table that throttle one API operation.
+fn kms_request_rates() -> Vec<&'static PublishedRow> {
+    KMS_ROWS
+        .iter()
+        .filter(|row| row.throttled_api.is_some())
+        .collect()
 }
 
 /// The rows this catalog publishes under AWS's own code for a service
@@ -85,20 +90,6 @@ struct RequestRate {
 /// `(ServiceCode, QuotaCode, QuotaName, Value, Adjustable)`.
 const RE_KEYED_ROWS: &[(&str, &str, &str, f64, bool)] =
     &[("kafka", "L-FAB9E493", "Number of brokers per cluster", 30.0, true)];
-
-/// The KMS request rates this catalog publishes.
-const KMS_REQUEST_RATES: &[RequestRate] = &[
-    RequestRate {
-        quota_code: "L-8A08DAEA",
-        api_name: "ListKeys",
-        requests_per_second: 500.0,
-    },
-    RequestRate {
-        quota_code: "L-275D92F3",
-        api_name: "UpdateCustomKeyStore",
-        requests_per_second: 5.0,
-    },
-];
 
 /// The `QuotaCode`s a service's AWS-default listing reports.
 async fn listed_codes(client: &Client, service_code: &str) -> BTreeSet<String> {
@@ -260,20 +251,24 @@ async fn a_kms_request_rate_is_published_as_its_whole_class_is() {
     let client = client(&engine, "us-west-2");
 
     let listed = defaults(&client, "kms").await;
+    let rates = kms_request_rates();
 
-    for rate in KMS_REQUEST_RATES {
+    for rate in &rates {
+        let api_name = rate
+            .throttled_api
+            .expect("a rate row names the operation it throttles");
         let case = format!("kms/{}", rate.quota_code);
         let pair = json!({"ServiceCode": "kms", "QuotaCode": rate.quota_code});
         let quota = client.ok("GetAWSDefaultServiceQuota", pair).await["Quota"].clone();
 
         assert_eq!(
             quota["QuotaName"],
-            json!(format!("{} request rate", rate.api_name)),
+            json!(format!("{api_name} request rate")),
             "case {case}: expected the published quota name, got {quota}"
         );
         assert_eq!(
             quota["Value"],
-            json!(rate.requests_per_second),
+            json!(rate.value),
             "case {case}: expected the published requests per second, got {quota}"
         );
         assert_eq!(
@@ -284,9 +279,8 @@ async fn a_kms_request_rate_is_published_as_its_whole_class_is() {
         assert_eq!(
             quota["Description"],
             json!(format!(
-                "Maximum {} requests per second. When you reach this quota, KMS rejects requests \
-                 for this operation for the remainder of the interval.",
-                rate.api_name
+                "Maximum {api_name} requests per second. When you reach this quota, KMS rejects \
+                 requests for this operation for the remainder of the interval."
             )),
             "case {case}: expected the published description of the class, got {quota}"
         );
@@ -298,7 +292,7 @@ async fn a_kms_request_rate_is_published_as_its_whole_class_is() {
                 "MetricStatisticRecommendation": "Sum",
                 "MetricDimensions": {
                     "Service": "KMS",
-                    "Resource": rate.api_name,
+                    "Resource": api_name,
                     "Type": "API",
                     "Class": "None",
                 },
@@ -318,24 +312,38 @@ async fn a_kms_request_rate_is_published_as_its_whole_class_is() {
         );
     }
 
-    // The two rows differ in the operation they throttle and in their value, so the
+    // The rate rows differ in the operation they throttle and in their value, so the
     // class is asserted over more than one shape of row.
-    let values: BTreeSet<String> = listed
+    let rate_codes: BTreeSet<&str> = rates.iter().map(|rate| rate.quota_code).collect();
+    let rate_rows: Vec<&serde_json::Value> = listed
+        .iter()
+        .filter(|quota| {
+            quota["QuotaCode"]
+                .as_str()
+                .is_some_and(|code| rate_codes.contains(code))
+        })
+        .collect();
+    assert_eq!(
+        rate_rows.len(),
+        rates.len(),
+        "case kms: the listing must carry every published rate row, got {rate_rows:?}"
+    );
+    let values: BTreeSet<String> = rate_rows
         .iter()
         .map(|quota| quota["Value"].to_string())
         .collect();
     assert_eq!(
         values.len(),
-        KMS_REQUEST_RATES.len(),
+        rates.len(),
         "case kms: the rows must span more than one published value, got {values:?}"
     );
-    let names: BTreeSet<&str> = listed
+    let names: BTreeSet<&str> = rate_rows
         .iter()
         .filter_map(|quota| quota["QuotaName"].as_str())
         .collect();
     assert_eq!(
         names.len(),
-        KMS_REQUEST_RATES.len(),
+        rates.len(),
         "case kms: each row names its own operation, got {names:?}"
     );
 }

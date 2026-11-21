@@ -3736,22 +3736,7 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
         service(
             "kms",
             "AWS Key Management Service (AWS KMS)",
-            // KMS publishes a REQUEST-RATE quota per API operation, all of one shape
-            // ([`kms_request_rate`]). These two are the rows whose `QuotaCode` the
-            // recorded default-quota listing of this service states; the rest of the
-            // service's published catalog names no code this catalog can cite for the
-            // quota it names.
-            vec![
-                // `L-8A08DAEA`'s name, value and every other member are STATED by the
-                // recorded listing of this service (see the parent issue's evidence).
-                kms_request_rate("ListKeys", 500.0).code("L-8A08DAEA"),
-                // The recording states this code's name but not its value. SOURCE for
-                // the 5: the "Request quotas for each AWS KMS API operation" table of
-                // the KMS Developer Guide's "Quotas" chapter, whose row for
-                // `UpdateCustomKeyStore` — like every custom-key-store operation's —
-                // publishes 5 requests per second.
-                kms_request_rate("UpdateCustomKeyStore", 5.0).code("L-275D92F3"),
-            ],
+            kms_quotas(),
         ),
         service("lambda", "AWS Lambda", lambda_quotas()),
         service(
