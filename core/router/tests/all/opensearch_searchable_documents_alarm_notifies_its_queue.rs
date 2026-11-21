@@ -85,10 +85,13 @@ const ALARM_PERIOD: i64 = 60;
 /// How long each phase waits for the condition it is about: the domain reporting itself
 /// provisioned, every alarm reaching the state its datapoints imply.
 ///
-/// Generous on purpose. An evaluation grades the newest period that has CLOSED, so a state is
-/// at most one period away from the change that implies it; this is only the point at which
-/// waiting is called a failure, and nothing here asserts on how long anything took.
-const PHASE_DEADLINE: Duration = Duration::from_secs(120);
+/// Generous on purpose. An evaluation grades the newest period that has CLOSED, so a phase
+/// can have to wait for the period carrying its change to close AND for the evaluation that
+/// grades it — two of the alarm's own 60-second periods — before the state it waits for can
+/// exist at all; the point at which waiting is called a failure therefore sits well clear of
+/// that, so a loaded host does not fail a condition that does arrive. Nothing here asserts on
+/// how long anything took.
+const PHASE_DEADLINE: Duration = Duration::from_secs(4 * ALARM_PERIOD as u64);
 
 /// How long each look waits before looking again. Non-zero, so the runtime gets to run the
 /// sampler and the deliveries the wait is for.

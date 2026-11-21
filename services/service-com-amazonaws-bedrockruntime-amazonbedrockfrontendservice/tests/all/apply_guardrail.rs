@@ -19,6 +19,14 @@
 //! with ([`state::guardrail_registry::publish`]), so what these suites apply is what
 //! a created guardrail is; the two planes are driven together in
 //! `core/router/tests/all/bedrock_guardrail_applied_across_planes.rs`.
+//!
+//! Evaluating a revision presupposes RESOLVING the one the request names, so the last
+//! two suites here pin that half on this operation's own wire: a readable reference
+//! naming no revision this account holds is refused with an error the operation
+//! MODELS, however the account came to not hold it, and the same reference is served
+//! once the revision it names is published. (The taxonomy of that refusal across the
+//! OTHER guardrail surfaces of this service is `inline_guardrail_error_taxonomy`'s
+//! subject.)
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -1217,4 +1225,206 @@ async fn the_usage_and_coverage_report_what_each_policy_read() {
         Some((GUARDED.chars().count() + SOURCE.chars().count()) as i64),
         "the total characters are every character submitted, got {coverage}"
     );
+}
+
+/// Every error code `ApplyGuardrail` declares, so a refusal can be asserted to carry
+/// one the operation MODELS rather than a code no SDK has a type for.
+///
+/// Source: the operation's own error list —
+/// `smithy_query(query="operation",operation="ApplyGuardrail",model_path="services/service-com-amazonaws-bedrockruntime-amazonbedrockfrontendservice/smithy-model/com-amazonaws-bedrockruntime-amazonbedrockfrontendservice.json")`
+/// — `AccessDeniedException` 403, `InternalServerException` 500,
+/// `ResourceNotFoundException` 404, `ServiceQuotaExceededException` 400,
+/// `ServiceUnavailableException` 503, `ThrottlingException` 429 and
+/// `ValidationException` 400.
+const MODELED_ERROR_CODES: [&str; 7] = [
+    "AccessDeniedException",
+    "InternalServerException",
+    "ResourceNotFoundException",
+    "ServiceQuotaExceededException",
+    "ServiceUnavailableException",
+    "ThrottlingException",
+    "ValidationException",
+];
+
+/// The sentence Amazon Bedrock answers a request whose guardrail revision does not
+/// exist with, written out here so a refusal is pinned to the WORDING rather than to
+/// whatever the implementation's own constant currently says.
+const NOT_FOUND_MESSAGE: &str =
+    "The guardrail identifier or version provided in the request does not exist.";
+
+/// The id of the guardrail that stands in for one this account does not hold: it
+/// satisfies `GuardrailIdentifier`'s pattern (`^(|([a-z0-9]+)|(arn:…))$`) and is
+/// nothing the suites here publish.
+const UNHELD_ID: &str = "ffff0000ffff";
+
+/// The id of a guardrail the account holds that is NOT the one a row's reference names
+/// — what a caller probing one guardrail of a populated account addresses past.
+const OTHER_HELD_ID: &str = "wxyz56780000";
+
+/// Publish one guardrail of `id`, at its DRAFT, with its own ARN — the way the control
+/// plane publishes a created guardrail, for the guardrails of a row that are not
+/// [`GUARDRAIL_ID`].
+fn publish_guardrail(engine: &engine::InMemoryEngine, id: &str) {
+    assert!(
+        state::guardrail_registry::publish(
+            engine,
+            PublishedGuardrail {
+                id: id.to_string(),
+                arn: engine::emulator_arn("bedrock", "us-east-1", &format!("guardrail/{id}")),
+                revisions: BTreeMap::from([(DRAFT_VERSION.to_string(), revision())]),
+            }
+        ),
+        "the guardrail must be publishable on the engine the service holds"
+    );
+}
+
+/// RULE: a guardrail reference the service CAN read but which names no revision this
+/// account holds is refused with an error the operation MODELS — `ValidationException`,
+/// HTTP 400, in the words for a revision that is not there — however the account came
+/// to not hold it: it holds no guardrail at all, it holds a different one, or it holds
+/// the named one at another version; and whichever spelling of the identifier the
+/// request used.
+#[tokio::test]
+async fn an_unresolvable_reference_is_refused_with_an_error_the_operation_models() {
+    // (case, the guardrails the account holds — each at its DRAFT only, the identifier
+    // as it travels in the URI, the version, the side applied)
+    let rows: Vec<(&str, &[&str], String, &str, &str)> = vec![
+        (
+            "an account holding no guardrail at all",
+            &[],
+            GUARDRAIL_ID.to_string(),
+            DRAFT_VERSION,
+            "INPUT",
+        ),
+        (
+            // A readable id of the minted width (`state::GUARDRAIL_ID_LENGTH`) made
+            // only of digits: still a guardrail this account does not hold.
+            "an all-digit identifier, on an empty account",
+            &[],
+            "000000000000".to_string(),
+            "1",
+            "OUTPUT",
+        ),
+        (
+            "the ARN spelling, on an empty account",
+            &[],
+            encoded(&guardrail_arn()),
+            DRAFT_VERSION,
+            "INPUT",
+        ),
+        (
+            "an account holding two other guardrails, by the bare id",
+            &[GUARDRAIL_ID, OTHER_HELD_ID],
+            UNHELD_ID.to_string(),
+            DRAFT_VERSION,
+            "INPUT",
+        ),
+        (
+            "an account holding another guardrail, by the ARN",
+            &[OTHER_HELD_ID],
+            encoded(&engine::emulator_arn(
+                "bedrock",
+                "us-east-1",
+                &format!("guardrail/{UNHELD_ID}"),
+            )),
+            DRAFT_VERSION,
+            "OUTPUT",
+        ),
+        (
+            "the lowest numbered version of a held guardrail, never cut",
+            &[GUARDRAIL_ID],
+            GUARDRAIL_ID.to_string(),
+            "1",
+            "INPUT",
+        ),
+        (
+            // The highest version `GuardrailVersion`'s pattern admits
+            // (`^(|([1-9][0-9]{0,7})|(DRAFT))$`): a readable version, so it is the
+            // STATE that refuses it, not the constraint.
+            "the highest numbered version the pattern admits, never cut",
+            &[GUARDRAIL_ID],
+            GUARDRAIL_ID.to_string(),
+            "99999999",
+            "OUTPUT",
+        ),
+    ];
+    for (case, held, identifier, version, source) in rows {
+        let (engine, router) = emulator_with_engine();
+        for id in held {
+            publish_guardrail(&engine, id);
+        }
+        let call = apply(
+            &router,
+            &identifier,
+            version,
+            &text_body(source, "a question about tokens", None),
+        )
+        .await;
+        assert_eq!(
+            call.status,
+            400,
+            "case {case:?}: expected 400, got {} / {}",
+            call.status,
+            String::from_utf8_lossy(&call.body)
+        );
+        let code = call.error_code();
+        assert!(
+            MODELED_ERROR_CODES.contains(&code.as_str()),
+            "case {case:?}: expected one of the operation's modeled error codes \
+             {MODELED_ERROR_CODES:?}, got {code:?}"
+        );
+        assert_eq!(
+            code, "ValidationException",
+            "case {case:?}: expected ValidationException, got {code:?}"
+        );
+        assert_eq!(
+            call.json()["message"].as_str(),
+            Some(NOT_FOUND_MESSAGE),
+            "case {case:?}: the refusal must say that the revision the request named is \
+             not held, got {}",
+            call.json()
+        );
+    }
+}
+
+/// RULE, the other direction: that refusal is read out of the guardrails this account
+/// holds, so the very request refused on an account holding nothing is SERVED once the
+/// revision it names is published — by either spelling of the identifier.
+#[tokio::test]
+async fn the_same_reference_is_served_once_its_revision_is_published() {
+    let rows: [(&str, String); 2] = [
+        ("the bare id", GUARDRAIL_ID.to_string()),
+        ("the ARN", encoded(&guardrail_arn())),
+    ];
+    for (case, identifier) in rows {
+        let (engine, router) = emulator_with_engine();
+        let body = text_body("INPUT", "a question about tokens", None);
+
+        let refused = apply(&router, &identifier, DRAFT_VERSION, &body).await;
+        assert_eq!(
+            refused.status,
+            400,
+            "case {case:?}: before the guardrail is published the apply must be refused, \
+             got {} / {}",
+            refused.status,
+            String::from_utf8_lossy(&refused.body)
+        );
+        assert_eq!(
+            refused.error_code(),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {:?}",
+            refused.error_code()
+        );
+
+        publish(&engine, revision());
+        let served = apply(&router, &identifier, DRAFT_VERSION, &body).await;
+        ok(case, &served);
+        let action = action_of(&served);
+        assert_eq!(
+            action, "NONE",
+            "case {case:?}: the published revision configures no policy this text \
+             places, so it intervenes in nothing, got {action:?} in {}",
+            served.json()
+        );
+    }
 }
