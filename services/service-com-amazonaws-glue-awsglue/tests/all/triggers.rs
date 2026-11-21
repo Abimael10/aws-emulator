@@ -13,7 +13,9 @@
 //! service could not fire is refused instead of stored: a member the named `Type` requires
 //! is missing, the `Schedule` is no cron expression, `StartOnCreation` asks to start a type
 //! that cannot be started on creation, the trigger would initiate nothing, or an action or
-//! condition names a job or crawler this account does not hold.
+//! condition names a workflow or crawler this account does not hold. A JOB an action runs, or
+//! a condition waits on, is LATE-BOUND: it is resolved when the trigger fires, so a create may
+//! name a job the account does not hold yet ([`crate::trigger_job_late_binding`]).
 //!
 //! The suites are tables: each row is one input along the axis the rule generalises over
 //! (the trigger type, which optional members are sent, how many actions and conditions the
@@ -503,13 +505,16 @@ async fn a_schedule_must_be_a_cron_expression() {
     }
 }
 
-/// A trigger belongs to the workflow it names and runs the jobs and crawlers its actions
-/// name, and waits on the ones its conditions name, so a definition naming an entity this
-/// account does not hold is refused with `EntityNotFoundException`.
+/// A trigger belongs to the workflow it names and crawls with the crawlers its actions name
+/// and its conditions wait on, so a definition naming one of THOSE entities this account does
+/// not hold is refused with `EntityNotFoundException`.
+///
+/// A JOB an action runs, or a condition waits on, is NOT one of them: that reference is
+/// late-bound, resolved when the trigger fires, which [`crate::trigger_job_late_binding`]
+/// pins.
 ///
 /// The rows span the place the name appears (the trigger's own workflow, an action, a
-/// condition) and the kind of entity (a workflow, a job, a crawler), including a definition
-/// whose FIRST target exists and whose second does not.
+/// condition) and the kind of entity (a workflow, a crawler).
 #[tokio::test]
 async fn a_definition_naming_an_absent_entity_is_refused() {
     let router = emulator();
@@ -525,32 +530,14 @@ async fn a_definition_naming_an_absent_entity_is_refused() {
             }),
         ),
         (
-            "action names an absent job",
-            json!({ "Type": "ON_DEMAND", "Actions": [{ "JobName": "no-such-job" }] }),
-        ),
-        (
             "action names an absent crawler",
             json!({ "Type": "ON_DEMAND", "Actions": [{ "CrawlerName": "no-such-crawler" }] }),
         ),
         (
-            "second action names an absent job",
+            "second action names an absent crawler",
             json!({
                 "Type": "ON_DEMAND",
-                "Actions": [{ "JobName": JOB }, { "JobName": "no-such-job" }],
-            }),
-        ),
-        (
-            "condition names an absent job",
-            json!({
-                "Type": "CONDITIONAL",
-                "Predicate": {
-                    "Conditions": [{
-                        "LogicalOperator": "EQUALS",
-                        "JobName": "no-such-job",
-                        "State": "SUCCEEDED",
-                    }],
-                },
-                "Actions": [{ "JobName": JOB }],
+                "Actions": [{ "JobName": JOB }, { "CrawlerName": "no-such-crawler" }],
             }),
         ),
         (
@@ -588,24 +575,6 @@ async fn a_definition_naming_an_absent_entity_is_refused() {
             "case {case}: the refused trigger must not be stored, got {status} with {body}"
         );
     }
-
-    // A job of ANOTHER Region is not this Region's job, so a trigger created here cannot
-    // run it: the same action is accepted where the job lives and refused where it does
-    // not.
-    let request = json!({
-        "Name": "cross-region-action",
-        "Type": "ON_DEMAND",
-        "Actions": [{ "JobName": JOB }],
-    });
-    let (status, body) = call_in_region(&router, "us-west-2", "CreateTrigger", &request).await;
-    assert_eq!(
-        status, 400,
-        "case job of another Region: expected 400, got {status} with {body}"
-    );
-    assert!(
-        error_code(&body).contains("EntityNotFoundException"),
-        "case job of another Region: expected EntityNotFoundException, got {body}"
-    );
 }
 
 /// Addressing a trigger that is not stored is `EntityNotFoundException`, and creating one

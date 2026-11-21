@@ -650,18 +650,19 @@ impl AssetEntry {
     /// the whole request first — one call cannot spend more comparisons or more memory than
     /// [`MAX_ASSET_GLOSSARY_TERMS`] allows, whatever it sends.
     pub fn associate_glossary_terms(&mut self, identifiers: &[String]) -> Option<Vec<String>> {
-        let mut merged = self.glossary_terms.clone();
-        for identifier in identifiers {
-            if merged.iter().any(|held| held == identifier) {
-                continue;
-            }
-            if merged.len() == MAX_ASSET_GLOSSARY_TERMS {
-                return None;
-            }
-            merged.push(identifier.clone());
-        }
-        self.glossary_terms = merged;
+        self.glossary_terms = merged_glossary_terms(&self.glossary_terms, identifiers)?;
         Some(self.glossary_terms.clone())
+    }
+
+    /// Remove `identifiers` from this asset's glossary term set, reporting the terms it carries
+    /// afterwards.
+    ///
+    /// An id the asset does not carry removes nothing, so a disassociation sent twice leaves
+    /// the same set as sending it once, and the terms it does not name keep their order.
+    pub fn disassociate_glossary_terms(&mut self, identifiers: &[String]) -> Vec<String> {
+        self.glossary_terms
+            .retain(|held| !identifiers.iter().any(|removed| removed == held));
+        self.glossary_terms.clone()
     }
 
     /// This record's forms as the modelled `AssetFormMap`, with every form's content
@@ -1168,5 +1169,226 @@ impl GlossaryTermEntry {
             input.client_token.clone(),
             now,
         )
+    }
+
+    /// Apply an `UpdateGlossaryTerm` request to this record, as served at `now`.
+    ///
+    /// Every updatable member is optional on the request ("The updated name of the glossary
+    /// term", "The updated short description", "The updated long description"), so the ones
+    /// the request NAMES replace what is stored and the ones it omits are left where the last
+    /// write that named them put them — the one way this surface applies an update, exactly
+    /// as a glossary's own does ([`GlossaryEntry::apply_update`]).
+    ///
+    /// [`Self::updated_at`] moves to `now` when the request named a member and stays where it
+    /// is for one that named none: it reports when this term last CHANGED.
+    ///
+    /// [`Self::id`], [`Self::glossary_id`] and [`Self::created_at`] are no members of the
+    /// request and so cannot move — a term keeps the id its create minted and the glossary it
+    /// was created in — and [`Self::client_token`] keeps the CREATE's token, which is what a
+    /// retry of that create is recognised by.
+    pub fn apply_update(&mut self, input: &UpdateGlossaryTermInput, now: SystemTime) {
+        let mut changed = false;
+        if let Some(name) = input.name.clone() {
+            self.name = name;
+            changed = true;
+        }
+        if let Some(short_description) = input.short_description.clone() {
+            self.short_description = Some(short_description);
+            changed = true;
+        }
+        if let Some(long_description) = input.long_description.clone() {
+            self.long_description = Some(long_description);
+            changed = true;
+        }
+        if changed {
+            self.updated_at = now;
+        }
+    }
+}
+
+/// `identifiers` merged into the glossary term set `held`, or `None` when the merge would
+/// take it past [`MAX_ASSET_GLOSSARY_TERMS`].
+///
+/// A union, not a replacement: an id already held keeps its place and is not repeated, and
+/// one that is not held is appended — so the terms an earlier association added survive a
+/// later one, and an association sent twice is the same state as sending it once. The bound
+/// is checked against the UNION, so re-associating terms the entity already holds is served
+/// however full it is.
+///
+/// The ceiling is also what bounds the WORK: a request can only carry as many new ids as the
+/// union admits, so the walk stops at the first one past it rather than merging the whole
+/// request first.
+///
+/// ONE copy of the merge, so an association reaching a stored asset
+/// ([`AssetEntry::associate_glossary_terms`]) and one reaching a Data Catalog entity the
+/// business catalog indexes as an asset
+/// ([`ComAmazonawsGlueAwsglueState::associate_asset_glossary_terms`]) cannot disagree about
+/// what an association does.
+pub(super) fn merged_glossary_terms(
+    held: &[String],
+    identifiers: &[String],
+) -> Option<Vec<String>> {
+    let mut merged = held.to_vec();
+    for identifier in identifiers {
+        if merged.iter().any(|holding| holding == identifier) {
+            continue;
+        }
+        if merged.len() == MAX_ASSET_GLOSSARY_TERMS {
+            return None;
+        }
+        merged.push(identifier.clone());
+    }
+    Some(merged)
+}
+
+/// The `AssetTypeId` the business catalog reports for a Data Catalog TABLE it has indexed as
+/// an asset.
+///
+/// Spelled the way this surface spells the catalog's own entries on an asset — the catalog's
+/// namespace, then the thing inside it, exactly as the catalog's own form name
+/// ([`CATALOG_RESOURCE_FORM_NAME`]) is — with the catalog entity's own kind as the name,
+/// because what such an asset is an instance of is a Data Catalog table. It is not the id of
+/// any asset type a caller registered: no `PutAssetType` wrote it, which is why
+/// [`ComAmazonawsGlueAwsglueState::asset_type_by_reference`] resolves it to nothing and a
+/// read reports the identifier itself as the asset's type.
+pub const CATALOG_TABLE_ASSET_TYPE_ID: &str = "catalog::Table";
+
+/// The database and table the asset identifier `identifier` names, as the Data Catalog of the
+/// account this emulator serves keys them, or `None` when it names no table of THIS account.
+///
+/// The ARN is read the one way this crate reads a Glue resource ARN that may name a table
+/// ([`integration_table_reference`]), so an identifier that is no table ARN — a bare asset id,
+/// a connection or a database ARN — names no catalog entity here.
+///
+/// The ARN's own account field is NOT what the catalog is then keyed by: field 5 of an ARN is
+/// a value the REQUEST carries, and this endpoint serves one account's catalog — the account
+/// the qualified identifiers of this surface are built for
+/// ([`catalog_qualified_id`], [`asset_type_name_from_qualified_id`]) — so an ARN naming any
+/// other account names no entity this store would serve, and the one it names is looked up
+/// under the account this emulator serves. ONE helper, so the read, the probe and both
+/// association mutators cannot disagree about which identifiers resolve.
+fn catalog_table_reference(identifier: &str) -> Option<(String, String)> {
+    let IntegrationTableResource::Table {
+        account_id,
+        database,
+        table,
+    } = integration_table_reference(identifier).ok()?
+    else {
+        return None;
+    };
+    if account_id != ::engine::emulator_account_id() {
+        return None;
+    }
+    Some((database, table))
+}
+
+impl ComAmazonawsGlueAwsglueState {
+    /// The asset the business catalog has indexed for the Data Catalog entity `identifier`
+    /// names, or `None` when the identifier names no such entity this store holds.
+    ///
+    /// A Data Catalog entity carries business context, so the business catalog indexes it as
+    /// an ASSET addressed by the entity's own ARN — which is why an asset read and a glossary
+    /// term association reach a table that no `PutAsset` ever stored. The asset is PROJECTED
+    /// from the entity's own record on each call rather than stored beside it, so it cannot
+    /// drift from the entity: a table renamed, described or dropped moves its asset with it,
+    /// and the terms the projection reports are the ones held against the table itself
+    /// ([`TableEntry::glossary_terms`]).
+    ///
+    /// The identifier is resolved by [`catalog_table_reference`], which is also what keeps an
+    /// ARN naming another account's table from reaching this store.
+    pub fn catalog_entity_asset(&self, identifier: &str) -> Option<AssetEntry> {
+        let (database, table) = catalog_table_reference(identifier)?;
+        let stored = self
+            .database(::engine::emulator_account_id(), &database)?
+            .tables
+            .get(&table)?;
+        let mut projected = AssetEntry::new(
+            identifier.to_string(),
+            CATALOG_TABLE_ASSET_TYPE_ID.to_string(),
+            stored.name.clone(),
+            stored.description.clone(),
+            BTreeMap::new(),
+            None,
+            stored.create_time,
+        );
+        // The entity's own instants and its own associations: the asset IS the table, read
+        // through the business catalog's shape.
+        projected.updated_at = stored.update_time;
+        projected.glossary_terms = stored.glossary_terms.clone();
+        Some(projected)
+    }
+
+    /// The asset `identifier` addresses as a READ of it reports it: the stored asset a put
+    /// wrote, or the projection of the Data Catalog entity the identifier names.
+    ///
+    /// An owned record rather than a borrow, because a projected asset is computed and not
+    /// held. A stored asset wins: an identifier a put stored an asset under is that asset,
+    /// whatever else the identifier could name.
+    pub fn asset_as_read(&self, identifier: &str) -> Option<AssetEntry> {
+        self.asset(identifier)
+            .cloned()
+            .or_else(|| self.catalog_entity_asset(identifier))
+    }
+
+    /// Whether this catalog holds anything the asset identifier `identifier` addresses: a
+    /// stored asset, or a Data Catalog entity the business catalog indexes as one.
+    ///
+    /// The one question every operation that addresses an asset asks before it acts, so a
+    /// read and an association agree about which identifiers resolve.
+    pub fn holds_asset(&self, identifier: &str) -> bool {
+        self.asset(identifier).is_some() || self.catalog_entity_asset(identifier).is_some()
+    }
+
+    /// Merge `identifiers` into the glossary term set of the asset `identifier` addresses,
+    /// answering the terms that asset carries afterwards.
+    ///
+    /// `None` is the ceiling [`merged_glossary_terms`] refuses at — or an identifier that
+    /// addresses nothing, which the caller has already told apart with [`Self::holds_asset`]
+    /// under the same lock, so the refusal it reports is the ceiling.
+    ///
+    /// The write lands in whichever record OWNS the terms: a stored asset's own set, or the
+    /// Data Catalog entity's ([`TableEntry::glossary_terms`]), so a later read of the asset —
+    /// stored or projected — reports what this merged.
+    /// The identifier is resolved by [`catalog_table_reference`] for the reason
+    /// [`Self::catalog_entity_asset`] gives, so an ARN naming another account's table reaches
+    /// no record here either.
+    pub fn associate_asset_glossary_terms(
+        &mut self,
+        identifier: &str,
+        identifiers: &[String],
+    ) -> Option<Vec<String>> {
+        if let Some(asset) = self.assets.get_mut(identifier) {
+            return asset.associate_glossary_terms(identifiers);
+        }
+        let (database, table) = catalog_table_reference(identifier)?;
+        let stored = self.table_mut(::engine::emulator_account_id(), &database, &table)?;
+        stored.glossary_terms = merged_glossary_terms(&stored.glossary_terms, identifiers)?;
+        Some(stored.glossary_terms.clone())
+    }
+
+    /// Remove `identifiers` from the glossary term set of the asset `identifier` addresses,
+    /// answering the terms that asset carries afterwards, and `None` when the identifier
+    /// addresses nothing.
+    ///
+    /// An id the asset does not carry removes nothing, so the same removal sent twice leaves
+    /// the same set. The removal lands in whichever record OWNS the terms: a stored asset's own
+    /// set, or the Data Catalog entity's ([`TableEntry::glossary_terms`]), so a later read of
+    /// the asset — stored or projected — reports what this left.
+    /// The identifier is resolved the one way the association resolves it
+    /// ([`catalog_table_reference`]).
+    pub fn disassociate_asset_glossary_terms(
+        &mut self,
+        identifier: &str,
+        identifiers: &[String],
+    ) -> Option<Vec<String>> {
+        if let Some(asset) = self.assets.get_mut(identifier) {
+            return Some(asset.disassociate_glossary_terms(identifiers));
+        }
+        let (database, table) = catalog_table_reference(identifier)?;
+        let stored = self.table_mut(::engine::emulator_account_id(), &database, &table)?;
+        stored
+            .glossary_terms
+            .retain(|held| !identifiers.iter().any(|removed| removed == held));
+        Some(stored.glossary_terms.clone())
     }
 }

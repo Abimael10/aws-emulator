@@ -15,8 +15,10 @@
 //! conditional one), with a multi-condition predicate that does not say whether all or any
 //! of them must hold, or with a `Schedule` that is no cron expression; and with
 //! `EntityNotFoundException` when no trigger of this Region has the requested name, or when
-//! an action or condition names a job or crawler this account does not hold (see
-//! [`crate::state::missing_trigger_reference`]). A refused update writes nothing.
+//! an action or condition names a crawler this account does not hold (see
+//! [`crate::state::missing_trigger_reference`]). A refused update writes nothing. The JOB an
+//! action runs, or a condition waits on, is resolved when the trigger FIRES rather than
+//! here, so an update may name a job the account does not hold yet.
 //!
 //! ## Shape of an operation
 //!
@@ -205,13 +207,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_input(message));
         }
 
-        // The entities the replacement definition runs and waits on have to exist for it to
-        // resolve, exactly as on the create: a trigger cannot be left running a job this
-        // Region does not hold. The workflow the trigger belongs to is NOT re-resolved —
+        // The entities the replacement definition waits on have to exist for it to resolve,
+        // exactly as on the create: a trigger cannot be left crawling with a crawler this
+        // account does not hold, while the JOB an action runs is resolved at fire time. The
+        // workflow the trigger belongs to is NOT re-resolved —
         // `TriggerUpdate` carries no `WorkflowName`, so this update does not move it.
         if let Some(missing) = crate::state::missing_trigger_reference(
             &store,
-            &region,
             None,
             &updated.actions,
             updated.predicate.as_ref(),

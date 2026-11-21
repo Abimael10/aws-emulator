@@ -247,7 +247,7 @@ impl BlueprintEntry {
     /// read of any of them reports the state the clock had already reached; a run already in
     /// flight does not stop another being recorded, because a blueprint publishes no ceiling
     /// on its concurrent runs. The id is minted by the start that lays the run's workflow out
-    /// ([`ComAmazonawsGlueAwsglueState::start_blueprint_run`]), because the workflow a run
+    /// ([`ComAmazonawsGlueAwsglueState::begin_blueprint_run`]), because the workflow a run
     /// creates carries the id of the run that created it.
     pub fn begin_run(
         &mut self,
@@ -388,10 +388,41 @@ pub enum BlueprintRunLayout {
     /// This account already held a workflow of this name, so the run created none and
     /// nothing already stored was overwritten.
     WorkflowAlreadyExists(String),
+    /// The layout ran and created no job, crawler or trigger, so there is no workflow to run:
+    /// the one case AWS fails a run whose layout itself went through.
+    NothingDeployed,
+    /// The layout could not be read or run, raised, or one of its creations was refused: the
+    /// reason, which is what the run then reports as its `ErrorMessage`.
+    Failed(String),
+}
+
+/// What [`ComAmazonawsGlueAwsglueState::begin_blueprint_run`] left for the start to do.
+#[derive(Debug, Clone)]
+pub enum BlueprintRunBegun {
+    /// The workflow the run produces was created, and the layout published at the blueprint's
+    /// location is still to be run and deployed into it; the run's own record is written once
+    /// that is known ([`ComAmazonawsGlueAwsglueState::record_blueprint_run`]).
+    Deploying(BlueprintLayoutPlan),
+    /// The run created nothing and is already recorded: there is no layout to run.
+    Recorded {
+        /// The id the run was recorded under, which is what the start answers with.
+        run_id: String,
+    },
+}
+
+impl BlueprintRunBegun {
+    /// The id of the run this began, which is what `StartBlueprintRun` answers with.
+    #[must_use]
+    pub fn run_id(&self) -> &str {
+        match self {
+            Self::Deploying(plan) => &plan.run_id,
+            Self::Recorded { run_id } => run_id,
+        }
+    }
 }
 
 /// Why no run of a blueprint could be started
-/// ([`ComAmazonawsGlueAwsglueState::start_blueprint_run`]).
+/// ([`ComAmazonawsGlueAwsglueState::begin_blueprint_run`]).
 ///
 /// Each variant is one of `StartBlueprintRun`'s own modelled failures, carrying what the
 /// refusal has to name; the handler words them, so the store answers WHAT happened rather
@@ -506,6 +537,14 @@ impl BlueprintRunEntry {
                 None,
                 Some(messages::blueprint_run_workflow_exists(workflow_name)),
             ),
+            BlueprintRunLayout::NothingDeployed => (
+                BLUEPRINT_RUN_STATE_FAILED,
+                None,
+                Some(messages::BLUEPRINT_RUN_DEPLOYED_NOTHING.to_string()),
+            ),
+            BlueprintRunLayout::Failed(reason) => {
+                (BLUEPRINT_RUN_STATE_FAILED, None, Some(reason.clone()))
+            }
         };
         Self {
             run_id,

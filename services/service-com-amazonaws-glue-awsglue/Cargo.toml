@@ -105,14 +105,17 @@ protox-parse = "0.10"
 # `protox-parse` reports one through), so a definition fault is reported at the position in
 # the submitted definition the parse stopped at.
 miette = "7"
-# The CONTAINED Python interpreter a Glue job run's own script is executed by, and the AWS
-# SDK modules that interpreter puts on a script's import path — both reached through the
+# The CONTAINED Python interpreter the caller-supplied Python this service runs is executed
+# by — a Glue job run's own script, a session statement's code, and the LAYOUT published
+# inside a blueprint's archive — and the AWS SDK modules that interpreter puts on their
+# import path: both reached through the
 # Lambda service crate, which is where this workspace's ONE embedded Python execution
 # substrate lives (`state::execution::python`). Reused rather than stood up a second time
-# here, so a job script runs under exactly the containment and the bounds that engine
+# here, so each of those runs under exactly the containment and the bounds that engine
 # already enforces, and this crate adds no execution surface of its own: it supplies the
-# script's source, its command line and its ceilings
-# (`crate::state::job_script`) and nothing else.
+# source, its arguments and its ceilings
+# (`crate::state::job_script`, `crate::state::statement_execution`,
+# `crate::state::blueprint_layout`) and nothing else.
 #
 # Capability class: an execution substrate. What it re-opens is answered by that engine and
 # by this crate's own module docs — the interpreter is built with the engine crate's
@@ -137,6 +140,9 @@ emulator-core-build-support = { workspace = true }
 # The one integration-test target of this crate is rooted at `tests/all/main.rs`, which
 # declares every `tests/all/<name>.rs` beside it as a suite of that binary.
 automod = { workspace = true }
+# Writes the .zip a blueprint's archive is published as, so the layout suite stages the
+# archive a caller would publish (`tests/all/blueprint_layout_deployment.rs`).
+zip = { version = "9", default-features = false, features = ["deflate"] }
 # The catalog-encryption suite mounts the KMS service beside Glue on one engine, because a
 # catalog write and a catalog read of an SSE-KMS catalog each call it.
 service-com-amazonaws-kms-trentservice = { workspace = true }

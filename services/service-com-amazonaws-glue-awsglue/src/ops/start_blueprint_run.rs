@@ -10,26 +10,39 @@
 //! afterwards still sees it in progress.
 //!
 //! A run produces a WORKFLOW — "the name of a workflow that is created as a result of a
-//! successful blueprint run" — so the start lays that workflow out too
-//! ([`crate::state::ComAmazonawsGlueAwsglueState::start_blueprint_run`]), carrying the run
-//! that created it, and the run reaches the succeeded state once the clock owes it. A run
-//! whose workflow name this account already holds a workflow under creates nothing and
-//! fails, rather than overwriting what is stored.
+//! successful blueprint run" — so the start creates that workflow
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::begin_blueprint_run`]), carrying the run
+//! that created it, and then DEPLOYS the blueprint's layout into it: the archive published at
+//! the blueprint's `BlueprintLocation` is fetched from the emulator's own Amazon S3, its
+//! layout generator is executed by the contained Python interpreter, and every job, crawler
+//! and trigger the workflow it answers with carries is created through this emulator's own
+//! Glue API as a session of the start's `RoleArn`
+//! ([`crate::state::perform_blueprint_layout`]) — so a `GetWorkflow` of what the run produced
+//! reports the graph those entities make up.
 //!
-//! KNOWN DIVERGENCE, visible to a caller: what a run creates is the WORKFLOW RECORD and
-//! nothing inside it. The jobs, crawlers and triggers a blueprint's layout adds to that
-//! workflow — and the parameter spec that says which parameters the layout takes — are
-//! defined by the archive published at the blueprint's `BlueprintLocation`, which nothing
-//! here fetches, so a `GetWorkflow` of what a run produced reports a workflow with no graph
-//! and no entry point, and a `StartWorkflowRun` of it is refused for having no starting
-//! trigger. The workflow's NAME is the `WorkflowName` the start's `Parameters` asked for, and
-//! the blueprint's own name when they ask for none
+//! What the run comes to rest in is what that deployment came to: the succeeded state for a
+//! run that created at least one entity, and the failed state carrying the reason for a run
+//! whose layout could not be read or run, raised, or created nothing at all — a blueprint
+//! that lays out no entity is unrunnable, so such a run fails and the workflow it had created
+//! is rolled back. A run whose workflow name this account already holds a workflow under
+//! creates nothing and fails, rather than overwriting what is stored.
+//! The workflow's NAME is the `WorkflowName` the start's `Parameters` asked for, and the
+//! blueprint's own name when they ask for none
 //! ([`crate::state::blueprint_run_workflow_name`]).
 //!
 //! A run may only be started of a registration that has FINISHED: a blueprint whose
 //! registration is still in flight is refused with the modelled
 //! `IllegalBlueprintStateException` rather than run. A run already in flight does not stop
 //! another beginning — a blueprint publishes no ceiling on its concurrent runs.
+//!
+//! KNOWN DIVERGENCE, visible to a caller: where NOTHING answers the read of the published
+//! archive — no object store is mounted beside this service to ask, which is the shape of an
+//! emulator serving Glue alone — nothing is established about the layout, so the run reports
+//! what this service itself DID (it created the workflow) and the workflow it reports carries
+//! no entity. That is the one outcome here that claims no deployment, and it is the reading of
+//! an unanswered object read this service already makes for a REGISTRATION
+//! ([`crate::state::read_blueprint_archive`]); an emulator with an object store mounted never
+//! takes it, because the store then answers and the run reports what the layout came to.
 //!
 //! ## Shape of an operation
 //!
@@ -174,9 +187,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Blueprints live in one per-account namespace, so nothing here depends on the
-        // request's Region — the same way `CreateBlueprint` and `GetBlueprint` serve one.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // This operation models a server fault, so an unreachable store is reported
             // as that rather than as a client error the caller could act on.
@@ -193,55 +203,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // boundary, as is `Parameters`' length, so every check left is one the STORE
         // answers.
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-        // The ONE place a blueprint run is started: it materialises the registration status
-        // the clock already owed the blueprint, lays out the workflow the run produces and
-        // records the run of it, so a run and its workflow are written together.
-        let run_id = match store.start_blueprint_run(&input, now) {
-            Ok(run_id) => run_id,
-            Err(crate::state::BlueprintRunNotStarted::NoSuchBlueprint) => {
-                return Err(StartBlueprintRunErrorModeled::EntityNotFoundException(
-                    EntityNotFoundException {
-                        message: Some(crate::state::messages::BLUEPRINT_NOT_FOUND.to_string()),
-                        from_federation_source: None,
-                    },
-                )
-                .into());
-            }
-            // Only a blueprint with an ACTIVE definition can be run: "Active — The
-            // blueprint has been successfully registered" is the one status in which the
-            // template a run would lay out is registered, so a run of a blueprint in any
-            // other is refused with this operation's modelled state error.
-            Err(crate::state::BlueprintRunNotStarted::NoActiveDefinition) => {
-                return Err(
-                    StartBlueprintRunErrorModeled::IllegalBlueprintStateException(
-                        IllegalBlueprintStateException {
+        // Blueprints live in one per-account namespace, so nothing about resolving one depends
+        // on the request's Region — the same way `CreateBlueprint` and `GetBlueprint` serve
+        // one. The Region IS what the layout's own creating calls are made in, because a job
+        // definition and a trigger live in the Region they were created in.
+        let region = crate::state::request_region(ctx.parts());
+        // The run is BEGUN under the store's guard and the guard is released with the block:
+        // the layout the run deploys is caller-supplied code, and nothing of this store is
+        // held while it runs.
+        let begun = {
+            let mut store = state.lock();
+            match store.begin_blueprint_run(&input, now) {
+                Ok(begun) => begun,
+                Err(crate::state::BlueprintRunNotStarted::NoSuchBlueprint) => {
+                    return Err(StartBlueprintRunErrorModeled::EntityNotFoundException(
+                        EntityNotFoundException {
                             message: Some(
-                                crate::state::messages::blueprint_has_no_active_definition(
-                                    &input.blueprint_name,
-                                ),
+                                crate::state::messages::BLUEPRINT_NOT_FOUND.to_string(),
                             ),
+                            from_federation_source: None,
                         },
                     )
-                    .into(),
-                );
-            }
-            // The run creates a workflow, so a store already holding as many workflows as it
-            // will cannot serve the start: refused with this operation's own modelled limit
-            // error rather than recording a run that could create nothing.
-            Err(crate::state::BlueprintRunNotStarted::WorkflowCeilingReached(ceiling)) => {
-                return Err(
-                    StartBlueprintRunErrorModeled::ResourceNumberLimitExceededException(
-                        ResourceNumberLimitExceededException {
-                            message: Some(format!(
-                                "This account already holds the maximum of {ceiling} workflows"
-                            )),
-                        },
-                    )
-                    .into(),
-                );
+                    .into());
+                }
+                // Only a blueprint with an ACTIVE definition can be run: "Active — The
+                // blueprint has been successfully registered" is the one status in which the
+                // template a run would lay out is registered, so a run of a blueprint in any
+                // other is refused with this operation's modelled state error.
+                Err(crate::state::BlueprintRunNotStarted::NoActiveDefinition) => {
+                    return Err(
+                        StartBlueprintRunErrorModeled::IllegalBlueprintStateException(
+                            IllegalBlueprintStateException {
+                                message: Some(
+                                    crate::state::messages::blueprint_has_no_active_definition(
+                                        &input.blueprint_name,
+                                    ),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                // The run creates a workflow, so a store already holding as many workflows as
+                // it will cannot serve the start: refused with this operation's own modelled
+                // limit error rather than recording a run that could create nothing.
+                Err(crate::state::BlueprintRunNotStarted::WorkflowCeilingReached(ceiling)) => {
+                    return Err(
+                        StartBlueprintRunErrorModeled::ResourceNumberLimitExceededException(
+                            ResourceNumberLimitExceededException {
+                                message: Some(format!(
+                                    "This account already holds the maximum of {ceiling} \
+                                     workflows"
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
             }
         };
+
+        // The LAYOUT published at the blueprint's location is what the run deploys: it is
+        // fetched and executed with no store guard held ([`crate::state::blueprint_layout`]),
+        // each entity it answers with is created through this emulator's own Glue API as a
+        // session of the start's `RoleArn`, and the run is then recorded carrying what that
+        // came to — succeeded for a run that created entities, failed carrying the reason for
+        // a run whose layout could not be run or created nothing.
+        //
+        // WHAT ONE REQUEST MAY SPEND ON IT is bounded, and every bound is host code the
+        // layout cannot reach: a layout is caller-supplied code, so it runs inside the
+        // contained interpreter under a wall-clock, step, memory, recursion and answer budget
+        // ([`crate::state::blueprint_layout_budget`]) read against a clock the RUN drives,
+        // with the host time one run may take stopped by the engine
+        // ([`crate::state::BLUEPRINT_LAYOUT_HOST_CEILING`]); at most
+        // [`crate::state::MAX_CONCURRENT_BLUEPRINT_LAYOUT_RUNS`] of them run at a time, and
+        // the permit is taken with NO wait, so a start that finds none free fails its run
+        // rather than queueing; at most [`crate::state::MAX_BLUEPRINT_ARCHIVE_BYTES`] of
+        // archive is read, by a ranged read; and no host path, process or socket is reachable
+        // from it (the engine's own containment). THIS CALL is bounded beside all of that:
+        // the await is given [`crate::state::BLUEPRINT_LAYOUT_CALL_CEILING`], past which the
+        // request stops waiting and the run is recorded as the failure it is — so one request
+        // cannot be held open by a layout whatever that layout does.
+        if let crate::state::BlueprintRunBegun::Deploying(plan) = &begun {
+            let deployment =
+                crate::state::perform_blueprint_layout(&*self.engine, ctx, &region, plan);
+            let outcome = match ::tokio::time::timeout(
+                crate::state::BLUEPRINT_LAYOUT_CALL_CEILING,
+                deployment,
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(_elapsed) => crate::state::BlueprintLayoutOutcome::Failed(
+                    crate::state::blueprint_layout_call_ceiling_reached(),
+                ),
+            };
+            ::tracing::info!(
+                operation = "StartBlueprintRun",
+                blueprint = %input.blueprint_name,
+                run = %plan.run_id,
+                workflow = %plan.workflow_name,
+                created = outcome.created(),
+                "performed a Glue blueprint run's layout"
+            );
+            state
+                .lock()
+                .record_blueprint_run(&input, plan, &outcome, now);
+        }
+        let run_id = begun.run_id().to_string();
         ::tracing::info!(
             operation = "StartBlueprintRun",
             blueprint = %input.blueprint_name,

@@ -176,9 +176,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Read-only: the stored asset is projected out and nothing is written.
+        // Read-only: the asset is projected out and nothing is written. The identifier
+        // resolves to the asset a put stored under it, or to the Data Catalog entity the
+        // business catalog indexes as an asset under its own ARN
+        // (`crate::state::ComAmazonawsGlueAwsglueState::asset_as_read`), so a catalog table
+        // is readable as the asset it is.
         let store = state.lock();
-        let Some(entry) = store.asset(&input.identifier) else {
+        let Some(entry) = store.asset_as_read(&input.identifier) else {
             return Err(GetAssetErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
                     // The one wording this surface refuses an identifier it holds no asset

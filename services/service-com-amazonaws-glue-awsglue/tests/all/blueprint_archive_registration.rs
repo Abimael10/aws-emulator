@@ -43,19 +43,27 @@ use crate::wire::{call, error_code, error_message, ok, s3_client};
 /// that failed backs no run.
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/sim2real-glue-blueprint-role";
 
-/// Stage `key` in the suite's bucket as a published blueprint archive, and answer the
-/// `s3://` location that names it.
+/// The bytes a row stages when what it publishes does not matter: a registration asks only
+/// whether the archive at the location can be FETCHED, so these stand for a published archive.
+pub(crate) const PUBLISHED_ARCHIVE: &[u8] = b"PK\x03\x04 a blueprint archive";
+
+/// Stage `bytes` in the suite's bucket as the published blueprint archive `key`, and answer
+/// the `s3://` location that names it.
 ///
-/// Shared with [`crate::blueprint_registration_terminal_status`], so both suites publish an
-/// archive the same way.
-pub(crate) async fn stage_archive(router: &MultiServiceRouter, key: &str) -> String {
+/// The ONE way a suite of this target publishes a blueprint archive, shared with
+/// [`crate::blueprint_registration_terminal_status`] and
+/// [`crate::blueprint_layout_deployment`] — which stages a real .zip holding a layout, where
+/// the registration suites stage [`PUBLISHED_ARCHIVE`].
+pub(crate) async fn stage_archive(
+    router: &MultiServiceRouter,
+    key: &str,
+    bytes: Vec<u8>,
+) -> String {
     s3_client(router)
         .put_object()
         .bucket(BUCKET)
         .key(key)
-        .body(aws_sdk_s3::primitives::ByteStream::from_static(
-            b"PK\x03\x04 a blueprint archive",
-        ))
+        .body(aws_sdk_s3::primitives::ByteStream::from(bytes))
         .send()
         .await
         .unwrap_or_else(|error| panic!("the archive {key} must be staged, got {error:?}"));
@@ -131,7 +139,7 @@ fn archive_cases() -> Vec<ArchiveCase> {
 /// suite's bucket — unless it names another bucket, which the `@` prefix marks.
 async fn location_of(router: &MultiServiceRouter, row: &ArchiveCase) -> String {
     match (row.staged, row.unstaged_location) {
-        (Some(key), _) => stage_archive(router, key).await,
+        (Some(key), _) => stage_archive(router, key, PUBLISHED_ARCHIVE.to_vec()).await,
         (None, Some(location)) => match location.strip_prefix('@') {
             Some(elsewhere) => format!("s3://{elsewhere}"),
             None => format!("s3://{BUCKET}/{location}"),

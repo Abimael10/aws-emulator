@@ -262,6 +262,7 @@ pub mod catalog_encryption;
 /// reached as `crate::state::lake_formation` rather than glob re-exported, because what it
 /// answers is a decision about a request and not a record this store holds.
 pub mod lake_formation;
+mod blueprint_layout;
 mod blueprints;
 mod catalog;
 mod classifiers;
@@ -313,6 +314,7 @@ mod triggers;
 mod workflow_runs;
 mod workflows;
 
+pub use blueprint_layout::*;
 pub use blueprints::*;
 pub use catalog::*;
 pub use classifiers::*;
@@ -437,8 +439,9 @@ use crate::ops::types::{
     Tag, TargetProcessingProperties, TargetTableConfig,
     TriggerUpdate,
     UpdateClassifierInput, UpdateColumnStatisticsTaskSettingsInput, UpdateCrawlerInput,
-    UpdateDataQualityRulesetInput, UpdateGlossaryInput,
+    UpdateDataQualityRulesetInput, UpdateGlossaryInput, UpdateGlossaryTermInput,
     UpdateMLTransformInput,
+    UpdateUsageProfileInput,
     UpdateWorkflowInput,
     UsageProfileDefinition,
     Workflow, WorkflowGraph,
@@ -2380,26 +2383,30 @@ impl ComAmazonawsGlueAwsglueState {
             .and_then(|sessions| sessions.remove(id))
     }
 
-    /// Start a run of the blueprint `input` names at `now` and answer the id minted for that
-    /// run, or why no run could be started.
+    /// Begin a run of the blueprint `input` names at `now`: resolve the blueprint, create the
+    /// workflow the run produces, and answer what the run must do next — or why no run could be
+    /// started.
     ///
-    /// The ONE place a blueprint run is started, so a run and the workflow it produced are
-    /// written together or not at all. In order: the blueprint is resolved, the registration
-    /// status the CLOCK already owed it is materialised, a run is refused of a registration
-    /// that has not finished, the workflow the run lays out is created, and the run of it is
-    /// recorded carrying what that layout came to.
+    /// The ONE place a blueprint run begins. In order: the blueprint is resolved, the
+    /// registration status the CLOCK already owed it is materialised, a run is refused of a
+    /// registration that has not finished, and the workflow the run lays its entities out in is
+    /// created, carrying the run that created it ("the details of the blueprint that this
+    /// particular workflow is created from", `Workflow$BlueprintDetails`).
     ///
     /// "The name of a workflow that is created as a result of a successful blueprint run"
-    /// (`BlueprintRun$WorkflowName`) is what a run produces, and the workflow it creates
-    /// carries the run that created it ("The details of the blueprint that this particular
-    /// workflow is created from", `Workflow$BlueprintDetails`). A name this account already
-    /// holds a workflow under is NOT overwritten: that run creates nothing and fails, the
-    /// way any blueprint run that cannot create its entities does.
-    pub fn start_blueprint_run(
+    /// (`BlueprintRun$WorkflowName`) is what a run produces, so a name this account already
+    /// holds a workflow under is NOT overwritten: that run creates nothing, which is recorded
+    /// here as the run it is, and the caller performs no layout for it.
+    ///
+    /// The run of a workflow the layout is still to be deployed into is NOT recorded yet: the
+    /// state a run comes to rest in is what its layout came to, so the record is written by
+    /// [`Self::record_blueprint_run`] once that is known. The id is minted here, because the
+    /// workflow this creates carries the id of the run that created it.
+    pub fn begin_blueprint_run(
         &mut self,
         input: &StartBlueprintRunInput,
         now: SystemTime,
-    ) -> Result<String, BlueprintRunNotStarted> {
+    ) -> Result<BlueprintRunBegun, BlueprintRunNotStarted> {
         // Whether the store has room for the workflow the run would create, read before the
         // two maps below are borrowed apart.
         let can_store_workflow = self.can_store_workflow();
@@ -2425,20 +2432,81 @@ impl ComAmazonawsGlueAwsglueState {
         let workflow_name =
             blueprint_run_workflow_name(&blueprint.name, input.parameters.as_deref());
         let run_id = new_blueprint_run_id();
-        let layout = if workflows.contains_key(&workflow_name) {
-            BlueprintRunLayout::WorkflowAlreadyExists(workflow_name)
-        } else if can_store_workflow {
-            insert_workflow_into(
-                workflows,
-                WorkflowEntry::from_blueprint_run(&workflow_name, &blueprint.name, &run_id, now),
+        if workflows.contains_key(&workflow_name) {
+            blueprint.begin_run(
+                input,
+                run_id.clone(),
+                now,
+                &BlueprintRunLayout::WorkflowAlreadyExists(workflow_name),
             );
-            BlueprintRunLayout::Created(workflow_name)
-        } else {
+            return Ok(BlueprintRunBegun::Recorded { run_id });
+        }
+        if !can_store_workflow {
             return Err(BlueprintRunNotStarted::WorkflowCeilingReached(MAX_WORKFLOWS));
-        };
+        }
+        insert_workflow_into(
+            workflows,
+            WorkflowEntry::from_blueprint_run(&workflow_name, &blueprint.name, &run_id, now),
+        );
+        Ok(BlueprintRunBegun::Deploying(BlueprintLayoutPlan {
+            blueprint_name: blueprint.name.clone(),
+            run_id,
+            workflow_name,
+            blueprint_location: blueprint.blueprint_location.clone(),
+            role_arn: input.role_arn.clone(),
+            parameters: input.parameters.clone(),
+        }))
+    }
 
-        blueprint.begin_run(input, run_id.clone(), now, &layout);
-        Ok(run_id)
+    /// Record the run `plan` began, carrying what deploying its layout came to.
+    ///
+    /// A run that created at least one entity succeeded carrying the workflow it deployed them
+    /// into. A run that created none did not produce a workflow — "if a blueprint run has an
+    /// error, there will not be a workflow created" — so the workflow the run had created is
+    /// REMOVED again, which is the rollback of the entities a failed run created ("we try to
+    /// roll back the created entities until that point and delete them") for the one entity
+    /// this phase created, and the run is recorded as the failure it is.
+    pub fn record_blueprint_run(
+        &mut self,
+        input: &StartBlueprintRunInput,
+        plan: &BlueprintLayoutPlan,
+        outcome: &BlueprintLayoutOutcome,
+        now: SystemTime,
+    ) {
+        let layout = match outcome {
+            BlueprintLayoutOutcome::Deployed { .. } => {
+                BlueprintRunLayout::Created(plan.workflow_name.clone())
+            }
+            // NOTHING ANSWERED the read of the archive, so nothing is established about the
+            // layout: this emulator cannot show that the blueprint deploys entities, and it
+            // cannot show that it does not either, so the run is left reporting what this
+            // phase itself DID — it created the workflow — rather than a failure of the
+            // blueprint's own. It is the one outcome here that claims no deployment: the
+            // workflow it reports is empty, which a `GetWorkflow` of it shows, and no entity
+            // is reported as created anywhere. The alternative — failing the run — would
+            // report a defect of the blueprint that nothing established, which is why this
+            // follows the registration's own reading of an unanswered object read
+            // ([`BlueprintLayoutOutcome::NotEstablished`]); an emulator with an object store
+            // mounted never takes this branch, because the store then ANSWERS.
+            BlueprintLayoutOutcome::NotEstablished => {
+                BlueprintRunLayout::Created(plan.workflow_name.clone())
+            }
+            BlueprintLayoutOutcome::NothingDeployed => {
+                self.workflows.remove(&plan.workflow_name);
+                BlueprintRunLayout::NothingDeployed
+            }
+            BlueprintLayoutOutcome::Failed(reason) => {
+                self.workflows.remove(&plan.workflow_name);
+                BlueprintRunLayout::Failed(reason.clone())
+            }
+        };
+        // The blueprint a run belongs to is where the run's record lives, so a blueprint a
+        // delete removed while the layout ran holds no run to record: the workflow this phase
+        // rolled back is rolled back all the same, and the id the start answers with addresses
+        // the run of a blueprint that is gone, which a read of it reports as the miss it is.
+        if let Some(blueprint) = self.blueprints.get_mut(&plan.blueprint_name) {
+            blueprint.begin_run(input, plan.run_id.clone(), now, &layout);
+        }
     }
 
     /// The stored workflow `name`, or `None` when this account holds no such workflow.

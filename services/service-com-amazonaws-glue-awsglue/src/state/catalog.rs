@@ -799,6 +799,16 @@ pub struct TableEntry {
     /// same type is a duplicate rather than an overwrite, and why dropping the table drops
     /// its optimizers with it. Ordered by type, so a reader has one deterministic order.
     pub optimizers: BTreeMap<String, TableOptimizerEntry>,
+    /// The business glossary terms the business catalog holds against this table, in the
+    /// order the associations added them.
+    ///
+    /// A Data Catalog table is indexed as an ASSET of the business catalog, addressed by its
+    /// own ARN, so `AssociateGlossaryTerms` against that ARN writes here and a read of that
+    /// asset reports them ([`ComAmazonawsGlueAwsglueState::catalog_entity_asset`]). They live
+    /// ON the table because the table is the entity the terms are attached to: dropping the
+    /// table drops its associations with it, and a write of its definition leaves them where
+    /// they are ([`Self::apply_input`] does not touch them).
+    pub glossary_terms: Vec<String>,
 }
 
 /// One stored table optimizer: the configuration a create or update wrote for one
@@ -1384,6 +1394,9 @@ impl TableEntry {
             // Nor any optimizer: an optimizer of a table arrives through
             // `CreateTableOptimizer`, which addresses a table that already exists.
             optimizers: BTreeMap::new(),
+            // Nor any glossary term: the business catalog attaches one to the table a
+            // caller names, so a freshly created table carries none.
+            glossary_terms: Vec::new(),
         }
     }
 

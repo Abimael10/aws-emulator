@@ -344,36 +344,19 @@ async fn a_job_miss_reported_inside_an_output_carries_the_same_sentence() {
         }
     }
 
-    // A trigger whose action would run a job nothing holds resolves the same job name, so
-    // it is refused with the same sentence.
+    // A trigger whose action names a job nothing holds is NOT refused: that reference is
+    // late-bound — it is resolved when the trigger fires — so the job-miss sentence is not
+    // what a trigger write answers ([`crate::trigger_job_late_binding`]).
     let trigger_request = json!({
         "Name": "trigger-of-an-absent-job",
         "Type": "ON_DEMAND",
         "Actions": [{ "JobName": absent }],
     });
-    let body = assert_refusal(
-        &router,
-        "CreateTrigger naming an absent job",
-        "CreateTrigger",
-        &trigger_request,
-        ENTITY_NOT_FOUND,
-        JOB_NOT_FOUND,
-    )
-    .await;
-    assert_withholds(
-        "CreateTrigger naming an absent job",
-        &error_message(&body),
-        absent,
-    );
-
-    // The refused create stored nothing: the trigger name is still free, which a second
-    // create of the same name over a job that DOES exist shows.
-    ok(&router, "CreateJob", &job_body(absent)).await;
     let created = ok(&router, "CreateTrigger", &trigger_request).await;
     assert_eq!(
         created["Name"].as_str(),
         Some("trigger-of-an-absent-job"),
-        "the trigger name the refusal left free must be creatable, got {created}"
+        "a trigger may be created ahead of the job it runs, got {created}"
     );
 }
 

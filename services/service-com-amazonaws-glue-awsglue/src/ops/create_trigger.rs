@@ -13,10 +13,14 @@
 //! cannot be started on creation, when the trigger would initiate nothing, or when a
 //! conditional trigger names one job both in its `Predicate` and in its `Actions`; and with
 //! `EntityNotFoundException` when the trigger names a workflow, or an action or condition
-//! names a job or crawler, that this account does not hold (see
+//! names a crawler, that this account does not hold (see
 //! [`crate::state::missing_trigger_reference`]). Every definition refusal is decided BEFORE
 //! the entities it names are looked up, so a definition the service could not fire is
 //! reported as the input error it is rather than as a missing entity.
+//!
+//! The JOB an action runs, or a condition waits on, is NOT resolved here: that reference is
+//! late-bound, resolved when the trigger FIRES, so a trigger whose `Actions[].JobName` names
+//! no job yet is stored as sent and a later `GetTrigger` reports that name back unchanged.
 //!
 //! The trigger's name is also this create's idempotency identifier, so a name the Region
 //! already holds a trigger under is refused as `AlreadyExistsException` when the request
@@ -266,12 +270,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        // The entities the trigger belongs to, runs and waits on have to exist for the
-        // definition to resolve: a trigger cannot run a job this account does not hold,
-        // nor belong to a workflow nothing created.
+        // The entities the trigger belongs to and waits on have to exist for the definition
+        // to resolve: a trigger cannot belong to a workflow nothing created, nor crawl with
+        // a crawler this account does not hold. The JOB an action runs is resolved when the
+        // trigger FIRES, not here, so a dangling job name is stored as sent.
         if let Some(missing) = crate::state::missing_trigger_reference(
             &store,
-            &region,
             input.workflow_name.as_deref(),
             &input.actions,
             input.predicate.as_ref(),

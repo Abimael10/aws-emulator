@@ -16,8 +16,9 @@
 //! replacement the service could not fire is refused without touching what is stored: the
 //! trigger would initiate nothing, it would lose the member its type requires, its
 //! predicate would not say whether all or any of several conditions must hold, its schedule
-//! is no cron expression, or an action or condition names a job or crawler this account
-//! does not hold.
+//! is no cron expression, or an action or condition names a crawler this account does not
+//! hold. A JOB an action runs, or a condition waits on, is LATE-BOUND: it is resolved when the
+//! trigger fires, so an update may name a job the account does not hold yet.
 //!
 //! The suites are tables: each row is one input along the axis the rule generalises over
 //! (the trigger's type, which definition members the update carries, how many actions and
@@ -625,10 +626,11 @@ async fn a_refused_update_leaves_the_stored_definition_unchanged() {
     }
 }
 
-/// An update whose action or condition names a job or crawler this account does not hold is
-/// the modelled not-found refusal, and the stored definition is untouched: the job miss is
-/// the fixed sentence every job lookup answers with, and the crawler miss names the crawler
-/// asked for.
+/// An update whose action or condition names a CRAWLER this account does not hold is the
+/// modelled not-found refusal, and the stored definition is untouched: the crawler miss names
+/// the crawler asked for. A JOB an action runs or a condition waits on is late-bound — it is
+/// resolved when the trigger fires — so an update may name one the account does not hold, which
+/// [`crate::trigger_job_late_binding`] pins.
 #[tokio::test]
 async fn an_update_naming_an_absent_target_is_the_modelled_miss() {
     let router = emulator();
@@ -636,37 +638,10 @@ async fn an_update_naming_an_absent_target_is_the_modelled_miss() {
 
     let cases: Vec<(&str, &str, Value, String)> = vec![
         (
-            "an action on a job nothing created",
-            "ON_DEMAND",
-            json!({ "Actions": [{ "JobName": "no-such-job" }] }),
-            messages::JOB_NOT_FOUND.to_string(),
-        ),
-        (
-            "one of two actions on a job nothing created",
-            "ON_DEMAND",
-            json!({ "Actions": [{ "JobName": JOB }, { "JobName": "another-absent-job" }] }),
-            messages::JOB_NOT_FOUND.to_string(),
-        ),
-        (
             "an action on a crawler nothing created",
             "ON_DEMAND",
             json!({ "Actions": [{ "CrawlerName": "no-such-crawler" }] }),
             messages::crawler_not_found("no-such-crawler"),
-        ),
-        (
-            "a condition on a job nothing created",
-            "CONDITIONAL",
-            json!({
-                "Predicate": {
-                    "Conditions": [{
-                        "LogicalOperator": "EQUALS",
-                        "JobName": "absent-condition-job",
-                        "State": "SUCCEEDED",
-                    }],
-                },
-                "Actions": [{ "JobName": JOB }],
-            }),
-            messages::JOB_NOT_FOUND.to_string(),
         ),
         (
             "a condition on a crawler nothing created",

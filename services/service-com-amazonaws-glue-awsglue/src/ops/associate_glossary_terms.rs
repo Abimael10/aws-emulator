@@ -6,9 +6,12 @@
 //! its `AssetIdentifier` names ([`crate::state::AssetEntry::glossary_terms`]), so a later
 //! `GetAsset` of that identifier reports every term any association put on it. The
 //! identifier is resolved the way every operation that addresses an asset resolves one
-//! ([`crate::state::ComAmazonawsGlueAwsglueState::asset`]), and an identifier this account
-//! holds no asset under is refused with the modelled `EntityNotFoundException` rather than
-//! creating anything.
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::holds_asset`]) — the asset a put stored
+//! under it, or the Data Catalog entity the business catalog indexes as an asset under its
+//! own ARN, whose terms are held on that entity
+//! ([`crate::state::TableEntry::glossary_terms`]) — and an identifier this catalog holds
+//! nothing under is refused with the modelled `EntityNotFoundException` rather than creating
+//! anything.
 //!
 //! Every entry of `GlossaryTermIdentifiers` is RESOLVED against the glossary term
 //! namespace ([`crate::state::ComAmazonawsGlueAwsglueState::first_unheld_glossary_term`])
@@ -238,11 +241,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
-        // The asset the association targets has to be one this account holds, and it is the
+        // The asset the association targets has to be one this catalog holds — a stored
+        // asset, or the Data Catalog entity the business catalog indexes as one
+        // (`crate::state::ComAmazonawsGlueAwsglueState::holds_asset`) — and it is the
         // resource the request ADDRESSES, so it is resolved FIRST — ahead of the terms the
         // request references — and a request whose asset and whose terms are all absent is
-        // refused naming the asset.
-        if store.asset(&input.asset_identifier).is_none() {
+        // refused naming the asset. The question is asked under the lock the merge happens
+        // under, so the record the refusal was decided against is the record the merge writes
+        // to.
+        if !store.holds_asset(&input.asset_identifier) {
             return Err(AssociateGlossaryTermsErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
                     // The same miss the asset's own reader answers, worded the one way the
@@ -297,20 +304,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The record every refusal above was decided against is the record the merge writes
-        // to: it is resolved once, mutably, under the lock the merge happens under.
-        let Some(asset) = store.asset_mut(&input.asset_identifier) else {
-            return Err(AssociateGlossaryTermsErrorModeled::EntityNotFoundException(
-                EntityNotFoundException {
-                    message: Some(crate::state::asset_not_found_message(
-                        &input.asset_identifier,
-                    )),
-                    from_federation_source: None,
-                },
-            )
-            .into());
-        };
-
-        let Some(associated) = asset.associate_glossary_terms(&input.glossary_term_identifiers)
+        // to: whichever record OWNS the terms — a stored asset's own set, or the Data Catalog
+        // entity's — is reached once, mutably, under the lock the merge happens under.
+        let Some(associated) = store
+            .associate_asset_glossary_terms(&input.asset_identifier, &input.glossary_term_identifiers)
         else {
             // The list that reports an asset's terms is bounded by the model, so an asset
             // cannot come to hold more than that many: the association is refused with the

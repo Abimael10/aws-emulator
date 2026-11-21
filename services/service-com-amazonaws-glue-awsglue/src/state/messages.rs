@@ -1748,6 +1748,15 @@ pub fn blueprint_run_workflow_exists(workflow_name: &str) -> String {
     )
 }
 
+/// A blueprint run whose layout ran and created no entity at all:
+/// `BlueprintRun$ErrorMessage`, "indicates any errors that are seen while running the
+/// blueprint". NOT recorded: what is pinned is the behaviour — a run whose layout produces no
+/// entity reaches the modelled failed state rather than the succeeded one, because there is no
+/// workflow for a caller to run — and the sentence states exactly that.
+pub const BLUEPRINT_RUN_DEPLOYED_NOTHING: &str =
+    "The blueprint's layout created no job, crawler or trigger, so the blueprint run deployed \
+     no workflow.";
+
 /// A blueprint run lookup (`GetBlueprintRun`) for a `RunId` the named blueprint holds no
 /// run under. NOT recorded: the sentence follows the per-resource template of
 /// [`column_statistics_task_run_not_found`], built from the ADDRESS the request sent — the
@@ -2217,8 +2226,18 @@ pub fn usage_profile_already_exists(name: &str) -> String {
 /// A usage profile lookup (`GetUsageProfile`, and every other operation that addresses
 /// a profile by name) for a name no profile of this account has. RECORDED template,
 /// including its wording, built from the requested `Name`.
+///
+/// The UPDATE words the same miss differently — it closes the sentence with a period
+/// ([`usage_profile_not_found_on_update`]) — which is also recorded, so the two are kept apart
+/// rather than folded into one wording.
 pub fn usage_profile_not_found(name: &str) -> String {
     format!("UsageProfile {name} does not exists")
+}
+
+/// The same miss as [`usage_profile_not_found`], as `UpdateUsageProfile` words it: RECORDED
+/// template, the same sentence closed with a period. The variable part is the requested `Name`.
+pub fn usage_profile_not_found_on_update(name: &str) -> String {
+    format!("UsageProfile {name} does not exists.")
 }
 
 /// A session create for an `Id` this Region already holds a session under — whatever the

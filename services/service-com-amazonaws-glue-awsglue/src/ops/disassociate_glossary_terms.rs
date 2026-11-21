@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateGlossaryTerms
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateGlossaryTerms`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateGlossaryTerms::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the request's `GlossaryTermIdentifiers` from the glossary term set of the asset its
+//! `AssetIdentifier` names and answers the terms that asset carries AFTERWARDS, so a later
+//! `GetAsset` of that identifier reports the same remaining set. The identifier is resolved the
+//! way every operation that addresses an asset resolves one
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::holds_asset`]) — the asset a put stored under
+//! it, or the Data Catalog entity the business catalog indexes as an asset under its own ARN —
+//! and an identifier this catalog holds nothing under is refused with the modelled
+//! `EntityNotFoundException`.
+//!
+//! An id the asset does not carry removes nothing and is not refused: the request asks for the
+//! asset to be left WITHOUT that term, which it already is, so the same disassociation sent
+//! twice reports the same set. The ids are not resolved against the glossary term namespace
+//! either — unlike an association, which may not WRITE a reference that resolves to nothing
+//! ([`crate::ops::associate_glossary_terms`]) — because removing a reference needs no live
+//! term, which is what lets a client drop the id of a term a `DeleteGlossaryTerm` has already
+//! removed.
+//!
+//! A request that names an `IterableFormName` targets an item inside one of the asset's
+//! iterable forms. Nothing writes an iterable form onto an asset — the model binds no operation
+//! that stores one — so such a request names an entity that does not exist and is refused the
+//! way the association refuses it; and the two members name ONE target together, so a request
+//! carrying one without the other is refused as invalid input.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +181,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateGlossaryTerms` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateGlossaryTermsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateGlossaryTerms"))
+        // Assets live in one per-account namespace, so nothing here depends on the
+        // request's Region.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(
+                DisassociateGlossaryTermsErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some("the Glue asset store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "The identifier of the item within the iterable form. Required when
+        // iterableFormName is specified" (`ItemIdentifier`): the two name ONE target
+        // together, so a request carrying one without the other names no target at all and is
+        // refused with the modelled `InvalidInputException`, in the one wording this surface
+        // refuses that pair with.
+        match (
+            input.iterable_form_name.as_deref(),
+            input.item_identifier.as_deref(),
+        ) {
+            (Some(_), None) => {
+                return Err(DisassociateGlossaryTermsErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(crate::state::item_identifier_required_message()),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            }
+            (None, Some(_)) => {
+                return Err(DisassociateGlossaryTermsErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(crate::state::iterable_form_name_required_message()),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            }
+            _ => {}
+        }
+
+        let mut store = state.lock();
+
+        // The asset the disassociation targets has to be one this catalog holds, asked under
+        // the lock the removal happens under — so the record the refusal was decided against
+        // is the record the removal writes to.
+        if !store.holds_asset(&input.asset_identifier) {
+            return Err(
+                DisassociateGlossaryTermsErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        // The same miss the asset's own reader answers, worded the one way the
+                        // catalog's asset surface words it.
+                        message: Some(crate::state::asset_not_found_message(
+                            &input.asset_identifier,
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // An item inside an iterable form is an entity no asset of this store carries, so
+        // such a target is the same modelled miss the association answers with.
+        if let Some(iterable_form_name) = input.iterable_form_name.as_deref() {
+            return Err(
+                DisassociateGlossaryTermsErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::iterable_form_not_found_message(
+                            iterable_form_name,
+                            &input.asset_identifier,
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let remaining = store.disassociate_asset_glossary_terms(
+            &input.asset_identifier,
+            &input.glossary_term_identifiers,
+        );
+        let Some(remaining) = remaining else {
+            // The identifier resolved a moment ago under this same lock, so there is no
+            // record for it to have stopped naming; this is reported as the same miss rather
+            // than as a success nothing wrote.
+            return Err(
+                DisassociateGlossaryTermsErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::asset_not_found_message(
+                            &input.asset_identifier,
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        };
+        ::tracing::info!(
+            operation = "DisassociateGlossaryTerms",
+            asset = %input.asset_identifier,
+            requested = input.glossary_term_identifiers.len(),
+            remaining = remaining.len(),
+            "disassociated Glue glossary terms from an asset"
+        );
+
+        // "The remaining glossary terms associated with the asset", read off the record this
+        // wrote, so a later `GetAsset` of the same identifier reports the same set. The two
+        // item members are echoed as the request sent them, which for a disassociation from
+        // the asset itself is nothing at all.
+        Ok(DisassociateGlossaryTermsOutput {
+            asset_identifier: Some(input.asset_identifier.clone()),
+            iterable_form_name: input.iterable_form_name.clone(),
+            item_identifier: input.item_identifier.clone(),
+            glossary_terms: Some(remaining),
+        })
     }
 }

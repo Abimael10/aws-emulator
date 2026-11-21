@@ -439,15 +439,17 @@ pub(super) fn same_event_batching_condition(
     }
 }
 
-/// One Glue entity a trigger's definition names: the workflow it belongs to, the job an
-/// action runs or a condition waits on, or the crawler of either.
+/// One Glue entity a trigger's definition names and that has to exist for the definition to
+/// be written: the workflow it belongs to, or the crawler an action runs or a condition waits
+/// on.
+///
+/// A JOB an action runs or a condition waits on is NOT one of them: that reference is
+/// late-bound ([`missing_trigger_reference`]).
 ///
 /// Returned by [`missing_trigger_reference`], so a refusal can say which kind of entity it
 /// could not find and under which name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TriggerReference<'a> {
-    /// `Action$JobName` or `Condition$JobName`.
-    Job(&'a str),
     /// `Action$CrawlerName` or `Condition$CrawlerName`.
     Crawler(&'a str),
     /// `CreateTriggerRequest$WorkflowName`.
@@ -457,13 +459,9 @@ pub enum TriggerReference<'a> {
 impl TriggerReference<'_> {
     /// How a trigger write refuses the definition that names this missing entity: the
     /// wording the lookup of THAT kind of entity answers with wherever it is made, so a
-    /// create and an update report one missing job, crawler or workflow alike.
+    /// create and an update report one missing crawler or workflow alike.
     pub fn refusal_message(&self) -> String {
         match self {
-            // The job-definition miss is the same fixed sentence wherever a job is looked
-            // up, so a trigger that would run a job nothing holds is refused with it too,
-            // and discloses no name.
-            Self::Job(_) => messages::JOB_NOT_FOUND.to_string(),
             Self::Crawler(name) => messages::crawler_not_found(name),
             // The workflow miss is the same fixed sentence wherever a workflow is looked
             // up, so a trigger that would belong to a workflow nothing holds is refused
@@ -565,22 +563,29 @@ pub(super) fn job_is_predicate_and_action(actions: &[Action], predicate: Option<
         .any(|action_job| condition_jobs.contains(action_job))
 }
 
-/// The first workflow, job or crawler a trigger's definition names that this store holds
-/// no record of, or `None` when every one of them is a stored entity.
+/// The first workflow or crawler a trigger's definition names that this store holds no
+/// record of, or `None` when every one of them is a stored entity.
 ///
 /// A trigger belongs to the workflow it names and runs the actions and waits on the
-/// conditions it carries, so the definition is resolvable only if those entities exist;
-/// `region` is the Region the request is served in, which is where its job definitions
-/// live, while a workflow and a crawler live in one per-account namespace. An
-/// `Action$SecurityConfiguration` is NOT resolved here: it configures how an action runs
-/// rather than naming the entity the action initiates.
+/// conditions it carries, so those entities have to exist for the definition to be written. A
+/// workflow and a crawler live in one per-account namespace, so nothing here is resolved per
+/// Region. An `Action$SecurityConfiguration` is NOT resolved here: it configures how an action
+/// runs rather than naming the entity the action initiates.
+///
+/// A JOB an action runs or a condition waits on is resolved NOWHERE here, because that
+/// reference is LATE-BOUND: `Action$JobName` is "the name of a job to be run" and what
+/// resolves it is the FIRING — the run a fired trigger begins is begun against the job
+/// definition the Region holds at that instant
+/// ([`ComAmazonawsGlueAwsglueState::initiate_trigger_actions`], where an action naming a job
+/// that Region does not hold begins no run). So a write stores the job name as given and a
+/// trigger may be written ahead of the job it will run, which is what lets a deployment
+/// create its triggers before the jobs they point at.
 ///
 /// The walk visits each action once and each condition once — the conditions bounded by
 /// the modelled `ConditionList` length of at most 500, the actions by the request body the
 /// transport accepted — and every lookup is a map probe.
 pub fn missing_trigger_reference<'a>(
     store: &ComAmazonawsGlueAwsglueState,
-    region: &str,
     workflow_name: Option<&'a str>,
     actions: &'a [Action],
     predicate: Option<&'a Predicate>,
@@ -590,29 +595,15 @@ pub fn missing_trigger_reference<'a>(
             return Some(TriggerReference::Workflow(workflow_name));
         }
     }
-    let action_targets = actions
-        .iter()
-        .map(|action| (action.job_name.as_deref(), action.crawler_name.as_deref()));
+    let action_targets = actions.iter().map(|action| action.crawler_name.as_deref());
     let condition_targets = predicate
         .and_then(|predicate| predicate.conditions.as_ref())
         .into_iter()
         .flatten()
-        .map(|condition| {
-            (
-                condition.job_name.as_deref(),
-                condition.crawler_name.as_deref(),
-            )
-        });
-    for (job_name, crawler_name) in action_targets.chain(condition_targets) {
-        if let Some(job_name) = job_name {
-            if store.job(region, job_name).is_none() {
-                return Some(TriggerReference::Job(job_name));
-            }
-        }
-        if let Some(crawler_name) = crawler_name {
-            if store.crawler(crawler_name).is_none() {
-                return Some(TriggerReference::Crawler(crawler_name));
-            }
+        .map(|condition| condition.crawler_name.as_deref());
+    for crawler_name in action_targets.chain(condition_targets).flatten() {
+        if store.crawler(crawler_name).is_none() {
+            return Some(TriggerReference::Crawler(crawler_name));
         }
     }
     None

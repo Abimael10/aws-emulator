@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateGlossaryTerm
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateGlossaryTerm`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateGlossaryTerm::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the members an update names to the glossary term this account holds under the
+//! requested `GlossaryTermId` and reports the record it wrote, so a later `GetGlossaryTerm`
+//! of that id reports the same term.
+//!
+//! `Identifier` is the whole address of a term, so an id this account holds no term under —
+//! one never created, or one a delete has since removed — updates nothing and is refused
+//! with the modelled `EntityNotFoundException`, worded the one way every operation that
+//! resolves a `GlossaryTermId` words that miss
+//! ([`crate::state::glossary_term_not_found_message`]).
+//!
+//! A term's name identifies it WITHIN its glossary, so a rename onto a name another term of
+//! the same glossary already carries is refused with `AlreadyExistsException`, the same
+//! collision `CreateGlossaryTerm` refuses and under the same wording.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +168,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateGlossaryTerm` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateGlossaryTermErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateGlossaryTerm"))
+        // Glossary terms live in one per-account namespace, so nothing here depends on the
+        // request's Region — exactly as `CreateGlossaryTerm`, `GetGlossaryTerm` and
+        // `DeleteGlossaryTerm` read it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(UpdateGlossaryTermErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue glossary store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // The ONE wording every operation that resolves a `GlossaryTermId` words a miss
+        // with, built once here because both the resolve below and the write that follows it
+        // report the same miss.
+        let missing = || -> UpdateGlossaryTermError {
+            UpdateGlossaryTermErrorModeled::EntityNotFoundException(EntityNotFoundException {
+                message: Some(crate::state::glossary_term_not_found_message(
+                    &input.identifier,
+                )),
+                from_federation_source: None,
+            })
+            .into()
+        };
+
+        let mut store = state.lock();
+
+        // `Identifier` is the whole address of a term, so an identifier this account holds
+        // no term under updates nothing and is refused. Judged before anything is written,
+        // so a refused update leaves the store as it was.
+        let Some(stored) = store.glossary_term(&input.identifier) else {
+            return Err(missing());
+        };
+        let glossary_id = stored.glossary_id.clone();
+
+        // A term's name identifies it within its glossary, so that glossary holds one term
+        // per name: a rename onto a name ANOTHER term of the same glossary already carries is
+        // refused, the same collision `CreateGlossaryTerm` refuses and under the same
+        // wording. A request that restates this term's own name collides with nothing, so
+        // re-sending an update is served rather than refused, and the same name in another
+        // glossary is a different term and is free.
+        if let Some(requested) = input.name.as_deref() {
+            if store
+                .glossary_term_by_name(&glossary_id, requested)
+                .is_some_and(|other| other.id != input.identifier)
+            {
+                return Err(UpdateGlossaryTermErrorModeled::AlreadyExistsException(
+                    AlreadyExistsException {
+                        message: Some(crate::state::glossary_term_already_exists_message(
+                            &glossary_id,
+                            requested,
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Modelled constraints — the required `Identifier`, the `Name` and description
+        // lengths and the `ClientToken` pattern — are refused before this handler runs, so
+        // the only thing left is to write the members the request named.
+        let Some(entry) = store.glossary_term_mut(&input.identifier) else {
+            return Err(missing());
+        };
+        entry.apply_update(&input, ::std::time::SystemTime::now());
+        let stored = entry.clone();
+        ::tracing::info!(
+            operation = "UpdateGlossaryTerm",
+            glossary = %stored.glossary_id,
+            term = %stored.id,
+            "updated a Glue glossary term"
+        );
+
+        // Every member comes from the record just written, so the update reports exactly
+        // what a later `GetGlossaryTerm` of this id will.
+        Ok(UpdateGlossaryTermOutput {
+            id: Some(stored.id),
+            glossary_id: Some(stored.glossary_id),
+            name: Some(stored.name),
+            short_description: stored.short_description,
+            long_description: stored.long_description,
+        })
     }
 }

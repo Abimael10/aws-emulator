@@ -39,7 +39,9 @@ use service_com_amazonaws_glue_awsglue::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::blueprint_archive_registration::{make_settlement_due, read, stage_archive};
+use crate::blueprint_archive_registration::{
+    make_settlement_due, read, stage_archive, PUBLISHED_ARCHIVE,
+};
 use crate::job_runs::{RUN_AT_REST_DEADLINE, RUN_POLL_INTERVAL};
 use crate::job_script_execution::{create_bucket, emulator_with_s3, BUCKET};
 use crate::wire::ok;
@@ -164,7 +166,7 @@ async fn an_unreadable_archive_settles_failed_reporting_the_location_it_could_no
     for (index, row) in unreadable_locations().iter().enumerate() {
         let case = row.case;
         if let Some(key) = row.staged {
-            stage_archive(&router, key).await;
+            stage_archive(&router, key, PUBLISHED_ARCHIVE.to_vec()).await;
         }
         let location = row.location();
         let name = format!("terminal-failure-{index}");
@@ -211,7 +213,7 @@ async fn a_failed_registration_never_reaches_active() {
 
     // The archive lands at the very location the registration named — after that
     // registration already came to rest.
-    let staged = stage_archive(&router, key).await;
+    let staged = stage_archive(&router, key, PUBLISHED_ARCHIVE.to_vec()).await;
     assert_eq!(
         staged, location,
         "case {case}: the archive must be staged at the location the create named, got {staged:?}"
@@ -248,7 +250,7 @@ async fn a_polling_client_observes_the_terminal_status_each_archive_decides() {
     let (router, _engine) = emulator_with_s3();
     create_bucket(&router).await;
 
-    let served = stage_archive(&router, "polled/served.zip").await;
+    let served = stage_archive(&router, "polled/served.zip", PUBLISHED_ARCHIVE.to_vec()).await;
     let unserved = format!("s3://{BUCKET}/polled/never-served.zip");
     let cases = [
         (

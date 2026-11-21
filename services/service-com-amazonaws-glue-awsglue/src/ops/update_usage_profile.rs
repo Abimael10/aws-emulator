@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateUsageProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateUsageProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateUsageProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the configuration an update carries onto the usage profile this account holds
+//! under the requested `Name` and answers with that name, so a later `GetUsageProfile`
+//! reports what this wrote.
+//!
+//! A usage profile is addressed by `Name` alone, so a name this account holds no profile
+//! under — one never created, or one a delete has since removed — updates nothing and is
+//! refused with the modelled `EntityNotFoundException`. This operation words that miss with the
+//! sentence a read words it with, closed with a period
+//! ([`crate::state::messages::usage_profile_not_found_on_update`]), which is how the recorded
+//! responses word it here.
+//!
+//! `Configuration` is `@required`, so what the request carries REPLACES the stored parameter
+//! set; a configuration whose parameters contradict their own bounds configures a parameter
+//! no value satisfies and is refused with `InvalidInputException` before anything is written,
+//! exactly as the create refuses it
+//! ([`crate::state::usage_profile_configuration_defect`]).
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +163,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateUsageProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateUsageProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateUsageProfile"))
+        // Usage profiles live in one per-account namespace, so nothing here depends on the
+        // request's Region — exactly as `CreateUsageProfile`, `GetUsageProfile` and
+        // `DeleteUsageProfile` read them.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(UpdateUsageProfileErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue usage profile store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+
+        // `Name` is the whole address of a usage profile, so a name this account holds no
+        // profile under updates nothing and is refused — with the one wording every
+        // operation that resolves such a name words that miss. Judged before anything is
+        // written, so a refused update leaves the store as it was.
+        if !store.usage_profiles.contains_key(&input.name) {
+            return Err(UpdateUsageProfileErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::usage_profile_not_found_on_update(
+                        &input.name,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        // A `ProfileConfiguration` whose parameters contradict their own bounds configures a
+        // parameter no value satisfies, so it is refused as invalid input BEFORE anything is
+        // written and the store never comes to hold a profile a read could not report — the
+        // same rule, in the same wording, the create enforces.
+        if let Some(message) =
+            crate::state::usage_profile_configuration_defect(&input.configuration)
+        {
+            return Err(UpdateUsageProfileErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        let Some(entry) = store.usage_profiles.get_mut(&input.name) else {
+            return Err(UpdateUsageProfileErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::usage_profile_not_found_on_update(
+                        &input.name,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        entry.apply_update(&input, ::std::time::SystemTime::now());
+        ::tracing::info!(
+            operation = "UpdateUsageProfile",
+            usage_profile = %input.name,
+            "updated a Glue usage profile"
+        );
+
+        // "The name of the usage profile that was updated" — the name the record this write
+        // landed in is stored under, which is what a later read addresses it by.
+        Ok(UpdateUsageProfileOutput {
+            name: Some(input.name),
+        })
     }
 }

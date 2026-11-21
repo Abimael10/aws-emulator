@@ -111,6 +111,25 @@ impl UsageProfileEntry {
             last_modified_on: Some(to_date_time(self.last_modified_on)),
         }
     }
+
+    /// Apply an `UpdateUsageProfile` request to this record, as served at `now`.
+    ///
+    /// `Configuration` is `@required` on that request, so the configuration it carries
+    /// REPLACES the stored one wholesale — the update states the whole parameter set, not a
+    /// patch of it — while `Description` is optional and so replaces the stored description
+    /// only when the request names one.
+    ///
+    /// [`Self::name`] is the profile's address and [`Self::created_on`] is the create's, so
+    /// neither moves; [`Self::last_modified_on`] moves to `now`, because this write changes
+    /// the profile. [`Self::tags`] are written by the tagging operations and are no member of
+    /// this request.
+    pub fn apply_update(&mut self, input: &UpdateUsageProfileInput, now: SystemTime) {
+        self.configuration = input.configuration.clone();
+        if let Some(description) = input.description.clone() {
+            self.description = Some(description);
+        }
+        self.last_modified_on = now;
+    }
 }
 
 /// Why the service refuses a submitted `ProfileConfiguration`, as the `Message` of the

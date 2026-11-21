@@ -14757,6 +14757,7 @@ dependencies = [
  "sqlparser",
  "tokio",
  "tracing",
+ "zip",
 ]
 
 [[package]]
