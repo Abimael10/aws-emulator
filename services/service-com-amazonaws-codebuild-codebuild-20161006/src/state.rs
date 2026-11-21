@@ -68,6 +68,9 @@ mod build_image;
 mod build_logs;
 /// The CloudWatch metrics a build that ENDED publishes about itself.
 pub mod build_metrics;
+/// WHEN a build leaves the queue, what it occupies while it runs, and what it reports
+/// while it is still running.
+mod build_queue;
 /// The REPORTS a build produces: the report runs its buildspec declared, read from the
 /// result files its own commands wrote.
 mod build_reports;
@@ -113,6 +116,7 @@ pub use build_events::*;
 pub use build_image::*;
 pub use build_logs::*;
 pub use build_metrics::{publish_completed_builds, CompletedBuild};
+pub use build_queue::*;
 pub use build_reports::*;
 pub use build_run::*;
 pub use build_secrets::*;
@@ -1113,9 +1117,27 @@ pub struct StoredBuild {
     /// The same for each of the build's secondary output artifacts, in the order it runs
     /// with them.
     pub secondary_artifacts: Vec<ProjectArtifacts>,
-    /// Set once this build's run has been CLAIMED by the operation that is performing it
-    /// ([`build_run::settle_due_builds`]), so two calls that arrive together run it once.
+    /// Set once this build has been admitted onto a machine and its run CLAIMED by the
+    /// operation that is performing it ([`build_run::settle_due_builds`]), so two calls that
+    /// arrive together run it once.
+    ///
+    /// It is also what says the build is no longer waiting in the queue: a build that is on
+    /// a machine and has not finished occupies one of its fleet's
+    /// ([`ComAmazonawsCodebuildCodebuild20161006State::due_builds`]).
     pub run_claimed: bool,
+    /// Set when the capacity this build was admitted onto is a machine of the compute fleet
+    /// its environment names, as against CodeBuild's on-demand capacity — which an overflow
+    /// build of a fleet that runs its overflow on demand gets, and which this emulator does
+    /// not ration.
+    ///
+    /// It is what says the build is accounted against its fleet's machines: one of them is
+    /// taken until this build's own window closes
+    /// ([`ComAmazonawsCodebuildCodebuild20161006State::due_builds`]).
+    pub on_fleet_machine: bool,
+    /// What this build's run answered, while the build is still EXECUTING the time its own
+    /// commands state they take — `None` for a build that is not running, and for one whose
+    /// run has already become the record every reader sees ([`ExecutingRun`]).
+    pub executing: Option<ExecutingRun>,
 }
 
 /// A persisted compute fleet: the modelled [`Fleet`] plus the instants its
@@ -2191,20 +2213,7 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
     /// region, account, resource type or fleet id can never resolve to a local
     /// record.
     pub fn fleet_key(&self, identifier: &str) -> Option<String> {
-        let by_arn = identifier.starts_with("arn:");
-        let name = if by_arn {
-            // A fleet id is `<name>:<uuid>`, and the name is what the store is
-            // keyed by. The ARN itself is parsed by the one parser every
-            // fleet-addressing operation uses ([`fleet_id_from_arn`]).
-            fleet_id_from_arn(identifier)?.split_once(':')?.0
-        } else {
-            identifier
-        };
-        let stored = self.fleets.get(name)?;
-        if by_arn && stored.fleet.arn.as_deref() != Some(identifier) {
-            return None;
-        }
-        Some(name.to_string())
+        fleet_key_in(&self.fleets, identifier)
     }
 
     /// Start the deletion of the compute fleet `identifier` addresses, handing back
@@ -2246,120 +2255,6 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
             });
         }
         Some(stored)
-    }
-
-    /// Read a build as it stands.
-    ///
-    /// It makes no write: the transition out of `IN_PROGRESS` is the RUN of the build's
-    /// buildspec, which is performed by the operation that reads it
-    /// ([`build_run::settle_due_builds`], called before this one takes the lock) rather
-    /// than here — a run reads a caller-supplied specification and puts the build's output
-    /// in the object store, and neither can happen inside a critical section every other
-    /// request of this service shares.
-    pub fn settled_build(&mut self, id: &str, now_millis: i64) -> Option<&StoredBuild> {
-        let _ = now_millis;
-        self.builds.get(id)
-    }
-
-    /// Claim every build whose run the clock owes, for the operation that is about to
-    /// perform those runs ([`build_run::settle_due_builds`]).
-    ///
-    /// A claimed build is marked as claimed under this one lock, so a run is performed
-    /// once however many calls arrive together: the others see a build that is still
-    /// `IN_PROGRESS`, which is what it is until its run has happened.
-    pub fn claim_due_build_runs(&mut self, now_millis: i64) -> Vec<build_run::ClaimedRun> {
-        // Which caches may be restored is a question about the PROJECT — a cache reset
-        // after the last save discarded it — and it is answered before the builds are
-        // taken mutably.
-        let cache_restorable: BTreeMap<String, bool> = self
-            .projects
-            .iter()
-            .map(|(name, stored)| {
-                let restorable = match (stored.cache_invalidated_millis, stored.cache_saved_millis)
-                {
-                    (Some(reset), Some(saved)) => saved >= reset,
-                    (Some(_), None) => false,
-                    _ => true,
-                };
-                (name.clone(), restorable)
-            })
-            .collect();
-        let mut claimed = Vec::new();
-        for (id, stored) in self.builds.iter_mut() {
-            let due = !stored.build.build_complete
-                && now_millis >= stored.settle_due_millis
-                && !stored.run_claimed;
-            if !due {
-                continue;
-            }
-            stored.run_claimed = true;
-            // A build is keyed by `<projectName>:<uuid>`, so the project it belongs to is
-            // known from the key even for a record that states none.
-            let project_name = stored
-                .build
-                .project_name
-                .clone()
-                .or_else(|| project_name_from_resource_id(id).map(str::to_string))
-                .unwrap_or_default();
-            claimed.push(build_run::ClaimedRun {
-                id: id.clone(),
-                build: stored.build.clone(),
-                project_name: project_name.clone(),
-                artifacts: stored.artifacts.clone(),
-                secondary_artifacts: stored.secondary_artifacts.clone(),
-                start_millis: stored.start_millis,
-                due_millis: stored.settle_due_millis,
-                cache_restorable: cache_restorable
-                    .get(&project_name)
-                    .copied()
-                    .unwrap_or(true),
-            });
-        }
-        claimed
-    }
-
-    /// Record what one claimed run answered ([`StoredBuild::record_run`]), the report runs it
-    /// produced ([`build_reports::record_build_reports`]), and the instant the cache it saved
-    /// was written at, which is what a later build restores against the project's last cache
-    /// reset.
-    ///
-    /// Answers the build this call COMPLETED, for the metrics CodeBuild publishes about a
-    /// build that ended ([`build_metrics`]) — `None` when the record had already reached its
-    /// outcome, so one build is metered once however many runs are recorded for it.
-    pub fn record_build_run(
-        &mut self,
-        claimed: &build_run::ClaimedRun,
-        region: &str,
-        recorded: build_run::RecordedRun,
-    ) -> Option<CompletedBuild> {
-        // The reports the build produced go in first: they are what its own commands wrote,
-        // read in the format its buildspec declared, and the build REPORTS the ARN of each
-        // one that was written ([`Build::report_arns`]).
-        let report_arns =
-            build_reports::record_build_reports(self, claimed, region, &recorded.reports);
-        // The instant the build's last phase ended at, which is the instant the build ended
-        // at ([`buildspec::BuildRun::ended_millis`]) — read before the run is recorded, and
-        // what the metrics this build is metered by are stamped with.
-        let ended_millis = recorded.run.ended_millis;
-        let mut completed = None;
-        if let Some(stored) = self.builds.get_mut(&claimed.id) {
-            let was_complete = stored.build.build_complete;
-            stored.record_run(
-                recorded.run,
-                recorded.artifacts,
-                &recorded.secondary_artifacts,
-                report_arns,
-            );
-            if !was_complete && stored.build.build_complete {
-                completed = Some(stored.completed_build(&claimed.project_name, ended_millis));
-            }
-        }
-        if let Some(saved) = recorded.cache_saved_millis {
-            if let Some(project) = self.projects.get_mut(&claimed.project_name) {
-                project.cache_saved_millis = Some(saved);
-            }
-        }
-        completed
     }
 
     /// Read a batch build, first materialising the transition the clock already
@@ -2881,87 +2776,6 @@ impl StoredFleet {
     }
 }
 
-impl StoredBuild {
-    /// Record what running this build answered: the status and phases it ended with, the
-    /// variables it exported, and what it reports for the artifacts it put at their
-    /// destinations.
-    ///
-    /// The ONE place a finished build's record is written. A build's run is performed by
-    /// the operation that read it ([`build_run::settle_due_builds`]) and never under this
-    /// store's lock: the run reads a caller-supplied buildspec and puts the build's output
-    /// in the object store, and neither belongs in a critical section every other request
-    /// of this service shares.
-    ///
-    /// Idempotent: a build that is already complete keeps the outcome it reached, so a run
-    /// recorded for a build something else has meanwhile finished — a `StopBuild` that
-    /// stopped it — changes nothing.
-    pub fn record_run(
-        &mut self,
-        run: BuildRun,
-        artifacts: Option<BuildArtifacts>,
-        secondary_artifacts: &[(String, BuildArtifacts)],
-        report_arns: Vec<String>,
-    ) {
-        if self.build.build_complete {
-            return;
-        }
-        // "An array of the ARNs associated with this build's reports": the runs this build
-        // minted for the groups its buildspec declared
-        // ([`build_reports::record_build_reports`]). A build that declared none, or whose
-        // declarations minted nothing, is associated with no report and states none.
-        if !report_arns.is_empty() {
-            self.build.report_arns = Some(report_arns);
-        }
-        self.build.build_status = Some(run.status);
-        self.build.current_phase = Some("COMPLETED".to_string());
-        self.build.build_complete = true;
-        // The build ENDED where its last phase ended: the phases a build ran occupy the time
-        // their own commands took ([`buildspec::BuildClock`]), so the build's own window is
-        // the one every phase window it reports lies inside.
-        self.build.end_time = Some(datetime(run.ended_millis));
-        self.build.phases = Some(run.phases);
-        self.build.exported_environment_variables = run.exported_variables;
-        // Once the environment has been provisioned, the build reports the environment it
-        // RAN IN rather than only the one it was started with: CodeBuild starts a build
-        // container with its own entrypoint — the agent that runs the buildspec — rather
-        // than the entrypoint of the image, so a build that got an environment reports
-        // that. A build whose provisioning failed never had one, so it reports none.
-        if run.environment_provisioned {
-            if let Some(environment) = self.build.environment.as_mut() {
-                environment.custom_entrypoint = Some(true);
-            }
-        }
-        if let Some(artifacts) = artifacts {
-            self.build.artifacts = Some(artifacts);
-        }
-        for (identifier, uploaded) in secondary_artifacts {
-            for reported in self.build.secondary_artifacts.iter_mut().flatten() {
-                if reported.artifact_identifier.as_deref() == Some(identifier.as_str()) {
-                    *reported = uploaded.clone();
-                }
-            }
-        }
-    }
-
-    /// What this build, now that it has ENDED, is metered by ([`build_metrics`]): the
-    /// project its series are dimensioned on, the status it ended in, and the instants it
-    /// started and ended at.
-    ///
-    /// `project_name` is the project the build belongs to, as the caller resolved it — off
-    /// the record, or off the id the store keys the build by. `end_millis` is the instant
-    /// the call that ended the build recorded as its `endTime`, so the duration published
-    /// is the span the record itself reports.
-    #[must_use]
-    pub fn completed_build(&self, project_name: &str, end_millis: i64) -> CompletedBuild {
-        CompletedBuild {
-            project_name: project_name.to_string(),
-            status: self.build.build_status.clone().unwrap_or_default(),
-            start_millis: self.start_millis,
-            end_millis,
-        }
-    }
-}
-
 impl StoredBuildBatch {
     /// Report each build group's build with what that build's own record now carries,
     /// keyed by the ARN the group names it by
@@ -3470,6 +3284,37 @@ pub fn fleet_arn(region: &str, id: &str) -> String {
 /// fleet id's own `<name>:<uuid>` colon is kept intact.
 pub fn fleet_id_from_arn(arn: &str) -> Option<&str> {
     resource_from_arn(arn, "fleet/")
+}
+
+/// [`ComAmazonawsCodebuildCodebuild20161006State::fleet_key`] over the fleets alone: the
+/// `fleets` key of the fleet `identifier` addresses, if the account holds it.
+///
+/// The one resolution, as a function of the map rather than of the whole store, so a caller
+/// that has taken the store's fields apart — the admission pass, which holds the builds
+/// mutably while it asks about their fleets ([`build_queue`]) — resolves an identifier
+/// exactly as every fleet-addressing operation does.
+///
+/// An identifier that is not an ARN is a fleet name, which is what the store is keyed by. An
+/// ARN is resolved the way [`ComAmazonawsCodebuildCodebuild20161006State::report_group_by_arn`]
+/// resolves a report group's — the name comes out of the ARN's resource segment for the map
+/// lookup, and the candidate is kept only if its STORED ARN is exactly the one asked for, so
+/// an ARN for another partition, region, account, resource type or fleet id can never resolve
+/// to a local record.
+pub fn fleet_key_in(fleets: &BTreeMap<String, StoredFleet>, identifier: &str) -> Option<String> {
+    let by_arn = identifier.starts_with("arn:");
+    let name = if by_arn {
+        // A fleet id is `<name>:<uuid>`, and the name is what the store is keyed by. The ARN
+        // itself is parsed by the one parser every fleet-addressing operation uses
+        // ([`fleet_id_from_arn`]).
+        fleet_id_from_arn(identifier)?.split_once(':')?.0
+    } else {
+        identifier
+    };
+    let stored = fleets.get(name)?;
+    if by_arn && stored.fleet.arn.as_deref() != Some(identifier) {
+        return None;
+    }
+    Some(name.to_string())
 }
 
 /// The CodeBuild endpoint a project's webhook events are sent to, as

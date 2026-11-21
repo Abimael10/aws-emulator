@@ -529,6 +529,8 @@ mod tests {
                 artifacts: None,
                 secondary_artifacts: Vec::new(),
                 run_claimed: false,
+                on_fleet_machine: false,
+                executing: None,
             },
         );
         store.record_build_state_changes("us-west-2");

@@ -97,9 +97,12 @@ pub async fn settle_due_builds<Eng: Send + Sync + 'static>(
     state: &::engine::ServiceState<ComAmazonawsCodebuildCodebuild20161006State>,
     region: &str,
 ) {
-    let claimed = state.lock().claim_due_build_runs(now_millis());
-    let mut completed = Vec::new();
-    for run in claimed {
+    // Where every build now stands: the ones a machine is free for are admitted here, the
+    // ones still running report the phase they are in, and the ones whose queue window ran
+    // out end here ([`super::build_queue`]).
+    let due = state.lock().due_builds(now_millis());
+    let mut completed = due.completed;
+    for run in due.runs {
         let recorded = perform(callback, engine, region, &run).await;
         completed.extend(state.lock().record_build_run(&run, region, recorded));
     }

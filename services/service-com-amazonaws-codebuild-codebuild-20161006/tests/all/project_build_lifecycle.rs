@@ -1345,6 +1345,8 @@ async fn each_per_request_store_is_bounded_at_its_growth_site() {
                     artifacts: None,
                     secondary_artifacts: Vec::new(),
                     run_claimed: false,
+                    on_fleet_machine: false,
+                    executing: None,
                 },
             );
         }

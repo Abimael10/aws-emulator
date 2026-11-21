@@ -648,6 +648,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             .clone()
                             .unwrap_or_default(),
                         run_claimed: false,
+                        on_fleet_machine: false,
+                        executing: None,
                     },
                 ));
             }

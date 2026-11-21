@@ -597,6 +597,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     artifacts: artifacts_destination.clone(),
                     secondary_artifacts: secondary_destinations.clone().unwrap_or_default(),
                     run_claimed: false,
+                    // Nothing has run for this build yet: it is waiting in the queue for
+                    // capacity to take it (`crate::state::due_builds`).
+                    on_fleet_machine: false,
+                    executing: None,
                 },
             );
             if let Some(key) = token_key {

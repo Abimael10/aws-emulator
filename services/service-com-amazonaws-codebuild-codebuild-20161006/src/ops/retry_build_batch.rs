@@ -389,6 +389,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         artifacts: configured_artifacts.clone(),
                         secondary_artifacts: configured_secondary_artifacts.clone(),
                         run_claimed: false,
+                        on_fleet_machine: false,
+                        executing: None,
                     },
                 ));
             }

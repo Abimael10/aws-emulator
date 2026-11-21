@@ -377,6 +377,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     artifacts: retried_artifacts,
                     secondary_artifacts: retried_secondary_artifacts,
                     run_claimed: false,
+                    on_fleet_machine: false,
+                    executing: None,
                 },
             );
             if let Some(key) = token_key {

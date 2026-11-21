@@ -504,6 +504,8 @@ async fn the_builds_of_a_deleted_batch_build_are_deleted_with_it() {
                         artifacts: None,
                         secondary_artifacts: Vec::new(),
                         run_claimed: false,
+                        on_fleet_machine: false,
+                        executing: None,
                     },
                 );
             }
