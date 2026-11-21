@@ -482,12 +482,21 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// (`^arn:aws(-(cn|us-gov|iso(-[bef])?))?:glue:`).
 pub const ARN_NAMESPACE: &str = "glue";
 
-/// A wall-clock instant as the modelled timestamp type.
+/// A wall-clock instant as the modelled timestamp type, at the resolution this API's wire
+/// form carries: WHOLE MILLISECONDS.
+///
+/// Every `Timestamp` of this service is serialised in the `epoch-seconds` form its
+/// `awsJson1_1` protocol defines — a JSON number of seconds since the epoch whose
+/// fractional part is the sub-second remainder — and the finest sub-second remainder the
+/// API states an instant to is a millisecond, so an instant is reduced to whole
+/// milliseconds here, before it ever reaches a response. The host clock reads nanoseconds;
+/// handing those straight to the serializer would render a fractional part of up to nine
+/// digits, a number of a form this API does not emit.
+///
+/// ONE copy, shared by every path of this crate that reports an instant, so no response
+/// member can carry a finer value than the wire form admits.
 pub fn to_date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
-    let since_epoch = at
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    ::aws_smithy_types::DateTime::from_secs_f64(since_epoch.as_secs_f64())
+    ::aws_smithy_types::DateTime::from_millis(to_unix_millis(at))
 }
 
 /// The same instant as the `LongValue` members that carry "the unix time and date"

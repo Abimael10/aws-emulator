@@ -16,9 +16,14 @@
 //! added (so the schema version rises) and dropped (so it falls), the authentication
 //! configuration cleared, and the catalog named explicitly rather than defaulted.
 
-use serde_json::{json, Value};
+use std::sync::Arc;
+use std::time::Duration;
 
-use crate::wire::{assert_echoed, call, emulator, error_code, ok, ACCOUNT_ID};
+use aws_smithy_types::DateTime;
+use serde_json::{json, Value};
+use service_com_amazonaws_glue_awsglue::state::ComAmazonawsGlueAwsglueState;
+
+use crate::wire::{assert_echoed, call, emulator, emulator_on, error_code, ok, ACCOUNT_ID};
 
 /// The members a `ConnectionInput` sets that a `Connection` reports back, so a row can
 /// assert both directions of the rule: a member the update sent round-trips, a member it
@@ -181,9 +186,37 @@ async fn read_connection(
         .unwrap_or_else(|| panic!("GetConnection must report a Connection, got {answer}"))
 }
 
+/// How far back a stored connection is aged before the update under test, so the write
+/// lands in a LATER millisecond than the create did.
+///
+/// Every instant this API reports is carried at millisecond resolution, so a create and an
+/// update served back to back in one process can fall in the same millisecond and report one
+/// number. Aging the record is what makes the two writes separable, which is the case a
+/// client sees: it fixes the elapsed time instead of leaving it to how fast the host runs.
+const AGED_BY: Duration = Duration::from_secs(1);
+
+/// Pull the instants a stored connection carries back by [`AGED_BY`].
+fn age_connection(engine: &Arc<engine::InMemoryEngine>, catalog_id: &str, name: &str) {
+    let state = engine.state::<ComAmazonawsGlueAwsglueState>();
+    let mut store = state.lock();
+    let entry = store
+        .connection_mut(catalog_id, name)
+        .unwrap_or_else(|| panic!("the store must hold connection {name:?}"));
+    entry.definition.creation_time = entry.definition.creation_time.map(aged);
+    entry.definition.last_updated_time = entry.definition.last_updated_time.map(aged);
+}
+
+/// One stored instant, [`AGED_BY`] earlier.
+fn aged(at: DateTime) -> DateTime {
+    let millis = at.to_millis().expect("a representable instant");
+    let back = i64::try_from(AGED_BY.as_millis()).expect("a representable span");
+    DateTime::from_millis(millis - back)
+}
+
 #[tokio::test]
 async fn an_update_replaces_the_whole_stored_connection_definition() {
-    let router = emulator();
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator_on(engine.clone());
 
     for row in update_rows() {
         let mut create = json!({ "ConnectionInput": row.created });
@@ -198,6 +231,13 @@ async fn an_update_replaces_the_whole_stored_connection_definition() {
             status, 200,
             "case {:?}: CreateConnection must answer 200, got {status} with body {body}",
             row.case
+        );
+        // The create's instants are aged, so the update's own instant is in a later
+        // millisecond than the creation instant and the two are told apart on the wire.
+        age_connection(
+            &engine,
+            row.catalog_id.unwrap_or(ACCOUNT_ID),
+            row.name,
         );
         let before = read_connection(&router, row.name, row.catalog_id).await;
         let created_at = before.get("CreationTime").and_then(Value::as_f64);

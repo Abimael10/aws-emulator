@@ -23,11 +23,15 @@
 //! a ceiling of zero, of one and a large one, a name carrying whitespace) and — for the
 //! refusals — the form of the name, including each published length bound and one past it.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_glue_awsglue::state::messages::WORKFLOW_NOT_FOUND;
+use service_com_amazonaws_glue_awsglue::state::ComAmazonawsGlueAwsglueState;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::wire::{assert_echoed, call, emulator, error_code, error_message, ok};
+use crate::wire::{assert_echoed, call, emulator, emulator_on, error_code, error_message, ok};
 use crate::workflow_run_properties::{
     get_properties, register_job, register_workflow, start_run,
 };
@@ -73,6 +77,27 @@ async fn get_workflow(router: &MultiServiceRouter, name: &str) -> Value {
     body.get("Workflow")
         .cloned()
         .unwrap_or_else(|| panic!("GetWorkflow must report a Workflow, got {body}"))
+}
+
+/// How far back a stored workflow is aged before the update under test, so the write lands
+/// in a LATER millisecond than the create did.
+///
+/// Every instant this API reports is carried at millisecond resolution, so a create and an
+/// update served back to back in one process can fall in the same millisecond and report one
+/// number. Aging the record is what makes the two writes separable, which is the case a
+/// client sees: it fixes the elapsed time instead of leaving it to how fast the host runs.
+const AGED_BY: Duration = Duration::from_secs(1);
+
+/// Pull the instants a stored workflow carries back by [`AGED_BY`].
+fn age_workflow(engine: &Arc<engine::InMemoryEngine>, name: &str) {
+    let state = engine.state::<ComAmazonawsGlueAwsglueState>();
+    let mut store = state.lock();
+    let entry = store
+        .workflow_mut(name)
+        .unwrap_or_else(|| panic!("the store must hold workflow {name:?}"));
+    let back = |at: std::time::SystemTime| at.checked_sub(AGED_BY).expect("an instant in range");
+    entry.created_on = back(entry.created_on);
+    entry.last_modified_on = back(entry.last_modified_on);
 }
 
 /// Send one update, assert it answers "the name of the workflow which was specified in
@@ -254,7 +279,8 @@ fn patch_rows() -> Vec<PatchRow> {
 
 #[tokio::test]
 async fn an_update_replaces_the_members_it_names_and_preserves_the_rest() {
-    let router = emulator();
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator_on(engine.clone());
 
     for (index, row) in patch_rows().into_iter().enumerate() {
         let case = row.case;
@@ -267,6 +293,9 @@ async fn an_update_replaces_the_members_it_names_and_preserves_the_rest() {
             format!("patched-workflow-{index}")
         };
         create_workflow(&router, &name, &row.created).await;
+        // The create's instants are aged, so the update's own instant is in a later
+        // millisecond than the creation instant and the two are told apart on the wire.
+        age_workflow(&engine, &name);
         let before = get_workflow(&router, &name).await;
 
         update_workflow(&router, case, &name, &row.update).await;

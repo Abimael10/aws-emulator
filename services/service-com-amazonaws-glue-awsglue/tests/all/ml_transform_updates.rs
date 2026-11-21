@@ -22,15 +22,42 @@
 //! timeout at the published lower bound and one past it, each spelling of a capacity), and
 //! — for the refusals — the form of the id and of the role.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::{
-    DEFAULT_ML_TRANSFORM_DPUS, DEFAULT_ML_TRANSFORM_GLUE_VERSION,
+    ComAmazonawsGlueAwsglueState, DEFAULT_ML_TRANSFORM_DPUS, DEFAULT_ML_TRANSFORM_GLUE_VERSION,
     DEFAULT_ML_TRANSFORM_TIMEOUT_MINUTES, TRANSFORM_STATUS_NOT_READY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ml_transforms::{create_body, given_transform, listed, store_table, ROLE, TRANSFORM_TYPE};
-use crate::wire::{assert_echoed, call, emulator, error_code, error_message, ok, ACCOUNT_ID};
+use crate::wire::{
+    assert_echoed, call, emulator, emulator_on, error_code, error_message, ok, ACCOUNT_ID,
+};
+
+/// How far back a stored transform is aged before the update under test, so the write lands
+/// in a LATER millisecond than the create did.
+///
+/// Every instant this API reports is carried at millisecond resolution, so a create and an
+/// update served back to back in one process can fall in the same millisecond and report one
+/// number. Aging the record is what makes the two writes separable, which is the case a
+/// client sees: it fixes the elapsed time instead of leaving it to how fast the host runs.
+const AGED_BY: Duration = Duration::from_secs(1);
+
+/// Pull the instants a stored transform carries back by [`AGED_BY`].
+fn age_transform(engine: &Arc<engine::InMemoryEngine>, transform_id: &str) {
+    let state = engine.state::<ComAmazonawsGlueAwsglueState>();
+    let mut store = state.lock();
+    let entry = store
+        .ml_transforms
+        .get_mut(transform_id)
+        .unwrap_or_else(|| panic!("the store must hold transform {transform_id:?}"));
+    let back = |at: std::time::SystemTime| at.checked_sub(AGED_BY).expect("an instant in range");
+    entry.created_on = back(entry.created_on);
+    entry.last_modified_on = back(entry.last_modified_on);
+}
 
 /// One row of the patch table: the case, the members the create carried beside the required
 /// ones, the members the update names, and the members the read must then report.
@@ -103,7 +130,8 @@ fn assert_preserved(case: &str, expected: &Value, before: &Value, after: &Value)
 
 #[tokio::test]
 async fn an_update_replaces_the_members_it_names_and_preserves_the_rest() {
-    let router = emulator();
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator_on(engine.clone());
     store_table(
         &router,
         "sales",
@@ -295,6 +323,9 @@ async fn an_update_replaces_the_members_it_names_and_preserves_the_rest() {
         // Each row gets its own transform, so a row's write cannot be read as the previous
         // row's.
         let id = given_transform(&router, &format!("patched-{index}"), created.clone()).await;
+        // The create's instants are aged, so the update's own instant is in a later
+        // millisecond than the creation instant and the two are told apart on the wire.
+        age_transform(&engine, &id);
         let before = get_transform(&router, &id).await;
 
         update_transform(&router, case, &id, update).await;

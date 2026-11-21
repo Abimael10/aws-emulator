@@ -13,9 +13,13 @@
 //! request has no member for). The description-plus-ruleset update a lifecycle client sends
 //! is one row among them.
 
-use serde_json::{json, Value};
+use std::sync::Arc;
+use std::time::Duration;
 
-use crate::wire::{call, emulator, error_code, error_message, ok};
+use serde_json::{json, Value};
+use service_com_amazonaws_glue_awsglue::state::ComAmazonawsGlueAwsglueState;
+
+use crate::wire::{call, emulator, emulator_on, error_code, error_message, ok};
 
 /// The longest `Ruleset` the model accepts: "len 1..65536" on `DataQualityRulesetString`
 /// (`smithy_query operation=UpdateDataQualityRuleset`). The shortest text a stored ruleset
@@ -80,6 +84,28 @@ fn instant(case: &str, member: &str, body: &Value) -> f64 {
         .unwrap_or_else(|| panic!("case {case}: {member} must be a timestamp, got {body}"))
 }
 
+/// How far back a stored ruleset is aged before the write under test, so that write lands
+/// in a LATER millisecond than the one before it.
+///
+/// Every instant this API reports is carried at millisecond resolution, so two writes served
+/// back to back in one process can fall in the same millisecond and report one number. Aging
+/// the record is what makes them separable, which is the case a client sees: it fixes the
+/// elapsed time instead of leaving it to how fast the host runs.
+const AGED_BY: Duration = Duration::from_secs(1);
+
+/// Pull the instants a stored ruleset carries back by [`AGED_BY`].
+fn age_ruleset(engine: &Arc<engine::InMemoryEngine>, name: &str) {
+    let state = engine.state::<ComAmazonawsGlueAwsglueState>();
+    let mut store = state.lock();
+    let entry = store
+        .data_quality_rulesets
+        .get_mut(name)
+        .unwrap_or_else(|| panic!("the store must hold ruleset {name:?}"));
+    let back = |at: std::time::SystemTime| at.checked_sub(AGED_BY).expect("an instant in range");
+    entry.created_on = back(entry.created_on);
+    entry.last_modified_on = back(entry.last_modified_on);
+}
+
 // ---------------------------------------------------------------------------
 // The patch
 // ---------------------------------------------------------------------------
@@ -91,7 +117,8 @@ fn instant(case: &str, member: &str, body: &Value) -> f64 {
 /// exactly as the create wrote them.
 #[tokio::test]
 async fn an_update_writes_the_members_it_names_and_preserves_the_rest() {
-    let router = emulator();
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator_on(engine.clone());
 
     let longest_ruleset = ruleset_of_length(MAX_RULESET_LENGTH);
     let shortest_ruleset = SHORTEST_STORED_RULESET.to_string();
@@ -255,6 +282,9 @@ async fn an_update_writes_the_members_it_names_and_preserves_the_rest() {
     for (case, create_body, patch, expected_description, expected_ruleset) in &cases {
         let name = create_body["Name"].as_str().expect("the case carries a Name");
         create(&router, create_body).await;
+        // The create's instants are aged, so the update's own instant is in a later
+        // millisecond than the creation instant and the two are told apart on the wire.
+        age_ruleset(&engine, name);
         let before = get(&router, name).await;
         let created_on = instant(case, "CreatedOn", &before);
 
@@ -357,7 +387,8 @@ async fn an_update_writes_the_members_it_names_and_preserves_the_rest() {
 /// along which member each successive update names.
 #[tokio::test]
 async fn successive_updates_each_patch_what_the_last_one_left() {
-    let router = emulator();
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator_on(engine.clone());
 
     create(
         &router,
@@ -402,13 +433,15 @@ async fn successive_updates_each_patch_what_the_last_one_left() {
         ),
     ];
 
-    let mut previous_instant = instant(
-        "before any update",
-        "LastModifiedOn",
-        &get(&router, "composed").await,
-    );
-
     for (case, patch, description, ruleset) in &steps {
+        // The record is aged before each write, so the instant that write puts on it is in
+        // a later millisecond than the one the write before it left.
+        age_ruleset(&engine, "composed");
+        let previous_instant = instant(
+            case,
+            "LastModifiedOn",
+            &get(&router, "composed").await,
+        );
         update(&router, patch).await;
 
         let read = get(&router, "composed").await;
@@ -429,7 +462,6 @@ async fn successive_updates_each_patch_what_the_last_one_left() {
             "case {case}: each write moves LastModifiedOn forward; expected later than \
              {previous_instant}, got {last_modified}"
         );
-        previous_instant = last_modified;
     }
 }
 

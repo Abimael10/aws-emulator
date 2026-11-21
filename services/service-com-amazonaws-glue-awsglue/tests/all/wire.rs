@@ -125,16 +125,7 @@ pub async fn call_reported(
     operation: &str,
     body: &Value,
 ) -> (u16, smithy_server_runtime::http::HeaderMap, Value) {
-    let request = smithy_server_runtime::http::Request::builder()
-        .method("POST")
-        .uri("/")
-        .header("content-type", "application/x-amz-json-1.1")
-        .header("x-amz-target", format!("AWSGlue.{operation}"))
-        .header("authorization", authorization_in(region))
-        .body(bytes::Bytes::from(body.to_string()))
-        .expect("build the request");
-
-    let response = router.dispatch(request).await;
+    let response = router.dispatch(request_for(region, operation, body)).await;
     let status = response.status().as_u16();
     let headers = response.headers().clone();
     let parsed = if response.body().is_empty() {
@@ -143,6 +134,37 @@ pub async fn call_reported(
         serde_json::from_slice(response.body()).unwrap_or(Value::Null)
     };
     (status, headers, parsed)
+}
+
+/// The same ONE request builder, answering the response body as the TEXT the service
+/// serialised it as, beside its status — for a suite whose subject is the wire FORM a value
+/// is carried in rather than the value a JSON parser reads back from it, as the resolution a
+/// timestamp is carried at is (`tests/all/timestamp_wire_resolution.rs`): a parse into a
+/// float loses exactly the digits such a suite is about.
+pub async fn call_text(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, String) {
+    let response = router
+        .dispatch(request_for(REGION, operation, body))
+        .await;
+    let status = response.status().as_u16();
+    let text = String::from_utf8_lossy(response.body()).to_string();
+    (status, text)
+}
+
+/// The ONE request every call in this crate's suites is made with: `POST /` carrying the
+/// operation in `X-Amz-Target` and the body as `awsJson1_1`, signed into `region`'s scope.
+fn request_for(
+    region: &str,
+    operation: &str,
+    body: &Value,
+) -> smithy_server_runtime::http::Request<bytes::Bytes> {
+    smithy_server_runtime::http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("content-type", "application/x-amz-json-1.1")
+        .header("x-amz-target", format!("AWSGlue.{operation}"))
+        .header("authorization", authorization_in(region))
+        .body(bytes::Bytes::from(body.to_string()))
+        .expect("build the request")
 }
 
 /// Make one call that must succeed, and return its body.
