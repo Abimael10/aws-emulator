@@ -78,7 +78,11 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// One awsJson1_1 call to the service `signing_name` claims, under `target`.
-async fn json_call(
+///
+/// `pub(crate)` here and below: the suite that drives what a build's registry calls are
+/// AUTHORIZED by (`super::ecr_repository_policy_authorizes_a_build`) reads the build's own log
+/// too, so it drives its builds through this one harness rather than a second copy of it.
+pub(crate) async fn json_call(
     router: &MultiServiceRouter,
     signing_name: &str,
     target: &str,
@@ -113,7 +117,7 @@ async fn json_call(
 }
 
 /// One CodeBuild operation that has to succeed.
-async fn codebuild(
+pub(crate) async fn codebuild(
     router: &MultiServiceRouter,
     case: &str,
     operation: &str,
@@ -180,7 +184,11 @@ async fn role_allowing(router: &MultiServiceRouter, name: &str, actions: &[&str]
 
 /// Create a role trusted by CodeBuild whose inline policy carries `statements`, and answer the
 /// ARN IAM holds it under.
-async fn role_stating(router: &MultiServiceRouter, name: &str, statements: Value) -> String {
+pub(crate) async fn role_stating(
+    router: &MultiServiceRouter,
+    name: &str,
+    statements: Value,
+) -> String {
     let (status, created) = iam(
         router,
         "CreateRole",
@@ -221,7 +229,11 @@ async fn role_stating(router: &MultiServiceRouter, name: &str, statements: Value
 
 /// Start a build of `project` and look again until the transition the clock owes it has
 /// fallen due, answering the settled record `BatchGetBuilds` reports.
-async fn settled_build(router: &MultiServiceRouter, case: &str, project: &str) -> Value {
+pub(crate) async fn settled_build(
+    router: &MultiServiceRouter,
+    case: &str,
+    project: &str,
+) -> Value {
     let started = codebuild(router, case, "StartBuild", &json!({"projectName": project})).await;
     let id = started["build"]["id"]
         .as_str()
@@ -244,7 +256,7 @@ async fn settled_build(router: &MultiServiceRouter, case: &str, project: &str) -
 
 /// The messages the stream `stream` of the group `group` holds, as CloudWatch Logs' own read
 /// reports them — and `None` when it holds no such stream at all.
-async fn delivered_messages(
+pub(crate) async fn delivered_messages(
     router: &MultiServiceRouter,
     group: &str,
     stream: &str,
@@ -271,7 +283,7 @@ async fn delivered_messages(
 
 /// A `CreateProject` request for `name` running as `role`, with `buildspec` and `extra`'s
 /// members.
-fn project_body(name: &str, role: &str, buildspec: &str, extra: Value) -> Value {
+pub(crate) fn project_body(name: &str, role: &str, buildspec: &str, extra: Value) -> Value {
     let mut body = json!({
         "name": name,
         "serviceRole": role,
@@ -290,7 +302,7 @@ fn project_body(name: &str, role: &str, buildspec: &str, extra: Value) -> Value 
 }
 
 /// A buildspec whose build phase runs `commands`.
-fn buildspec(commands: &[&str]) -> String {
+pub(crate) fn buildspec(commands: &[&str]) -> String {
     let listed = commands
         .iter()
         .map(|command| format!("      - '{command}'\n"))

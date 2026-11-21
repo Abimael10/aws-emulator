@@ -46,6 +46,13 @@
 //! names is the session CodeBuild assumes the role in for the build
 //! ([`super::role_session_arn`]).
 //!
+//! A call against a resource that carries a RESOURCE-BASED policy of its own is decided by
+//! BOTH documents ([`withholds`]), because within one account either of them can allow it: a
+//! repository whose policy denies the role the build runs as is a repository that build cannot
+//! push to, and one whose policy shares itself with that role is one it can push to however
+//! little the role's own documents say. The document is read through the service that OWNS it,
+//! so what a build is decided against is what a client reads back from that service.
+//!
 //! The call itself is the AWS SDK driven over the framework's in-process callback, exactly as
 //! every other call between two emulated services in this crate: the credential the framework
 //! hands this emulator's handlers is what signs it, and it is held here — never in the
@@ -355,19 +362,34 @@ impl BuildTools {
     /// allow `action` on `resource` — the sentence AWS refuses the call with — and `None` when
     /// they do or when nothing is known about the role.
     ///
-    /// The decision itself is [`role_withholds`], which every call made FOR a build goes
-    /// through; what this adds is the budget the question is asked inside and the principal the
-    /// refusal names.
+    /// The decision itself is [`withholds`], which every call made FOR a build goes through;
+    /// what this adds is the budget the question is asked inside and the principal the refusal
+    /// names.
     fn withheld(&self, action: &str, resource: &str) -> Option<String> {
+        self.withheld_with_shared(action, resource, None)
+    }
+
+    /// [`Self::withheld`] for a call addressing a resource that carries a RESOURCE-BASED
+    /// policy of its own, `shared`, which is decided together with the role's identity-based
+    /// documents ([`withholds`]).
+    fn withheld_with_shared(
+        &self,
+        action: &str,
+        resource: &str,
+        shared: Option<&::service_common::iam_authorization::PreparedDocument>,
+    ) -> Option<String> {
         let role_arn = self.role_arn.clone()?;
+        let principal = self.principal.clone();
         let withheld = self
             .made(|| async {
-                Ok(role_withholds(
+                Ok(withholds(
                     &self.callback,
                     &self.region,
                     &role_arn,
+                    &principal,
                     action,
                     resource,
+                    shared,
                 )
                 .await)
             })
@@ -412,12 +434,41 @@ impl BuildTools {
     fn repository_arn(region: &str, name: &str) -> String {
         ::emulator_server::emulator_arn(ECR_ARN_SERVICE, region, &format!("repository/{name}"))
     }
+
+    /// The RESOURCE-BASED policy the repository `repository` of the registry of `region`
+    /// carries, read through the service that owns it (Amazon ECR's own
+    /// `GetRepositoryPolicy`) and parsed once
+    /// (`::service_common::iam_authorization::PreparedDocument`), because one push decides
+    /// every action it performs against the same document.
+    ///
+    /// `None` for a repository that carries none, for one that registry does not hold, and for
+    /// a read this build's commands had no budget left for: a document that cannot be read
+    /// states nothing, so the call is then decided on the role's own documents alone.
+    fn repository_policy(
+        &self,
+        region: &str,
+        repository: &str,
+    ) -> Option<::service_common::iam_authorization::PreparedDocument> {
+        let text = self
+            .made(|| async {
+                Ok(self
+                    .ecr(region)
+                    .get_repository_policy()
+                    .repository_name(repository)
+                    .send()
+                    .await
+                    .ok()
+                    .and_then(|answer| answer.policy_text().map(str::to_string)))
+            })
+            .unwrap_or(None)?;
+        Some(::service_common::iam_authorization::PreparedDocument::read(&text))
+    }
 }
 
 /// The ARN namespace, and the IAM action prefix, of Amazon ECR.
 const ECR_ARN_SERVICE: &str = "ecr";
 
-/// WHY the permissions in force on a role withheld an action from a build.
+/// WHY the documents in force withheld an action from a build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Withheld {
     /// A statement of the role's own documents DENIES the action.
@@ -425,6 +476,9 @@ pub enum Withheld {
     /// The role states identity-based policies and none of them allows the action, which is
     /// IAM's default deny.
     NotAllowed,
+    /// A statement of the RESOURCE's own policy denies the action to the role the build runs
+    /// as — a fact about that document rather than about the role's.
+    SharedDenied,
 }
 
 impl Withheld {
@@ -439,8 +493,94 @@ impl Withheld {
             Self::NotAllowed => {
                 ::service_common::iam_authorization::no_identity_policy_allows(action)
             }
+            Self::SharedDenied => {
+                ::service_common::iam_authorization::RESOURCE_POLICY_EXPLICIT_DENY.to_string()
+            }
         }
     }
+}
+
+/// Whether the documents in force do NOT allow the role `role_arn` — acting as the session
+/// `principal` — to perform `action` on `resource`, deciding the role's identity-based
+/// policies TOGETHER with the resource's own resource-based policy `shared`.
+///
+/// Two documents can allow a call within one account, so both are read: an explicit `Deny` on
+/// either side withholds it, and otherwise an `Allow` from either is enough — the rule
+/// `::service_common::iam_authorization::is_allowed` states. It is applied here rather than
+/// called, because this answers WHICH document withheld the call (the refusal names it) and
+/// because the identity half is three-valued and deliberately lenient about a role that states
+/// no policies at all ([`identity_answer`]), which a boolean grant cannot carry. A resource that
+/// carries no policy, or one whose policy this emulator cannot read, states nothing — `shared`
+/// is then `None` and the identity half alone decides, exactly as [`role_withholds`] answers it.
+///
+/// `None` — withhold nothing — for everything that is not an answer, as [`role_withholds`]
+/// reads those.
+///
+/// Amazon ECR's own in-process pull gate combines the same two documents for a compute service
+/// pulling an image (`service-com-amazonaws-ecr-amazonec2containerregistry-v20150921`'s
+/// `state::registry_pull`); it reads the IAM store directly, which this crate cannot, so the two
+/// are separate readings of the one rule rather than a duplicate to remove.
+pub async fn withholds(
+    callback: &EmbeddedEmulator,
+    region: &str,
+    role_arn: &str,
+    principal: &str,
+    action: &str,
+    resource: &str,
+    shared: Option<&::service_common::iam_authorization::PreparedDocument>,
+) -> Option<Withheld> {
+    use ::service_common::iam_authorization::Decision;
+
+    let stated = shared.map_or(Decision::NotStated, |document| {
+        shared_decision(document, action, resource, principal, role_arn)
+    });
+    // The resource's own document says no, which no identity-based grant can lift.
+    if stated == Decision::Denied {
+        return Some(Withheld::SharedDenied);
+    }
+    let identity = identity_answer(callback, region, role_arn, action, resource).await;
+    // Nothing denies, and the resource shares itself with this role: the call is allowed
+    // however little the role's own documents say about it. An explicit deny in those
+    // documents says no just as finally, so a grant the resource states cannot lift it.
+    if stated == Decision::Allowed && !identity.denied {
+        return None;
+    }
+    identity.withheld
+}
+
+/// What the RESOURCE-BASED policy `document` says about the call: the action, the resource it
+/// is taken on, and every spelling that document may name the build by.
+///
+/// The spellings are the session CodeBuild assumes the role in for the build and the role
+/// itself — the two a resource policy names a build by. The ACCOUNT's own spellings count for
+/// a DENY and not for a grant, which is how IAM reads them: a statement denying an account
+/// refuses each of its principals, while one allowing it delegates the decision to that
+/// account's identity-based policies
+/// (`::service_common::iam_authorization::account_principals`).
+///
+/// The document arrives already READ (`::service_common::iam_authorization::PreparedDocument`):
+/// one push decides every action it performs against the same policy, so the text is parsed once
+/// per push rather than once per question asked of it.
+fn shared_decision(
+    document: &::service_common::iam_authorization::PreparedDocument,
+    action: &str,
+    resource: &str,
+    principal: &str,
+    role_arn: &str,
+) -> ::service_common::iam_authorization::Decision {
+    use ::service_common::iam_authorization as iam;
+
+    let named = [principal.to_string(), role_arn.to_string()];
+    let mut with_account = named.to_vec();
+    with_account.extend(iam::account_principals(role_arn));
+    let decided = |principals: &[String]| {
+        iam::resource_outcome_prepared(document, &iam::Request::new(action, resource, principals))
+            .decision
+    };
+    if decided(&with_account) == iam::Decision::Denied {
+        return iam::Decision::Denied;
+    }
+    decided(&named)
 }
 
 /// Whether the permissions in force on the role `role_arn` do NOT allow `action` on
@@ -461,20 +601,65 @@ pub async fn role_withholds(
     action: &str,
     resource: &str,
 ) -> Option<Withheld> {
-    if ::service_common::iam_role::role_states_permissions_through(callback, region, role_arn).await
+    identity_answer(callback, region, role_arn, action, resource)
+        .await
+        .withheld
+}
+
+/// What the ROLE's own identity-based documents say about one call: whether they withhold it,
+/// and whether a statement of theirs DENIES it outright.
+///
+/// The second half is what a decision combining them with a resource's own policy needs
+/// ([`withholds`]): an explicit deny is final, while IAM's default deny is only the answer
+/// where no other document allows the call.
+#[derive(Debug, Clone, Copy)]
+struct IdentityAnswer {
+    /// Why the role's own documents withhold the call, and `None` when they do not.
+    withheld: Option<Withheld>,
+    /// Whether a statement of those documents denies the call explicitly.
+    denied: bool,
+}
+
+/// [`role_withholds`]' reading of the role's own documents, keeping the explicit deny apart
+/// from IAM's default deny.
+///
+/// Which answer counts is `::service_common::iam_role`'s own rule: a statement that DENIES the
+/// action is an answer about this role whatever else is in force, while a policy set that merely
+/// says NOTHING about it is an answer only from a role that STATES identity-based policies — a
+/// build's service role is routinely provisioned out of band, so a role IAM holds no policy for
+/// holds nothing back. The hops are that crate's too, so a role's permissions are still read in
+/// one place: the three-valued simulation of the role's policy set, and whether the role states
+/// identity-based policies at all.
+async fn identity_answer(
+    callback: &EmbeddedEmulator,
+    region: &str,
+    role_arn: &str,
+    action: &str,
+    resource: &str,
+) -> IdentityAnswer {
+    use ::service_common::iam_authorization::Decision;
+
+    let decision = ::service_common::iam_role::role_action_decision_through(
+        callback, region, role_arn, action, resource, &[],
+    )
+    .await;
+    let denied = decision == Some(Decision::Denied);
+    let withheld = if denied {
+        // A statement that DENIES the action is an answer about this role whatever else its
+        // documents say, and AWS words such a refusal as the explicit deny it is.
+        Some(Withheld::Denied)
+    } else if ::service_common::iam_role::role_states_permissions_through(
+        callback, region, role_arn,
+    )
+    .await
     {
-        ::service_common::iam_role::role_withholds_action_through(
-            callback, region, role_arn, action, resource,
-        )
-        .await
-        .then_some(Withheld::NotAllowed)
+        decision
+            .is_some_and(|decision| decision != Decision::Allowed)
+            .then_some(Withheld::NotAllowed)
     } else {
-        ::service_common::iam_role::role_denies_action_through(
-            callback, region, role_arn, action, resource,
-        )
-        .await
-        .then_some(Withheld::Denied)
-    }
+        None
+    };
+    IdentityAnswer { withheld, denied }
 }
 
 /// What the owning service answered, as a command's diagnostic states it: the error class and

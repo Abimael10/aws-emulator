@@ -20,8 +20,9 @@
 //! * `docker push` UPLOADS that image to the repository its reference names: each blob
 //!   through the registry's layer-upload calls and then the manifest through `PutImage`, so
 //!   the repository really holds the image once the command has exited 0 — and a push the
-//!   registry refused, or one the build's role may not make, exits non-zero with nothing
-//!   uploaded.
+//!   registry refused, or one no policy in force lets the build's role make (the role's own
+//!   documents and the repository's own policy decided together, `super::build_tools`), exits
+//!   non-zero with nothing uploaded.
 //!
 //! A reference is `[<registry>/]<repository>[:<tag>]`, and a push addresses the registry its
 //! own reference names: this environment reaches the registries of THIS emulator, and the
@@ -400,8 +401,15 @@ fn pushed(tools: &BuildTools, reference: &str) -> ProgramOutcome {
     // registries at names no Region, and one registry of this account serves each.
     let region = registry_region(&registry).unwrap_or_else(|| tools.region.clone());
     let repository_arn = BuildTools::repository_arn(&region, &reference.repository);
+    // A repository is reached only where a policy in force allows it, and TWO documents can
+    // allow one: the role's own identity-based policies and the repository's own
+    // resource-based policy, which is what shares a repository with a principal that has no
+    // identity-based grant — and what withholds it from one that has, when a statement of it
+    // denies. The document is read once, through the service that owns it, and then decides
+    // every action the push performs.
+    let shared = tools.repository_policy(&region, &reference.repository);
     for action in PUSH_ACTIONS {
-        if let Some(denial) = tools.withheld(action, &repository_arn) {
+        if let Some(denial) = tools.withheld_with_shared(action, &repository_arn, shared.as_ref()) {
             return tools.refused(DOCKER_PROGRAM, &format!("denied: {denial}"), DOCKER_FAILED);
         }
     }
