@@ -29,12 +29,21 @@
 //! The rows differ along what the rule generalises over: whether the group's health checks are
 //! enabled at all, the destination the check requests (the documented default and a configured
 //! one), and the status the function answers (inside the group's matcher and outside it).
+//!
+//! Nothing here is timed by the wall clock. The spans the clock owes — a function's activation,
+//! the load balancer's move to `active`, a registration's settling, and the instant the next
+//! check of a registration is owed at ([`make_checks_due`]) — are PLACED in the store rather
+//! than slept for, and every wait is a look repeated until the condition it is about holds,
+//! inside a budget generous enough that a loaded host does not decide the outcome. The two
+//! members that time a check are left as long as the model admits for the same reason: how
+//! fast this host runs the function must not decide whether its answer arrives in time.
 
 use std::io::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Value};
+use service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::state::ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State as ElbState;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::alb_data_plane::{create_load_balancer, settle};
@@ -49,17 +58,20 @@ const RUNTIME: &str = "python3.12";
 /// mounted here, so nothing is known about the role and nothing it does is withheld.
 const ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-exec";
 
-/// The cadence every checked group is created with: the shortest
-/// `HealthCheckIntervalSeconds` the member admits ("the range is 5-300"), so a check comes due
-/// without the suite waiting out the 35 seconds a `lambda` target group defaults to.
-const INTERVAL_SECONDS: &str = "5";
+/// The cadence every checked group is created with: the LONGEST
+/// `HealthCheckIntervalSeconds` the member admits ("the range is 5-300"), because the span one
+/// check may wait for its answer can be as long as the cadence and no longer — and that span
+/// is the one this suite leaves generous ([`TIMEOUT_SECONDS`]). No row waits the cadence out:
+/// the instant a registration's next check is owed at is PLACED in the store
+/// ([`make_checks_due`]), exactly as the settling spans either side of it are.
+const INTERVAL_SECONDS: &str = "300";
 
-/// The `HealthCheckTimeoutSeconds` those groups carry, because the service holds the pair to
-/// "health check interval must be greater than the timeout" and a `lambda` target group
-/// defaults that member to 30 seconds — longer than the cadence above. The longest wait that
-/// pairs with that cadence, so a first run of the function that takes a moment is still
-/// answered inside the span the check waits.
-const TIMEOUT_SECONDS: &str = "4";
+/// The `HealthCheckTimeoutSeconds` those groups carry: the longest the member admits ("the
+/// range is 2–120 seconds"), so the run of the function one check invokes is never cut short
+/// by how fast the host it runs on happens to be. Nothing in this suite asserts that span —
+/// the rows are about the invocation, what it hands the function and what its answer decides —
+/// so it is given all the room the member has rather than the least that fits a cadence.
+const TIMEOUT_SECONDS: &str = "120";
 
 /// The marker the handler prints the event under, which is what a log record of the run is
 /// found by.
@@ -353,15 +365,42 @@ fn rows() -> Vec<Row> {
     ]
 }
 
+/// Place the instant the NEXT check of every registration this store holds is owed at in the
+/// past, so the checking clock's next pass makes one of each.
+///
+/// The same reading as the settling spans either side of it ([`settle`], a function's
+/// `active_due`): what the clock OWES is placed rather than slept for, so no verdict this
+/// suite waits for depends on the cadence running out on the wall clock. It places a due
+/// instant and NOTHING else: which check is then made, whether it invokes anything at all, and
+/// what its answer decides stay the service's own, so no part of the rule under test is
+/// written here.
+fn make_checks_due(engine: &Arc<engine::InMemoryEngine>) {
+    let state = engine.state::<ElbState>();
+    let mut store = state.lock();
+    let past = SystemTime::now() - Duration::from_secs(1);
+    for group in store.target_groups.values_mut() {
+        for target in group.targets.values_mut() {
+            target.checks_due_at = past;
+        }
+    }
+}
+
 /// Look at `DescribeLogStreams` until CloudWatch Logs answers 200 with at least one stream of
 /// `group`, and answer the streams it reported — or panic once the budget is spent.
 ///
-/// The wait is for the CONDITION, not for a span: a check comes due on the target group's own
-/// cadence and the records of the run it makes reach the group after it, so what this waits for
-/// is the group holding a stream.
-async fn streams_of(router: &MultiServiceRouter, case: &str, group: &str) -> Vec<Value> {
+/// The wait is for the CONDITION, not for a span: every look first places the instant the next
+/// check of each registration is owed at ([`make_checks_due`]) and then asks whether the
+/// records of the run that check makes have reached the group, so what this waits for is the
+/// group holding a stream rather than a cadence passing on the wall clock.
+async fn streams_of(
+    router: &MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
+    case: &str,
+    group: &str,
+) -> Vec<Value> {
     let deadline = Instant::now() + BUDGET;
     loop {
+        make_checks_due(engine);
         let (status, answered) = logs(
             router,
             "DescribeLogStreams",
@@ -388,15 +427,19 @@ async fn streams_of(router: &MultiServiceRouter, case: &str, group: &str) -> Vec
 
 /// Look at `DescribeTargetHealth` until the registration of `target_group` reports `health`, or
 /// panic once the budget is spent. The verdict is a number of the group's own checks away, so
-/// what this waits for is the state rather than a span.
+/// what this waits for is the state rather than a span: every look first places the instant
+/// the next check is owed at ([`make_checks_due`]) and the verdict arrives once as many of
+/// them have been made as the group's threshold takes.
 async fn until_health(
     router: &MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
     case: &str,
     target_group: &str,
     health: &str,
 ) -> String {
     let deadline = Instant::now() + BUDGET;
     loop {
+        make_checks_due(engine);
         let mut form = action("DescribeTargetHealth");
         form.push(p("TargetGroupArn", target_group));
         let reply = call(router, &form).await;
@@ -543,8 +586,10 @@ async fn a_lambda_target_groups_health_check_invokes_the_function_and_its_run_is
             // Nothing checks this group's registration, so nothing ever invoked its function
             // — and a log group no run created is a group CloudWatch Logs genuinely does not
             // hold, which is the one thing `ResourceNotFoundException` is for. Asserted after
-            // every checked row has been observed, so the cadence has had several of its
-            // intervals to invoke something.
+            // every checked row has been observed: each of those waits placed the instant the
+            // next check of EVERY registration this store holds is owed at, this one among
+            // them, so the checks that invoked the other functions were made due for this one
+            // too and still invoked nothing.
             let (status, answered) = logs(
                 &router,
                 "DescribeLogStreams",
@@ -571,7 +616,7 @@ async fn a_lambda_target_groups_health_check_invokes_the_function_and_its_run_is
             );
             // And its registration is reported as the model words a group whose health checks
             // are off, rather than as a health no check determined.
-            let reported = until_health(&router, row.case, &tg_arn, "unavailable").await;
+            let reported = until_health(&router, &engine, row.case, &tg_arn, "unavailable").await;
             assert_eq!(
                 reported, "unavailable",
                 "case {:?}: expected the registration of a group with health checks off to be \
@@ -583,7 +628,7 @@ async fn a_lambda_target_groups_health_check_invokes_the_function_and_its_run_is
 
         // The group CloudWatch Logs now holds, because the health check's invocation RAN the
         // function and the run's records were delivered to it.
-        let streams = streams_of(&router, row.case, &group).await;
+        let streams = streams_of(&router, &engine, row.case, &group).await;
         for stream in &streams {
             let name = stream["logStreamName"].as_str().unwrap_or_default();
             assert!(
@@ -699,7 +744,7 @@ async fn a_lambda_target_groups_health_check_invokes_the_function_and_its_run_is
 
         // And the status the function answered is what the health reported for the target is
         // decided by.
-        let reported = until_health(&router, row.case, &tg_arn, health).await;
+        let reported = until_health(&router, &engine, row.case, &tg_arn, health).await;
         assert_eq!(
             reported, health,
             "case {:?}: expected the registration to be reported {health:?}, got {reported:?}",
