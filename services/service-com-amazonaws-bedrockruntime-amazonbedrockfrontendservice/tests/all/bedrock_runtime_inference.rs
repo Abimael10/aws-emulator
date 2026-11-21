@@ -1118,7 +1118,8 @@ async fn invoke_model_reports_a_length_stop_only_for_a_completion_the_cap_cut_of
                 String::from_utf8_lossy(&call.body)
             );
             let served = call.json();
-            let expected = state::family_stop_reason(*family, cut_off);
+            let expected =
+                state::family_stop_reason(*family, state::TurnStop::of(cut_off, None));
             assert_eq!(
                 served.pointer(stop_pointer).and_then(serde_json::Value::as_str),
                 Some(expected),

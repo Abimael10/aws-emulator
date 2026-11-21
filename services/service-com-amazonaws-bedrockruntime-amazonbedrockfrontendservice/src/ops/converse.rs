@@ -18,8 +18,9 @@
 //! The supplied `inferenceConfig` bounds that message: it is composed to fit
 //! `maxTokens` and it HALTS where the first configured `stopSequences` entry
 //! completes (see [`crate::state::halt_at_stop_sequence`]), so a configured stop
-//! sequence is the last thing the turn serves, nothing follows it, and the turn
-//! reports `stop_sequence` as what stopped it.
+//! sequence is the last thing the turn serves and nothing follows it. WHICH
+//! `stopReason` such a turn reports is the invoked model's, worded as its family
+//! words a halt ([`crate::state::stop_reason`]).
 //!
 //! A mandatory `toolConfig.toolChoice` (`any` or `tool`) obliges the turn to
 //! request a tool instead of generating text: the assistant message is then one

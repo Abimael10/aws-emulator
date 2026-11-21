@@ -115,6 +115,16 @@ pub mod openai_chat;
 /// tokens, and the turn composed from that count — run off the async worker.
 pub mod turn_composition;
 
+/// What a served turn reports as the CAUSE of its stop, in the vocabulary of the model
+/// family that served it: the modelled `StopReason` the Converse surfaces report, and the
+/// family's own terminal word the invoke surfaces carry in its envelope.
+pub mod stop_reason;
+
+// Re-exported so every caller reaches the stop-reason stage where it reached the
+// per-family vocabulary before: the per-family table MOVED into its own module,
+// which is also where the modelled `StopReason` a halted turn carries is decided.
+pub use stop_reason::{converse_stop_reason, family_stop_reason, TurnStop};
+
 // Re-exported so every handler and every caller of this module reaches the
 // generation stage where it reached it before: the stage MOVED into its own
 // module, it did not change, and nothing about the text a turn serves differs.
@@ -2602,10 +2612,14 @@ pub struct ConverseTurn {
     /// at a configured stop sequence ended on that sequence rather than at the
     /// cap, so this is `false` for it.
     pub truncated: bool,
-    /// Whether a configured stop sequence completed inside the text, which is
-    /// what makes the turn stop on `stop_sequence`
-    /// ([`EmulatedCompletion::halted_at_stop_sequence`]).
-    pub halted_at_stop_sequence: bool,
+    /// The configured stop sequence the text halted on, when one completed
+    /// inside it ([`EmulatedCompletion::halted_on`]): what the turn ended ON,
+    /// which is the cause its stop reason names.
+    pub halted_on: Option<String>,
+    /// The response family of the model that served this turn, which is whose
+    /// vocabulary the stop reason is reported in ([`stop_reason`]). `None` for a
+    /// model that generates no text at all, which serves no turn.
+    pub family: Option<ModelFamily>,
     /// Whether a guardrail blocked this turn, which is what makes it stop on
     /// `guardrail_intervened` and carry the guardrail's blocked messaging as its
     /// whole content ([`enforced_guardrail::EnforcedGuardrail`]).
@@ -2614,23 +2628,25 @@ pub struct ConverseTurn {
 
 impl ConverseTurn {
     /// The modelled `StopReason` this turn ended on.
+    ///
+    /// A tool request and a guardrail intervention are the SERVICE's own causes —
+    /// the turn requested a tool instead of generating text, or the guardrail
+    /// answered in place of a turn — so they are reported for every model alike.
+    /// What ended a turn's own GENERATION is the model's to report, so it is
+    /// worded in the serving family's vocabulary ([`converse_stop_reason`]).
     pub fn stop_reason(&self) -> &'static str {
         if self.guardrail_intervened {
             enforced_guardrail::STOP_REASON_GUARDRAIL_INTERVENED
         } else if self.tool_use.is_some() {
             "tool_use"
-        } else if self.halted_at_stop_sequence {
-            // The modelled `StopReason` names the cause of the stop, and a
-            // request's `stopSequences` are "a sequence of characters that
-            // causes the model to stop generating the response": a turn that
-            // ended because one of them was generated reports THAT, not the
-            // reason a turn which simply finished reports.
-            "stop_sequence"
-        } else if self.truncated {
-            "max_tokens"
         } else {
-            "end_turn"
+            converse_stop_reason(self.family, self.stop())
         }
+    }
+
+    /// What ended this turn's own generation.
+    pub fn stop(&self) -> TurnStop<'_> {
+        TurnStop::of(self.truncated, self.halted_on.as_deref())
     }
 
     /// The assistant message's content, as the modelled `ContentBlock`s: the
@@ -2785,7 +2801,8 @@ pub fn converse_turn(
             output_tokens,
             cache,
             truncated: false,
-            halted_at_stop_sequence: false,
+            halted_on: None,
+            family: model.family,
             guardrail_intervened: false,
         };
     }
@@ -2814,7 +2831,8 @@ pub fn converse_turn(
         output_tokens,
         cache,
         truncated: completion.truncated,
-        halted_at_stop_sequence: completion.halted_at_stop_sequence,
+        halted_on: completion.halted_on,
+        family: model.family,
         guardrail_intervened: false,
     }
 }
@@ -3253,10 +3271,24 @@ pub struct InvokeTurn {
     /// reports one.
     pub completion_id: String,
     /// Whether generation ended at the request's token cap rather than on its
-    /// own, which is what picks the family's terminal stop reason.
+    /// own, which is one of the causes that pick the family's terminal stop
+    /// reason ([`stop_reason`]).
     pub stopped_at_token_cap: bool,
+    /// The configured stop sequence generation halted on, when the body carried
+    /// one that completed inside the text: the other such cause, and the
+    /// sequence a family whose response fields name the generated one reports
+    /// there.
+    pub halted_on: Option<String>,
     pub input_tokens: u32,
     pub output_tokens: u32,
+}
+
+impl InvokeTurn {
+    /// What ended this turn's generation, as the family's own vocabulary and its
+    /// response fields report it.
+    pub fn stop(&self) -> TurnStop<'_> {
+        TurnStop::of(self.stopped_at_token_cap, self.halted_on.as_deref())
+    }
 }
 
 /// Serve one invoke-API inference from the body that was actually supplied.
@@ -3306,6 +3338,7 @@ pub fn invoke_turn(
     );
     let text = completion.text;
     let truncated = completion.truncated;
+    let halted_on = completion.halted_on;
     let output_tokens = count_text_tokens(&text);
 
     // A completion id is a per-run, server-generated value; deriving it from the
@@ -3327,11 +3360,12 @@ pub fn invoke_turn(
             &text,
             input_tokens,
             output_tokens,
-            truncated,
+            TurnStop::of(truncated, halted_on.as_deref()),
         ),
         text,
         completion_id,
         stopped_at_token_cap: truncated,
+        halted_on,
         input_tokens,
         output_tokens,
     }
@@ -3987,16 +4021,37 @@ pub fn latency_ms(elapsed: std::time::Duration) -> i64 {
 /// sequences arrived in `inferenceConfig` or in a model family's own request
 /// body, and the streaming surfaces frame exactly the text their unary siblings
 /// return.
-pub fn halt_at_stop_sequence(text: &str, stop_sequences: &[String]) -> Option<String> {
+/// One halt: the text as the sequence that halted generation left it, and which
+/// of the configured sequences that was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopSequenceHalt {
+    /// The served text, ending WITH the sequence and carrying nothing after it.
+    pub text: String,
+    /// The configured sequence generation ended on, which a model family whose
+    /// response fields name the generated sequence reports there
+    /// ([`stop_reason`]).
+    pub sequence: String,
+}
+
+pub fn halt_at_stop_sequence(
+    text: &str,
+    stop_sequences: &[String],
+) -> Option<StopSequenceHalt> {
     stop_sequences
         .iter()
         .filter(|sequence| !sequence.is_empty())
         .filter_map(|sequence| {
             text.find(sequence.as_str())
-                .map(|at| at.saturating_add(sequence.len()))
+                .map(|at| (at.saturating_add(sequence.len()), sequence))
         })
-        .min()
-        .map(|end| text[..end].to_string())
+        // Whichever completes FIRST; where two of them complete at the same
+        // offset, the one the request listed first, since `min_by_key` keeps the
+        // earliest of equal keys.
+        .min_by_key(|(end, _)| *end)
+        .map(|(end, sequence)| StopSequenceHalt {
+            text: text[..end].to_string(),
+            sequence: sequence.clone(),
+        })
 }
 
 /// The whole completion [`emulated_completion`] composes when no generation cap
@@ -4104,7 +4159,10 @@ pub fn invoke_body_violation(family: ModelFamily, body: &[u8]) -> Option<String>
 /// envelope.
 ///
 /// Envelopes as documented per family in "Inference request parameters and
-/// response fields for foundation models" in the Amazon Bedrock User Guide.
+/// response fields for foundation models" in the Amazon Bedrock User Guide. The
+/// terminal reason is `stop`'s, worded as `family` words it
+/// ([`family_stop_reason`]), and the family whose response fields name the
+/// generated stop sequence carries it beside that reason.
 pub fn invoke_model_response_body(
     family: ModelFamily,
     model_id: &str,
@@ -4112,9 +4170,10 @@ pub fn invoke_model_response_body(
     text: &str,
     input_tokens: u32,
     output_tokens: u32,
-    stop_reason_is_max_tokens: bool,
+    stop: TurnStop<'_>,
 ) -> serde_json::Value {
-    let stop_reason = family_stop_reason(family, stop_reason_is_max_tokens);
+    let stop_reason = family_stop_reason(family, stop);
+    let halted_on = stop_reason::halted_sequence_field(stop);
     match family {
         ModelFamily::AnthropicMessages => serde_json::json!({
             "id": format!("msg_{completion_id}"),
@@ -4123,7 +4182,7 @@ pub fn invoke_model_response_body(
             "model": model_id,
             "content": [{ "type": "text", "text": text }],
             "stop_reason": stop_reason,
-            "stop_sequence": serde_json::Value::Null,
+            "stop_sequence": halted_on,
             "usage": { "input_tokens": input_tokens, "output_tokens": output_tokens },
         }),
         ModelFamily::TitanText => serde_json::json!({
@@ -4188,28 +4247,6 @@ fn nova_usage(input_tokens: u32, output_tokens: u32) -> serde_json::Value {
     })
 }
 
-/// The stop reason `family` reports for a turn that ended on its own, and for one
-/// that ended at the request's generation cap — in the family's own vocabulary.
-///
-/// Per family as documented in "Inference request parameters and response fields
-/// for foundation models" in the Amazon Bedrock User Guide. The unary response
-/// envelope and the streaming events read it from here, so the two cannot report
-/// a turn as having ended differently.
-pub fn family_stop_reason(family: ModelFamily, stopped_at_token_cap: bool) -> &'static str {
-    match (family, stopped_at_token_cap) {
-        (ModelFamily::AnthropicMessages | ModelFamily::Nova, true) => "max_tokens",
-        (ModelFamily::AnthropicMessages | ModelFamily::Nova, false) => "end_turn",
-        (ModelFamily::TitanText, true) => "LENGTH",
-        (ModelFamily::TitanText, false) => "FINISH",
-        (ModelFamily::Llama | ModelFamily::Mistral, true) => "length",
-        (ModelFamily::Llama | ModelFamily::Mistral, false) => "stop",
-        (ModelFamily::CohereCommand, true) => "MAX_TOKENS",
-        (ModelFamily::CohereCommand, false) => "COMPLETE",
-        (ModelFamily::OpenAiChat, true) => openai_chat::FINISH_REASON_LENGTH,
-        (ModelFamily::OpenAiChat, false) => openai_chat::FINISH_REASON_STOP,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Response streaming
 // ---------------------------------------------------------------------------
@@ -4267,7 +4304,8 @@ pub fn invoke_model_stream_chunks(
 ) -> Vec<serde_json::Value> {
     let text = turn.text.as_str();
     let completion_id = turn.completion_id.as_str();
-    let stop_reason = family_stop_reason(family, turn.stopped_at_token_cap);
+    let stop_reason = family_stop_reason(family, turn.stop());
+    let halted_on = stop_reason::halted_sequence_field(turn.stop());
     let input_tokens = turn.input_tokens;
     let output_tokens = turn.output_tokens;
 
@@ -4301,7 +4339,7 @@ pub fn invoke_model_stream_chunks(
             serde_json::json!({ "type": "content_block_stop", "index": 0 }),
             serde_json::json!({
                 "type": "message_delta",
-                "delta": { "stop_reason": stop_reason, "stop_sequence": serde_json::Value::Null },
+                "delta": { "stop_reason": stop_reason, "stop_sequence": halted_on },
                 "usage": { "output_tokens": output_tokens },
             }),
             serde_json::json!({ "type": "message_stop" }),

@@ -230,7 +230,7 @@ fn halt_generation(answer: GeneratedAnswer, stop_sequences: &[String]) -> Genera
     let Some(halted) = runtime_state::halt_at_stop_sequence(&answer.text, stop_sequences) else {
         return answer;
     };
-    let kept = halted.chars().count();
+    let kept = halted.text.chars().count();
     let passages = answer
         .passages
         .into_iter()
@@ -250,7 +250,7 @@ fn halt_generation(answer: GeneratedAnswer, stop_sequences: &[String]) -> Genera
         })
         .collect();
     GeneratedAnswer {
-        text: halted,
+        text: halted.text,
         passages,
     }
 }

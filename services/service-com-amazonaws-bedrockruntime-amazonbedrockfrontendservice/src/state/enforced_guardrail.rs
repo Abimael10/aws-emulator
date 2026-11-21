@@ -72,7 +72,7 @@
 use rustrict::{Censor, Type};
 
 use super::{
-    count_text_tokens, invoke_model_response_body, ConverseTurn, InvokeTurn, ModelEntry,
+    count_text_tokens, invoke_model_response_body, ConverseTurn, InvokeTurn, ModelEntry, TurnStop,
     ModelFamily,
 };
 use crate::ops::types::{ContentBlock, Message, SystemContentBlock};
@@ -657,10 +657,11 @@ impl InvokeTurn {
                 messaging,
                 self.input_tokens,
                 output_tokens,
-                false,
+                TurnStop::Finished,
             ),
             text: messaging.to_string(),
             stopped_at_token_cap: false,
+            halted_on: None,
             output_tokens,
             ..self
         }
@@ -699,7 +700,8 @@ impl ConverseTurn {
             output_tokens,
             cache,
             truncated: false,
-            halted_at_stop_sequence: false,
+            halted_on: None,
+            family: self.family,
             guardrail_intervened: true,
         }
     }
