@@ -25,6 +25,10 @@
 //! The id of the request is reported in the header this protocol names a request in, fresh
 //! per call.
 //!
+//! RULE 3 is about the BODY, not only its text: the body of a refusal carries the sentence in
+//! `message` and the error class in `__type`, and nothing else, so two refusals of ONE
+//! condition carry the same body byte for byte while each names its own call in the header.
+//!
 //! Each suite is a TABLE whose rows differ along what the rule generalizes over:
 //! rule 1 over the resource type, the operation that reports it, the identifier's
 //! form and length, and the Region the request is signed for; rule 2 over the enum
@@ -526,6 +530,15 @@ async fn a_requirement_that_is_not_an_enum_keeps_the_frameworks_wording() {
     );
 }
 
+/// The statuses this service refuses a CLIENT with, one per modelled client-error class:
+/// `ValidationException` (400), `ServiceQuotaExceededException` (402),
+/// `AccessDeniedException` (403), `ResourceNotFoundException` (404) and `ConflictException`
+/// (409) — from the classes the operations of this service declare in the model. A table
+/// claiming to span the refusals of this service is compared against this one definition.
+fn client_error_statuses() -> BTreeSet<u16> {
+    BTreeSet::from([400u16, 402, 403, 404, 409])
+}
+
 /// Assert `answer` is a client error whose message is `sentence` and nothing after it, and
 /// report the id its own header named the request by.
 ///
@@ -678,7 +691,7 @@ async fn every_client_error_refusal_states_its_sentence_alone() {
     // The table spans the five client-error statuses this service refuses with.
     assert_eq!(
         statuses,
-        BTreeSet::from([400u16, 402, 403, 404, 409]),
+        client_error_statuses(),
         "the rows must span every client-error status this service answers, got {statuses:?}"
     );
     // Per REFUSAL, not per condition: no two of the refusals above named one request id.
@@ -749,5 +762,266 @@ async fn each_refusal_names_its_own_call_and_none_carries_the_clients_envelope()
         ::service_common::query_error_envelope::is_request_id(&served.request_id),
         "a served call names its request too, got {:?}",
         served.request_id
+    );
+}
+
+/// One row of the refusal-BODY table: the call that is refused, the status and the modelled
+/// error class it is refused with, and the sentence its `message` must carry.
+struct BodyRow {
+    /// What this row varies, named in every assertion.
+    case: &'static str,
+    method: &'static str,
+    uri: String,
+    body: Option<Value>,
+    status: u16,
+    /// The error class the model declares for this condition, as the protocol renders it.
+    class: &'static str,
+    sentence: String,
+}
+
+/// The whole of what a refused call carries: the status, and a body of the two members this
+/// protocol renders an error with — the sentence in `message` and the class in `__type`.
+///
+/// Nothing a client renders around the call is in it: not the service that answered, not the
+/// status, not the id of the request (which travels in the header and is read from there) and
+/// not the attempts the call took.
+fn assert_refusal_body(
+    case: &str,
+    answer: &crate::harness::Answer,
+    status: u16,
+    class: &str,
+    sentence: &str,
+) {
+    // The status, the sentence and the id in the header are rule 3's own assertions, made by
+    // the one helper that makes them; what follows is what the BODY adds to them.
+    assert_envelope(case, answer, sentence);
+    assert_eq!(
+        answer.status, status,
+        "case {case:?}: expected HTTP {status}, got {} with body {}",
+        answer.status, answer.body
+    );
+    let members: BTreeSet<&str> = answer
+        .body
+        .as_object()
+        .map(|body| body.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        members,
+        BTreeSet::from(["__type", "message"]),
+        "case {case:?}: a refusal body carries the class and the sentence alone, got members \
+         {members:?}"
+    );
+    assert_eq!(
+        answer.class(),
+        class,
+        "case {case:?}: expected the class {class:?}, got {:?} with body {}",
+        answer.error_type,
+        answer.body
+    );
+
+    let rendered = answer.body.to_string();
+    // The clauses an SDK renders AROUND a refusal when it raises its exception; no byte of
+    // one belongs to the answer.
+    for rendered_by_the_client in [" (Service: ", "Status Code: ", "SDK Attempt Count"] {
+        assert!(
+            !rendered.contains(rendered_by_the_client),
+            "case {case:?}: {rendered_by_the_client:?} is the client's own rendering and \
+             reaches no wire, got {rendered}"
+        );
+    }
+    assert!(
+        !rendered.contains(&answer.request_id),
+        "case {case:?}: the id of the call belongs to the header alone, got {rendered}"
+    );
+}
+
+/// RULE 3 at the BODY a refusal carries: the sentence in `message`, the class in `__type`,
+/// nothing else — so two refusals of one condition carry the SAME body, while each names its
+/// own call in the header.
+///
+/// This is the half one message comparison cannot show. A refusal whose text carried the
+/// client's envelope would carry THAT call's request id inside `message`, so two refusals of
+/// one condition would never compare equal, no exact-match assertion on an error body could
+/// hold, and every error body would be longer than the service's own answer.
+///
+/// The rows span the status (400, 402, 403, 404, 409), the layer that refuses (a handler of
+/// this service, and the request boundary), the operation, and the kind of sentence (built
+/// from the request, or wholly fixed). The 404 row is the teardown read of a tag/untag round
+/// trip — the scope is created, tagged, untagged and deleted — so it is the genuine
+/// not-found path a flow reaches after its own teardown.
+#[tokio::test]
+async fn a_refusal_body_carries_the_sentence_and_the_class_alone() {
+    let emulator = Emulator::new();
+
+    // The round trip the 404 row below closes: a scope created, tagged, untagged, torn down.
+    let created = emulator
+        .create_scope(json!({
+            "targets": targets(&[("123456789012", "us-east-1")]),
+            "clientToken": client_token(21),
+        }))
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "the scope must be created: got {} with body {}",
+        created.status, created.body
+    );
+    let scope_id = created.text("scopeId");
+    let scope_arn = created.text("scopeArn");
+    for (case, answer) in [
+        (
+            "tagging the scope",
+            emulator
+                .tag_resource(&scope_arn, &json!({ "owner": "sweep" }))
+                .await,
+        ),
+        (
+            "untagging it again",
+            emulator.untag_resource(&scope_arn, &["owner"]).await,
+        ),
+    ] {
+        assert_eq!(
+            answer.status, 204,
+            "case {case:?}: expected 204, got {} with body {}",
+            answer.status, answer.body
+        );
+    }
+    let deleted = emulator.delete_scope(&scope_id).await;
+    assert_eq!(
+        deleted.status, 200,
+        "the scope must delete: got {} with body {}",
+        deleted.status, deleted.body
+    );
+
+    // A scope and a monitor the store HOLDS, so the quota row is refused for the slot the
+    // scope took and the conflict row for the name the monitor holds.
+    let live_scope = emulator.scope_for_monitors().await;
+    let held = "wire-body-probe";
+    let monitor_body = |name: &str, scope: &str| {
+        json!({
+            "monitorName": name,
+            "scopeArn": scope,
+            "localResources": [{ "type": "AWS::EC2::VPC", "identifier": "vpc-body" }],
+        })
+    };
+    let held_monitor = emulator.create_monitor(monitor_body(held, &live_scope)).await;
+    assert_eq!(
+        held_monitor.status, 200,
+        "the held monitor must be created: got {} with body {}",
+        held_monitor.status, held_monitor.body
+    );
+
+    let missing_monitor = "wire-body-missing";
+    let absent_scope_arn = format!(
+        "arn:aws:{SIGNING_NAME}:{REGION}:{ACCOUNT_ID}:scope/\
+         00000000-0000-4000-8000-0000000000ff"
+    );
+    let rows: Vec<BodyRow> = vec![
+        BodyRow {
+            case: "the teardown read of the round trip (GetScope)",
+            method: "GET",
+            uri: format!("/scopes/{scope_id}"),
+            body: None,
+            status: 404,
+            class: "ResourceNotFoundException",
+            sentence: scope_not_found(REGION, &scope_id),
+        },
+        BodyRow {
+            case: "a scope identifier of another form",
+            method: "GET",
+            uri: "/scopes/not-a-scope-identifier".to_string(),
+            body: None,
+            status: 400,
+            class: "ValidationException",
+            sentence: "The provided Scope ARN is not valid".to_string(),
+        },
+        BodyRow {
+            case: "a monitor name the store holds nothing under",
+            method: "GET",
+            uri: format!("/monitors/{missing_monitor}"),
+            body: None,
+            status: 404,
+            class: "ResourceNotFoundException",
+            sentence: monitor_not_found(REGION, missing_monitor),
+        },
+        BodyRow {
+            case: "a cursor this service never issued",
+            method: "GET",
+            uri: "/monitors?nextToken=zzzz".to_string(),
+            body: None,
+            status: 400,
+            class: "ValidationException",
+            sentence: "NextToken provided isn't valid.".to_string(),
+        },
+        BodyRow {
+            case: "a page size past the declared maximum, raised at the boundary",
+            method: "GET",
+            uri: "/monitors?maxResults=26".to_string(),
+            body: None,
+            status: 400,
+            class: "ValidationException",
+            sentence: one_validation_error(
+                "26",
+                "maxResults",
+                "Member must have value less than or equal to 25",
+            ),
+        },
+        BodyRow {
+            case: "a second scope slot in the Region",
+            method: "POST",
+            uri: "/scopes".to_string(),
+            body: Some(json!({
+                "targets": targets(&[("123456789012", "us-east-1")]),
+                "clientToken": client_token(22),
+            })),
+            status: 402,
+            class: "ServiceQuotaExceededException",
+            // `state::SCOPE_QUOTA` is one scope per account and Region.
+            sentence: format!(
+                "Maximum limit of [1] for resource [scope] exceeded for account [{ACCOUNT_ID}]."
+            ),
+        },
+        BodyRow {
+            case: "a monitor naming a scope nothing resolves",
+            method: "POST",
+            uri: "/monitors".to_string(),
+            body: Some(monitor_body("unparented", &absent_scope_arn)),
+            status: 403,
+            class: "AccessDeniedException",
+            sentence: "scope supplied doesn't exist".to_string(),
+        },
+        BodyRow {
+            case: "a monitor name the store already holds",
+            method: "POST",
+            uri: "/monitors".to_string(),
+            body: Some(monitor_body(held, &live_scope)),
+            status: 409,
+            class: "ConflictException",
+            sentence: "Cannot create a monitor which already exists".to_string(),
+        },
+    ];
+
+    let mut statuses: BTreeSet<u16> = BTreeSet::new();
+    for row in &rows {
+        let first = emulator.call(row.method, &row.uri, row.body.clone()).await;
+        let again = emulator.call(row.method, &row.uri, row.body.clone()).await;
+        assert_refusal_body(row.case, &first, row.status, row.class, &row.sentence);
+        assert_refusal_body(row.case, &again, row.status, row.class, &row.sentence);
+        // One condition, refused twice: one body, and two calls each naming its own id.
+        assert_eq!(
+            first.body, again.body,
+            "case {:?}: two refusals of one condition carry one body, got {} then {}",
+            row.case, first.body, again.body
+        );
+        assert_ne!(
+            first.request_id, again.request_id,
+            "case {:?}: each refusal names its own call, got {:?} twice",
+            row.case, first.request_id
+        );
+        statuses.insert(row.status);
+    }
+    assert_eq!(
+        statuses,
+        client_error_statuses(),
+        "the rows must span every client-error status this service answers, got {statuses:?}"
     );
 }

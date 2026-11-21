@@ -118,6 +118,27 @@ impl Answer {
         self.error_type.contains(code) || self.text("__type").contains(code)
     }
 
+    /// The error class this answer names, as the shape NAME alone.
+    ///
+    /// `__type` may be namespace-qualified (`<namespace>#<name>`) and the header may carry a
+    /// trailing `:` qualifier, so a suite asserting the class the model DECLARES compares this
+    /// rather than a substring of whichever rendering was used — [`Answer::is_error`] is the
+    /// substring form, for a suite that only has to recognise a class it already knows.
+    pub fn class(&self) -> String {
+        let rendered = if self.text("__type").is_empty() {
+            self.error_type.clone()
+        } else {
+            self.text("__type")
+        };
+        let after_namespace = rendered.split('#').next_back().unwrap_or(&rendered);
+        after_namespace
+            .split(':')
+            .next()
+            .unwrap_or(after_namespace)
+            .trim()
+            .to_string()
+    }
+
     /// The SENTENCE a refusal words: its `message`, whole.
     ///
     /// A refused call carries the sentence the service worded and nothing after it — the
