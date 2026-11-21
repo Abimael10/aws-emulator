@@ -1573,6 +1573,16 @@ pub fn parameter_constraint(parameter: &str, constraint: &str) -> String {
     format!("Invalid parameter at '{parameter}' failed to satisfy constraint: '{constraint}'")
 }
 
+/// How a refusal naming SEVERAL refused parameters joins their clauses: every member at
+/// fault, in the order the request carries them, so a caller fixes the whole request from
+/// one message.
+///
+/// The one spelling of that separator, reached by the refusal the boundary walk's
+/// violations are worded into (`crate::service`) and by a handler judging a value class
+/// the walk cannot ([`refused_repository_filters`]), so a request refused for several
+/// parameters reads as one message however it was caught.
+pub const CLAUSE_SEPARATOR: &str = "; ";
+
 /// [`invalid_parameter_at`] for a DOCUMENT-valued parameter: `parameter` is the
 /// API-DOCUMENTED label of the request parameter carrying the document
 /// ([`POLICY_TEXT_PARAMETER`], [`LIFECYCLE_POLICY_TEXT_PARAMETER`]), which the API
@@ -4505,6 +4515,11 @@ mod layer_download;
 /// `crate::state::…` like every other part of this store.
 mod parameter_clause;
 pub use parameter_clause::*;
+/// Which values ECR accepts for the filter a replication rule carries, and the refusal of
+/// one outside that class, in `state/replication_filter.rs`. Declared and re-exported
+/// here, so a handler reaches it as `crate::state::…` like every other part of this store.
+mod replication_filter;
+pub use replication_filter::*;
 /// What ECR judges about a `repositoryName` a request addresses an existing repository by,
 /// in `state/repository_name.rs`. Declared and re-exported here, so a handler reaches it as
 /// `crate::state::…` like every other part of this store.

@@ -16,6 +16,12 @@
 //! into each destination registry that rule names — the same-named repository is created
 //! there and holds the identical image, manifest bytes, referenced blobs and tags included
 //! — while a repository no rule covers is copied nowhere and stays absent there.
+//!
+//! The last two suites are about WHICH VALUES a rule's repository filter may carry: the
+//! class ECR holds that value to is the expression its own validator publishes, which
+//! admits the `*` wildcard and states the value's length as a look-ahead, so a value inside
+//! that class is stored and reported back and one outside it is refused quoting the very
+//! expression it failed.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -938,4 +944,221 @@ async fn a_copy_lands_in_a_destination_repository_the_client_already_created() {
         "case {case:?}: the copy does not re-create the destination repository, got \
          {described:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The value class a repository filter carries
+// ---------------------------------------------------------------------------
+
+/// The expression ECR's own validator HOLDS for the value a replication repository filter
+/// carries — the one it quotes back in the constraint clause of its refusal — written out
+/// literally here, because the point of the two suites below is that the service accepts
+/// and quotes exactly this rule rather than another.
+///
+/// It admits the `*` wildcard in every character class and states the length the value may
+/// run to as a leading look-ahead. The model spells the same class narrower —
+/// `smithy_query(query="shape", shape="RepositoryFilterValue")` gives
+/// `^(?:[a-z0-9]+(?:[._-][a-z0-9]*)*/)*[a-z0-9]*(?:[._-][a-z0-9]*)*$` with
+/// `@length(2..256)` beside it — and what a caller is held to is the service's own
+/// expression.
+const PUBLISHED_FILTER_EXPRESSION: &str =
+    "^(?=.{1,256}$)(?:[a-z0-9*]+(?:[._-][a-z0-9*]*)*/)*[a-z0-9*]*(?:[._-][a-z0-9*]*)*$";
+
+/// The longest value [`PUBLISHED_FILTER_EXPRESSION`]'s look-ahead admits (`.{1,256}`).
+const MAX_FILTER_LENGTH: usize = 256;
+
+/// A Region that is not the one these calls are made against, so a destination in it is a
+/// real destination and the configuration is judged on its filters alone.
+const FILTER_DESTINATION: &str = "us-east-2";
+
+/// One rule replicating to [`FILTER_DESTINATION`] and carrying `filters` as its repository
+/// filters, each of them a `PREFIX_MATCH` filter.
+fn filtered_rule(filters: &[&str]) -> Value {
+    json!({
+        "destinations": [destination(REGISTRY_ID, FILTER_DESTINATION)],
+        "repositoryFilters": filters.iter().map(|filter| prefix(filter)).collect::<Vec<Value>>(),
+    })
+}
+
+/// The whole clause a filter outside the class is refused with: the path the validating
+/// walk descends to the `filter`-th filter of the `rule`-th rule, 1-based element steps
+/// included, and the expression the service holds that value class to.
+fn filter_clause(rule: usize, filter: usize) -> String {
+    format!(
+        "Invalid parameter at \
+         'replicationConfiguration.rules.{rule}.member.repositoryFilters.{filter}.member.filter' \
+         failed to satisfy constraint: 'Member must satisfy regular expression pattern: \
+         {PUBLISHED_FILTER_EXPRESSION}'"
+    )
+}
+
+/// A repository filter the published class ADMITS is stored and reported back, the `*`
+/// wildcard included — the character an operator covers a namespace with, which the
+/// model's own narrower `@pattern` does not admit.
+///
+/// The rows differ along what the rule generalises over: where the wildcard sits (the
+/// whole value, the name after a namespace, the namespace itself, inside a name, after a
+/// separator, several of them at once), whether there is a wildcard at all, and the length
+/// of the value — the shortest and the longest the published look-ahead admits.
+#[tokio::test]
+async fn a_repository_filter_the_published_class_admits_is_stored_and_reported() {
+    let longest = "a".repeat(MAX_FILTER_LENGTH);
+    // (case, the filter value the rule carries)
+    let rows: Vec<(&str, String)> = vec![
+        (
+            "the reported value: a wildcard covering a namespace",
+            "team/*".to_string(),
+        ),
+        (
+            "a wildcard on its own, which covers every repository",
+            "*".to_string(),
+        ),
+        (
+            "a wildcard as the namespace segment",
+            "*/service".to_string(),
+        ),
+        ("a wildcard inside a name", "team-*-service".to_string()),
+        (
+            "a wildcard after a separator inside a namespaced name",
+            "team/app.*".to_string(),
+        ),
+        ("several wildcards in one value", "*/*-*".to_string()),
+        (
+            "no wildcard at all, the form the model admits too",
+            "team-a".to_string(),
+        ),
+        (
+            // The published look-ahead admits one character where the model's `@length`
+            // states two: the service's own expression is the rule for this class, the
+            // same reason the wildcard is accepted.
+            "the shortest value the published length admits",
+            "a".to_string(),
+        ),
+        (
+            "the longest value the published length admits",
+            longest.clone(),
+        ),
+    ];
+
+    let router = emulator();
+    for (case, filter) in rows {
+        let configuration = json!({"rules": [filtered_rule(&[filter.as_str()])]});
+        let put = ok_in_region(
+            &router,
+            case,
+            REGION,
+            "PutReplicationConfiguration",
+            &json!({"replicationConfiguration": configuration}),
+        )
+        .await;
+        assert_eq!(
+            put["replicationConfiguration"], configuration,
+            "case {case:?}: the put must answer with the configuration it stored, got {put:?}"
+        );
+
+        let described = described_configuration(&router, case, REGION).await;
+        assert_eq!(
+            described, configuration,
+            "case {case:?}: DescribeRegistry must report the stored configuration, got \
+             {described:?}"
+        );
+    }
+}
+
+/// A repository filter the published class does NOT admit is refused HTTP 400
+/// `InvalidParameterException`, in the clause every refused parameter of this service is
+/// stated in, quoting the expression the value was held to and naming the position the
+/// filter sits at — and nothing of the refused configuration is stored.
+///
+/// The rows differ along what the rule generalises over: which half of the class the value
+/// broke (a character of neither class, an empty namespace segment, the empty value and one
+/// character past the published maximum), where the filter sits (the only one, a later
+/// filter of a rule, a later rule's filter), and how many filters are at fault, since every
+/// one of them is stated.
+#[tokio::test]
+async fn a_repository_filter_outside_the_published_class_is_refused_quoting_it() {
+    let too_long = "a".repeat(MAX_FILTER_LENGTH + 1);
+    // (case, the rules the put carries, the message the refusal states)
+    let rows: Vec<(&str, Value, String)> = vec![
+        (
+            "an upper-case name, which no character class admits",
+            json!([filtered_rule(&["Team/App"])]),
+            filter_clause(1, 1),
+        ),
+        (
+            "a character outside both classes",
+            json!([filtered_rule(&["team#app"])]),
+            filter_clause(1, 1),
+        ),
+        (
+            "a space inside the value",
+            json!([filtered_rule(&["team app"])]),
+            filter_clause(1, 1),
+        ),
+        (
+            "an empty namespace segment",
+            json!([filtered_rule(&["team//app"])]),
+            filter_clause(1, 1),
+        ),
+        (
+            "the empty value, which the published length refuses",
+            json!([filtered_rule(&[""])]),
+            filter_clause(1, 1),
+        ),
+        (
+            "one character past the published maximum length",
+            json!([filtered_rule(&[too_long.as_str()])]),
+            filter_clause(1, 1),
+        ),
+        (
+            "the second filter of the second rule, so a position is not a name",
+            json!([
+                filtered_rule(&["team/*"]),
+                filtered_rule(&["team/*", "Team/App"]),
+            ]),
+            filter_clause(2, 2),
+        ),
+        (
+            "two filters at fault, each one stated",
+            json!([filtered_rule(&["Team/App", "team-ok", "ALSO/BAD"])]),
+            format!("{}; {}", filter_clause(1, 1), filter_clause(1, 3)),
+        ),
+    ];
+
+    let router = emulator();
+    for (case, rules, expected) in rows {
+        let answer = call_in_region(
+            &router,
+            REGION,
+            "PutReplicationConfiguration",
+            &json!({"replicationConfiguration": {"rules": rules}}),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: expected HTTP 400, got {} with {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.error_code(),
+            "InvalidParameterException",
+            "case {case:?}: expected InvalidParameterException, got {:?}",
+            answer.body
+        );
+        assert_eq!(
+            answer.message(),
+            expected,
+            "case {case:?}: expected the clause {expected:?}, got {:?}",
+            answer.message()
+        );
+
+        // A refused put stores nothing: no row above was ever accepted, so the registry
+        // still reports the empty rule list it started with.
+        let described = described_configuration(&router, case, REGION).await;
+        assert_eq!(
+            described,
+            json!({"rules": []}),
+            "case {case:?}: a refused put must store nothing, got {described:?}"
+        );
+    }
 }

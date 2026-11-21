@@ -271,7 +271,17 @@ pub struct ReplicationDestination {
     pub registry_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ecr#RepositoryFilter")]
+// `skip_validation = ["filter"]`: the value class a repository filter carries is WIDER at
+// ECR than this model spells it. The expression ECR's own validator holds for
+// `RepositoryFilterValue` — the one it quotes back in a refusal — admits the `*` wildcard
+// in every character class and states the value's length as a leading look-ahead, while
+// the model's `@pattern` admits no wildcard and states `@length(2..256)` beside it. The
+// boundary walk enforces what the model declares and its engine compiles no look-around,
+// so this member is kept off the walk and judged by
+// `crate::state::refused_repository_filters`, which checks the published expression's body
+// and its length bound and quotes that expression. `filterType` stays on the walk: its
+// enumerated type is a constraint the model and the service agree on.
+#[smithy_macros::smithy(shape = "com.amazonaws.ecr#RepositoryFilter", skip_validation = ["filter"])]
 #[derive(Debug, Clone, Default)]
 pub struct RepositoryFilter {
     pub filter: String,

@@ -466,32 +466,6 @@ const LAYER_DIGEST_EXPRESSION: &str = "[a-zA-Z0-9-_+.]+:[a-fA-F0-9]+";
 /// not state back to a caller.
 const ANCHORED_LAYER_DIGEST_SPELLING: &str = "^[a-zA-Z0-9-_+.]+:[a-fA-F0-9]+$";
 
-/// The expression ECR PUBLISHES for a REPLICATION repository filter — the value a
-/// replication rule's `repositoryFilters` entry carries.
-///
-/// A `PREFIX_MATCH` filter may carry the `*` wildcard, and the expression ECR publishes
-/// admits it in every character class, with the length the value may run to as a leading
-/// lookahead. `smithy_query(query="shape", shape="RepositoryFilterValue")` spells the
-/// class without the wildcard and states its length as a separate `@length(2..256)`, so
-/// the model and the service disagree about this one class, and the published expression
-/// is the one a refusal quotes.
-///
-/// What this emulator CHECKS a filter against is still the model's spelling: the boundary
-/// walk is driven by the model's own constraints, and the lookahead this expression opens
-/// with is not one the walk's regular-expression engine compiles. The two spellings
-/// therefore disagree about the values carrying `*`, which are narrower here than at ECR;
-/// that acceptance gap is carried as its own issue
-/// (`20261118T120000Z-ecr-putreplicationconfiguration-refuses-a-wildcard-repository-filter-aws-accepts`),
-/// while a value either spelling refuses is refused with the published one quoted, which
-/// is what the recorded refusal carries.
-const REPLICATION_FILTER_EXPRESSION: &str =
-    "^(?=.{1,256}$)(?:[a-z0-9*]+(?:[._-][a-z0-9*]*)*/)*[a-z0-9*]*(?:[._-][a-z0-9*]*)*$";
-
-/// The spelling of the replication-filter class this model carries, which ECR's validator
-/// does not state back to a caller.
-const MODELLED_REPLICATION_FILTER_SPELLING: &str =
-    "^(?:[a-z0-9]+(?:[._-][a-z0-9]*)*/)*[a-z0-9]*(?:[._-][a-z0-9]*)*$";
-
 /// The value classes whose expression ECR PUBLISHES differently from how this model spells
 /// it, as the pair (the model's spelling, the one ECR states).
 ///
@@ -500,13 +474,14 @@ const MODELLED_REPLICATION_FILTER_SPELLING: &str =
 /// class is refused with the same one. A class absent from this table is published exactly
 /// as the model spells it, which is what the recorded refusals of this service's other
 /// classes show.
-const PUBLISHED_EXPRESSIONS: [(&str, &str); 3] = [
+///
+/// The REPLICATION repository filter is in neither half of this table: ECR publishes a
+/// wider class for it than the model spells — one admitting the `*` wildcard — so what a
+/// caller is held to is not a constraint of the model at all and the walk never states it.
+/// That class is judged, and its refusal worded, in `crate::state::replication_filter`.
+const PUBLISHED_EXPRESSIONS: [(&str, &str); 2] = [
     (SEPARATOR_CLASS_GLOB_SPELLING, REPOSITORY_GLOB_EXPRESSION),
     (ANCHORED_LAYER_DIGEST_SPELLING, LAYER_DIGEST_EXPRESSION),
-    (
-        MODELLED_REPLICATION_FILTER_SPELLING,
-        REPLICATION_FILTER_EXPRESSION,
-    ),
 ];
 
 /// The expression ECR polices for the value class `pattern` constrains: `pattern` itself
@@ -734,7 +709,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                         .iter()
                         .map(clause)
                         .collect::<Vec<String>>()
-                        .join("; ")
+                        .join(crate::state::CLAUSE_SEPARATOR)
                 },
             }),
             // Authentication is not this service's concern, and a refusal kind added

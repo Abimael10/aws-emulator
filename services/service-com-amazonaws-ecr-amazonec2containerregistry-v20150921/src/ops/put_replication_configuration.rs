@@ -6,6 +6,11 @@
 //! destination naming this registry itself (its own account id in the Region the request
 //! was made against) is refused — there is no replication from a registry to itself.
 //!
+//! The repository filter a rule carries is held to the value class ECR publishes for one,
+//! which admits the `*` wildcard: that class is wider than the model's own `@pattern` for
+//! it, so it is judged here rather than at the request boundary (see
+//! `crate::state::replication_filter`).
+//!
 //! The configuration stored here is an instruction about CONTENT: a push into a repository
 //! one of these rules covers is copied into each destination registry the rule names, which
 //! is `crate::state::replication`'s work.
@@ -214,6 +219,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request was signed for, and that Region is what makes a destination "the source".
         let region = crate::state::request_region(ctx.parts());
         let configuration = input.replication_configuration;
+
+        // Every repository filter the request carries has to be a value of the class ECR
+        // polices for one, which admits the `*` wildcard a namespace is covered with. The
+        // class is wider than the model's own `@pattern`, so the member is off the boundary
+        // walk (`skip_validation` on `RepositoryFilter`) and is judged here — first, where
+        // the walk would have judged it, so a configuration that breaks this rule and
+        // another is answered about the value it carries.
+        if let Some(message) = crate::state::refused_repository_filters(&configuration) {
+            return Err(
+                PutReplicationConfigurationErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
 
         // Every destination names a registry in a Region, so the Region has to be one:
         // a destination in a Region AWS does not have is refused before the
