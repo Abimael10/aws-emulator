@@ -14,9 +14,11 @@
 //! The material is read by the crates that implement the formats it comes in — [`ssh_key`]
 //! for the OpenSSH public key line, [`pkcs1`] and `spki` for the PEM structures — rather
 //! than by matching on the text: what counts as a key is the format itself, which is also
-//! what tells the two refusals apart. An encoding neither family recognises is
-//! `UnrecognizedPublicKeyEncodingException`; material in a recognised encoding that is not
-//! a usable key is `InvalidPublicKeyException`.
+//! what tells the two refusals apart. Material no reader of either format can take an RSA
+//! public key out of is in neither of the encodings the upload names, which is
+//! `UnrecognizedPublicKeyEncodingException`; material that IS such a key but not one the
+//! service takes — a key under the published minimum length — is
+//! `InvalidPublicKeyException`.
 //!
 //! Split out of the [`crate::state`] module root so each file holds one concern, and
 //! re-exported from it, so a handler reaches these as `crate::state::<item>` like every
@@ -26,16 +28,25 @@ use ::md5::Digest as _;
 use ::pkcs1::der::{Decode as _, Encode as _};
 
 use super::{
-    name_key, unique_id, ComAmazonawsIamAwsidentitymanagementv20100508State as IamState,
+    name_key, unique_id_of_length, ComAmazonawsIamAwsidentitymanagementv20100508State as IamState,
     CREDENTIAL_STATUS_ACTIVE,
 };
 use crate::ops::types::{SSHPublicKey, SSHPublicKeyMetadata};
 
 /// The prefix AWS gives an SSH public key's unique id — the `APKA` prefix the "IAM
 /// identifiers" page of the IAM User Guide lists for a public key under "unique ID
-/// prefixes". `SSHPublicKey$SSHPublicKeyId` is modelled as `publicKeyIdType` (len 20..128,
-/// pattern `^[\w]+$`), which this prefix plus the account's unique-id suffix satisfies.
+/// prefixes".
 const SSH_PUBLIC_KEY_ID_PREFIX: &str = "APKA";
+
+/// How many characters follow that prefix.
+///
+/// `SSHPublicKey$SSHPublicKeyId` is modelled as `publicKeyIdType` (len 20..128, pattern
+/// `^[\w]+$`), and the id AWS mints is at that minimum: the prefix and sixteen further
+/// characters, twenty in all, the length of the "SSH key ID" the CodeCommit User Guide
+/// writes out when it tells a user to sign in with one ("for example,
+/// APKAEIBAERJR2EXAMPLE"). The first thirteen of them carry all 64 bits of the counter the
+/// id is minted from, so the shorter suffix is no less unique than a longer one.
+const SSH_PUBLIC_KEY_ID_CHARACTERS: usize = 16;
 
 /// How many SSH public keys ONE IAM user may hold. AWS's "IAM and STS quotas" page gives
 /// the quota "SSH public keys per IAM user: 5"; an upload past it is refused with
@@ -46,14 +57,6 @@ pub const MAX_SSH_PUBLIC_KEYS_PER_USER: usize = 5;
 /// The shortest RSA key an upload takes, in bits: "the minimum bit-length of the public key
 /// is 2048 bits" (`UploadSSHPublicKey$SSHPublicKeyBody`).
 pub const MIN_SSH_PUBLIC_KEY_BITS: usize = 2048;
-
-/// The key type an OpenSSH public key line carries for the format the upload names:
-/// "the public key must be encoded in ssh-rsa format or PEM format".
-const OPENSSH_RSA_TYPE: &str = "ssh-rsa";
-
-/// The opening of the PEM framing RFC 7468 defines, which is what tells a PEM body from an
-/// OpenSSH line without reading either as the other.
-const PEM_BEGIN: &str = "-----BEGIN ";
 
 /// The PEM label of an X.509 `SubjectPublicKeyInfo` (RFC 7468 section 13) — what
 /// `ssh-keygen -e -m PKCS8` writes, the PEM form of a public key.
@@ -203,7 +206,11 @@ impl IamState {
     /// (`SSHPublicKey$SSHPublicKeyId`) is what every later read reports.
     pub fn next_ssh_public_key_id(&mut self) -> String {
         self.ssh_public_key_id_seq += 1;
-        unique_id(SSH_PUBLIC_KEY_ID_PREFIX, self.ssh_public_key_id_seq)
+        unique_id_of_length(
+            SSH_PUBLIC_KEY_ID_PREFIX,
+            self.ssh_public_key_id_seq,
+            SSH_PUBLIC_KEY_ID_CHARACTERS,
+        )
     }
 
     /// How many SSH public keys the user keyed by `user_key` holds.
@@ -295,19 +302,19 @@ impl IamState {
 
 /// What a `SSHPublicKeyBody` carries, as the upload reads it.
 ///
-/// The three answers are the three the operation's modelled refusals distinguish: an
-/// encoding neither public-key family recognises, a recognised encoding carrying no usable
-/// key, and a key.
+/// The three answers are the three the operation's modelled refusals distinguish: a body no
+/// public key can be read out of, a key the upload will not take, and a key.
 #[derive(Debug, Clone)]
 pub enum SshPublicKeyMaterial {
-    /// The body is in neither of the encodings the upload names — not an OpenSSH public
-    /// key line and not a PEM structure — which is
+    /// The body carries no public key in either of the encodings the upload names — no
+    /// reader of an OpenSSH `ssh-rsa` line and no reader of a PEM public-key structure can
+    /// take a key out of it — which is
     /// `UnrecognizedPublicKeyEncodingException`.
     UnrecognizedEncoding,
-    /// The body is in one of those encodings but carries no public key the upload can
-    /// take: it does not decode, it is not an RSA key, or the key is shorter than
-    /// [`MIN_SSH_PUBLIC_KEY_BITS`]. That is `InvalidPublicKeyException`, "the public key is
-    /// malformed or otherwise invalid".
+    /// The body carries such a key, but not one the upload takes: it is shorter than
+    /// [`MIN_SSH_PUBLIC_KEY_BITS`], or it cannot be written back out as the key it is.
+    /// That is `InvalidPublicKeyException`, "the public key is malformed or otherwise
+    /// invalid".
     Invalid,
     /// A key the upload takes.
     Key {
@@ -328,17 +335,19 @@ pub enum SshPublicKeyMaterial {
 /// Both encodings the upload names are read — "the public key must be encoded in ssh-rsa
 /// format or PEM format" — and each is reduced to the one structure that identifies the key
 /// it carries, so the two spellings of one key are one key here.
+///
+/// WHICH REFUSAL a body earns is decided by that reading and not by what the text looks
+/// like: the question an encoding answers is whether a public key can be READ out of the
+/// body at all, so a body no reader of either format takes a key out of is in neither
+/// encoding — a line whose blob is not one, a PEM structure that holds no public key, text
+/// that is in no such format — while a body that does carry a key is refused, if at all,
+/// for the key it carries.
 pub fn read_ssh_public_key(ssh_public_key_body: &str) -> SshPublicKeyMaterial {
     let text = ssh_public_key_body.trim();
-    let read = if text.starts_with(OPENSSH_RSA_TYPE) {
-        openssh_rsa_key(text)
-    } else if text.starts_with(PEM_BEGIN) {
-        pem_rsa_key(text)
-    } else {
+    let Some((modulus, public_exponent)) =
+        openssh_rsa_key(text).or_else(|| pem_rsa_key(text))
+    else {
         return SshPublicKeyMaterial::UnrecognizedEncoding;
-    };
-    let Some((modulus, public_exponent)) = read else {
-        return SshPublicKeyMaterial::Invalid;
     };
     if integer_bits(&modulus) < MIN_SSH_PUBLIC_KEY_BITS {
         return SshPublicKeyMaterial::Invalid;

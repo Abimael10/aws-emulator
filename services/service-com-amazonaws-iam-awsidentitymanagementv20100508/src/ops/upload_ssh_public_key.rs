@@ -175,9 +175,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 subject_public_key_info,
                 fingerprint,
             } => (subject_public_key_info, fingerprint),
-            // "The public key must be encoded in ssh-rsa format or PEM format": material
-            // in neither encoding is the one the operation models for an encoding it does
-            // not recognise.
+            // "The public key must be encoded in ssh-rsa format or PEM format": a body no
+            // reader of either encoding can take a public key out of is in neither, which
+            // is the refusal the operation models for an encoding it does not recognise.
             crate::state::SshPublicKeyMaterial::UnrecognizedEncoding => {
                 return Err(
                     UploadSSHPublicKeyErrorModeled::UnrecognizedPublicKeyEncodingException(
@@ -190,8 +190,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             }
-            // A recognised encoding carrying no usable key: "the public key is malformed
-            // or otherwise invalid" (`InvalidPublicKeyException`).
+            // Material that IS a public key in one of those encodings but not one the
+            // upload takes: "the public key is malformed or otherwise invalid"
+            // (`InvalidPublicKeyException`).
             crate::state::SshPublicKeyMaterial::Invalid => {
                 return Err(UploadSSHPublicKeyErrorModeled::InvalidPublicKeyException(
                     InvalidPublicKeyException {
@@ -304,9 +305,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// What IAM answers a body in a recognised encoding that carries no usable key with —
-/// "the public key is malformed or otherwise invalid" (`InvalidPublicKeyException`).
-const INVALID_PUBLIC_KEY: &str = "The public key is malformed or otherwise invalid.";
+/// What IAM answers a body that carries a public key it will not take with — the one
+/// sentence it words for "the public key is malformed or otherwise invalid"
+/// (`InvalidPublicKeyException`).
+///
+/// Fixed text with no variable part: it names neither the body nor what is wrong with the
+/// key, because the caller supplied the body.
+const INVALID_PUBLIC_KEY: &str = "Invalid body for public key";
 
 /// What IAM answers an upload of a key the named user already holds with — the one sentence
 /// it words for "the SSH public key is already associated with the specified IAM user"

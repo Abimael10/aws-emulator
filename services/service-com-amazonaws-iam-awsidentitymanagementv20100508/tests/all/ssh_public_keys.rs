@@ -12,9 +12,10 @@
 //!    by a minted `SSHPublicKeyId`, fingerprints it as "the MD5 message digest of the SSH
 //!    public key" (`SSHPublicKey$Fingerprint`) and holds it `Active`; and what it stored is
 //!    what a later read reports. The two refusals the operation models are told apart by
-//!    the ENCODING: material in neither encoding is `UnrecognizedPublicKeyEncoding`, whose
-//!    `Message` is one fixed sentence for the whole class, while material in one of them
-//!    that is no usable key is `InvalidPublicKey`.
+//!    the READING of the material: a body no reader of either encoding can take an RSA
+//!    public key out of is in neither of them, which is `UnrecognizedPublicKeyEncoding`,
+//!    while a body that IS such a key but not one the upload takes is `InvalidPublicKey` —
+//!    and each refusal carries one fixed sentence for its whole class.
 //! 2. the list "returns information about the SSH public keys associated with the specified
 //!    IAM user. If none exists, the operation returns an empty list" — so it reports exactly
 //!    the keys that user holds, pages over them under `MaxItems`, and refuses a name the
@@ -328,19 +329,23 @@ async fn one_key_fingerprints_alike_in_every_encoding() {
     }
 }
 
-/// One row of the refused-material table: a body, and the awsQuery code and status the
-/// refusal carries.
+/// One row of the refused-material table: a body, and the awsQuery code, status and
+/// `Message` the refusal carries.
 struct Refused {
     case: &'static str,
     body: String,
     code: &'static str,
     status: u16,
+    message: &'static str,
 }
 
-/// Rows spanning the two ways material fails: an encoding neither public-key family
-/// recognises, and a recognised encoding carrying no usable key — a key under the published
-/// minimum length in each encoding, an unreadable blob, and a PEM structure that is no
-/// public key.
+/// Rows spanning the two ways material fails, which the READING of the material tells
+/// apart rather than the look of the text: a body no reader of either encoding can take a
+/// public key out of is in neither encoding (prose, a bare blob, an OpenSSH line whose blob
+/// or key type is not one, a PEM document that holds no public key), while a body that IS
+/// such a key but one the upload will not take is refused for the key — here a key under
+/// the published minimum length, in each encoding and at each of two lengths below the
+/// bound.
 fn refused() -> Vec<Refused> {
     vec![
         Refused {
@@ -348,43 +353,81 @@ fn refused() -> Vec<Refused> {
             body: "this is not a public key".to_string(),
             code: "UnrecognizedPublicKeyEncoding",
             status: 400,
+            message: UNRECOGNIZED_ENCODING_MESSAGE,
         },
         Refused {
             case: "a base64 blob with no key type in front of it",
             body: "AAAAB3NzaC1yc2EAAAADAQAB".to_string(),
             code: "UnrecognizedPublicKeyEncoding",
             status: 400,
+            message: UNRECOGNIZED_ENCODING_MESSAGE,
         },
         Refused {
             case: "an ssh-rsa line whose blob cannot be read",
             body: "ssh-rsa not-a-base64-blob".to_string(),
-            code: "InvalidPublicKey",
+            code: "UnrecognizedPublicKeyEncoding",
             status: 400,
+            message: UNRECOGNIZED_ENCODING_MESSAGE,
         },
         Refused {
-            case: "an ssh-rsa key one bit under the published minimum",
+            case: "an OpenSSH line whose key type is not ssh-rsa",
+            body: openssh_line(&modulus(PUBLISHED_MINIMUM_BITS, 23), "")
+                .replacen("ssh-rsa", "ssh-dss", 1),
+            code: "UnrecognizedPublicKeyEncoding",
+            status: 400,
+            message: UNRECOGNIZED_ENCODING_MESSAGE,
+        },
+        Refused {
+            case: "a PEM structure that is no public key",
+            body: "-----BEGIN CERTIFICATE-----\nAAAAB3Nz\n-----END CERTIFICATE-----\n"
+                .to_string(),
+            code: "UnrecognizedPublicKeyEncoding",
+            status: 400,
+            message: UNRECOGNIZED_ENCODING_MESSAGE,
+        },
+        Refused {
+            // A readable PEM document whose LABEL says it holds something other than a
+            // public key: the framing is PEM, and no public key comes out of it.
+            case: "a PEM document under a label that is no public key",
+            body: spki_pem(&modulus(PUBLISHED_MINIMUM_BITS, 24))
+                .replace("PUBLIC KEY", "CERTIFICATE"),
+            code: "UnrecognizedPublicKeyEncoding",
+            status: 400,
+            message: UNRECOGNIZED_ENCODING_MESSAGE,
+        },
+        Refused {
+            case: "an ssh-rsa key half the published minimum",
             body: openssh_line(&modulus(PUBLISHED_MINIMUM_BITS - 1024, 21), ""),
             code: "InvalidPublicKey",
             status: 400,
+            message: INVALID_PUBLIC_KEY_MESSAGE,
+        },
+        Refused {
+            case: "an ssh-rsa key one byte under the published minimum",
+            body: openssh_line(&modulus(PUBLISHED_MINIMUM_BITS - 8, 25), ""),
+            code: "InvalidPublicKey",
+            status: 400,
+            message: INVALID_PUBLIC_KEY_MESSAGE,
         },
         Refused {
             case: "a PEM key under the published minimum",
             body: spki_pem(&modulus(PUBLISHED_MINIMUM_BITS - 1024, 22)),
             code: "InvalidPublicKey",
             status: 400,
+            message: INVALID_PUBLIC_KEY_MESSAGE,
         },
         Refused {
-            case: "a PEM structure that is no public key",
-            body: "-----BEGIN CERTIFICATE-----\nAAAAB3Nz\n-----END CERTIFICATE-----\n"
-                .to_string(),
+            case: "a PKCS#1 PEM key one byte under the published minimum",
+            body: pkcs1_pem(&modulus(PUBLISHED_MINIMUM_BITS - 8, 26)),
             code: "InvalidPublicKey",
             status: 400,
+            message: INVALID_PUBLIC_KEY_MESSAGE,
         },
     ]
 }
 
-/// RULE 1's refusals over every row: the status and the code say WHICH way the material
-/// failed, and nothing is stored for the user.
+/// RULE 1's refusals over every row: the status, the code and the sentence say WHICH way
+/// the material failed, and nothing is stored for the user.
 #[tokio::test]
 async fn material_outside_the_published_forms_is_refused_and_stores_nothing() {
     let router = router();
@@ -404,6 +447,13 @@ async fn material_outside_the_published_forms_is_refused_and_stores_nothing() {
             "case {:?}: expected the modelled awsQuery code {}, got {body}",
             case.case,
             case.code
+        );
+        assert_eq!(
+            element(&body, "Message"),
+            case.message,
+            "case {:?}: expected the sentence {:?}, got {body}",
+            case.case,
+            case.message
         );
 
         let (status, listed) = list(&router, &[("UserName", user_name)]).await;
@@ -873,6 +923,11 @@ async fn an_update_moves_the_named_keys_status_and_nothing_else() {
 /// instead of following it. It interpolates nothing: the sentence names neither the material
 /// nor the encodings the upload takes.
 const UNRECOGNIZED_ENCODING_MESSAGE: &str = "Invalid public key uploaded.";
+
+/// The whole `Message` AWS refuses a body that carries a public key it will not take with —
+/// `InvalidPublicKeyException`'s own sentence, spelled out here for the same reason, and
+/// interpolating nothing either: it names neither the body nor what is wrong with the key.
+const INVALID_PUBLIC_KEY_MESSAGE: &str = "Invalid body for public key";
 
 /// RULE 1's refusal SENTENCE for an unrecognized encoding: every body in neither encoding is
 /// refused with that one fixed sentence, which carries no part of the request.
