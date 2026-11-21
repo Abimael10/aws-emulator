@@ -125,18 +125,24 @@ pub(crate) fn tools() -> [Tool; 2] {
 /// (`us-east-1`), the others are not.
 pub(crate) const REGIONS: [&str; 3] = ["us-east-1", "eu-west-2", "ap-northeast-3"];
 
+/// One router over one engine, whose calls are signed as a principal the access decision
+/// allows ([`crate::authorized_signing_identity`]): the rows below read what the OPERATIONS
+/// answer, including one addressing a tool by the OTHER tool's reserved identifier, which the
+/// published credential alone is refused for (`unnameable_identifier_authorization.rs`).
 pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    crate::authorized_signing_identity::given_authorized_caller(&engine);
     let mut router = MultiServiceRouter::default();
     router.register_service(EmulatedService::new(engine));
     router
 }
 
 /// A SigV4 `Authorization` header for this service in `region`. It is what the router
-/// routes on, and what the handlers read the ARN region from.
+/// routes on, what the handlers read the ARN region from, and the identity it names.
 fn authorization(region: &str) -> String {
+    let key = crate::authorized_signing_identity::AUTHORIZED_KEY_ID;
     format!(
-        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{region}/bedrock-agentcore/aws4_request, \
+        "AWS4-HMAC-SHA256 Credential={key}/20240101/{region}/bedrock-agentcore/aws4_request, \
          SignedHeaders=host, Signature=abc"
     )
 }

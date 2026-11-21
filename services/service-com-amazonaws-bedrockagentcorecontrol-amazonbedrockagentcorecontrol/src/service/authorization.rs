@@ -6,13 +6,18 @@
 //!
 //! A signed call is decided by IAM ahead of the service, so a principal whose policies do
 //! not allow the action is told it is not authorized rather than told anything about the
-//! request it sent: whether the resource it addressed exists, and whether the identifier it
-//! named is even inside the member's modelled format, are both answers this refusal
-//! withholds. That ORDER is the point of taking the decision here: the framework's
-//! centralized walk validates the model's constraints before any handler runs, so a handler
-//! cannot take a decision that precedes it, and a caller without the action's grant would
-//! otherwise be answered `ValidationException` for a malformed identifier — a caller-bug
-//! verdict — where AWS answers `AccessDeniedException`.
+//! request it sent: whether the resource it addressed exists, and what is wrong with any
+//! member of the request, are both answers this refusal withholds. That ORDER is the point of
+//! taking the decision here: the framework's centralized walk validates the model's
+//! constraints before any handler runs, so a handler cannot take a decision that precedes it,
+//! and a caller without the action's grant would otherwise be answered `ValidationException`
+//! for a malformed identifier — a caller-bug verdict — where AWS answers
+//! `AccessDeniedException`.
+//!
+//! One thing about the request IS read before the decision, and it decides no part of it: the
+//! identifier the route addresses its resource by is read for whether a resource of the family
+//! can be addressed by it at all, because that is what the account's own standing grant over
+//! its own resources can be in force over (see "The callers the decision cannot refuse").
 //!
 //! The three pieces, each held in exactly one place:
 //!
@@ -79,6 +84,34 @@
 //! permits. The DENY half is decided the same way round: an explicit `Deny` about the action
 //! over every resource refuses the request here ([`EVERY_RESOURCE`]).
 //!
+//! ## An identifier no resource of its family can carry
+//!
+//! A route addresses its resource by the identifier its path carries, and an identifier
+//! outside the modelled format of the member that names it is one no resource of the family
+//! can be addressed by: the call names no resource of this account. That is the one request
+//! the account's own standing exemption below does not reach — it stands in for the grants the
+//! account has over its own resources, and the call addresses none of them — so the decision
+//! is taken on what this gate can READ: a principal whose readable documents allow the action
+//! reaches the operation, and one no readable statement allows falls to IAM's own default deny
+//! and is refused `AccessDeniedException` at 403, in the wording that family states a denial
+//! in, with no report about the member at all. Every other caller is decided exactly as it is
+//! for any other request, including a principal carrying a grant this emulator cannot read.
+//!
+//! It is the recorded answer of this endpoint, and of this tree's other services' tagging
+//! planes: a read of a runtime whose `agentRuntimeId` carries no identifier any runtime can
+//! have is answered 403 and not the member's constraint clause for the caller this emulator
+//! publishes — an IAM user ARN holding no document, which is the position IAM's default deny
+//! answers — a listing of a capacity provider's runtime versions is answered the same way for
+//! an identifier no provider of the account has, and a tag call naming a resource that is no
+//! ARN is refused the same way before its member's shape is reported at all. A request whose
+//! addressing identifier IS inside its member's format is judged as every other request is
+//! and, when it gets through, reaches the operation's own verdicts — where a member of the
+//! request that breaks a modelled constraint is the modelled `ValidationException`, and a
+//! well-formed identifier that names nothing is the modelled not-found refusal. Only the
+//! identifier the DECISION is taken against is read this way: a malformed CHILD identifier
+//! beside a well-formed parent leaves the parent named, so that request is validated and
+//! answered the member's clause.
+//!
 //! ## How the refusal is worded
 //!
 //! A refusal states the principal and the action it asked for; whether it goes on to name
@@ -94,14 +127,19 @@
 //!
 //! ## The callers the decision cannot refuse
 //!
-//! * **The account's own published credential.** A request whose access key id neither STS
-//!   nor IAM holds a record for resolves to [`sts_store::ambient_identity`], which is not a
-//!   principal the IAM store holds policies for — the position AWS account root credentials
-//!   are in. Such a request is allowed, which is also why the credential this emulator
-//!   publishes at start keeps reaching every operation.
+//! * **The account's own published credential**, for a call that names a resource of the
+//!   account. A request whose access key id neither STS nor IAM holds a record for resolves to
+//!   [`sts_store::ambient_identity`], which is not a principal the IAM store holds policies
+//!   for — the position AWS account root credentials are in. Such a request is allowed, which
+//!   is also why the credential this emulator publishes at start keeps reaching every
+//!   operation. What it stands in for is the account's own authority over its own resources,
+//!   so it is in force over a call that addresses one; a call whose identifier no resource of
+//!   its family can carry addresses none, and is decided by IAM's own evaluation instead (see
+//!   the section above).
 //! * **A principal holding an attachment this emulator cannot read.** An AWS-managed policy
 //!   belongs to AWS rather than to the account, so the IAM store holds no document for it;
-//!   refusing on a grant this emulator cannot see would deny access AWS permits. An
+//!   refusing on a grant this emulator cannot see would deny access AWS permits — for every
+//!   request alike, since such a grant may cover the action over every resource. An
 //!   explicit `Deny` in a document that CAN be read still refuses, and a permissions
 //!   boundary the store DOES hold still caps the grant.
 //!
@@ -118,7 +156,7 @@ use ::aws_smithy_schema::Schema;
 use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam_store;
 use ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_store;
 use ::service_common::iam_authorization::{self as iam, Decision};
-use smithy_server_runtime::{OperationContext, Refused};
+use smithy_server_runtime::{OperationContext, Refused, Violation, ViolationKind};
 
 /// The namespace a policy statement spells this endpoint's actions under, which is also its
 /// SigV4 signing name and its ARN namespace: `bedrock-agentcore` for all three
@@ -208,6 +246,17 @@ pub fn request_principal<Eng: Send + Sync + 'static>(
 /// line is judged against that ARN, and one whose resource it cannot name is judged on the
 /// action alone, over every resource (see the module docs).
 ///
+/// A request whose addressing identifier is one the member that names it cannot admit names
+/// no resource of this account, which withdraws the account credential's standing exemption
+/// for that one request ([`Caller::identity_is_unbounded`]): a principal no readable statement
+/// allows then falls to IAM's default deny, and one whose readable documents allow the action
+/// reaches the operation as usual.
+///
+/// `violations` is the framework's OWN reading of the request against `input_schema`, which
+/// is what settles whether the addressing identifier is inside its member's modelled format:
+/// the format is checked in exactly one place for the whole service, and this decision cannot
+/// disagree with the constraint clause the same walk would state.
+///
 /// IAM's order: an explicit `Deny` in a document that CAN be read refuses the request
 /// whatever else the principal carries; otherwise a grant is needed, which a caller this
 /// gate does not bound has by definition (see the module docs); and a grant is capped by the
@@ -223,20 +272,37 @@ pub fn refusal<Eng: Send + Sync + 'static>(
     ctx: &OperationContext<'_>,
     operation: &str,
     input_schema: &Schema,
+    violations: &[Violation],
 ) -> Option<Refused> {
-    let addressed = addressed(ctx, input_schema).unwrap_or(Addressed::EveryResource);
+    let judged = judged(ctx, input_schema, violations).unwrap_or(Judged {
+        addressed: Addressed::EveryResource,
+        names_a_resource: true,
+    });
     let caller = caller(engine, ctx);
     // Nothing this gate can read bears on the request: there is no document that could deny
-    // it, no boundary that could cap it, and the credential is one the gate does not bound.
-    if caller.documents.is_empty() && caller.boundary.is_none() && caller.identity_is_unbounded()
+    // it, no boundary that could cap it, and the credential is one the gate does not bound
+    // for a call that names a resource of this account ([`Caller::identity_is_unbounded`]).
+    if caller.documents.is_empty()
+        && caller.boundary.is_none()
+        && caller.identity_is_unbounded(judged.names_a_resource)
     {
         return None;
     }
+    let Judged {
+        addressed,
+        names_a_resource,
+    } = judged;
     let action = action_for(operation);
     // An identity-based document states no `Principal` element, so the decision rests on
     // the action and the resource the request addressed.
     let request = iam::Request::new(&action, addressed.arn(), &[]);
-    let withheld = withheld(&caller, &request, &action, addressed.scope())?;
+    let withheld = withheld(
+        &caller,
+        &request,
+        &action,
+        addressed.scope(),
+        names_a_resource,
+    )?;
     ::tracing::info!(
         operation = %operation,
         action = %action,
@@ -265,6 +331,7 @@ fn withheld(
     request: &iam::Request<'_>,
     action: &str,
     scope: Scope,
+    names_a_resource: bool,
 ) -> Option<String> {
     // Each document is read ONCE per decision: the identity-based question, the grant
     // question below it and the boundary's own reading all take the prepared form.
@@ -274,7 +341,7 @@ fn withheld(
         return Some(iam::IDENTITY_POLICY_EXPLICIT_DENY.to_string());
     }
     if !(iam::is_allowed(said, Decision::NotStated)
-        || caller.identity_is_unbounded()
+        || caller.identity_is_unbounded(names_a_resource)
         || grant_scoped_elsewhere(&documents, action, scope))
     {
         return Some(iam::no_identity_policy_allows(action));
@@ -327,9 +394,10 @@ pub fn not_authorized(principal: &str, action: &str) -> String {
     format!("User: {principal} is not authorized to perform: {action}")
 }
 
-/// The ARN of the resource this request addresses, when this layer can name it from the
-/// request line, and `None` for every other request — which its caller judges over every
-/// resource rather than leaving unjudged (see the module docs).
+/// What this request's authorization decision is taken against, and what that decision rests
+/// on — the resource this layer can name from the request line, and `None` for every other
+/// request, which its caller judges over every resource rather than leaving unjudged (see the
+/// module docs).
 ///
 /// Read off the operation's OWN modelled `@http` URI rather than off a list of operation
 /// names, so every route of a family this layer names an ARN type for is judged, and one
@@ -352,12 +420,26 @@ pub fn not_authorized(principal: &str, action: &str) -> String {
 /// path a caller sent: a request carrying no identifier at the label's segment still
 /// addresses the family the route names, so it is judged against that family's collection
 /// rather than falling to the action alone.
-fn addressed(ctx: &OperationContext<'_>, input_schema: &Schema) -> Option<Addressed> {
+///
+/// What the SHAPE of the carried identifier decides is one thing only
+/// ([`Judged::names_a_resource`]): whether it can name a resource of the family at all, which
+/// settles whether the account credential's standing exemption reaches this decision — never
+/// which resource the decision is taken against, and never the decision itself.
+fn judged(
+    ctx: &OperationContext<'_>,
+    input_schema: &Schema,
+    violations: &[Violation],
+) -> Option<Judged> {
     let parts = ctx.parts();
     let region = crate::state::request_region(parts);
     let template = input_schema.http().map(|http| http.uri())?;
     let family = path_segment(template, 0)?;
-    let collection = || collection_arn(family, &region).map(Addressed::Collection);
+    let collection = || {
+        collection_arn(family, &region).map(|arn| Judged {
+            addressed: Addressed::Collection(arn),
+            names_a_resource: true,
+        })
+    };
     let Some((index, label)) = first_label(template) else {
         return collection();
     };
@@ -368,11 +450,52 @@ fn addressed(ctx: &OperationContext<'_>, input_schema: &Schema) -> Option<Addres
     let Some(carried) = carried else {
         return collection();
     };
-    // A family this layer names no ARN type for answers `None` here, and is judged on its
-    // action alone by the caller of this reading.
-    member_arn(label, &carried, &region).map(|arn| Addressed::Member {
-        arn,
-        states_resource: !ACTION_ONLY_REFUSAL_FAMILIES.contains(&family),
+    // An identifier outside its member's modelled format is one no resource of the family
+    // can be addressed by: the call names a resource of this account only when the
+    // identifier it carries is one such a resource can carry (see the module docs). It is
+    // read off the ROUTE's own member, so it holds for every family alike — including the
+    // ones this layer builds no ARN type for, whose decision is taken over every resource.
+    let names_a_resource = !outside_the_modelled_format(label, violations);
+    // A family this layer names no ARN type for is judged on its action alone, over every
+    // resource, by the reading below — carrying the same answer about the identifier.
+    let addressed = member_arn(label, &carried, &region).map_or(
+        Addressed::EveryResource,
+        |arn| Addressed::Member {
+            arn,
+            states_resource: !ACTION_ONLY_REFUSAL_FAMILIES.contains(&family),
+        },
+    );
+    Some(Judged {
+        addressed,
+        names_a_resource,
+    })
+}
+
+/// Whether the identifier the request carried at the member `label` is outside that member's
+/// modelled format, read off the framework's OWN violations for this request.
+///
+/// The format of an identifier member is the character grammar its `@pattern` publishes: an
+/// identifier outside it is one no resource of the family can be addressed by. Taking it from
+/// the shared validating walk rather than re-reading the member's traits here is what keeps
+/// one reading of "inside the modelled format" for the whole service — the same walk whose
+/// clause a request that DOES address a resource is refused by.
+///
+/// Only the `@pattern` is read. A member that publishes no grammar — the `resourceArn` the
+/// tagging and resource-policy routes carry, which the model bounds by length alone — says
+/// nothing about which values can name a resource, so a request carrying one is judged
+/// against the resource as carried, the way every other request is. A patterned identifier
+/// member's `@length` window is read the same way: these members' patterns bound their own
+/// length, so a value inside the pattern is inside the window too, and nothing is decided
+/// here on a bound the grammar does not already state.
+///
+/// A violation at any other member says nothing about the resource the route addresses, so it
+/// is not read here: a malformed CHILD identifier (an endpoint's name beside its runtime's
+/// id) leaves the parent — the resource the decision is taken against — named exactly as the
+/// request named it.
+fn outside_the_modelled_format(label: &str, violations: &[Violation]) -> bool {
+    let path = ::aws_smithy_schema_server::constraints::path::member(label);
+    violations.iter().any(|violation| {
+        violation.path == path && matches!(violation.kind, ViolationKind::Pattern(_))
     })
 }
 
@@ -493,6 +616,21 @@ enum Addressed {
     EveryResource,
 }
 
+/// What this request's authorization decision is taken against, and what that decision rests
+/// on besides the caller's documents.
+#[derive(Debug, Clone)]
+struct Judged {
+    /// The resource the decision is taken against ([`Addressed`]).
+    addressed: Addressed,
+    /// Whether the call NAMES a resource of this account at all: cleared when the identifier
+    /// the route addresses its resource by is one the member that names it cannot admit, so
+    /// no resource of the family answers to it. It decides one thing
+    /// ([`Caller::identity_is_unbounded`]): whether the credential this emulator publishes
+    /// keeps the exemption that lets its calls through unjudged, which stands in for a grant
+    /// over the resource a call addresses (see the module docs).
+    names_a_resource: bool,
+}
+
 /// Which GRANT question a request is decided by, which follows the resource the decision is
 /// taken against ([`Addressed`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -565,10 +703,20 @@ struct Caller {
 
 impl Caller {
     /// Whether nothing the identity-based decision found can refuse this caller once no
-    /// readable document DENIES the action: the account's own credential, which holds no
-    /// IAM policies, or a principal carrying a grant this emulator cannot read.
-    fn identity_is_unbounded(&self) -> bool {
-        self.account_credential || self.unreadable_attachment
+    /// readable document DENIES the action: a principal carrying a grant this emulator cannot
+    /// read, or — for a call that NAMES a resource of this account — the account's own
+    /// published credential.
+    ///
+    /// `names_a_resource` is what the request addressed ([`Judged::names_a_resource`]). The
+    /// account's own credential holds no document at all, so the exemption it carries is this
+    /// emulator's standing-in for the grants the account has over its own resources; a call
+    /// whose identifier no resource of its family can carry addresses none of them, so there
+    /// is nothing for it to stand in for and the decision falls to what IAM itself says about
+    /// the action (see the module docs). A grant this emulator cannot READ is unaffected: it
+    /// may cover the action over every resource, so refusing on it would deny access AWS
+    /// permits.
+    fn identity_is_unbounded(&self, names_a_resource: bool) -> bool {
+        (self.account_credential && names_a_resource) || self.unreadable_attachment
     }
 
     /// Read what the IAM identity `identity_arn` names may do, through the IAM service's OWN
@@ -1040,7 +1188,10 @@ mod tests {
             ];
             for (judged, resource, scope, expected) in decided {
                 let request = iam::Request::new(&action, resource, &[]);
-                let reached = withheld(&caller, &request, &action, scope);
+                // Every row is an IAM user with documents of its own, so the account
+                // credential's standing exemption is not in play: each is judged as a call
+                // that names a resource is.
+                let reached = withheld(&caller, &request, &action, scope, true);
                 assert_eq!(
                     reached, expected,
                     "case {:?} judged {judged}: expected {expected:?}, got {reached:?}",

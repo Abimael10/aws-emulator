@@ -55,18 +55,24 @@ const PAST_SETTLE: Duration = Duration::from_millis(900);
 /// `^[a-zA-Z][a-zA-Z0-9_]{0,39}-[a-zA-Z0-9]{10}$` that no row ever creates.
 const ABSENT_HARNESS_ID: &str = "noSuchHarness-abcdefghij";
 
+/// One router over one engine, whose calls are signed as a principal the access decision
+/// allows ([`crate::authorized_signing_identity`]): the rows below read what the OPERATIONS
+/// answer, including a `harnessId` no harness can carry, which the published credential alone
+/// is refused for (`unnameable_identifier_authorization.rs`).
 fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    crate::authorized_signing_identity::given_authorized_caller(&engine);
     let mut router = MultiServiceRouter::default();
     router.register_service(EmulatedService::new(engine));
     router
 }
 
-/// A SigV4 `Authorization` header for this service: what the router routes on, and what
-/// the handlers read the ARN and endpoint region from.
+/// A SigV4 `Authorization` header for this service: what the router routes on, what
+/// the handlers read the ARN and endpoint region from, and the identity it names.
 fn authorization() -> String {
+    let key = crate::authorized_signing_identity::AUTHORIZED_KEY_ID;
     format!(
-        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/bedrock-agentcore/\
+        "AWS4-HMAC-SHA256 Credential={key}/20260101/{REGION}/bedrock-agentcore/\
          aws4_request, SignedHeaders=host, Signature=abc"
     )
 }

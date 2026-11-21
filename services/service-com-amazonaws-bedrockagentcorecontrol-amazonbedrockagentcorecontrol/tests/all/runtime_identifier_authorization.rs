@@ -16,6 +16,10 @@
 //! the operation's own verdicts, where that same malformed identifier IS the modelled
 //! `ValidationException`.
 //!
+//! Which callers the gate lets through UNJUDGED is the subject of the two tests at the end,
+//! and `unnameable_identifier_authorization.rs` holds the one request those exemptions do
+//! not reach: a call addressing its runtime by an identifier no runtime can carry.
+//!
 //! The user, its access key and its inline policy live in the IAM store of the SAME shared
 //! engine — the store IAM's own handlers write — so the documents under test are the ones
 //! `iam:PutUserPolicy` stores, and the principal a refusal blames is the one
@@ -43,17 +47,17 @@ use service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam;
 use service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts;
 
 /// The region every row signs for, and a second one for the rows about a statement's scope.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 const OTHER_REGION: &str = "eu-west-3";
 
 /// An access key id neither store holds a record for: the account's own published
 /// credential, which holds no IAM policy.
-const AMBIENT_KEY_ID: &str = "AKIDEXAMPLE";
+pub(crate) const AMBIENT_KEY_ID: &str = "AKIDEXAMPLE";
 
 /// The access key id of the IAM user every policy row signs with, and the user it is held
 /// for. The user's name appears nowhere in the key's text, so an identity synthesised from
 /// that text cannot pass a row.
-const USER_KEY_ID: &str = "AKIAEXAMPLEAGENTCORE1";
+pub(crate) const USER_KEY_ID: &str = "AKIAEXAMPLEAGENTCORE1";
 const USER: &str = "agentcore-operator";
 
 /// The name of the inline policy the rows put in force.
@@ -67,31 +71,35 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 const RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
 
 /// A `roleArn` inside `RoleArn`'s pattern, for the rows whose request carries a body.
-const VALID_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/ProbeRuntimeRole";
+pub(crate) const VALID_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/ProbeRuntimeRole";
 
 /// An `agentRuntimeId` inside `AgentRuntimeId`'s pattern that no row creates.
-const ABSENT_RUNTIME_ID: &str = "noSuchRuntime-abcdefghij";
+pub(crate) const ABSENT_RUNTIME_ID: &str = "noSuchRuntime-abcdefghij";
 
 /// An `agentRuntimeId` OUTSIDE that pattern (no `-` plus ten alphanumerics), of the form a
 /// caller derives from a runtime's log-group name.
-const UNPATTERNED_RUNTIME_ID: &str = "probe_runtime_from_log_group";
+pub(crate) const UNPATTERNED_RUNTIME_ID: &str = "probe_runtime_from_log_group";
 
-/// One answer: the status, the error code and the `message` the body carries.
-struct Answer {
-    status: u16,
-    code: String,
-    message: String,
+/// One answer: the status, the error code, the `message` the body carries and the body
+/// itself.
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) code: String,
+    pub(crate) message: String,
+    pub(crate) body: Value,
 }
 
 /// One router over one engine: the control plane under test, plus the IAM and STS stores of
-/// that same engine, which this suite seeds directly.
-struct Harness {
+/// that same engine, which this suite — and `unnameable_identifier_authorization.rs`, which
+/// drives the same decision over the identifier a route addresses its resource by — seed
+/// directly.
+pub(crate) struct Harness {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Harness {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::default();
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
@@ -99,7 +107,7 @@ impl Harness {
     }
 
     /// Send one call signed with `access_key_id` for `region`.
-    async fn send_as(
+    pub(crate) async fn send_as(
         &self,
         access_key_id: &str,
         region: &str,
@@ -148,17 +156,18 @@ impl Harness {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
+            body: parsed,
         }
     }
 
     /// Send one call in [`REGION`] signed with the account's own published credential.
-    async fn send(&self, method: &str, uri: &str, body: Option<&Value>) -> Answer {
+    pub(crate) async fn send(&self, method: &str, uri: &str, body: Option<&Value>) -> Answer {
         self.send_as(AMBIENT_KEY_ID, REGION, method, uri, body).await
     }
 
     /// Create a runtime named `name` with the account's own credential, and answer the
     /// `agentRuntimeId` the service minted for it.
-    async fn create_runtime(&self, name: &str) -> String {
+    pub(crate) async fn create_runtime(&self, name: &str) -> String {
         let body = json!({
             "agentRuntimeName": name,
             "agentRuntimeArtifact": {"containerConfiguration": {
@@ -191,7 +200,7 @@ impl Harness {
 
     /// Record the IAM user [`USER_KEY_ID`] belongs to, as `iam:CreateUser` and
     /// `iam:CreateAccessKey` record one, and answer the ARN the account holds it under.
-    fn given_user(&self) -> String {
+    pub(crate) fn given_user(&self) -> String {
         let arn = user_arn();
         let minted = ::aws_smithy_types::DateTime::from_secs(0);
         let store = iam::service_state(&*self.engine).expect("the IAM store");
@@ -223,7 +232,7 @@ impl Harness {
     /// Put `document` in force as that user's inline policy, replacing whatever it carried
     /// — what `iam:PutUserPolicy` does. `None` takes every policy off it, as the matching
     /// delete does.
-    fn given_policy(&self, document: Option<&str>) {
+    pub(crate) fn given_policy(&self, document: Option<&str>) {
         let store = iam::service_state(&*self.engine).expect("the IAM store");
         let mut store = store.lock();
         let key = iam::name_key(USER);
@@ -249,7 +258,7 @@ impl Harness {
     /// Attach `policy_arn` to that user as a MANAGED policy, as `iam:AttachUserPolicy`
     /// does. A policy of AWS's own catalog is one this emulator holds no document for: a
     /// grant it cannot read, and so cannot make the reason a call is refused.
-    fn given_attached_policy(&self, policy_arn: &str) {
+    pub(crate) fn given_attached_policy(&self, policy_arn: &str) {
         let store = iam::service_state(&*self.engine).expect("the IAM store");
         store
             .lock()
@@ -267,7 +276,7 @@ fn authorization(access_key_id: &str, region: &str) -> String {
 }
 
 /// The ARN the account holds the IAM user under, which a refusal names as that caller.
-fn user_arn() -> String {
+pub(crate) fn user_arn() -> String {
     format!(
         "arn:aws:iam::{}:user/{USER}",
         engine::emulator_account_id()
@@ -275,12 +284,12 @@ fn user_arn() -> String {
 }
 
 /// The sentence this endpoint refuses an unauthorized call with.
-fn not_authorized(principal: &str, operation: &str) -> String {
+pub(crate) fn not_authorized(principal: &str, operation: &str) -> String {
     format!("User: {principal} is not authorized to perform: bedrock-agentcore:{operation}")
 }
 
 /// A policy document granting `actions` on `resources`, as `iam:PutUserPolicy` takes one.
-fn allow(actions: &str, resources: &str) -> String {
+pub(crate) fn allow(actions: &str, resources: &str) -> String {
     format!(
         r#"{{"Version":"2012-10-17","Statement":[
          {{"Effect":"Allow","Action":{actions},"Resource":{resources}}}]}}"#

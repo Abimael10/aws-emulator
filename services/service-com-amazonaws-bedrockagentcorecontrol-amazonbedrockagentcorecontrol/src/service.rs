@@ -491,7 +491,17 @@ fn pre_handler<O: Operation, Eng: Send + Sync + 'static>(
     req: &RtRequest,
     ctx: &OperationContext<'_>,
 ) -> Option<PreHandler> {
-    if let Some(denial) = authorization::refusal(engine, ctx, O::NAME, O::INPUT_SCHEMA) {
+    // The request is READ before the decisions below, and nothing is answered from that
+    // reading yet: the authorization decision needs one fact out of it — whether the
+    // identifier the route addresses its resource by is inside the modelled format of the
+    // member that names it, which is what settles whether the call addresses a resource of
+    // this endpoint at all ([`authorization`]). Reading is not answering, so the ORDER a
+    // caller sees is unchanged: the access decisions are still taken, and still answered,
+    // ahead of every statement about the request's members.
+    let (violations, lists) =
+        service_common::validation::refusing_violations_with_lists::<O>(protocol, req);
+    if let Some(denial) = authorization::refusal(engine, ctx, O::NAME, O::INPUT_SCHEMA, &violations)
+    {
         return Some(PreHandler::Denied(denial));
     }
     // And the account's own entitlement to the feature the request addresses, which the
@@ -499,8 +509,6 @@ fn pre_handler<O: Operation, Eng: Send + Sync + 'static>(
     if let Some(denial) = entitlement::refusal(engine, ctx, O::NAME) {
         return Some(PreHandler::Denied(denial));
     }
-    let (violations, lists) =
-        service_common::validation::refusing_violations_with_lists::<O>(protocol, req);
     let stated = validation::refusal(
         &violations,
         Some(O::INPUT_SCHEMA),
