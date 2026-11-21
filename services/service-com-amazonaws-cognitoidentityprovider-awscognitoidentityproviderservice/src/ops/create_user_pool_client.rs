@@ -412,20 +412,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // Every URL this app client would redirect a browser to is an absolute
+        // URI, which a value naming no scheme is not
+        // ([`crate::state::redirect_uri_without_a_scheme`]). Asked through the
+        // same `state.rs` rule the update path asks, over every redirect member
+        // the request carries, before anything is stored.
+        if let Some(url) = crate::state::redirect_uri_without_a_scheme(registered_redirect_urls(
+            &input,
+        )) {
+            return Err(invalid_parameter(
+                crate::state::scheme_less_redirect_uri_message(url),
+            ));
+        }
+
         // Every URL this app client would redirect a browser to is one the
         // authorization server can redirect to, which a URI carrying a fragment
         // component is not ([`crate::state::redirect_uri_with_a_fragment`]).
         // Asked through the same `state.rs` rule the update path asks, over every
         // redirect member the request carries, before anything is stored.
-        if let Some(url) = crate::state::redirect_uri_with_a_fragment(
-            input
-                .callback_ur_ls
-                .iter()
-                .flatten()
-                .chain(input.logout_ur_ls.iter().flatten())
-                .chain(input.default_redirect_uri.iter())
-                .map(String::as_str),
-        ) {
+        if let Some(url) = crate::state::redirect_uri_with_a_fragment(registered_redirect_urls(
+            &input,
+        )) {
             return Err(invalid_parameter(
                 crate::state::fragment_redirect_uri_message(url),
             ));
@@ -436,18 +443,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ([`crate::state::http_redirect_uri`]). Asked through the same `state.rs`
         // rule the update path asks, over every redirect member the request
         // carries, before anything is stored.
-        if let Some(url) = crate::state::http_redirect_uri(
-            input
-                .callback_ur_ls
-                .iter()
-                .flatten()
-                .chain(input.logout_ur_ls.iter().flatten())
-                .chain(input.default_redirect_uri.iter())
-                .map(String::as_str),
-        ) {
+        if let Some(url) = crate::state::http_redirect_uri(registered_redirect_urls(&input)) {
             return Err(invalid_parameter(crate::state::http_redirect_uri_message(
                 url,
             )));
+        }
+
+        // The default redirect URI an app client is configured with is one of the
+        // callback URLs it registers
+        // ([`crate::state::unregistered_default_redirect_uri`]). Asked through
+        // the same `state.rs` rule the update path asks, over the configuration
+        // the request carries, before anything is stored.
+        if let Some(url) = crate::state::unregistered_default_redirect_uri(
+            input.default_redirect_uri.as_deref(),
+            input.callback_ur_ls.as_deref(),
+        ) {
+            return Err(invalid_parameter(
+                crate::state::default_redirect_uri_not_registered_message(url),
+            ));
         }
 
         let now = ::std::time::SystemTime::now();
@@ -618,6 +631,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             user_pool_client: Some(stored),
         })
     }
+}
+
+/// Every URL this request would leave the app client registered for a browser
+/// redirect with, read through the one definition of that set
+/// ([`crate::state::registered_redirect_urls`]), so each redirect rule this
+/// handler asks judges the same values in the same order the request listed them.
+fn registered_redirect_urls(
+    input: &CreateUserPoolClientInput,
+) -> impl Iterator<Item = &str> {
+    crate::state::registered_redirect_urls(
+        input.callback_ur_ls.as_deref(),
+        input.logout_ur_ls.as_deref(),
+        input.default_redirect_uri.as_deref(),
+    )
 }
 
 /// This operation's `ResourceNotFoundException` for an absent user pool.

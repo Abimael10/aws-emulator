@@ -4,10 +4,18 @@
 //! driven through the router exactly as an SDK drives it (`POST /` with
 //! `X-Amz-Target: AWSCognitoIdentityProviderService.<Op>`).
 //!
-//! Two rules are under test, each held by `CreateUserPoolClient` and
+//! Four rules are under test, each held by `CreateUserPoolClient` and
 //! `UpdateUserPoolClient` alike, decided over the configuration the write would
 //! LEAVE the app client with, and before anything is stored:
 //!
+//! * a URL an app client registers for a browser redirect is an ABSOLUTE URI —
+//!   "a redirect URI must meet the following requirements: … Be an absolute
+//!   URI"
+//!   (`smithy_query(query="doc",shape="CreateUserPoolClientRequest",member="CallbackURLs")`),
+//!   because the authorization server sends the browser to the URL as it was
+//!   registered, with no base to resolve it against — so a `CallbackURLs`,
+//!   `LogoutURLs` or `DefaultRedirectURI` entry that names no scheme is refused
+//!   with a 400 `InvalidParameterException` naming that URL;
 //! * a URL an app client registers for a browser redirect carries no FRAGMENT
 //!   component — "a redirect URI must meet the following requirements: … Not
 //!   include a fragment component"
@@ -16,6 +24,15 @@
 //!   redirects to and a browser keeps a fragment to itself — so a `CallbackURLs`,
 //!   `LogoutURLs` or `DefaultRedirectURI` entry carrying one is refused with a 400
 //!   `InvalidParameterException` naming that URL;
+//! * the DEFAULT redirect URI an app client is configured with is one of the
+//!   callback URLs it registers — "the default redirect URI … must be in the
+//!   `CallbackURLs` list"
+//!   (`smithy_query(query="doc",shape="CreateUserPoolClientRequest",member="DefaultRedirectURI")`),
+//!   because that default stands in for the `redirect_uri` an authorization
+//!   request omits and "Amazon Cognito doesn't accept authorization requests with
+//!   `redirect_uri` values that aren't in the list of `CallbackURLs`"
+//!   (`CallbackURLs`) — so a `DefaultRedirectURI` the write would not register is
+//!   refused with a 400 `InvalidParameterException` naming it;
 //! * an app client whose authorization server allows a grant whose response is
 //!   delivered by redirect — `code`, which "provides an authorization code as the
 //!   response", and `implicit`, which issues the tokens "directly to your user"
@@ -230,6 +247,22 @@ async fn assert_both_paths(
             "case {case:?}: the update owes the same answer, got {update_status} with \
              {update_payload}"
         );
+        // An accepted write STORES the redirect configuration it was given: every
+        // member this update replaces is read back off the stored app client as
+        // the request spelled it, and a member the request omitted is read back
+        // absent — so a served row proves the write landed rather than only that
+        // the call was not refused.
+        for member in REDIRECT_MEMBERS {
+            let submitted = members
+                .get(member)
+                .cloned()
+                .unwrap_or(Value::Null);
+            let stored = now.get(member).cloned().unwrap_or(Value::Null);
+            assert_eq!(
+                stored, submitted,
+                "case {case:?}: an accepted update stores {member} as submitted, got {stored}"
+            );
+        }
         return;
     };
 
@@ -376,6 +409,238 @@ async fn a_registered_redirect_url_carries_no_fragment_component() {
             )
             .await;
         }
+    }
+}
+
+/// One row of the absolute-URI rule: the URL a redirect member carries, and
+/// whether it names a scheme.
+struct SchemeCase {
+    case: &'static str,
+    url: &'static str,
+    names_a_scheme: bool,
+}
+
+/// The rows differ along the FORM of the relative reference a caller can send
+/// instead of an absolute URI — a bare host, a host with a path, an
+/// authority-relative URL, a rooted path, a bare path — and, for the served rows,
+/// along the forms an absolute URI takes: HTTPS, a scheme spelled in upper case,
+/// the loopback URLs the member admits, and the application schemes it also
+/// supports ("app callback URLs such as `myapp://example` are also supported",
+/// `smithy_query(query="doc",shape="CreateUserPoolClientRequest",member="CallbackURLs")`).
+const SCHEME_CASES: &[SchemeCase] = &[
+    SchemeCase {
+        case: "a bare host",
+        url: "app.example.com",
+        names_a_scheme: false,
+    },
+    SchemeCase {
+        case: "a host with a path",
+        url: "internal-alb-1234567890.us-west-2.elb.amazonaws.com/_dashboards/app/home",
+        names_a_scheme: false,
+    },
+    SchemeCase {
+        case: "an authority-relative URL",
+        url: "//app.example.com/cb",
+        names_a_scheme: false,
+    },
+    SchemeCase {
+        case: "a rooted path",
+        url: "/cb",
+        names_a_scheme: false,
+    },
+    SchemeCase {
+        case: "a bare path",
+        url: "cb/landing",
+        names_a_scheme: false,
+    },
+    SchemeCase {
+        case: "a host with a path and a query",
+        url: "app.example.com/cb?state=1",
+        names_a_scheme: false,
+    },
+    SchemeCase {
+        case: "an HTTPS URL",
+        url: "https://app.example.com/cb",
+        names_a_scheme: true,
+    },
+    SchemeCase {
+        case: "a scheme spelled in upper case",
+        url: "HTTPS://app.example.com/cb",
+        names_a_scheme: true,
+    },
+    SchemeCase {
+        case: "a loopback URL over cleartext",
+        url: "http://localhost:3000/cb",
+        names_a_scheme: true,
+    },
+    SchemeCase {
+        case: "an application scheme",
+        url: "myapp://example",
+        names_a_scheme: true,
+    },
+];
+
+#[tokio::test]
+async fn a_registered_redirect_url_is_an_absolute_uri() {
+    let router = router();
+    let user_pool_id = pool(&router, "scheme-url-pool").await;
+    let standing_id = standing_client(&router, &user_pool_id).await;
+
+    for SchemeCase {
+        case,
+        url,
+        names_a_scheme,
+    } in SCHEME_CASES
+    {
+        for member in REDIRECT_MEMBERS {
+            let mut members = Map::new();
+            // The OAuth members a registered redirect URL belongs beside, so
+            // every row carries a configuration the other rules admit.
+            members.insert("AllowedOAuthFlowsUserPoolClient".to_string(), json!(true));
+            members.insert("AllowedOAuthFlows".to_string(), json!(["code"]));
+            members.insert("AllowedOAuthScopes".to_string(), json!(["openid"]));
+            members.insert("CallbackURLs".to_string(), json!([GOOD_CALLBACK]));
+            if member == "DefaultRedirectURI" {
+                // "The default redirect URI … must be in the CallbackURLs list"
+                // (`DefaultRedirectURI` in this service's model).
+                members.insert("CallbackURLs".to_string(), json!([url]));
+                members.insert(member.to_string(), json!(url));
+            } else {
+                members.insert(member.to_string(), json!([url]));
+            }
+            let case = format!("{case} in {member}");
+            let message = format!("{url} must contain a scheme.");
+            assert_both_paths(
+                &router,
+                &user_pool_id,
+                &standing_id,
+                &case,
+                &Value::Object(members),
+                (!names_a_scheme).then_some(("InvalidParameterException", message.as_str())),
+            )
+            .await;
+        }
+    }
+}
+
+/// The sentence a write naming a default redirect URI the app client would not
+/// register is refused with.
+fn default_redirect_uri_refusal(url: &str) -> String {
+    format!("The default redirect URI {url} is not in the callback URIs list.")
+}
+
+#[tokio::test]
+async fn the_default_redirect_uri_is_one_of_the_registered_callback_urls() {
+    let router = router();
+    let user_pool_id = pool(&router, "default-redirect-pool").await;
+    let standing_id = standing_client(&router, &user_pool_id).await;
+
+    // The rows differ along HOW the default relates to the callback list it is
+    // judged against: absent from a list that holds other URLs, differing from a
+    // registered URL only by a trailing slash, judged against no list at all and
+    // against an empty one, and — for the served rows — matching the first or the
+    // second registered URL, in the schemes the member admits, or left unset.
+    let rows: Vec<(&str, Value, Option<String>)> = vec![
+        (
+            "a default that is none of the registered callback URLs",
+            json!({
+                "AllowedOAuthFlowsUserPoolClient": true,
+                "AllowedOAuthFlows": ["code"],
+                "AllowedOAuthScopes": ["openid"],
+                "CallbackURLs": [GOOD_CALLBACK],
+                "DefaultRedirectURI": "https://other.example.com/cb",
+            }),
+            Some(default_redirect_uri_refusal("https://other.example.com/cb")),
+        ),
+        (
+            "a default differing from a registered URL by a trailing slash",
+            json!({
+                "AllowedOAuthFlowsUserPoolClient": true,
+                "AllowedOAuthFlows": ["code"],
+                "AllowedOAuthScopes": ["openid"],
+                "CallbackURLs": [GOOD_CALLBACK],
+                "DefaultRedirectURI": "https://app.example.com/cb/",
+            }),
+            Some(default_redirect_uri_refusal("https://app.example.com/cb/")),
+        ),
+        (
+            "a default with no callback member at all",
+            json!({ "DefaultRedirectURI": GOOD_CALLBACK }),
+            Some(default_redirect_uri_refusal(GOOD_CALLBACK)),
+        ),
+        (
+            "a default with an empty callback list",
+            json!({ "CallbackURLs": [], "DefaultRedirectURI": GOOD_CALLBACK }),
+            Some(default_redirect_uri_refusal(GOOD_CALLBACK)),
+        ),
+        (
+            "a default that is the first of two registered callback URLs",
+            json!({
+                "AllowedOAuthFlowsUserPoolClient": true,
+                "AllowedOAuthFlows": ["code"],
+                "AllowedOAuthScopes": ["openid"],
+                "CallbackURLs": [GOOD_CALLBACK, "https://other.example.com/cb"],
+                "DefaultRedirectURI": GOOD_CALLBACK,
+            }),
+            None,
+        ),
+        (
+            "a default that is the second of two registered callback URLs",
+            json!({
+                "AllowedOAuthFlowsUserPoolClient": true,
+                "AllowedOAuthFlows": ["code"],
+                "AllowedOAuthScopes": ["openid"],
+                "CallbackURLs": [GOOD_CALLBACK, "https://other.example.com/cb"],
+                "DefaultRedirectURI": "https://other.example.com/cb",
+            }),
+            None,
+        ),
+        (
+            "a registered default in an application scheme",
+            json!({
+                "AllowedOAuthFlowsUserPoolClient": true,
+                "AllowedOAuthFlows": ["code"],
+                "AllowedOAuthScopes": ["openid"],
+                "CallbackURLs": ["myapp://example"],
+                "DefaultRedirectURI": "myapp://example",
+            }),
+            None,
+        ),
+        (
+            "a registered loopback default",
+            json!({
+                "AllowedOAuthFlowsUserPoolClient": true,
+                "AllowedOAuthFlows": ["code"],
+                "AllowedOAuthScopes": ["openid"],
+                "CallbackURLs": ["http://localhost:3000/cb"],
+                "DefaultRedirectURI": "http://localhost:3000/cb",
+            }),
+            None,
+        ),
+        (
+            "callback URLs with no default at all",
+            json!({
+                "AllowedOAuthFlowsUserPoolClient": true,
+                "AllowedOAuthFlows": ["code"],
+                "AllowedOAuthScopes": ["openid"],
+                "CallbackURLs": [GOOD_CALLBACK],
+            }),
+            None,
+        ),
+    ];
+
+    for (case, members, refusal) in rows {
+        assert_both_paths(
+            &router,
+            &user_pool_id,
+            &standing_id,
+            case,
+            &members,
+            refusal
+                .as_deref()
+                .map(|message| ("InvalidParameterException", message)),
+        )
+        .await;
     }
 }
 

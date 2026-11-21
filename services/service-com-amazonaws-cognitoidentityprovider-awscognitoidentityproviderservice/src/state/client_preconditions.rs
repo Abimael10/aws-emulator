@@ -96,6 +96,72 @@ pub fn redirect_grant_without_a_callback_url(
         && callback_urls.is_none_or(<[String]>::is_empty)
 }
 
+/// Every URL a write would leave the app client registered for a browser redirect
+/// with, in the order the request listed them: the callback URLs, then the sign-out
+/// redirect URLs, then the default redirect URI.
+///
+/// The ONE definition of "every redirect URL this write would leave the app client
+/// with", so each rule below judges the same values in the same order whichever
+/// operation wrote them, and the refusal names the first offending URL wherever
+/// the caller put it. The three members are the ones an app client registers a
+/// browser redirect in (`CreateUserPoolClient`'s `CallbackURLs`, `LogoutURLs` and
+/// `DefaultRedirectURI`).
+pub fn registered_redirect_urls<'write>(
+    callback_urls: Option<&'write [String]>,
+    logout_urls: Option<&'write [String]>,
+    default_redirect_uri: Option<&'write str>,
+) -> impl Iterator<Item = &'write str> {
+    callback_urls
+        .into_iter()
+        .flatten()
+        .chain(logout_urls.into_iter().flatten())
+        .map(String::as_str)
+        .chain(default_redirect_uri)
+}
+
+/// The message an app-client write is refused with when a URL it registers for a
+/// browser redirect is no absolute URI because it names no scheme
+/// ([`redirect_uri_without_a_scheme`]).
+///
+/// The offending URL is the one value such a refusal reports, taken verbatim from
+/// the member the request carried it in; the rest is fixed text.
+#[must_use]
+pub fn scheme_less_redirect_uri_message(url: &str) -> String {
+    format!("{url} must contain a scheme.")
+}
+
+/// The first URL among `urls` that names no scheme, and so is no absolute URI,
+/// and `None` when every one of them names one.
+///
+/// "A redirect URI must meet the following requirements: … Be an absolute URI"
+/// (`CreateUserPoolClient.CallbackURLs` in this service's model): the
+/// authorization server sends the browser to the URL as the app client registered
+/// it, with no base to resolve it against, so a bare host, a path, or any other
+/// relative reference is not a URL an app client can register, however the request
+/// spelled it.
+///
+/// The URL is read by the tree's URL parser rather than scanned here, so what
+/// counts as a scheme is what a browser would resolve: a value the parser can read
+/// only as relative to some base names none, while one it reads on its own names
+/// one — whichever it is, the application schemes "such as `myapp://example`" the
+/// same member admits included. A value that names a scheme and is malformed for
+/// some other reason is not about this rule, and is left to the rules that are.
+///
+/// `urls` is every URL the write would leave the app client with, in the order the
+/// request listed them, so the refusal names the first offending one wherever the
+/// caller put it.
+#[must_use]
+pub fn redirect_uri_without_a_scheme<'a>(
+    urls: impl IntoIterator<Item = &'a str>,
+) -> Option<&'a str> {
+    urls.into_iter().find(|url| {
+        matches!(
+            ::url::Url::parse(url),
+            Err(::url::ParseError::RelativeUrlWithoutBase)
+        )
+    })
+}
+
 /// The message an app-client write is refused with when a URL it registers for a
 /// browser redirect carries a fragment component
 /// ([`redirect_uri_with_a_fragment`]).
@@ -201,4 +267,45 @@ fn is_cleartext_redirect(url: &str) -> bool {
     !LOOPBACK_REDIRECT_HOSTS
         .iter()
         .any(|loopback| host.eq_ignore_ascii_case(loopback))
+}
+
+/// The message an app-client write is refused with when the default redirect URI
+/// it names is none of the callback URLs the client would register
+/// ([`unregistered_default_redirect_uri`]).
+///
+/// The default redirect URI is the one value such a refusal reports, taken
+/// verbatim from the request; the rest is fixed text.
+#[must_use]
+pub fn default_redirect_uri_not_registered_message(url: &str) -> String {
+    format!("The default redirect URI {url} is not in the callback URIs list.")
+}
+
+/// The default redirect URI a write would leave the app client with when it is
+/// none of the callback URLs that same write would leave it with, and `None` when
+/// the request names no default redirect URI or names one that is registered.
+///
+/// "The default redirect URI. In app clients with one assigned IdP, replaces
+/// `redirect_uri` in authentication requests. Must be in the `CallbackURLs` list"
+/// (`CreateUserPoolClient.DefaultRedirectURI` in this service's model), and
+/// "Amazon Cognito doesn't accept authorization requests with `redirect_uri`
+/// values that aren't in the list of `CallbackURLs` that you provide"
+/// (`CallbackURLs`) — the default stands in for a `redirect_uri` the request
+/// omits, so one the app client does not register is a default no authorization
+/// request could be answered with.
+///
+/// The two arguments are the EFFECTIVE values of the write — what the app client
+/// would hold once it is stored — so the pair is judged as the caller left it,
+/// whichever operation wrote it, and the URI is compared to the registered text as
+/// it stands, which is the text an authorization request is matched against.
+#[must_use]
+pub fn unregistered_default_redirect_uri<'a>(
+    default_redirect_uri: Option<&'a str>,
+    callback_urls: Option<&[String]>,
+) -> Option<&'a str> {
+    let default_redirect_uri = default_redirect_uri?;
+    let registered = callback_urls
+        .unwrap_or_default()
+        .iter()
+        .any(|callback| callback == default_redirect_uri);
+    (!registered).then_some(default_redirect_uri)
 }
