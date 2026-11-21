@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCodeSecurityScanConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCodeSecurityScanConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCodeSecurityScanConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages through the code security scan configurations stored in this
+//! service's shared state, summarising each stored record — the ARN and owner the create
+//! minted it under, the name it was created with, and the scan settings flattened as
+//! `CodeSecurityScanConfigurationSummary` carries them. A pure read: it reports what
+//! `CreateCodeSecurityScanConfiguration` stored and `DeleteCodeSecurityScanConfiguration`
+//! removed, and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -140,6 +137,53 @@ impl<Eng> ListCodeSecurityScanConfigurations<Eng> {
     }
 }
 
+/// This operation's page size when the request names no `maxResults`: the largest page the
+/// model allows (`ListCodeSecurityScanConfigurationsRequest$maxResults` range 1..100), so a
+/// caller that asks for no page size sees everything it can in one answer.
+/// Source: `smithy_query(query="operation", operation="ListCodeSecurityScanConfigurations")`.
+const DEFAULT_PAGE_SIZE: usize = 100;
+
+/// The scan configuration ARN a cursor names, or `None` when the value is not a cursor this
+/// service minted. A token only decodes when it is hex AND the bytes are an ARN of this
+/// service, so an arbitrary even-length hex string is refused rather than read as a
+/// position. The hex coding itself is [`crate::state::decode_cursor`], shared with this
+/// service's other paginated operations.
+fn decode_token(token: &str) -> Option<String> {
+    let minted_prefix = format!("arn:aws:{}:", crate::state::SERVICE_NAMESPACE);
+    crate::state::decode_cursor(token, |value| value.starts_with(&minted_prefix))
+}
+
+/// One stored configuration as `CodeSecurityScanConfigurationSummary` carries it: the
+/// record's identity and its scan settings FLATTENED — the periodic frequency and schedule
+/// expression, and the continuous-integration events, lifted out of the stored
+/// `CodeSecurityScanConfiguration` onto members of their own.
+///
+/// A setting the configuration does not hold is reported as absent rather than as a token:
+/// a configuration with no periodic settings has no frequency, and one with no
+/// continuous-integration settings no supported events.
+/// Source: `smithy_query(query="shape", shape="CodeSecurityScanConfigurationSummary")`.
+fn summary(
+    stored: &crate::state::StoredCodeSecurityScanConfiguration,
+) -> CodeSecurityScanConfigurationSummary {
+    let periodic = stored.configuration.periodic_scan_configuration.as_ref();
+    CodeSecurityScanConfigurationSummary {
+        scan_configuration_arn: stored.arn.clone(),
+        name: stored.name.clone(),
+        owner_account_id: stored.owner_id.clone(),
+        periodic_scan_frequency: periodic.and_then(|settings| settings.frequency.clone()),
+        frequency_expression: periodic.and_then(|settings| settings.frequency_expression.clone()),
+        continuous_integration_scan_supported_events: stored
+            .configuration
+            .continuous_integration_scan_configuration
+            .as_ref()
+            .map(|settings| settings.supported_events.clone()),
+        rule_set_categories: stored.configuration.rule_set_categories.clone(),
+        // Absent for a general scan configuration, which is what a create carrying no
+        // `scopeSettings` asks for.
+        scope_settings: stored.scope_settings.clone(),
+    }
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListCodeSecurityScanConfigurations<Eng>
 {
@@ -157,18 +201,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCodeSecurityScanConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCodeSecurityScanConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCodeSecurityScanConfigurations"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListCodeSecurityScanConfigurationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "Amazon Inspector code security scan configuration state is \
+                              unavailable"
+                        .to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+        })?;
+
+        // A token this service did not mint cannot name a position, so the request is
+        // refused rather than silently answered from the start of the list.
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_token(token).ok_or_else(|| {
+                ListCodeSecurityScanConfigurationsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: "nextToken is not a token returned by a previous \
+                                  ListCodeSecurityScanConfigurations call"
+                            .to_string(),
+                        reason: "CANNOT_PARSE".to_string(),
+                        fields: Some(vec![ValidationExceptionField {
+                            name: "nextToken".to_string(),
+                            message: "must be a nextToken returned by \
+                                      ListCodeSecurityScanConfigurations"
+                                .to_string(),
+                        }]),
+                    },
+                )
+            })?),
+            None => None,
+        };
+
+        // `maxResults` is modelled `range 1..100`, so the boundary validator has already
+        // refused anything outside that band by the time this runs.
+        let page_size = input
+            .max_results
+            .map_or(DEFAULT_PAGE_SIZE, |max| max.max(1) as usize);
+
+        // A pure read: the answer is built from the stored records, so reporting them
+        // writes nothing and a later caller sees exactly what this one did. The records are
+        // keyed by the ARN that identifies them, so walking the map is already the total
+        // order a page cursor is meaningful in. One more than the page is read, so the
+        // cursor is only emitted when a further configuration really exists.
+        let guard = state.lock();
+        let selected: Vec<&crate::state::StoredCodeSecurityScanConfiguration> = guard
+            .code_security_scan_configurations
+            .values()
+            .filter(|stored| {
+                after
+                    .as_deref()
+                    .is_none_or(|cursor| stored.arn.as_str() > cursor)
+            })
+            .take(page_size + 1)
+            .collect();
+
+        let truncated = selected.len() > page_size;
+        let page = &selected[..selected.len().min(page_size)];
+        let next_token = truncated
+            .then(|| {
+                page.last()
+                    .map(|stored| crate::state::encode_cursor(&stored.arn))
+            })
+            .flatten();
+
+        Ok(ListCodeSecurityScanConfigurationsOutput {
+            // Always reported, and EMPTY for an account holding no configuration, so the
+            // shape of the answer never depends on whether any were created.
+            configurations: Some(page.iter().map(|stored| summary(stored)).collect()),
+            next_token,
+        })
     }
 }

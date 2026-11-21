@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end tests for the Amazon Inspector code security scan configuration slice:
-//! `CreateCodeSecurityScanConfiguration`, `GetCodeSecurityScanConfiguration` and
-//! `DeleteCodeSecurityScanConfiguration`.
+//! `CreateCodeSecurityScanConfiguration`, `GetCodeSecurityScanConfiguration`,
+//! `ListCodeSecurityScanConfigurations` and `DeleteCodeSecurityScanConfiguration`.
 //!
 //! The rule under test: a code security scan configuration is a stored resource — the
 //! create mints its `ScanConfigurationArn` and records the name, level, scan configuration,
 //! scope settings and tags it was sent; the get reports exactly that record (with the tag
 //! set as a map and the periodic schedule the service chose, both covered by
 //! `code_security_periodic_schedule`) plus the instants it was created and last updated at;
-//! and the delete removes the record, so a later get or delete of the same ARN is refused
-//! as a missing resource.
+//! the list reports one summary per stored record, with the scan settings flattened onto
+//! the summary's own members, and pages at `maxResults`; and the delete removes the record,
+//! so a later get or delete of the same ARN is refused as a missing resource. A create the
+//! request boundary refuses stores nothing at all, so the list never reports it.
 //!
 //! Every request goes through the real `MultiServiceRouter` — routing, restJson1
 //! deserialization, modelled-constraint validation, the handler, and restJson1
@@ -69,6 +71,21 @@ async fn delete(router: &MultiServiceRouter, arn: &str) -> (u16, Option<String>,
         &json!({ "scanConfigurationArn": arn }),
     )
     .await
+}
+
+/// `ListCodeSecurityScanConfigurations` — `POST /codesecurity/scan-configuration/list`.
+///
+/// Both input members are bound to the QUERY STRING, so `query` is sent there and the body
+/// carries nothing.
+/// Source: `smithy_query(query="operation", operation="ListCodeSecurityScanConfigurations")`
+/// — `nextToken` and `maxResults` are `httpQuery` members.
+async fn list(router: &MultiServiceRouter, query: &str) -> (u16, Option<String>, Value) {
+    let uri = if query.is_empty() {
+        "/codesecurity/scan-configuration/list".to_string()
+    } else {
+        format!("/codesecurity/scan-configuration/list?{query}")
+    };
+    post_in(router, "us-east-1", &uri, &json!({})).await
 }
 
 /// Assert `arn` is a `ScanConfigurationArn` of `region` owned by `owner`, with the
@@ -453,4 +470,418 @@ async fn every_create_mints_a_distinct_configuration() {
              {read}"
         );
     }
+}
+
+/// The summary `ListCodeSecurityScanConfigurations` owes for the configuration `row` was
+/// created as, under `arn`: the record's identity, plus the scan settings FLATTENED onto
+/// the summary's own members. The periodic members are read off what the get reports
+/// nested, because a row that named a frequency without an expression runs on the schedule
+/// the SERVICE chose (asserted against its own rule in `code_security_periodic_schedule`),
+/// not on one this table carries.
+///
+/// Source: `smithy_query(query="shape", shape="CodeSecurityScanConfigurationSummary")` —
+/// `scanConfigurationArn`, `name`, `ownerAccountId` and `ruleSetCategories` are required,
+/// and `periodicScanFrequency`, `frequencyExpression`,
+/// `continuousIntegrationScanSupportedEvents` and `scopeSettings` are each reported only
+/// when the configuration holds that setting.
+fn expected_summary(row: &Row, arn: &str, read: &Value) -> Value {
+    let mut summary = json!({
+        "scanConfigurationArn": arn,
+        "name": row.name,
+        "ownerAccountId": ACCOUNT,
+        "ruleSetCategories": row.configuration["ruleSetCategories"].clone(),
+    });
+    let periodic = &read["configuration"]["periodicScanConfiguration"];
+    for (flattened, nested) in [
+        ("periodicScanFrequency", "frequency"),
+        ("frequencyExpression", "frequencyExpression"),
+    ] {
+        if !periodic[nested].is_null() {
+            summary[flattened] = periodic[nested].clone();
+        }
+    }
+    let events = &row.configuration["continuousIntegrationScanConfiguration"]["supportedEvents"];
+    if !events.is_null() {
+        summary["continuousIntegrationScanSupportedEvents"] = events.clone();
+    }
+    if let Some(scope_settings) = &row.scope_settings {
+        summary["scopeSettings"] = scope_settings.clone();
+    }
+    summary
+}
+
+/// The summaries of `listed`, ordered by ARN so two answers over the same records compare
+/// equal whatever order they were reported in.
+fn summaries(case: &str, listed: &Value) -> Vec<Value> {
+    let mut reported = listed["configurations"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case:?}: no configurations list in {listed}"))
+        .clone();
+    reported.sort_by_key(|summary| {
+        summary["scanConfigurationArn"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    });
+    reported
+}
+
+/// RULE: the list reports one summary per STORED configuration — the identity the create
+/// minted it under and the scan settings flattened onto the summary's members — and nothing
+/// for an account that holds none.
+///
+/// Every row is created in one region, so what is asserted here is the flattening and not
+/// which regions a list spans.
+#[tokio::test]
+async fn list_reports_a_flattened_summary_of_every_stored_configuration() {
+    let router = router();
+
+    // An account that has created nothing lists an empty set rather than an absent member.
+    let (status, error_type, listed) = list(&router, "").await;
+    assert_eq!(
+        status, 200,
+        "case \"no configurations\": expected 200, got {status} / {listed} ({error_type:?})"
+    );
+    assert_eq!(
+        listed["configurations"],
+        json!([]),
+        "case \"no configurations\": expected an empty list, got {listed}"
+    );
+    assert_eq!(
+        listed["nextToken"],
+        Value::Null,
+        "case \"no configurations\": expected no cursor, got {listed}"
+    );
+
+    let mut expected: Vec<Value> = Vec::new();
+    for row in rows() {
+        let case = row.case;
+        let (status, error_type, created) =
+            create_in(&router, "us-east-1", &create_body(&row)).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: CreateCodeSecurityScanConfiguration: expected 200, got {status} / \
+             {created} ({error_type:?})"
+        );
+        let arn = created["scanConfigurationArn"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no scanConfigurationArn in {created}"))
+            .to_string();
+        let (status, _, read) = get(&router, &arn).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: GetCodeSecurityScanConfiguration: expected 200, got {status} / {read}"
+        );
+        expected.push(expected_summary(&row, &arn, &read));
+    }
+    expected.sort_by_key(|summary| {
+        summary["scanConfigurationArn"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    });
+
+    let (status, error_type, listed) = list(&router, "").await;
+    assert_eq!(
+        status, 200,
+        "case \"every configuration\": expected 200, got {status} / {listed} ({error_type:?})"
+    );
+    assert_eq!(
+        summaries("every configuration", &listed),
+        expected,
+        "case \"every configuration\": expected one flattened summary per stored \
+         configuration, got {listed}"
+    );
+    assert_eq!(
+        listed["nextToken"],
+        Value::Null,
+        "case \"every configuration\": every record fits one page, so no cursor is owed, got \
+         {listed}"
+    );
+
+    // A list is a pure read: a second one answers exactly the same thing.
+    let (status, _, again) = list(&router, "").await;
+    assert_eq!(
+        status, 200,
+        "case \"repeated list\": expected 200, got {status} / {again}"
+    );
+    assert_eq!(
+        again, listed,
+        "case \"repeated list\": a list must not change what a later caller sees, got {again}"
+    );
+
+    // A deleted record leaves the list, and the others stay in it.
+    let removed = expected.remove(0);
+    let arn = removed["scanConfigurationArn"].as_str().expect("an ARN");
+    let (status, _, deleted) = delete(&router, arn).await;
+    assert_eq!(
+        status, 200,
+        "case \"after a delete\": expected 200 deleting {arn:?}, got {status} / {deleted}"
+    );
+    let (status, _, listed) = list(&router, "").await;
+    assert_eq!(
+        status, 200,
+        "case \"after a delete\": expected 200, got {status} / {listed}"
+    );
+    assert_eq!(
+        summaries("after a delete", &listed),
+        expected,
+        "case \"after a delete\": a deleted configuration leaves the list, got {listed}"
+    );
+}
+
+/// RULE: `maxResults` truncates the page and the `nextToken` it returns fetches exactly the
+/// remainder, so paging yields every stored configuration exactly once.
+///
+/// Rows differ along how many configurations are stored and how large a page is asked for,
+/// including both published bounds of the modelled 1..100 range and a page larger than the
+/// result set.
+/// Source: `smithy_query(query="operation", operation="ListCodeSecurityScanConfigurations")`
+/// — `maxResults` range 1..100.
+#[tokio::test]
+async fn list_pages_at_max_results_and_yields_every_configuration_once() {
+    for (total, page_size) in [(1usize, 1i64), (4, 1), (4, 2), (4, 3), (4, 4), (3, 100)] {
+        let case = format!("total={total} maxResults={page_size}");
+        let router = router();
+        let mut created: Vec<String> = Vec::new();
+        for index in 0..total {
+            let body = json!({
+                "name": format!("configuration-{index}"),
+                "level": "ACCOUNT",
+                "configuration": { "ruleSetCategories": ["SAST"] },
+            });
+            let (status, error_type, response) = create_in(&router, "us-east-1", &body).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: CreateCodeSecurityScanConfiguration: expected 200, got {status} \
+                 / {response} ({error_type:?})"
+            );
+            created.push(
+                response["scanConfigurationArn"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("case {case:?}: no scanConfigurationArn in {response}"))
+                    .to_string(),
+            );
+        }
+        created.sort();
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut next_token: Option<String> = None;
+        let mut pages = 0usize;
+        loop {
+            let query = match &next_token {
+                Some(token) => format!("maxResults={page_size}&nextToken={token}"),
+                None => format!("maxResults={page_size}"),
+            };
+            let (status, error_type, listed) = list(&router, &query).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: ListCodeSecurityScanConfigurations: expected 200, got {status} / \
+                 {listed} ({error_type:?})"
+            );
+            let page = listed["configurations"]
+                .as_array()
+                .unwrap_or_else(|| panic!("case {case:?}: no configurations list in {listed}"));
+            assert!(
+                page.len() as i64 <= page_size,
+                "case {case:?}: a page carried {} summaries",
+                page.len()
+            );
+            for summary in page {
+                seen.push(
+                    summary["scanConfigurationArn"]
+                        .as_str()
+                        .unwrap_or_else(|| panic!("case {case:?}: no ARN in {summary}"))
+                        .to_string(),
+                );
+            }
+            pages += 1;
+            assert!(
+                pages <= total + 1,
+                "case {case:?}: paging did not terminate after {pages} pages"
+            );
+            next_token = listed["nextToken"].as_str().map(str::to_string);
+            if next_token.is_none() {
+                break;
+            }
+        }
+
+        let mut paged = seen.clone();
+        paged.sort();
+        paged.dedup();
+        assert_eq!(
+            paged.len(),
+            seen.len(),
+            "case {case:?}: paging reported a configuration twice, got {seen:?}"
+        );
+        assert_eq!(
+            paged, created,
+            "case {case:?}: paging must yield every stored configuration exactly once, got \
+             {seen:?}"
+        );
+    }
+}
+
+/// RULE: a `nextToken` this service did not mint names no position, so the request is
+/// refused as invalid input rather than answered from the start of the list.
+#[tokio::test]
+async fn list_refuses_a_next_token_it_did_not_mint() {
+    let router = router();
+    // Rows differ along the FORM of the token: not hex at all, hex of bytes that are no ARN
+    // of this service, hex of an ARN of another service, and an odd-length hex string.
+    let tokens = [
+        "zzzz",
+        &::hex::encode("nonsense"),
+        &::hex::encode("arn:aws:s3:::bucket"),
+        "abc",
+    ];
+    for token in tokens {
+        let (status, error_type, answer) = list(&router, &format!("nextToken={token}")).await;
+        assert_eq!(
+            status, 400,
+            "case {token:?}: expected 400, got {status} / {answer}"
+        );
+        assert_eq!(
+            error_type.as_deref(),
+            Some("ValidationException"),
+            "case {token:?}: expected ValidationException, got {error_type:?} / {answer}"
+        );
+    }
+}
+
+/// RULE: a create the request boundary refuses stores NOTHING — no configuration is minted
+/// for it, so the list reports none; and the same call with values the model admits
+/// succeeds and is listed.
+///
+/// Rows differ along WHICH modelled constraint the request broke: an unmodelled token in a
+/// list of enums, a list under its own `@length` minimum, an unmodelled scalar enum token, a
+/// name outside its `@pattern`, and an unmodelled nested enum token.
+/// Sources: `smithy_query(query="shape", shape="RuleSetCategory,RuleSetCategories,ConfigurationLevel,ScanConfigurationName,PeriodicScanFrequency")`.
+#[tokio::test]
+async fn a_refused_create_stores_no_configuration() {
+    // Every row carries the SAME name, so what the list shows is whether the refused call
+    // created anything under it.
+    const NAME: &str = "refused-configuration";
+    let rejected: [(&str, Value); 5] = [
+        (
+            "an unmodelled rule set category",
+            json!({
+                "name": NAME,
+                "level": "ACCOUNT",
+                "configuration": {
+                    "ruleSetCategories": ["NOT_A_REAL_RULE_SET_CATEGORY"],
+                    "periodicScanConfiguration": { "frequency": "WEEKLY" },
+                },
+            }),
+        ),
+        (
+            "a rule set category list under its minimum",
+            json!({
+                "name": NAME,
+                "level": "ACCOUNT",
+                "configuration": { "ruleSetCategories": [] },
+            }),
+        ),
+        (
+            "an unmodelled configuration level",
+            json!({
+                "name": NAME,
+                "level": "ACCOUNTS",
+                "configuration": { "ruleSetCategories": ["SAST"] },
+            }),
+        ),
+        (
+            "a name outside its pattern",
+            json!({
+                "name": "a name with spaces",
+                "level": "ACCOUNT",
+                "configuration": { "ruleSetCategories": ["SAST"] },
+            }),
+        ),
+        (
+            "an unmodelled periodic scan frequency",
+            json!({
+                "name": NAME,
+                "level": "ACCOUNT",
+                "configuration": {
+                    "ruleSetCategories": ["SAST"],
+                    "periodicScanConfiguration": { "frequency": "FORTNIGHTLY" },
+                },
+            }),
+        ),
+    ];
+
+    let router = router();
+    for (case, body) in rejected {
+        let (status, error_type, answer) = create_in(&router, "us-east-1", &body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status} / {answer}"
+        );
+        assert_eq!(
+            error_type.as_deref(),
+            Some("ValidationException"),
+            "case {case:?}: expected ValidationException, got {error_type:?} / {answer}"
+        );
+        let (status, _, listed) = list(&router, "").await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: ListCodeSecurityScanConfigurations: expected 200, got {status} / \
+             {listed}"
+        );
+        assert_eq!(
+            listed["configurations"],
+            json!([]),
+            "case {case:?}: a refused create must store nothing, got {listed}"
+        );
+    }
+
+    // The same call with values the model admits is served, and the list reports exactly it.
+    let body = json!({
+        "name": NAME,
+        "level": "ACCOUNT",
+        "configuration": {
+            "ruleSetCategories": ["SAST"],
+            "periodicScanConfiguration": { "frequency": "WEEKLY" },
+        },
+    });
+    let (status, error_type, created) = create_in(&router, "us-east-1", &body).await;
+    assert_eq!(
+        status, 200,
+        "case \"admitted values\": expected 200, got {status} / {created} ({error_type:?})"
+    );
+    let arn = created["scanConfigurationArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case \"admitted values\": no scanConfigurationArn in {created}"));
+    let (status, _, listed) = list(&router, "").await;
+    assert_eq!(
+        status, 200,
+        "case \"admitted values\": expected 200, got {status} / {listed}"
+    );
+    let reported = summaries("admitted values", &listed);
+    assert_eq!(
+        reported.len(),
+        1,
+        "case \"admitted values\": expected exactly the created configuration, got {listed}"
+    );
+    assert_eq!(
+        reported[0]["scanConfigurationArn"],
+        json!(arn),
+        "case \"admitted values\": expected the created ARN, got {listed}"
+    );
+    assert_eq!(
+        reported[0]["name"],
+        json!(NAME),
+        "case \"admitted values\": expected the name as sent, got {listed}"
+    );
+    assert_eq!(
+        reported[0]["ruleSetCategories"],
+        json!(["SAST"]),
+        "case \"admitted values\": expected the rule set categories as sent, got {listed}"
+    );
+    assert_eq!(
+        reported[0]["periodicScanFrequency"],
+        json!("WEEKLY"),
+        "case \"admitted values\": expected the periodic frequency as sent, got {listed}"
+    );
 }
