@@ -39,7 +39,9 @@ use smithy_server_runtime::{
 
 use service_com_amazonaws_cloudwatchomni_cloudwatchomnifrontend as omni;
 
-use omni::ops::create_access_profile::{CreateAccessProfile, CreateAccessProfileError};
+use omni::ops::create_access_profile::{
+    CreateAccessProfile, CreateAccessProfileError, CreateAccessProfileErrorModeled,
+};
 use omni::ops::create_domain::CreateDomain;
 use omni::ops::create_space::CreateSpace;
 use omni::ops::get_access_profile::{GetAccessProfile, GetAccessProfileError};
@@ -49,9 +51,13 @@ use omni::ops::types::{
     CREATE_ACCESS_PROFILE_INPUT_SCHEMA, GET_ACCESS_PROFILE_INPUT_SCHEMA,
 };
 use omni::state::{
-    ACCESS_PROFILE_QUOTA, ACCESS_PROFILE_TYPE_CUSTOMER_MANAGED, ASSUME_STATUS_ALLOWED,
-    ASSUME_STATUS_DENIED,
+    ACCESS_PROFILE_NAME_TAKEN, ACCESS_PROFILE_QUOTA, ACCESS_PROFILE_TYPE_CUSTOMER_MANAGED,
+    ASSUME_STATUS_ALLOWED, ASSUME_STATUS_DENIED,
 };
+
+use omni::scaffolded::Scaffolded;
+
+use super::validation_message_wording::error_envelope;
 
 /// The region the suite signs for; the handlers record the signed region on each
 /// resource, so every ARN below is expected to carry it.
@@ -866,4 +872,93 @@ async fn the_access_profile_lifecycle_over_the_rpcv2cbor_wire() {
         rendered.contains("ValidationException"),
         "the wire refusal does not name ValidationException: {rendered:?}"
     );
+}
+
+/// The message the operation's modelled `ConflictException` carries, or a panic naming
+/// what came back instead.
+fn conflict_message<O: std::fmt::Debug>(
+    case: &str,
+    result: Result<O, CreateAccessProfileError>,
+) -> String {
+    match result {
+        Ok(output) => panic!("case {case:?}: expected a ConflictException, got Ok({output:?})"),
+        Err(error) => {
+            assert_eq!(
+                error.http_status(),
+                409,
+                "case {case:?}: expected HTTP 409, got {} ({error:?})",
+                error.http_status()
+            );
+            match error {
+                Scaffolded::Modeled(CreateAccessProfileErrorModeled::ConflictException(
+                    refusal,
+                )) => refusal.message,
+                other => {
+                    panic!("case {case:?}: expected the modelled ConflictException, got {other:?}")
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_name_a_space_already_holds_is_refused_with_the_services_one_sentence() {
+    let omni = Omni::new();
+    let first = omni.space("conflict", "profile-conflict-a").await;
+    let second = omni.space("conflict", "profile-conflict-b").await;
+
+    // Rows span `AccessProfileName`'s whole `@length(1..256)` and its
+    // `^[a-zA-Z0-9 _.:/=+@-]+$` class, and each name is tried in BOTH spaces, because
+    // the refusal is one sentence that states neither the name nor the space: nothing
+    // the request carried is a variable of it.
+    for name in [
+        "a",
+        "Read Only _.:/=+@- profile",
+        "profile.with.dots",
+        &"n".repeat(256),
+    ] {
+        for (space_label, space_id) in [("the first space", &first), ("the second space", &second)] {
+            let case = format!("{name:?} in {space_label}");
+            omni.create_access_profile(&create_input(space_id, name))
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("case {case:?}: the first create failed: {error:?}")
+                });
+            let message = conflict_message(
+                &case,
+                omni.create_access_profile(&create_input(space_id, name))
+                    .await,
+            );
+            assert_eq!(
+                message, ACCESS_PROFILE_NAME_TAKEN,
+                "case {case:?}: expected {ACCESS_PROFILE_NAME_TAKEN:?}, got {message:?}"
+            );
+            assert!(
+                !message.contains(space_id.as_str()),
+                "case {case:?}: the refusal names the space: {message:?}"
+            );
+            // A one- or two-character name can occur inside the sentence's own words, so
+            // the name is required withheld for the rows long enough to be recognisable.
+            assert!(
+                name.len() <= 3 || !message.contains(name),
+                "case {case:?}: the refusal names the requested name: {message:?}"
+            );
+
+            // The same refusal reaches a real client over the rpcv2Cbor wire.
+            let (status, body) = omni
+                .over_the_wire(
+                    "CreateAccessProfile",
+                    CREATE_ACCESS_PROFILE_INPUT_SCHEMA,
+                    &create_input(space_id, name),
+                )
+                .await;
+            let (code, message) = error_envelope(&case, &body);
+            assert_eq!(
+                (status, code.as_str(), message.as_str()),
+                (409, "ConflictException", ACCESS_PROFILE_NAME_TAKEN),
+                "case {case:?}: the wire must answer 409 ConflictException with \
+                 {ACCESS_PROFILE_NAME_TAKEN:?}, got {status} {code:?}: {message:?}"
+            );
+        }
+    }
 }

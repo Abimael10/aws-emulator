@@ -128,12 +128,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut store = state.lock();
-        if store.domain_has_spaces(&input.domain_id) {
+        // "A domain cannot be deleted while it contains spaces": how many it holds is
+        // read from the space records themselves, so the refusal states the number a
+        // caller still has to clear.
+        let spaces = store.spaces_in_domain(&input.domain_id);
+        if spaces > 0 {
             return Err(DeleteDomainErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "Domain '{}' still contains spaces and cannot be deleted.",
-                    input.domain_id
-                ),
+                message: crate::state::domain_holds_spaces_message(&input.domain_id, spaces),
                 conflict_type: Some("NOT_EMPTY".to_string()),
                 resource_id: Some(input.domain_id.clone()),
                 resource_type: Some("Domain".to_string()),

@@ -178,15 +178,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `AccessProfileName`'s model doc: "A name that identifies an access profile",
         // and a profile belongs to one space — so a name that already identifies a
         // profile of that space cannot identify a second one. `ConflictException` is the
-        // modelled refusal for a request that conflicts with the current state.
+        // modelled refusal for a request that conflicts with the current state, and
+        // `crate::state` words it: the conflict is with the space's collection of
+        // profiles, so the sentence states neither the name nor the space the request
+        // carried.
         if let Some(existing) = store.access_profile_named(&input.space_id, &input.name) {
             let existing_id = existing.profile.profile_id.clone();
             return Err(CreateAccessProfileErrorModeled::ConflictException(
                 ConflictException {
-                    message: format!(
-                        "An access profile named '{}' already exists in space '{}'.",
-                        input.name, input.space_id
-                    ),
+                    message: crate::state::ACCESS_PROFILE_NAME_TAKEN.to_string(),
                     conflict_type: Some("ALREADY_EXISTS".to_string()),
                     resource_id: Some(existing_id),
                     resource_type: Some("AccessProfile".to_string()),

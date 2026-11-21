@@ -81,11 +81,11 @@ pub const DEFAULT_MAX_RESULTS: i32 = 100;
 /// stops the store growing without end. It bounds
 /// [`ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::spaces`] and, with it,
 /// `create_space_tokens` (one entry per live space, forgotten by `DeleteSpace`) — and
-/// therefore also the per-request work [`spaces_after`] and [`domain_has_spaces`] do
+/// therefore also the per-request work [`spaces_after`] and [`spaces_in_domain`] do
 /// under the store lock, which is linear in the number of stored spaces.
 ///
 /// [`spaces_after`]: ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::spaces_after
-/// [`domain_has_spaces`]: ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::domain_has_spaces
+/// [`spaces_in_domain`]: ComAmazonawsCloudwatchomniCloudwatchomnifrontendState::spaces_in_domain
 pub const SPACE_QUOTA: usize = 10_000;
 
 /// How many access profiles the store holds before `CreateAccessProfile` refuses with
@@ -688,13 +688,17 @@ impl ComAmazonawsCloudwatchomniCloudwatchomnifrontendState {
         selected
     }
 
-    /// Whether any stored space still belongs to `domain_id`.
+    /// How many stored spaces still belong to `domain_id`.
     ///
-    /// Linear in the number of stored spaces, which [`SPACE_QUOTA`] bounds.
-    pub fn domain_has_spaces(&self, domain_id: &str) -> bool {
+    /// Counted from the space records themselves rather than from a tally kept beside
+    /// them, so the number a refusal states is the number a listing of that domain's
+    /// spaces would return. Linear in the number of stored spaces, which [`SPACE_QUOTA`]
+    /// bounds.
+    pub fn spaces_in_domain(&self, domain_id: &str) -> usize {
         self.spaces
             .values()
-            .any(|stored| stored.domain_id == domain_id)
+            .filter(|stored| stored.domain_id == domain_id)
+            .count()
     }
 }
 
@@ -1498,7 +1502,10 @@ mod space_authorization;
 
 pub use space_authorization::{authorization_failed, AUTHORIZATION_FAILED};
 
-pub use domain_admission::{client_token_required_message, DOMAIN_ALREADY_EXISTS_FOR_ACCOUNT};
+pub use domain_admission::{
+    client_token_required_message, identity_center_instance_required,
+    DOMAIN_ALREADY_EXISTS_FOR_ACCOUNT, IDENTITY_CENTER_INSTANCE_REQUIRED,
+};
 
 pub use resource_not_found::{
     alert_not_found_message, dashboard_not_found_message, view_not_found_message,
@@ -1506,7 +1513,10 @@ pub use resource_not_found::{
     DOMAIN_NOT_FOUND_MESSAGE, SPACE_NOT_FOUND_MESSAGE, VIEW_NOT_FOUND_RESOURCE,
 };
 
-pub use resource_conflict::view_already_exists_message;
+pub use resource_conflict::{
+    domain_holds_spaces_message, view_already_exists_message, ACCESS_GRANT_NAME_TAKEN,
+    ACCESS_PROFILE_NAME_TAKEN,
+};
 
 pub use view_definition::{
     view_definition_rejection, INVALID_VIEW_DEFINITION, VIEW_DEFINITION_MUST_BE_A_SELECT_QUERY,

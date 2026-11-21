@@ -296,10 +296,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let existing_id = existing.grant.grant_id.clone();
             return Err(CreateAccessGrantErrorModeled::ConflictException(
                 ConflictException {
-                    message: format!(
-                        "An access grant named '{}' already exists in space '{}'.",
-                        input.name, input.space_id
-                    ),
+                    message: crate::state::ACCESS_GRANT_NAME_TAKEN.to_string(),
                     conflict_type: Some("ALREADY_EXISTS".to_string()),
                     resource_id: Some(existing_id),
                     resource_type: Some("AccessGrant".to_string()),

@@ -97,8 +97,8 @@ use omni::ops::update_space::{UpdateSpace, UpdateSpaceError, UpdateSpaceErrorMod
 use omni::ops::update_view::{UpdateView, UpdateViewError, UpdateViewErrorModeled};
 use omni::scaffolded::Scaffolded;
 use omni::state::{
-    ACCESS_GRANT_NOT_FOUND_MESSAGE, ACCESS_PROFILE_NOT_FOUND_MESSAGE, ASSUME_STATUS_ALLOWED,
-    DOMAIN_NOT_FOUND_MESSAGE, SPACE_NOT_FOUND_MESSAGE, VIEW_TYPE_USER,
+    ACCESS_GRANT_NOT_FOUND_MESSAGE, ACCESS_PROFILE_NAME_TAKEN, ACCESS_PROFILE_NOT_FOUND_MESSAGE,
+    ASSUME_STATUS_ALLOWED, DOMAIN_NOT_FOUND_MESSAGE, SPACE_NOT_FOUND_MESSAGE, VIEW_TYPE_USER,
 };
 
 /// The region the suite signs for.
@@ -1461,6 +1461,66 @@ async fn a_rename_onto_a_name_a_sibling_holds_is_the_modelled_conflict_and_write
         "the self-rename changed the name to {:?}",
         kept.name
     );
+}
+
+#[tokio::test]
+async fn a_rename_onto_a_taken_name_states_the_services_one_sentence_for_the_kind() {
+    let omni = Omni::new();
+    let space_id = omni.space("conflict wording", "update-conflict-wording").await;
+
+    // Rows span the name class `AccessProfileName` admits (`@length(1..256)`,
+    // `^[a-zA-Z0-9 _.:/=+@-]+$`), because the refusal is one sentence for the kind: it
+    // states neither the name the patch asked for nor the space the profile lives in.
+    for (index, name) in ["a", "Taken Profile _.:/=+@-", &"n".repeat(256)]
+        .into_iter()
+        .enumerate()
+    {
+        omni.create_profile("conflict wording", &space_id, name, None)
+            .await;
+        let free = omni
+            .create_profile(
+                "conflict wording",
+                &space_id,
+                &format!("free profile {index}"),
+                None,
+            )
+            .await;
+        let refusal = omni
+            .update_profile(&UpdateAccessProfileInput {
+                space_id: space_id.clone(),
+                profile_id: free.profile_id.clone(),
+                name: Some(name.to_string()),
+                description: None,
+            })
+            .await
+            .expect_err(&format!("case {name:?}: the rename was admitted"));
+        assert_eq!(
+            refusal.http_status(),
+            409,
+            "case {name:?}: expected HTTP 409, got {} ({refusal:?})",
+            refusal.http_status()
+        );
+        let message = match refusal {
+            Scaffolded::Modeled(UpdateAccessProfileErrorModeled::ConflictException(conflict)) => {
+                conflict.message
+            }
+            other => panic!("case {name:?}: expected the modelled ConflictException, got {other:?}"),
+        };
+        assert_eq!(
+            message, ACCESS_PROFILE_NAME_TAKEN,
+            "case {name:?}: expected {ACCESS_PROFILE_NAME_TAKEN:?}, got {message:?}"
+        );
+        assert!(
+            !message.contains(&space_id),
+            "case {name:?}: the refusal names the space: {message:?}"
+        );
+        // A one- or two-character name can occur inside the sentence's own words, so the
+        // name is required withheld for the rows long enough to be recognisable.
+        assert!(
+            name.len() <= 3 || !message.contains(name),
+            "case {name:?}: the refusal names the requested name: {message:?}"
+        );
+    }
 }
 
 #[tokio::test]

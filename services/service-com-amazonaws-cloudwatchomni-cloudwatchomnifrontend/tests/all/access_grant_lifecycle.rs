@@ -49,7 +49,9 @@ use smithy_server_runtime::{
 
 use service_com_amazonaws_cloudwatchomni_cloudwatchomnifrontend as omni;
 
-use omni::ops::create_access_grant::{CreateAccessGrant, CreateAccessGrantError};
+use omni::ops::create_access_grant::{
+    CreateAccessGrant, CreateAccessGrantError, CreateAccessGrantErrorModeled,
+};
 use omni::ops::create_access_profile::CreateAccessProfile;
 use omni::ops::create_domain::CreateDomain;
 use omni::ops::create_space::CreateSpace;
@@ -73,13 +75,14 @@ use omni::ops::types::{
     DELETE_ACCESS_PROFILE_INPUT_SCHEMA, GET_ACCESS_GRANT_INPUT_SCHEMA,
     LIST_ACCESS_GRANTS_INPUT_SCHEMA, UPDATE_ACCESS_PROFILE_INPUT_SCHEMA,
 };
+use omni::scaffolded::Scaffolded;
 use omni::state::{
-    agent_principal_id, ACCESS_GRANT_PERMISSION_SPACE_ADMIN, ACCESS_GRANT_PRINCIPAL_TYPE_AGENT,
-    ACCESS_GRANT_PRINCIPAL_TYPE_IAM_ROOT, ACCESS_GRANT_TYPE_CUSTOMER_MANAGED,
-    ACCESS_GRANT_TYPE_SERVICE_MANAGED, ACCESS_PROFILE_RESOURCE_TYPE,
-    ACCESS_PROFILE_TYPE_CUSTOMER_MANAGED, ACCESS_PROFILE_TYPE_SERVICE_MANAGED,
-    AGENT_ASSUME_GRANT_NAME, ASSUME_STATUS_ALLOWED, ASSUME_STATUS_DENIED,
-    ASYNC_WORKFLOWS_PROFILE_NAME, SERVICE_MANAGED_GRANT_NOT_DELETABLE,
+    agent_principal_id, ACCESS_GRANT_NAME_TAKEN, ACCESS_GRANT_PERMISSION_SPACE_ADMIN,
+    ACCESS_GRANT_PRINCIPAL_TYPE_AGENT, ACCESS_GRANT_PRINCIPAL_TYPE_IAM_ROOT,
+    ACCESS_GRANT_TYPE_CUSTOMER_MANAGED, ACCESS_GRANT_TYPE_SERVICE_MANAGED,
+    ACCESS_PROFILE_RESOURCE_TYPE, ACCESS_PROFILE_TYPE_CUSTOMER_MANAGED,
+    ACCESS_PROFILE_TYPE_SERVICE_MANAGED, AGENT_ASSUME_GRANT_NAME, ASSUME_STATUS_ALLOWED,
+    ASSUME_STATUS_DENIED, ASYNC_WORKFLOWS_PROFILE_NAME, SERVICE_MANAGED_GRANT_NOT_DELETABLE,
     SERVICE_MANAGED_PROFILE_NOT_DELETABLE, SERVICE_MANAGED_PROFILE_NOT_UPDATABLE,
     SPACE_ADMIN_GRANT_NAME,
 };
@@ -830,6 +833,67 @@ async fn a_name_identifies_one_grant_per_space() {
             elsewhere.space_id, second,
             "case {name:?}: expected spaceId {second}, got {:?}",
             elsewhere.space_id
+        );
+    }
+}
+
+/// The message `CreateAccessGrant`'s modelled `ConflictException` carries, or a panic
+/// naming what came back instead.
+fn grant_conflict_message<O: std::fmt::Debug>(
+    case: &str,
+    result: Result<O, CreateAccessGrantError>,
+) -> String {
+    match result {
+        Ok(output) => panic!("case {case:?}: expected a ConflictException, got Ok({output:?})"),
+        Err(error) => {
+            assert_eq!(
+                error.http_status(),
+                409,
+                "case {case:?}: expected HTTP 409, got {} ({error:?})",
+                error.http_status()
+            );
+            match error {
+                Scaffolded::Modeled(CreateAccessGrantErrorModeled::ConflictException(refusal)) => {
+                    refusal.message
+                }
+                other => {
+                    panic!("case {case:?}: expected the modelled ConflictException, got {other:?}")
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_name_a_space_already_holds_is_refused_with_the_services_one_sentence_for_a_grant() {
+    let omni = Omni::new();
+    let (domain_id, space_id) = omni.domain_and_space("conflict", "grant-conflict").await;
+
+    // Rows span `AccessGrantName`'s class again, because the refusal is one sentence
+    // that states neither the name nor the space: nothing the request carried is a
+    // variable of it.
+    for name in ["a", "Grant_9-NAME", &"n".repeat(64)] {
+        omni.create_access_grant(&create_input(&domain_id, &space_id, name))
+            .await
+            .unwrap_or_else(|error| panic!("case {name:?}: the first create failed: {error:?}"));
+        let message = grant_conflict_message(
+            name,
+            omni.create_access_grant(&create_input(&domain_id, &space_id, name))
+                .await,
+        );
+        assert_eq!(
+            message, ACCESS_GRANT_NAME_TAKEN,
+            "case {name:?}: expected {ACCESS_GRANT_NAME_TAKEN:?}, got {message:?}"
+        );
+        assert!(
+            !message.contains(&space_id),
+            "case {name:?}: the refusal names the space: {message:?}"
+        );
+        // A one- or two-character name can occur inside the sentence's own words, so the
+        // name is required withheld for the rows long enough to be recognisable.
+        assert!(
+            name.len() <= 3 || !message.contains(name),
+            "case {name:?}: the refusal names the requested name: {message:?}"
         );
     }
 }

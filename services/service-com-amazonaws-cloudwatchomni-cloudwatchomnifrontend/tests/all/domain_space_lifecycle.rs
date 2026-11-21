@@ -54,7 +54,7 @@ use service_com_amazonaws_cloudwatchomni_cloudwatchomnifrontend as omni;
 
 use omni::ops::create_domain::{CreateDomain, CreateDomainError, CreateDomainErrorModeled};
 use omni::ops::create_space::{CreateSpace, CreateSpaceError};
-use omni::ops::delete_domain::{DeleteDomain, DeleteDomainError};
+use omni::ops::delete_domain::{DeleteDomain, DeleteDomainError, DeleteDomainErrorModeled};
 use omni::ops::delete_space::{DeleteSpace, DeleteSpaceError};
 use omni::ops::get_domain::{GetDomain, GetDomainError};
 use omni::ops::get_space::{GetSpace, GetSpaceError};
@@ -65,11 +65,14 @@ use omni::ops::types::{
     GetDomainInput, GetDomainOutput, GetSpaceInput, GetSpaceOutput, IdentityCenterConfiguration,
     IdentityProviderConfiguration, ListSpacesInput, ListSpacesOutput, Space, UpdateDomainInput,
     UpdateDomainOutput, CREATE_DOMAIN_INPUT_SCHEMA, CREATE_SPACE_INPUT_SCHEMA,
-    GET_SPACE_INPUT_SCHEMA, LIST_SPACES_INPUT_SCHEMA, UPDATE_DOMAIN_INPUT_SCHEMA,
+    DELETE_DOMAIN_INPUT_SCHEMA, GET_SPACE_INPUT_SCHEMA, LIST_SPACES_INPUT_SCHEMA,
+    UPDATE_DOMAIN_INPUT_SCHEMA,
 };
-use omni::ops::update_domain::{UpdateDomain, UpdateDomainError};
+use omni::ops::update_domain::{UpdateDomain, UpdateDomainError, UpdateDomainErrorModeled};
 use omni::scaffolded::Scaffolded;
-use omni::state::SPACE_QUOTA;
+use omni::state::{IDENTITY_CENTER_INSTANCE_REQUIRED, SPACE_QUOTA};
+
+use super::validation_message_wording::error_envelope;
 
 /// The region the suite signs for; the handlers record the signed region on each
 /// resource, so every ARN and `region` member below is expected to carry it.
@@ -2011,7 +2014,7 @@ fn domain_patch_table() -> Vec<DomainPatch> {
             case: "a providers-only patch adds IDC and keeps the name",
             initial_name: "omni-patch-four".to_string(),
             initial_providers: vec!["IAM"],
-            initial_instance: None,
+            initial_instance: Some(IDC_INSTANCE_ARN),
             patch_name: None,
             patch_providers: Some(vec!["IAM", "IDC"]),
             patch_instance: None,
@@ -2593,5 +2596,348 @@ async fn update_domain_over_the_rpcv2cbor_wire() {
     assert!(
         rendered.contains("ResourceNotFoundException"),
         "the wire error body does not name ResourceNotFoundException: {rendered:?}"
+    );
+}
+
+/// The message the operation's modelled `ConflictException` carries, or a panic naming
+/// what came back instead.
+fn delete_conflict_message<O: std::fmt::Debug>(
+    case: &str,
+    result: Result<O, DeleteDomainError>,
+) -> String {
+    match result {
+        Ok(output) => panic!("case {case:?}: expected a ConflictException, got Ok({output:?})"),
+        Err(error) => {
+            assert_eq!(
+                error.http_status(),
+                409,
+                "case {case:?}: expected HTTP 409, got {} ({error:?})",
+                error.http_status()
+            );
+            match error {
+                Scaffolded::Modeled(DeleteDomainErrorModeled::ConflictException(refusal)) => {
+                    refusal.message
+                }
+                other => {
+                    panic!("case {case:?}: expected the modelled ConflictException, got {other:?}")
+                }
+            }
+        }
+    }
+}
+
+/// The message `UpdateDomain`'s modelled `ValidationException` carries, or a panic naming
+/// what came back instead.
+fn patch_validation_message<O: std::fmt::Debug>(
+    case: &str,
+    result: Result<O, UpdateDomainError>,
+) -> String {
+    match result {
+        Ok(output) => panic!("case {case:?}: expected a ValidationException, got Ok({output:?})"),
+        Err(error) => {
+            assert_eq!(
+                error.http_status(),
+                400,
+                "case {case:?}: expected HTTP 400, got {} ({error:?})",
+                error.http_status()
+            );
+            match error {
+                Scaffolded::Modeled(UpdateDomainErrorModeled::ValidationException(refusal)) => {
+                    refusal.message
+                }
+                other => panic!(
+                    "case {case:?}: expected the modelled ValidationException, got {other:?}"
+                ),
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_domain_that_still_holds_spaces_is_refused_with_the_count_it_holds() {
+    let omni = Omni::new();
+    let parent = domain(&omni, "not empty", "omni-not-empty", &["IAM"]).await;
+
+    // Rows walk the count UP and then back DOWN, so the number in the message is read
+    // from the store on each call rather than fixed or remembered: one space (the
+    // smallest count that blocks the delete) and then a second and a third.
+    let mut held: Vec<String> = Vec::new();
+    for count in 1..=3_usize {
+        held.push(
+            space(
+                &omni,
+                "not empty",
+                &format!("omni-not-empty-{count}"),
+                &parent.domain_id,
+            )
+            .await
+            .space_id,
+        );
+        let case = format!("{count} space(s) in the domain");
+        let expected = format!(
+            "Cannot delete Domain {} because it has {count} associated Spaces. Delete all \
+             Spaces first.",
+            parent.domain_id
+        );
+        let message = delete_conflict_message(&case, omni.delete_domain(&parent.domain_id).await);
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
+        );
+        // The template is the service's one sentence for this class, so the expectation
+        // above is the one the shared template renders.
+        assert_eq!(
+            message,
+            omni::state::domain_holds_spaces_message(&parent.domain_id, count),
+            "case {case:?}: the refusal does not state the service's template"
+        );
+        // The refused delete left the domain in place and ACTIVE.
+        let still_there = omni
+            .get_domain(&parent.domain_id)
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: GetDomain failed: {error:?}"))
+            .domain;
+        assert_eq!(
+            still_there.status, "ACTIVE",
+            "case {case:?}: the refused delete moved the domain's status to {:?}",
+            still_there.status
+        );
+    }
+
+    // Removing the spaces one at a time walks the count back down, and the last removal
+    // frees the domain.
+    while let Some(space_id) = held.pop() {
+        omni.delete_space(&space_id)
+            .await
+            .unwrap_or_else(|error| panic!("DeleteSpace failed: {error:?}"));
+        let remaining = held.len();
+        if remaining == 0 {
+            break;
+        }
+        let case = format!("{remaining} space(s) left in the domain");
+        let expected = format!(
+            "Cannot delete Domain {} because it has {remaining} associated Spaces. Delete all \
+             Spaces first.",
+            parent.domain_id
+        );
+        let message = delete_conflict_message(&case, omni.delete_domain(&parent.domain_id).await);
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
+        );
+    }
+    omni.delete_domain(&parent.domain_id)
+        .await
+        .expect("the domain deletes once its last space is gone");
+}
+
+/// One row of the Identity Center precondition table: a patch of a domain that starts out
+/// with `initial_providers` and, where `initial_instance` names one, an Identity Center
+/// instance.
+struct FederationPatch {
+    case: &'static str,
+    initial_providers: Vec<&'static str>,
+    initial_instance: Option<&'static str>,
+    patch_providers: Option<Vec<&'static str>>,
+    /// The `identityProviderConfiguration` the patch carries: `None` for a patch that
+    /// omits the member, `Some(None)` for one that carries it naming no instance.
+    patch_configuration: Option<Option<&'static str>>,
+    patch_name: Option<&'static str>,
+    /// Whether the patch must be refused.
+    refused: bool,
+}
+
+fn federation_patch_table() -> Vec<FederationPatch> {
+    // Rows differ along which members the patch carries (the provider list, the
+    // configuration, the name, and combinations), along the provider sets the model
+    // admits (`IdentityProviderList` @length(1..2) @uniqueItems over [IAM, IDC]) and
+    // along whether an instance is reachable from the request or from the domain.
+    vec![
+        FederationPatch {
+            case: "switching to IDC with no instance anywhere",
+            initial_providers: vec!["IAM"],
+            initial_instance: None,
+            patch_providers: Some(vec!["IDC"]),
+            patch_configuration: None,
+            patch_name: None,
+            refused: true,
+        },
+        FederationPatch {
+            case: "adding IDC beside IAM with no instance anywhere",
+            initial_providers: vec!["IAM"],
+            initial_instance: None,
+            patch_providers: Some(vec!["IAM", "IDC"]),
+            patch_configuration: None,
+            patch_name: None,
+            refused: true,
+        },
+        FederationPatch {
+            case: "switching to IDC with a configuration naming no instance",
+            initial_providers: vec!["IAM"],
+            initial_instance: None,
+            patch_providers: Some(vec!["IDC"]),
+            patch_configuration: Some(None),
+            patch_name: None,
+            refused: true,
+        },
+        FederationPatch {
+            case: "renaming and switching to IDC with no instance",
+            initial_providers: vec!["IAM"],
+            initial_instance: None,
+            patch_providers: Some(vec!["IDC", "IAM"]),
+            patch_configuration: None,
+            patch_name: Some("omni-federation-renamed"),
+            refused: true,
+        },
+        FederationPatch {
+            case: "switching to IDC and naming an instance",
+            initial_providers: vec!["IAM"],
+            initial_instance: None,
+            patch_providers: Some(vec!["IDC"]),
+            patch_configuration: Some(Some(IDC_INSTANCE_ARN)),
+            patch_name: None,
+            refused: false,
+        },
+        FederationPatch {
+            case: "adding IDC to a domain that already holds an instance",
+            initial_providers: vec!["IAM"],
+            initial_instance: Some(IDC_INSTANCE_ARN),
+            patch_providers: Some(vec!["IAM", "IDC"]),
+            patch_configuration: None,
+            patch_name: None,
+            refused: false,
+        },
+        FederationPatch {
+            case: "dropping IDC needs no instance",
+            initial_providers: vec!["IDC"],
+            initial_instance: Some(IDC_INSTANCE_ARN),
+            patch_providers: Some(vec!["IAM"]),
+            patch_configuration: None,
+            patch_name: None,
+            refused: false,
+        },
+        FederationPatch {
+            case: "a rename alone touches no federation",
+            initial_providers: vec!["IDC"],
+            initial_instance: None,
+            patch_providers: None,
+            patch_configuration: None,
+            patch_name: Some("omni-federation-rename-only"),
+            refused: false,
+        },
+        FederationPatch {
+            case: "moving the instance of a domain that lists IDC",
+            initial_providers: vec!["IDC"],
+            initial_instance: Some(IDC_INSTANCE_ARN),
+            patch_providers: None,
+            patch_configuration: Some(Some(OTHER_IDC_INSTANCE_ARN)),
+            patch_name: None,
+            refused: false,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_patch_that_would_leave_idc_without_an_instance_is_refused_and_writes_nothing() {
+    for row in federation_patch_table() {
+        let case = row.case;
+        // An account holds at most ONE domain, so each row patches the domain of an
+        // account of its own.
+        let omni = Omni::new();
+        let mut create = create_domain_input("omni-federation", &row.initial_providers);
+        create.identity_provider_configuration = row.initial_instance.map(idc_configuration);
+        let created = omni
+            .create_domain(&create)
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: CreateDomain failed: {error:?}"))
+            .domain;
+        let before = format!("{created:?}");
+
+        let patch = UpdateDomainInput {
+            domain_id: created.domain_id.clone(),
+            name: row.patch_name.map(str::to_string),
+            identity_providers: row.patch_providers.as_deref().map(providers),
+            identity_provider_configuration: row.patch_configuration.map(|instance| {
+                instance.map_or_else(IdentityProviderConfiguration::default, idc_configuration)
+            }),
+        };
+        let result = omni.update_domain(&patch).await;
+
+        if !row.refused {
+            result
+                .unwrap_or_else(|error| panic!("case {case:?}: the patch was refused: {error:?}"));
+            continue;
+        }
+
+        let message = patch_validation_message(case, result);
+        assert_eq!(
+            message, IDENTITY_CENTER_INSTANCE_REQUIRED,
+            "case {case:?}: expected {IDENTITY_CENTER_INSTANCE_REQUIRED:?}, got {message:?}"
+        );
+        // The refusal wrote nothing: the domain still reports what it held, including the
+        // provider list and the absence of an Identity Center application.
+        let after = omni
+            .get_domain(&created.domain_id)
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: GetDomain failed: {error:?}"))
+            .domain;
+        assert_eq!(
+            format!("{after:?}"),
+            before,
+            "case {case:?}: the refused patch changed the domain"
+        );
+        assert_eq!(
+            after.identity_center_application_arn, None,
+            "case {case:?}: an Identity Center application was minted for a domain with no \
+             instance: {:?}",
+            after.identity_center_application_arn
+        );
+    }
+}
+
+#[tokio::test]
+async fn both_refusals_carry_their_message_over_the_rpcv2cbor_wire() {
+    let omni = Omni::new();
+    let parent = domain(&omni, "wire refusals", "omni-wire-refusals", &["IAM"]).await;
+    space(&omni, "wire refusals", "omni-wire-refusals-a", &parent.domain_id).await;
+
+    let expected = format!(
+        "Cannot delete Domain {} because it has 1 associated Spaces. Delete all Spaces first.",
+        parent.domain_id
+    );
+    let (status, body) = omni
+        .over_the_wire(
+            "DeleteDomain",
+            DELETE_DOMAIN_INPUT_SCHEMA,
+            &DeleteDomainInput {
+                domain_id: parent.domain_id.clone(),
+            },
+        )
+        .await;
+    let (code, message) = error_envelope("a domain that still holds a space", &body);
+    assert_eq!(
+        (status, code.as_str(), message.as_str()),
+        (409, "ConflictException", expected.as_str()),
+        "the wire must answer 409 ConflictException with {expected:?}, got {status} {code:?}: \
+         {message:?}"
+    );
+
+    let (status, body) = omni
+        .over_the_wire(
+            "UpdateDomain",
+            UPDATE_DOMAIN_INPUT_SCHEMA,
+            &UpdateDomainInput {
+                domain_id: parent.domain_id.clone(),
+                identity_providers: Some(providers(&["IDC"])),
+                ..Default::default()
+            },
+        )
+        .await;
+    let (code, message) = error_envelope("a switch to IDC with no instance", &body);
+    assert_eq!(
+        (status, code.as_str(), message.as_str()),
+        (400, "ValidationException", IDENTITY_CENTER_INSTANCE_REQUIRED),
+        "the wire must answer 400 ValidationException with \
+         {IDENTITY_CENTER_INSTANCE_REQUIRED:?}, got {status} {code:?}: {message:?}"
     );
 }

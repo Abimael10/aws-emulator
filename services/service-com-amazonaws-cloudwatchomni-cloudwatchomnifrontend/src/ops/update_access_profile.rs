@@ -170,9 +170,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|requested| {
                 store
                     .access_profile_named(&input.space_id, requested)
-                    .map(|existing| (requested.to_string(), existing.profile.profile_id.clone()))
+                    .map(|existing| existing.profile.profile_id.clone())
             })
-            .filter(|(_, existing_id)| *existing_id != input.profile_id);
+            .filter(|existing_id| *existing_id != input.profile_id);
 
         // A profile is addressed by its space AND its id, so a profile of another space
         // is not this request's profile. An unknown id and a deleted one are the same
@@ -211,13 +211,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The conflict is answered before anything is written, so a refused patch leaves
         // the profile exactly as it was.
-        if let Some((requested, existing_id)) = conflicting {
+        if let Some(existing_id) = conflicting {
             return Err(UpdateAccessProfileErrorModeled::ConflictException(
                 ConflictException {
-                    message: format!(
-                        "An access profile named '{requested}' already exists in space '{}'.",
-                        input.space_id
-                    ),
+                    message: crate::state::ACCESS_PROFILE_NAME_TAKEN.to_string(),
                     conflict_type: Some("ALREADY_EXISTS".to_string()),
                     resource_id: Some(existing_id),
                     resource_type: Some("AccessProfile".to_string()),
