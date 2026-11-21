@@ -778,13 +778,12 @@ fn an_action_past_its_published_bound_is_refused(
     assert_eq!(
         message,
         format!(
-            "ActionType (Category: 'Invoke', Provider: 'Lambda', Owner: 'AWS', Version: '1') in \
-             action 'Deploy' allows at most {input_maximum} input artifact(s), but the action \
-             declares {}",
+            "Action Deploy declares {} input artifacts which is more than the maximum count \
+             ({input_maximum})",
             inputs.len()
         ),
-        "case {case:?}: the refusal states the action type, the action, the bound it was judged \
-         against and the count declared"
+        "case {case:?}: the refusal states the action, the count of which artifacts it declared \
+         and the published maximum that count is over"
     );
     let (status, answer) = emulator.cp("GetPipeline", &json!({ "name": name }));
     assert_eq!(

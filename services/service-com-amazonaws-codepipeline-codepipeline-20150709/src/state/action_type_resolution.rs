@@ -136,26 +136,23 @@ pub fn unknown_action_type_message(
 }
 
 /// The message `InvalidActionDeclarationException` carries for an action declaring more
-/// artifacts than its action type takes: the action type, the action that declared them,
-/// WHICH artifacts they are (the ones the action takes in or the ones it produces), the
-/// bound that action type publishes and the count the request declared.
+/// artifacts than its action type takes: the action that declared them, WHICH artifacts
+/// they are (the ones the action takes in or the ones it produces), the count the request
+/// declared and the bound that action type publishes.
 ///
-/// Worded in the family this service's other declaration refusals are stated in — the
-/// `ActionType (…) in action '…'` subject its sibling carries, and the `(s)` form
-/// `too_few_stages_message`'s "Pipeline has only 1 stage(s)" uses, which reads correctly
-/// for every count — and the kind of artifact is stated in prose rather than as the JSON
-/// member name, because the sentence is for a person reading the refusal.
+/// The subject is the ACTION, named unquoted, and the two counts are stated declared-then-
+/// maximum, with the maximum parenthesised: the defect is an artifact COUNT over a bound,
+/// so the sentence names the action to fix and the two numbers to compare, and restates
+/// neither the `actionTypeId` (which resolved) nor the JSON member name.
 pub fn artifact_count_message(
-    id: &ActionTypeId,
     action_name: &str,
     artifacts: &str,
     declared: usize,
     maximum: i32,
 ) -> String {
     format!(
-        "{} in action '{action_name}' allows at most {maximum} {artifacts} artifact(s), \
-         but the action declares {declared}",
-        action_type_identity(id)
+        "Action {action_name} declares {declared} {artifacts} artifacts which is more than \
+         the maximum count ({maximum})"
     )
 }
 
@@ -198,7 +195,6 @@ pub fn validate_action_type(
         let maximum = published.max(0);
         if declared > maximum as usize {
             return Err(DeclarationProblem::Action(artifact_count_message(
-                id,
                 &action.name,
                 artifacts,
                 declared,

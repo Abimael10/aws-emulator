@@ -198,8 +198,8 @@ async fn a_fault_of_one_actions_declaration_is_refused_as_an_action_fault() {
                 ),
             ]),
             ACTION_FAULT,
-            "action Compile in stage Build declares the input artifact NoSuchArtifact, \
-             which no earlier action outputs"
+            "Input Artifact Bundle NoSuchArtifact in action Compile is not declared as \
+             Output Artifact Bundle in any of the preceding actions"
                 .to_string(),
         ),
         (
@@ -216,8 +216,8 @@ async fn a_fault_of_one_actions_declaration_is_refused_as_an_action_fault() {
                 ),
             ]),
             ACTION_FAULT,
-            "action Compile in stage Build declares the input artifact ShipOut, which no \
-             earlier action outputs"
+            "Input Artifact Bundle ShipOut in action Compile is not declared as Output \
+             Artifact Bundle in any of the preceding actions"
                 .to_string(),
         ),
         (
@@ -233,8 +233,8 @@ async fn a_fault_of_one_actions_declaration_is_refused_as_an_action_fault() {
                 ),
             ]),
             ACTION_FAULT,
-            "action Test in stage Build declares the input artifact BuildOut, which no \
-             earlier action outputs"
+            "Input Artifact Bundle BuildOut in action Test is not declared as Output \
+             Artifact Bundle in any of the preceding actions"
                 .to_string(),
         ),
         (
@@ -349,6 +349,142 @@ async fn a_fault_of_one_stage_is_refused_as_a_stage_fault() {
     ];
 
     each_row_is_refused(&rows).await;
+}
+
+/// RULE: an action consuming an artifact bundle no PRECEDING action declares as an output
+/// artifact bundle is refused in one sentence, which names the bundle the action asked for
+/// and the action that asked for it — the stage holding it is no part of the law, which is
+/// stated over the actions preceding that one wherever they are declared.
+#[tokio::test]
+async fn a_dangling_input_artifact_is_refused_naming_the_bundle_and_the_action() {
+    // ONE template over every row, with the two variable parts taken from the row: the
+    // artifact the action named and the name of the action that named it.
+    let expected = |artifact: &str, action_name: &str| {
+        format!(
+            "Input Artifact Bundle {artifact} in action {action_name} is not declared as \
+             Output Artifact Bundle in any of the preceding actions"
+        )
+    };
+    // The rows differ along what the rule generalises over: WHICH entry of the input list
+    // dangles and how long that list is, how far into the declaration the consuming action
+    // sits, the shape of the artifact name, and whether the bundle exists nowhere, only
+    // later, or only at the same `runOrder`.
+    let rows: Vec<(&str, Value, &str, &str)> = vec![
+        (
+            "a lone input bundle nothing produces",
+            json!([
+                source_stage("Source", "SourceOut"),
+                stage(
+                    "Build",
+                    vec![with_artifacts(action("Compile", "Build", 1), &["Nowhere"], &[])],
+                ),
+            ]),
+            "Nowhere",
+            "Compile",
+        ),
+        (
+            "the SECOND entry of an input list whose first entry is produced",
+            json!([
+                source_stage("Source", "SourceOut"),
+                stage(
+                    "Build",
+                    vec![with_artifacts(
+                        action("Compile", "Build", 1),
+                        &["SourceOut", "Second_Bundle-9"],
+                        &[],
+                    )],
+                ),
+            ]),
+            "Second_Bundle-9",
+            "Compile",
+        ),
+        (
+            "the THIRD entry, in the last of three stages",
+            json!([
+                source_stage("Source", "SourceOut"),
+                stage(
+                    "Build",
+                    vec![with_artifacts(
+                        action("Compile", "Build", 1),
+                        &["SourceOut"],
+                        &["BuildOut"],
+                    )],
+                ),
+                stage(
+                    "Ship",
+                    vec![with_artifacts(
+                        action("Release-1", "Deploy", 1),
+                        &["SourceOut", "BuildOut", "Absent"],
+                        &[],
+                    )],
+                ),
+            ]),
+            "Absent",
+            "Release-1",
+        ),
+        (
+            "a bundle produced only in a LATER stage",
+            json!([
+                source_stage("Source", "SourceOut"),
+                stage(
+                    "Build",
+                    vec![with_artifacts(action("Compile", "Build", 1), &["ShipOut"], &[])],
+                ),
+                stage(
+                    "Ship",
+                    vec![with_artifacts(
+                        action("Deploy", "Deploy", 1),
+                        &["SourceOut"],
+                        &["ShipOut"],
+                    )],
+                ),
+            ]),
+            "ShipOut",
+            "Compile",
+        ),
+        (
+            "a bundle produced at the SAME runOrder, by a second action of that stage",
+            json!([
+                source_stage("Source", "SourceOut"),
+                stage(
+                    "Build",
+                    vec![
+                        with_artifacts(
+                            action("Compile", "Build", 1),
+                            &["SourceOut"],
+                            &["BuildOut"],
+                        ),
+                        with_artifacts(action("Verify", "Test", 1), &["BuildOut"], &[]),
+                    ],
+                ),
+            ]),
+            "BuildOut",
+            "Verify",
+        ),
+    ];
+
+    for operation in DECLARATION_OPERATIONS {
+        for (case, stages, artifact, action_name) in &rows {
+            let emulator = emulator_with_fixture().await;
+            let name = if operation == DECLARATION_OPERATIONS[1] {
+                FIXTURE
+            } else {
+                "fresh"
+            };
+            let (status, code, message) = refusal(
+                &emulator,
+                operation,
+                &json!({"pipeline": pipeline(name, stages.clone())}),
+            )
+            .await;
+            assert_eq!(
+                (status, code.as_str(), message.as_str()),
+                (400, ACTION_FAULT, expected(artifact, action_name).as_str()),
+                "case {case:?} on {operation}: expected the dangling-bundle refusal naming \
+                 {artifact} and {action_name}, got {status} {code} {message:?}"
+            );
+        }
+    }
 }
 
 /// RULE: a fault of the pipeline AS A WHOLE stays a malformed STRUCTURE — the scope of

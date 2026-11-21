@@ -333,27 +333,28 @@ async fn an_aws_owned_action_type_the_service_does_not_publish_is_refused() {
     );
 }
 
+/// The artifact bound an `AWS`-owned action type PUBLISHES, read off the catalog itself,
+/// so a case states what the action type publishes rather than a figure copied by hand.
+fn published_bound(category: &str, provider: &str, outputs: bool) -> i32 {
+    let entry = BUILT_IN_ACTION_TYPES
+        .iter()
+        .find(|entry| {
+            entry.category == category && entry.owner == "AWS" && entry.provider == provider
+        })
+        .unwrap_or_else(|| panic!("the catalog publishes {category}/AWS/{provider}"));
+    if outputs {
+        entry.output_artifacts.1
+    } else {
+        entry.input_artifacts.1
+    }
+}
+
 /// RULE: an action declares no more artifacts on either list than its action type's
 /// published maximum, so an artifact on an action type that takes or produces none is
 /// refused — and an action type with no published bounds admits any list the service's own
 /// per-action cap allows.
 #[tokio::test]
 async fn an_action_declares_no_more_artifacts_than_its_action_type_takes() {
-    // The bounds the rows are written against come from the catalog itself, so a case
-    // states what the action type publishes rather than a figure copied by hand.
-    let bound = |category: &str, provider: &str, outputs: bool| -> i32 {
-        let entry = BUILT_IN_ACTION_TYPES
-            .iter()
-            .find(|entry| {
-                entry.category == category && entry.owner == "AWS" && entry.provider == provider
-            })
-            .unwrap_or_else(|| panic!("the catalog publishes {category}/AWS/{provider}"));
-        if outputs {
-            entry.output_artifacts.1
-        } else {
-            entry.input_artifacts.1
-        }
-    };
     // (case, category, owner, provider, input count, output count, accepted)
     let rows: Vec<(&str, &str, &str, &str, usize, usize, bool)> = vec![
         (
@@ -466,21 +467,26 @@ async fn an_action_declares_no_more_artifacts_than_its_action_type_takes() {
             ),
         ]);
         let expected = (!accepted).then(|| {
-            // The refusal names WHICH artifacts were over their bound and the published
-            // maximum they exceeded.
-            let over_outputs = outputs > bound(category, provider, true) as usize;
+            // The refusal names the action, the count it declared of WHICH artifacts, and
+            // the published maximum that count is over.
+            let over_outputs = outputs > published_bound(category, provider, true) as usize;
             let artifacts = if over_outputs { "output" } else { "input" };
+            let declared = if over_outputs { outputs } else { inputs };
             (
                 BAD_ACTION,
-                format!("allows at most {} {artifacts} artifact(s)", bound(category, provider, over_outputs)),
+                format!(
+                    "Action Work declares {declared} {artifacts} artifacts which is more \
+                     than the maximum count ({})",
+                    published_bound(category, provider, over_outputs)
+                ),
             )
         });
         assert_declaration(case, stages, expected).await;
     }
 
     // The sentence itself, spelled out once, so the whole message is pinned rather than
-    // only the clause naming the artifacts: the action type's identity, the action that
-    // declared them, which artifacts they are, the published bound and the count declared.
+    // only the clause naming the artifacts: the action that declared them, how many of
+    // which artifacts it declared, and the published bound that count is over.
     let emulator = emulator_with_fixture().await;
     let (_, _, message) = refusal(
         &emulator,
@@ -502,11 +508,138 @@ async fn an_action_declares_no_more_artifacts_than_its_action_type_takes() {
     .await;
     assert_eq!(
         message,
-        "ActionType (Category: 'Approval', Provider: 'Manual', Owner: 'AWS', \
-         Version: '1') in action 'Approve' allows at most 0 output artifact(s), but the \
-         action declares 1",
+        "Action Approve declares 1 output artifacts which is more than the maximum \
+         count (0)",
         "expected the sentence this refusal states, got {message:?}"
     );
+}
+
+/// RULE: the refusal of an action whose artifact list is longer than its action type's
+/// published maximum is ONE sentence, naming the action, how many of WHICH artifacts it
+/// declared and the maximum that count is over — the three variable parts, two read off
+/// the request and one off what the action type publishes.
+#[tokio::test]
+async fn an_artifact_count_over_the_published_maximum_is_refused_in_one_sentence() {
+    // The rows differ along what the rule generalises over: the action's name, WHICH list
+    // is over its bound, how far over it is, and the size of the published maximum —
+    // including an action type the issue did not cite (`Build/AWS/CodeBuild`, whose bounds
+    // are not zero).
+    // (case, action name, category, provider, the output list is the one over its bound,
+    //  how far over it is)
+    let rows: Vec<(&str, &str, &str, &str, bool, usize)> = vec![
+        (
+            "one output artifact on a manual approval, which produces none",
+            "ApprovalAction",
+            "Approval",
+            "Manual",
+            true,
+            1,
+        ),
+        (
+            "two input artifacts past what a manual approval takes",
+            "Gate-1",
+            "Approval",
+            "Manual",
+            false,
+            2,
+        ),
+        (
+            "one input artifact past what an S3 deploy takes",
+            "Ship_It",
+            "Deploy",
+            "S3",
+            false,
+            1,
+        ),
+        (
+            "an output artifact on an S3 deploy, which produces none",
+            "Ship2",
+            "Deploy",
+            "S3",
+            true,
+            1,
+        ),
+        (
+            "one output artifact past the five a CodeBuild action produces",
+            "Compile",
+            "Build",
+            "CodeBuild",
+            true,
+            1,
+        ),
+        (
+            "three input artifacts past what a CodeBuild action takes",
+            "CompileAgain",
+            "Build",
+            "CodeBuild",
+            false,
+            3,
+        ),
+    ];
+
+    for operation in DECLARATION_OPERATIONS {
+        for (case, action_name, category, provider, over_outputs, over_by) in &rows {
+            let maximum = published_bound(category, provider, *over_outputs);
+            let declared = maximum.max(0) as usize + over_by;
+            // Only the list under test is over its bound: the other sits exactly at the
+            // maximum its action type publishes.
+            let other = published_bound(category, provider, !*over_outputs).max(0) as usize;
+            let (inputs, outputs) = if *over_outputs {
+                (other, declared)
+            } else {
+                (declared, other)
+            };
+            // The first consumed name is the one the source stage produces; a further one
+            // names nothing, which this rule is refused ahead of.
+            let consumed: Vec<String> = (0..inputs)
+                .map(|index| {
+                    if index == 0 {
+                        SOURCE_ARTIFACT.to_string()
+                    } else {
+                        format!("Extra{index}")
+                    }
+                })
+                .collect();
+            let produced: Vec<String> = (0..outputs).map(|index| format!("Out{index}")).collect();
+            let consumed_refs: Vec<&str> = consumed.iter().map(String::as_str).collect();
+            let produced_refs: Vec<&str> = produced.iter().map(String::as_str).collect();
+            let name = if operation == DECLARATION_OPERATIONS[0] {
+                FRESH
+            } else {
+                FIXTURE
+            };
+            let emulator = emulator_with_fixture().await;
+            let (status, code, message) = refusal(
+                &emulator,
+                operation,
+                &json!({"pipeline": pipeline(
+                    name,
+                    json!([
+                        source_stage(),
+                        acting_stage(
+                            "Act",
+                            action_name,
+                            action_type(category, "AWS", provider, "1"),
+                            &consumed_refs,
+                            &produced_refs,
+                        ),
+                    ]),
+                )}),
+            )
+            .await;
+            let artifacts = if *over_outputs { "output" } else { "input" };
+            let expected = format!(
+                "Action {action_name} declares {declared} {artifacts} artifacts which is \
+                 more than the maximum count ({maximum})"
+            );
+            assert_eq!(
+                (status, code.as_str(), message.as_str()),
+                (400, BAD_ACTION, expected.as_str()),
+                "case {case:?} on {operation}: expected the artifact-count refusal, got \
+                 {status} {code} {message:?}"
+            );
+        }
+    }
 }
 
 /// RULE: the identities the service publishes come from ONE answer to "does the service
@@ -987,7 +1120,11 @@ async fn the_bound_an_entry_publishes_is_the_bound_a_declaration_is_held_to() {
                  refused, got {status} {code} ({message:?})"
             );
             let bound = if over_inputs { inputs } else { outputs };
-            let clause = format!("allows at most {bound} {artifacts} artifact(s)");
+            let declared = bound + 1;
+            let clause = format!(
+                "Action Work declares {declared} {artifacts} artifacts which is more than \
+                 the maximum count ({bound})"
+            );
             assert!(
                 message.contains(&clause),
                 "case {case}: the refusal states the bound the listing published: expected \

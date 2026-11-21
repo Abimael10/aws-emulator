@@ -4027,6 +4027,21 @@ pub fn duplicate_action_name_message(action_name: &str, stage_name: &str) -> Str
     format!("Action name '{action_name}' is used more than once in pipeline stage '{stage_name}'")
 }
 
+/// The message `InvalidActionDeclarationException` carries for an action consuming an
+/// artifact no preceding action produces.
+///
+/// Built from the request: the artifact the action named in its `inputArtifacts` and the
+/// action that named it. An artifact bundle is produced exactly once and consumed by
+/// whatever runs after it, so what the caller has to fix is the NAME and the action that
+/// consumes it — the stage holding that action is not part of the law, which is stated
+/// over the actions preceding this one wherever they are declared.
+pub fn dangling_input_artifact_message(artifact_name: &str, action_name: &str) -> String {
+    format!(
+        "Input Artifact Bundle {artifact_name} in action {action_name} is not declared as \
+         Output Artifact Bundle in any of the preceding actions"
+    )
+}
+
 /// The message a declaration that states `pipelineType` `V1` while carrying a V2-only
 /// FEATURE is refused with: the feature, in the service's own words.
 ///
@@ -4720,11 +4735,9 @@ pub fn validate_declaration(
             for action in group {
                 for input in action.input_artifacts.iter().flatten() {
                     if !produced.contains(input.name.as_str()) {
-                        return Err(DeclarationProblem::Action(format!(
-                            "action {} in stage {} declares the input artifact {}, which \
-                             no earlier action outputs",
-                            action.name, stage.name, input.name
-                        )));
+                        return Err(DeclarationProblem::Action(
+                            dangling_input_artifact_message(&input.name, &action.name),
+                        ));
                     }
                 }
                 for output in action.output_artifacts.iter().flatten() {

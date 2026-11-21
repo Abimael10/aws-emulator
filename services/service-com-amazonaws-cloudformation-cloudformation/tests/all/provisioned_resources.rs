@@ -804,7 +804,8 @@ async fn a_refused_resource_fails_the_deployment() {
     )
     .await;
     assert!(
-        on_the_resource.contains("which no earlier action outputs")
+        on_the_resource
+            .contains("is not declared as Output Artifact Bundle in any of the preceding actions")
             && on_the_resource.contains("HandlerErrorCode: InvalidRequest"),
         "expected the owning service's refusal on the failed resource's event, got \
          {on_the_resource:?}"
