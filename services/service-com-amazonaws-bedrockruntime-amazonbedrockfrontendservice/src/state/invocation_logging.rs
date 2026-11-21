@@ -67,7 +67,11 @@
 //! rather than one JSON array. The two therefore state their own layouts, and
 //! neither reads the other's.
 //!
-//! Every value in a record comes off the call that was served. Of the
+//! Every value in a record comes off the call that was served. A record names the
+//! call by the id the CALLER was answered under and names the principal that made
+//! it, so the two facts a consumer correlates a record by — the response a client
+//! holds and the identity that invoked the model — are the call's own
+//! ([`with_invocation_request_id_header`], [`record`]). Of the
 //! per-datatype delivery switches, the one this emulator's records are gated by is
 //! `textDataDeliveryEnabled`: the bodies it delivers carry a conversation and a
 //! completion, which is text data, so a configuration that turned text data
@@ -93,8 +97,10 @@
 //! owning store's own ceilings refuse a write past what it holds, which is what
 //! bounds a long-running emulator's accumulated records.
 
+use ::std::cell::RefCell;
 use ::std::io::Write;
 
+use ::aws_smithy_runtime_api::http::Response as RtResponse;
 use ::service_com_amazonaws_s3_amazons3 as s3;
 
 use crate::ops::types::{ContentBlock, Message, TokenUsage};
@@ -130,6 +136,10 @@ const MODEL_ID_MEMBER: &str = "modelId";
 /// into the one `aws/bedrock/modelinvocations` stream of the group the
 /// configuration named, so every invocation's event is read back from one place.
 pub const LOG_STREAM_NAME: &str = "aws/bedrock/modelinvocations";
+
+/// `identity` — the block a record names the principal that made the invocation
+/// in, carrying that principal's `arn`.
+const IDENTITY_MEMBER: &str = "identity";
 
 /// `operation` — the API operation a record was written for. One constant per
 /// inference surface, so the four surfaces cannot spell the same operation two
@@ -216,6 +226,97 @@ pub fn install<Eng: Send + Sync + 'static>(
     };
     state.lock().invocation_log_delivery = delivery;
     true
+}
+
+thread_local! {
+    /// The id the caller of the invocation this thread is serving is answered under,
+    /// put here by the delivery that carried it in the record ([`deliver`]) and taken
+    /// by the report that states it on the response
+    /// ([`with_invocation_request_id_header`]) — so the record of a call and the
+    /// response to that call name one id, which is what lets a consumer of the records
+    /// find the record of the very call a response it holds is of.
+    ///
+    /// # The invariant this rests on
+    ///
+    /// The two sides of it are ONE poll apart, which is what makes a thread-local the
+    /// right home: the framework's sequence serializes the handler's result with
+    /// nothing awaited after `Operation::handle`
+    /// ([`::smithy_server_runtime::run_operation_http`]), and the layer that reports
+    /// the id is the one that awaited that sequence — so nothing else can run on this
+    /// thread between the id being put here and it being taken. The delivery therefore
+    /// puts it here as the LAST thing it does, after both destinations have been
+    /// written.
+    ///
+    /// Nothing is left to be quietly wrong if that ever stops holding: the id is TAKEN
+    /// rather than read, so it is reported for at most one response, and an empty slot
+    /// means the response is named by a freshly minted id exactly as the response of a
+    /// call that delivered no record is.
+    static ANSWERED_AS: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Hold `request_id` as the id the caller of this invocation is answered under.
+fn answer_as(request_id: &str) {
+    ANSWERED_AS.with(|slot| *slot.borrow_mut() = Some(request_id.to_string()));
+}
+
+/// The id this thread is holding, taken out of the slot so it is read once.
+fn taken_answer() -> Option<String> {
+    ANSWERED_AS.with(|slot| slot.borrow_mut().take())
+}
+
+/// How this service names the request every one of its responses answers: under the
+/// id the invocation's own record was delivered with, where this call delivered one,
+/// and under a freshly minted id everywhere else.
+///
+/// The report (`::service_common::query_error_envelope::Report`) this service hands
+/// both its operation wrappers and its definition wrapper, so the response an
+/// operation produced and the response no operation produced name their request the
+/// same way. It is the one place the two readings of an invocation are held to one
+/// value: the delivered record carries the id the caller was answered under because
+/// the caller is answered under the id the record carries.
+#[must_use]
+pub fn with_invocation_request_id_header(resp: RtResponse) -> RtResponse {
+    match taken_answer() {
+        Some(answered_as) => {
+            ::service_common::query_error_envelope::with_stated_request_id_header(
+                resp,
+                &answered_as,
+            )
+        }
+        None => ::service_common::query_error_envelope::with_request_id_header(resp),
+    }
+}
+
+/// The ARN of the IAM principal an invocation was made by, as the record's `identity`
+/// names them — `None` for a request this emulator can place no principal for.
+///
+/// Read off the credential the request was signed with, through the one rule every
+/// recorder of a served call in this tree reads a caller by
+/// (`::service_common::management_events::recorded_caller`): a call made with a
+/// temporary credential names the session the account's directory holds for it, a
+/// call made with the emulator's long-term credential names the IAM user that
+/// credential belongs to, and a request that carried no credential at all names
+/// nobody rather than a made-up principal.
+fn caller_identity_arn<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    parts: &::http::request::Parts,
+) -> Option<String> {
+    let caller = ::service_common::management_events::recorded_caller(parts);
+    let access_key_id = caller.access_key_id.as_deref()?;
+    let session = ::service_common::on_behalf_of_calls::session_audit_directory(engine).and_then(
+        |directory| {
+            directory
+                .lock()
+                .session(access_key_id)
+                .map(|held| held.arn.clone())
+        },
+    );
+    match session {
+        Some(arn) => Some(arn),
+        None => (caller.principal_type
+            == ::service_common::management_events::PRINCIPAL_TYPE_IAM_USER)
+            .then(::service_common::caller_principal::ambient_user_arn),
+    }
 }
 
 /// One served invocation, as a record states it.
@@ -324,12 +425,15 @@ pub fn converse_answer_body(
 
 /// The record one served invocation is, as the line a delivered object carries.
 ///
-/// `request_id` names the DELIVERY: the one record of the one invocation, which is
-/// also what tells two objects of the same minute apart. It is not the id this
-/// emulator's response reports for the same call: that one is minted by the
-/// request-id reporting layer this service's front door wraps every operation in
-/// (`crate::service`), after the handler has already answered, so correlating a
-/// delivered record with the response it is of is not modelled here.
+/// `request_id` names the CALL: it is the id the caller of that invocation was
+/// answered under, which is also what tells two objects of the same minute apart —
+/// so a client holding a response finds the record of that very invocation rather
+/// than guessing which record of an operation is its own (see
+/// [`with_invocation_request_id_header`] for how the two are held to one value).
+///
+/// `identity_arn` is the IAM principal the invocation was made BY, as the record's
+/// `identity` block names them; a request whose principal this emulator cannot place
+/// carries no such block rather than a made-up one.
 ///
 /// The bodies travel only where `delivery` allows that data to: a configuration
 /// that turned text data delivery off still gets the record, with its model, its
@@ -339,6 +443,7 @@ pub fn record(
     delivery: &InvocationLogDelivery,
     invocation: &LoggedInvocation,
     request_id: &str,
+    identity_arn: Option<&str>,
 ) -> ::serde_json::Value {
     let mut input = ::serde_json::Map::new();
     input.insert(
@@ -366,7 +471,7 @@ pub fn record(
             output.insert("outputBodyJson".to_string(), body);
         }
     }
-    ::serde_json::json!({
+    let mut written = ::serde_json::json!({
         "schemaType": SCHEMA_TYPE,
         "schemaVersion": SCHEMA_VERSION,
         "timestamp": super::datetime_of_millis(invocation.at_millis)
@@ -379,7 +484,14 @@ pub fn record(
         "modelId": invocation.model_id,
         "input": ::serde_json::Value::Object(input),
         "output": ::serde_json::Value::Object(output),
-    })
+    });
+    if let (Some(members), Some(arn)) = (written.as_object_mut(), identity_arn) {
+        members.insert(
+            IDENTITY_MEMBER.to_string(),
+            ::serde_json::json!({ "arn": arn }),
+        );
+    }
+    written
 }
 
 /// The prefix every record of one account's invocations lands under:
@@ -449,6 +561,28 @@ fn gzipped(records: &[::serde_json::Value]) -> Option<Vec<u8>> {
     encoder.finish().ok()
 }
 
+/// The records one DELIVERED object carries: its bytes read back as what [`gzipped`]
+/// wrote them, one JSON document per line — `None` for bytes that are not such an
+/// object.
+///
+/// The reading counterpart of the framing above, stated here beside it for the reason
+/// [`record_key_prefix`] is: a reader of a destination bucket — an audit consumer, and
+/// the suites that assert what one holds — fetches an object and decompresses it, so
+/// the form it decodes cannot drift from the form the delivery wrote.
+#[must_use]
+pub fn delivered_records(object: &[u8]) -> Option<Vec<::serde_json::Value>> {
+    use ::std::io::Read;
+
+    let mut decoded = String::new();
+    ::flate2::read::GzDecoder::new(object)
+        .read_to_string(&mut decoded)
+        .ok()?;
+    decoded
+        .lines()
+        .map(|line| ::serde_json::from_str(line).ok())
+        .collect()
+}
+
 /// Deliver `invocation`'s record to EVERY destination this account configured, if
 /// it configured any.
 ///
@@ -461,6 +595,12 @@ fn gzipped(records: &[::serde_json::Value]) -> Option<Vec<u8>> {
 /// The record is composed, framed and written with NO guard of this service's
 /// store held, and a write a destination's own service refuses is traced rather
 /// than failing the call that was already served (see the module docs).
+///
+/// The record names the call by the id the CALLER is answered under: the id is
+/// minted here, carried in the record, and then held for the report that states it
+/// on the response this call is answered with
+/// ([`with_invocation_request_id_header`]) — which is why holding it is the last
+/// thing this does, after every destination has been written.
 pub async fn deliver<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
@@ -473,18 +613,26 @@ pub async fn deliver<Eng: Send + Sync + 'static>(
     let Some(delivery) = delivery else {
         return;
     };
-    // The id this record is delivered under, which also tells two objects of the
-    // same minute apart. Drawn fresh from the maintained generator the rest of this
-    // tree mints request ids with, never derived from the request; see [`record`]
-    // for why it is not the id the response reported.
+    // The id this call is answered under, which the record names the call by and
+    // which also tells two objects of the same minute apart. Drawn fresh from the
+    // maintained generator the rest of this tree mints request ids with, never
+    // derived from the request.
     let request_id = ::service_common::query_error_envelope::new_request_id();
-    let record = record(&delivery, invocation, &request_id);
+    let record = record(
+        &delivery,
+        invocation,
+        &request_id,
+        caller_identity_arn(engine, ctx.parts()).as_deref(),
+    );
     if let Some(destination) = delivery.object_destination.as_ref() {
         deliver_object(engine, destination, invocation, &record, &request_id);
     }
     if let Some(destination) = delivery.log_group_destination.as_ref() {
         deliver_log_event(ctx, destination, invocation, &record).await;
     }
+    // Last, with nothing awaited after it: the report that answers this call is one
+    // poll away on this very thread (see [`ANSWERED_AS`]).
+    answer_as(&request_id);
 }
 
 /// Write one invocation's `record` into the object destination, as the vended-log
@@ -707,7 +855,12 @@ mod tests {
                 ..delivery(Some("sim2real"))
             };
             let invocation = invocation();
-            let written = record(&destination, &invocation, "r1");
+            let written = record(
+                &destination,
+                &invocation,
+                "r1",
+                Some("arn:aws:iam::000000000000:user/emulator"),
+            );
             assert_eq!(
                 (
                     written["operation"].as_str(),
@@ -736,6 +889,34 @@ mod tests {
                 ),
                 (bodies, bodies),
                 "case {case:?}: expected the bodies present={bodies}, got {written}"
+            );
+        }
+    }
+
+    /// RULE: a record names the principal that made the invocation, and names none at
+    /// all for a call this emulator can place no principal for — never a made-up one.
+    #[test]
+    fn a_record_names_the_principal_that_made_the_invocation() {
+        // (case, the principal the call was signed by, the `identity.arn` stated)
+        let rows = [
+            (
+                "a call made by the account's IAM user",
+                Some("arn:aws:iam::000000000000:user/emulator"),
+                Some("arn:aws:iam::000000000000:user/emulator"),
+            ),
+            (
+                "a call made with a role session",
+                Some("arn:aws:sts::000000000000:assumed-role/auditor/session-1"),
+                Some("arn:aws:sts::000000000000:assumed-role/auditor/session-1"),
+            ),
+            ("a call no principal could be placed for", None, None),
+        ];
+        for (case, identity_arn, expected) in rows {
+            let written = record(&delivery(None), &invocation(), "r1", identity_arn);
+            assert_eq!(
+                written[IDENTITY_MEMBER]["arn"].as_str(),
+                expected,
+                "case {case:?}: expected {expected:?} as the record's identity, got {written}"
             );
         }
     }

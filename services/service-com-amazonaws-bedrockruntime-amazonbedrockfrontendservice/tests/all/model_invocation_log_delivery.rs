@@ -477,6 +477,59 @@ async fn the_destination_decides_where_a_record_lands_and_how_much_of_it_travels
     }
 }
 
+/// RULE: the record a served inference delivers names the call it is of by the id the
+/// CALLER was answered under — the `x-amzn-RequestId` of that very response — and names
+/// the principal the call was made by, so a consumer holding a response finds the record
+/// of that one invocation instead of guessing which record of an operation is its own.
+/// The object the record is delivered as is named for that same id, which is what a
+/// consumer polling a prefix for one call's record reads.
+///
+/// The rows differ along the surface that served the inference (all four) and along the
+/// per-datatype delivery switch, because a record withholding the bodies still has to be
+/// the record of a call a client can name.
+#[tokio::test]
+async fn a_record_names_the_call_by_the_id_the_caller_was_answered_under() {
+    for surface in surfaces() {
+        for text_enabled in [true, false] {
+            let case = format!("{} with text data delivery={text_enabled}", surface.case);
+            let case = case.as_str();
+            let (engine, router) = emulator();
+            given_bucket(&router, case).await;
+            given_logging(&engine, Some("sim2real"), text_enabled);
+
+            let prompt = format!("a prompt served under {case}");
+            let answered = invoke(&router, &surface, &prompt).await;
+            let answered_as = answered.header("x-amzn-requestid");
+            assert!(
+                !answered_as.is_empty(),
+                "case {case:?}: the response must name the request it answers"
+            );
+
+            let prefix = logging::record_key_prefix(Some("sim2real"), &account_id(), REGION);
+            let (key, record) = sole_record(&router, case, &prefix).await;
+            assert!(
+                key.contains(&answered_as),
+                "case {case:?}: expected the delivered object to be named for the answered \
+                 request {answered_as:?}, got {key:?}"
+            );
+            assert_eq!(
+                (
+                    record["requestId"].as_str(),
+                    record["operation"].as_str(),
+                    record["identity"]["arn"].as_str(),
+                ),
+                (
+                    Some(answered_as.as_str()),
+                    Some(surface.operation),
+                    Some(service_common::caller_principal::ambient_user_arn().as_str()),
+                ),
+                "case {case:?}: the record must name the call the caller was answered for and \
+                 the principal that made it, got {record}"
+            );
+        }
+    }
+}
+
 /// RULE: delivery follows the configuration. An account that configured no
 /// destination has nothing written for it, and an account whose configuration was
 /// withdrawn has nothing written for the calls it serves after the withdrawal —

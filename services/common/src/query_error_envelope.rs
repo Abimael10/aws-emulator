@@ -742,6 +742,18 @@ impl<O: ErasedOperation> RequestIdReportingOperation<O> {
         }
     }
 
+    /// Serve `operation` and report the id with `report` — the constructor for a service
+    /// whose report neither of the two above states, because the id it names a request by
+    /// is its own (see [`Report`]).
+    ///
+    /// The operation counterpart of [`RequestIdEnvelopeDefinition::reporting`], for a
+    /// service that serves some of its operations WRAPPED: handed the same `report` as that
+    /// definition, so the response an operation produced and the response no operation
+    /// produced name their request the same way.
+    pub fn reported(operation: O, report: Report) -> Self {
+        Self { operation, report }
+    }
+
     /// The operation this report wraps, for a service that asks it a question of its own
     /// before handing it the request (whether its front door claims that request, say).
     ///

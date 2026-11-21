@@ -55,14 +55,21 @@
 //! alone — `restJson1` has no envelope element for the id) and wires it at the layers every
 //! response of this service passes through:
 //!
-//! * [`RequestIdHeaderOperation`] for every operation the generated routing table serves,
-//!   and [`RequestIdReportingOperation::header`] around each of the two event-stream
+//! * [`RequestIdReportedOperation`] for every operation the generated routing table serves,
+//!   and [`RequestIdReportingOperation::reported`] around each of the two event-stream
 //!   operations this file routes itself — between them, everything an operation answers: a
 //!   success, a modelled error, and a constraint refusal raised while it was being served;
-//! * [`RequestIdEnvelopeDefinition::header_only`], the definition wrapper
+//! * [`RequestIdEnvelopeDefinition::reporting`], the definition wrapper
 //!   [`Service::definition`] hands back, covers a response NO operation produced: a routing
 //!   failure, a transport failure detected up front, and a pre-dispatch authentication
 //!   refusal.
+//!
+//! Each of those layers is handed ONE report,
+//! [`crate::state::invocation_logging::with_invocation_request_id_header`]: it states the
+//! header this protocol reports the id in, under the id the invocation-logging record of
+//! this very call was delivered with where this call delivered one — so a consumer of those
+//! records finds the record of the call a response it holds is of — and under a freshly
+//! minted id on every other response, which is the shared rule unchanged.
 //!
 //! Nothing else about a response changes: the status, the other headers and every byte of
 //! the body stay as the renderer wrote them.
@@ -75,7 +82,7 @@ use service_common::event_stream::EventStreamRoute;
 // `request_path`: the one reader of a request URI's path, shared rather than inlined
 // again here.
 use service_common::query_error_envelope::{
-    RequestIdEnvelopeDefinition, RequestIdHeaderOperation, RequestIdReportingOperation,
+    RequestIdEnvelopeDefinition, RequestIdReportedOperation, RequestIdReportingOperation,
 };
 use service_common::request_path;
 use service_common::restated_refusal::RestatedRefusalOperation;
@@ -312,7 +319,7 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// Serves every operation the generated routing table names, so each response an
     /// operation produced names the request it answers. Held, not built per request:
     /// `override_operation` hands back a borrow of it.
-    request_id: RequestIdHeaderOperation,
+    request_id: RequestIdReportedOperation,
     /// Serves a request that names a GUARDRAIL in its path, so a reference this
     /// service cannot read is refused on that reference whatever else is wrong with
     /// the request ([`in_guardrail_reference_words`]). The request id is reported
@@ -326,20 +333,28 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        // The ONE report every layer below is handed, so no response of this service can
+        // name the request it answers differently from the invocation-logging record of
+        // that same call (see the module docs).
+        let report = crate::state::invocation_logging::with_invocation_request_id_header;
         Self {
-            entry: RequestIdEnvelopeDefinition::header_only(crate::ServiceDefinition::new(
-                Arc::clone(&engine),
-            )),
-            converse_stream: RequestIdReportingOperation::header(EventStreamRoute(
-                ConverseStream::new(Arc::clone(&engine)),
-            )),
-            invoke_model_with_response_stream: RequestIdReportingOperation::header(
-                EventStreamRoute(InvokeModelWithResponseStream::new(engine)),
+            entry: RequestIdEnvelopeDefinition::reporting(
+                crate::ServiceDefinition::new(Arc::clone(&engine)),
+                report,
             ),
-            request_id: RequestIdHeaderOperation,
-            apply_guardrail: RequestIdReportingOperation::header(RestatedRefusalOperation::new(
-                in_guardrail_reference_words,
-            )),
+            converse_stream: RequestIdReportingOperation::reported(
+                EventStreamRoute(ConverseStream::new(Arc::clone(&engine))),
+                report,
+            ),
+            invoke_model_with_response_stream: RequestIdReportingOperation::reported(
+                EventStreamRoute(InvokeModelWithResponseStream::new(engine)),
+                report,
+            ),
+            request_id: RequestIdReportedOperation::new(report),
+            apply_guardrail: RequestIdReportingOperation::reported(
+                RestatedRefusalOperation::new(in_guardrail_reference_words),
+                report,
+            ),
         }
     }
 }
@@ -393,7 +408,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // served" response rather than being half-served here.
         //
         // Each of the two is served through the shared request-id report, and every other
-        // request the generated table answers goes through `RequestIdHeaderOperation` —
+        // request the generated table answers goes through `RequestIdReportedOperation` —
         // the one place every operation's response passes, so no operation can answer
         // without naming the request it answered. A request the table does not answer
         // declines here exactly as it would there, leaving the router's routing-error path
