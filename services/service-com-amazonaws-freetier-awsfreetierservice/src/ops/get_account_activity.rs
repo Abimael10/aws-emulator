@@ -179,10 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not-found whatever the boundary does.
         let activity_id = input.activity_id.as_str();
         if !crate::state::is_activity_id(activity_id) {
-            return Err(validation(format!(
-                "activityId: {activity_id} must be exactly 32 characters matching \
-                 ^[a-zA-Z0-9]+$"
-            )));
+            return Err(validation(MALFORMED_ACTIVITY_ID));
         }
 
         // As on `ListAccountActivities`: the code selects the language of the
@@ -252,6 +249,20 @@ fn refusal(message: impl Into<String>) -> GetAccountActivityError {
     })
     .into()
 }
+
+/// What this service states for an `activityId` that cannot be an `ActivityId`
+/// at all: a FIXED sentence, whose terms are the modelled constraints
+/// (`smithy_query(query="shape",shape="ActivityId")`: exactly 32 characters, each
+/// alphanumeric) and not the id submitted.
+///
+/// The sibling of [`ACTIVITY_NOT_FOUND`], for the same reason and in the envelope
+/// this service's own validation layer states a condition in: every id that is
+/// not one reads the same, however it fails to be one. The clause that DOES echo
+/// the submitted id is the boundary walk's own, which refuses the request in
+/// front of this handler; the re-check here is what keeps the refusal this
+/// operation's 400 whatever the boundary does with such a value.
+const MALFORMED_ACTIVITY_ID: &str =
+    "The activity id must be exactly 32 alphanumeric characters";
 
 /// What this service states for a well-formed `ActivityId` that names no
 /// activity of the caller's account: a FIXED sentence with no variable parts.

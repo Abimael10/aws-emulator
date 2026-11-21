@@ -223,10 +223,6 @@ const PAGE_KIND: &str = "freeTierUsages";
 /// writes.
 const MAX_FILTER_DEPTH: usize = 16;
 
-/// The `Dimension` whose value is a number rather than text, so it compares by
-/// magnitude (`shared_types::DIMENSION_VALUES` lists every dimension).
-const DIMENSION_USAGE_PERCENTAGE: &str = "USAGE_PERCENTAGE";
-
 /// The root operators of an `Expression`, by the names the model gives its
 /// members (`Or`, `And`, `Not`, `Dimensions`). A filter sets exactly one of
 /// them; see [`check_expression`].
@@ -287,6 +283,80 @@ const ONE_ROOT_OPERATOR: &str =
 /// the array"). As fixed as [`ONE_ROOT_OPERATOR`], and for the same reason: the
 /// count submitted is not part of the rule.
 const ONE_MATCH_OPTION: &str = "Exactly one match option must be provided";
+
+/// What the service states when a logical operator lists no expression at all
+/// (`Or`/`And` over an empty list, which states no condition).
+///
+/// As fixed as [`ONE_ROOT_OPERATOR`], and for the same reason: which operator the
+/// caller wrote, and where in the tree it sat, are not part of the rule, so a
+/// sentence naming either would vary with an input the rule does not distinguish.
+const ONE_EXPRESSION_PER_OPERATOR: &str = "A logical operator must list at least one expression";
+
+/// What the service states when a comparison carries no value to compare against
+/// (`DimensionValues$Values`: "the results all match at least one of the specified
+/// values", so a comparison against nothing matches nothing).
+///
+/// Fixed for the reason [`ONE_MATCH_OPTION`] is: the condition is "the array holds
+/// no value", the same wherever the comparison sat and whichever dimension it
+/// named.
+const AT_LEAST_ONE_VALUE: &str = "At least one value must be provided";
+
+/// What the service states when the dimension a comparison names is not one a
+/// usage record carries a value for (`crate::state::dimension_kind`).
+///
+/// Fixed for the reason [`ONE_ROOT_OPERATOR`] is: the dimension submitted is the
+/// input the rule refuses, not part of the rule, and the clause that DOES echo a
+/// value outside the modelled `Dimension` enum is the boundary walk's own
+/// ([`crate::state::enum_value_refusal`]), which this function states verbatim
+/// before reaching here.
+const KNOWN_DIMENSION: &str = "The dimension must be one a Free Tier usage record carries";
+
+/// What the service states when the magnitude option is asked of a dimension whose
+/// values are text, which has no magnitude to compare.
+///
+/// Fixed as [`ONE_MATCH_OPTION`] is: every request that breaks this condition
+/// submitted exactly the option named here — that is what the condition IS — and
+/// the dimension it named, one of the several the condition holds for, is not. The
+/// option is named from [`MATCH_GREATER_THAN_OR_EQUAL`], so this sentence holds no
+/// second spelling of it.
+fn magnitude_option_needs_numbers() -> String {
+    format!("{MATCH_GREATER_THAN_OR_EQUAL} applies only to a dimension whose values are numbers")
+}
+
+/// What the service states when a dimension whose values are numbers is compared
+/// under an option that compares text rather than magnitude.
+///
+/// Fixed as [`magnitude_option_needs_numbers`] is, and it names the two options
+/// the rule ADMITS rather than the one submitted: which of the text options was
+/// asked is the input, and the rule does not distinguish them.
+fn numbers_compare_by_magnitude() -> String {
+    format!(
+        "A dimension whose values are numbers must be compared with {MATCH_EQUALS} or \
+         {MATCH_GREATER_THAN_OR_EQUAL}"
+    )
+}
+
+/// What the service states when a value compared against a dimension whose values
+/// are numbers names no magnitude — one finite number.
+///
+/// Fixed as [`numbers_compare_by_magnitude`] is: which value could not be read,
+/// how it was spelled and how many of them there were are all the input.
+const NUMERIC_VALUES_ONLY: &str = "Every value compared against a dimension whose values are \
+     numbers must be a number";
+
+/// What the service states when an `Expression` nests deeper than this service
+/// evaluates ([`MAX_FILTER_DEPTH`]).
+///
+/// Fixed as [`ONE_ROOT_OPERATOR`] is — one sentence for the whole condition, with
+/// nothing taken from the request: how deep the expression nested, which
+/// operators nested it and where the level that broke the bound sat are all the
+/// input. The BOUND itself is stated, because it is this service's own and a
+/// caller cannot read it anywhere else, exactly as a clause for a bound this
+/// service enforces on top of the model's states its ceiling
+/// (`crate::service::validation`'s rule 7).
+fn deeper_than_the_depth_bound() -> String {
+    format!("An expression must not nest more than {MAX_FILTER_DEPTH} levels")
+}
 
 /// `MatchOption` values, from the model's enum of the same name
 /// (`shared_types::MATCH_OPTION_VALUES`).
@@ -390,9 +460,7 @@ fn check_expression<'a>(
     depth: usize,
 ) -> Result<CheckedExpression<'a>, GetFreeTierUsageError> {
     if depth > MAX_FILTER_DEPTH {
-        return Err(validation(format!(
-            "filter: the expression nests more than {MAX_FILTER_DEPTH} levels"
-        )));
+        return Err(validation(deeper_than_the_depth_bound()));
     }
 
     // The roots this expression sets, in the order the model declares the
@@ -445,9 +513,7 @@ fn check_branches<'a>(
     depth: usize,
 ) -> Result<Vec<CheckedExpression<'a>>, GetFreeTierUsageError> {
     if branches.is_empty() {
-        return Err(validation(format!(
-            "filter.{name}: a logical operator must list at least one expression"
-        )));
+        return Err(validation(ONE_EXPRESSION_PER_OPERATOR));
     }
     branches
         .iter()
@@ -468,9 +534,13 @@ fn check_branches<'a>(
 /// depends on a record, so all of it is settled here — and settled ONCE: what
 /// this function decodes is what [`matches_dimension`] then compares by.
 ///
-/// `path` is the dotted path this comparison was reached at, so a clause about one
-/// of its members names that member where the caller really sent it
-/// ([`member_path`]).
+/// `path` is the dotted path this comparison was reached at, so the boundary
+/// walk's own clause — the one refusal this function restates VERBATIM, for a
+/// value outside a modelled enumerated type — names the member where the caller
+/// really sent it ([`member_path`]). The conditions this function checks for
+/// ITSELF are stated in this service's own validation envelope, where a sentence
+/// names no path and no submitted value (see [`validation`] and
+/// [`crate::state::stated_validation`]).
 fn check_dimension<'a>(
     dimensions: &'a DimensionValues,
     path: &str,
@@ -490,9 +560,7 @@ fn check_dimension<'a>(
     }
 
     if dimensions.values.is_empty() {
-        return Err(validation(
-            "filter.Dimensions.Values: at least one value is required",
-        ));
+        return Err(validation(AT_LEAST_ONE_VALUE));
     }
 
     let [option] = dimensions.match_options.as_slice() else {
@@ -513,28 +581,19 @@ fn check_dimension<'a>(
     }
 
     let Some(kind) = crate::state::dimension_kind(key) else {
-        return Err(validation(format!(
-            "filter.Dimensions.Key: {key} names no Free Tier usage member"
-        )));
+        return Err(validation(KNOWN_DIMENSION));
     };
 
     let wanted = match kind {
         crate::state::DimensionKind::Text => {
             if option == MATCH_GREATER_THAN_OR_EQUAL {
-                return Err(validation(format!(
-                    "filter.Dimensions.MatchOptions: {MATCH_GREATER_THAN_OR_EQUAL} compares \
-                     magnitudes, so it applies only to {DIMENSION_USAGE_PERCENTAGE}, not to \
-                     {key}"
-                )));
+                return Err(validation(magnitude_option_needs_numbers()));
             }
             CheckedValues::Text(dimensions.values.as_slice())
         }
         crate::state::DimensionKind::Number => {
             if option != MATCH_EQUALS && option != MATCH_GREATER_THAN_OR_EQUAL {
-                return Err(validation(format!(
-                    "filter.Dimensions.MatchOptions: {key} is a number, so it compares with \
-                     {MATCH_EQUALS} or {MATCH_GREATER_THAN_OR_EQUAL}, not with {option}"
-                )));
+                return Err(validation(numbers_compare_by_magnitude()));
             }
             let mut magnitudes = Vec::with_capacity(dimensions.values.len());
             for wanted in &dimensions.values {
@@ -554,10 +613,7 @@ fn check_dimension<'a>(
                     .ok()
                     .filter(|magnitude: &f64| magnitude.is_finite())
                 else {
-                    return Err(validation(format!(
-                        "filter.Dimensions.Values: {wanted} is not a number, and {key} compares \
-                         numbers"
-                    )));
+                    return Err(validation(NUMERIC_VALUES_ONLY));
                 };
                 magnitudes.push(magnitude);
             }

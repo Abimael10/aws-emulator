@@ -9,8 +9,11 @@
 //!
 //! 1. a condition a HANDLER checks (the root-operator arity of a `filter`, the number of
 //!    match options, a `nextToken` the service did not issue) is stated as ONE fixed
-//!    sentence for the whole condition: nothing of the request appears in it, so every
-//!    input that breaks the rule reads the same. WHICH sentence, and whether it is wrapped
+//!    sentence for the whole condition: nothing of the request appears in it — not the
+//!    value submitted, not the member or operator the caller chose, not the dotted path
+//!    the value arrived at — so every input that breaks the rule reads the same. It holds
+//!    for EVERY condition such a layer refuses rather than for the ones one report cited.
+//!    WHICH sentence, and whether it is wrapped
 //!    in the envelope this service's filter-shape layer states a condition in
 //!    (`crate::state::stated_validation`), is a property of the operation that states it;
 //!    an unissued `nextToken` is the condition two operations reach and state differently;
@@ -26,15 +29,17 @@
 //! failing elements. Each refusal table carries its positive control, so a passing row
 //! cannot mean "every request is refused".
 
+use aws_smithy_types::DateTime;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_freetier_awsfreetierservice::ops::types::{
-    ACTIVITY_STATUS_VALUES, MATCH_OPTION_VALUES,
+    ACTIVITY_STATUS_VALUES, DIMENSION_VALUES, MATCH_OPTION_VALUES,
 };
 use service_com_amazonaws_freetier_awsfreetierservice::state::{
-    stated_validation, ACCOUNT_PLAN_TYPE_VALUE_SET, ACTIVITIES_INVALID_NEXT_TOKEN,
-    INVALID_NEXT_TOKEN,
+    stated_validation, ComAmazonawsFreetierAwsfreetierserviceState, ACCOUNT_PLAN_TYPE_VALUE_SET,
+    ACTIVITIES_INVALID_NEXT_TOKEN, INVALID_NEXT_TOKEN, PLAN_STATUS_ACTIVE, PLAN_TYPE_FREE,
+    PLAN_TYPE_PAID,
 };
 
 use crate::free_tier::{call, error_code, harness, ok};
@@ -616,4 +621,505 @@ async fn a_members_own_constraint_is_stated_with_its_value_path_and_requirement(
             "case {case}: expected {expected:?}, got {actual:?}"
         );
     }
+}
+
+/// The one `Dimension` whose value on a usage record is a number, so it is the one
+/// compared by magnitude (`smithy_query(query="shape",shape="Dimension")` declares the
+/// seven dimensions; `UsageRecord::dimension_value` answers which kind each takes).
+const NUMERIC_DIMENSION: &str = "USAGE_PERCENTAGE";
+
+/// The `MatchOption` that compares magnitudes rather than text
+/// (`smithy_query(query="shape",shape="MatchOption")`).
+const MAGNITUDE_OPTION: &str = "GREATER_THAN_OR_EQUAL";
+
+/// The option a value of either kind is compared for equality by.
+const EQUALITY_OPTION: &str = "EQUALS";
+
+/// How the request spells the filter and the members of one comparison, as the model
+/// declares them: a sentence this service's own validation layer states names none of
+/// them, because where in the request a value arrived is no part of the condition the
+/// sentence reports (the clause that DOES name a member path is the boundary walk's,
+/// asserted by RULE 2 above).
+const MEMBER_NAMES: [&str; 8] = [
+    "filter",
+    "Dimensions",
+    "MatchOptions",
+    "Values",
+    "Key",
+    "Or",
+    "And",
+    "Not",
+];
+
+/// The places one offending expression can sit in a `filter`: every condition below is
+/// checked at every level of the tree, so each row is driven at each of them.
+fn positions(offending: &Value) -> Vec<(&'static str, Value)> {
+    vec![
+        ("at the root", offending.clone()),
+        ("inside And", json!({"And": [offending.clone()]})),
+        (
+            "inside Or, after a well-formed branch",
+            json!({"Or": [one_root(), offending.clone()]}),
+        ),
+        ("inside Not", json!({"Not": offending.clone()})),
+        (
+            "two levels down, inside Or inside And",
+            json!({"And": [{"Or": [offending.clone()]}]}),
+        ),
+    ]
+}
+
+/// One condition `GetFreeTierUsage` refuses for ITSELF, with the sentence a client reads
+/// and the offending requests that reach it.
+struct SelfWordedRefusal {
+    /// What the condition is.
+    case: &'static str,
+    /// The whole `message`, the envelope included.
+    expected: &'static str,
+    /// One offending request each: its case, the request body, and the strings THIS
+    /// request contributes that must not appear in what the client reads.
+    rows: Vec<(String, Value, Vec<String>)>,
+}
+
+/// One `Dimensions` comparison as a request body.
+fn usage_request(filter: Value) -> Value {
+    json!({"maxResults": 10, "filter": filter})
+}
+
+/// Every condition this operation's own checks refuse on a well-modelled `filter`, each
+/// over a table of offending requests.
+///
+/// Reachability: every value below satisfies the model, so the framework's constraint
+/// walk passes the request to the handler — `Value` is 1..20 characters matching
+/// `^[ a-zA-Z0-9\-\:\.\_\/\,\$\(\)]*$`, `Dimension` and `MatchOption` are the enums the
+/// model declares, and `Expressions` declares no length of its own
+/// (`smithy_query(query="shape",shape="DimensionValues,Values,Expression")`). The two
+/// conditions the model DOES declare a constraint for — an empty `Values` list and a
+/// value outside either enum — are refused in front of the handler and are asserted by
+/// RULE 2 above instead.
+fn self_worded_refusals() -> Vec<SelfWordedRefusal> {
+    let text_dimensions: Vec<&str> = DIMENSION_VALUES
+        .iter()
+        .copied()
+        .filter(|key| *key != NUMERIC_DIMENSION)
+        .collect();
+    let text_options: Vec<&str> = MATCH_OPTION_VALUES
+        .iter()
+        .copied()
+        .filter(|option| *option != EQUALITY_OPTION && *option != MAGNITUDE_OPTION)
+        .collect();
+    assert!(
+        text_dimensions.len() > 1 && !text_options.is_empty(),
+        "case the model's own sets: expected several text dimensions and at least one \
+         text-only option, got {text_dimensions:?} and {text_options:?}"
+    );
+
+    // The magnitude option asked of a dimension whose values are text. The sentence
+    // names that option because every request breaking this condition submitted exactly
+    // it — that is what the condition IS — while the dimension and the value the rows
+    // vary are the request's, so neither appears.
+    let mut magnitude_on_text = Vec::new();
+    for key in &text_dimensions {
+        for value in ["us-east-1", "AWSLambda"] {
+            let offending = comparison(key, &[value], &[MAGNITUDE_OPTION]);
+            for (place, filter) in positions(&offending) {
+                magnitude_on_text.push((
+                    format!("{key} against {value:?} {place}"),
+                    usage_request(filter),
+                    vec![(*key).to_string(), value.to_string()],
+                ));
+            }
+        }
+    }
+
+    // A dimension whose values are numbers compared under an option that compares text.
+    // The sentence names the two options the rule ADMITS; which of the text options was
+    // asked is the input.
+    let mut text_option_on_numbers = Vec::new();
+    for option in &text_options {
+        for values in [vec!["0"], vec!["50"], vec!["0", "100"]] {
+            let offending = comparison(NUMERIC_DIMENSION, &values, &[option]);
+            for (place, filter) in positions(&offending) {
+                text_option_on_numbers.push((
+                    format!("{NUMERIC_DIMENSION} {option} {values:?} {place}"),
+                    usage_request(filter),
+                    std::iter::once((*option).to_string())
+                        .chain(values.iter().map(|value| (*value).to_string()))
+                        .chain(std::iter::once(NUMERIC_DIMENSION.to_string()))
+                        .collect(),
+                ));
+            }
+        }
+    }
+
+    // A value that names no magnitude, on the dimension that compares magnitudes: the
+    // rows differ along which value cannot be read, how it is spelled, how many values
+    // sit beside it and which option compares them.
+    let mut unreadable_magnitude = Vec::new();
+    for values in [
+        vec!["half"],
+        vec!["1,5"],
+        vec!["0x32"],
+        vec![" "],
+        vec!["NaN"],
+        vec!["1e400"],
+        vec!["fifty", "50"],
+        vec!["0", "25", "nearly all"],
+    ] {
+        for option in [EQUALITY_OPTION, MAGNITUDE_OPTION] {
+            let offending = comparison(NUMERIC_DIMENSION, &values, &[option]);
+            for (place, filter) in positions(&offending) {
+                unreadable_magnitude.push((
+                    format!("{NUMERIC_DIMENSION} {option} {values:?} {place}"),
+                    usage_request(filter),
+                    values
+                        .iter()
+                        .map(|value| (*value).to_string())
+                        .chain(std::iter::once(NUMERIC_DIMENSION.to_string()))
+                        .collect(),
+                ));
+            }
+        }
+    }
+
+    // A logical operator that lists no expression at all, which states no condition:
+    // the rows differ along which operator holds the empty list and where it sits.
+    let mut empty_operator = Vec::new();
+    for (case, filter) in [
+        ("Or at the root", json!({"Or": []})),
+        ("And at the root", json!({"And": []})),
+        ("Or inside And", json!({"And": [{"Or": []}]})),
+        ("And inside Not", json!({"Not": {"And": []}})),
+        (
+            "And after a well-formed branch of Or",
+            json!({"Or": [one_root(), {"And": []}]}),
+        ),
+        (
+            "Or after a well-formed branch of And",
+            json!({"And": [one_root(), {"Or": []}]}),
+        ),
+    ] {
+        empty_operator.push((case.to_string(), usage_request(filter), Vec::new()));
+    }
+
+    vec![
+        SelfWordedRefusal {
+            case: "the magnitude option on a dimension whose values are text",
+            expected: "[Message = GREATER_THAN_OR_EQUAL applies only to a dimension whose \
+                       values are numbers]",
+            rows: magnitude_on_text,
+        },
+        SelfWordedRefusal {
+            case: "a text option on the dimension whose values are numbers",
+            expected: "[Message = A dimension whose values are numbers must be compared with \
+                       EQUALS or GREATER_THAN_OR_EQUAL]",
+            rows: text_option_on_numbers,
+        },
+        SelfWordedRefusal {
+            case: "a value naming no number where the dimension's values are numbers",
+            expected: "[Message = Every value compared against a dimension whose values are \
+                       numbers must be a number]",
+            rows: unreadable_magnitude,
+        },
+        SelfWordedRefusal {
+            case: "a logical operator listing no expression",
+            expected: "[Message = A logical operator must list at least one expression]",
+            rows: empty_operator,
+        },
+    ]
+}
+
+/// RULE 1 over EVERY condition this operation refuses for itself, not only the two whose
+/// sentences were already pinned: each is stated as ONE fixed sentence in this service's
+/// own validation envelope, identical for every request that breaks it, and carrying
+/// nothing of that request — not the dimension, option or value submitted, and not the
+/// member path the value arrived at.
+#[tokio::test]
+async fn every_condition_this_operation_refuses_itself_states_one_fixed_sentence() {
+    let router = harness().0;
+
+    for condition in self_worded_refusals() {
+        let mut stated: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        assert!(
+            condition.rows.len() > 3,
+            "case {}: the table must span the condition, got {} rows",
+            condition.case,
+            condition.rows.len()
+        );
+        for (row, body, borrowed) in &condition.rows {
+            let case = format!("{} \u{2014} {row}", condition.case);
+            let actual = refusal_message(&router, &case, "GetFreeTierUsage", body).await;
+            assert_eq!(
+                actual, condition.expected,
+                "case {case}: expected {:?}, got {actual:?}",
+                condition.expected
+            );
+            for token in borrowed
+                .iter()
+                .map(String::as_str)
+                .chain(MEMBER_NAMES.iter().copied())
+            {
+                // A value that is whitespace alone contributes no token to look for.
+                if token.trim().is_empty() {
+                    continue;
+                }
+                assert!(
+                    !actual.contains(token),
+                    "case {case}: expected a sentence carrying nothing of the request, but it \
+                     names {token:?}: {actual:?}"
+                );
+            }
+            stated.insert(actual);
+        }
+        let stated: Vec<String> = stated.into_iter().collect();
+        assert_eq!(
+            stated.len(),
+            1,
+            "case {}: expected one sentence for the whole condition, got {stated:?}",
+            condition.case
+        );
+    }
+
+    // The positive controls: the well-formed neighbour of each condition is served, so a
+    // passing row above cannot mean "every filter is refused".
+    for (case, filter) in [
+        (
+            "a dimension whose values are text, compared for equality",
+            comparison("SERVICE", &["AWSLambda"], &[EQUALITY_OPTION]),
+        ),
+        (
+            "a dimension whose values are text, compared by a text option",
+            comparison("REGION", &["us-east"], &["STARTS_WITH"]),
+        ),
+        (
+            "the numeric dimension compared for equality against a number",
+            comparison(NUMERIC_DIMENSION, &["0"], &[EQUALITY_OPTION]),
+        ),
+        (
+            "the numeric dimension compared by magnitude against a number",
+            comparison(NUMERIC_DIMENSION, &["50"], &[MAGNITUDE_OPTION]),
+        ),
+        (
+            "a logical operator listing one expression",
+            json!({"And": [one_root()]}),
+        ),
+    ] {
+        let answered = ok(&router, "GetFreeTierUsage", &usage_request(filter)).await;
+        assert!(
+            answered["freeTierUsages"].is_array(),
+            "case {case}: expected a served page, got {answered}"
+        );
+    }
+}
+
+/// A filter nesting `levels` logical operators above one well-formed comparison. `shape`
+/// says what each level is: `Not` over the expression, `And`/`Or` over a list holding it,
+/// and anything else alternates the two, because the rule is about the DEPTH and not
+/// about which operator sits at which level.
+fn nested(levels: usize, shape: &str) -> Value {
+    let mut filter = one_root();
+    for level in 0..levels {
+        filter = match (shape, level % 2 == 0) {
+            ("Not", _) => json!({"Not": filter}),
+            ("And", _) => json!({"And": [filter]}),
+            ("Or", _) => json!({"Or": [filter]}),
+            (_, true) => json!({"And": [filter]}),
+            (_, false) => json!({"Not": filter}),
+        };
+    }
+    filter
+}
+
+/// RULE 1 at the nesting bound this service enforces on a `filter`: an expression that
+/// nests past it is refused with ONE sentence, whatever operators nested it and however
+/// far past the bound it went — and the bound that sentence states is the bound the
+/// service really enforces, which is the one number in it and the reason it states a
+/// number at all (a bound a caller can read nowhere else, exactly as a clause for a
+/// bound this service enforces on top of the model's states its ceiling).
+#[tokio::test]
+async fn an_expression_nesting_past_the_depth_bound_states_one_sentence() {
+    let router = harness().0;
+    let shapes = ["Not", "And", "Or", "alternating"];
+
+    // Where the bound sits, FOUND by asking rather than written down, so the sentence is
+    // checked against the depth the service really evaluates: the shallowest nesting it
+    // refuses.
+    let mut threshold = None;
+    for levels in 1..=32 {
+        let (status, _) = call(
+            &router,
+            "GetFreeTierUsage",
+            &usage_request(nested(levels, "Not")),
+        )
+        .await;
+        if status != 200 {
+            threshold = Some(levels);
+            break;
+        }
+    }
+    let threshold = threshold.expect(
+        "case the nesting bound: an expression nesting 32 levels must be refused, or this \
+         service evaluates expressions without a bound",
+    );
+    assert!(
+        threshold > 1,
+        "case the nesting bound: a filter nesting one operator must be served, got a refusal \
+         at {threshold} levels"
+    );
+    let expected = format!(
+        "[Message = An expression must not nest more than {} levels]",
+        threshold - 1
+    );
+
+    for shape in shapes {
+        // Just past the bound, further past it, and far past it.
+        for levels in [threshold, threshold + 1, threshold + 3, threshold + 6] {
+            let case = format!("{levels} levels of {shape}");
+            let actual = refusal_message(
+                &router,
+                &case,
+                "GetFreeTierUsage",
+                &usage_request(nested(levels, shape)),
+            )
+            .await;
+            assert_eq!(
+                actual, expected,
+                "case {case}: expected {expected:?}, got {actual:?}"
+            );
+            // The depth SUBMITTED is the input; only the bound is part of the rule.
+            let submitted = levels.to_string();
+            assert!(
+                !actual.contains(&submitted),
+                "case {case}: expected a sentence carrying nothing of the request, but it \
+                 names the depth submitted ({submitted}): {actual:?}"
+            );
+            for name in MEMBER_NAMES {
+                assert!(
+                    !actual.contains(name),
+                    "case {case}: expected a sentence naming no member of the request, but it \
+                     names {name:?}: {actual:?}"
+                );
+            }
+        }
+
+        // The positive control, at the bound the sentence states: an expression nesting
+        // exactly that many levels is served, for every operator the rows nest with.
+        let case = format!("{} levels of {shape}", threshold - 1);
+        let answered = ok(
+            &router,
+            "GetFreeTierUsage",
+            &usage_request(nested(threshold - 1, shape)),
+        )
+        .await;
+        assert!(
+            answered["freeTierUsages"].is_array(),
+            "case {case}: expected a served page at the bound the refusal states, got {answered}"
+        );
+    }
+}
+
+/// RULE 1 on the condition another operation of this service refuses for itself and
+/// decides from STATE rather than from the request: moving an account back onto the
+/// one-off free plan whose window it no longer holds. One fixed sentence, the same for
+/// every account state the condition holds for — so the plan the account holds and the
+/// status that plan is in, which the rule does not distinguish between, are no part of
+/// what a client branches on.
+#[tokio::test]
+async fn the_closed_free_window_refusal_states_one_sentence() {
+    let expected = "[Message = The FREE plan is a one-off window this account no longer holds]";
+    let day: i64 = 86_400;
+
+    // The stored states the window is closed in: an account that left the free plan for
+    // the paid one, and one whose window the clock has carried past its own instant.
+    let rows: [(&str, &str, Option<i64>); 5] = [
+        ("an account on the paid plan", PLAN_TYPE_PAID, None),
+        (
+            "an account on the paid plan carrying an instant of its own",
+            PLAN_TYPE_PAID,
+            Some(day),
+        ),
+        (
+            "a free plan one second past its instant",
+            PLAN_TYPE_FREE,
+            Some(-1),
+        ),
+        (
+            "a free plan expiring at this very instant",
+            PLAN_TYPE_FREE,
+            Some(0),
+        ),
+        (
+            "a free plan years past its instant",
+            PLAN_TYPE_FREE,
+            Some(-3_650 * day),
+        ),
+    ];
+
+    let mut stated: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (case, stored_type, offset) in rows {
+        let (router, engine) = harness();
+        {
+            let state = engine.state::<ComAmazonawsFreetierAwsfreetierserviceState>();
+            let mut store = state.lock();
+            let now = DateTime::from(std::time::SystemTime::now()).secs();
+            let plan = store.plan_mut(engine::emulator_account_id());
+            plan.plan_type = stored_type.to_string();
+            plan.plan_status = PLAN_STATUS_ACTIVE.to_string();
+            plan.expiration_date = offset.map(|offset| DateTime::from_secs(now + offset));
+        }
+
+        let actual = refusal_message(
+            &router,
+            case,
+            "UpgradeAccountPlan",
+            &json!({"accountPlanType": PLAN_TYPE_FREE}),
+        )
+        .await;
+        assert_eq!(
+            actual, expected,
+            "case {case}: expected {expected:?}, got {actual:?}"
+        );
+        // Neither the account's stored plan nor its status nor the member the plan was
+        // asked at belongs in the sentence. That the sentence does not echo the plan
+        // asked FOR is what the rows above show: every stored state reads alike.
+        for token in [PLAN_TYPE_PAID, "accountPlanType", PLAN_STATUS_ACTIVE, "EXPIRED"] {
+            assert!(
+                !actual.contains(token),
+                "case {case}: expected a sentence carrying nothing of the request or of the \
+                 stored plan, but it names {token:?}: {actual:?}"
+            );
+        }
+        stated.insert(actual);
+    }
+
+    let stated: Vec<String> = stated.into_iter().collect();
+    assert_eq!(
+        stated,
+        vec![expected.to_string()],
+        "case the whole table of closed windows: expected the one sentence {expected:?}, got \
+         {stated:?}"
+    );
+
+    // The positive control: an account whose window IS open is moved onto the free plan.
+    let (router, engine) = harness();
+    {
+        let state = engine.state::<ComAmazonawsFreetierAwsfreetierserviceState>();
+        let mut store = state.lock();
+        let now = DateTime::from(std::time::SystemTime::now()).secs();
+        let plan = store.plan_mut(engine::emulator_account_id());
+        plan.plan_type = PLAN_TYPE_FREE.to_string();
+        plan.plan_status = PLAN_STATUS_ACTIVE.to_string();
+        plan.expiration_date = Some(DateTime::from_secs(now + day));
+    }
+    let answered = ok(
+        &router,
+        "UpgradeAccountPlan",
+        &json!({"accountPlanType": PLAN_TYPE_FREE}),
+    )
+    .await;
+    assert_eq!(
+        answered["accountPlanType"].as_str().unwrap_or_default(),
+        PLAN_TYPE_FREE,
+        "case an account whose window is open: expected the plan asked for, got {answered}"
+    );
 }

@@ -235,11 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whose expiration instant the clock has already passed, so neither can
         // be returned to it.
         if target == crate::state::PLAN_TYPE_FREE && !plan.free_window_open() {
-            return Err(validation(format!(
-                "accountPlanType: the FREE plan is a one-off window this account no longer \
-                 holds (its account plan is {} and {}), so it cannot be moved back onto it",
-                plan.plan_type, plan.plan_status
-            )));
+            return Err(validation(FREE_WINDOW_CLOSED));
         }
 
         plan.upgrade_to(target, now);
@@ -254,6 +250,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// The member this operation's enum refusal names, as its input spells it.
 const ACCOUNT_PLAN_TYPE_MEMBER: &str = "accountPlanType";
+
+/// What this operation states when it refuses to move an account back onto the
+/// free plan because that one-off window is no longer open to it.
+///
+/// ONE fixed sentence for the whole condition, stated in the envelope this
+/// service's own validation layer states a condition in
+/// ([`crate::state::stated_validation`]): the condition is "the window is not
+/// open", which is the same condition for an account that left it for the paid
+/// plan and for one whose window the clock has passed, so neither the plan the
+/// account holds, nor its status, nor the member the plan was asked at belongs in
+/// what a client branches on.
+const FREE_WINDOW_CLOSED: &str =
+    "The FREE plan is a one-off window this account no longer holds";
 
 /// Refuse the request with this operation's own modelled `ValidationException`
 /// (HTTP 400), stating `message` in the envelope this service's validation

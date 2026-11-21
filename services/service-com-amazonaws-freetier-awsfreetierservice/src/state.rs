@@ -721,9 +721,16 @@ pub const ACTIVITIES_INVALID_NEXT_TOKEN: &str = "Invalid nextToken";
 /// (`crate::service::validation`), which this service's recordings show
 /// unwrapped.
 ///
-/// `sentence` states the condition and nothing of the request: a reason string
-/// that varied with the input would make a client's branch on it depend on
-/// something the rule does not distinguish.
+/// `sentence` states the condition and nothing of the request: not the value
+/// submitted, not the member or operator the caller chose, and not the dotted
+/// path the value arrived at — so every request that breaks one condition reads
+/// identically. A reason string that varied with the input would make a client's
+/// branch on it depend on something the rule does not distinguish. The rule's own
+/// terms — the operators an expression may set, the options an option compares
+/// by, a bound this service enforces — are part of the condition rather than of
+/// the request, so a sentence states those; the one refusal that echoes a
+/// submitted value is the boundary walk's own clause, which a handler restates
+/// VERBATIM and outside this envelope ([`enum_value_refusal`]).
 pub fn stated_validation(sentence: &str) -> String {
     format!("[Message = {sentence}]")
 }
