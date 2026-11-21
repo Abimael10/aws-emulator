@@ -51,7 +51,7 @@ const ACCOUNT: &str = "000000000000";
 ///
 /// SOURCE: `smithy_query(query="shape", shape="PolicyValueSource")` — the enum's two
 /// values are `SELF` and `CROSS_ACCOUNT`.
-const SOURCE_SELF: &str = "SELF";
+pub(crate) const SOURCE_SELF: &str = "SELF";
 
 /// Every `EffectivePolicyValues` member, paired with the policy block and member its
 /// value is derived from.
@@ -60,7 +60,7 @@ const SOURCE_SELF: &str = "SELF";
 /// shape="EffectivePolicyValues,AvailabilitySlo,MultiAzTargets,MultiRegionTargets,DataRecoveryTargets")`
 /// — the eight per-target members of `EffectivePolicyValues` and the policy targets that
 /// carry the same quantity.
-const DERIVATIONS: [(&str, &str, &str); 8] = [
+pub(crate) const DERIVATIONS: [(&str, &str, &str); 8] = [
     ("availabilitySlo", "availabilitySlo", "target"),
     ("multiAzRto", "multiAz", "rtoInMinutes"),
     ("multiAzRpo", "multiAz", "rpoInMinutes"),
@@ -85,7 +85,7 @@ const DERIVATIONS: [(&str, &str, &str); 8] = [
 /// SOURCE: `smithy_query(query="shape",
 /// shape="MultiAzDisasterRecoveryApproach,MultiRegionDisasterRecoveryApproach")` — both
 /// enums carry exactly these five values.
-const DISASTER_RECOVERY_APPROACHES: [&str; 5] = [
+pub(crate) const DISASTER_RECOVERY_APPROACHES: [&str; 5] = [
     "ACTIVE_ACTIVE",
     "HOT_STANDBY",
     "WARM_STANDBY",
@@ -97,11 +97,11 @@ const DISASTER_RECOVERY_APPROACHES: [&str; 5] = [
 ///
 /// SOURCE: `smithy_query(query="shape", shape="AvailabilitySlo")` — `range {min: 0,
 /// max: 100}`.
-const AVAILABILITY_SLO_MIN: f64 = 0.0;
-const AVAILABILITY_SLO_MAX: f64 = 100.0;
+pub(crate) const AVAILABILITY_SLO_MIN: f64 = 0.0;
+pub(crate) const AVAILABILITY_SLO_MAX: f64 = 100.0;
 
 /// An emulator holding only this service, over one shared engine.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -120,7 +120,7 @@ fn signed() -> String {
     )
 }
 
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -148,7 +148,11 @@ async fn call(
 }
 
 /// Create the policy `body` describes and answer its minted ARN.
-async fn create_policy(router: &MultiServiceRouter, case: &str, body: Value) -> String {
+pub(crate) async fn create_policy(
+    router: &MultiServiceRouter,
+    case: &str,
+    body: Value,
+) -> String {
     let (status, answered) = call(router, "POST", CREATE_POLICY, Some(body)).await;
     assert_eq!(
         status, 200,
@@ -161,7 +165,7 @@ async fn create_policy(router: &MultiServiceRouter, case: &str, body: Value) -> 
 }
 
 /// `CreateService` with the minimal required members, optionally attaching `policy_arn`.
-async fn create_service(
+pub(crate) async fn create_service(
     router: &MultiServiceRouter,
     name: &str,
     policy_arn: Option<&str>,
@@ -177,7 +181,10 @@ async fn create_service(
     call(router, "POST", CREATE_SERVICE, Some(body)).await
 }
 
-async fn get_service(router: &MultiServiceRouter, service_arn: &str) -> (u16, Value) {
+pub(crate) async fn get_service(
+    router: &MultiServiceRouter,
+    service_arn: &str,
+) -> (u16, Value) {
     call(
         router,
         "GET",
@@ -188,7 +195,7 @@ async fn get_service(router: &MultiServiceRouter, service_arn: &str) -> (u16, Va
 }
 
 /// The `service` member of a successful create, read or update.
-fn service_of(case: &str, status: u16, body: &Value) -> Value {
+pub(crate) fn service_of(case: &str, status: u16, body: &Value) -> Value {
     assert_eq!(
         status, 200,
         "case {case:?}: expected HTTP 200, got {status} {body:?}"
@@ -201,7 +208,7 @@ fn service_of(case: &str, status: u16, body: &Value) -> Value {
     service.clone()
 }
 
-fn service_arn_of(case: &str, service: &Value) -> String {
+pub(crate) fn service_arn_of(case: &str, service: &Value) -> String {
     service["serviceArn"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: no serviceArn in {service:?}"))
@@ -212,7 +219,7 @@ fn service_arn_of(case: &str, service: &Value) -> String {
 /// describes, each the policy's stored target value together with the policy's `name` and
 /// the account the value came from. A target the policy does not set derives nothing, so
 /// it contributes no entry — and a policy that sets none at all derives the empty object.
-fn derived_from(policy_body: &Value, policy_name: &str, source: &str) -> Value {
+pub(crate) fn derived_from(policy_body: &Value, policy_name: &str, source: &str) -> Value {
     let mut expected = Map::new();
     for (member, block, target) in DERIVATIONS {
         let value = policy_body
@@ -235,7 +242,7 @@ fn derived_from(policy_body: &Value, policy_name: &str, source: &str) -> Value {
 
 /// Whether `actual` and `expected` are the same JSON value, comparing numbers by their
 /// numeric value so an integral double matches whichever way a serializer punctuated it.
-fn same_json(actual: &Value, expected: &Value) -> bool {
+pub(crate) fn same_json(actual: &Value, expected: &Value) -> bool {
     match (actual, expected) {
         (Value::Number(actual), Value::Number(expected)) => {
             match (actual.as_f64(), expected.as_f64()) {
@@ -264,7 +271,7 @@ fn same_json(actual: &Value, expected: &Value) -> bool {
 
 /// Assert that `service` reports exactly `expected` as its `effectivePolicyValues`, the
 /// member being PRESENT either way.
-fn assert_effective(case: &str, service: &Value, expected: &Value) {
+pub(crate) fn assert_effective(case: &str, service: &Value, expected: &Value) {
     let actual = &service["effectivePolicyValues"];
     assert!(
         actual.is_object(),
@@ -504,7 +511,10 @@ async fn reattaching_a_policy_rederives_the_values_the_service_reports() {
 // The same rule, reached by DELETING the policy the values are derived from
 // ---------------------------------------------------------------------------
 
-async fn get_policy(router: &MultiServiceRouter, policy_arn: &str) -> (u16, Value) {
+pub(crate) async fn get_policy(
+    router: &MultiServiceRouter,
+    policy_arn: &str,
+) -> (u16, Value) {
     call(
         router,
         "GET",

@@ -33,7 +33,7 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The modelled routes these suites drive.
 const CREATE_POLICY: &str = "/v2/create-policy";
 const GET_POLICY: &str = "/v2/get-policy";
-const UPDATE_POLICY: &str = "/v2/update-policy";
+pub(crate) const UPDATE_POLICY: &str = "/v2/update-policy";
 const DELETE_POLICY: &str = "/v2/delete-policy";
 
 /// The Region these suites sign for.
