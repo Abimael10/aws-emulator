@@ -22,6 +22,13 @@
 //! updates an alarm and associates it with the specified metric, metric math expression,
 //! anomaly detection model, or Metrics Insights query" (`PutMetricAlarm`).
 //!
+//! A template's scalar is TEXT wherever its author quoted it and wherever a `Ref` to a
+//! parameter resolved it, while that call models a cadence, a count, a threshold and a switch
+//! as a number or a boolean — so every member it types as one is read as that type before the
+//! request is sent ([`alarm_scalar`], walked by the one reading of a declared document this
+//! service has). Without it the put is refused by its own deserializer, which fails the
+//! resource and rolls the whole stack back.
+//!
 //! The alarm carries the tags its own declaration asks for plus the ones CloudFormation
 //! gives the resource ([`tags_of`]), as the `[{Key, Value}]` list CloudWatch's own `Tag`
 //! shape spells — the shape that call's own `Tags` member takes.
@@ -190,9 +197,10 @@ async fn put_alarm_configuration(
 }
 
 /// The `PutMetricAlarm` request one declaration becomes: every property the type publishes
-/// that the declaration carries, under its own name, with the alarm's NAME the one member
-/// CloudFormation decides — so a name the template happened to state does not travel beside
-/// the name the resource was given.
+/// that the declaration carries, under its own name and read as the TYPE that call models the
+/// member as ([`alarm_scalar`]), with the alarm's NAME the one member CloudFormation decides —
+/// so a name the template happened to state does not travel beside the name the resource was
+/// given.
 fn alarm_request(name: &str, properties: &Value) -> Map<String, Value> {
     let mut request = Map::new();
     for property in ALARM_PROPERTIES {
@@ -200,7 +208,10 @@ fn alarm_request(name: &str, properties: &Value) -> Map<String, Value> {
             continue;
         }
         if let Some(value) = properties.get(*property).filter(|value| !value.is_null()) {
-            request.insert((*property).to_string(), value.clone());
+            request.insert(
+                (*property).to_string(),
+                modelled_declaration(property, value, &alarm_scalar),
+            );
         }
     }
     request.insert(
@@ -208,6 +219,25 @@ fn alarm_request(name: &str, properties: &Value) -> Map<String, Value> {
         Value::String(name.to_string()),
     );
     request
+}
+
+/// What `PutMetricAlarm` models each member this type declares as, where that is not text.
+///
+/// Source: that call's own member list and the shapes under it
+/// (`smithy_query(query="closure",operation="PutMetricAlarm")`) — `ActionsEnabled` and a
+/// query's `ReturnData` are booleans, `Period` (the alarm's own and the one inside a
+/// `MetricStat` or a `MetricDataQuery`), `EvaluationPeriods`, `DatapointsToAlarm` are integers
+/// and `Threshold` a double. A tag set is a collection of TEXT whose keys are the requester's,
+/// so a value in it that merely reads as a number stays the text it was declared as.
+fn alarm_scalar(member: &str) -> ModelledScalar {
+    match member {
+        "ActionsEnabled" | "ReturnData" => ModelledScalar::Boolean,
+        "DatapointsToAlarm" | "EvaluationPeriods" | "Period" | "Threshold" => {
+            ModelledScalar::Number
+        }
+        TAGS_PROPERTY => ModelledScalar::TextThroughout,
+        _ => ModelledScalar::AsWritten,
+    }
 }
 
 /// Delete the alarm a stack created, by the name it was created under — this resource's
@@ -348,6 +378,97 @@ mod tests {
         assert!(
             !request.contains_key("TreatMissingData"),
             "case \"an undeclared property\": expected it to be left out, got {request:?}"
+        );
+    }
+
+    /// RULE: every member the put models as a number or a boolean is read as that type out of
+    /// the TEXT a template carries it as — the quoted spelling an author wrote, and the text a
+    /// `Ref` to a parameter resolves to — at every depth the document nests it, while a value
+    /// already of that type, and a tag whose text merely reads as a number, travel as written.
+    ///
+    /// Asserted through [`alarm_request`], which is the function the put itself sends.
+    #[test]
+    fn a_declared_scalar_reaches_the_put_as_the_type_it_models() {
+        let declared = serde_json::json!({
+            "Namespace": "Flint/Frames",
+            "MetricName": "Time",
+            "ComparisonOperator": "GreaterThanThreshold",
+            // The four numbers and the switch, every one of them as text.
+            "Period": "30",
+            "EvaluationPeriods": "3",
+            "DatapointsToAlarm": "2",
+            "Threshold": "15000.5",
+            "ActionsEnabled": "false",
+            "ExtendedStatistic": "p90",
+            "Dimensions": [{ "Name": "Camera_name", "Value": "ALL" }],
+            // A tag set's values are the requester's text, whatever they read as.
+            "Tags": [{ "Key": "Period", "Value": "30" }],
+        });
+        let request = alarm_request("the-resources-own-name", &declared);
+        let expected: &[(&str, Value)] = &[
+            ("Period", serde_json::json!(30)),
+            ("EvaluationPeriods", serde_json::json!(3)),
+            ("DatapointsToAlarm", serde_json::json!(2)),
+            ("Threshold", serde_json::json!(15_000.5)),
+            ("ActionsEnabled", serde_json::json!(false)),
+            // Text stays text, and so does a dimension's value.
+            ("ExtendedStatistic", serde_json::json!("p90")),
+            (
+                "Dimensions",
+                serde_json::json!([{ "Name": "Camera_name", "Value": "ALL" }]),
+            ),
+            ("Tags", serde_json::json!([{ "Key": "Period", "Value": "30" }])),
+        ];
+        for (member, wanted) in expected {
+            let sent = request.get(*member);
+            assert_eq!(
+                sent,
+                Some(wanted),
+                "case {member:?}: expected the put to carry {wanted}, got {sent:?}"
+            );
+        }
+
+        // The same reading inside a `Metrics` query array, where the cadence and the
+        // designation of the watched series sit a level down.
+        let math = serde_json::json!({
+            "ComparisonOperator": "LessThanThreshold",
+            "EvaluationPeriods": "2",
+            "Threshold": "1",
+            "Metrics": [
+                {
+                    "Id": "visible",
+                    "MetricStat": {
+                        "Metric": { "Namespace": "AWS/SQS", "MetricName": "Backlog" },
+                        "Period": "60",
+                        "Stat": "Average",
+                    },
+                    "ReturnData": "false",
+                },
+                { "Id": "doubled", "Expression": "visible * 2", "ReturnData": "true" },
+            ],
+        });
+        let request = alarm_request("a-math-alarm", &math);
+        let queries = request
+            .get("Metrics")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            queries.first().and_then(|query| query.pointer("/MetricStat/Period").cloned()),
+            Some(serde_json::json!(60)),
+            "case \"a query's own period\": expected the number 60, got {queries:?}"
+        );
+        let designations: Vec<Option<&Value>> = queries
+            .iter()
+            .map(|query| query.get("ReturnData"))
+            .collect();
+        assert_eq!(
+            designations,
+            vec![
+                Some(&serde_json::json!(false)),
+                Some(&serde_json::json!(true)),
+            ],
+            "case \"the designated query\": expected the two booleans, got {designations:?}"
         );
     }
 

@@ -465,9 +465,9 @@ pub(super) use super::{
 
 use super::provisioning::{
     call_json_rpc, call_query, call_rest_json, call_rest_json_named, call_rest_xml,
-    percent_encoded, published_instant, xml_element, xml_elements,
+    modelled_declaration, percent_encoded, published_instant, xml_element, xml_elements,
     xml_entry_map, xml_entry_structures, xml_leaf, xml_member_structures, xml_scalar_children,
-    Created, Readiness,
+    Created, ModelledScalar, Readiness,
     Refusal, Removal,
     AWS_JSON_1_0, AWS_JSON_1_1,
 };

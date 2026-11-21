@@ -24,7 +24,7 @@ use ::serde_json::Value;
 
 /// What the owning API models one member as, where that is not TEXT.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ModelledScalar {
+pub(in crate::state) enum ModelledScalar {
     /// Text, or anything else this reading does not change: the value travels as the
     /// declaration wrote it.
     AsWritten,
@@ -60,7 +60,7 @@ const MAX_MODELLED_NESTING: usize = 32;
 ///
 /// `member` is the name `value` stands under — the list's own member name for each entry of a
 /// list, which is what makes a list entry's members reachable.
-pub(super) fn modelled_declaration(
+pub(in crate::state) fn modelled_declaration(
     member: &str,
     value: &Value,
     modelled_as: &impl Fn(&str) -> ModelledScalar,

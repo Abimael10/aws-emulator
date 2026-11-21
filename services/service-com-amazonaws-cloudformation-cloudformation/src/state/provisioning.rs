@@ -240,7 +240,11 @@ mod appsync_resources;
 /// the one walk every provisioning arm whose owning model types a member as a number or a
 /// boolean reaches ([`modelled_declaration`]).
 mod modelled_declaration;
-use modelled_declaration::{modelled_declaration, ModelledScalar};
+// Re-exported to the rest of `crate::state` because the per-type arms of
+// [`crate::state::provisioner`] are in the same position as the ones here: the owning model of
+// the call THEY make types members as numbers and booleans too, so they read a declaration
+// through this one walk rather than a second copy of it.
+pub(in crate::state) use modelled_declaration::{modelled_declaration, ModelledScalar};
 /// The five `AWS::ServiceDiscovery::*` types a Cloud Map namespace's estate is declared with —
 /// an HTTP, a public DNS and a private DNS namespace, a service of one, and an instance
 /// registered in a service: created in AWS Cloud Map itself ([`service_discovery`]).

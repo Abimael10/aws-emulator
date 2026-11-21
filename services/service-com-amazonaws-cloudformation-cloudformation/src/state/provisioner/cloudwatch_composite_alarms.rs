@@ -22,6 +22,12 @@
 //! request, and the one call serves this type's create and its in-place update alike: "Creates
 //! or updates a composite alarm" (`PutCompositeAlarm`).
 //!
+//! A template's scalar is TEXT wherever its author quoted it and wherever a `Ref` to a
+//! parameter resolved it, while that call models a switch and the two suppression periods as a
+//! boolean and as numbers — so every member it types as one is read as that type before the
+//! request is sent ([`composite_alarm_scalar`]). Without it the put is refused by its own
+//! deserializer, which fails the resource and rolls the whole stack back.
+//!
 //! The alarm carries the tags its own declaration asks for plus the ones CloudFormation gives
 //! the resource ([`tags_of`]), as the `[{Key, Value}]` list CloudWatch's own `Tag` shape
 //! spells — the shape that call's own `Tags` member takes.
@@ -164,9 +170,10 @@ async fn put_composite_alarm_configuration(
 }
 
 /// The `PutCompositeAlarm` request one declaration becomes: every property the type publishes
-/// that the declaration carries, under its own name, with the alarm's NAME the one member
-/// CloudFormation decides — so a name the template happened to state does not travel beside
-/// the name the resource was given.
+/// that the declaration carries, under its own name and read as the TYPE that call models the
+/// member as ([`composite_alarm_scalar`]), with the alarm's NAME the one member CloudFormation
+/// decides — so a name the template happened to state does not travel beside the name the
+/// resource was given.
 fn composite_alarm_request(name: &str, properties: &Value) -> Map<String, Value> {
     let mut request = Map::new();
     for property in COMPOSITE_ALARM_PROPERTIES {
@@ -174,7 +181,10 @@ fn composite_alarm_request(name: &str, properties: &Value) -> Map<String, Value>
             continue;
         }
         if let Some(value) = properties.get(*property).filter(|value| !value.is_null()) {
-            request.insert((*property).to_string(), value.clone());
+            request.insert(
+                (*property).to_string(),
+                modelled_declaration(property, value, &composite_alarm_scalar),
+            );
         }
     }
     request.insert(
@@ -182,6 +192,25 @@ fn composite_alarm_request(name: &str, properties: &Value) -> Map<String, Value>
         Value::String(name.to_string()),
     );
     request
+}
+
+/// What `PutCompositeAlarm` models each member this type declares as, where that is not text.
+///
+/// Source: that call's own member list
+/// (`smithy_query(query="operation",operation="PutCompositeAlarm")`) — `ActionsEnabled` is a
+/// boolean and the two suppression periods are integers; every other member of it, the alarm
+/// rule and the action lists included, is text. A tag set is a collection of TEXT whose keys
+/// are the requester's, so a value in it that merely reads as a number stays the text it was
+/// declared as.
+fn composite_alarm_scalar(member: &str) -> ModelledScalar {
+    match member {
+        "ActionsEnabled" => ModelledScalar::Boolean,
+        "ActionsSuppressorExtensionPeriod" | "ActionsSuppressorWaitPeriod" => {
+            ModelledScalar::Number
+        }
+        TAGS_PROPERTY => ModelledScalar::TextThroughout,
+        _ => ModelledScalar::AsWritten,
+    }
 }
 
 /// Delete the composite alarm a stack created, by the name it was created under — this
@@ -320,6 +349,41 @@ mod tests {
             !request.contains_key("ActionsSuppressor"),
             "case \"an undeclared property\": expected it to be left out, got {request:?}"
         );
+    }
+
+    /// RULE: every member the put models as a number or a boolean is read as that type out of
+    /// the TEXT a template carries it as, while text and a tag whose value reads as a number
+    /// travel as written — asserted through [`composite_alarm_request`], which is the function
+    /// the put itself sends.
+    #[test]
+    fn a_declared_scalar_reaches_the_put_as_the_type_it_models() {
+        let declared = serde_json::json!({
+            "AlarmRule": "ALARM(child-one) OR ALARM(child-two)",
+            "ActionsEnabled": "TRUE",
+            "ActionsSuppressor": "a-suppressor",
+            "ActionsSuppressorWaitPeriod": "120",
+            "ActionsSuppressorExtensionPeriod": "60",
+            "Tags": [{ "Key": "ActionsSuppressorWaitPeriod", "Value": "120" }],
+        });
+        let request = composite_alarm_request("the-resources-own-name", &declared);
+        let expected: &[(&str, Value)] = &[
+            ("ActionsEnabled", serde_json::json!(true)),
+            ("ActionsSuppressorWaitPeriod", serde_json::json!(120)),
+            ("ActionsSuppressorExtensionPeriod", serde_json::json!(60)),
+            ("ActionsSuppressor", serde_json::json!("a-suppressor")),
+            (
+                "Tags",
+                serde_json::json!([{ "Key": "ActionsSuppressorWaitPeriod", "Value": "120" }]),
+            ),
+        ];
+        for (member, wanted) in expected {
+            let sent = request.get(*member);
+            assert_eq!(
+                sent,
+                Some(wanted),
+                "case {member:?}: expected the put to carry {wanted}, got {sent:?}"
+            );
+        }
     }
 
     /// A property outside the type's own set is refused rather than dropped, and every
