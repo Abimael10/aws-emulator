@@ -10,6 +10,11 @@
 //! An identifier this store does not hold is `ResourceNotFoundException`; a name another
 //! guardrail already holds is `ConflictException`.
 //!
+//! The `kmsKeyId` a request names is resolved against the service that OWNS keys before
+//! anything is written, and one AWS KMS holds no key for is refused with the modelled
+//! `ValidationException` (HTTP 400), so the stored key and `updatedAt` stand unchanged
+//! ([`crate::state::unresolvable_kms_key_id`]).
+//!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
 //! ---
@@ -187,6 +192,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let region = crate::state::request_region(ctx.parts());
+        // The key an update moves the guardrail onto has to EXIST before anything is
+        // written: a `kmsKeyId` AWS KMS holds no key for is refused here, ahead of every
+        // mutation, so the stored key and the draft's `updatedAt` are left exactly as they
+        // stood ([`crate::state::unresolvable_kms_key_id`]).
+        if let Some(refusal) =
+            crate::state::unresolvable_kms_key_id(ctx, &region, input.kms_key_id.as_deref()).await
+        {
+            return Err(
+                UpdateGuardrailErrorModeled::ValidationException(ValidationException {
+                    message: Some(refusal),
+                })
+                .into(),
+            );
+        }
         let now = ::std::time::SystemTime::now();
         // The key the guardrail reports, resolved before this service's own store is
         // locked: an alias is a question for AWS KMS, and one request holds one lock.

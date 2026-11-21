@@ -15,7 +15,10 @@
 //! A replay of the same `clientRequestToken` answers with the policy that token already
 //! minted (`@idempotencyToken`), a name another policy already holds in the same region is
 //! refused with `ConflictException`, and a request carrying more tags than one resource
-//! may hold is refused with `TooManyTagsException`.
+//! may hold is refused with `TooManyTagsException`. The `kmsKeyId` a request names is
+//! resolved against the service that OWNS keys before anything is minted, and one AWS KMS
+//! holds no key for is refused with the modelled `ValidationException` (HTTP 400)
+//! ([`crate::state::unresolvable_kms_key_id`]).
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -184,6 +187,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(server_error());
         };
         let region = crate::state::request_region(ctx.parts());
+        // A policy encrypted under a customer managed key can only be written once that key
+        // EXISTS, which is AWS KMS's answer to give: the `kmsKeyId` member is resolved there
+        // and a value it holds no key for is refused ahead of every mutation, so a refused
+        // create mints no policy ([`crate::state::unresolvable_kms_key_id`]).
+        if let Some(refusal) =
+            crate::state::unresolvable_kms_key_id(ctx, &region, input.kms_key_id.as_deref()).await
+        {
+            return Err(
+                CreateAutomatedReasoningPolicyErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(refusal),
+                    },
+                )
+                .into(),
+            );
+        }
         let now = ::std::time::SystemTime::now();
         // The key the policy reports, resolved before this service's own store is locked:
         // an alias is a question for AWS KMS, and one request holds one lock.

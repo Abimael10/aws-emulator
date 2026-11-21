@@ -28,6 +28,14 @@
 //! ARN is that Region's key ARN for the id, the same ARN KMS mints for a key it issued
 //! ([`kms_store::key_arn`]).
 //!
+//! Whether the key EXISTS at all is the other half of the same question, and it is asked of
+//! the same service before anything is written ([`unresolvable_kms_key_id`]): the member's
+//! `@length` and `@pattern` constrain only the SHAPE of the identifier, so a well-formed
+//! value naming no key is not a boundary failure but a pre-condition on a resource AWS KMS
+//! owns. A resource recorded as encrypted under a key that does not exist could never be
+//! read back under it, and the refusal belongs on the call a caller can still correct rather
+//! than on every later read of the resource.
+//!
 //! LOCKING: this takes the KMS store's lock and no other, and nothing in KMS reaches into
 //! this service's store, so the two can never be taken in opposite orders. Callers ask it
 //! before taking this service's own guard all the same, so one request holds one lock.
@@ -96,4 +104,38 @@ fn alias_target_key_arn<Eng: Send + Sync + 'static>(
         | kms_store::KeyRef::MalformedArn
         | kms_store::KeyRef::UnauthorizedAccount => None,
     }
+}
+
+/// What Amazon Bedrock answers a request whose `kmsKeyId` names no key.
+///
+/// The sentence is the FIXED text of its error class: it names the member and interpolates
+/// nothing — not the identifier submitted, not the resource being written and not the Region
+/// — so one sentence answers every spelling the member admits.
+pub const INVALID_KMS_KEY_ID: &str = "The kmsKeyId provided is invalid.";
+
+/// The refusal a request earns for naming through `kms_key_id` a customer managed key AWS
+/// KMS holds none of, or `None` when it named a key KMS answered for — and when it named no
+/// key at all, which is the optional member being absent.
+///
+/// `region` is the Region the call was signed for, which is where an identifier carrying no
+/// Region of its own is looked for; an identifier that is an ARN is looked for in the Region
+/// THAT ARN names, because that is the endpoint holding it.
+///
+/// Asked of the service that OWNS keys, through the tree's one reading of a key identifier
+/// against it ([`::service_common::kms_key::key_is_absent`]), so what is refused rests on
+/// what AWS KMS ANSWERED: a key of another account, an answer about KMS rather than about the
+/// key, an answer that could not be read, and an emulator with no KMS mounted to ask
+/// establish nothing and the write goes through — the bar every cross-service resolution of
+/// this service is held to ([`super::logging_destination`], [`super::model_source`]).
+///
+/// Call it with NO store of this service held: it awaits.
+pub async fn unresolvable_kms_key_id(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    kms_key_id: Option<&str>,
+) -> Option<String> {
+    let requested = kms_key_id?;
+    ::service_common::kms_key::key_is_absent(ctx, region, requested)
+        .await
+        .then(|| INVALID_KMS_KEY_ID.to_string())
 }

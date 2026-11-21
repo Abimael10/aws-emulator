@@ -11,6 +11,11 @@
 //! already minted (`@idempotencyToken`), and a name another guardrail already holds is
 //! refused with `ConflictException`.
 //!
+//! The `kmsKeyId` a request names is resolved against the service that OWNS keys before
+//! anything is minted, and one AWS KMS holds no key for is refused with the modelled
+//! `ValidationException` (HTTP 400), so nothing is created
+//! ([`crate::state::unresolvable_kms_key_id`]).
+//!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
 //! ---
@@ -194,6 +199,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let region = crate::state::request_region(ctx.parts());
+        // A guardrail encrypted under a customer managed key can only be written once that
+        // key EXISTS, which is AWS KMS's answer to give: a `kmsKeyId` it holds no key for is
+        // refused here, ahead of every mutation, so a refused create mints no id and leaves
+        // no guardrail behind ([`crate::state::unresolvable_kms_key_id`]).
+        if let Some(refusal) =
+            crate::state::unresolvable_kms_key_id(ctx, &region, input.kms_key_id.as_deref()).await
+        {
+            return Err(
+                CreateGuardrailErrorModeled::ValidationException(ValidationException {
+                    message: Some(refusal),
+                })
+                .into(),
+            );
+        }
         let now = ::std::time::SystemTime::now();
         let token = input.client_request_token;
         // The key the guardrail reports, resolved before this service's own store is
