@@ -257,6 +257,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The record's `RecordTags` are the tags of the provisioned product this
             // request operates on, which is what it carries into its history.
             tags,
+            // `IgnoreErrors` governs what becomes of the provisioned product when the
+            // resources behind it cannot be deleted — "Service Catalog stops managing the
+            // specified provisioned product even if it cannot delete the underlying
+            // resources" — so settling a termination as a failure is that member's
+            // business, and nothing here derives one yet.
+            failure: None,
         };
 
         let record_detail = record.detail(now);

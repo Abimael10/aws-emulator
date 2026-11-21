@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeRecord
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeRecord`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeRecord::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -154,18 +144,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeRecord` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeRecordErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let now = std::time::SystemTime::now();
+
+        // A pure read: this operation reports what one request operation did and writes
+        // nothing, so a later caller sees exactly what this one saw. The store's lock is
+        // released before the stack behind the launch is read, so no lock is held across an
+        // await.
+        let (record_detail, launch) = {
+            let state = state.lock();
+
+            // "The record identifier of the provisioned product. This identifier is
+            // returned by the request operation": a record is addressed by that id alone,
+            // and an id nothing stored carries addresses no record.
+            //
+            // The record is read from the store's own map rather than through the
+            // provisioned product it describes, because a record OUTLIVES it: terminating a
+            // provisioned product "does not delete any records associated with the
+            // provisioned product", so the record of a launch stays describable once the
+            // provisioned product it launched is gone.
+            let record = state.records.get(&input.id).ok_or_else(|| {
+                not_found(crate::state::not_found_message(
+                    crate::state::KIND_RECORD,
+                    &input.id,
+                ))
+            })?;
+
+            // "Information about the product created as the result of a request": the
+            // outputs reported belong to the stack the LAUNCH stood up, so only the record
+            // of a request that provisioned the product has any — and only once that
+            // provisioning has succeeded, since until then nothing has been produced. The
+            // record of a request that changed or terminated the provisioned product, and
+            // one whose provisioned product no longer exists, report none.
+            let launch = (record.record_type == crate::state::RECORD_TYPE_PROVISION_PRODUCT
+                && record.status(now) == crate::state::RECORD_STATUS_SUCCEEDED)
+                .then(|| state.provisioned_product(&record.provisioned_product_id, now))
+                .flatten()
+                .and_then(|provisioned| {
+                    Some((provisioned.stack()?.to_string(), provisioned.region.clone()))
+                });
+
+            (record.detail(now), launch)
+        };
+
+        // The launch's outputs are the stack's, so they are READ from CloudFormation — key,
+        // value and description as it holds them, and the stack's own ARN beside them —
+        // rather than derived here. The read is dispatched IN PROCESS, by the framework's
+        // callback connector, to the CloudFormation mounted beside this service on the same
+        // engine (`crate::state::in_process_cloudformation`).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeRecord"))
+        // A stack CloudFormation will not answer for leaves this record with no outputs to
+        // report: the record itself exists and is reported either way, the outputs being
+        // the stack's rather than the record's.
+        let outputs = match &launch {
+            None => Vec::new(),
+            Some((stack, region)) => match crate::state::launch_outputs(ctx, region, stack).await {
+                Ok(outputs) => outputs,
+                Err(reason) => {
+                    ::tracing::debug!(%stack, %reason, "this launch's stack could not be read");
+                    Vec::new()
+                }
+            },
+        };
+
+        // `PageToken` pages over those outputs: this service's own opaque cursor, the
+        // POSITION in that list the next page resumes at. Anything else is no page token of
+        // this service's at all, and is refused rather than answered with the first page —
+        // a client paging on a token the read ignored would walk page one forever. This
+        // operation models no parameter error, so the refusal is the unmodelled-input one.
+        let resume_at = match input.page_token.as_deref().filter(|token| !token.is_empty()) {
+            Some(token) => match crate::state::decode_page_cursor(token)
+                .and_then(|cursor| cursor.parse::<usize>().ok())
+            {
+                Some(position) => position,
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "PageToken is not a valid page token.",
+                    ))
+                }
+            },
+            None => 0,
+        };
+        // `PageSize` is modelled `0..20` with a default of 0, and 0 asks for no
+        // caller-imposed bound: the whole remaining list is reported.
+        let page_size = if input.page_size > 0 {
+            input.page_size as usize
+        } else {
+            outputs.len()
+        };
+        let total = outputs.len();
+        let page: Vec<RecordOutput> = outputs.into_iter().skip(resume_at).take(page_size).collect();
+        let reported_through = resume_at.saturating_add(page.len());
+        // "The page token to use to retrieve the next set of results. If there are no
+        // additional results, this value is null."
+        let next_page_token = (reported_through < total)
+            .then(|| crate::state::encode_page_cursor(&reported_through.to_string()));
+
+        Ok(DescribeRecordOutput {
+            record_detail: Some(record_detail),
+            record_outputs: Some(page),
+            next_page_token,
+        })
     }
+}
+
+/// This operation's only modelled failure, carrying `message`: the record identifier
+/// addressed no record of this account. The sentence is the shape every not-found in this
+/// service reports ([`crate::state::not_found_message`]).
+fn not_found(message: String) -> DescribeRecordError {
+    DescribeRecordErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
 }

@@ -34,7 +34,7 @@ use crate::ops::types::{
     BudgetDetail, ConstraintDetail, ConstraintSummary, PortfolioDetail, ProductViewDetail,
     ProductViewSummary, ProvisionedProductAttribute, ProvisionedProductDetail,
     ProvisionedProductPlanDetails, ProvisioningArtifact as ModelledProvisioningArtifact,
-    ProvisioningArtifactDetail, ProvisioningArtifactSummary, RecordDetail, RecordTag,
+    ProvisioningArtifactDetail, ProvisioningArtifactSummary, RecordDetail, RecordError, RecordTag,
     ResourceDetail, ServiceActionDetail, ServiceActionSummary, SourceConnectionDetail, Tag,
     TagOptionDetail, UpdateProvisioningParameter,
 };
@@ -313,6 +313,9 @@ pub const ARN_PREFIX: &str = "arn:";
 
 /// The resource kind a provisioned product is, as its not-found names it.
 pub const KIND_PROVISIONED_PRODUCT: &str = "Provisioned product";
+
+/// The resource kind a request operation's record is, as its not-found names it.
+pub const KIND_RECORD: &str = "Record";
 
 /// The resource kind a provisioned product's CloudFormation stack is, as a refusal that
 /// cannot read it names it.
@@ -982,6 +985,16 @@ pub struct Record {
     pub completed_at: SystemTime,
     /// Tag key -> tag value, reported as this record's `RecordTags`.
     pub tags: BTreeMap<String, String>,
+    /// Why the operation this record describes did NOT happen, for one whose deployment
+    /// the service that owns it refused; `None` for one that is happening.
+    ///
+    /// A request is accepted before the deployment it submits is made — the record answers
+    /// in the non-terminal status — so what the request is accepted as says nothing about
+    /// what became of it: the OUTCOME is this field, and it is what the terminal status the
+    /// clock owes is derived from ([`Record::status`]). The failure is the refusing
+    /// service's own ([`LaunchFailure`]), reported as this record's single `RecordError`
+    /// and as the status message of the provisioned product it is about.
+    pub failure: Option<LaunchFailure>,
 }
 
 /// The `RecordType` of a record `ProvisionProduct` creates
@@ -1015,6 +1028,11 @@ pub const RECORD_STATUS_CREATED: &str = "CREATED";
 /// operation has successfully completed".
 pub const RECORD_STATUS_SUCCEEDED: &str = "SUCCEEDED";
 
+/// `RecordStatus`'s other terminal value, which the model documents as "the requested
+/// operation has unsuccessfully completed. Investigate using the error messages returned" —
+/// the status of a record whose operation did not happen ([`Record::failure`]).
+pub const RECORD_STATUS_FAILED: &str = "FAILED";
+
 /// `ProvisionedProductStatus`'s transitive value, which the model documents as
 /// "operations performed might not have valid results. Wait for an AVAILABLE status
 /// before performing operations"
@@ -1024,6 +1042,13 @@ pub const PROVISIONED_PRODUCT_STATUS_UNDER_CHANGE: &str = "UNDER_CHANGE";
 /// `ProvisionedProductStatus`'s stable value: "ready to perform any operation. The
 /// most recent operation succeeded and completed".
 pub const PROVISIONED_PRODUCT_STATUS_AVAILABLE: &str = "AVAILABLE";
+
+/// `ProvisionedProductStatus`'s value for a provisioned product whose resources are not
+/// standing, which the model documents as "an unexpected error occurred. The provisioned
+/// product exists but the stack is not running. For example, CloudFormation received a
+/// parameter value that was not valid and could not launch the stack" — the status of a
+/// provisioned product whose last operation did not happen ([`Record::failure`]).
+pub const PROVISIONED_PRODUCT_STATUS_ERROR: &str = "ERROR";
 
 /// `ProvisionedProductStatus`'s other stable value, which the model documents as
 /// "ready to perform any operation. The stack has completed the requested operation
@@ -1074,13 +1099,34 @@ pub const PROVISIONED_PRODUCT_TYPE_CFN_STACK: &str = "CFN_STACK";
 
 impl Record {
     /// This record's `RecordStatus` at `now`: the non-terminal one until the clock
-    /// owes the transition, the terminal one afterwards.
+    /// owes the transition, and afterwards the terminal one its OUTCOME names — the
+    /// operation did not happen, or it did ([`Record::failure`]).
     pub fn status(&self, now: SystemTime) -> &'static str {
         if now < self.completed_at {
             RECORD_STATUS_CREATED
+        } else if self.failure.is_some() {
+            RECORD_STATUS_FAILED
         } else {
             RECORD_STATUS_SUCCEEDED
         }
+    }
+
+    /// "The errors that occurred" on the operation this record describes, at `now`.
+    ///
+    /// A record reports the errors of an operation that has FINISHED unsuccessfully: while
+    /// the operation is still in flight nothing has gone wrong yet, which is why the
+    /// request that starts it is answered with none, and one that completed had none to
+    /// report. The failure is the refusing service's own, as one `RecordError` pairs its
+    /// code with its description.
+    pub fn errors(&self, now: SystemTime) -> Vec<RecordError> {
+        self.failure
+            .iter()
+            .filter(|_| self.status(now) == RECORD_STATUS_FAILED)
+            .map(|failure| RecordError {
+                code: failure.code.clone(),
+                description: Some(failure.description.clone()),
+            })
+            .collect()
     }
 
     /// Whether this record is the record of a provisioning request — see
@@ -1115,9 +1161,10 @@ impl Record {
             product_id: Some(self.product_id.clone()),
             provisioning_artifact_id: Some(self.provisioning_artifact_id.clone()),
             path_id: Some(self.path_id.clone()),
-            // "The errors that occurred": the operation this record describes has
-            // not failed, so there are none rather than an unknown set.
-            record_errors: Some(Vec::new()),
+            // "The errors that occurred": the ones the operation this record describes
+            // finished unsuccessfully with, and none at all while it is in flight or once
+            // it has completed ([`Record::errors`]).
+            record_errors: Some(self.errors(now)),
             record_tags: Some(self.tag_list()),
             // A launch role comes from a LAUNCH constraint's `RoleArn`, and nothing
             // assumes a role in this emulator, so no record carries one.
@@ -1779,6 +1826,20 @@ impl ComAmazonawsServicecatalogAws242servicecatalogserviceState {
         self.records.insert(record.id.clone(), record);
     }
 
+    /// Record that the operation `record_id` describes did NOT happen, with the failure the
+    /// service that owns the deployment refused it with.
+    ///
+    /// The request was accepted before the deployment was submitted, so this is where its
+    /// OUTCOME is written: the record settles [`RECORD_STATUS_FAILED`] once the clock owes
+    /// its completion, carrying that failure as its one `RecordError`, and the provisioned
+    /// product it is about reports [`PROVISIONED_PRODUCT_STATUS_ERROR`] with the same
+    /// sentence. Nothing is written for a record the store no longer holds.
+    pub fn fail_record(&mut self, record_id: &str, failure: LaunchFailure) {
+        if let Some(record) = self.records.get_mut(record_id) {
+            record.failure = Some(failure);
+        }
+    }
+
     /// Drop one stored record, and the reference to it the provisioned product it
     /// describes holds.
     ///
@@ -1841,8 +1902,10 @@ impl ComAmazonawsServicecatalogAws242servicecatalogserviceState {
     }
 
     /// `provisioned`'s `ProvisionedProductStatus` at `now`: the transitive one while
-    /// the operation its last record describes is still in flight, the stable one once
-    /// the clock owes that record's completion.
+    /// the operation its last record describes is still in flight, and once the clock owes
+    /// that record's completion the stable one its OUTCOME names — the resources are
+    /// standing, or the operation did not happen and they are not
+    /// ([`PROVISIONED_PRODUCT_STATUS_ERROR`]).
     ///
     /// A provisioned product a PLAN created and nothing has performed an operation on
     /// yet reports the transitive status the model documents for exactly that:
@@ -1854,15 +1917,36 @@ impl ComAmazonawsServicecatalogAws242servicecatalogserviceState {
         now: SystemTime,
     ) -> &'static str {
         match self.provisioned_product_records(provisioned).next_back() {
-            Some(last) if last.status(now) == RECORD_STATUS_CREATED => {
-                PROVISIONED_PRODUCT_STATUS_UNDER_CHANGE
-            }
-            Some(_) => PROVISIONED_PRODUCT_STATUS_AVAILABLE,
+            Some(last) => match last.status(now) {
+                RECORD_STATUS_CREATED => PROVISIONED_PRODUCT_STATUS_UNDER_CHANGE,
+                RECORD_STATUS_FAILED => PROVISIONED_PRODUCT_STATUS_ERROR,
+                _ => PROVISIONED_PRODUCT_STATUS_AVAILABLE,
+            },
             None if provisioned.plan_created => PROVISIONED_PRODUCT_STATUS_PLAN_IN_PROGRESS,
             // A provisioned product with no readable history is one whose records the
             // store has evicted: its last operation completed.
             None => PROVISIONED_PRODUCT_STATUS_AVAILABLE,
         }
+    }
+
+    /// `provisioned`'s `ProvisionedProductStatusMessage` at `now`: "the current status
+    /// message of the provisioned product".
+    ///
+    /// The message belongs to the status, so it is read from the same record that status is
+    /// derived from: a provisioned product whose last operation did not happen reports why
+    /// — the refusing service's own sentence, the one that record's `RecordError` carries —
+    /// and one whose resources are standing or whose operation is still in flight has
+    /// nothing to report rather than an invented message.
+    pub fn provisioned_product_status_message(
+        &self,
+        provisioned: &ProvisionedProduct,
+        now: SystemTime,
+    ) -> Option<String> {
+        let last = self.provisioned_product_records(provisioned).next_back()?;
+        last.errors(now)
+            .into_iter()
+            .next()
+            .and_then(|error| error.description)
     }
 
     /// `provisioned` as the modelled `ProvisionedProductDetail`.
@@ -1881,11 +1965,10 @@ impl ComAmazonawsServicecatalogAws242servicecatalogserviceState {
             r#type: Some(provisioned.r#type.clone()),
             id: Some(provisioned.id.clone()),
             status: Some(self.provisioned_product_status(provisioned, now).to_string()),
-            // A status message reports what the resources behind the provisioned
-            // product last said. Reporting one is the business of the failure path a
-            // launch that did not deploy settles on, which nothing here derives yet, so
-            // there is no message rather than an invented one.
-            status_message: None,
+            // "The current status message of the provisioned product": what the resources
+            // behind it last said, read from the same record the status is
+            // ([`Self::provisioned_product_status_message`]).
+            status_message: self.provisioned_product_status_message(provisioned, now),
             created_time: Some(reported_time(provisioned.created_time)),
             idempotency_token: Some(provisioned.provision_token.clone()),
             last_record_id: provisioned.record_ids.last().cloned(),

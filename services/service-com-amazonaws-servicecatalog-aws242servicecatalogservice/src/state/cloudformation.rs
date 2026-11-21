@@ -112,8 +112,7 @@ pub struct Launch {
     pub provisioned_product_arn: String,
 }
 
-/// Stand `launch`'s stack up and answer the stack id CloudFormation minted for it — or
-/// the reason CloudFormation gave for not standing it up.
+/// Stand `launch`'s stack up and answer what became of it ([`LaunchOutcome`]).
 ///
 /// The launch IS the stack: the resources behind a provisioned product are the ones that
 /// stack creates, and its outputs are what the provisioned product's outputs are read
@@ -130,7 +129,7 @@ pub async fn create_launch_stack<Eng: Send + Sync + 'static>(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     launch: &Launch,
-) -> Result<String, String> {
+) -> LaunchOutcome {
     let as_service =
         super::ServicePrincipalCall::begin(engine, ctx, &launch.provisioned_product_arn);
     let (cloudformation, tags) = match &as_service {
@@ -172,18 +171,173 @@ pub async fn create_launch_stack<Eng: Send + Sync + 'static>(
                 .build(),
         );
     }
-    let request = match template_reference(&cloudformation, &launch.template).await? {
-        TemplateReference::Url(url) => request.template_url(url),
-        TemplateReference::Body(body) => request.template_body(body),
+    let request = match launch_template(&cloudformation, &launch.template).await {
+        Ok(TemplateReference::Url(url)) => request.template_url(url),
+        Ok(TemplateReference::Body(body)) => request.template_body(body),
+        // There is nothing to submit, or nothing answered about the template there was:
+        // either way the stack is not asked for, and what became of the launch is what
+        // resolving its template answered.
+        Err(outcome) => return outcome,
     };
 
-    request
-        .send()
-        .await
-        .map_err(error_message)?
-        .stack_id
-        .ok_or_else(|| "CloudFormation created no stack for this launch.".to_string())
+    match request.send().await {
+        Ok(created) => match created.stack_id {
+            Some(stack_id) => LaunchOutcome::Deployed(stack_id),
+            None => LaunchOutcome::Refused(LaunchFailure::unsubmitted(
+                "CloudFormation created no stack for this launch.".to_string(),
+            )),
+        },
+        Err(error) => answered_launch(&error),
+    }
 }
+
+/// What became of a launch Service Catalog submitted — the three things that can be known
+/// about one, which is what the record of the request that asked for it settles on.
+#[derive(Debug, Clone)]
+pub enum LaunchOutcome {
+    /// CloudFormation stood the stack up: the id it minted for it, which is the handle
+    /// every later read of that stack uses.
+    Deployed(String),
+    /// The deployment did NOT happen, and this is why ([`LaunchFailure`]).
+    Refused(LaunchFailure),
+    /// Nothing answered for this launch, so nothing is KNOWN about it: no CloudFormation is
+    /// mounted beside this service to submit to, or the call came back with no answer of
+    /// the service's at all. Evidence of nothing — not a refusal of the deployment — so the
+    /// launch is left as the request was accepted rather than settled either way, and the
+    /// reason is carried only for the log.
+    Unanswered(String),
+}
+
+/// Why a launch's stack was not stood up, as the record of the request that asked for the
+/// launch carries that failure: the two members ONE `RecordError` pairs
+/// (`smithy_query query="shape" shape="RecordError"`).
+///
+/// A launch is submitted to CloudFormation, so a launch that did not happen did not happen
+/// for CloudFormation's own reason, and that reason is what travels: the sentence
+/// CloudFormation worded, inside the clause the SDK layer that made the call states around
+/// a failed call, under the exception class that layer raises. Nothing here is Service
+/// Catalog's own wording.
+#[derive(Debug, Clone)]
+pub struct LaunchFailure {
+    /// `RecordError$Code`: the class of the exception the launch's call raised, which is
+    /// what a caller switches on. `None` for a launch that was never submitted, there
+    /// being no answer to read a class off.
+    pub code: Option<String>,
+    /// `RecordError$Description`, and the status message the provisioned product reports:
+    /// the caught exception stated in full, within [`MAX_FAILURE_DESCRIPTION`].
+    pub description: String,
+}
+
+impl LaunchFailure {
+    /// A launch no call was made for, which therefore carries `reason` alone: the product
+    /// version addresses no template at all, or the template it addresses could not be
+    /// resolved to something to submit. There is no answered status, code or request id to
+    /// state a clause from, so the reason stands on its own.
+    fn unsubmitted(reason: String) -> Self {
+        Self {
+            code: None,
+            description: recorded(reason),
+        }
+    }
+}
+
+/// `description` as the record of a failed launch KEEPS it: within
+/// [`MAX_FAILURE_DESCRIPTION`] characters.
+///
+/// A refusal of a deployment quotes the template's own declarations — the pattern a value
+/// had to match, the parameter keys it named — so its length is the SUBMITTED template's
+/// rather than this service's, and what is stored per record would otherwise be bounded
+/// only by the body a caller staged.
+fn recorded(description: String) -> String {
+    match description.char_indices().nth(MAX_FAILURE_DESCRIPTION) {
+        Some((end, _)) => description[..end].to_string(),
+        None => description,
+    }
+}
+
+/// The most of one failed launch's sentence a record keeps.
+///
+/// This emulator's own bound, not an AWS one (neither `ErrorDescription` nor
+/// `ProvisionedProductStatusMessage` is length-constrained in the model): far longer than
+/// any refusal a deployment is really answered with, and a constant, so the store holds a
+/// constant per record rather than as much text as one request can make CloudFormation
+/// quote back.
+pub const MAX_FAILURE_DESCRIPTION: usize = 4_096;
+
+/// What a FAILED call about a launch says about it: the exception CloudFormation answered,
+/// as the SDK layer that made the call renders one — or, for a call it did not answer,
+/// that nothing is known.
+///
+/// A refusal is an ANSWER from the service that owns the deployment: it decided this launch
+/// does not happen, and it names the CODE it refused under. A call that never reached that
+/// service, or that came back with something its own errors cannot be read out of, decided
+/// nothing about the deployment — so it is evidence of nothing rather than a launch that
+/// failed.
+///
+/// Every variable part of a refusal comes from CloudFormation's own answer — the sentence it
+/// worded, the status it answered with, the code it answered under and the id of that
+/// answer — and the fixed text is the rendering itself, which is the workspace's one copy of
+/// it (`service_common::relayed_refusal`).
+fn answered_launch<E>(
+    error: &::aws_sdk_cloudformation::error::SdkError<
+        E,
+        ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> LaunchOutcome
+where
+    E: ::aws_smithy_types::error::metadata::ProvideErrorMetadata + std::error::Error + 'static,
+{
+    use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
+
+    let refused = error.as_service_error();
+    let Some(code) = refused.and_then(ProvideErrorMetadata::code) else {
+        return LaunchOutcome::Unanswered(error_message(error));
+    };
+    // A refusal that carried no sentence of its own is still that refusal, and the code it
+    // named is what it says: nothing is worded here in its place.
+    let reason = refused
+        .and_then(ProvideErrorMetadata::message)
+        .unwrap_or_default();
+    let status = error
+        .raw_response()
+        .map_or(CLOUDFORMATION_REFUSAL_STATUS, |response| {
+            response.status().as_u16()
+        });
+    // The id belongs to the ANSWER this failure is relayed from, read off that answer's own
+    // headers; an answer that carried none is still the answer to one call, so one of that
+    // form is minted for it rather than derived from anything in the request.
+    let request_id = error.raw_response().map_or_else(
+        ::service_common::query_error_envelope::new_request_id,
+        |response| ::service_common::relayed_refusal::answered_request_id(response.headers()),
+    );
+    let caught = ::service_common::relayed_refusal::caught_exception_message(
+        "",
+        "",
+        reason,
+        ::service_common::relayed_refusal::CaughtCall {
+            service: CLOUDFORMATION_SERVICE_NAME,
+            status,
+            code,
+            request_id: &request_id,
+        },
+    );
+    LaunchOutcome::Refused(LaunchFailure {
+        code: Some(CLOUDFORMATION_EXCEPTION.to_string()),
+        description: recorded(format!("{CLOUDFORMATION_EXCEPTION}  {caught}")),
+    })
+}
+
+/// The exception class the client a launch is submitted through raises for a refused call,
+/// which is the class the failure is recorded under.
+const CLOUDFORMATION_EXCEPTION: &str = "AmazonCloudFormationException";
+
+/// CloudFormation's name as the SDK layer that relayed the launch's call reports it, which
+/// is neither its endpoint prefix nor the casing of its `sdkId`.
+const CLOUDFORMATION_SERVICE_NAME: &str = "AmazonCloudFormation";
+
+/// The status a refusal that reached this service without one to read is stated under:
+/// CloudFormation refuses a request it will not serve with HTTP 400.
+const CLOUDFORMATION_REFUSAL_STATUS: u16 = 400;
 
 /// Tear the stack `stack` names down, which is what terminating a provisioned product
 /// does to the resources behind it, and answer the reason CloudFormation gave if it
@@ -432,11 +586,60 @@ async fn template_reference(
             .map_err(error_message)?
             .template_body
             .map(TemplateReference::Body)
-            .ok_or_else(|| format!("The stack {physical_id} carries no template.")),
-        TemplateSource::Unaddressed => {
-            Err("The provisioning artifact names no CloudFormation template.".to_string())
-        }
+            .ok_or_else(|| stack_carries_no_template(physical_id)),
+        TemplateSource::Unaddressed => Err(NO_TEMPLATE_ADDRESSED.to_string()),
     }
+}
+
+/// [`template_reference`] for a LAUNCH, whose failure to resolve a template is one of the
+/// things that can become of that launch ([`LaunchOutcome`]) rather than a bare reason.
+///
+/// The difference is the version that names the PHYSICAL ID of a resource containing the
+/// template: reading it is a CALL, so a call CloudFormation did not answer says nothing
+/// about this launch and is classified exactly as the submission itself is
+/// ([`answered_launch`]) — only an answer decides that the launch does not happen. A version
+/// that addresses no template at all needs no call: there is nothing to submit, which is
+/// Service Catalog's own reading of its own record and so its own sentence.
+async fn launch_template(
+    cloudformation: &::aws_sdk_cloudformation::Client,
+    template: &TemplateSource,
+) -> Result<TemplateReference, LaunchOutcome> {
+    match template {
+        TemplateSource::Url(url) => Ok(TemplateReference::Url(url.clone())),
+        TemplateSource::Stack(physical_id) => {
+            match cloudformation
+                .get_template()
+                .stack_name(physical_id)
+                .send()
+                .await
+            {
+                Ok(answered) => answered
+                    .template_body
+                    .map(TemplateReference::Body)
+                    .ok_or_else(|| {
+                        LaunchOutcome::Refused(LaunchFailure::unsubmitted(
+                            stack_carries_no_template(physical_id),
+                        ))
+                    }),
+                Err(error) => Err(answered_launch(&error)),
+            }
+        }
+        TemplateSource::Unaddressed => Err(LaunchOutcome::Refused(LaunchFailure::unsubmitted(
+            NO_TEMPLATE_ADDRESSED.to_string(),
+        ))),
+    }
+}
+
+/// The reason a version whose `Info` names neither template source cannot be submitted:
+/// there is nothing to deploy, which this service decides from its own record of the
+/// version. Shared by both readings of a template source, so one version is not described
+/// two ways.
+const NO_TEMPLATE_ADDRESSED: &str = "The provisioning artifact names no CloudFormation template.";
+
+/// The reason a version naming the physical id of a stack that carries no template cannot
+/// be submitted, shared the same way.
+fn stack_carries_no_template(physical_id: &str) -> String {
+    format!("The stack {physical_id} carries no template.")
 }
 
 /// What the change set `change_set` names says about the plan it backs.

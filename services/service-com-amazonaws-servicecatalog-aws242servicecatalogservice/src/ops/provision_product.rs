@@ -186,7 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Everything this request resolves and stores is done under the lock, which is
         // released before the launch itself: the stack is stood up by a call into
         // CloudFormation, and no lock is held across an await.
-        let (provisioned_product_id, launch, record_detail) = {
+        let (provisioned_product_id, record_id, launch, record_detail) = {
         let mut state = state.lock();
 
         // A provisioned product whose termination the clock has settled stopped
@@ -440,6 +440,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_time: now,
             completed_at,
             tags: tags.clone(),
+            // What became of this launch is not known yet: the request is accepted here
+            // and the stack is submitted below, so the outcome is written once
+            // CloudFormation has answered for it.
+            failure: None,
         };
         let provisioned = crate::state::ProvisionedProduct {
             id: provisioned_product_id.clone(),
@@ -471,9 +475,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state
             .provisioned_products
             .insert(provisioned_product_id.clone(), provisioned);
-        state.remember_provision_token(input.provision_token, record_id);
+        state.remember_provision_token(input.provision_token, record_id.clone());
 
-        (provisioned_product_id, launch, record_detail)
+        (provisioned_product_id, record_id, launch, record_detail)
         };
 
         // "Provisioning a product that's based on a CloudFormation template launches a
@@ -490,11 +494,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // The request has already been accepted at this point — the record answers
         // `CREATED` and the launch is performed afterwards — so a launch CloudFormation
-        // will not stand up does not un-accept it: the stack is simply not there, and
-        // the provisioned product reports no stack resource and no outputs.
+        // will not stand up does not un-accept it: what it does is SETTLE the launch as a
+        // failure. The record of this request then carries CloudFormation's own refusal as
+        // its one `RecordError` and reaches `FAILED` when the clock owes its completion,
+        // the provisioned product reports `ERROR` with that same sentence as its status
+        // message, and no provisioning of it has succeeded — so there is no successful
+        // provisioning record for its outputs to be reported for
+        // (`crate::state::fail_record`).
+        //
+        // A call NOTHING answered decided nothing about this launch, so it settles neither
+        // way: the launch is left as it was accepted.
         if let Some(launch) = launch {
             match crate::state::create_launch_stack(&*self.engine, ctx, &region, &launch).await {
-                Ok(stack_id) => {
+                crate::state::LaunchOutcome::Deployed(stack_id) => {
                     if let Some(provisioned) = state
                         .lock()
                         .provisioned_products
@@ -503,10 +515,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         provisioned.stack_id = Some(stack_id);
                     }
                 }
-                Err(reason) => ::tracing::debug!(
+                crate::state::LaunchOutcome::Refused(failure) => {
+                    ::tracing::debug!(
+                        provisioned_product = %provisioned_product_id,
+                        reason = %failure.description,
+                        "CloudFormation refused to stand this launch's stack up"
+                    );
+                    state.lock().fail_record(&record_id, failure);
+                }
+                crate::state::LaunchOutcome::Unanswered(reason) => ::tracing::debug!(
                     provisioned_product = %provisioned_product_id,
                     %reason,
-                    "CloudFormation stood no stack up for this launch"
+                    "nothing answered for this launch's stack"
                 ),
             }
         }
