@@ -261,8 +261,15 @@ eb_schema_and_codec!(
 /// `OptionSettingDetails` list carries.
 ///
 /// RECORDED BEHAVIOUR, not modelled, as [`OptionSource`] is.
+///
+/// The three identity members are the ones that name an option
+/// (`ResourceName`, `Namespace`, `OptionName` — the same triple an
+/// `OptionSpecification` names one by), so a detail about an option set on a
+/// resource of its own says which resource. `option_source` is absent where the
+/// option is in force at NO value: there is then no layer its value came from.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OptionSettingDetail {
+    pub resource_name: Option<String>,
     pub namespace: Option<String>,
     pub option_name: Option<String>,
     pub option_source: Option<OptionSource>,
@@ -274,13 +281,21 @@ eb_schema_and_codec!(
     "com.amazonaws.elasticbeanstalk#OptionSettingDetail",
     "com.amazonaws.elasticbeanstalk",
     "OptionSettingDetail",
-    (M_NAMESPACE, namespace, "Namespace", 0, opt, string),
-    (M_OPTION_NAME, option_name, "OptionName", 1, opt, string),
+    (
+        M_DETAIL_RESOURCE_NAME,
+        resource_name,
+        "ResourceName",
+        0,
+        opt,
+        string
+    ),
+    (M_NAMESPACE, namespace, "Namespace", 1, opt, string),
+    (M_OPTION_NAME, option_name, "OptionName", 2, opt, string),
     (
         M_OPTION_SOURCE,
         option_source,
         "OptionSource",
-        2,
+        3,
         opt,
         struct_of(OptionSource)
     ),

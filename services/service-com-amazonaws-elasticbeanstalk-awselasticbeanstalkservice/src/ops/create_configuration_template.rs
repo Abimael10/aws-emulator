@@ -293,6 +293,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "the Elastic Beanstalk store is unavailable",
             )
         })?;
+        // Everything this call settles under the store's lock, which is
+        // RELEASED before the document below is written: that write reaches
+        // object storage in process, and no state of this service is read
+        // while it runs.
+        let (output, stored) = {
         let mut store = state.lock();
         // An application the clock has already finished deleting holds no
         // templates, and an environment whose termination has come due is no
@@ -495,12 +500,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             &template
         );
-        // "TemplateUrl": the Amazon S3 location the template document was
-        // stored at, which this call is what stores. Derived from the region,
-        // the account's own storage bucket and the two names the request
-        // supplied — see `crate::state::configuration_template_url`.
+        // "TemplateUrl": the location of the template document this call
+        // stores, on the address this emulator is reached on — see
+        // `crate::state::configuration_template_url`.
         let output = CreateConfigurationTemplateOutput {
             template_url: Some(crate::state::configuration_template_url(
+                ctx.endpoint().as_str(),
                 &region,
                 &template.application_name,
                 &template.template_name,
@@ -509,6 +514,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let subject = template.event_subject();
         let template_name = template.template_name.clone();
+        let stored = template.clone();
         store.configuration_templates.insert(template.key(), template);
 
         // The activity this call performed, recorded for `DescribeEvents`: the
@@ -523,6 +529,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )),
             subject,
         );
+
+        // The document the location above names: a saved configuration IS an
+        // object in the account's storage bucket, and this call is what puts it
+        // there, so the URL the answer carries addresses an object the
+        // emulator's own object storage holds.
+        (output, stored)
+        };
+        crate::state::store_configuration_template_document(ctx, &region, &stored).await;
 
         Ok(output)
     }

@@ -82,3 +82,34 @@ Detail (excerpt): member[0].Namespace expected 'aws:cloudformation:template:para
 4. Cause 2: same fixture, step task#8 — UpdateConfigurationTemplate on that template; inspect UpdateConfigurationTemplateResult.TemplateUrl the same way.
 5. Cause 3: same fixture, step task#6 (and task#9) — DescribeConfigurationSettings with ApplicationName + TemplateName. Compare the ConfigurationSettings.member.OptionSettingDetails / OptionSettings lists against the recorded response: the aws:cloudformation:template:parameter and aws:elasticbeanstalk:application:environment families are missing, the order starts at aws:autoscaling:asg, and every entry carries OptionSource {Identifier: Service, Origin: Service}.
 6. Cause 4: replay fixture elasticbeanstalk-environment-create-option-setting-reflected step task#5 — CreateEnvironment with explicit OptionSettings, then DescribeConfigurationSettings with ApplicationName + EnvironmentName. The caller-supplied options are not reported with OptionSource Origin/Identifier = API, and the resolved list order/membership diverges as in step 5.
+
+## Resolution
+
+Causes 1 and 2 are fixed and replay clean: `TemplateUrl` is built from the address
+this emulator is reached on (`OperationContext::endpoint`) followed by the
+account's storage bucket and the saved-configuration key, and the template
+document itself is now written into that bucket on the create and the update and
+deleted with the template, so a client that follows the URL downloads the
+configuration this emulator stored instead of leaving for a host it does not
+serve.
+
+Causes 3 and 4 are implemented as rules: a read of a configuration set now
+reports the options the platform version SUPPLIES to the environment it
+provisions — the `aws:cloudformation:template:parameter` family and the
+environment property a Python runtime adds — ahead of its published defaults,
+with the instance type's family derived from the type in force; `OptionSource` is
+emitted only where a value IS in force (`API` for one the configuration holds,
+`Service` for one the platform put there) and left out entirely for an option in
+force at no value; and an option-setting detail now names the resource a
+resource-scoped setting is set on.
+
+What the replay still reports, left here so the gap is not lost: the recorded
+platform version publishes roughly a hundred and ten configuration options where
+this emulator's catalog publishes about seventy, so the two resolved lists still
+diverge once the entries this emulator does not define are reached (the first
+divergence moved from `OptionSettingDetails.member[0]` to `member[103]` on the
+template fixture and to `member[10]` on the environment fixture). Closing that
+needs AWS's published per-platform-version option catalog as DATA, which is the
+subject of the open `DescribeConfigurationOptions` catalog issue
+(20261029T180136Z-elasticbeanstalk-elastic-beanstalk-accepts-inputs-aws-refuses-and-publishes.md);
+no rule of the resolution or of the attribution is missing here.

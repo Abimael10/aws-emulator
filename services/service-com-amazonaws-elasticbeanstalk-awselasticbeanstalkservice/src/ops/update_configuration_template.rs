@@ -197,6 +197,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "the Elastic Beanstalk store is unavailable",
             )
         })?;
+        // Everything this call settles under the store's lock, which is
+        // RELEASED before the document below is rewritten: that write reaches
+        // object storage in process, and no state of this service is read
+        // while it runs.
+        let (output, updated) = {
         let mut store = state.lock();
         let request_id = crate::state::new_request_id();
         // An application the clock has already finished deleting holds no
@@ -313,12 +318,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             &updated
         );
-        // "TemplateUrl": the Amazon S3 location of the template document this
-        // call just rewrote — the same location the create reported, derived
-        // the same way, so a create-then-update round trip reports one
-        // location for one template.
+        // "TemplateUrl": the location of the template document this call just
+        // rewrote — the same location the create reported, derived the same
+        // way, so a create-then-update round trip reports one location for one
+        // template.
         let output = UpdateConfigurationTemplateOutput {
             template_url: Some(crate::state::configuration_template_url(
+                ctx.endpoint().as_str(),
                 &region,
                 &updated.application_name,
                 &updated.template_name,
@@ -334,6 +340,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None,
             updated.event_subject(),
         );
+
+        // The stored document is rewritten with the configuration this call
+        // settled, so the location the answer carries hands back the updated
+        // template rather than the one it replaced.
+        (output, updated)
+        };
+        crate::state::store_configuration_template_document(ctx, &region, &updated).await;
 
         Ok(output)
     }

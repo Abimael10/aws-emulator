@@ -65,14 +65,17 @@ fn borrowed(params: &[(String, String)]) -> Vec<(&str, &str)> {
 }
 
 /// The value of the option `name` in [`NAMESPACE`] in the configuration set
-/// `set`, or `None` when the set carries no such option.
+/// `set`, or `None` when the set carries no such option or reports it at no
+/// value.
+///
+/// Read member by MEMBER: a resolved set reports options in force at no value
+/// with no `Value` element at all, so three independent flat lists would
+/// re-align the values against the wrong options.
 fn option_value(set: &crate::lifecycle::Answer, name: &str) -> Option<String> {
-    let namespaces = set.values_at("OptionSettings/member/Namespace");
-    let names = set.values_at("OptionSettings/member/OptionName");
-    let values = set.values_at("OptionSettings/member/Value");
-    for (index, option_name) in names.iter().enumerate() {
-        if *option_name == name && namespaces.get(index) == Some(&NAMESPACE) {
-            return values.get(index).map(|value| (*value).to_string());
+    for member in set.elements_at("OptionSettings/member") {
+        if member.value("OptionName") == Some(name) && member.value("Namespace") == Some(NAMESPACE)
+        {
+            return member.value("Value").map(|value| value.to_string());
         }
     }
     None

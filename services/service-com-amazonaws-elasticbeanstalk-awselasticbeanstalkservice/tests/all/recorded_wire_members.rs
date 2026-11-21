@@ -5,16 +5,18 @@
 //!
 //! The rules under test:
 //!
-//! * a configuration-template WRITE reports the Amazon S3 location the template
-//!   document is stored at — the account's storage bucket for the request's
-//!   region, the saved-configuration prefix, and the application and template
-//!   the request named — so a create and a later update of one template report
-//!   one location;
+//! * a configuration-template WRITE reports the location of the template
+//!   document — the address this emulator is REACHED on, the account's storage
+//!   bucket for the request's region, the saved-configuration prefix, and the
+//!   application and template the request named — so a create and a later update
+//!   of one template report one location, and the document that location names
+//!   is one the emulator's own object storage really holds;
 //! * a READ of a configuration set attributes every option of the RESOLVED set:
 //!   one detail entry per reported setting, naming the option and the source its
 //!   effective value came from — the API where the configuration itself holds
 //!   the setting, the service where the value is the platform version's own
-//!   default — beside the set's link points and the environment tier it is for;
+//!   default or one it supplies, and NO source where the option is in force at
+//!   no value — beside the set's link points and the environment tier it is for;
 //! * every published configuration option carries the option reference's own
 //!   description and the restrictions that option has, and reports
 //!   `UserDefined` false, because the catalog publishes what the PLATFORM
@@ -48,14 +50,22 @@ const APP_ENV: &str = "aws:elasticbeanstalk:application:environment";
 /// The Auto Scaling group namespace, which holds the two sibling options the
 /// recorded option descriptions are about.
 const ASG: &str = "aws:autoscaling:asg";
+/// A scheduled scaling action: the namespace whose settings carry a
+/// `ResourceName` of their own, which the detail of such a setting names.
+const SCHEDULED: &str = "aws:autoscaling:scheduledaction";
+/// The template parameter the service puts the instance type's FAMILY in force
+/// as — the one supplied option a value is in force for.
+const INSTANCE_TYPE_FAMILY: &str = "InstanceTypeFamily";
 
 /// The worker tier's two members, as a request names them.
 const WORKER_TIER: &[(&str, &str)] = &[("Tier.Name", "Worker"), ("Tier.Type", "SQS/HTTP")];
 
-/// One `OptionSettingDetails` entry as the answer reports it: `(Namespace,
-/// OptionName, Identifier, Origin)`, read member by member off ONE element so a
-/// detail attributed to the wrong option fails rather than matching a flat list.
-type ReportedDetail = (String, String, String, String);
+/// One `OptionSettingDetails` entry as the answer reports it: the triple that
+/// NAMES the option (`ResourceName`, `Namespace`, `OptionName`) and the
+/// `OptionSource`'s `Identifier` and `Origin`, read member by member off ONE
+/// element so a detail attributed to the wrong option fails rather than matching
+/// a flat list. An entry carrying no `OptionSource` reads as two empty strings.
+type ReportedDetail = (String, String, String, String, String);
 
 /// Every option-setting detail in `answer`, in document order.
 fn reported_details(answer: &Answer) -> Vec<ReportedDetail> {
@@ -66,6 +76,7 @@ fn reported_details(answer: &Answer) -> Vec<ReportedDetail> {
             let source = member.elements_at("OptionSource");
             let source = source.first();
             (
+                member.value("ResourceName").unwrap_or_default().to_string(),
                 member.value("Namespace").unwrap_or_default().to_string(),
                 member.value("OptionName").unwrap_or_default().to_string(),
                 source
@@ -81,17 +92,30 @@ fn reported_details(answer: &Answer) -> Vec<ReportedDetail> {
         .collect()
 }
 
-/// The `(Namespace, OptionName)` pairs of the reported `OptionSettings` list.
-fn reported_setting_keys(answer: &Answer) -> Vec<(String, String)> {
+/// The identity triple of each reported `OptionSettings` entry —
+/// `(ResourceName, Namespace, OptionName)` — with whether that setting carries a
+/// VALUE: an option the set reports in force at NO value carries no `Value`
+/// member at all.
+fn reported_settings(answer: &Answer) -> Vec<(String, String, String, bool)> {
     answer
         .elements_at("OptionSettings/member")
         .iter()
         .map(|member| {
             (
+                member.value("ResourceName").unwrap_or_default().to_string(),
                 member.value("Namespace").unwrap_or_default().to_string(),
                 member.value("OptionName").unwrap_or_default().to_string(),
+                member.value("Value").is_some(),
             )
         })
+        .collect()
+}
+
+/// The identity triples of the reported `OptionSettings` list.
+fn reported_setting_keys(answer: &Answer) -> Vec<(String, String, String)> {
+    reported_settings(answer)
+        .into_iter()
+        .map(|(resource_name, namespace, option_name, _)| (resource_name, namespace, option_name))
         .collect()
 }
 
@@ -170,7 +194,7 @@ async fn a_template_write_reports_the_stored_templates_s3_location() {
     ];
 
     for case in cases {
-        let emulator = Emulator::new();
+        let emulator = Emulator::with_object_storage();
         let stack = published_stack_of_category("Python").name();
         created_in_region(
             &emulator,
@@ -179,18 +203,19 @@ async fn a_template_write_reports_the_stored_templates_s3_location() {
             &[("ApplicationName", case.application)],
         )
         .await;
-        // The fixed parts of the location — the Amazon S3 host form, the
-        // `elasticbeanstalk-<region>-<account>` bucket form and the
-        // saved-configuration prefix — are written out here rather than read
-        // back from the service, so a service that changed any of them fails.
-        let expected = format!(
-            "https://s3-{}.amazonaws.com/elasticbeanstalk-{}-{}/resources/templates/{}/{}",
-            case.region,
-            case.region,
-            engine::emulator_account_id(),
-            case.application,
-            case.template
+        // The fixed parts of the location — the address this emulator is
+        // REACHED on, the `elasticbeanstalk-<region>-<account>` bucket form and
+        // the saved-configuration prefix — are written out here rather than
+        // read back from the service, so a service that changed any of them
+        // fails. A production Amazon S3 hostname is not one this emulator
+        // answers on, so a client that followed it would never reach the
+        // document this service stored.
+        let key = format!(
+            "{}/{}",
+            eb::state::storage_bucket_name(case.region),
+            eb::state::configuration_template_key(case.application, case.template)
         );
+        let expected = format!("{}/{key}", smithy_server_runtime::UNSERVED_URL_BASE);
 
         let template_created = created_in_region(
             &emulator,
@@ -200,6 +225,7 @@ async fn a_template_write_reports_the_stored_templates_s3_location() {
                 ("ApplicationName", case.application),
                 ("TemplateName", case.template),
                 ("SolutionStackName", &stack),
+                ("Description", "a described saved configuration"),
             ],
         )
         .await;
@@ -211,8 +237,34 @@ async fn a_template_write_reports_the_stored_templates_s3_location() {
             template_created.body
         );
 
+        // The location is FOLLOWED: the document it names is one the emulator's
+        // own object storage really holds, so the bytes a client downloads are
+        // the configuration this service stored — its description and the
+        // platform version it is for.
+        let platform = template_created
+            .value("PlatformArn")
+            .expect("a created template reports the platform version it is for")
+            .to_string();
+        let downloaded = emulator
+            .s3_in_region(case.region, "GET", &format!("/{key}"), &[])
+            .await;
+        assert_eq!(
+            downloaded.status, 200,
+            "case {:?}: the reported location must hand back the stored document, got {} and \
+             body {}",
+            case.case, downloaded.status, downloaded.body
+        );
+        assert!(
+            downloaded.body.contains("a described saved configuration")
+                && downloaded.body.contains(&platform),
+            "case {:?}: the stored document must be this template's own configuration, got {}",
+            case.case,
+            downloaded.body
+        );
+
         // The same location on the update path: one template, one location,
-        // whatever the write.
+        // whatever the write — and the document that location names is the
+        // configuration the update settled.
         let updated = created_in_region(
             &emulator,
             case.region,
@@ -220,7 +272,7 @@ async fn a_template_write_reports_the_stored_templates_s3_location() {
             &[
                 ("ApplicationName", case.application),
                 ("TemplateName", case.template),
-                ("Description", "a described saved configuration"),
+                ("Description", "an updated saved configuration"),
             ],
         )
         .await;
@@ -230,6 +282,17 @@ async fn a_template_write_reports_the_stored_templates_s3_location() {
             "case {:?}: the update must report the same location, got {}",
             case.case,
             updated.body
+        );
+        let downloaded = emulator
+            .s3_in_region(case.region, "GET", &format!("/{key}"), &[])
+            .await;
+        assert!(
+            downloaded.status == 200
+                && downloaded.body.contains("an updated saved configuration"),
+            "case {:?}: the location must hand back the UPDATED document, got {} and body {}",
+            case.case,
+            downloaded.status,
+            downloaded.body
         );
 
         // A READ of the configuration set is not a template write: it reports
@@ -250,6 +313,27 @@ async fn a_template_write_reports_the_stored_templates_s3_location() {
             "case {:?}: a read must report no template location, got {}",
             case.case,
             described.body
+        );
+
+        // A DELETED saved configuration has no document: the location the
+        // writes reported stops handing one back.
+        created_in_region(
+            &emulator,
+            case.region,
+            "DeleteConfigurationTemplate",
+            &[
+                ("ApplicationName", case.application),
+                ("TemplateName", case.template),
+            ],
+        )
+        .await;
+        let gone = emulator
+            .s3_in_region(case.region, "GET", &format!("/{key}"), &[])
+            .await;
+        assert_eq!(
+            gone.status, 404,
+            "case {:?}: a deleted template's document must be gone, got {} and body {}",
+            case.case, gone.status, gone.body
         );
     }
 }
@@ -303,6 +387,13 @@ async fn a_read_of_a_configuration_set_attributes_every_option_and_names_its_tie
             case: "a web server environment that set one option",
             template: false,
             written: &[(APP_ENV, "SPRING_PROFILES_ACTIVE", "prod", "")],
+            tier: &[],
+            reported_tier: ("WebServer", "Standard", "1.0"),
+        },
+        AttributionCase {
+            case: "a template whose setting names a resource of its own",
+            template: true,
+            written: &[(SCHEDULED, "MaxSize", "8", "peak-hours")],
             tier: &[],
             reported_tier: ("WebServer", "Standard", "1.0"),
         },
@@ -375,17 +466,56 @@ async fn a_read_of_a_configuration_set_attributes_every_option_and_names_its_tie
         assert_eq!(
             details
                 .iter()
-                .map(|(namespace, option_name, _, _)| (namespace.clone(), option_name.clone()))
-                .collect::<Vec<(String, String)>>(),
+                .map(|(resource_name, namespace, option_name, _, _)| (
+                    resource_name.clone(),
+                    namespace.clone(),
+                    option_name.clone()
+                ))
+                .collect::<Vec<(String, String, String)>>(),
             settings,
             "case {:?}: every reported setting must carry its detail, got {}",
             case.case,
             read.body
         );
 
+        // The set carries the options the platform version SUPPLIES to the
+        // environment it provisions — read from the service, so the row names
+        // none of them — and the service puts the instance type's family in
+        // force among them.
+        let stack_of_the_set = eb::state::solution_stack_named(&stack);
+        let supplied = eb::state::platform_supplied_options(stack_of_the_set);
+        assert!(
+            !supplied.is_empty(),
+            "case {:?}: the platform version must supply options of its own",
+            case.case
+        );
+        for (namespace, option_name) in &supplied {
+            assert!(
+                settings.iter().any(|(_, reported_namespace, reported_name)| {
+                    reported_namespace == namespace && reported_name == option_name
+                }),
+                "case {:?}: {namespace}/{option_name} is supplied by the platform, so the \
+                 resolved set must carry it, got {}",
+                case.case,
+                read.body
+            );
+        }
+        let instance_type_family = reported_settings(&read)
+            .into_iter()
+            .find(|(_, _, option_name, _)| option_name == INSTANCE_TYPE_FAMILY)
+            .map(|(_, _, _, carries_a_value)| carries_a_value);
+        assert_eq!(
+            instance_type_family,
+            Some(true),
+            "case {:?}: the instance type's family is a value the service puts in force, got {}",
+            case.case,
+            read.body
+        );
+
         // The source of each value: the API where the configuration set itself
         // holds the setting, the service where the value is the platform
-        // version's own default.
+        // version's own default or one it supplies — and NO source at all where
+        // the option is in force at no value, because no layer put one there.
         let written: BTreeSet<(String, String)> = case
             .written
             .iter()
@@ -393,8 +523,12 @@ async fn a_read_of_a_configuration_set_attributes_every_option_and_names_its_tie
                 ((*namespace).to_string(), (*option_name).to_string())
             })
             .collect();
-        for (namespace, option_name, identifier, origin) in &details {
-            let expected = if written.contains(&(namespace.clone(), option_name.clone())) {
+        for ((_, namespace, option_name, identifier, origin), (_, _, _, carries_a_value)) in
+            details.iter().zip(reported_settings(&read))
+        {
+            let expected = if !carries_a_value {
+                ""
+            } else if written.contains(&(namespace.clone(), option_name.clone())) {
                 eb::state::OPTION_SOURCE_API
             } else {
                 eb::state::OPTION_SOURCE_SERVICE
@@ -407,11 +541,24 @@ async fn a_read_of_a_configuration_set_attributes_every_option_and_names_its_tie
                 read.body
             );
         }
+        // At least one option is in force at no value on every platform
+        // version this service publishes — the parameters it supplies no value
+        // for — so the no-source half of the rule above is really exercised.
+        assert!(
+            reported_settings(&read)
+                .iter()
+                .any(|(_, _, _, carries_a_value)| !carries_a_value),
+            "case {:?}: expected an option in force at no value, got {}",
+            case.case,
+            read.body
+        );
         // Every option the request set is in the resolved set, so the detail
         // above really did cover it.
         for (namespace, option_name) in &written {
             assert!(
-                settings.contains(&(namespace.clone(), option_name.clone())),
+                settings.iter().any(|(_, reported_namespace, reported_name)| {
+                    reported_namespace == namespace && reported_name == option_name
+                }),
                 "case {:?}: {namespace}/{option_name} must be in the resolved set, got {}",
                 case.case,
                 read.body

@@ -999,6 +999,79 @@ pub(super) const PLATFORM_CATEGORY_CONFIGURATION_OPTIONS: &[(&str, &[Configurati
 /// its web tier offers. See [`PLATFORM_CATEGORY_CONFIGURATION_OPTIONS`].
 pub(super) const LINUX_CONFIGURATION_OPTIONS: &[ConfigurationOption] = &[PROXY_NGINX_OR_NONE];
 
+/// The namespace holding the parameters Elastic Beanstalk fills into the
+/// CloudFormation template it builds for an environment. It is not a namespace a
+/// platform version publishes a configurable option description of (it is listed
+/// in
+/// [`super::configuration_option_namespaces::UNDESCRIBED_CONFIGURATION_NAMESPACES`]),
+/// and it carries options a configuration SET reports — see
+/// [`PLATFORM_SUPPLIED_OPTIONS`]. The environment properties an application
+/// reads ([`NAMESPACE_APPLICATION_ENVIRONMENT`]) are the other such namespace.
+pub(super) const NAMESPACE_TEMPLATE_PARAMETER: &str = "aws:cloudformation:template:parameter";
+
+/// The template parameter whose value is the FAMILY of the instance type the
+/// configuration runs on — the one parameter below this service puts a value in
+/// force for, derived from the type itself (see [`supplied_option_values`]).
+pub(super) const OPTION_INSTANCE_TYPE_FAMILY: &str = "InstanceTypeFamily";
+
+/// The options EVERY platform version SUPPLIES to the environment it provisions
+/// rather than publishes for configuration: the parameters of the
+/// CloudFormation template Elastic Beanstalk builds for that environment.
+///
+/// RECORDED BEHAVIOUR, not modelled and not in the published option reference:
+/// the awsQuery `DescribeConfigurationSettings` answers in this project's
+/// recorded corpus carry these three
+/// [`NAMESPACE_TEMPLATE_PARAMETER`] entries in the resolved set of a
+/// configuration nobody wrote them into, so they belong to the set the platform
+/// version puts in force rather than to what a caller configured. They are
+/// listed as (namespace, option name) pairs and not as
+/// [`ConfigurationOption`]s because a platform publishes no
+/// `ConfigurationOptionDescription` for them: there is no default, no change
+/// severity and no value set to publish, which is exactly why
+/// `DescribeConfigurationOptions` describes none of them.
+pub const PLATFORM_SUPPLIED_OPTIONS: &[(&str, &str)] = &[
+    (NAMESPACE_TEMPLATE_PARAMETER, OPTION_INSTANCE_TYPE_FAMILY),
+    (NAMESPACE_TEMPLATE_PARAMETER, "StaticFiles"),
+    (NAMESPACE_TEMPLATE_PARAMETER, "EnvironmentVariables"),
+];
+
+/// The environment properties a PYTHON platform version supplies on top of
+/// those: the module search path its application server reads. Same source as
+/// [`PLATFORM_SUPPLIED_OPTIONS`] — a recorded resolved set of a Python
+/// configuration carries it.
+const PYTHON_SUPPLIED_OPTIONS: &[(&str, &str)] =
+    &[(NAMESPACE_APPLICATION_ENVIRONMENT, "PYTHONPATH")];
+
+/// The properties a platform version supplies because of the RUNTIME it runs,
+/// by the [`SolutionStack::platform_category`] the catalog publishes it under —
+/// the same keying [`PLATFORM_CATEGORY_CONFIGURATION_OPTIONS`] uses. A category
+/// not listed here supplies none: this emulator has no recorded resolved set
+/// for it, and a property guessed from nothing would be reported as the
+/// platform's.
+const PLATFORM_CATEGORY_SUPPLIED_OPTIONS: &[(&str, &[(&str, &str)])] =
+    &[("Python", PYTHON_SUPPLIED_OPTIONS)];
+
+/// The options the platform version `stack` SUPPLIES to a configuration set for
+/// it: the template parameters every version supplies, then the properties its
+/// runtime adds. See [`PLATFORM_SUPPLIED_OPTIONS`].
+pub fn platform_supplied_options(
+    stack: Option<&SolutionStack>,
+) -> Vec<(&'static str, &'static str)> {
+    let runtime = stack
+        .and_then(|stack| {
+            PLATFORM_CATEGORY_SUPPLIED_OPTIONS
+                .iter()
+                .find(|(category, _)| *category == stack.platform_category)
+                .map(|(_, supplied)| *supplied)
+        })
+        .unwrap_or_default();
+    PLATFORM_SUPPLIED_OPTIONS
+        .iter()
+        .chain(runtime)
+        .copied()
+        .collect()
+}
+
 /// The configuration options the platform version `stack` defines, in a stable
 /// order (by namespace, then by option name) so two reads of one platform
 /// report the same catalog in the same sequence.
@@ -1081,17 +1154,25 @@ pub fn named_platform_version(
         .or_else(|| platform_arn.and_then(|arn| managed_platform_version(region, arn)))
 }
 
-/// The option settings a configuration SET holds, RESOLVED: the option catalog
-/// `catalog` publishes at its default values, with the settings `written` on the
+/// The option settings a configuration SET holds, RESOLVED: the options
+/// `supplied` by the platform version, then the option catalog `catalog`
+/// publishes at its default values, with the settings `written` on the
 /// configuration itself applied over them.
 ///
-/// Elastic Beanstalk resolves a configuration through a layered chain — the
-/// platform version's defaults, then the saved configuration, then the settings
-/// set on the environment — so the configuration set a read reports is the
-/// resolved one: it carries options nobody wrote, each at the `DefaultValue`
-/// `DescribeConfigurationOptions` publishes for the same (`Namespace`,
-/// `OptionName`) on that platform version, and an option the configuration DOES
-/// set at the value it was set to.
+/// Elastic Beanstalk resolves a configuration through a layered chain — what the
+/// platform version supplies and defaults, then the saved configuration, then
+/// the settings set on the environment — so the configuration set a read reports
+/// is the resolved one: it carries options nobody wrote, each at the
+/// `DefaultValue` `DescribeConfigurationOptions` publishes for the same
+/// (`Namespace`, `OptionName`) on that platform version, and an option the
+/// configuration DOES set at the value it was set to.
+///
+/// The `supplied` options are the ones that platform version SUPPLIES to the
+/// environment it provisions rather than publishes for configuration (see
+/// [`platform_supplied_options`]): they are in the set whether or not a value is
+/// in force for them, because the platform puts them there — an option in force
+/// at no value is reported with no `Value`, which is also what makes it
+/// attributable to no layer (see [`resolved_option_setting_details`]).
 ///
 /// An option the catalog defines no default for is in force at no value, so it
 /// is reported only where the configuration sets it; an option the catalog does
@@ -1104,8 +1185,23 @@ pub fn named_platform_version(
 /// set.
 pub fn resolved_option_settings(
     catalog: &[&'static ConfigurationOption],
+    supplied: &[(&'static str, &'static str)],
     written: &[ConfigurationOptionSetting],
 ) -> Vec<ConfigurationOptionSetting> {
+    // The options the platform SUPPLIES come first, which is where the recorded
+    // resolved sets carry them: they are the parameters of the environment the
+    // service provisions, not values a caller chose.
+    let supplied: Vec<ConfigurationOptionSetting> = supplied
+        .iter()
+        .map(|(namespace, option_name)| ConfigurationOptionSetting {
+            resource_name: None,
+            namespace: Some((*namespace).to_string()),
+            option_name: Some((*option_name).to_string()),
+            // In force at no value until the service puts one in force
+            // ([`supplied_option_values`]) or the configuration sets it.
+            value: None,
+        })
+        .collect();
     let defaults: Vec<ConfigurationOptionSetting> = catalog
         .iter()
         .filter(|option| !option.default_value.is_empty())
@@ -1119,7 +1215,39 @@ pub fn resolved_option_settings(
             value: Some(option.default_value.to_string()),
         })
         .collect();
-    merge_option_settings(&defaults, written)
+    let mut resolved = merge_option_settings(&merge_option_settings(&supplied, &defaults), written);
+    supplied_option_values(&mut resolved);
+    resolved
+}
+
+/// Put the values the SERVICE itself derives for the options it supplies in
+/// force on the resolved set `resolved`.
+///
+/// The template parameter [`OPTION_INSTANCE_TYPE_FAMILY`] is the family of the
+/// instance type the configuration runs on ([`environment_instance_type`], the
+/// same derivation the environment's resources are reported from), so it tracks
+/// the type the configuration puts in force rather than being written out. A
+/// parameter the configuration ITSELF sets keeps the value it was set to: the
+/// derivation fills only a parameter in force at no value.
+fn supplied_option_values(resolved: &mut [ConfigurationOptionSetting]) {
+    let instance_type = environment_instance_type(resolved);
+    let family = instance_type_family(&instance_type).to_string();
+    for setting in resolved.iter_mut() {
+        let supplies_the_family = setting.namespace.as_deref() == Some(NAMESPACE_TEMPLATE_PARAMETER)
+            && setting.option_name.as_deref() == Some(OPTION_INSTANCE_TYPE_FAMILY);
+        if supplies_the_family && setting.value.is_none() {
+            setting.value = Some(family.clone());
+        }
+    }
+}
+
+/// The FAMILY of the Amazon EC2 instance type `instance_type`: the part before
+/// the size, which is how an instance type is named (`<family>.<size>`). A name
+/// carrying no size is its own family.
+fn instance_type_family(instance_type: &str) -> &str {
+    instance_type
+        .split_once('.')
+        .map_or(instance_type, |(family, _)| family)
 }
 
 /// `OptionSource$Origin` (and `$Identifier`) for a value in force because the
@@ -1140,20 +1268,26 @@ pub const OPTION_SOURCE_API: &str = "API";
 /// one entry per setting [`resolved_option_settings`] reports, in the same
 /// order, so the two lists line up position for position.
 ///
-/// The source is decided by the layer the value came from: an option the
-/// configuration set WROTE is in force because a request set it ([`
-/// OPTION_SOURCE_API`]), and one in force only because the platform version
-/// defines that default is the SERVICE's ([`OPTION_SOURCE_SERVICE`]). This is
-/// the only thing that tells a value a caller set apart from an inherited
-/// default, which is what a client reads to confirm a setting it applied took
-/// effect.
+/// The source is the layer the value in force came from: an option the
+/// configuration set WROTE is in force because a request set it
+/// ([`OPTION_SOURCE_API`]), and one in force because the platform version
+/// defines that default or supplies that value is the SERVICE's
+/// ([`OPTION_SOURCE_SERVICE`]). This is the only thing that tells a value a
+/// caller set apart from an inherited default, which is what a client reads to
+/// confirm a setting it applied took effect.
+///
+/// An option the set reports at NO value came from NO layer, so it carries no
+/// `OptionSource` at all rather than one naming a source that put nothing in
+/// force — which is how the recorded answers report the options a platform
+/// version supplies without a value (see [`PLATFORM_SUPPLIED_OPTIONS`]).
 pub fn resolved_option_setting_details(
     catalog: &[&'static ConfigurationOption],
+    supplied: &[(&'static str, &'static str)],
     written: &[ConfigurationOptionSetting],
 ) -> Vec<OptionSettingDetail> {
     let set_through_the_api: BTreeSet<(String, String, String)> =
         written.iter().map(option_setting_key).collect();
-    resolved_option_settings(catalog, written)
+    resolved_option_settings(catalog, supplied, written)
         .iter()
         .map(|setting| {
             let origin = if set_through_the_api.contains(&option_setting_key(setting)) {
@@ -1162,9 +1296,13 @@ pub fn resolved_option_setting_details(
                 OPTION_SOURCE_SERVICE
             };
             OptionSettingDetail {
+                // The three members that NAME the option, the triple an
+                // `OptionSpecification` names one by, so a detail about an
+                // option set on a resource of its own says which resource.
+                resource_name: setting.resource_name.clone(),
                 namespace: setting.namespace.clone(),
                 option_name: setting.option_name.clone(),
-                option_source: Some(OptionSource {
+                option_source: setting.value.as_ref().map(|_| OptionSource {
                     identifier: Some(origin.to_string()),
                     origin: Some(origin.to_string()),
                 }),

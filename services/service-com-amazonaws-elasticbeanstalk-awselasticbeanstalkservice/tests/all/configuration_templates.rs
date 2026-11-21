@@ -187,7 +187,10 @@ pub(crate) fn expected_options(
 /// and needs to say nothing here. A setting written at exactly its platform's
 /// default is not an override by this measure and so is invisible to it — the
 /// resolution suite asserts the whole resolved set, which is where that case is
-/// covered.
+/// covered. The options that platform version SUPPLIES
+/// (`eb::state::platform_supplied_options`, the parameters of the environment
+/// the service provisions) are not overrides either: nothing a caller wrote put
+/// them in the set.
 pub(crate) fn overridden_options(answer: &Answer) -> Vec<(String, String, String, String)> {
     let stack = answer
         .value("SolutionStackName")
@@ -195,15 +198,23 @@ pub(crate) fn overridden_options(answer: &Answer) -> Vec<(String, String, String
     // Worker-tier options included, so an option is recognised at its default
     // whichever tier the configuration set is for.
     let catalog = eb::state::published_configuration_options(stack, true);
+    let supplied = eb::state::platform_supplied_options(stack);
     let mut overrides: Vec<(String, String, String, String)> = reported_options(answer)
         .into_iter()
         .filter(|(namespace, option_name, value, resource_name)| {
-            !resource_name.is_empty()
-                || !catalog.iter().any(|option| {
-                    option.namespace == namespace.as_str()
-                        && option.name == option_name.as_str()
-                        && option.default_value == value.as_str()
-                })
+            let supplied_by_the_platform = supplied
+                .iter()
+                .any(|(supplied_namespace, supplied_name)| {
+                    *supplied_namespace == namespace.as_str()
+                        && *supplied_name == option_name.as_str()
+                });
+            !supplied_by_the_platform
+                && (!resource_name.is_empty()
+                    || !catalog.iter().any(|option| {
+                        option.namespace == namespace.as_str()
+                            && option.name == option_name.as_str()
+                            && option.default_value == value.as_str()
+                    }))
         })
         .collect();
     overrides.sort();

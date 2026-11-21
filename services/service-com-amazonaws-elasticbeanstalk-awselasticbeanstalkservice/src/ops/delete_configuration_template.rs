@@ -157,12 +157,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteConfigurationTemplateError::internal_failure(
                 "the Elastic Beanstalk store is unavailable",
             )
         })?;
+        // Everything this call settles under the store's lock, which is
+        // RELEASED before the document below is deleted: that delete reaches
+        // object storage in process, and no state of this service is read
+        // while it runs. A name the application holds no saved configuration
+        // under answers from inside it — there is no record and no document of
+        // this emulator's to delete.
+        {
         let mut store = state.lock();
         // Every event this call records belongs to this one request's activity.
         let request_id = crate::state::new_request_id();
@@ -217,6 +223,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None,
             template.event_subject(),
         );
+
+        }
+
+        // The saved configuration's own document goes with it: the location the
+        // template writes reported named an object in the account's storage
+        // bucket, and a deleted template has none.
+        crate::state::discard_configuration_template_document(
+            ctx,
+            &crate::state::request_region(ctx),
+            &input.application_name,
+            &input.template_name,
+        )
+        .await;
 
         Ok(DeleteConfigurationTemplateOutput)
     }

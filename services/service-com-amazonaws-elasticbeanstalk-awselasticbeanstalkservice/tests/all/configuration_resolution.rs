@@ -4,14 +4,16 @@
 //! end to end over this service's awsQuery surface.
 //!
 //! RULE under test: a configuration set reports the RESOLVED option settings of
-//! the platform version it is for — every option that version's published
-//! catalogue gives a `DefaultValue` for, at that default, with the settings the
-//! configuration itself holds replacing the defaults of the options they name
-//! and adding the options the catalogue does not define. So the set a read
-//! answers with carries options the caller never wrote, an option the catalogue
-//! gives no default for is reported only where the configuration sets it, and an
-//! option an `OptionsToRemove` takes out stops overriding its default and
-//! resolves back to it instead of vanishing from the set.
+//! the platform version it is for — the options that version SUPPLIES to the
+//! environment it provisions and every option its published catalogue gives a
+//! `DefaultValue` for, at that default, with the settings the configuration
+//! itself holds replacing the defaults of the options they name and adding the
+//! options the catalogue does not define. So the set a read answers with carries
+//! options the caller never wrote, a supplied option the service puts no value
+//! in force for is reported with no value, an option the catalogue gives no
+//! default for is reported only where the configuration sets it, and an option
+//! an `OptionsToRemove` takes out stops overriding its default and resolves back
+//! to it instead of vanishing from the set.
 //!
 //! The defaults every assertion here is made against are read over the WIRE from
 //! `DescribeConfigurationOptions` — the operation that owns the catalogue — so
@@ -37,7 +39,7 @@ use crate::configuration_templates::{
     as_params, created, option_params, published_stack_of_category, remove_params,
     reported_options as reported_settings,
 };
-use crate::lifecycle::{Answer, Emulator, PAST_DUE};
+use crate::lifecycle::{wait_for_status, Answer, Emulator};
 use service_com_amazonaws_elasticbeanstalk_awselasticbeanstalkservice as eb;
 
 /// The application every configuration set below belongs to.
@@ -134,22 +136,46 @@ async fn published_option_named(
     (found.namespace, found.name)
 }
 
-/// The configuration set `written` puts in force on the platform version whose
-/// published defaults are `defaults`: every default, with the written settings
-/// over them, sorted by the key an option is identified by.
+/// The configuration set `written` puts in force on the platform version
+/// `stack`, whose published defaults are `defaults`: the options that version
+/// SUPPLIES, then every published default, with the written settings over them,
+/// sorted by the key an option is identified by.
+///
+/// The supplied options are the ones the platform version puts in the set
+/// without publishing a configurable description of them — the parameters of the
+/// environment the service provisions — so WHICH they are is read from the
+/// service (`eb::state::platform_supplied_options`) rather than listed here.
+/// Each is in force at no value, reported with no `Value` (which the reader
+/// answers as the empty string), except the instance-type FAMILY, which the
+/// service derives from the instance type the configuration runs on.
 fn expected_resolved(
+    stack: &str,
     defaults: &BTreeMap<(String, String), String>,
     written: &[Setting],
 ) -> Vec<Setting> {
-    let mut resolved: BTreeMap<(String, String, String), String> = defaults
-        .iter()
-        .map(|((namespace, option_name), value)| {
-            (
-                (namespace.clone(), option_name.clone(), String::new()),
-                value.clone(),
-            )
-        })
-        .collect();
+    let published = eb::state::solution_stack_named(stack);
+    let family = expected_instance_type_family(defaults, written);
+    let mut resolved: BTreeMap<(String, String, String), String> =
+        eb::state::platform_supplied_options(published)
+            .into_iter()
+            .map(|(namespace, option_name)| {
+                let value = if option_name == INSTANCE_TYPE_FAMILY {
+                    family.clone()
+                } else {
+                    String::new()
+                };
+                (
+                    (namespace.to_string(), option_name.to_string(), String::new()),
+                    value,
+                )
+            })
+            .collect();
+    resolved.extend(defaults.iter().map(|((namespace, option_name), value)| {
+        (
+            (namespace.clone(), option_name.clone(), String::new()),
+            value.clone(),
+        )
+    }));
     for (namespace, option_name, value, resource_name) in written {
         resolved.insert(
             (
@@ -168,6 +194,39 @@ fn expected_resolved(
         .collect();
     rows.sort();
     rows
+}
+
+/// The template parameter the service puts the instance type's FAMILY in force
+/// as, and the launch-configuration option naming that type.
+const INSTANCE_TYPE_FAMILY: &str = "InstanceTypeFamily";
+/// See [`INSTANCE_TYPE_FAMILY`].
+const LAUNCH_CONFIGURATION: &str = "aws:autoscaling:launchconfiguration";
+/// See [`INSTANCE_TYPE_FAMILY`].
+const INSTANCE_TYPE: &str = "InstanceType";
+
+/// The value the instance-type family is in force at: the part before the size
+/// of the instance type the configuration runs on — the one the configuration
+/// wrote, else the default the platform version publishes for it, else the type
+/// an environment that names none runs.
+fn expected_instance_type_family(
+    defaults: &BTreeMap<(String, String), String>,
+    written: &[Setting],
+) -> String {
+    let instance_type = written
+        .iter()
+        .find(|(namespace, option_name, _, _)| {
+            namespace == LAUNCH_CONFIGURATION && option_name == INSTANCE_TYPE
+        })
+        .map(|(_, _, value, _)| value.clone())
+        .or_else(|| {
+            defaults
+                .get(&(LAUNCH_CONFIGURATION.to_string(), INSTANCE_TYPE.to_string()))
+                .cloned()
+        })
+        .unwrap_or_else(|| eb::state::DEFAULT_INSTANCE_TYPE.to_string());
+    instance_type
+        .split_once('.')
+        .map_or(instance_type.clone(), |(family, _)| family.to_string())
 }
 
 /// The option settings `answer` reports, sorted the way [`expected_resolved`]
@@ -332,7 +391,7 @@ async fn a_configuration_set_reports_the_published_defaults_with_its_own_setting
         let reported = resolved_settings(&only_set(&described, case));
         assert_eq!(
             reported,
-            expected_resolved(&defaults, written),
+            expected_resolved(&stack, &defaults, written),
             "case {case:?}: the configuration set must be the published defaults with its own \
              settings over them, got {}",
             described.body
@@ -488,7 +547,7 @@ async fn removing_an_override_resolves_the_option_back_to_its_published_default(
             &as_params(&update),
         )
         .await;
-        let expected = expected_resolved(&defaults, remaining);
+        let expected = expected_resolved(&stack, &defaults, remaining);
         assert_eq!(
             resolved_settings(&updated),
             expected,
@@ -556,15 +615,18 @@ async fn removing_an_option_from_an_environment_leaves_it_at_its_published_defau
     ];
     params.extend(option_params(&borrowed(&written)));
     created(&emulator, "CreateEnvironment", &as_params(&params)).await;
-    // The launch the clock owed, then the update's own deployment: the
-    // configuration an update deploys is the environment's draft until then.
-    std::thread::sleep(PAST_DUE);
+    // The launch the clock owed, waited for by the CONDITION it ends in: the
+    // environment is `Ready` once the launch has completed.
+    wait_for_status(&emulator, case, "removal-env", eb::state::STATUS_READY).await;
 
     let mut update: Vec<(String, String)> =
         vec![("EnvironmentName".to_string(), "removal-env".to_string())];
     update.extend(remove_params(&[(ASG, "MinSize", "")]));
     created(&emulator, "UpdateEnvironment", &as_params(&update)).await;
-    std::thread::sleep(PAST_DUE);
+    // The update's own deployment: the configuration an update deploys is the
+    // environment's draft until that deployment completes, which is again the
+    // environment being back at `Ready`.
+    wait_for_status(&emulator, case, "removal-env", eb::state::STATUS_READY).await;
 
     let described = created(
         &emulator,
@@ -577,7 +639,7 @@ async fn removing_an_option_from_an_environment_leaves_it_at_its_published_defau
     .await;
     assert_eq!(
         resolved_settings(&only_set(&described, case)),
-        expected_resolved(&defaults, &[setting(APP_ENV, "STAGE", "qa", "")]),
+        expected_resolved(&stack, &defaults, &[setting(APP_ENV, "STAGE", "qa", "")]),
         "case {case:?}: the removed option must be back at its published default, got {}",
         described.body
     );
@@ -635,7 +697,7 @@ async fn an_option_with_no_published_default_is_reported_only_when_the_set_sets_
         let reported = resolved_settings(&only_set(&described, case));
         assert_eq!(
             reported,
-            expected_resolved(&defaults, &written),
+            expected_resolved(&stack, &defaults, &written),
             "case \"{case}, {name}\": unexpected resolved set, got {}",
             described.body
         );
@@ -724,7 +786,7 @@ async fn removing_an_option_whose_value_the_service_sets_is_refused() {
     .await;
     assert_eq!(
         resolved_settings(&only_set(&described, case)),
-        expected_resolved(&defaults, &written),
+        expected_resolved(&stack, &defaults, &written),
         "case {case:?}: a refused update must leave the configuration set as it stood, got {}",
         described.body
     );
