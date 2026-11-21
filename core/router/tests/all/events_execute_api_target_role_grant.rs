@@ -51,9 +51,11 @@ const SOURCE_HEADER_VALUE: &str = "rule-denied";
 /// own ARN.
 ///
 /// This suite's own setup is the crate's one setup for a CUSTOM BUS whose rules target a deployed
-/// stage: the sibling suite that varies the FAN-OUT of one event over several such targets
-/// (`crate::events_execute_api_target_role_independence`) imports the items marked `pub(crate)`
-/// here, so there is ONE set of setup calls and ONE wording of the refused invoke for both.
+/// stage: the sibling suites that vary the FAN-OUT of one event over several such targets
+/// (`crate::events_execute_api_target_role_independence`) and the IDENTITY each request at that
+/// method is made under (`crate::events_execute_api_stage_answers_every_caller`) import the items
+/// marked `pub(crate)` here, so there is ONE set of setup calls and ONE wording of the refused
+/// invoke for all of them.
 pub(crate) const INVOKE_ACTION: &str = "execute-api:Invoke";
 
 /// The opening of the sentence EventBridge words a refused invoke with: the status the stage
@@ -270,7 +272,11 @@ async fn wired(
 }
 
 /// Publish one matching entry on the custom bus, which has to be accepted.
-async fn published(
+///
+/// `pub(crate)` for the reason the header gives: a sibling suite that wires its own targets to
+/// the stage this suite stands up publishes through this, so there is one wording of a
+/// publication for both.
+pub(crate) async fn published(
     router: &MultiServiceRouter,
     case: &str,
     stage: &Deployed,
