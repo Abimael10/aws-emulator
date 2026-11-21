@@ -24,7 +24,8 @@ use serde_json::{json, Value};
 
 use super::control_plane_refusal_wording::message;
 use super::domain_lifecycle::{
-    create_baseline, error_code, Answer, Emulator, PREFIX, RECORDED_NOT_FOUND_STATUS,
+    create_baseline, create_index_serving_baseline, error_code, Answer, Emulator, PREFIX,
+    RECORDED_NOT_FOUND_STATUS,
 };
 use super::insight_details::guid;
 
@@ -332,7 +333,9 @@ async fn every_kind_of_resource_this_account_does_not_hold_is_answered_on_one_st
     // a held domain carries is a missing resource too, so what moves the status is the
     // error shape and not which half of the address resolved.
     let held = "status-index-domain";
-    create_baseline(&emulator, held).await;
+    // The index operations are served by a domain whose engine offers them, so the rows
+    // below reach the index lookup rather than that software-version gate.
+    create_index_serving_baseline(&emulator, held).await;
     for (method, operation) in [("GET", "GetIndex"), ("DELETE", "DeleteIndex")] {
         let answer = emulator
             .call(

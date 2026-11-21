@@ -11,7 +11,12 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-opensearch-amazonopensearchservice.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.opensearch#DeleteApplicationRequest")]
+// `skip_validation = ["id"]`: the member's modelled `@pattern` is not the surface this
+// service validates an application id against, so the member is taken off the request
+// boundary and the handler holds it to the service's own rule
+// ([`crate::state::application_id_refusal`]) — see `attach_data_source_types` for the whole
+// reason.
+#[smithy_macros::smithy(shape = "com.amazonaws.opensearch#DeleteApplicationRequest", skip_validation = ["id"])]
 #[derive(Debug, Clone, Default)]
 pub struct DeleteApplicationInput {
     pub id: String,

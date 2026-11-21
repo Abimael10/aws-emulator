@@ -11,7 +11,12 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-opensearch-amazonopensearchservice.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.opensearch#AttachDataSourceRequest")]
+// `skip_validation = ["id"]`: the `Id` member's modelled `@pattern` is not the surface this
+// service validates an application id against — that surface admits a hyphen inside the id,
+// so the member is taken off the request boundary and the handler holds it to the service's
+// own rule ([`crate::state::application_id_refusal`]), which is what lets an id of that form
+// be RESOLVED rather than refused as malformed.
+#[smithy_macros::smithy(shape = "com.amazonaws.opensearch#AttachDataSourceRequest", skip_validation = ["id"])]
 #[derive(Debug, Clone, Default)]
 pub struct AttachDataSourceInput {
     pub id: String,

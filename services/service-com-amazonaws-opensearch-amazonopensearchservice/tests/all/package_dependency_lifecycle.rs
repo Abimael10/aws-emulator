@@ -49,8 +49,8 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
 };
 
 use super::domain_lifecycle::{
-    create_baseline, error_code, string_member, Answer, Emulator, RECORDED_NOT_FOUND_STATUS,
-    SETTLE_WAIT,
+    create_index_serving_baseline, error_code, string_member, Answer, Emulator,
+    RECORDED_NOT_FOUND_STATUS, SETTLE_WAIT,
 };
 use super::index_deletion::deleted_index;
 use super::index_registry::{create as create_index, created_index, get as get_index};
@@ -110,7 +110,9 @@ fn reference_path(emulator: &Emulator, package_id: &str, case: &str) -> String {
 /// them yet. Answers the `PackageID` the create minted.
 pub(crate) async fn domain_and_package(emulator: &Emulator, domain: &str, package: &str) -> String {
     let package_id = create_package(emulator, package, PACKAGE_TYPE_TXT_DICTIONARY).await;
-    create_baseline(emulator, domain).await;
+    // These cases drive the INDEX operations against this domain, so it runs a release whose
+    // engine serves them.
+    create_index_serving_baseline(emulator, domain).await;
     // The copy span `CreatePackage` leaves the package in `COPYING` for, and the
     // domain's own provisioning span, both fall due inside this one wait.
     tokio::time::sleep(SETTLE_WAIT).await;

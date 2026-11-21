@@ -32,12 +32,13 @@ use crate::ops::types::{DependencyFailureException, InternalException, Validatio
 /// so a domain running that engine serves none of these operations.
 pub const INDEX_MANAGEMENT_ENGINE_TYPE: &str = ENGINE_TYPE_OPENSEARCH;
 
-/// The oldest OpenSearch release that serves them: the machine-learning and neural search
-/// the semantic enrichment these operations configure is built on arrived in the engine's
-/// SECOND generation, so this is the first `OpenSearch_2` release the service offers
-/// ([`super::SUPPORTED_ENGINE_VERSIONS`]) and a domain on an older release is behind the
-/// software this feature needs.
-pub const INDEX_MANAGEMENT_ENGINE_VERSION: &str = "OpenSearch_2.3";
+/// The oldest OpenSearch release that serves them: these operations configure an index's
+/// AUTOMATIC SEMANTIC ENRICHMENT, which is built on the engine's own `semantic` field type
+/// ([`MAPPING_FIELD_TYPES`]) — a mapper the engine added in its THIRD major generation — so
+/// this is the first `OpenSearch_3` release the service offers
+/// ([`super::SUPPORTED_ENGINE_VERSIONS`]) and a domain on any earlier release is behind the
+/// software this feature needs, whichever of the two engines it runs.
+pub const INDEX_MANAGEMENT_ENGINE_VERSION: &str = "OpenSearch_3.1";
 
 /// Whether a domain running `engine_version` serves the index-management operations: its
 /// engine has to be [`INDEX_MANAGEMENT_ENGINE_TYPE`], at
@@ -62,17 +63,24 @@ pub fn serves_index_management(engine_version: &str) -> bool {
     }
 }
 
-/// The service's sentence for a feature a domain's software cannot serve — the
-/// software-version gate.
+/// The sentence the index-management gate is refused with, for every operation it gates and
+/// every engine version it gates them on ([`INDEX_MANAGEMENT_UNSUPPORTED`]).
 ///
-/// It is stated ONCE for this service, by
-/// [`super::DOMAIN_NOT_ON_LATEST_SOFTWARE_VERSION`] (the package operations sit behind the
-/// same gate and the corpus records that whole message, trailing space included), and
-/// reached from here, so the two gates of one service cannot answer one condition with two
-/// texts.
+/// It is the feature these operations configure that the software cannot serve, so the
+/// sentence names that feature rather than the domain or the release it runs: the whole
+/// message, with no variable part. One text for the four operations and for both engines, so
+/// a client can tell this gate from every other `ValidationException` they raise.
+///
+/// It is NOT the sentence the PACKAGE operations' own gate states
+/// ([`super::DOMAIN_NOT_ON_LATEST_SOFTWARE_VERSION`]): those are two gates over two features,
+/// each recorded with its own text.
+pub const INDEX_MANAGEMENT_UNSUPPORTED: &str =
+    "Automatic Semantic Enrichment feature is not supported on this software version.";
+
+/// That sentence as the refusal.
 pub fn index_management_unavailable() -> ValidationException {
     ValidationException {
-        message: Some(super::DOMAIN_NOT_ON_LATEST_SOFTWARE_VERSION.to_string()),
+        message: Some(INDEX_MANAGEMENT_UNSUPPORTED.to_string()),
     }
 }
 

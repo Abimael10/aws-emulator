@@ -72,7 +72,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{service_state, state_unavailable};
+use crate::state::{application_id_refusal, service_state, state_unavailable};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -153,6 +153,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+
+        // The id is held to the surface this service RESOLVES an application by, here rather
+        // than at the request boundary (`skip_validation` on this input), so a value that
+        // surface admits reaches the lookup below — where an id the account holds no
+        // application under is the idempotent answer stated there — rather than being
+        // refused as malformed ([`crate::state::application_id_refusal`]).
+        if let Some(refusal) = application_id_refusal("id", &input.id) {
+            return Err(DeleteApplicationErrorModeled::ValidationException(refusal).into());
+        }
 
         // The record this call removes is resolved with whatever the clock already owed
         // it materialised, so the delete acts on the application as it stands at `now`

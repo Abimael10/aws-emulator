@@ -322,7 +322,13 @@ enum Stated {
 /// of every operation: this is the surface the model has not caught up with, not a second
 /// copy of it.
 const STATED: &[(&str, &[Stated])] = &[
-    ("id", &[Stated::Pattern(r"^(?!-)[a-z0-9\-]{3,30}$")]),
+    // The expression is `crate::state`'s, the one home of the id surface this service
+    // resolves an application by — the same statement the handlers APPLY, so what a clause
+    // quotes and what a value is held to cannot drift.
+    (
+        "id",
+        &[Stated::Pattern(crate::state::APPLICATION_ID_PATTERN)],
+    ),
     (
         "applicationId",
         &[Stated::Pattern("[a-z0-9-]{3,30}"), Stated::MaxLength(30)],
@@ -373,6 +379,35 @@ fn stated_violations(violation: &Violation) -> Vec<Violation> {
         return vec![violation.clone()];
     }
     stated
+}
+
+/// The `ValidationException` message this service states for a member whose own validation
+/// surface a HANDLER applied: the clauses [`STATED`] records for that member over the value
+/// it was handed — the expression the value is outside of, and a recorded bound it is past.
+///
+/// This is the refusal half of a member taken OFF the request boundary (`skip_validation` in
+/// `src/ops/types/`, for a member whose surface the model's traits do not describe): the
+/// handler decides WHICH values earn it, and the words are the ones the boundary's own report
+/// would have used for the same value, so a caller cannot tell the two apart.
+///
+/// `None` for a member this table records no surface for — there is nothing for this service
+/// to state about it beyond the model's own traits, which the boundary still reports.
+pub(crate) fn stated_surface_report(member: &str, value: &str) -> Option<String> {
+    let path = constraints::path::member(member);
+    STATED.iter().find(|(stated, _)| *stated == path)?;
+    // The requirements are selected by [`stated_violations`] over a PATTERN violation of
+    // that member, which is the violation the boundary would have reported for a value
+    // outside the surface; the expression it carries is replaced by the recorded one, so
+    // nothing of this placeholder reaches the message.
+    let violation = Violation {
+        path,
+        kind: ViolationKind::Pattern(String::new()),
+        value: Some(value.to_owned()),
+        sensitive: false,
+    };
+    // The member is stated WITH the value it submitted, however many clauses its surface
+    // states: the empty set is what the walk reported for one violation of one member.
+    worded(stated_violations(&violation), &BTreeSet::new()).map(|refused| refused.message)
 }
 
 /// The members this service states a clause for AHEAD of the members the validating walk

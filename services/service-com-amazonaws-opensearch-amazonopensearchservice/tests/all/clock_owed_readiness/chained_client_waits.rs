@@ -55,7 +55,7 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
 use super::{
     association_status, domain_status, endpoint_status, kinds, package_status, service_software,
 };
-use crate::domain_lifecycle::{create_baseline, error_code, poll_until, Emulator};
+use crate::domain_lifecycle::{create_index_serving_baseline, error_code, poll_until, Emulator};
 use crate::index_deletion::deleted_index;
 use crate::index_registry::{create as create_index, created_index};
 use crate::package_associations::{create_package, member};
@@ -338,7 +338,9 @@ async fn the_package_calls_those_waits_gate_are_served_through_them() {
 
     // === the domain, then the package, each on its own span ===
     let kind = kind_named(&table, "a domain");
-    create_baseline(&emulator, domain).await;
+    // The index calls below are served by a domain whose engine offers the index-management
+    // operations, so this one is created on that release.
+    create_index_serving_baseline(&emulator, domain).await;
     let called_at = Instant::now();
     converges(
         kind.case,

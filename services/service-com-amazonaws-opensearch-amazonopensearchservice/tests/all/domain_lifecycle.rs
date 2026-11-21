@@ -942,6 +942,30 @@ pub(crate) async fn create_baseline(emulator: &Emulator, name: &str) -> Value {
     answer.body["DomainStatus"].clone()
 }
 
+/// The same baseline domain on a release whose engine SERVES the index-management
+/// operations (`CreateIndex`, `GetIndex`, `UpdateIndex`, `DeleteIndex`), asserting the
+/// create was accepted.
+///
+/// The bodies above create a domain on `OpenSearch_2.11`, which is behind the software those
+/// operations need (`crate::state::INDEX_MANAGEMENT_ENGINE_VERSION`), so a case that drives
+/// one of them against a baseline domain creates it on the oldest release that offers them —
+/// read off that constant rather than written out, so a release added to the catalog needs
+/// nothing restated here.
+pub(crate) async fn create_index_serving_baseline(emulator: &Emulator, name: &str) -> Value {
+    let mut body = baseline_create(name);
+    body["EngineVersion"] = json!(
+        service_com_amazonaws_opensearch_amazonopensearchservice::state::INDEX_MANAGEMENT_ENGINE_VERSION
+    );
+    let answer = emulator.create(body).await;
+    assert_eq!(
+        answer.status, 200,
+        "case CreateDomain({name:?}, on the release that serves index management): expected \
+         200, got {} with {:?}",
+        answer.status, answer.body
+    );
+    answer.body["DomainStatus"].clone()
+}
+
 #[tokio::test]
 async fn a_created_domain_is_persisted_and_read_back_member_for_member() {
     let emulator = Emulator::new();

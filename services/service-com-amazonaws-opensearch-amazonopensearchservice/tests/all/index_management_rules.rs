@@ -474,13 +474,175 @@ async fn the_index_operations_are_served_only_by_an_engine_that_carries_them() {
             );
             assert_eq!(
                 string_member(&answer.body, "message", case),
-                state::DOMAIN_NOT_ON_LATEST_SOFTWARE_VERSION,
-                "case {case}/{operation}: expected the service's software-version sentence, got \
-                 {:?}",
+                state::INDEX_MANAGEMENT_UNSUPPORTED,
+                "case {case}/{operation}: expected the gate's own sentence, got {:?}",
                 answer.body
             );
         }
     }
+}
+
+/// RULE: the sentence that gate is refused with is ONE sentence
+/// ([`state::INDEX_MANAGEMENT_UNSUPPORTED`]) — the feature the operations configure, named
+/// as unsupported on the domain's software — for EVERY engine version the gate covers and
+/// for both operations a caller reaches it through, and it is answered before the request's
+/// own `IndexSchema` is judged.
+///
+/// The rows differ along the engine: both engine types the service offers, several majors of
+/// each, and the two releases either side of the bound the feature arrives at — each read off
+/// the published catalog rather than written out. What a gated call carries is varied too: a
+/// schema the operations accept, and one whose settings section the serving releases refuse
+/// with a sentence of their own — so what the rule pins is that the gate speaks first and
+/// says one thing.
+#[tokio::test]
+async fn the_version_gate_states_one_sentence_for_every_engine_it_gates() {
+    let emulator = Emulator::new();
+
+    let bound = state::upgrade_rank(INDEX_MANAGEMENT_ENGINE_VERSION);
+    let gated: Vec<&str> = state::published_engine_versions()
+        .into_iter()
+        .filter(|version| {
+            [
+                "Elasticsearch_1.5",
+                "Elasticsearch_7.10",
+                "OpenSearch_1.0",
+                "OpenSearch_2.11",
+                "OpenSearch_2.19",
+            ]
+            .contains(version)
+        })
+        .collect();
+    assert!(
+        gated.iter().all(|version| state::upgrade_rank(version) < bound
+            || state::engine_type_of(version) != Some(state::ENGINE_TYPE_OPENSEARCH)),
+        "every row must name a release the feature is not offered on, got {gated:?}"
+    );
+    assert_eq!(
+        gated.len(),
+        5,
+        "the table spans five published releases; a row that left the catalog must fail here \
+         rather than disappear, got {gated:?}"
+    );
+
+    // The domains are created first and settled together, so no case waits on a span of its
+    // own.
+    for (at, version) in gated.iter().enumerate() {
+        let domain = format!("one-sentence-{at}");
+        let answer = emulator
+            .create(json!({ "DomainName": domain, "EngineVersion": version }))
+            .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {version}: expected the domain to be created, got {} with {:?}",
+            answer.status, answer.body
+        );
+    }
+    for (at, _) in gated.iter().enumerate() {
+        settled_domain(&emulator, &format!("one-sentence-{at}")).await;
+    }
+
+    // The two schemas: one these operations accept on a serving release, and one whose
+    // settings section they refuse there with their own sentence
+    // ([`INDEX_SETTINGS_UPDATE_UNSUPPORTED`]), which is what shows the gate is answered
+    // before the document is judged.
+    let schemas = [
+        (
+            "a mapping these operations accept",
+            json!({ "mappings": { "properties": { "title": { "type": "text" } } } }),
+        ),
+        (
+            "a settings section a serving release refuses with its own sentence",
+            json!({ "settings": { "index": { "number_of_shards": 1 } } }),
+        ),
+    ];
+
+    for (at, version) in gated.iter().enumerate() {
+        let domain = format!("one-sentence-{at}");
+        for (shape, schema) in &schemas {
+            let answers = [
+                (
+                    "UpdateIndex",
+                    update_index(&emulator, &domain, "gate-index", schema).await,
+                ),
+                ("GetIndex", get_index(&emulator, &domain, "gate-index").await),
+            ];
+            for (operation, answer) in answers {
+                let case = format!("{version} / {shape} / {operation}");
+                assert_eq!(
+                    answer.status, 400,
+                    "case {case}: expected HTTP 400, got {} with {:?}",
+                    answer.status, answer.body
+                );
+                assert_eq!(
+                    error_code(&answer),
+                    "ValidationException",
+                    "case {case}: expected ValidationException, got {:?}",
+                    answer.body
+                );
+                assert_eq!(
+                    string_member(&answer.body, "message", &case),
+                    state::INDEX_MANAGEMENT_UNSUPPORTED,
+                    "case {case}: expected the one gate sentence, got {:?}",
+                    answer.body
+                );
+                assert_ne!(
+                    string_member(&answer.body, "message", &case),
+                    INDEX_SETTINGS_UPDATE_UNSUPPORTED,
+                    "case {case}: the gate speaks before the document is judged"
+                );
+            }
+        }
+    }
+
+    // On a release that DOES offer the feature the same calls are past the gate: the read of
+    // an index nothing created is the missing index, and the write that carries a settings
+    // section earns the sentence those operations state for it.
+    let serving = "one-sentence-serving";
+    let answer = emulator
+        .create(json!({
+            "DomainName": serving,
+            "EngineVersion": INDEX_MANAGEMENT_ENGINE_VERSION,
+        }))
+        .await;
+    assert_eq!(
+        answer.status, 200,
+        "case the serving release: expected the domain to be created, got {} with {:?}",
+        answer.status, answer.body
+    );
+    settled_domain(&emulator, serving).await;
+    let read = get_index(&emulator, serving, "gate-index").await;
+    assert_ne!(
+        string_member(&read.body, "message", "the serving release / GetIndex"),
+        state::INDEX_MANAGEMENT_UNSUPPORTED,
+        "case the serving release / GetIndex: expected the gate to be past, got {:?}",
+        read.body
+    );
+    created_index(
+        &emulator,
+        serving,
+        "gate-index",
+        &json!({ "mappings": { "properties": { "title": { "type": "text" } } } }),
+        "the serving release",
+    )
+    .await;
+    let settings_update = update_index(
+        &emulator,
+        serving,
+        "gate-index",
+        &json!({ "settings": { "index": { "number_of_shards": 1 } } }),
+    )
+    .await;
+    assert_eq!(
+        string_member(
+            &settings_update.body,
+            "message",
+            "the serving release / UpdateIndex"
+        ),
+        INDEX_SETTINGS_UPDATE_UNSUPPORTED,
+        "case the serving release / UpdateIndex: expected the sentence these operations state \
+         for a settings section, got {:?}",
+        settings_update.body
+    );
 }
 
 // ---------------------------------------------------------------------------

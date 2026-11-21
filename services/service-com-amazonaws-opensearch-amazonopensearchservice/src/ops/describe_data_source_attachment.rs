@@ -88,7 +88,8 @@
 use super::types::*;
 
 use crate::state::{
-    application_not_found_named, attachment_not_found, service_state, state_unavailable,
+    application_id_refusal, application_not_found_named, attachment_not_found, service_state,
+    state_unavailable,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -188,6 +189,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // provisioning has landed is active, and a pending attachment that has fallen
         // due is reported in the status it is then in.
         store.settle_for_attachments(now, &foreign);
+
+        // The id is held to the surface this service RESOLVES an application by, here rather
+        // than at the request boundary (`skip_validation` on this input), so a value that
+        // surface admits reaches the lookup below and is reported as the missing application
+        // it is rather than refused as malformed
+        // ([`crate::state::application_id_refusal`]).
+        if let Some(refusal) = application_id_refusal("id", &input.id) {
+            return Err(
+                DescribeDataSourceAttachmentErrorModeled::ValidationException(refusal).into(),
+            );
+        }
 
         // The attachment belongs to the application, so an id naming none holds no
         // attachment to report.

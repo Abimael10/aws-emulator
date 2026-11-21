@@ -45,7 +45,8 @@ use serde_json::{json, Map, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
-    INDEX_STATUS_CREATED, INDEX_STATUS_DELETED, INDEX_STATUS_UPDATED,
+    INDEX_MANAGEMENT_ENGINE_VERSION, INDEX_STATUS_CREATED, INDEX_STATUS_DELETED,
+    INDEX_STATUS_UPDATED,
 };
 
 use crate::cloudformation_provisions_opensearch_domains::{
@@ -54,9 +55,11 @@ use crate::cloudformation_provisions_opensearch_domains::{
 };
 use crate::query_wire::outputs_of;
 
-/// The engine release every row deploys: one the owning service's catalogue offers, so the
-/// only thing a row can fail on is what this suite is about.
-const ENGINE_VERSION: &str = "OpenSearch_2.11";
+/// The engine release every row deploys: the oldest release the owning service offers the
+/// INDEX-MANAGEMENT operations on, since every row drives that lifecycle against the deployed
+/// domain. Read off that service's own constant rather than written out, so the only thing a
+/// row can fail on is what this suite is about.
+const ENGINE_VERSION: &str = INDEX_MANAGEMENT_ENGINE_VERSION;
 
 /// The template parameter each row's domain name is passed in under, so `DomainName` reaches
 /// the provisioner through a `Ref` and the policy document through an `Fn::Sub` variable —

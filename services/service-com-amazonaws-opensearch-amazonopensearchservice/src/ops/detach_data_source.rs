@@ -89,9 +89,9 @@
 use super::types::*;
 
 use crate::state::{
-    application_not_active, application_not_found_named, attachment_detach_in_flight,
-    attachment_pending, data_source_not_attached, service_state, state_unavailable,
-    APPLICATION_STATUS_ACTIVE, ATTACHMENT_STATUS_PENDING,
+    application_id_refusal, application_not_active, application_not_found_named,
+    attachment_detach_in_flight, attachment_pending, data_source_not_attached, service_state,
+    state_unavailable, APPLICATION_STATUS_ACTIVE, ATTACHMENT_STATUS_PENDING,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -193,6 +193,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // fallen due is no longer pending, and an attachment whose own detach has landed is
         // a record the store no longer holds.
         store.settle_for_attachments(now, &foreign);
+
+        // The id is held to the surface this service RESOLVES an application by, here rather
+        // than at the request boundary (`skip_validation` on this input), so a value that
+        // surface admits reaches the lookup below and is reported as the missing application
+        // it is rather than refused as malformed
+        // ([`crate::state::application_id_refusal`]).
+        if let Some(refusal) = application_id_refusal("id", &input.id) {
+            return Err(DetachDataSourceErrorModeled::ValidationException(refusal).into());
+        }
 
         // The attachment belongs to the application, so an id naming none holds no
         // data source to detach.

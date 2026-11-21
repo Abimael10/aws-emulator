@@ -16,7 +16,8 @@
 //!    members of five operations, over three different expressions;
 //! 2. a member whose live validation surface the model has not caught up with states THAT
 //!    surface: the expression the service validates it against, and a length bound it
-//!    states a clause of its own for;
+//!    states a clause of its own for — and a value that surface ADMITS is RESOLVED by every
+//!    operation that addresses an application by id rather than refused as malformed;
 //! 3. an enumerated type's value set is stated in the order this front door walks its own
 //!    hash table over the admitted values — neither the model's declaration order nor
 //!    lexicographic — asserted over four enums, two of which the model declares in an
@@ -39,7 +40,7 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::ops::types::{
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::published_engine_versions;
 use service_common::validation_message::hashed_enum_order;
 
-use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX};
+use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX, RECORDED_NOT_FOUND_STATUS};
 
 /// A `DomainName` the model's pattern admits, so a refusal under test is about the member
 /// the row exercises and nothing else.
@@ -377,6 +378,196 @@ async fn a_member_the_model_lags_states_the_surface_the_service_validates() {
     for (case, method, uri, body, expected) in rows {
         refuses(&emulator, case, method, &uri, body, &expected).await;
     }
+}
+
+/// RULE 2b: a value that surface ADMITS is a well-formed application id, so every operation
+/// that addresses an application by `id` RESOLVES it — answering the modelled
+/// missing-resource refusal when it names no application of the account, and the application
+/// itself when it names one — while only a value OUTSIDE the surface is refused as invalid.
+///
+/// The surface is `crate::state::APPLICATION_ID_PATTERN`, the one statement of it, and the
+/// rows differ along what that expression generalises over: where the hyphens sit, how many
+/// there are, which character classes the id is built from, and both published width bounds
+/// with one value past each of them.
+#[tokio::test]
+async fn an_id_the_stated_surface_admits_is_resolved_rather_than_refused() {
+    let emulator = Emulator::new();
+    // A data source for the operations that name one. Its ARN is a well-formed domain ARN,
+    // so a refusal below is about the id the request carries and nothing else.
+    let arn = super::data_source_attachments::domain(&emulator, "id-surface-source").await;
+
+    // Ids this service admits, none of which the account holds an application under.
+    let admitted: [(&str, &str); 7] = [
+        ("hyphens inside the id", "sim2real-noapp-50855"),
+        ("one hyphen", "no-application"),
+        ("a trailing hyphen", "noapplication-"),
+        ("digits around a hyphen", "0-9"),
+        ("the shortest admitted id", "a-c"),
+        ("the longest admitted id", "a1b2c3d4e5-f6g7h8i9j0-k1l2m3n4"),
+        ("no hyphen at all", "noapplicationhere"),
+    ];
+    for (case, id) in admitted {
+        // Each of the six operations that RESOLVE the id answers the missing application,
+        // on the status this service answers that shape on.
+        let reads: [(&str, Answer); 6] = [
+            (
+                "GetApplication",
+                emulator
+                    .call("GET", &format!("{PREFIX}/opensearch/application/{id}"), None)
+                    .await,
+            ),
+            (
+                "UpdateApplication",
+                emulator
+                    .call(
+                        "PUT",
+                        &format!("{PREFIX}/opensearch/application/{id}"),
+                        Some(json!({})),
+                    )
+                    .await,
+            ),
+            (
+                "AttachDataSource",
+                emulator
+                    .call(
+                        "POST",
+                        &format!("{PREFIX}/opensearch/application/{id}/attachDataSource"),
+                        Some(json!({ "dataSourceArn": arn })),
+                    )
+                    .await,
+            ),
+            (
+                "DetachDataSource",
+                emulator
+                    .call(
+                        "POST",
+                        &format!("{PREFIX}/opensearch/application/{id}/detachDataSource"),
+                        Some(json!({ "dataSourceArn": arn })),
+                    )
+                    .await,
+            ),
+            (
+                "DescribeDataSourceAttachment",
+                emulator
+                    .call(
+                        "POST",
+                        &format!(
+                            "{PREFIX}/opensearch/application/{id}/describeDataSourceAttachment"
+                        ),
+                        Some(json!({ "dataSourceArn": arn })),
+                    )
+                    .await,
+            ),
+            (
+                "ListDataSourceAttachments",
+                emulator
+                    .call(
+                        "POST",
+                        &format!("{PREFIX}/opensearch/application/{id}/listDataSourceAttachments"),
+                        Some(json!({})),
+                    )
+                    .await,
+            ),
+        ];
+        for (operation, answer) in reads {
+            assert_eq!(
+                answer.status, RECORDED_NOT_FOUND_STATUS,
+                "case {case} ({operation}, {id:?}): expected {RECORDED_NOT_FOUND_STATUS} for an \
+                 id the surface admits, got {} with {:?}",
+                answer.status, answer.body
+            );
+            assert_eq!(
+                error_code(&answer),
+                "ResourceNotFoundException",
+                "case {case} ({operation}, {id:?}): an admitted id that names no application is \
+                 a missing resource, got {:?}",
+                answer.body
+            );
+        }
+
+        // The attach names the account the id was resolved in beside the id itself.
+        let attached = emulator
+            .call(
+                "POST",
+                &format!("{PREFIX}/opensearch/application/{id}/attachDataSource"),
+                Some(json!({ "dataSourceArn": arn })),
+            )
+            .await;
+        let stated = message(&attached, case);
+        let expected = format!(
+            "Application {id} not found for account {}",
+            engine::emulator_account_id()
+        );
+        assert_eq!(
+            stated, expected,
+            "case {case} (AttachDataSource, {id:?}): expected {expected:?}, got {stated:?}"
+        );
+
+        // The delete of an id the account holds no application under is idempotent, so the
+        // admitted id reaches that answer rather than a refusal.
+        let deleted = emulator
+            .call(
+                "DELETE",
+                &format!("{PREFIX}/opensearch/application/{id}"),
+                None,
+            )
+            .await;
+        assert_eq!(
+            deleted.status, 200,
+            "case {case} (DeleteApplication, {id:?}): expected the idempotent answer, got {} \
+             with {:?}",
+            deleted.status, deleted.body
+        );
+    }
+
+    // And a value OUTSIDE the surface is refused as the malformed input it is, stating the
+    // member and the expression the service publishes — one value past each published width
+    // bound and one of each character class the surface excludes.
+    let refused: [(&str, &str); 5] = [
+        ("a leading hyphen", "-noapplication"),
+        ("an underscore", "no_application"),
+        ("an upper-case letter", "noApplication"),
+        ("one character short of the shortest", "ab"),
+        (
+            "one character past the longest",
+            "a1b2c3d4e5-f6g7h8i9j0-k1l2m3n45",
+        ),
+    ];
+    for (case, id) in refused {
+        let expected = report(&[clause(
+            id,
+            "id",
+            &expression(
+                service_com_amazonaws_opensearch_amazonopensearchservice::state::APPLICATION_ID_PATTERN,
+            ),
+        )]);
+        refuses(
+            &emulator,
+            case,
+            "GET",
+            &format!("{PREFIX}/opensearch/application/{id}"),
+            None,
+            &expected,
+        )
+        .await;
+    }
+
+    // The positive control: the id the service MINTS is resolved by the same path, so
+    // admitting the wider surface did not stop an id that names an application resolving.
+    let held = super::data_source_attachments::application(&emulator, "id-surface-app").await;
+    let read = emulator
+        .call(
+            "GET",
+            &format!("{PREFIX}/opensearch/application/{held}"),
+            None,
+        )
+        .await;
+    assert_eq!(
+        read.status, 200,
+        "case GetApplication({held:?}): expected the held application to resolve, got {} with \
+         {:?}",
+        read.status, read.body
+    );
 }
 
 /// RULE 3: an enumerated type's value set is stated in the order this front door walks its

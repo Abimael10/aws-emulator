@@ -165,6 +165,10 @@ mod store;
 /// The capabilities an OpenSearch UI application has registered, and their lifecycle.
 mod capabilities;
 
+/// The id an application is addressed by: the values this service admits as one, and the
+/// refusal of a value outside them.
+mod application_id;
+
 /// The ADDRESS an OpenSearch UI application publishes for its own user interface, and the
 /// page a fetch of that address renders out of the stored application.
 pub mod application_ui;
@@ -211,6 +215,7 @@ mod projections;
 mod refusals;
 
 pub use analyzers::*;
+pub use application_id::*;
 pub use application_ui::*;
 pub use capabilities::*;
 pub use domains::*;
