@@ -3881,6 +3881,41 @@ pub fn invalid_next_token() -> ValidationException {
     }
 }
 
+/// Where a `@paginated` operation of this service starts the scan the request asked for:
+/// the position its `nextToken` names, or `None` when the request named no token and the
+/// scan starts at the first item.
+///
+/// The whole step from the member a request carries to the position a scan resumes at,
+/// stated once: a token is resolved under the listing it was handed to
+/// ([`decode_page_token`]) and a token that names no position in that listing is refused
+/// in this service's one wording for that ([`invalid_next_token`]) — whichever way it
+/// failed. It lives beside the two halves it joins, so no two paginated operations of
+/// this service can disagree about which tokens resume a listing or about how a token
+/// that does not is refused; a handler lifts the refusal into its own modelled error
+/// with one `map_err`.
+///
+/// `T` is the cursor's own type — the key of the collection the listing pages over — so
+/// a listing keyed by a number resumes at a number. A cursor that is not a value of that
+/// type names no position in the listing either, so it is refused exactly like a token
+/// this service never issued.
+pub fn page_cursor<T>(
+    key: &PageTokenKey,
+    scope: &PageScope,
+    next_token: Option<&str>,
+) -> Result<Option<T>, ValidationException>
+where
+    T: ::std::str::FromStr,
+{
+    let Some(token) = next_token else {
+        return Ok(None);
+    };
+    decode_page_token(key, scope, token)
+        .ok()
+        .and_then(|cursor| cursor.parse::<T>().ok())
+        .map(Some)
+        .ok_or_else(invalid_next_token)
+}
+
 // =============================================================================
 // How this service STATES a request its modelled constraints refuse
 // =============================================================================

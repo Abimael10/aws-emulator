@@ -207,19 +207,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The secret THIS store authenticates its own page tokens under, taken off the
         // store before the records it is about to report are borrowed.
         let page_token_key = state.page_token_key;
-        // The cursor is the store key of the entitlement the next page starts at.
-        let start_at = match input.next_token.as_deref() {
-            None => None,
-            Some(token) => Some(
-                crate::state::decode_page_token(&page_token_key, &scope, token).map_err(
-                    |_| {
-                        ListVmEntitlementsErrorModeled::ValidationException(
-                            crate::state::invalid_next_token(),
-                        )
-                    },
-                )?,
-            ),
-        };
+        // The cursor is the store key of the entitlement the next page starts at;
+        // resolving it, or refusing a token that names no position in this listing, is
+        // the one step every paginated operation of this service shares.
+        let start_at: Option<String> =
+            crate::state::page_cursor(&page_token_key, &scope, input.next_token.as_deref())
+                .map_err(ListVmEntitlementsErrorModeled::ValidationException)?;
 
         // Regional resource: the entitlements of an environment are only listable at
         // the endpoint of the Region that environment was created in.
