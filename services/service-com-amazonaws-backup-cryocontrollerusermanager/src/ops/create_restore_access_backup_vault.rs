@@ -380,6 +380,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A create attaches no resource policy: one is attached only by
             // the call that puts it there.
             access_policy: None,
+            // Nor any notification configuration, for the same reason: a vault
+            // publishes events only once a call turns them on.
+            notifications: None,
         };
         let output = CreateRestoreAccessBackupVaultOutput {
             restore_access_backup_vault_arn: Some(vault.arn.clone()),

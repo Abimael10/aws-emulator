@@ -41,7 +41,9 @@
 //! A vault's resource policy is one of [`BackupVault`]'s own members
 //! ([`BackupVault::access_policy`]): `PutBackupVaultAccessPolicy` stores it
 //! there and `GetBackupVaultAccessPolicy` reports it from there, so the policy
-//! a client attaches is the policy the vault carries.
+//! a client attaches is the policy the vault carries. Its notification
+//! configuration is another ([`BackupVault::notifications`]), stored, reported
+//! and cleared the same way (the `vault_notifications` module).
 //!
 //! A job's state is also ANNOUNCED, not only stored: the `events` module holds the one diff
 //! that turns every state a stored job moves into after its start call into an event on the
@@ -178,6 +180,12 @@ pub use mpa_approval_team::*;
 /// answer from. Re-exported for the reason given on `events`.
 mod backup_job_view;
 pub use backup_job_view::*;
+
+/// The event notifications a vault is configured to publish, which the vault's
+/// notification write, read and delete all answer from. Re-exported for the
+/// reason given on `events`.
+mod vault_notifications;
+pub use vault_notifications::*;
 
 /// Unit coverage for [`modelled_timestamp`]: the arithmetic it does, and the
 /// branches of it no request can reach.
@@ -2971,6 +2979,12 @@ pub struct BackupVault {
     /// reported in (`::service_common::iam_policy::canonical_document`). `None`
     /// for a vault carrying none, which is what the policy read reports absent.
     pub access_policy: Option<String>,
+    /// The event notifications `PutBackupVaultNotifications` turned on for this
+    /// vault, once a call has: the topic its events are published to and which
+    /// events are published ([`VaultNotifications`]). `None` for a vault no such
+    /// call has named, and for one whose configuration has been deleted — the
+    /// state in which the notifications read has nothing to report.
+    pub notifications: Option<VaultNotifications>,
 }
 
 impl BackupVault {
