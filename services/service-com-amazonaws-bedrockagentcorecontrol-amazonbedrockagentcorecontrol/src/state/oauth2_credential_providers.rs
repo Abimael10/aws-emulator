@@ -18,6 +18,18 @@
 //! request whose declared vendor and supplied member disagree is refused rather
 //! than reinterpreted as the vendor the payload happens to name.
 //!
+//! ## The address an authorizing user is redirected back to
+//!
+//! A provider reports a `callbackUrl` ([`oauth2_authorization_callback_url`]):
+//! the redirect URI the caller REGISTERS with its vendor's authorization server,
+//! not an endpoint the API caller dials, and the one address of this emulator —
+//! never a host AWS answers on — so a redirect carrying an authorization code
+//! stays inside the emulated environment. Nothing of this service answers at that
+//! path yet: the 3-legged flow a user agent would arrive there from is the data
+//! plane's `GetResourceOauth2Token`, which still answers 501, so the address is
+//! published for vendor registration alone and the flow behind it is not claimed
+//! to work.
+//!
 //! ## Where the client secret lives
 //!
 //! Not in this service's own store. Each configuration carries a `MANAGED` or an
@@ -60,6 +72,42 @@ pub fn oauth2_credential_provider_arn(region: &str, token_vault_id: &str, name: 
         ARN_SERVICE,
         region,
         &format!("token-vault/{token_vault_id}/{OAUTH2_CREDENTIAL_PROVIDER_ARN_TYPE}/{name}"),
+    )
+}
+
+/// The path this service's identity plane receives an OAuth2 authorization
+/// redirect at: the `/identities` prefix every credential-provider route of this
+/// service is served under (`smithy_query operation=GetOauth2CredentialProvider`
+/// reports the URI `/identities/GetOauth2CredentialProvider`), with the OAuth2
+/// flow's callback beneath it.
+pub const OAUTH2_AUTHORIZATION_CALLBACK_PATH: &str = "/identities/oauth2/callback";
+
+/// Where an OAuth2 authorization server sends a user back after they authorize:
+/// `callbackUrl` is "Callback URL to register on the OAuth2 credential provider
+/// as an allowed callback URL. This URL is where the OAuth2 authorization server
+/// redirects users after they complete the authorization flow" (`smithy_query
+/// doc shape=GetOauth2CredentialProviderResponse member=callbackUrl`).
+///
+/// An address a user agent is REDIRECTED to, so the one published names the
+/// endpoint THIS emulator is served at (`endpoint_base`, the base
+/// [`::smithy_server_runtime::OperationContext::endpoint`] reports) rather than a
+/// host a client here resolves nowhere near this process — the same reading every
+/// other address this service publishes for a caller to FOLLOW carries
+/// ([`consent_portal_url`], [`payment_connector_authorization_url`]).
+///
+/// ONE address per endpoint rather than one per provider: the callback belongs to
+/// the identity plane that completes the authorization flow, not to the provider
+/// whose vendor redirects to it, so every provider of the vault registers the
+/// same redirect URI with its vendor.
+///
+/// What a caller DOES with it is register it with that vendor; nothing of this
+/// service answers there yet, because the flow that would redirect a user agent
+/// to it is the data plane's own `GetResourceOauth2Token`, still a 501 stub (see
+/// this module's header).
+pub fn oauth2_authorization_callback_url(endpoint_base: &str) -> String {
+    format!(
+        "{}{OAUTH2_AUTHORIZATION_CALLBACK_PATH}",
+        endpoint_base.trim_end_matches('/')
     )
 }
 
@@ -769,6 +817,11 @@ pub struct Oauth2CredentialProviderRecord {
     /// The configuration every response reports: the authorization server the
     /// provider authenticates against, and the client it identifies itself as.
     pub config_output: Oauth2ProviderConfigOutput,
+    /// The redirect URI this provider's vendor is to be configured with
+    /// ([`oauth2_authorization_callback_url`]), held on the record so every read
+    /// of the provider reports the address the create published and an update
+    /// leaves it as it is.
+    pub callback_url: String,
     pub tags: BTreeMap<String, String>,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
@@ -785,10 +838,10 @@ impl Oauth2CredentialProviderRecord {
             client_secret_source: Some(self.client_secret.source.clone()),
             name: self.name.clone(),
             credential_provider_arn: self.credential_provider_arn.clone(),
-            // The authorization callback is an endpoint of the AgentCore
-            // identity plane, which this emulator serves none of, so the
-            // provider reports no URL a caller could register with its vendor.
-            callback_url: None,
+            // The address the provider's vendor redirects an authorizing user
+            // back to, which every response declaring it reports off the one
+            // record ([`oauth2_authorization_callback_url`]).
+            callback_url: Some(self.callback_url.clone()),
             oauth2_provider_config_output: Some(self.config_output.clone()),
             // The create stored or resolved the provider's secret before
             // answering, so nothing is left for the clock to owe it.
@@ -828,7 +881,8 @@ impl Oauth2CredentialProviderRecord {
     /// exactly as the update asked, with nothing of the previous configuration
     /// left mixed in. What the update does NOT touch is what identifies the
     /// provider rather than configures it: the name it is addressed by, the ARN
-    /// minted from that name, the tags it carries and the instant it was created.
+    /// minted from that name, the redirect URI its vendor is configured with, the
+    /// tags it carries and the instant it was created.
     pub fn apply_update(
         &mut self,
         vendor: String,

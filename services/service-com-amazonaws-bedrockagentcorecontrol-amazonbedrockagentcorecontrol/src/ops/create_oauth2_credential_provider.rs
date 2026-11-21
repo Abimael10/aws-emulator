@@ -256,6 +256,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             credential_provider_vendor: input.credential_provider_vendor,
             client_secret,
             config_output: requested.config_output,
+            // The redirect URI the caller registers with the provider's vendor
+            // is an address of the identity plane that completes the
+            // authorization flow, published at the endpoint this emulator is
+            // served at, and held so every later read reports the same one.
+            callback_url: crate::state::oauth2_authorization_callback_url(
+                ctx.endpoint().as_str(),
+            ),
             tags: crate::state::sorted_map(input.tags),
             created_at: now,
             updated_at: now,
