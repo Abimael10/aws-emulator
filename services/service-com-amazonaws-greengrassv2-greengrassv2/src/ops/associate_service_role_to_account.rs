@@ -110,6 +110,34 @@ impl From<AssociateServiceRoleToAccountErrorModeled> for AssociateServiceRoleToA
     }
 }
 
+/// Whether `value` is the ARN of an IAM ROLE — the form this operation's `roleArn` has to
+/// carry.
+///
+/// Two conditions, and nothing beyond them: the value is a well-formed resource ARN of the
+/// IAM vendor whose resource type is `role` (`service_common::arn::IAM_ROLE`, which states
+/// once for the whole workspace what "the ARN of an IAM role" is), and it NAMES a role —
+/// IAM writes the role's path and name after the type (`role/<name>`,
+/// `role/<path>/<name>`), so a value whose resource field stops at the type
+/// (`arn:aws:iam::<account>:role`) or whose last segment is empty
+/// (`arn:aws:iam::<account>:role/`) names no role, however well formed an ARN it is.
+///
+/// Deliberately NOT `service_common::iam_role::role_name`, which reads the same segment but
+/// only out of a role ARN of THIS account: the account's Greengrass service role is
+/// validated on the ARN's form alone — a role of another account or partition is a
+/// well-formed role ARN — so the account and Region conditions that reading adds would
+/// refuse values this operation accepts.
+fn is_iam_role_arn(value: &str) -> bool {
+    let requirement = ::service_common::arn::IAM_ROLE;
+    requirement.admits(value)
+        && requirement
+            .resource_type
+            .and_then(|resource_type| {
+                ::service_common::arn::resource_id_of_type(value, resource_type)
+            })
+            .and_then(|path_and_name| path_and_name.split('/').next_back())
+            .is_some_and(|role_name| !role_name.is_empty())
+}
+
 /// The `AssociateServiceRoleToAccount` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -161,12 +189,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The role this request names has to BE a role: `roleArn` is modelled as a plain
-        // string with no pattern, so the form is the service's own rule — the value must
-        // be the ARN of an IAM role (vendor `iam`, resource type `role`), which
-        // `service_common::arn` states once for every service that takes one. Whether that
-        // role EXISTS is not checked: the Greengrass API documents the role association as
-        // not validating the role's existence, only its ARN.
-        if !::service_common::arn::IAM_ROLE.admits(&input.role_arn) {
+        // string with no pattern, so the form is the service's own rule, stated once in
+        // [`is_iam_role_arn`]. Whether that role EXISTS is not checked, and neither is its
+        // trust policy: the Greengrass API documents the role association as not
+        // validating the role, only its ARN, so a role no Greengrass principal can assume
+        // is associated just as a trusted one is.
+        if !is_iam_role_arn(&input.role_arn) {
             return Err(st::LegacyRefusal::bad_request(st::INVALID_ROLE_ARN_MESSAGE).into());
         }
 
