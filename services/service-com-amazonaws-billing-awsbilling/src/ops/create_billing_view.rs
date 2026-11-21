@@ -17,6 +17,11 @@
 //! ([`crate::state::ComAmazonawsBillingAwsbillingState::unknown_source_view`]),
 //! so nothing a read reports as a source resolves to nothing.
 //!
+//! A view's source views are a SET: the view draws from a source it names more
+//! than once ONCE, so the request's list is collected through the one rule every
+//! writer of that field shares ([`crate::state::add_source_views`]) and no
+//! stored record holds the same source twice.
+//!
 //! The view is minted with the tags the request carries, collected through the
 //! one rule every writer of a tag set in this service shares
 //! ([`crate::state::requested_tag_set`]): a `resourceTags` list that gives the
@@ -317,6 +322,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // A view's source list is the SET of views it draws from, so the
+        // request's list is collected through the one rule every writer of that
+        // field shares (`crate::state::add_source_views`): a source named twice
+        // is one association, exactly as it is for the association that adds a
+        // source later. Otherwise the stored record would hold the same ARN
+        // twice and every read derived from it — `sourceViewCount`, the paged
+        // source listing, the per-view source bound — would report one
+        // association as two.
+        let mut source_views: Vec<String> = Vec::with_capacity(input.source_views.len());
+        crate::state::add_source_views(&mut source_views, input.source_views);
+
         let arn = state.mint_view_arn();
         let view = crate::state::BillingView {
             arn: arn.clone(),
@@ -324,7 +340,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description: input.description,
             billing_view_type: crate::state::BILLING_VIEW_TYPE_CUSTOM.to_string(),
             owner_account_id: ::engine::emulator_account_id().to_string(),
-            source_views: input.source_views,
+            source_views,
             data_filter_expression: input.data_filter_expression,
             created_at,
             updated_at: None,

@@ -284,8 +284,10 @@ fn decode_page_token(
 /// longer holds is forgotten instead of growing the token: it cannot be reported
 /// again, because it is not in the list any more.
 ///
-/// Each ARN the token names accounts for exactly ONE stored occurrence, so a
-/// view holding the same source ARN twice reports both copies, once each.
+/// Each ARN the token names accounts for exactly ONE stored occurrence, so the
+/// walk holds for whatever list the token was issued over. Every writer of a
+/// view's source list keeps it a SET ([`crate::state::add_source_views`]), so a
+/// stored view names each of its sources once and reports it once.
 fn split_reported<'views>(
     stored: &'views [String],
     reported: &[String],

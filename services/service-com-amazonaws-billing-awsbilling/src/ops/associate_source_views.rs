@@ -283,12 +283,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The association is a set, so a source already present adds nothing and
-        // the request stays idempotent.
-        for source in input.source_views {
-            if !source_views.contains(&source) {
-                source_views.push(source);
-            }
-        }
+        // the request stays idempotent — the one rule every writer of this field
+        // shares (`crate::state::add_source_views`), which is also why a request
+        // naming the same source twice adds it once.
+        crate::state::add_source_views(&mut source_views, input.source_views);
         if source_views.len() > crate::state::MAX_SOURCE_VIEWS_PER_VIEW {
             return Err(AssociateSourceViewsErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {

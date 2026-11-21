@@ -1607,6 +1607,29 @@ pub fn requested_tag_set(tags: &[ResourceTag]) -> Result<BTreeMap<String, String
     Ok(requested)
 }
 
+/// Add the source views one request names to the ones `held` already draws
+/// from, as a SET: the first mention of an ARN is kept, in the order it arrives,
+/// and every later mention of an ARN already in the list adds nothing.
+///
+/// A view's source list is the SET of billing views it draws its data from:
+/// `BillingViewElement$sourceViewCount` is "the number of source views
+/// associated with this billing view", and one view is associated with another
+/// once however many times a request names it. The modelled
+/// `BillingViewSourceViewsList` carries no `@uniqueItems`, so duplicates reach a
+/// handler and the rule is the service's to apply. Every writer of
+/// [`BillingView::source_views`] — the create that mints a view over its sources
+/// and the association that adds one later — collects through here, so no stored
+/// record holds the same source twice and nothing derived from it on read (the
+/// count, the paged source listing, the per-view bound
+/// [`MAX_SOURCE_VIEWS_PER_VIEW`]) reports one association as two.
+pub fn add_source_views(held: &mut Vec<String>, requested: impl IntoIterator<Item = String>) {
+    for source in requested {
+        if !held.contains(&source) {
+            held.push(source);
+        }
+    }
+}
+
 /// The message this service's ARN validation answers for a billing-view ARN
 /// that names no view of this account: the requested ARN, in brackets, reported
 /// as an invalid billing view ARN.
