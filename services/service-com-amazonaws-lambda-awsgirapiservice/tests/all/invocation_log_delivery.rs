@@ -230,6 +230,21 @@ pub(crate) fn record_text(message: &str) -> &str {
     message.strip_suffix('\n').unwrap_or(message)
 }
 
+/// ONE delivered line as the JSON OBJECT it is, or `None` for a line that is not one — which
+/// is how a client that selected the structured format reads what it was delivered.
+///
+/// `pub(crate)` for the reason [`record_text`] is: every suite that reads a STRUCTURED record
+/// ([`crate::invocation_log_record_format`], [`crate::invocation_log_phases_and_level_filters`],
+/// [`crate::python_json_error_records`]) parses a delivered line through here, so the reading is
+/// stated once.
+#[must_use]
+pub(crate) fn structured_record(line: &str) -> Option<serde_json::Map<String, Value>> {
+    match serde_json::from_str::<Value>(line) {
+        Ok(Value::Object(members)) => Some(members),
+        _ => None,
+    }
+}
+
 /// Every message the group `group` holds, whichever stream carries it, as `FilterLogEvents`
 /// reports them — the read a client that has just invoked the function makes, knowing the group
 /// but not the stream.

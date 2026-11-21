@@ -1954,6 +1954,14 @@ pub fn run_heap_bytes(memory_size: i32) -> usize {
 /// configures the language's own logging interface from.
 const APPLICATION_LOG_LEVEL_VARIABLE: &str = "AWS_LAMBDA_LOG_LEVEL";
 
+/// The variable a managed runtime reads the function's `LoggingConfig$LogFormat` as, and
+/// renders its own records in.
+///
+/// It is set only for a function whose `LoggingConfig` selected the structured format, as
+/// the level above is: both are variables the execution environment of a function on the
+/// default format carries none of.
+const LOG_FORMAT_VARIABLE: &str = "AWS_LAMBDA_LOG_FORMAT";
+
 /// The variable a managed runtime exports the identifier of the runtime it IS as
 /// ("AWS_EXECUTION_ENV – The runtime identifier, prefixed by `AWS_Lambda_`", the Lambda
 /// Developer Guide's reserved runtime environment variables).
@@ -2049,19 +2057,6 @@ fn runtime_environment(invocation: &Invocation, started: SystemTime) -> BTreeMap
             LOG_STREAM_VARIABLE,
             log_stream_name(&invocation.executed_version, &invocation.request_id, started),
         ),
-        // Which FORM the runtime renders this invocation's own records in: the function's
-        // `LoggingConfig$LogFormat`, which the runtime reads here because the records a
-        // handler writes are rendered where their level and message are known
-        // ([`bootstrap`], [`node::runtime`]) rather than by the delivery.
-        (
-            "AWS_LAMBDA_LOG_FORMAT",
-            if json_log_records(invocation) {
-                super::LOG_FORMAT_JSON
-            } else {
-                super::DEFAULT_LOG_FORMAT
-            }
-            .to_string(),
-        ),
         ("AWS_REGION", invocation.region.clone()),
         ("AWS_DEFAULT_REGION", invocation.region.clone()),
         (
@@ -2094,6 +2089,23 @@ fn runtime_environment(invocation: &Invocation, started: SystemTime) -> BTreeMap
     ];
     for (name, value) in reserved {
         environment.insert((*name).to_string(), value.clone());
+    }
+    // The two variables the structured format brings with it, which a function on the
+    // default plain-text format carries NEITHER of: the FORMAT the runtime renders this
+    // invocation's records in, and the LEVEL its application records are filtered at.
+    //
+    // `AWS_LAMBDA_LOG_FORMAT` names the format only where the function's `LoggingConfig`
+    // selected the structured one, because the runtime that writes a record reads the form
+    // from it ([`bootstrap`], [`node::runtime`]) and a logging library that branches on the
+    // mere presence of the variable must take the plain-text branch on a function AWS sets
+    // it for no value of.
+    if json_log_records(invocation) {
+        environment.insert(
+            LOG_FORMAT_VARIABLE.to_string(),
+            super::LOG_FORMAT_JSON.to_string(),
+        );
+    } else {
+        environment.remove(LOG_FORMAT_VARIABLE);
     }
     // The LEVEL the function's application records are filtered at, which the managed
     // runtimes read as `AWS_LAMBDA_LOG_LEVEL` and configure their own logging interface from:

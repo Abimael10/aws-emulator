@@ -253,22 +253,31 @@ class _LambdaLogFormatter(logging.Formatter):
         return _instant(record.created)
 
     def exception(self, record):
-        """The class, the message and the frames of the exception a record carries."""
+        """The class and the message of the exception a record carries, or ``None`` for a
+        record carrying none.
+
+        How that exception's STACK is reported is each format's own: the text framing
+        appends the whole rendered traceback to the line ([`_LambdaLogFormatter.format`]),
+        while the structured one reports its frames as a list
+        ([`_LambdaJsonLogFormatter.frames`]).
+        """
 
         if not record.exc_info:
             return None
+        kind, raised, _trace = record.exc_info
+        return (getattr(kind, "__name__", str(kind)), str(raised))
+
+    def traceback_text(self, record):
+        """The whole traceback of that exception as a rendering of it reads: the header
+        line, every frame and the exception line that closes it."""
+
         kind, raised, trace = record.exc_info
-        return (
-            getattr(kind, "__name__", str(kind)),
-            str(raised),
-            traceback.format_exception(kind, raised, trace),
-        )
+        return "".join(traceback.format_exception(kind, raised, trace))
 
     def format(self, record):
         message = record.getMessage()
-        failure = self.exception(record)
-        if failure is not None:
-            message = "%s\n%s" % (message, "".join(failure[2]).rstrip("\n"))
+        if record.exc_info:
+            message = "%s\n%s" % (message, self.traceback_text(record).rstrip("\n"))
         return "[%s]\t%s\t%s\t%s" % (
             record.levelname,
             self.formatTime(record),
@@ -285,10 +294,33 @@ class _LambdaJsonLogFormatter(_LambdaLogFormatter):
     and the invocation off named members instead of off tab-separated fields: the level is
     the emitting logger's own level NAME, the message is the formatted line, the logger is
     the one that emitted the record, the request id is the invocation's, and the timestamp is
-    the instant the record was created. A record carrying an exception names its class and
-    its frames beside them, which is what makes a failure readable as a record rather than as
-    free text.
+    the instant the record was created. A record carrying an exception names its class, the
+    FRAMES of its stack and where it was emitted beside them, which is what makes a failure
+    readable as a record rather than as free text.
     """
+
+    def frames(self, record):
+        """The stack of the exception a record carries, one entry per FRAME.
+
+        A structured record states the stack as a LIST of frames — each the location of
+        one frame and the source line at it — so a consumer that indexes frames, or counts
+        them to find the throwing one, reads frames and nothing else: the header line a
+        rendered traceback opens with and the exception line it closes on are no frames of
+        the stack, and what they say is on the record's own members instead (`errorType`,
+        `errorMessage`).
+
+        An exception carrying no traceback at all has no frames to state, which is the
+        empty stack rather than a failure to render one.
+        """
+
+        _kind, _raised, trace = record.exc_info
+        return traceback.format_tb(trace) if trace is not None else []
+
+    def location(self, record):
+        """WHERE the record was emitted: the file of the frame that emitted it, the
+        function in that frame and the line in it, in that order."""
+
+        return "%s:%s:%s" % (record.pathname, record.funcName, record.lineno)
 
     def format(self, record):
         document = {
@@ -302,7 +334,8 @@ class _LambdaJsonLogFormatter(_LambdaLogFormatter):
         if failure is not None:
             document["errorType"] = failure[0]
             document["errorMessage"] = failure[1]
-            document["stackTrace"] = failure[2]
+            document["stackTrace"] = self.frames(record)
+            document["location"] = self.location(record)
         return json.dumps(document)
 
 
@@ -915,19 +948,23 @@ def _report(error_type, error_message, stack_trace):
 
     Under the STRUCTURED log format the same report is ONE record of that format instead:
     the class, the message and the frames become the members of a single JSON object,
-    because a client that selected that format reads its function's log as records.
+    because a client that selected that format reads its function's log as records. That
+    record states its level under the member the Python runtime documents for it,
+    `log_level`, which is the member a consumer filtering or indexing the records that
+    signal a failure reads the level off, and every other member is the one the INVOKE
+    error document carries under the same name — the frames included, each as the document
+    states it — so a client correlating the two reads one failure rather than two.
     """
     if _LOGGING["json"]:
         _RecordStream().write(
             json.dumps(
                 {
                     "timestamp": _instant(time.time()),
-                    "level": "ERROR",
-                    "message": "%s: %s" % (error_type, error_message),
+                    "log_level": "ERROR",
                     "requestId": _LOGGING["requestId"],
                     "errorType": error_type,
                     "errorMessage": error_message,
-                    "stackTrace": [frame.rstrip("\n") for frame in stack_trace],
+                    "stackTrace": list(stack_trace),
                 }
             )
             + "\n"

@@ -48,7 +48,8 @@ use crate::event_source_mapping_role_access::{allow, given_role};
 use crate::event_source_mappings::call;
 use crate::invocation_log_delivery::{
     create_function_logging, delivered, emulator, groups, invocations_log, invoke,
-    states_initialization, streams, Created, LOGS, LOG_WRITES, NODE_RUNTIME, PYTHON_RUNTIME,
+    states_initialization, streams, structured_record as record, Created, LOGS, LOG_WRITES,
+    NODE_RUNTIME, PYTHON_RUNTIME,
 };
 
 /// Where `CreateFunction` is bound.
@@ -245,15 +246,6 @@ async fn reported_format(router: &MultiServiceRouter, case: &str, name: &str) ->
         .as_str()
         .unwrap_or_default()
         .to_string()
-}
-
-/// `line` as a JSON OBJECT, or `None` for a line that is not one — which is how a client that
-/// selected the structured format reads what it was delivered.
-fn record(line: &str) -> Option<serde_json::Map<String, Value>> {
-    match serde_json::from_str::<Value>(line) {
-        Ok(Value::Object(members)) => Some(members),
-        _ => None,
-    }
 }
 
 /// Every delivered record of one run, in the form the function's format selects.
@@ -572,13 +564,20 @@ fn assert_structured(case: &str, row: &Row, lines: &[String]) {
     );
 
     // The handler's own record: exactly one, carrying the level, the message, the invocation
-    // and the instant.
+    // and the instant. For a run the handler FAILED the record is the one the runtime writes
+    // itself, which the Python runtime states the level of under `log_level` and carries the
+    // failure's own sentence on `errorMessage` rather than on a message member.
+    let (level_member, message_member) = if row.fails {
+        ("log_level", "errorMessage")
+    } else {
+        ("level", "message")
+    };
     let application: Vec<&serde_json::Map<String, Value>> = parsed
         .iter()
         .filter(|members| {
-            members.get("level").is_some()
+            members.get(level_member).is_some()
                 && members
-                    .get("message")
+                    .get(message_member)
                     .and_then(Value::as_str)
                     .is_some_and(|message| message.contains(MARKER))
         })
@@ -590,10 +589,11 @@ fn assert_structured(case: &str, row: &Row, lines: &[String]) {
          got {application:?}"
     );
     let found = application[0];
-    let level = found.get("level").and_then(Value::as_str).unwrap_or_default();
+    let level = found.get(level_member).and_then(Value::as_str).unwrap_or_default();
     assert_eq!(
         level, row.level,
-        "case {case:?}: expected the record's level {:?}, got {level:?}",
+        "case {case:?}: expected the record's level under {level_member:?} to be {:?}, got \
+         {level:?}",
         row.level
     );
     let attributed = found.get("requestId").and_then(Value::as_str).unwrap_or_default();

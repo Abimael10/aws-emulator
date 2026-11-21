@@ -34,8 +34,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::event_source_mapping_role_access::{allow, given_role};
 use crate::invocation_log_delivery::{
-    create_function_logging, delivered, emulator, function_memory_size_mb, groups, invoke, streams,
-    Created, LOGS, LOG_WRITES, NODE_RUNTIME, PYTHON_RUNTIME,
+    create_function_logging, delivered, emulator, function_memory_size_mb, groups, invoke,
+    streams, structured_record as record, Created, LOGS, LOG_WRITES, NODE_RUNTIME, PYTHON_RUNTIME,
 };
 
 /// The line the handlers below write while their module is being imported, which is the
@@ -125,14 +125,6 @@ async fn created(
         logging_config,
     )
     .await;
-}
-
-/// `line` as a JSON object, or `None` for a record that is not one.
-fn record(line: &str) -> Option<serde_json::Map<String, Value>> {
-    match serde_json::from_str::<Value>(line) {
-        Ok(Value::Object(members)) => Some(members),
-        _ => None,
-    }
 }
 
 /// The `type` of every platform record of `tail`, in order.
