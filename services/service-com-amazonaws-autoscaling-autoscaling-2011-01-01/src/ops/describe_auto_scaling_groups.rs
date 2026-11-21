@@ -209,6 +209,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                  type of filter being applied.",
             ));
         }
+        // A request that asks for the groups to be SELECTED BY THEIR OWN NAME is told that
+        // THAT criterion is not one this operation filters by — named, rather than answered
+        // with the list of the ones that are. Asked before the filter types are weighed,
+        // because a criterion the service recognises and does not support is reported as
+        // itself and not as an unknown name.
+        if let Some(criterion) = filters
+            .iter()
+            .find_map(|filter| unsupported_criterion(filter.name.as_deref().unwrap_or_default()))
+            .or_else(|| {
+                // The documented filter types all select on TAGS, so a request that filters
+                // and also names the groups it wants asks for that same criterion on the
+                // group's own name.
+                let names_groups = input
+                    .auto_scaling_group_names
+                    .as_ref()
+                    .is_some_and(|names| !names.is_empty());
+                (!filters.is_empty() && names_groups).then_some(CRITERION_GROUP_NAME)
+            })
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                unsupported_filter_criterion_message(criterion),
+            ));
+        }
         if filters
             .iter()
             .any(|filter| !is_valid_filter_name(filter.name.as_deref().unwrap_or_default()))
@@ -231,15 +254,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let wanted = input.auto_scaling_group_names.unwrap_or_default();
-        // The documented filter types all select on TAGS, so a request that filters and
-        // also names the groups it wants asks for a criterion on the group's own name,
-        // which is not one of them.
-        if !filters.is_empty() && !wanted.is_empty() {
-            return Err(crate::scaffolded::Scaffolded::validation_error(
-                "The filter criteria isn't valid. Filtering Auto Scaling groups by group name \
-                 isn't supported.",
-            ));
-        }
         if wanted.len() > crate::state::max_filter_names(input.max_records) {
             return Err(crate::scaffolded::Scaffolded::validation_error(format!(
                 "The AutoScalingGroupNames value names {} groups, more than the {} this request \
@@ -301,6 +315,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 const FILTER_TAG_KEY: &str = "tag-key";
 const FILTER_TAG_VALUE: &str = "tag-value";
 const FILTER_TAG_PREFIX: &str = "tag:";
+
+/// The criterion a filter names when it asks for the groups the request wants to be
+/// selected by the group's OWN NAME — the criterion `AutoScalingGroupNames` selects by —
+/// spelled the way the refusal states it.
+const CRITERION_GROUP_NAME: &str = "group name";
+
+/// The filter-name spelling of the criterion that selects a group by its own name: the
+/// group's name member (`AutoScalingGroupName`) as a filter type is written in the
+/// lower-case dashed form every filter type of this service uses.
+const FILTER_GROUP_NAME: &str = "auto-scaling-group-name";
+
+/// The criterion `name` asks to filter by, for a criterion this service recognises and
+/// this operation does not support — `None` for a name that asks for no criterion it
+/// knows, which is answered with the filter types that ARE valid instead.
+fn unsupported_criterion(name: &str) -> Option<&'static str> {
+    (name == FILTER_GROUP_NAME).then_some(CRITERION_GROUP_NAME)
+}
+
+/// The sentence a read asking to filter by a criterion this operation does not support is
+/// refused with.
+///
+/// Two sentences: the fixed statement that the criteria are not valid, and the statement
+/// of WHICH criterion is unsupported — the only variable part, and the criterion the
+/// request asked to filter by rather than anything quoted from it.
+fn unsupported_filter_criterion_message(criterion: &str) -> String {
+    format!(
+        "The filter criteria isn't valid. Filtering Auto Scaling groups by {criterion} isn't \
+         supported."
+    )
+}
 
 /// Whether a filter names one of the filter types this operation documents: exactly
 /// `tag-key`, exactly `tag-value`, or `tag:` followed by the tag key the filter

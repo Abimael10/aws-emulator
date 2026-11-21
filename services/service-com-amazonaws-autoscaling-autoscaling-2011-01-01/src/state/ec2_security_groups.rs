@@ -53,13 +53,13 @@ enum GroupReference {
 /// EC2 Auto Scaling answers a request it cannot satisfy with.
 ///
 /// The sentence is FIXED: it states that one or more of the template's security groups are
-/// not in the network the group launches into, and names neither the groups, the subnets nor
+/// not in the networks the group launches into, and names neither the groups, the subnets nor
 /// the VPC — a template may carry several groups, and the service reports that at least one
 /// of them cannot be applied rather than which.
 fn foreign_security_group_error<E>() -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::validation_error(
-        "One or more security groups in the launch template are not linked to the VPC that the \
-         Auto Scaling group will launch instances in.",
+        "One or more security groups in the launch template are not linked to the VPCs \
+         configured in the Auto Scaling group",
     )
 }
 

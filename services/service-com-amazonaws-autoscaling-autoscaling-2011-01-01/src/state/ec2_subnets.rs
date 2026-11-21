@@ -58,10 +58,14 @@ pub fn unknown_subnet_error<E>(subnet_id: &str) -> crate::scaffolded::Scaffolded
 
 /// The refusal for a request that leaves the group with nowhere to place an instance:
 /// neither a zone nor a subnet. ONE spelling for both handlers.
+///
+/// The sentence names the three members ONE of which states the placement — the two
+/// spellings of a zone (`AvailabilityZones`, `AvailabilityZoneIds`) and the subnets
+/// (`VPCZoneIdentifier`, which the service names `Subnets` here) — and is fixed text with
+/// nothing taken from the request, which named none of them.
 pub fn no_placement_error<E>() -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::validation_error(
-        "At least one Availability Zone or VPC Subnet is required: specify AvailabilityZones \
-         or VPCZoneIdentifier",
+        "You must specify 1 of either AvailabilityZones, AvailabilityZoneIds, or Subnets",
     )
 }
 

@@ -194,8 +194,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.materialize_due(&*self.engine, now);
 
         let Some(group) = state.groups.get_mut(&name) else {
+            // The wording THIS operation answers an absent group with: the detail field
+            // after the fixed text is left unfilled, so it travels as the literal token
+            // `null` and the message carries no part of the request.
             return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::absent_group_message(&name),
+                crate::state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL,
             ));
         };
 

@@ -305,8 +305,7 @@ const ROWS: &[Row] = &[
 /// not in the group's own network with. It is FIXED: it names neither the security group,
 /// the subnet nor the VPC, a template being able to carry several groups.
 const EXPECTED_MESSAGE: &str = "One or more security groups in the launch template are not \
-                                linked to the VPC that the Auto Scaling group will launch \
-                                instances in.";
+                                linked to the VPCs configured in the Auto Scaling group";
 
 #[tokio::test]
 async fn a_launch_templates_security_groups_must_sit_in_the_groups_own_vpc() {

@@ -395,8 +395,8 @@ async fn a_detach_past_the_documented_per_call_maximum_is_refused() {
     );
 }
 
-/// A detach naming a group the account does not hold is refused like every other
-/// group-scoped mutation of this service, and names the group that is missing.
+/// A detach naming a group the account does not hold is refused, in the absent-group
+/// wording THIS operation answers with.
 #[tokio::test]
 async fn a_detach_of_an_absent_group_is_refused() {
     let (router, seeded) = emulator_with_target_groups().await;
@@ -413,10 +413,10 @@ async fn a_detach_of_an_absent_group_is_refused() {
             code, "ValidationError",
             "case {name:?}: expected the ValidationError code, got {code:?} {message:?}"
         );
-        // The absent-group refusal this service's group-scoped mutations answer with: the
-        // fixed sentence plus the name the request asked for (`state::absent_group_message`).
-        let expected =
-            format!("AutoScalingGroup name not found - AutoScalingGroup {name} not found");
+        // The absent-group refusal this operation answers with: the fixed sentence whose
+        // detail field is left unfilled, so no part of the request appears in it
+        // (`state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL`).
+        let expected = "AutoScalingGroup name not found - null";
         assert_eq!(
             message, expected,
             "case {name:?}: expected the message {expected:?}, got {message:?}"
