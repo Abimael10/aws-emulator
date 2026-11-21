@@ -8,7 +8,8 @@
 //! selection reports the body stored here.
 //!
 //! A selection is identified by the (`BackupPlanId`, `SelectionId`) pair AWS
-//! Backup addresses one by, so the body is stored verbatim under that pair. A
+//! Backup addresses one by, so the body is stored under that pair, value for
+//! value. A
 //! create that repeats a `CreatorRequestId` answers with the selection that
 //! token made; any OTHER create naming a selection the plan already holds is
 //! refused with `AlreadyExistsException`. A `BackupPlanId` naming no live plan
@@ -19,6 +20,15 @@
 //! selected resources up, so it is resolved against this account's IAM before
 //! anything is stored ([`crate::state::rejected_selection_role`]) and a role
 //! this service could not assume is refused.
+//!
+//! A tag condition under `ListOfTags` names the OPERATOR it selects resources
+//! by, and that name is read without regard to letter case
+//! ([`crate::state::rejected_condition_type`]): the operator the model lists as
+//! `STRINGEQUALS` is the one the service's own documentation spells
+//! `StringEquals`, so a condition stating it either way is stored — under the
+//! operator it names, which is what every read of the selection reports
+//! ([`crate::state::stored_backup_selection`]) — while a value that names no
+//! operator at all is refused and nothing is stored.
 //!
 //! ## Shape of an operation
 //!
@@ -184,6 +194,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
         let selection = input.backup_selection;
+
+        // A tag condition names the operator it selects by, and the operator set
+        // is read HERE rather than at the request boundary: AWS Backup reads that
+        // name in any letter case, which a modelled value set cannot express
+        // (`crate::state::rejected_condition_type`, and `skip_validation` on
+        // `Condition`). Read FIRST, as the boundary read it: a value no operator
+        // name admits is refused before anything else about the request is
+        // judged.
+        if let Some(refusal) = crate::state::rejected_condition_type(&selection) {
+            return Err(
+                CreateBackupSelectionErrorModeled::InvalidParameterValueException(refusal).into(),
+            );
+        }
 
         // The model types `IamRoleArn` and every entry of `Resources` and
         // `NotResources` as an ARN with no pattern, so the framework cannot

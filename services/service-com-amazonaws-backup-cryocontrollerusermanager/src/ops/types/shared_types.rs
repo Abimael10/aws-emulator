@@ -176,7 +176,19 @@ pub struct BackupSelection {
     pub conditions: Option<Conditions>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.backup#Condition")]
+// `skip_validation = ["ConditionType"]`: a tag condition's operator is read BY NAME, and
+// AWS Backup reads that name without regard to letter case — the one operator the model
+// lists as `STRINGEQUALS` is the operator its own documentation spells `StringEquals`
+// (the doc of `Condition$ConditionType` and of `BackupSelection$ListOfTags`), and a
+// condition stating it either way assigns resources by it. Matching the set as
+// case-sensitive equality at the request boundary refuses a selection AWS stores, so the
+// set is enforced by `CreateBackupSelection`'s handler instead
+// (`crate::state::rejected_condition_type`), which admits any casing of an admitted
+// operator and refuses everything else in the boundary's own words.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.backup#Condition",
+    skip_validation = ["ConditionType"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct Condition {
     pub condition_type: String,

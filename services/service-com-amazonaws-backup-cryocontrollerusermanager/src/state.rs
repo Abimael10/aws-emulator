@@ -189,6 +189,7 @@ use crate::ops::types::{
     BackupPlansListMember, BackupRule,
     BackupRuleInput,
     BackupSelection, CalculatedLifecycle, Conditions, ConflictException, CopyJob, FrameworkControl,
+    CONDITION_TYPE_VALUES,
     InvalidParameterValueException, InvalidRequestException, InvalidResourceStateException,
     LegalHold, Lifecycle, MissingParameterValueException, RecoveryPointSelection,
     ResourceNotFoundException, ScanSetting,
@@ -1900,6 +1901,110 @@ pub fn rejected_backup_selection_id(
     })
 }
 
+/// The ceiling an echoed request value is held to inside a refusal clause: the
+/// one the request boundary holds its own echoed values to, in BYTES, so a
+/// caller cannot amplify a request into an arbitrarily long response.
+const MAX_ECHOED_CLAUSE_VALUE: usize = 256;
+
+/// `value` as a refusal clause echoes it, worded as the request boundary words
+/// its own echo: itself when short, else a character-boundary-safe prefix with
+/// the marker naming the whole value's byte count
+/// (`::service_common::validation::quoted_echo_up_to`, the tree's one elision,
+/// held to this service's ceiling), so a clause this service makes and one the
+/// boundary makes cannot read differently for the same value.
+fn echoed_clause_value(value: &str) -> String {
+    ::service_common::validation::quoted_echo_up_to(value, MAX_ECHOED_CLAUSE_VALUE).into_owned()
+}
+
+/// The ONE clause this service states for a `ListOfTags` condition at `position`
+/// (1-based, as a clause counts a list's elements) whose operator is outside the
+/// admitted set: the request boundary's own sentence, over the path the boundary
+/// spells for that element's `ConditionType`, naming the set the model declares.
+fn condition_type_violation(
+    position: usize,
+    value: &str,
+) -> ::aws_smithy_schema_server::Violation {
+    use ::aws_smithy_schema_server::constraints::path;
+    ::aws_smithy_schema_server::Violation {
+        path: path::join(&[
+            path::member("BackupSelection"),
+            path::member("ListOfTags"),
+            path::element(position),
+            path::member("ConditionType"),
+        ]),
+        kind: ::aws_smithy_schema_server::ViolationKind::EnumValue(
+            CONDITION_TYPE_VALUES
+                .iter()
+                .map(|admitted| (*admitted).to_string())
+                .collect(),
+        ),
+        value: Some(echoed_clause_value(value)),
+        sensitive: false,
+    }
+}
+
+/// The operator `value` names, spelled as the MODEL spells it, or `None` when it
+/// names none of the operators `ConditionType` admits
+/// (`smithy_query(query="shape",shape="ConditionType")` — the single value
+/// `STRINGEQUALS`).
+///
+/// AWS Backup reads a condition's operator BY NAME, and the name is read without
+/// regard to ASCII case: the operator the model lists as `STRINGEQUALS` is the
+/// one AWS Backup's own documentation spells `StringEquals`
+/// (`Condition$ConditionType`: "Condition only supports `StringEquals`";
+/// `BackupSelection$ListOfTags`: "`ListOfTags` supports only `StringEquals`"),
+/// so a condition stating it either way assigns resources by that operator. What
+/// the condition is HELD under is the operator itself, so this answers the
+/// model's spelling of the one it names rather than the casing the request used
+/// ([`stored_backup_selection`]).
+#[must_use]
+fn admitted_condition_type(value: &str) -> Option<&'static str> {
+    CONDITION_TYPE_VALUES
+        .iter()
+        .find(|admitted| admitted.eq_ignore_ascii_case(value))
+        .copied()
+}
+
+/// The modelled refusal for a selection whose `ListOfTags` states an operator no
+/// tag condition may be stated with, or `None` when every condition it states
+/// names an admitted one ([`admitted_condition_type`]).
+///
+/// The operator set is enforced HERE rather than at the request boundary
+/// (`skip_validation` on `Condition` in `src/ops/types/shared_types.rs`),
+/// because the boundary can only match a modelled value set as case-sensitive
+/// equality while AWS Backup reads the operator name in any case. So this is
+/// the reading the boundary no longer makes: a value that is no casing of an
+/// admitted operator is refused in the boundary's OWN words
+/// ([`condition_type_violation`]) and over the path the boundary spells for it,
+/// several of them stated the way this service states several violations of one
+/// request — joined in the order the request declared them. No `Code`: the
+/// boundary's refusal carries none, and this condition has no observed token.
+///
+/// The sentence a caller can make this state is bounded as the boundary bounds
+/// its own: at most `::service_common::validation::MAX_VIOLATIONS` clauses,
+/// which is where the boundary's walk stops collecting, and each clause echoes
+/// the value it refused only up to [`MAX_ECHOED_CLAUSE_VALUE`] — so no request
+/// can be answered with a response out of proportion to it.
+pub fn rejected_condition_type(
+    selection: &BackupSelection,
+) -> Option<InvalidParameterValueException> {
+    let clauses = selection
+        .list_of_tags
+        .iter()
+        .flatten()
+        .enumerate()
+        .filter(|(_, condition)| admitted_condition_type(&condition.condition_type).is_none())
+        .map(|(index, condition)| {
+            condition_type_violation(index + 1, &condition.condition_type).message()
+        })
+        .take(::service_common::validation::MAX_VIOLATIONS)
+        .collect::<Vec<_>>();
+    (!clauses.is_empty()).then(|| InvalidParameterValueException {
+        message: Some(clauses.join("; ")),
+        ..Default::default()
+    })
+}
+
 /// The modelled refusal for a `BackupSelection` that selects nothing to back up,
 /// or `None` when it selects something.
 ///
@@ -3389,7 +3494,8 @@ pub fn stored_backup_rule(rule: BackupRuleInput, rule_id: String) -> BackupRule 
 }
 
 /// One resource selection as it is STORED: the body the caller gave, with every
-/// COLLECTION member it left out filled in as empty.
+/// COLLECTION member it left out filled in as empty and every tag condition held
+/// under the operator it names.
 ///
 /// A selection names the resources to back up in three published grammars, each
 /// a list — `Resources` and `NotResources` (ARNs) and `ListOfTags` (the legacy
@@ -3401,10 +3507,20 @@ pub fn stored_backup_rule(rule: BackupRuleInput, rule_id: String) -> BackupRule 
 /// an unknown one, and a condition declared under one operator never reappears
 /// under another. So the completion is applied where the body is STORED, and
 /// every read of the selection reports the same complete body.
+///
+/// A `ListOfTags` condition is held under the OPERATOR it names, not under the
+/// casing the request spelled that name in ([`admitted_condition_type`]): the
+/// name is read without regard to case, so two creates that differ only in it
+/// state the same condition, and every read of the stored selection reports the
+/// operator the way the model spells it.
 pub fn stored_backup_selection(mut selection: BackupSelection) -> BackupSelection {
     selection.resources.get_or_insert_with(Vec::new);
     selection.not_resources.get_or_insert_with(Vec::new);
-    selection.list_of_tags.get_or_insert_with(Vec::new);
+    for condition in selection.list_of_tags.get_or_insert_with(Vec::new) {
+        if let Some(operator) = admitted_condition_type(&condition.condition_type) {
+            condition.condition_type = operator.to_string();
+        }
+    }
     let conditions = selection.conditions.get_or_insert_with(Conditions::default);
     for operator in [
         &mut conditions.string_equals,
@@ -3429,8 +3545,10 @@ pub fn stored_backup_selection(mut selection: BackupSelection) -> BackupSelectio
 pub struct BackupSelectionRecord {
     pub selection_id: String,
     pub plan_id: String,
-    /// The body the create was given, kept verbatim: a selection has no member
-    /// the service fills, so a read reports what was stored.
+    /// The body the create was given, as [`stored_backup_selection`] holds it:
+    /// every value the caller stated, its collection members completed and its
+    /// tag conditions held under the operator they name, so a read reports what
+    /// was stored.
     pub selection: BackupSelection,
     pub creator_request_id: Option<String>,
     pub creation_date: SystemTime,
