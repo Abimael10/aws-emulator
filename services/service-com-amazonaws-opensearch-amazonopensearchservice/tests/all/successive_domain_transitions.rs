@@ -48,8 +48,9 @@ use super::domain_lifecycle::{error_code, string_member, Emulator, SETTLE_WAIT};
 use super::domain_maintenance::{census, list, start, status};
 use super::vpc_endpoints_for_domain::list_for_domain;
 
-/// The instance type every row below provisions its data nodes on.
-const INSTANCE_TYPE: &str = "t3.small.search";
+/// The instance type every row below provisions its data nodes on. Raised so a sibling suite
+/// that drives the same domain shape reads it here rather than spelling it again.
+pub(crate) const INSTANCE_TYPE: &str = "t3.small.search";
 
 /// One call that puts a domain into a processing state: the name a failure reports it
 /// by, the `UpdateDomainConfig` body it is made with (`None` for the create that mints
@@ -112,7 +113,10 @@ fn transitions() -> Vec<Transition> {
 
 /// The `CreateDomain` body of the domain every row acts on: one data node on a public
 /// endpoint, which is the smallest domain this control plane provisions.
-fn single_node_create(name: &str) -> Value {
+///
+/// This suite owns that body, so a sibling suite needing the same smallest domain reaches it
+/// here and the two cannot drift on the shape they provision.
+pub(crate) fn single_node_create(name: &str) -> Value {
     json!({
         "DomainName": name,
         "EngineVersion": "OpenSearch_2.11",

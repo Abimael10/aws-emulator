@@ -23,6 +23,17 @@ use super::domain_lifecycle::{
     CHANGE_LOG_GROUP, PREFIX, RECORDED_NOT_FOUND_STATUS, SETTLE_WAIT,
 };
 
+/// The same change record read from the OTHER side: not which properties a change names,
+/// but whether the call that STARTED the change and every path that later reports it agree
+/// on which change it is and what status it is in — and whether the one value in that
+/// projection the caller WROTE, a submitted access policy document, comes back as written.
+///
+/// The `#[path]` is what points this child at its own directory: this suite is itself
+/// reached through a `#[path]` from `tests/all.rs`, so a bare `mod` would resolve to a
+/// SIBLING suite.
+#[path = "change_progress/change_status_reported_consistently.rs"]
+mod change_status_reported_consistently;
+
 /// A well-formed `GUID` that names no change: the id space is 128 bits wide and the
 /// store mints v4 UUIDs, so the nil-shaped id below is never one of them.
 const ABSENT_CHANGE_ID: &str = "00000000-0000-4000-8000-000000000000";

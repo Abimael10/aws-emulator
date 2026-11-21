@@ -57,3 +57,31 @@ Smithy cited (com.amazonaws.opensearch#AmazonOpenSearchService): ConfigChangeSta
 4. In the 200 response, read $.DomainStatus.ChangeProgressDetails.ConfigChangeStatus: it must be 'Initializing', the emulator returns 'Pending'.
 5. Read $.DomainStatus.ModifyingProperties element by element: entry 3 (AccessPolicies) must echo the submitted policy with the principal in the submitted bare-account-id form, not rewritten to arn:aws:iam::<account-id>:root; the AdvancedSecurityOptions sub-property entries (indices 5, 7, 9, 10, 11) must carry PendingValue 'false', not ''; index 12 must be ClusterConfig.ColdStorageOptions, not AutoTuneOptions; index 26 must be TAGS with ValueType PLAIN_TEXT and an empty PendingValue, not CognitoOptions/STRINGIFIED_JSON; index 27 must be AutomatedSnapshotPauseOptions {"Enabled":false}, not DeploymentStrategyOptions; indices 31, 34, 35 and 41 must likewise match AWS's property enumeration.
 6. The step should pass against the recorded response.
+
+## Disposition
+
+Closed with the ConfigChangeStatus cause DECLINED as a per-run value, the access-policy
+symptom verified gone and pinned by a test, and the ModifyingProperties symptoms left with the
+issue that owns their replay keys.
+
+* `$.DomainStatus.ChangeProgressDetails.ConfigChangeStatus` (this report's only replay key) —
+  DECLINED. Which of the early states of its own change workflow AWS has reached when it
+  serialises a create response is a per-run race, not a rule: the SAME key is recorded as
+  'Pending' on five other creates (see
+  `issues/things-that-now-work/20261029T190009Z-es-domainstatus-and-domainconfig-responses-omit-modeled-option.md`,
+  cause 1 and its evidence line "expected 'Pending', got 'ApplyingChanges'"), and the earlier
+  create in THIS fixture is not among this report's traces either, so one run served two
+  creates two different values. The emulator reports a `ConfigChangeStatus` member for the
+  state the change is really in, the same value on every path that reports that change, and
+  advances it when the change advances; answering 'Initializing' on the create would fit this
+  one recording and break those five.
+* The access policy is NOT rewritten by this code base any more: a submitted document is held
+  with only the insignificant whitespace between its JSON tokens dropped, and
+  `tests/all/change_progress/change_status_reported_consistently.rs` now pins that over a
+  table of principal forms (bare account id, account root ARN, wildcard, role ARN in a
+  one-element list).
+* The `ModifyingProperties` entry set, order, `PendingValue` and `ValueType` divergences on
+  this step carry the replay keys of the OPEN issue
+  `20261114T061447Z-es-domain-configuration-projection-diverges-modifyingproperties-entries-pendingvalue.md`,
+  which holds the recorded rows for seven fixtures; they are that issue's to fix and are
+  untouched here.

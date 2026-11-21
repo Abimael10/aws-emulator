@@ -25,7 +25,10 @@ use serde_json::{json, Value};
 use super::domain_lifecycle::{Answer, Emulator, PREFIX, SETTLE_WAIT};
 
 /// `POST /2021-01-01/opensearch/domain-info` with `names` as its `DomainNames`.
-async fn describe_domains(emulator: &Emulator, names: &[&str]) -> Answer {
+///
+/// This suite owns the batch read, so a sibling suite that needs one call of it reaches this
+/// helper rather than writing a second copy of the request.
+pub(crate) async fn describe_domains(emulator: &Emulator, names: &[&str]) -> Answer {
     emulator
         .call(
             "POST",
