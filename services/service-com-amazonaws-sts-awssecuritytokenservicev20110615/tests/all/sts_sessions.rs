@@ -131,24 +131,25 @@ fn emulator_mounting(with_iam: bool) -> (MultiServiceRouter, Arc<engine::InMemor
     (router, engine)
 }
 
-/// Percent-encode the characters that are significant in an
-/// `application/x-www-form-urlencoded` body — the delimiters, and the CR/LF a value
-/// may carry — leaving everything else as a client's own encoder would (`:` and `/`
-/// in an ARN, `{`/`"` in a policy document).
+/// Percent-encode one `application/x-www-form-urlencoded` component the way an AWS SDK's
+/// own encoder does: BYTE-WISE over the value's UTF-8, leaving only RFC 3986's unreserved
+/// characters (`ALPHA / DIGIT / "-" / "." / "_" / "~"`) literal.
+///
+/// Byte-wise is the point for a value spelled outside ASCII — an accented letter, a CJK
+/// one: a client sends each of its UTF-8 bytes as its own `%XX`, so a suite that sent the
+/// character literally would never exercise the decoding a real request needs. The encoding
+/// itself is the maintained `percent-encoding` crate's; only the set of characters that stay
+/// literal is stated here.
 pub(crate) fn form_value(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| match c {
-            '&' => "%26".to_string(),
-            '=' => "%3D".to_string(),
-            '+' => "%2B".to_string(),
-            '%' => "%25".to_string(),
-            ' ' => "%20".to_string(),
-            '\n' => "%0A".to_string(),
-            '\r' => "%0D".to_string(),
-            other => other.to_string(),
-        })
-        .collect()
+    /// RFC 3986's unreserved characters, the ones an SDK's form encoder leaves literal:
+    /// everything else — the delimiters, the space, and every byte of a multi-byte
+    /// character — travels as `%XX`.
+    const ESCAPED: &::percent_encoding::AsciiSet = &::percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+    ::percent_encoding::utf8_percent_encode(value, ESCAPED).to_string()
 }
 
 /// One STS awsQuery call, signed (in the routing sense) with `access_key_id`: this

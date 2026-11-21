@@ -39,10 +39,10 @@ use crate::query_wire::{element, elements, opt_element};
 const ACCOUNT: &str = "000000000000";
 
 /// The session tag key every row writes and every policy conditions on.
-const TAG_KEY: &str = "Team";
+pub(crate) const TAG_KEY: &str = "Team";
 
 /// The action every conditioned statement here grants, and the one every refusal names.
-const ACTION: &str = "iam:ListRoles";
+pub(crate) const ACTION: &str = "iam:ListRoles";
 
 /// A trust policy admitting the account root both to assume the role and to attach session
 /// tags: "to pass session tags … the role's trust policy must allow the `sts:TagSession`
@@ -55,7 +55,7 @@ const TAGGING_TRUST_POLICY: &str = concat!(
 
 /// Create a role whose trust policy admits the account root to assume it and to tag the
 /// session, and return its ARN.
-async fn create_role(router: &MultiServiceRouter, role_name: &str) -> String {
+pub(crate) async fn create_role(router: &MultiServiceRouter, role_name: &str) -> String {
     let (status, body) = iam(
         router,
         "CreateRole",
@@ -76,7 +76,11 @@ async fn create_role(router: &MultiServiceRouter, role_name: &str) -> String {
 }
 
 /// Embed `document` in the role as its inline policy.
-async fn put_role_policy(router: &MultiServiceRouter, role_name: &str, document: &str) {
+pub(crate) async fn put_role_policy(
+    router: &MultiServiceRouter,
+    role_name: &str,
+    document: &str,
+) {
     let (status, body) = iam(
         router,
         "PutRolePolicy",
@@ -114,7 +118,7 @@ async fn tag_role(router: &MultiServiceRouter, role_name: &str, key: &str, value
 /// Assume `role_arn` as `signing_key`, under `session_name`, carrying `tags` as session tags
 /// and naming `transitive` as the keys that pass to a subsequent session; returns the access
 /// key id of the session STS minted.
-async fn assume_role(
+pub(crate) async fn assume_role(
     router: &MultiServiceRouter,
     signing_key: &str,
     role_arn: &str,
@@ -162,7 +166,10 @@ async fn assume_role(
 }
 
 /// Call `iam:ListRoles` as `access_key_id` and return `(status, body)`.
-async fn list_roles(router: &MultiServiceRouter, access_key_id: &str) -> (u16, String) {
+pub(crate) async fn list_roles(
+    router: &MultiServiceRouter,
+    access_key_id: &str,
+) -> (u16, String) {
     iam_as(router, access_key_id, "ListRoles", &[]).await
 }
 
@@ -202,7 +209,7 @@ fn conditioned_on(tag_key: &str, value: &str) -> String {
 /// `text` with every non-ASCII character written as the JSON `\uXXXX` escape (a pair of
 /// them for a character outside the basic multilingual plane), which is how a JSON
 /// serializer emits one when it is asked for ASCII output.
-fn ascii_json(text: &str) -> String {
+pub(crate) fn ascii_json(text: &str) -> String {
     let mut written = String::with_capacity(text.len());
     for character in text.chars() {
         if character.is_ascii() {
@@ -230,7 +237,13 @@ fn withheld_message(role_name: &str, session_name: &str) -> String {
 
 /// Assert the answer to `(status, body)` is the `AccessDenied` refusal of [`ACTION`] for
 /// `session_name` of `role_name`.
-fn assert_withheld(case: &str, role_name: &str, session_name: &str, status: u16, body: &str) {
+pub(crate) fn assert_withheld(
+    case: &str,
+    role_name: &str,
+    session_name: &str,
+    status: u16,
+    body: &str,
+) {
     assert_eq!(
         status, 403,
         "case {case:?}: {session_name} expected HTTP 403, got {status} {body}"
@@ -251,7 +264,7 @@ fn assert_withheld(case: &str, role_name: &str, session_name: &str, status: u16,
 }
 
 /// Assert the answer to `(status, body)` is the listing, carrying `role_name`.
-fn assert_lists(case: &str, role_name: &str, status: u16, body: &str) {
+pub(crate) fn assert_lists(case: &str, role_name: &str, status: u16, body: &str) {
     assert_eq!(
         status, 200,
         "case {case:?}: the exactly tagged session expected HTTP 200, got {status} {body}"

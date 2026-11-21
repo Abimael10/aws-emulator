@@ -83,6 +83,11 @@ ring = "0.17"
 hmac = "0.12"
 sha1 = "0.10"
 data-encoding = "2"
+# The suites post `application/x-www-form-urlencoded` bodies, so a value is percent-encoded
+# the way an SDK's own encoder does it — byte-wise over UTF-8, everything but RFC 3986's
+# unreserved set escaped — with the maintained encoder rather than one written here
+# (`tests/all/sts_sessions.rs`).
+percent-encoding = "2"
 
 [lints]
 workspace = true
