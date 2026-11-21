@@ -13,19 +13,30 @@
 //! `@connections` API named in it, so a payload it posts to a connection id is delivered to
 //! THAT connection.**
 //!
-//! The last table drives that rule over a SET of connections a deployed stage carries at the
-//! same time, all of them served by the CATCH-ALL route: **every client the announced endpoint
-//! accepts is minted its own connection id, so concurrent sockets of one stage never share
-//! one, and a payload the serving route's function posts to an id is delivered to that
-//! connection's socket whether or not it is the connection whose frame triggered the call** —
-//! which is what makes a server-side broadcast to connections that sent nothing observable at
-//! all.
+//! The table of CONCURRENT sockets drives that rule over a SET of connections a deployed
+//! stage carries at the same time, all of them served by the CATCH-ALL route: **every client
+//! the announced endpoint accepts is minted its own connection id, so concurrent sockets of
+//! one stage never share one, and a payload the serving route's function posts to an id is
+//! delivered to that connection's socket whether or not it is the connection whose frame
+//! triggered the call** — which is what makes a server-side broadcast to connections that sent
+//! nothing observable at all.
 //!
 //! Nothing here is a value this emulator fills in for the test: each assertion is on a value
 //! the gateway computed for the call (the route that served it, the stage, the api, the
 //! address the client dialled) or on bytes a RUNNING function pushed over the socket, which
 //! is why AWS Lambda and the `@connections` management API are mounted beside this service on
 //! one engine.
+//!
+//! The FINAL table is what a backend learns when one of the connections it is pushing to has
+//! DEPARTED: **every `@connections` call a route's function makes is answered with a complete
+//! modelled result — the payload delivered and `200` for a connection the endpoint still
+//! holds, the memberless `GoneException` (`410`, so no message at all) for an id of the
+//! issued shape it no longer holds — so the function reads each outcome as that call's own
+//! modelled answer, branches on it (pruning its record of a connection for the gone class and
+//! for nothing else), goes on serving the rest of the call, and the frames it then pushes to
+//! the connections it KEPT are delivered to them.** Never a transport failure and never a call
+//! that does not come back: either leaves a handler with nothing to branch on, and the live
+//! clients it had just been told about unnotified.
 //!
 //! The suites that own the steps before the integration are not restated here: the
 //! handshake's own statuses are `websocket_transport_data_plane.rs`, the event each call hands
@@ -43,6 +54,7 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::http_api_backend_dispatch::given_function;
+use crate::websocket_endpoint_connections::minted;
 use crate::websocket_transport_data_plane::{handshake_at, ClientSocket};
 
 /// The Region every request below is signed for.
@@ -61,6 +73,14 @@ const LOOPBACK_SOURCE_IP: &str = "127.0.0.1";
 /// a frame may be the answer of a function this emulator has to run first — and bounded so a
 /// case that will never be answered fails instead of hanging the suite.
 const FRAME_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How long a case waits for the FIRST frame a function owes it: that call starts the
+/// runtime of the function the route fronts, which on a host running every other suite of the
+/// workspace beside this one takes longer than a frame of an already-started one. A span no
+/// case here tests, so it is given generous room; every later frame of the same case is
+/// awaited for [`FRAME_DEADLINE`], so a case that stops being answered fails promptly. What
+/// is waited for is the FRAME rather than the clock.
+const RELAY_DEADLINE: Duration = Duration::from_secs(60);
 
 /// How often a case looks again for a state the call it already made owes — the record of a
 /// connection the client closed.
@@ -357,7 +377,19 @@ async fn send(case: &str, socket: &mut ClientSocket, message: &str) {
 /// The next frame this socket is sent, as its text; a socket that is sent none within
 /// [`FRAME_DEADLINE`] answers `None`.
 async fn next_frame(case: &str, socket: &mut ClientSocket) -> Option<String> {
-    match tokio::time::timeout(FRAME_DEADLINE, socket.next()).await {
+    next_frame_within(case, socket, FRAME_DEADLINE).await
+}
+
+/// [`next_frame`] awaited for as long as `within`: a frame a case must be sent is waited for
+/// generously, because the call that produces it may have to start a function's runtime
+/// first — a span no case here tests. The wait is for the FRAME, a condition, and nothing
+/// asserts on the clock.
+async fn next_frame_within(
+    case: &str,
+    socket: &mut ClientSocket,
+    within: Duration,
+) -> Option<String> {
+    match tokio::time::timeout(within, socket.next()).await {
         Ok(Some(Ok(Message::Text(frame)))) => Some(frame.as_str().to_string()),
         Ok(Some(Ok(Message::Binary(frame)))) => Some(String::from_utf8_lossy(&frame).to_string()),
         Ok(Some(Ok(other))) => panic!("case {case:?}: unexpected frame {other:?}"),
@@ -1019,6 +1051,447 @@ async fn every_socket_of_a_deployed_stage_is_posted_to_by_the_id_it_was_minted()
             last.0, GONE,
             "case {case:?}: socket {at}'s closed connection {id:?} must answer {GONE}, got {} {}",
             last.0, last.1
+        );
+    }
+}
+
+/// The route key that registers a connection in the backend's own table, and the one that
+/// fans a payload out over it. The api selects a route by the frame's `action`
+/// ([`given_api`]), so these are the values a frame names.
+const REGISTER_ROUTE_KEY: &str = "register";
+const FAN_ROUTE_KEY: &str = "fan";
+
+/// The node labels the registering clients name themselves with, one per connection: three
+/// forms a client spells a node with, so a reply or a delivery that reached the wrong socket
+/// is read as another node's.
+const NODE_LABELS: [&str; 3] = ["ui-west-1", "node.42", "LONGER-NODE-LABEL-0000000001"];
+
+/// The node the backend's table knows the id this stage NEVER held by — a row of its table
+/// that could only ever be answered the gone class.
+const UNHELD_NODE: &str = "node-from-another-process";
+
+/// The error shape a push to a connection the endpoint no longer holds is refused with
+/// (`GoneException`, `@httpError(410)`, declared with NO members, so it carries no message at
+/// all), and the status a delivered push answers.
+const GONE_CODE: &str = "GoneException";
+const DELIVERED_STATUS: u16 = 200;
+
+/// Which socket sends every fan-out below, and so the connection the backend notifies whatever
+/// the call named.
+const SENDER: usize = 0;
+
+/// A function that keeps the connection table AWS's own guidance has a backend keep, in the
+/// SDK its runtime supplies: it answers the frame that registers a connection, and for every
+/// other call it pushes the payload to each id it was handed, records what its SDK was
+/// ANSWERED for that id, prunes its row only where the connection has GONE, and notifies the
+/// connections it kept — the sender's included.
+///
+/// Everything it reports is something its own SDK was answered, so a push that produced no
+/// modelled result at all (a severed connection, a call that never came back) leaves the
+/// notice unsent and the rows below unread.
+const PRUNING_HANDLER: &str = r#"import json
+import boto3
+import botocore.exceptions
+
+GONE = "GoneException"
+
+
+def lambda_handler(event, context):
+    call = json.loads(event.get("body") or "{}")
+    reported = event["requestContext"]
+    if call.get("action") == "register":
+        # The reply a two-way route relays to the socket that sent the frame: the node this
+        # connection registered as, and the id the gateway reported for it.
+        return {
+            "statusCode": 200,
+            "body": json.dumps(
+                {"node": call["node"], "connectionId": reported["connectionId"]}
+            ),
+        }
+    connections = boto3.client(
+        "apigatewaymanagementapi",
+        endpoint_url="https://%s/%s" % (reported["domainName"], reported["stage"]),
+    )
+    kept = []
+    pruned = []
+    observed = []
+    for target in call.get("targets") or []:
+        try:
+            answered = connections.post_to_connection(
+                ConnectionId=target["connectionId"],
+                Data=json.dumps(
+                    {"node": target["node"], "message": call["message"]}
+                ).encode("utf-8"),
+            )
+        except botocore.exceptions.ClientError as error:
+            refusal = error.response["Error"]
+            observed.append(
+                {
+                    "node": target["node"],
+                    "code": refusal["Code"],
+                    "message": refusal.get("Message") or "",
+                    "status": error.response["ResponseMetadata"]["HTTPStatusCode"],
+                }
+            )
+            # A row is dropped for a connection that has GONE, and for nothing else.
+            if refusal["Code"] == GONE:
+                pruned.append(target["node"])
+            else:
+                kept.append(target)
+            continue
+        observed.append(
+            {
+                "node": target["node"],
+                "code": "",
+                "message": "",
+                "status": answered["ResponseMetadata"]["HTTPStatusCode"],
+            }
+        )
+        kept.append(target)
+    notice = json.dumps({"notice": "pruned", "pruned": pruned, "observed": observed})
+    notified = [reported["connectionId"]]
+    for target in kept:
+        if target["connectionId"] not in notified:
+            notified.append(target["connectionId"])
+    for connection_id in notified:
+        connections.post_to_connection(
+            ConnectionId=connection_id, Data=notice.encode("utf-8")
+        )
+    return {"statusCode": 200, "body": notice}
+"#;
+
+/// One row of the backend's connection table: the node it knows the connection by, the id it
+/// addresses, and whether the endpoint still holds that connection.
+struct Registered {
+    node: &'static str,
+    connection_id: String,
+    /// A connection the endpoint HOLDS, whose push is delivered; a row that is not live is one
+    /// the endpoint reports gone.
+    live: bool,
+}
+
+/// Register `node` over this socket through the two-way [`REGISTER_ROUTE_KEY`] route, and
+/// answer the connection id the function was given for it — the reply the gateway relayed back
+/// over the socket that sent the frame.
+async fn registered(case: &str, node: &str, socket: &mut ClientSocket) -> String {
+    let frame = json!({ "action": REGISTER_ROUTE_KEY, "node": node }).to_string();
+    send(case, socket, &frame).await;
+    let what = format!("the registration reply for {node:?}");
+    let reply = next_frame_within(case, socket, RELAY_DEADLINE)
+        .await
+        .unwrap_or_else(|| panic!("case {case:?}: {what} must be relayed over its own socket"));
+    let parsed: Value = serde_json::from_str(&reply).unwrap_or_else(|error| {
+        panic!("case {case:?}: {what} must be the function's JSON body, got {reply:?} ({error})")
+    });
+    assert_eq!(
+        parsed.get("node").and_then(Value::as_str),
+        Some(node),
+        "case {case:?}: {what} must carry the node this connection registered as, got {reply:?}"
+    );
+    parsed
+        .get("connectionId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or_else(|| panic!("case {case:?}: {what} must carry a connectionId, got {reply:?}"))
+        .to_string()
+}
+
+/// The frame `what` as the JSON the function pushed, or a panic naming the case.
+fn pushed_json(case: &str, what: &str, frame: &str) -> Value {
+    serde_json::from_str(frame).unwrap_or_else(|error| {
+        panic!(
+            "case {case:?}: {what} must be the JSON the function pushed, got {frame:?} ({error})"
+        )
+    })
+}
+
+/// A payload a route's function pushes to a DEPARTED connection is the modelled
+/// `GoneException` its SDK reads, so the function prunes that row alone and the connections it
+/// kept are notified over their own sockets.
+#[tokio::test]
+async fn a_routes_function_prunes_only_the_connection_the_endpoint_reports_gone() {
+    let case = "a route's function fanning out over a table holding a departed connection";
+    let (emulator, engine) = emulator();
+    let function = given_function(&emulator, &engine, case, "socket-prune", PRUNING_HANDLER).await;
+    let api = given_api(&emulator, case, "socket-prune-api").await;
+    // The registration route is TWO-WAY, so its answer reaches the socket that registered;
+    // the fan-out route is one-way, so the only frames it produces are the ones the function
+    // pushed.
+    given_lambda_route(
+        &emulator,
+        case,
+        &api.api_id,
+        REGISTER_ROUTE_KEY,
+        &function,
+        true,
+    )
+    .await;
+    given_lambda_route(&emulator, case, &api.api_id, FAN_ROUTE_KEY, &function, false).await;
+    given_stage(&emulator, case, &api.api_id).await;
+
+    // Three clients dial the announced socket and register, each with its own node label: the
+    // reply each reads is the one its OWN frame earned, and the id it carries names a
+    // connection the management API holds.
+    let mut sockets: Vec<ClientSocket> = Vec::with_capacity(NODE_LABELS.len());
+    let mut ids: Vec<String> = Vec::with_capacity(NODE_LABELS.len());
+    for node in NODE_LABELS {
+        let mut socket: ClientSocket = handshake_at(case, &api.authority, &format!("/{STAGE}"))
+            .await
+            .unwrap_or_else(|status| {
+                panic!("case {case:?}: the handshake for {node:?} must be completed, got {status}")
+            });
+        let connection_id = registered(case, node, &mut socket).await;
+        let (status, reported) = connections_call(&emulator, "GET", &connection_id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: GetConnection on {node:?}'s id {connection_id:?} must answer 200, \
+             got {status} {reported}"
+        );
+        sockets.push(socket);
+        ids.push(connection_id);
+    }
+    for (left, id) in ids.iter().enumerate() {
+        for (right, other) in ids.iter().enumerate().skip(left + 1) {
+            assert_ne!(
+                id, other,
+                "case {case:?}: the connections of {:?} and {:?} must each be minted their own \
+                 id, got {id:?} twice",
+                NODE_LABELS[left], NODE_LABELS[right]
+            );
+        }
+    }
+
+    // The LAST registered connection then departs — a `DeleteConnection` ends it definitely,
+    // so no row below waits on a close — and the endpoint reports it gone from then on.
+    let stale_node = NODE_LABELS[NODE_LABELS.len() - 1];
+    let stale_id = ids[ids.len() - 1].clone();
+    let (status, deleted) = connections_call(&emulator, "DELETE", &stale_id).await;
+    assert_eq!(
+        status, 204,
+        "case {case:?}: DeleteConnection on {stale_node:?} must answer 204, got {status} {deleted}"
+    );
+    drop(sockets.pop());
+    let deadline = std::time::Instant::now() + FRAME_DEADLINE;
+    let mut last = (0u16, Value::Null);
+    while std::time::Instant::now() < deadline {
+        last = connections_call(&emulator, "GET", &stale_id).await;
+        if last.0 == GONE {
+            break;
+        }
+        tokio::time::sleep(LOOK_INTERVAL).await;
+    }
+    assert_eq!(
+        last.0, GONE,
+        "case {case:?}: the departed connection {stale_id:?} must answer {GONE}, got {} {}",
+        last.0, last.1
+    );
+
+    // The table the fan-outs loop over: the two live connections, the one that departed, and
+    // a row naming an id of the issued shape this stage never held at all — both of the ways a
+    // backend's row can name a connection the endpoint does not hold.
+    let table = vec![
+        Registered {
+            node: NODE_LABELS[0],
+            connection_id: ids[0].clone(),
+            live: true,
+        },
+        Registered {
+            node: NODE_LABELS[1],
+            connection_id: ids[1].clone(),
+            live: true,
+        },
+        Registered {
+            node: stale_node,
+            connection_id: stale_id.clone(),
+            live: false,
+        },
+        Registered {
+            node: UNHELD_NODE,
+            connection_id: minted("never-held-by-this-stage"),
+            live: false,
+        },
+    ];
+    // The first rows of the table are the live connections, in the order their sockets were
+    // opened, which is what lets a row read the delivery owed to socket `at` off `sockets[at]`.
+    for (at, row) in table.iter().enumerate().take(sockets.len()) {
+        assert_eq!(
+            row.connection_id, ids[at],
+            "case {case:?}: table row {at} must be the connection socket {at} carries"
+        );
+    }
+
+    // The rows span what the rule generalises over: how many of the addressed connections the
+    // endpoint still holds (all, all but one, one, none), WHERE the departed ones sit in the
+    // fan-out (last, in the middle, first), and whether the row the endpoint does not hold was
+    // issued here and closed or never held at all. Each row carries its own marker, and each
+    // socket is read in row order, so a frame delivered to a connection a row did not name is
+    // read as the wrong marker by the next row that reads that socket — and the last row names
+    // every live connection, so none is left unread.
+    let rows: Vec<(&str, Vec<usize>, &str)> = vec![
+        (
+            "every addressed connection is one the endpoint holds",
+            vec![0, 1],
+            "both-live",
+        ),
+        (
+            "a departed connection addressed between two live ones",
+            vec![0, 2, 1],
+            "one-departed",
+        ),
+        (
+            "the departed connection addressed first, beside an id this stage never held",
+            vec![2, 3, 0],
+            "two-refused",
+        ),
+        (
+            "only a connection the endpoint no longer holds is addressed",
+            vec![2],
+            "nothing-delivered",
+        ),
+        // The LAST fan-out names both live connections again: each reads one delivery and one
+        // notice here, so a frame pushed to a connection an earlier row did not name — the row
+        // that addressed nothing live included — is read in this row's place instead of going
+        // unobserved.
+        (
+            "every addressed connection is live again, after every refusal",
+            vec![0, 1],
+            "both-live-last",
+        ),
+    ];
+
+    for (what, addressed, marker) in &rows {
+        let targets: Vec<Value> = addressed
+            .iter()
+            .map(|at| json!({ "connectionId": table[*at].connection_id, "node": table[*at].node }))
+            .collect();
+        let frame = json!({
+            "action": FAN_ROUTE_KEY,
+            "targets": targets,
+            "message": marker,
+        })
+        .to_string();
+        send(case, &mut sockets[SENDER], &frame).await;
+
+        // What the fan-out owes: a delivery to each addressed connection the endpoint holds,
+        // the gone class for every other addressed row, and the notice to the sender and to
+        // each connection the function kept.
+        let delivered: Vec<usize> = addressed
+            .iter()
+            .copied()
+            .filter(|at| table[*at].live)
+            .collect();
+        let pruned: Vec<&str> = addressed
+            .iter()
+            .copied()
+            .filter(|at| !table[*at].live)
+            .map(|at| table[at].node)
+            .collect();
+
+        for at in 0..sockets.len() {
+            let owed_delivery = delivered.contains(&at);
+            let owed_notice = at == SENDER || owed_delivery;
+            if owed_delivery {
+                let label = format!("{what}: the payload addressed to {:?}", table[at].node);
+                let read = next_frame_within(case, &mut sockets[at], FRAME_DEADLINE)
+                    .await
+                    .unwrap_or_else(|| {
+                        panic!("case {case:?}: {label} must be delivered over its own socket")
+                    });
+                let payload = pushed_json(case, &label, &read);
+                assert_eq!(
+                    payload.get("node").and_then(Value::as_str),
+                    Some(table[at].node),
+                    "case {case:?}: {label} must name the node it was addressed to, got {read:?}"
+                );
+                assert_eq!(
+                    payload.get("message").and_then(Value::as_str),
+                    Some(*marker),
+                    "case {case:?}: {label} must carry this row's payload, got {read:?}"
+                );
+            }
+            if !owed_notice {
+                continue;
+            }
+            let label = format!("{what}: the notice {:?} is sent", table[at].node);
+            let read = next_frame_within(case, &mut sockets[at], FRAME_DEADLINE)
+                .await
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: {label} must reach the connection it was pushed to")
+                });
+            let notice = pushed_json(case, &label, &read);
+            let reported_pruned: Vec<&str> = notice
+                .get("pruned")
+                .and_then(Value::as_array)
+                .map(|nodes| nodes.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            assert_eq!(
+                reported_pruned, pruned,
+                "case {case:?}: {label} must prune exactly the connections the endpoint reports \
+                 gone, got {read:?}"
+            );
+            // And what the function's own SDK was answered for each id it addressed, in the
+            // order it addressed them: the modelled gone class for a connection the endpoint
+            // no longer holds, and the delivered status for one it does.
+            let observed = notice
+                .get("observed")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            assert_eq!(
+                observed.len(),
+                addressed.len(),
+                "case {case:?}: {label} must report one answer per addressed id, got {read:?}"
+            );
+            for (seen, at_addressed) in observed.iter().zip(addressed.iter().copied()) {
+                let row = &table[at_addressed];
+                let expected_status = if row.live { DELIVERED_STATUS } else { GONE };
+                let expected_code = if row.live { "" } else { GONE_CODE };
+                assert_eq!(
+                    seen.get("node").and_then(Value::as_str),
+                    Some(row.node),
+                    "case {case:?}: {label} must report the ids in the order they were \
+                     addressed, got {read:?}"
+                );
+                assert_eq!(
+                    seen.get("status").and_then(Value::as_u64),
+                    Some(u64::from(expected_status)),
+                    "case {case:?}: {label} must report {expected_status} for {:?}, got {read:?}",
+                    row.node
+                );
+                assert_eq!(
+                    seen.get("code").and_then(Value::as_str),
+                    Some(expected_code),
+                    "case {case:?}: {label} must report the error class {expected_code:?} for \
+                     {:?}, got {read:?}",
+                    row.node
+                );
+                // `GoneException` declares no members, so the refusal a departed connection
+                // earns carries no sentence at all — what the SDK reports for it is the empty
+                // message. A delivered push is no refusal and has none to report either, which
+                // its status and empty error class above already say.
+                if !row.live {
+                    assert_eq!(
+                        seen.get("message").and_then(Value::as_str),
+                        Some(""),
+                        "case {case:?}: {label} must carry no message for {:?} — GoneException \
+                         is memberless — got {read:?}",
+                        row.node
+                    );
+                }
+            }
+        }
+    }
+
+    // The fan-outs left the registry where they found it: every live connection is still
+    // reported, and neither id the function pruned names one.
+    for row in &table {
+        let expected = if row.live { 200 } else { GONE };
+        let (status, reported) = connections_call(&emulator, "GET", &row.connection_id).await;
+        assert_eq!(
+            status, expected,
+            "case {case:?}: after the fan-outs GetConnection on {:?} must answer {expected}, got \
+             {status} {reported}",
+            row.node
         );
     }
 }
