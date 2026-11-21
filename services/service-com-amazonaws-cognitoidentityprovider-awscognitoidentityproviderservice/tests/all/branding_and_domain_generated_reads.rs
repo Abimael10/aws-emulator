@@ -347,7 +347,7 @@ async fn the_merged_view_reports_the_services_own_settings_and_image_files() {
         );
     }
 
-    // The image files the service provides: one SVG for each display mode of
+    // The image files the service provides: one file for each display mode of
     // every category it provides artwork for, inside the modelled maximum. The
     // artwork itself is served from the managed login pages, so no file claims
     // bytes a caller uploaded.
@@ -369,10 +369,15 @@ async fn the_merged_view_reports_the_services_own_settings_and_image_files() {
             ["LIGHT", "DARK"].contains(&color_mode),
             "a provided file must name the display mode it is for, got {file}"
         );
+        // A category whose name states the file format its role is fetched in
+        // is provided in that format; every other role is artwork the page
+        // scales.
+        let expected_extension = if category == "FAVICON_ICO" { "ICO" } else { "SVG" };
         assert_eq!(
             file["Extension"],
-            json!("SVG"),
-            "a provided file is an SVG, got {file}"
+            json!(expected_extension),
+            "a provided file carries the file type its category is published in, expected \
+             {expected_extension}, got {file}"
         );
         assert!(
             file.get("Bytes").is_none() && file.get("ResourceId").is_none(),

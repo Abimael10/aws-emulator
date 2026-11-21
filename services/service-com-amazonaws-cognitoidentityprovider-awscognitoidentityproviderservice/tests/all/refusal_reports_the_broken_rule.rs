@@ -234,9 +234,11 @@ async fn sign_in(router: &MultiServiceRouter, client_id: &str, username: &str) -
 // ---------------------------------------------------------------------------
 
 /// The one sentence a challenge response answers a `Session` that names no
-/// outstanding challenge with: it is no session of this request, which is the
-/// same fact as a session started for another pool or app client.
-const SESSION_NOT_FOR_THIS_REQUEST_MESSAGE: &str = "Invalid session for the user.";
+/// outstanding challenge with: the response authenticates with the PAIR of its
+/// session and its challenge parameters, so a session half that resolves nothing
+/// is that pair failing — the same fact as a session started for another pool or
+/// app client.
+const CHALLENGE_SESSION_MISMATCH_MESSAGE: &str = "Invalid code/session provided";
 
 #[tokio::test]
 async fn every_session_that_names_no_outstanding_challenge_is_one_invalid_session() {
@@ -286,8 +288,8 @@ async fn every_session_that_names_no_outstanding_challenge_is_one_invalid_sessio
                 &case,
                 operation,
                 &Value::Object(body),
-                "NotAuthorizedException",
-                SESSION_NOT_FOR_THIS_REQUEST_MESSAGE,
+                "CodeMismatchException",
+                CHALLENGE_SESSION_MISMATCH_MESSAGE,
             )
             .await;
             // The sentence reports the pair, so it quotes neither half of it.

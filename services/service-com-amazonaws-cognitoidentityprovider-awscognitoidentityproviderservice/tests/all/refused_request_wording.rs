@@ -572,8 +572,10 @@ async fn two_factors_marked_preferred_are_refused_for_the_conflict_in_the_reques
 /// session of this request.
 const SESSION_ALREADY_USED: &str = "Invalid session for the user, session can only be used once.";
 
-/// The sentence a value naming no session of this request is refused with.
-const SESSION_NOT_FOR_THIS_REQUEST: &str = "Invalid session for the user.";
+/// The sentence a value naming no session of this request is refused with: a challenge
+/// response authenticates with the pair of its session and its challenge parameters, so a
+/// session half that resolves no outstanding challenge is a code/session mismatch.
+const CHALLENGE_SESSION_MISMATCH: &str = "Invalid code/session provided";
 
 /// A `SessionType` value (len 20..4096) this emulator never handed out.
 const UNISSUED_SESSION: &str = "nosuchsessionvaluehere0123456789";
@@ -723,21 +725,23 @@ async fn a_replayed_new_password_session_reports_the_single_use_clause() {
         );
 
         // A value naming NO session of this request is the other fact, and says
-        // so: the clause above is what tells the two apart.
+        // so: the single-use clause above is what a session this request DID
+        // hold reports, while a value that resolves no outstanding challenge is
+        // the response's pair failing.
         let mut unissued = response.clone();
         unissued["Session"] = json!(UNISSUED_SESSION);
         let (status, unknown) =
             dispatch(&instance.router, responder, &unissued, administrative).await;
         assert_eq!(
             (status, error_code(&unknown)),
-            (REFUSED, "NotAuthorizedException"),
-            "case {case:?}: expected a {REFUSED} NotAuthorizedException, \
+            (REFUSED, "CodeMismatchException"),
+            "case {case:?}: expected a {REFUSED} CodeMismatchException, \
              got {status} with {unknown}"
         );
         let message = error_message(&unknown);
         assert_eq!(
-            message, SESSION_NOT_FOR_THIS_REQUEST,
-            "case {case:?}: expected {SESSION_NOT_FOR_THIS_REQUEST:?}, got {message:?}"
+            message, CHALLENGE_SESSION_MISMATCH,
+            "case {case:?}: expected {CHALLENGE_SESSION_MISMATCH:?}, got {message:?}"
         );
     }
 }

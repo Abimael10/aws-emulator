@@ -24,7 +24,9 @@ pub enum NewPasswordChallengeRefusal {
     /// The response map names no user, which every challenge response has to.
     UsernameMissing,
     /// The response does not belong to the challenge it presents: it names
-    /// another user than the session was started for.
+    /// another user than the session was started for, so the session half of
+    /// the response resolves no outstanding challenge of this request
+    /// ([`CHALLENGE_SESSION_MISMATCH_MESSAGE`]).
     SessionNotApplicable,
     /// The chosen password misses one of the pool's policy requirements, which
     /// the pool's own wording reports ([`UserPool::check_password`]).
@@ -59,7 +61,7 @@ impl NewPasswordChallengeRefusal {
                 "Invalid attributes given, new password should be given with key {NEW_PASSWORD}"
             ),
             Self::UsernameMissing => format!("Missing required parameter {CHALLENGE_USERNAME}"),
-            Self::SessionNotApplicable => SESSION_NOT_FOR_THIS_REQUEST_MESSAGE.to_string(),
+            Self::SessionNotApplicable => CHALLENGE_SESSION_MISMATCH_MESSAGE.to_string(),
             Self::PasswordRejected(message) => message.clone(),
             Self::UnknownAttribute(name) => format!(
                 "Invalid attributes given, {name} is not a valid attribute of this user pool"

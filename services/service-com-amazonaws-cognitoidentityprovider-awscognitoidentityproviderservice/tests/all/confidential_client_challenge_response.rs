@@ -759,13 +759,13 @@ async fn a_challenge_response_answers_only_the_challenge_its_own_session_is_wait
         .await;
         assert_eq!(
             (status, error_code(&payload)),
-            (400, "NotAuthorizedException"),
-            "case {case:?}: expected a NotAuthorizedException, got {status} with {payload}"
+            (400, "CodeMismatchException"),
+            "case {case:?}: expected a CodeMismatchException, got {status} with {payload}"
         );
         let message = error_message(&payload);
         assert_eq!(
-            message, "Invalid session for the user.",
-            "case {case:?}: expected the invalid-session refusal, got {message:?}"
+            message, "Invalid code/session provided",
+            "case {case:?}: expected the code/session mismatch refusal, got {message:?}"
         );
         assert!(
             !message.contains(&session),
@@ -815,8 +815,8 @@ async fn the_client_side_respond_applies_the_same_secret_gate() {
         (
             "the hash this client's secret produces",
             Some(secret_hash(&secret, username, &confidential.client_id)),
-            "NotAuthorizedException",
-            "Invalid session for the user.".to_string(),
+            "CodeMismatchException",
+            "Invalid code/session provided".to_string(),
         ),
     ];
 

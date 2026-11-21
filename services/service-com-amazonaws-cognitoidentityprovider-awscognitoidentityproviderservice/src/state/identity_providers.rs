@@ -676,7 +676,7 @@ pub fn default_branding_settings() -> ::aws_smithy_types::Document {
                     "active": { "backgroundColor": "033160ff", "textColor": "ffffffff" },
                     "defaults": { "backgroundColor": "0972d3ff", "textColor": "ffffffff" },
                     "disabled": { "backgroundColor": "d1d5dbff", "textColor": "ffffffff" },
-                    "hover": { "backgroundColor": "065299ff", "textColor": "ffffffff" }
+                    "hover": { "backgroundColor": "033160ff", "textColor": "ffffffff" }
                 }
             },
             "secondaryButton": {
@@ -724,23 +724,29 @@ pub fn default_branding_settings() -> ::aws_smithy_types::Document {
 /// role the style did not fill itself.
 ///
 /// One file for each display mode of every category the service provides
-/// artwork for — every value of `AssetCategoryType` — in `LIGHT` and in `DARK`,
+/// artwork for — every value of `AssetCategoryType` — in `DARK` and in `LIGHT`,
 /// the two display modes an image is served for (`ColorSchemeModeType`'s third
 /// value, `DYNAMIC`, is the mode that follows the browser rather than a third
-/// image to serve). Every file is an `SVG`, the one file type of
-/// `AssetExtensionType` that scales to each of these roles, and the set stays
-/// inside `AssetListType`'s modelled maximum of 40 files. Categories, display
-/// modes and file types from
+/// image to serve). The set stays inside `AssetListType`'s modelled maximum of
+/// 40 files. Categories, display modes and file types from
 /// `smithy_query(query="shape",shape="AssetCategoryType,ColorSchemeModeType,AssetExtensionType")`.
 ///
-/// Each file names the role it fills and the display mode it is for, and carries
-/// no `Bytes`: "The image file, in Base64-encoded binary" (`AssetType.Bytes`) is
-/// the file a CALLER uploaded, while the artwork for these roles is the
-/// service's own and is served from the managed login pages rather than handed
-/// back through this API. Rendered fresh per read, so no caller can change what
-/// another caller reads.
+/// The catalogue is a FIXED SEQUENCE the service serves in its own order, and a
+/// read renders it in that order rather than sorting it: the categories in the
+/// order the managed login configuration lays a style out in
+/// ([`PROVIDED_ASSET_CATEGORIES`]), and each category's `DARK` file immediately
+/// before its `LIGHT` one, which is the order a style's files read back in.
+/// Every index of `Assets` therefore addresses the same role on every read.
+///
+/// Each file names the role it fills, the display mode it is for and the file
+/// type that role's artwork is published in ([`provided_asset_extension`]), and
+/// carries no `Bytes`: "The image file, in Base64-encoded binary"
+/// (`AssetType.Bytes`) is the file a CALLER uploaded, while the artwork for
+/// these roles is the service's own and is served from the managed login pages
+/// rather than handed back through this API. Rendered fresh per read, so no
+/// caller can change what another caller reads.
 pub fn default_branding_assets() -> Vec<crate::ops::types::AssetType> {
-    crate::ops::types::ASSET_CATEGORY_TYPE_VALUES
+    PROVIDED_ASSET_CATEGORIES
         .iter()
         .flat_map(|category| {
             PROVIDED_ASSET_MODES
@@ -748,7 +754,7 @@ pub fn default_branding_assets() -> Vec<crate::ops::types::AssetType> {
                 .map(move |color_mode| crate::ops::types::AssetType {
                     category: (*category).to_string(),
                     color_mode: (*color_mode).to_string(),
-                    extension: PROVIDED_ASSET_EXTENSION.to_string(),
+                    extension: provided_asset_extension(category).to_string(),
                     bytes: None,
                     // "The ID of the asset" (`AssetType.ResourceId`) names an
                     // uploaded file; a file the service provides is not one a
@@ -759,13 +765,74 @@ pub fn default_branding_assets() -> Vec<crate::ops::types::AssetType> {
         .collect()
 }
 
-/// The file type of every file [`default_branding_assets`] provides: one of the
-/// modelled `AssetExtensionType` values.
+/// The categories [`default_branding_assets`] provides a file for, in the order
+/// the catalogue serves them.
+///
+/// The catalogue's order is the order the managed login configuration lays a
+/// style out in, not the alphabetical order the generated validation set
+/// (`crate::ops::types::ASSET_CATEGORY_TYPE_VALUES`) lists the same categories
+/// in: the page's own surfaces first, from the page footer inwards to the page
+/// background; then the graphic of each authentication factor a sign-in can
+/// present; then the logo each surface carries; and last the favicons a browser
+/// fetches for the page and the icon an identity-provider button wears. Within
+/// the factor, logo and icon groups the order is the one this service's model
+/// declares the categories in
+/// (`smithy_query(query="shape",shape="AssetCategoryType")`). The two
+/// collections name the same categories, which this crate's branding tests hold
+/// them to.
+const PROVIDED_ASSET_CATEGORIES: [&str; 15] = [
+    // The page's surfaces.
+    "PAGE_FOOTER_BACKGROUND",
+    "FORM_BACKGROUND",
+    "PAGE_HEADER_BACKGROUND",
+    "PAGE_BACKGROUND",
+    // The graphic of each authentication factor.
+    "EMAIL_GRAPHIC",
+    "AUTH_APP_GRAPHIC",
+    "SMS_GRAPHIC",
+    "PASSWORD_GRAPHIC",
+    "PASSKEY_GRAPHIC",
+    // The logo each surface carries.
+    "PAGE_HEADER_LOGO",
+    "PAGE_FOOTER_LOGO",
+    "FORM_LOGO",
+    // The icons the browser and the federation buttons fetch.
+    "FAVICON_ICO",
+    "FAVICON_SVG",
+    "IDP_BUTTON_ICON",
+];
+
+/// The file type the artwork of `category` is published in: one of the modelled
+/// `AssetExtensionType` values.
+///
+/// A category NAMES its file type where the format is part of the role — a
+/// browser asks for a site's `favicon.ico` as an ICO file and for its SVG
+/// favicon as an SVG one, which is why `AssetCategoryType` carries the two as
+/// separate categories (`FAVICON_ICO`, `FAVICON_SVG`) — so that category's file
+/// is served in the format its name states. Every other role is artwork the
+/// page scales, which is what [`PROVIDED_ASSET_EXTENSION`] is.
+fn provided_asset_extension(category: &str) -> &'static str {
+    const ICO_EXTENSION: &str = "ICO";
+    if category == FAVICON_ICO_ASSET_CATEGORY {
+        ICO_EXTENSION
+    } else {
+        PROVIDED_ASSET_EXTENSION
+    }
+}
+
+/// The `AssetCategoryType` value whose artwork is an ICO file: the favicon a
+/// browser fetches as `favicon.ico`.
+const FAVICON_ICO_ASSET_CATEGORY: &str = "FAVICON_ICO";
+
+/// The file type of the files [`default_branding_assets`] provides for every
+/// category that does not name one of its own: the `AssetExtensionType` value
+/// that scales to each of those roles.
 const PROVIDED_ASSET_EXTENSION: &str = "SVG";
 
-/// The display modes [`default_branding_assets`] provides a file for: the two
-/// modelled `ColorSchemeModeType` values an image is served for.
-const PROVIDED_ASSET_MODES: [&str; 2] = ["LIGHT", "DARK"];
+/// The display modes [`default_branding_assets`] provides a file for, in the
+/// order a style's files are served in: the two modelled `ColorSchemeModeType`
+/// values an image is served for, dark mode first.
+const PROVIDED_ASSET_MODES: [&str; 2] = ["DARK", "LIGHT"];
 
 /// [`default_branding_settings`] with `customized` laid over it: every option a
 /// style customizes is the style's, and every option it leaves alone is the

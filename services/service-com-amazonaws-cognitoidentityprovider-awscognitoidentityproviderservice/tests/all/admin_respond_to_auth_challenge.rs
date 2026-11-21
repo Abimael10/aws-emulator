@@ -655,21 +655,21 @@ async fn a_response_that_does_not_satisfy_the_challenge_is_refused_and_writes_no
             case: "a Session this emulator never handed out",
             session: SessionSource::Unknown,
             status: 400,
-            code: "NotAuthorizedException",
+            code: "CodeMismatchException",
             ..CORRECT
         },
         Refused {
             case: "a Session started on another app client",
             session: SessionSource::OtherClient,
             status: 400,
-            code: "NotAuthorizedException",
+            code: "CodeMismatchException",
             ..CORRECT
         },
         Refused {
             case: "a Session started in another user pool",
             session: SessionSource::OtherPool,
             status: 400,
-            code: "NotAuthorizedException",
+            code: "CodeMismatchException",
             ..CORRECT
         },
         Refused {
@@ -738,7 +738,7 @@ async fn a_response_that_does_not_satisfy_the_challenge_is_refused_and_writes_no
             case: "a USERNAME the session was not started for",
             responded_username: Some("mallory"),
             status: 400,
-            code: "NotAuthorizedException",
+            code: "CodeMismatchException",
             ..CORRECT
         },
         Refused {

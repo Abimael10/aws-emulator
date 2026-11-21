@@ -109,10 +109,12 @@ const UNAUTHORIZED_REFRESH_TOKEN: &str = "Invalid Refresh Token.";
 /// answered with.
 const SESSION_ALREADY_USED: &str = "Invalid session for the user, session can only be used once.";
 
-/// The sentence a challenge response answers a stored session that does not belong to the
-/// request it arrived on — one started for another pool or app client, or a value that
-/// names no stored session at all — with.
-const SESSION_NOT_FOR_THIS_REQUEST: &str = "Invalid session for the user.";
+/// The sentence a challenge response answers a session that resolves no outstanding
+/// challenge of its own — one started for another pool or app client, one started for
+/// another user, or a value that names no stored session at all — with: the response
+/// authenticates with the pair of its session and its challenge parameters, so a session
+/// half that resolves nothing is refused as that pair failing.
+const CHALLENGE_SESSION_MISMATCH: &str = "Invalid code/session provided";
 
 /// The sentence `AdminLinkProviderForUser` answers a `SourceUser` naming the pool's own
 /// native provider with.
@@ -1145,8 +1147,8 @@ async fn a_challenge_session_answers_once_and_an_unknown_one_is_a_code_mismatch(
         let (status, payload) = call(&router, operation, &body).await;
         assert_eq!(
             (status, error_code(&payload), error_message(&payload)),
-            (400, "NotAuthorizedException", SESSION_NOT_FOR_THIS_REQUEST),
-            "case {case:?}: expected the invalid-session class, got {status} with {payload}"
+            (400, "CodeMismatchException", CHALLENGE_SESSION_MISMATCH),
+            "case {case:?}: expected the code/session mismatch class, got {status} with {payload}"
         );
     }
 
@@ -1244,11 +1246,7 @@ async fn a_challenge_session_answers_once_and_an_unknown_one_is_a_code_mismatch(
             let (status, payload) = call(&router, replay_operation, &Value::Object(body)).await;
             assert_eq!(
                 (status, error_code(&payload), error_message(&payload)),
-                (
-                    400,
-                    "NotAuthorizedException",
-                    SESSION_NOT_FOR_THIS_REQUEST
-                ),
+                (400, "CodeMismatchException", CHALLENGE_SESSION_MISMATCH),
                 "case {case:?} replayed through {elsewhere_case:?}: the spent session must not \
                  be reported to it, got {status} with {payload}"
             );

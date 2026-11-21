@@ -966,7 +966,16 @@ pub struct LimitType {
     pub free_limit_value: i32,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.cognitoidentityprovider#UICustomizationType")]
+/// The hosted UI customization of one level of a user pool, as every operation that
+/// answers with one reports it: the `UICustomizationType` members the model declares, in
+/// the model's own member order, and the `CSSUrl` the service reports on every
+/// customization it answers with appended last.
+///
+/// Member set and order from `smithy_query(query="shape", shape="UICustomizationType")`,
+/// plus `CSSUrl` — a member the real service carries on the hosted UI customization it
+/// answers with and the on-disk model omits, which is why the schema and the codec come
+/// from `types/recorded_member_wire.rs` rather than from the derive (see that module's
+/// note).
 #[derive(Debug, Clone, Default)]
 pub struct UICustomizationType {
     pub user_pool_id: Option<String>,
@@ -976,7 +985,47 @@ pub struct UICustomizationType {
     pub css_version: Option<String>,
     pub last_modified_date: Option<::aws_smithy_types::DateTime>,
     pub creation_date: Option<::aws_smithy_types::DateTime>,
+    /// Where the stored CSS document of this level is published
+    /// ([`crate::state::hosted_css_url`]).
+    pub css_url: Option<String>,
 }
+
+cip_schema_and_codec!(
+    UICustomizationType,
+    UI_CUSTOMIZATION_TYPE_SCHEMA,
+    "com.amazonaws.cognitoidentityprovider#UICustomizationType",
+    "com.amazonaws.cognitoidentityprovider",
+    "UICustomizationType",
+    (M_USER_POOL_ID, user_pool_id, "UserPoolId", 0, opt, string),
+    (M_CLIENT_ID, client_id, "ClientId", 1, opt, string),
+    (M_IMAGE_URL, image_url, "ImageUrl", 2, opt, string),
+    (M_CSS, css, "CSS", 3, opt, string),
+    (M_CSS_VERSION, css_version, "CSSVersion", 4, opt, string),
+    (
+        M_LAST_MODIFIED_DATE,
+        last_modified_date,
+        "LastModifiedDate",
+        5,
+        opt,
+        timestamp
+    ),
+    (
+        M_CREATION_DATE,
+        creation_date,
+        "CreationDate",
+        6,
+        opt,
+        timestamp
+    ),
+    (
+        M_CSS_URL,
+        css_url,
+        "CSSUrl",
+        7,
+        opt,
+        recorded("aws.emulator.recorded.cognitoidentityprovider", string)
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.cognitoidentityprovider#SmsMfaConfigType")]
 #[derive(Debug, Clone, Default)]

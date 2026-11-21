@@ -41,14 +41,15 @@
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
 //!   404, …). Return `Some(resp)` to answer in your own envelope if desired. This
-//!   service answers three such requests itself: a GET of a pool's
+//!   service answers four such requests itself: a GET of a pool's
 //!   `/<UserPoolId>/.well-known/jwks.json`, the public key set its tokens are
 //!   verified against, a GET of its
 //!   `/<UserPoolId>/.well-known/openid-configuration`, the OpenID Connect
-//!   discovery document naming its endpoints, and a GET of a level's
+//!   discovery document naming its endpoints, a GET of a level's
 //!   `/<UserPoolId>/<ClientId>/assets/login_logo.png`, the classic hosted UI logo
-//!   image `SetUICustomization` stored — neither of which the Smithy model
-//!   describes.
+//!   image `SetUICustomization` stored, and a GET of a level's
+//!   `/<UserPoolId>/<ClientId>/<CSSVersion>/assets/CSS/custom-css.css`, the
+//!   stylesheet it stored — none of which the Smithy model describes.
 //! - `override_framework_error` — how this service words a transport-level
 //!   failure the orchestrator detects up front (e.g. a malformed `aws-chunked`
 //!   body). The default returns `None`, keeping the entry's protocol-correct
@@ -917,6 +918,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             // still needs one of the two routing keys above.
             || (parts.method == http::Method::GET
                 && hosted_logo_route(&parts.uri.to_string()).is_some())
+            // The stylesheet of a level of a pool is fetched by the same
+            // anonymous browser, at the path `UICustomizationType.CSSUrl`
+            // published for it, so a GET of exactly that path is claimed here
+            // too.
+            || (parts.method == http::Method::GET
+                && hosted_css_route(&parts.uri.to_string()).is_some())
             // A pool's well-known documents are fetched by whatever verifier or
             // relying party holds a token this service minted, or bootstraps
             // from the pool's discovery document, which follows the token's
@@ -1120,6 +1127,30 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             response.headers_mut().insert("content-type", media_type);
             return Some(response);
         }
+        if let Some((user_pool_id, client_id, css_version)) = hosted_css_route(req.uri()) {
+            // A path naming no stored stylesheet of that level AT THAT VERSION
+            // is not this route: it falls through to the framework's refusal
+            // rather than answering an empty document. Rendering the STORED
+            // document is a pure read.
+            let css = {
+                let guard = state.lock();
+                guard
+                    .pool(user_pool_id)?
+                    .hosted_css(client_id, css_version)?
+                    .to_string()
+            };
+            let mut response = aws_smithy_runtime_api::http::Response::new(
+                aws_smithy_runtime_api::http::StatusCode::try_from(200).ok()?,
+                ::aws_smithy_types::body::SdkBody::from(css),
+            );
+            // The document is "a plaintext CSS file"
+            // (`SetUICustomization.CSS`), which is the media type a browser
+            // applies a stylesheet from.
+            response
+                .headers_mut()
+                .insert("content-type", "text/css; charset=utf-8");
+            return Some(response);
+        }
         let (user_pool_id, document) = well_known_route(req.uri())?;
         let rendered = {
             let guard = state.lock();
@@ -1220,6 +1251,28 @@ fn hosted_logo_route(uri: &str) -> Option<(&str, &str)> {
         && is_user_pool_id_shaped(user_pool_id)
         && is_client_id_shaped(client_id))
     .then_some((user_pool_id, client_id))
+}
+
+/// The pool, the level and the CSS version whose hosted UI stylesheet `uri`
+/// addresses, for a request path of the form
+/// `/<UserPoolId>/<ClientId>/<CSSVersion>/assets/CSS/custom-css.css`, and `None`
+/// for every other path.
+///
+/// This is the path [`crate::state::hosted_css_url`] builds — the two read the
+/// same [`crate::state::HOSTED_CSS_FILE`], so a locator this service hands out
+/// and the route that serves it cannot drift. Every segment has to have the FORM
+/// this service mints it in, so a path of the same shape addressed to another
+/// mounted service is not mistaken for a locator this service published.
+fn hosted_css_route(uri: &str) -> Option<(&str, &str, &str)> {
+    let path = uri.split(['?', '#']).next().unwrap_or(uri);
+    let (user_pool_id, tail) = path.strip_prefix('/')?.split_once('/')?;
+    let (client_id, tail) = tail.split_once('/')?;
+    let (css_version, file) = tail.split_once('/')?;
+    (file == crate::state::HOSTED_CSS_FILE
+        && is_user_pool_id_shaped(user_pool_id)
+        && is_client_id_shaped(client_id)
+        && crate::state::is_css_version_shaped(css_version))
+    .then_some((user_pool_id, client_id, css_version))
 }
 
 /// The pool and the job whose user-import CSV upload target `uri` addresses, for

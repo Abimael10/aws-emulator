@@ -1575,8 +1575,8 @@ impl UserPool {
 
     /// The modelled view of the stored classic hosted UI branding
     /// `customization` of this pool, rendered from what is stored, with its
-    /// stored logo image located on the endpoint `host` the reading request
-    /// arrived at.
+    /// stored logo image and its stored stylesheet located on the endpoint
+    /// `host` the reading request arrived at.
     pub fn to_ui_customization_type(
         &self,
         customization: &UiCustomization,
@@ -1594,7 +1594,30 @@ impl UserPool {
             css_version: Some(customization.css_version.clone()),
             last_modified_date: Some(to_date_time(customization.last_modified_date)),
             creation_date: Some(to_date_time(customization.creation_date)),
+            // The locator addresses the CSS document THIS level has stored,
+            // under the version it is stored at, so a level holding no
+            // stylesheet publishes none to fetch.
+            css_url: customization.css.as_ref().and_then(|_| {
+                host.and_then(|host| {
+                    hosted_css_url(
+                        host,
+                        &self.id,
+                        &customization.client_id,
+                        &customization.css_version,
+                    )
+                })
+            }),
         }
+    }
+
+    /// The CSS document this pool publishes for `client_id` at version
+    /// `css_version`, which is the stylesheet stored for THAT level at THAT
+    /// version: the locator a read handed out names one level and one version,
+    /// so it serves that level's document and never another's, and never a
+    /// later write's.
+    pub fn hosted_css(&self, client_id: &str, css_version: &str) -> Option<&str> {
+        let stored = self.ui_customizations.get(client_id)?;
+        (stored.css_version == css_version).then_some(stored.css.as_deref()?)
     }
 
     /// The logo image this pool serves for `client_id`, which is the image

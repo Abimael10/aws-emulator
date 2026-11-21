@@ -590,7 +590,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminRespondToAut
                     &session,
                     responses.get(crate::state::SETUP_SESSION_RESPONSE),
                 ) {
-                    return Err(invalid_session());
+                    return Err(setup_session_not_presented());
                 }
                 let username = usable_session_user(guard, &session)?;
                 match guard.complete_mfa_setup(&session, now) {
@@ -862,8 +862,8 @@ fn challenge_refused(
         | crate::state::NewPasswordChallengeRefusal::RequiredAttributeUnset(_) => {
             invalid_parameter(message)
         }
-        crate::state::NewPasswordChallengeRefusal::SessionNotApplicable
-        | crate::state::NewPasswordChallengeRefusal::UserDisabled => not_authorized(&message),
+        crate::state::NewPasswordChallengeRefusal::SessionNotApplicable => invalid_session(),
+        crate::state::NewPasswordChallengeRefusal::UserDisabled => not_authorized(&message),
         crate::state::NewPasswordChallengeRefusal::PasswordRejected(_) => {
             invalid_password(message)
         }
@@ -958,12 +958,37 @@ fn session_already_used() -> AdminRespondToAuthChallengeError {
     not_authorized(crate::state::SESSION_ALREADY_USED_MESSAGE)
 }
 
-/// The refusal for a stored `Session` that does not belong to this request: one
-/// started for another pool or app client, for another user than the response
-/// names, one whose challenge the stored user no longer owes, or a value that
-/// names no stored session at all.
-fn invalid_session() -> AdminRespondToAuthChallengeError {
+/// The refusal for an `MFA_SETUP` response that presents no software-token
+/// SETUP session — neither as the request's own `Session` nor in its `SESSION`
+/// entry ([`crate::state::mfa_setup_session_presented`]).
+///
+/// The value missing here is the registration session `VerifySoftwareToken`
+/// handed out, not the challenge-session half this request authenticates with,
+/// so it carries the sentence every call of the SOFTWARE-TOKEN flow gives a
+/// session another call handed out
+/// ([`crate::state::SESSION_NOT_FOR_THIS_REQUEST_MESSAGE`]), as
+/// `AssociateSoftwareToken` and `VerifySoftwareToken` do, rather than the
+/// code/session mismatch a challenge response's own session half earns.
+fn setup_session_not_presented() -> AdminRespondToAuthChallengeError {
     not_authorized(crate::state::SESSION_NOT_FOR_THIS_REQUEST_MESSAGE)
+}
+
+/// The refusal for a `Session` that resolves no outstanding challenge of this
+/// request: one started for another pool or app client, for another user than
+/// the response names, one whose challenge the stored user no longer owes, or a
+/// value that names no stored session at all.
+///
+/// The response authenticates with the PAIR of the session and the parameters
+/// the challenge requires, so a session half that resolves no outstanding
+/// challenge is a code/session mismatch — `CodeMismatchException`, HTTP 400,
+/// carrying [`crate::state::CHALLENGE_SESSION_MISMATCH_MESSAGE`] — and not a
+/// state of a session this service is holding for the caller, which is what the
+/// spent and expired refusals report.
+fn invalid_session() -> AdminRespondToAuthChallengeError {
+    AdminRespondToAuthChallengeErrorModeled::CodeMismatchException(CodeMismatchException {
+        message: Some(crate::state::CHALLENGE_SESSION_MISMATCH_MESSAGE.to_string()),
+    })
+    .into()
 }
 
 /// The refusal for a `Session` whose validity window has closed.

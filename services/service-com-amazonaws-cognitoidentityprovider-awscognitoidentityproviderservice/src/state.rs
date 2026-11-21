@@ -552,7 +552,28 @@ pub const ACCESS_TOKEN_REVOKED_MESSAGE: &str = "Access Token has been revoked";
 /// this emulator never handed out among them — and it is told apart from the replay of a
 /// spent session ([`SESSION_ALREADY_USED_MESSAGE`]) and from a closed validity window
 /// ([`SESSION_EXPIRED_MESSAGE`]).
+///
+/// It is the sentence the SOFTWARE-TOKEN registration operations word such a session
+/// with; a CHALLENGE RESPONSE words it as a code/session mismatch instead
+/// ([`CHALLENGE_SESSION_MISMATCH_MESSAGE`]).
 pub const SESSION_NOT_FOR_THIS_REQUEST_MESSAGE: &str = "Invalid session for the user.";
+
+/// The message a challenge response owes a `Session` that resolves no outstanding
+/// challenge of its own: a value this service never handed out, one started for another
+/// pool or app client, or one started for another user than the response names.
+///
+/// A challenge response authenticates with the PAIR of the session and the response
+/// parameters the challenge requires, so a pair whose session half resolves no
+/// outstanding challenge is refused as the pair failing rather than as a session state
+/// this service can report: `CodeMismatchException` is "thrown if the provided code
+/// doesn't match what the server was expecting" and the model gives it HTTP 400 on both
+/// response operations
+/// (`smithy_query(query="operation",operation="AdminRespondToAuthChallenge,RespondToAuthChallenge")`).
+/// The sentence names code and session together and carries no value from the request, so
+/// every such refusal carries it in full; a session this service DID hand out for this
+/// request and has since spent ([`SESSION_ALREADY_USED_MESSAGE`]) or expired
+/// ([`SESSION_EXPIRED_MESSAGE`]) is a state of that session and keeps its own wording.
+pub const CHALLENGE_SESSION_MISMATCH_MESSAGE: &str = "Invalid code/session provided";
 
 /// The message a challenge response owes a `Session` this emulator handed out
 /// and an earlier response ALREADY answered.
@@ -4124,6 +4145,49 @@ pub const HOSTED_LOGO_FILE: &str = "assets/login_logo.png";
 pub fn hosted_logo_url(host: &str, user_pool_id: &str, client_id: &str) -> Option<String> {
     is_host_shaped(host)
         .then(|| format!("https://{host}/{user_pool_id}/{client_id}/{HOSTED_LOGO_FILE}"))
+}
+
+/// The path segment under a level's CSS VERSION that the classic hosted UI
+/// serves its stored stylesheet on. Shared by the locator [`hosted_css_url`]
+/// hands out and by the route that serves it (`crate::service`), so the two
+/// cannot drift.
+pub const HOSTED_CSS_FILE: &str = "assets/CSS/custom-css.css";
+
+/// Where a client fetches the CSS document stored for `client_id` of
+/// `user_pool_id` at version `css_version`: the `CSSUrl` a read or a write of a
+/// hosted UI customization reports beside the `CSSVersion` it is published
+/// under.
+///
+/// AWS publishes the stylesheet under the asset host that fronts the classic
+/// hosted UI, per pool, per app client and per CSS version. This emulator
+/// provisions no such host, so — exactly as the logo locator does
+/// ([`hosted_logo_url`]) — the URL names the document on the endpoint THIS
+/// REQUEST ARRIVED AT, which this service serves itself (see `crate::service`),
+/// and the version it names is the one the stored document was minted under, so
+/// a locator handed out before a later write still names the document it was
+/// handed out for. A request that names no host of its own gets no locator at
+/// all.
+///
+/// `host` is taken only when it LOOKS like a `host[:port]`, so a caller cannot
+/// get a string of its own into the value this service reports.
+pub fn hosted_css_url(
+    host: &str,
+    user_pool_id: &str,
+    client_id: &str,
+    css_version: &str,
+) -> Option<String> {
+    (is_host_shaped(host) && is_css_version_shaped(css_version)).then(|| {
+        format!("https://{host}/{user_pool_id}/{client_id}/{css_version}/{HOSTED_CSS_FILE}")
+    })
+}
+
+/// Whether `candidate` has the form of a `CSSVersionType` value this service
+/// mints ([`version_stamp`]): a non-empty run of digits, which is what the CSS
+/// locator carries as a path segment.
+pub fn is_css_version_shaped(candidate: &str) -> bool {
+    !candidate.is_empty()
+        && candidate.len() <= 64
+        && candidate.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// The endpoint host this request addressed — its `Host` header, or the
