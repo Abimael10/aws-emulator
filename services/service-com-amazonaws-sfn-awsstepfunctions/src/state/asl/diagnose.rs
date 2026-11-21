@@ -321,6 +321,26 @@ const MACHINE_FIELDS: &[&str] = &[
     "Version",
 ];
 
+/// The versions of the Amazon States Language a state machine object may declare
+/// itself written in.
+///
+/// From the language specification's "State Machine Structure": `Version` is "the
+/// version of the States language used in the state machine (default is \"1.0\")", and
+/// 1.0 is the only version the language defines, so the set is a one-entry enumeration
+/// — which is what [`one_of_values_message`] reports a value outside against.
+const LANGUAGE_VERSIONS: &[&str] = &["1.0"];
+
+/// What a schema diagnostic says about a member whose value is outside the set the
+/// language admits there: the values it admits, in brackets, as a list.
+///
+/// RECORDED text. The sentence names the admitted values and nothing else — the
+/// rejected one is not echoed, exactly as [`STATE_TYPE_VALUES_MESSAGE`] does not echo a
+/// `Type` the language does not define, and WHICH member carried it is what `location`
+/// says.
+pub fn one_of_values_message(values: &[&str]) -> String {
+    format!("Value should be one of the following: [{}]", values.join(", "))
+}
+
 /// The fields a state machine declared as a `Map` state's processor carries: the
 /// machine's own, and the `ProcessorConfig` that says how that state runs it.
 ///
@@ -524,6 +544,20 @@ const CHOICE_RULE_FIELDS: &[&str] = &[
 /// The members of a `Choice` rule that carry RULES of their own, and so are walked as
 /// rules rather than read as a comparator's operand.
 const NESTED_RULE_MEMBERS: &[&str] = &["And", "Not", "Or"];
+
+/// The member a `Choice` rule says where the execution goes with, which is the field
+/// every rule of a `Choice` state's own `Choices` array owes: "Each Choice Rule […] MUST
+/// have a \"Next\" field, whose value MUST match a state name".
+const CHOICE_TRANSITION_MEMBER: &str = "Next";
+
+/// What a diagnostic says about a rule of a `Choice` state that points the execution
+/// nowhere: that the transition the rule owes is missing.
+///
+/// RECORDED text. It has no variable part — WHICH rule of which state left the member
+/// out is what `location` carries — and it is told from [`missing_target_message`], which
+/// is the other defect of the transition graph: a target that IS named and resolves to no
+/// state the machine declares.
+pub const MISSING_TRANSITION_POINTER_MESSAGE: &str = "Missing transition pointer";
 
 /// The fields the Amazon States Language declares on a state of each type, in the
 /// order its schema states them.
@@ -942,12 +976,38 @@ const WAIT_FIGURES: &[Bounded] = &[at_least("Seconds", 0.0, "0")];
 ///
 /// "TimeoutSeconds: If the task runs longer than the specified seconds, this state
 /// fails" and "HeartbeatSeconds: If more time than the specified seconds elapses
-/// between heartbeats from the task, this state fails" — each a number of SECONDS, so
-/// neither is negative.
+/// between heartbeats from the task, this state fails" — each a WINDOW the work has to
+/// finish something inside, which the language documents as a positive, non-zero number
+/// of seconds: a window of none at all admits no work, so the smallest either carries is
+/// [`MIN_WINDOW_SECONDS`].
 const TASK_FIGURES: &[Bounded] = &[
-    at_least("TimeoutSeconds", 0.0, "0"),
-    at_least("HeartbeatSeconds", 0.0, "0"),
+    at_least(
+        "TimeoutSeconds",
+        MIN_WINDOW_SECONDS,
+        MIN_WINDOW_SECONDS_STATED,
+    ),
+    at_least(
+        "HeartbeatSeconds",
+        MIN_WINDOW_SECONDS,
+        MIN_WINDOW_SECONDS_STATED,
+    ),
 ];
+
+/// The smallest a WINDOW the language documents as a positive, non-zero number of
+/// seconds carries: the seconds a `Task`'s work has to finish in and to beat between
+/// heartbeats, and the seconds an execution of the state machine has to run in.
+///
+/// A window of none at all is not a shorter deadline but work the service could never
+/// perform, so the language admits none: it is told from the figures whose own documented
+/// default IS none — a `Map`'s `MaxConcurrency` ("its default value is 0, which places no
+/// limit on concurrency"), a retrier's `MaxAttempts` ("a value of 0 means the error is
+/// never retried") and a `Wait`'s `Seconds` — which the language keeps admitting.
+const MIN_WINDOW_SECONDS: f64 = 1.0;
+
+/// That bound as the language writes it, which is what the diagnostic about it states
+/// ([`minimum_value_message`]): a window is a whole number of seconds, so its bound is
+/// stated as the count it is.
+const MIN_WINDOW_SECONDS_STATED: &str = "1";
 
 /// The figures a `Map` state declares.
 ///
@@ -956,20 +1016,29 @@ const TASK_FIGURES: &[Bounded] = &[
 /// "ToleratedFailureCount: [...] the number of failed items" is a count, and
 /// "ToleratedFailurePercentage: [...] the percentage of failed items" is a percentage,
 /// which is bounded at both ends.
+///
+/// The two counts state their bounds as the whole numbers they are; the percentage is a
+/// FRACTIONAL figure, so each end of its range is stated as the decimal the language
+/// writes it as — the same reason a retrier's `BackoffRate` states its own bound as
+/// [`MIN_BACKOFF_RATE_STATED`].
 const MAP_FIGURES: &[Bounded] = &[
     at_least("MaxConcurrency", 0.0, "0"),
     at_least("ToleratedFailureCount", 0.0, "0"),
     Bounded {
         member: "ToleratedFailurePercentage",
-        minimum: Some((0.0, "0")),
-        maximum: Some((100.0, "100")),
+        minimum: Some((0.0, "0.0")),
+        maximum: Some((100.0, "100.0")),
     },
 ];
 
 /// The figures a state machine OBJECT declares: "TimeoutSeconds: the maximum number of
-/// seconds an execution of the state machine can run", a number of seconds for the same
-/// reason a `Task`'s own bounds are.
-const MACHINE_FIGURES: &[Bounded] = &[at_least("TimeoutSeconds", 0.0, "0")];
+/// seconds an execution of the state machine can run", a WINDOW for the same reason a
+/// `Task`'s two are, and bounded below at [`MIN_WINDOW_SECONDS`] like them.
+const MACHINE_FIGURES: &[Bounded] = &[at_least(
+    "TimeoutSeconds",
+    MIN_WINDOW_SECONDS,
+    MIN_WINDOW_SECONDS_STATED,
+)];
 
 /// The figures one `Retry` retrier declares.
 ///
@@ -1670,6 +1739,23 @@ pub(super) fn diagnose_machine(
         prefix,
         into,
     );
+    // `Version` names the version of the Amazon States Language the object is written
+    // in, and the language defines ONE ([`LANGUAGE_VERSIONS`]): a value outside that set
+    // names a language this service does not implement, so the object declares semantics
+    // nothing could run it under. Judged where the object DECLARES the member, like every
+    // figure above, and reported at the member itself.
+    if let Some(declared) = document.get("Version") {
+        if !declared
+            .as_str()
+            .is_some_and(|named| LANGUAGE_VERSIONS.contains(&named))
+        {
+            into.push(error(
+                SCHEMA_VALIDATION_FAILED,
+                at(prefix, "/Version"),
+                one_of_values_message(LANGUAGE_VERSIONS),
+            ));
+        }
+    }
     // And the OBJECTS it carries whose own fields the language declares — a `Map`
     // state's processor carries the `ProcessorConfig` that says how it runs.
     diagnose_declared_objects(document, machine_fields(processor), prefix, into);
@@ -1779,12 +1865,14 @@ pub(super) fn diagnose_machine(
     // of it can leave. It is read BEFORE the states are judged and reported AFTER
     // them, so it follows the diagnostics about them; whether there is room left to
     // report it is `push`'s own answer, as it is for every other diagnostic.
+    //
+    // What is missing is a terminal state ANYWHERE in the workflow this machine
+    // describes, so the diagnostic sits at no position in the document and carries no
+    // location — for a `Parallel` branch and a `Map` state's processor, each its own
+    // scope, exactly as for the definition itself ([`Diagnostic::stated`] is what a
+    // refusal states an absent location as).
     if !terminal {
-        into.push(error(
-            MISSING_END_STATE,
-            at(prefix, ""),
-            MISSING_END_STATE_MESSAGE,
-        ));
+        into.push(error(MISSING_END_STATE, None, MISSING_END_STATE_MESSAGE));
     }
 }
 
@@ -1976,9 +2064,17 @@ fn diagnose_state<'a>(
     // work no execution of it could ever do.
     diagnose_task_resource(state, state_type, &here, into);
     // The rules a `Choice` state's own rules must satisfy: each is an object whose
-    // fields the language declares.
+    // fields the language declares, and each of the state's OWN rules says where the
+    // execution goes when it is the rule that holds.
     if state_type == "Choice" {
-        diagnose_choice_rules(state.get("Choices"), &here, "Choices", MAX_EXPRESSION_DEPTH, into);
+        diagnose_choice_rules(
+            state.get("Choices"),
+            &here,
+            "Choices",
+            true,
+            MAX_EXPRESSION_DEPTH,
+            into,
+        );
     }
     // And the OBJECTS a state carries beside its own members, whose fields the language
     // declares as closely as it declares a state's ([`MAP_OBJECT_FIELDS`]): a field
@@ -2019,27 +2115,20 @@ fn diagnose_state<'a>(
             ));
         }
     }
+    // A type that ENDS an execution declares no `Next` at all, so a state of one
+    // carrying the member is reported ONCE, by the closed field set every state is
+    // judged against above ([`state_fields`]): the field is not one the language
+    // declares there, which is the whole of what is wrong with it.
     match state.get("Next") {
-        Some(next) => match next.as_str() {
-            Some(_) => {
-                if TERMINAL_STATE_TYPES.contains(&state_type) {
-                    into.push(error(
-                        SCHEMA_VALIDATION_FAILED,
-                        at(&here, "/Next"),
-                        format!(
-                            "state '{name}' is a '{}' state, which ends an execution \
-                             and must not carry 'Next'",
-                            echoed(state_type)
-                        ),
-                    ));
-                }
+        Some(next) => {
+            if next.as_str().is_none() {
+                into.push(error(
+                    SCHEMA_VALIDATION_FAILED,
+                    at(&here, "/Next"),
+                    format!("state '{name}' has a non-string 'Next' member"),
+                ));
             }
-            None => into.push(error(
-                SCHEMA_VALIDATION_FAILED,
-                at(&here, "/Next"),
-                format!("state '{name}' has a non-string 'Next' member"),
-            )),
-        },
+        }
         None => {
             if CONTINUING_STATE_TYPES.contains(&state_type)
                 && state.get("End").and_then(Value::as_bool) != Some(true)
@@ -2218,10 +2307,18 @@ const DISTRIBUTED_MODE: &str = "DISTRIBUTED";
 /// ([`unsupported_field_message`]) — a misspelled comparator is a rule that can never
 /// decide anything, so it is refused where it is submitted rather than failing every
 /// execution that reaches the state.
+///
+/// `transition` says whether a rule at this level owes the member that says where the
+/// execution goes: a rule of the state's OWN `Choices` array is the whole of a branch of
+/// the state's decision ("Each Choice Rule […] MUST have a "Next" field"), so one that
+/// names no transition leaves the state with nowhere to go when it holds; a rule nested
+/// under `And`, `Or` or `Not` is a CONDITION of the rule that holds it and decides no
+/// transition of its own.
 fn diagnose_choice_rules(
     rules: Option<&Value>,
     here: &str,
     member: &str,
+    transition: bool,
     depth: usize,
     into: &mut Diagnosis,
 ) {
@@ -2252,6 +2349,24 @@ fn diagnose_choice_rules(
             ));
             continue;
         };
+        // The transition the rule owes is reported exactly as every other field an
+        // object of the language owes is — the field, located at the object that owes it
+        // ([`required_fields_message`]) — and then as the transition that is MISSING:
+        // the rule points the execution nowhere, which is the defect of the transition
+        // graph it is, reported under the code that graph's problems are reported under
+        // and located at the member that would have named the target.
+        if transition && !entry.contains_key(CHOICE_TRANSITION_MEMBER) {
+            into.push(error(
+                SCHEMA_VALIDATION_FAILED,
+                at(&at_entry, ""),
+                required_fields_message(&[CHOICE_TRANSITION_MEMBER]),
+            ));
+            into.push(error(
+                MISSING_TRANSITION_TARGET,
+                at(&at_entry, &format!("/{CHOICE_TRANSITION_MEMBER}")),
+                MISSING_TRANSITION_POINTER_MESSAGE,
+            ));
+        }
         for (field, value) in into.order().members(&at_entry, entry) {
             if !CHOICE_RULE_FIELDS.contains(&field.as_str()) {
                 into.push(error(
@@ -2262,7 +2377,7 @@ fn diagnose_choice_rules(
                 continue;
             }
             if NESTED_RULE_MEMBERS.contains(&field.as_str()) {
-                diagnose_choice_rules(Some(value), &at_entry, field, depth, into);
+                diagnose_choice_rules(Some(value), &at_entry, field, false, depth, into);
             }
         }
     }

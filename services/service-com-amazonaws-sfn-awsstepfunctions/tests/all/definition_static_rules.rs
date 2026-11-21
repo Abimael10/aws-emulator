@@ -122,6 +122,23 @@ async fn a_figure_outside_its_documented_bound_is_refused_at_the_figure() {
             "Minimum value is 0",
         ),
         (
+            // A WINDOW the work has to finish something inside: the language admits
+            // none of none at all, so the figure is probed at the second below its
+            // floor as well as at the one right below it.
+            "a Task state's TimeoutSeconds of no seconds at all",
+            one_state(
+                "T",
+                json!({
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::aws-sdk:sts:getCallerIdentity",
+                    "TimeoutSeconds": 0,
+                    "End": true,
+                }),
+            ),
+            "/States/T/TimeoutSeconds",
+            "Minimum value is 1",
+        ),
+        (
             "a Task state's TimeoutSeconds below none at all",
             one_state(
                 "T",
@@ -133,21 +150,21 @@ async fn a_figure_outside_its_documented_bound_is_refused_at_the_figure() {
                 }),
             ),
             "/States/T/TimeoutSeconds",
-            "Minimum value is 0",
+            "Minimum value is 1",
         ),
         (
-            "a Task state's HeartbeatSeconds below none at all",
+            "a Task state's HeartbeatSeconds of no seconds at all",
             one_state(
                 "T",
                 json!({
                     "Type": "Task",
                     "Resource": "arn:aws:states:::aws-sdk:sts:getCallerIdentity",
-                    "HeartbeatSeconds": -1,
+                    "HeartbeatSeconds": 0,
                     "End": true,
                 }),
             ),
             "/States/T/HeartbeatSeconds",
-            "Minimum value is 0",
+            "Minimum value is 1",
         ),
         (
             "a Map state's MaxConcurrency below none at all",
@@ -165,13 +182,15 @@ async fn a_figure_outside_its_documented_bound_is_refused_at_the_figure() {
             "a Map state's ToleratedFailurePercentage below the percentage range",
             one_state("M", map_state(json!({ "ToleratedFailurePercentage": -0.5 }))),
             "/States/M/ToleratedFailurePercentage",
-            "Minimum value is 0",
+            // A percentage is a fractional figure, so each end of its range is stated
+            // as the decimal the language writes it as.
+            "Minimum value is 0.0",
         ),
         (
             "a Map state's ToleratedFailurePercentage above the percentage range",
             one_state("M", map_state(json!({ "ToleratedFailurePercentage": 101 }))),
             "/States/M/ToleratedFailurePercentage",
-            "Maximum value is 100",
+            "Maximum value is 100.0",
         ),
         (
             "a retrier's IntervalSeconds below none at all",
@@ -200,14 +219,14 @@ async fn a_figure_outside_its_documented_bound_is_refused_at_the_figure() {
             "Minimum value is 1.0",
         ),
         (
-            "the state machine object's own TimeoutSeconds below none at all",
+            "the state machine object's own TimeoutSeconds of no seconds at all",
             json!({
                 "StartAt": "P",
-                "TimeoutSeconds": -1,
+                "TimeoutSeconds": 0,
                 "States": { "P": { "Type": "Pass", "End": true } },
             }),
             "/TimeoutSeconds",
-            "Minimum value is 0",
+            "Minimum value is 1",
         ),
     ];
 
@@ -253,14 +272,14 @@ async fn a_figure_outside_its_documented_bound_is_refused_at_the_figure() {
             one_state("W", json!({ "Type": "Wait", "Seconds": 0, "End": true })),
         ),
         (
-            "a Task window of no seconds at all",
+            "a Task window of the shortest the language admits",
             one_state(
                 "T",
                 json!({
                     "Type": "Task",
                     "Resource": "arn:aws:states:::aws-sdk:sts:getCallerIdentity",
-                    "TimeoutSeconds": 0,
-                    "HeartbeatSeconds": 0,
+                    "TimeoutSeconds": 1,
+                    "HeartbeatSeconds": 1,
                     "End": true,
                 }),
             ),
@@ -289,10 +308,10 @@ async fn a_figure_outside_its_documented_bound_is_refused_at_the_figure() {
             ),
         ),
         (
-            "a state machine timeout of no seconds at all",
+            "a state machine timeout of the shortest the language admits",
             json!({
                 "StartAt": "P",
-                "TimeoutSeconds": 0,
+                "TimeoutSeconds": 1,
                 "States": { "P": { "Type": "Pass", "End": true } },
             }),
         ),

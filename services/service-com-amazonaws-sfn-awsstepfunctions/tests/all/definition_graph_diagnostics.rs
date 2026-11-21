@@ -20,8 +20,8 @@
 //!    nowhere, at the state itself;
 //! 2. a state machine must declare at least one state that ENDS an execution — a
 //!    `Succeed`, a `Fail`, or any state declaring `"End": true` — and one that
-//!    declares none earns `MISSING_END_STATE`, located at the machine rather than at a
-//!    field the document has not got;
+//!    declares none earns `MISSING_END_STATE`, bound to no position in the document,
+//!    whether it is the definition itself or a machine nested inside one;
 //! 3. a field that reads a variable no run reaching that field has certainly assigned
 //!    earns one `POSSIBLY_UNDEFINED_VARIABLE` WARNING per field, located at the field,
 //!    in either query language and through either form of read; a variable every path
@@ -298,8 +298,8 @@ async fn an_unresolved_transition_target_is_reported_at_the_member_that_names_it
 // ---------------------------------------------------------------------------
 
 /// A state machine that declares no state ending an execution is reported as such,
-/// located at the machine — and one that declares one, by any of the forms the
-/// language gives for it, is not.
+/// bound to no position in the document — and one that declares one, by any of the forms
+/// the language gives for it, is not.
 #[tokio::test]
 async fn a_state_machine_declaring_no_terminal_state_is_reported() {
     let emulator = Emulator::new();
@@ -348,7 +348,10 @@ async fn a_state_machine_declaring_no_terminal_state_is_reported() {
                     },
                 },
             }),
-            Some("/States/M/ItemProcessor"),
+            // The missing terminal state is the whole workflow's, however deeply the
+            // machine that has none is nested, so the diagnostic sits nowhere in the
+            // document and carries no location.
+            Some(""),
             None,
         ),
         (
@@ -366,7 +369,7 @@ async fn a_state_machine_declaring_no_terminal_state_is_reported() {
                     },
                 },
             }),
-            Some("/States/P/Branches[0]"),
+            Some(""),
             None,
         ),
         (
