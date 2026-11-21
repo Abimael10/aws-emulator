@@ -153,12 +153,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A reporting operation: it reads the stored bot and writes nothing.
         //
-        // Resolving the `AppInstanceBotArn` is an ACCESS decision rather than a lookup
-        // that reports absence: an ARN this service holds no bot for names a bot this
-        // caller may not read, so the answer is the permanent 403 refusal, and it tells
-        // the caller nothing about whether such a bot exists anywhere. The only resource
-        // the request names is the one being resolved, so the modelled 404 — for
-        // resources a request names BESIDE the one it addresses — never applies here.
+        // This service answers a describe addressed to an ARN it holds no resource for
+        // with the permanent 403 refusal rather than with a missing-resource or
+        // malformed-input one: resolving the addressed ARN is an AUTHORIZATION decision,
+        // so "this ARN names no such resource" is reported as a request the caller may
+        // not make — the one forbidden-request sentence, with nothing interpolated into
+        // it, exactly as the sibling `DescribeAppInstanceAdmin` answers an identity it
+        // holds no admin grant for. The refusal is therefore the SAME whatever left the
+        // ARN unresolvable (a bot never minted, one deleted, one cascaded away with its
+        // parent `AppInstance`, or an ARN naming another resource kind, account or
+        // region), so the answer discloses nothing a caller could use to probe for
+        // resources it may not read — which is what the 403 class means here and what
+        // the `NotFoundException` the model also declares for this operation would not.
         let Some(record) = state.bot(&input.app_instance_bot_arn) else {
             return Err(DescribeAppInstanceBotErrorModeled::ForbiddenException(
                 ForbiddenException {

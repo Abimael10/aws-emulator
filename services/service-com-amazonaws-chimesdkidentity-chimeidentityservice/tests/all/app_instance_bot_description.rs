@@ -7,7 +7,9 @@
 //! `Configuration` the bot was created with, and the instants it was created and last
 //! written at — and changes nothing; an `AppInstanceBotArn` this service holds no bot for
 //! is an ARN the caller may not read, so it is refused with the modelled 403
-//! `ForbiddenException` rather than answered or told that the resource is absent.
+//! `ForbiddenException` rather than answered or told that the resource is absent, and
+//! that ONE refusal is the answer whatever left the ARN unresolvable, so it discloses
+//! nothing about whether such a resource exists.
 //!
 //! The tables span what the rule generalises over: which optional members a bot carries
 //! and at which sizes (absent, empty, the model's length maxima, non-ASCII), the shape of
@@ -148,6 +150,20 @@ async fn delete_app_instance(emulator: &Emulator, app_instance_arn: &str) {
         status, 204,
         "expected DeleteAppInstance to answer 204, got {status} {body:?}"
     );
+}
+
+/// `arn` with its REGION segment (the 4th) replaced, so a row can name the same resource
+/// in another region without hardcoding the region the emulator was built in.
+fn in_another_region(arn: &str) -> String {
+    let mut segments: Vec<&str> = arn.splitn(6, ':').collect();
+    assert_eq!(segments.len(), 6, "expected a six-segment ARN, got {arn:?}");
+    let other = if segments[3] == "eu-west-1" {
+        "us-east-2"
+    } else {
+        "eu-west-1"
+    };
+    segments[3] = other;
+    segments.join(":")
 }
 
 /// `arn` with its ACCOUNT segment (the 5th) replaced, so a row can name the same
@@ -467,5 +483,166 @@ async fn an_unresolvable_bot_arn_is_refused() {
         member(&body, "Name").as_str(),
         Some("kept"),
         "expected the surviving bot to report the Name it was created with, got {body:?}"
+    );
+}
+
+/// RULE: the refusal of a `DescribeAppInstanceBot` addressed to an ARN this service holds
+/// no bot for is ONE answer — the modelled 403 `ForbiddenException`, `Code` `Forbidden`
+/// and the fixed forbidden-request sentence with nothing interpolated into it — whatever
+/// left that ARN unresolvable, so the response body is identical across every class of
+/// unresolvable ARN, never reports absence as a 404 or a 400, and never echoes the ARN it
+/// was asked about. Resolving the addressed ARN is an authorization decision here, so
+/// telling a caller apart "no such bot" from "a bot you may not read" is exactly what the
+/// answer must not do.
+#[tokio::test]
+async fn one_refusal_answers_every_unresolvable_bot_arn_and_discloses_nothing() {
+    let emulator = Emulator::new();
+    let instance = emulator
+        .app_instance("undisclosed-bots", "tok-undisclosed")
+        .await;
+    let user = emulator
+        .user(&instance, "undisclosed-user", "tok-undisclosed-user")
+        .await;
+    let live = create_bot(
+        &emulator,
+        &instance,
+        "tok-undisclosed-live",
+        Some("live"),
+        Some("still here"),
+        &responds_to_configuration("BOTIDLIVEA", "en_US"),
+    )
+    .await;
+
+    let deleted = create_bot(
+        &emulator,
+        &instance,
+        "tok-undisclosed-deleted",
+        Some("deleted"),
+        None,
+        &responds_to_configuration("BOTIDGONEA", "en_US"),
+    )
+    .await;
+    delete_bot(&emulator, &deleted).await;
+
+    let doomed_instance = emulator
+        .app_instance("undisclosed-doomed", "tok-undisclosed-doomed")
+        .await;
+    let cascaded = create_bot(
+        &emulator,
+        &doomed_instance,
+        "tok-undisclosed-cascaded",
+        Some("cascaded"),
+        None,
+        &responds_to_configuration("BOTIDCASCB", "en_US"),
+    )
+    .await;
+    delete_app_instance(&emulator, &doomed_instance).await;
+
+    // Rows span the classes the rule generalises over: WHY the ARN resolves to no bot
+    // (never minted, minted and deleted, cascaded away with its parent, belonging to
+    // another account or region, or naming a live resource that is not a bot — a user,
+    // the parent instance itself, or a resource of another service entirely), and the
+    // SHAPE of the ARN (one segment longer than a bot ARN, one character off a live
+    // bot's, a resource path of its own). Every `ChimeArn` here satisfies the modelled
+    // pattern, so what is under test is the refusal and not input validation.
+    //
+    // Source for the ARN shape: `smithy_query(query="shape",shape="ChimeArn")` — len
+    // 5..1600 and `^arn:[a-z0-9-\.]{1,63}:[a-z0-9-\.]{0,63}:[a-z0-9-\.]{0,63}:[a-z0-9-\.]{0,63}:[^/].{0,1023}$`.
+    let one_character_off = {
+        let mut flipped = live.clone();
+        flipped.pop();
+        format!("{flipped}z")
+    };
+    let rows: Vec<(&str, String)> = vec![
+        (
+            "a bot never minted under a live AppInstance",
+            format!("{instance}/bot/never-minted"),
+        ),
+        (
+            "a bot under an AppInstance that never existed",
+            format!("{instance}-absent/bot/orphan"),
+        ),
+        ("a bot that was deleted", deleted.clone()),
+        (
+            "a bot whose parent AppInstance was deleted",
+            cascaded.clone(),
+        ),
+        (
+            "a live bot's ARN in another account",
+            in_another_account(&live),
+        ),
+        (
+            "a live bot's ARN in another region",
+            in_another_region(&live),
+        ),
+        ("a live AppInstanceUser's ARN", user.clone()),
+        ("the live parent AppInstance's own ARN", instance.clone()),
+        (
+            "an ARN one character off a live bot's",
+            one_character_off.clone(),
+        ),
+        (
+            "a bot ARN with a sub-resource path of its own",
+            format!("{live}/channel/extra"),
+        ),
+        (
+            "an ARN of another AWS service entirely",
+            "arn:aws:s3:us-west-2:123456789012:bucket-that-is-not-a-bot".to_string(),
+        ),
+    ];
+
+    let mut canonical: Option<(&str, Value)> = None;
+    for (label, arn) in &rows {
+        let (status, body) = describe_bot(&emulator, arn).await;
+        assert_eq!(
+            status, 403,
+            "case {label:?}: expected {arn:?} to be refused with the modelled 403, got {status} {body:?}"
+        );
+        assert_eq!(
+            body["Code"].as_str(),
+            Some("Forbidden"),
+            "case {label:?}: expected the Forbidden code, got {body:?}"
+        );
+        assert_eq!(
+            body["Message"].as_str(),
+            Some(FORBIDDEN_MESSAGE),
+            "case {label:?}: expected the fixed forbidden-request sentence, got {body:?}"
+        );
+        assert!(
+            body.get("AppInstanceBot").is_none(),
+            "case {label:?}: expected the refusal to report no bot, got {body:?}"
+        );
+        // Nothing of the request is interpolated into the refusal, so the answer cannot
+        // be read as a statement about the ARN that was asked about.
+        let rendered = body.to_string();
+        assert!(
+            !rendered.contains(arn.as_str()),
+            "case {label:?}: expected the refusal not to echo {arn:?}, got {rendered}"
+        );
+        match &canonical {
+            None => canonical = Some((label, body)),
+            Some((first_label, first_body)) => assert_eq!(
+                &body, first_body,
+                "case {label:?}: expected the same refusal as case {first_label:?} ({first_body:?}), got {body:?}"
+            ),
+        }
+    }
+
+    // The refusals are not a blanket one: the bot that does exist is still reported, with
+    // everything it was created with, after every row above.
+    let (status, body) = describe_bot(&emulator, &live).await;
+    assert_eq!(
+        status, 200,
+        "expected the live bot to still be described, got {status} {body:?}"
+    );
+    assert_eq!(
+        member(&body, "AppInstanceBotArn").as_str(),
+        Some(live.as_str()),
+        "expected the live bot to report its own ARN, got {body:?}"
+    );
+    assert_eq!(
+        member(&body, "Metadata").as_str(),
+        Some("still here"),
+        "expected the live bot to report the Metadata it was created with, got {body:?}"
     );
 }
