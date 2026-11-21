@@ -14,7 +14,10 @@
 //! put back in the source queue, and the cancellation instant is recorded on the task
 //! record, so every later reader projects the same status and the same progress from it.
 //! A handle no recorded task answers to, and a task whose status is not running, are
-//! refused.
+//! refused as the VALUE the required `TaskHandle` member carried: the handle is a value
+//! this service minted, so one it cannot resolve and one naming a task a cancellation
+//! cannot act on are both values the parameter does not accept, and a request carrying no
+//! handle at all is refused as the absent parameter it is.
 //!
 //! ## Shape of an operation
 //!
@@ -89,6 +92,11 @@
 use super::types::*;
 use crate::state as sqs;
 use std::time::SystemTime;
+
+/// The modelled member a handle arrives in, as the model spells it
+/// (`CancelMessageMoveTaskRequest$TaskHandle`, required): the name every refusal about that
+/// member reports.
+const TASK_HANDLE_PARAMETER: &str = "TaskHandle";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -166,6 +174,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the audit record below, the way the real service's trail does.
         let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
 
+        // "An identifier associated with a message movement task" is a member this call
+        // REQUIRES: a request carrying no handle named no task to stop, so it is refused as
+        // the absent parameter it is before the store is reached.
+        if let Some(absent) =
+            sqs::absent_required_parameter(&[(TASK_HANDLE_PARAMETER, &input.task_handle)])
+        {
+            return Err(crate::scaffolded::Scaffolded::missing_parameter(absent));
+        }
+
         let store = sqs::service_state(&*self.engine).ok_or_else(|| {
             CancelMessageMoveTaskErrorModeled::UnsupportedOperation(sqs::store_unavailable())
         })?;
@@ -181,33 +198,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is what is left once everything already due has been applied.
         state.materialise_due(now);
 
-        // "One or more specified resources don't exist" (`ResourceNotFoundException`): a
-        // handle no recorded task answers to names no message movement task. The service
-        // words this one for the task rather than for the parameter, so it does not go
-        // through the shared `SourceArn`/`DestinationArn` wording.
+        // A handle no recorded task answers to is not a resource that is missing: the
+        // handle is a value this service minted, and one it cannot resolve is a value the
+        // parameter does not accept, so the refusal is the parameter one and names the
+        // modelled member. The submitted handle is NOT echoed — it tells the caller nothing
+        // it did not send, and the parameter publishes no value set to repair it against.
         let Some(task) = state.message_move_task(&region, &input.task_handle) else {
-            return Err(CancelMessageMoveTaskErrorModeled::ResourceNotFoundException(
-                sqs::unknown_message_move_task(),
-            )
-            .into());
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                sqs::invalid_parameter_value_message(TASK_HANDLE_PARAMETER),
+            ));
         };
 
         // "A message movement can only be cancelled when the current status is RUNNING":
         // a task that has delivered everything it took, or that an earlier call already
-        // cancelled, has nothing left to stop.
-        let status = task.status(now);
-        if status != sqs::MESSAGE_MOVE_RUNNING {
-            return Err(CancelMessageMoveTaskErrorModeled::UnsupportedOperation(
-                UnsupportedOperation {
-                    message: Some(format!(
-                        "The message movement task that you specified for the TaskHandle \
-                         parameter is {status}; a message movement can only be cancelled when \
-                         the current status is {}.",
-                        sqs::MESSAGE_MOVE_RUNNING
-                    )),
-                },
-            )
-            .into());
+        // cancelled, has nothing left to stop. The refusal is about the VALUE the parameter
+        // carried — a handle of a task this call cannot act on — and states the whole rule
+        // as fixed text, naming neither the handle nor the status the task is in.
+        if task.status(now) != sqs::MESSAGE_MOVE_RUNNING {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                sqs::ONLY_ACTIVE_TASKS_CANCELLABLE,
+            ));
         }
         let source_queue = task.source_queue_name.clone();
         let destination_queue = task.destination_queue_name.clone();
@@ -219,8 +229,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let moved = state
             .cancel_message_move_task(&region, &input.task_handle, now)
             .ok_or_else(|| {
-                CancelMessageMoveTaskErrorModeled::ResourceNotFoundException(
-                    sqs::unknown_message_move_task(),
+                crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    sqs::invalid_parameter_value_message(TASK_HANDLE_PARAMETER),
                 )
             })?;
 

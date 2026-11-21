@@ -384,6 +384,32 @@ pub const REDRIVE_ALLOW_POLICY_FORM_REASON: &str =
     "Amazon SQS can't create the redrive allow policy. The redrive allow policy must be a JSON \
      object whose sourceQueueArns parameter lists Amazon SQS queue ARNs.";
 
+/// The reason a refusal gives for a `RedrivePolicy` value that is no JSON document at all.
+///
+/// The attribute's value is "the string that includes the parameters for the dead-letter
+/// queue functionality of the source queue as a JSON object" — a map of the two members that
+/// documentation defines — so text the service cannot read as one carries no dead-letter
+/// configuration to judge. Amazon SQS answers that with its own sentence about the
+/// document's FORM, which is what a caller telling this refusal apart from the refusals of
+/// the members INSIDE a readable document matches.
+pub const REDRIVE_POLICY_FORM_REASON: &str = "Redrive policy is not a valid JSON map.";
+
+/// The reason a refusal gives for a value of `attribute` that is not the JSON MAP that
+/// attribute's own documentation defines member by member, or `None` for a document
+/// attribute whose members this service does not define at all.
+///
+/// The two redrive attributes each document the members their value carries, so a value that
+/// is no such map is refused with the sentence THAT attribute states its document's form in;
+/// `Policy` is "a valid Amazon Web Services policy", a document this service does not define
+/// member by member, and its refusal names the attribute alone.
+pub(super) fn document_form_reason(attribute: &str) -> Option<&'static str> {
+    match attribute {
+        REDRIVE_POLICY => Some(REDRIVE_POLICY_FORM_REASON),
+        REDRIVE_ALLOW_POLICY => Some(REDRIVE_ALLOW_POLICY_FORM_REASON),
+        _ => None,
+    }
+}
+
 /// Why a `RedriveAllowPolicy` document cannot be stored, told apart by the class the refusal
 /// answers under: each handler renders it as the modelled error its own operation declares.
 #[derive(Debug)]

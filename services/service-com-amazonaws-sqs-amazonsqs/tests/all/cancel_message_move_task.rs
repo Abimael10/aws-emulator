@@ -41,8 +41,25 @@ const CANCELLED: &str = "CANCELLED";
 /// The status a task reports once every message it took has been delivered.
 const COMPLETED: &str = "COMPLETED";
 
-/// What the service says when a `TaskHandle` names no message movement task.
-const UNKNOWN_TASK_MESSAGE: &str = "Task does not exist.";
+/// What the service says when a `TaskHandle` names no message movement task it can stop:
+/// the handle is a value this service minted, so one it cannot resolve is a value the
+/// parameter does not accept — stated without echoing the handle back. Spelled out here
+/// rather than imported, so a drifting constant in the service cannot make a row pass.
+const UNRESOLVABLE_HANDLE_MESSAGE: &str = "Value for parameter TaskHandle is invalid.";
+
+/// What it says when the task a handle names is not one a cancellation can act on: "a
+/// message movement can only be cancelled when the current status is RUNNING", as fixed
+/// text that interpolates neither the handle nor the status.
+const ONLY_ACTIVE_TASKS_MESSAGE: &str = "Only active tasks can be cancelled.";
+
+/// What it says when the request carries no handle at all: the required parameter was not
+/// supplied, named by its modelled member (`CancelMessageMoveTaskRequest$TaskHandle`).
+const ABSENT_HANDLE_MESSAGE: &str = "The request must contain the parameter TaskHandle.";
+
+/// The two classes those refusals carry: a parameter whose VALUE this call does not accept,
+/// and a parameter the call requires and did not get.
+const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
+const MISSING_PARAMETER: &str = "MissingParameter";
 
 /// How long a loop waits for a status the clock owes before giving up. Far longer than
 /// any span these rows wait on, so a slow machine cannot fail a row the emulator is still
@@ -446,45 +463,53 @@ async fn a_cancel_naming_no_running_task_is_refused() {
         "case the completed task: expected it to finish its one message"
     );
 
-    // (case, TaskHandle, expected status, expected error code, the message it must carry
-    // when the service words one for the refusal). A handle no record answers to names no
-    // task, whatever shape it has; a task that is not running is a task a cancellation
-    // cannot act on.
-    let rows: &[(&str, String, u16, &str, Option<&str>)] = &[
+    // (case, TaskHandle, expected status, expected error code, the message the refusal must
+    // carry). A handle no record answers to is a VALUE this parameter does not accept,
+    // whatever shape it has; a task that is not running is a task a cancellation cannot act
+    // on, under the same class and the rule's own sentence; and a request carrying no handle
+    // at all supplied the required parameter no more than one leaving it out did.
+    let rows: &[(&str, String, u16, &str, &str)] = &[
         (
             "a handle no task answers to",
             "6f57b2cc-0000-4000-8000-000000000000".to_string(),
-            404,
-            "ResourceNotFoundException",
-            Some(UNKNOWN_TASK_MESSAGE),
+            400,
+            INVALID_PARAMETER_VALUE,
+            UNRESOLVABLE_HANDLE_MESSAGE,
         ),
         (
             "a handle that is not of the shape this service mints",
             "not-a-task-handle".to_string(),
-            404,
-            "ResourceNotFoundException",
-            Some(UNKNOWN_TASK_MESSAGE),
+            400,
+            INVALID_PARAMETER_VALUE,
+            UNRESOLVABLE_HANDLE_MESSAGE,
+        ),
+        (
+            "a handle of the shape this service mints that names no task of this region",
+            "00000000-0000-4000-8000-000000000000".to_string(),
+            400,
+            INVALID_PARAMETER_VALUE,
+            UNRESOLVABLE_HANDLE_MESSAGE,
         ),
         (
             "an empty handle",
             String::new(),
-            404,
-            "ResourceNotFoundException",
-            Some(UNKNOWN_TASK_MESSAGE),
+            400,
+            MISSING_PARAMETER,
+            ABSENT_HANDLE_MESSAGE,
         ),
         (
             "the handle of a task an earlier call cancelled",
             cancelled_handle.clone(),
             400,
-            "UnsupportedOperation",
-            None,
+            INVALID_PARAMETER_VALUE,
+            ONLY_ACTIVE_TASKS_MESSAGE,
         ),
         (
             "the handle of a task that has delivered everything it took",
             done_handle.clone(),
             400,
-            "UnsupportedOperation",
-            None,
+            INVALID_PARAMETER_VALUE,
+            ONLY_ACTIVE_TASKS_MESSAGE,
         ),
     ];
 
@@ -505,14 +530,12 @@ async fn a_cancel_naming_no_running_task_is_refused() {
             "case {case}: expected HTTP {expected_status} {expected_code}, got {status} with \
              {parsed}"
         );
-        if let Some(expected_message) = expected_message {
-            // awsJson1_0 carries the modelled `message` member as the body's `message`.
-            assert_eq!(
-                parsed["message"].as_str(),
-                Some(*expected_message),
-                "case {case}: expected the message {expected_message:?}, got {parsed}"
-            );
-        }
+        // awsJson1_0 carries the refusal's `message` member as the body's `message`.
+        assert_eq!(
+            parsed["message"].as_str(),
+            Some(*expected_message),
+            "case {case}: expected the message {expected_message:?}, got {parsed}"
+        );
         assert!(
             parsed.get("ApproximateNumberOfMessagesMoved").is_none(),
             "case {case}: a refusal cancels nothing, got {parsed}"

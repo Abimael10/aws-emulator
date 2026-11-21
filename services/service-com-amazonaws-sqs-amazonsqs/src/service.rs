@@ -682,19 +682,41 @@ impl ErasedOperation for MediaTypeNotServed {
 /// The error Amazon SQS names for a value the boundary validator refused, or `None` to
 /// leave the framework's wording in place.
 ///
-/// One case, and it is model-driven rather than keyed to a member name: a value
-/// outside `QueueAttributeName`'s value set is an attribute name that does not exist,
-/// which this service's model has an error shape for — `InvalidAttributeName`, "The
-/// specified attribute doesn't exist." (HTTP 400, the same status the refusal already
-/// carries). Every operation that takes attribute names reaches it through the same
-/// enum, so matching on the refused value SET covers all of them without naming one.
+/// Two cases, both model-driven rather than keyed to a member name:
+///
+/// * A member the operation REQUIRES and the request did not supply. Amazon SQS answers that
+///   under the code its documentation carries for an absent parameter — `MissingParameter`,
+///   named in the body by the shape id of the request-validation framework in front of it
+///   ([`crate::scaffolded::MISSING_PARAMETER_SHAPE_ID`]) — with the one sentence this service
+///   words that class in ([`crate::state::missing_parameter_message`]), naming the member the
+///   MODEL declares ([`modelled_member_name`]). Without this the refusal would name
+///   `ValidationException`, a shape this model does not declare at all, so no client of this
+///   API could classify it. It covers every operation at once, because every required member
+///   of every operation reaches the walk the same way.
+/// * A value outside `QueueAttributeName`'s value set is an attribute name that does not
+///   exist, which this service's model has an error shape for — `InvalidAttributeName`, "The
+///   specified attribute doesn't exist." (HTTP 400, the same status the refusal already
+///   carries). Every operation that takes attribute names reaches it through the same enum,
+///   so matching on the refused value SET covers all of them without naming one.
 ///
 /// An attribute name supplied as a MAP KEY (`CreateQueue`/`SetQueueAttributes`
 /// `Attributes`) never arrives here: the constraint walk captures a map key rather than
 /// validating it, so those handlers refuse an unknown name themselves
 /// (`crate::state::validate_attributes`). This covers the LIST form
 /// (`GetQueueAttributes` `AttributeNames`), which the walk does validate.
+///
+/// A member that is PRESENT and carries no value is not a violation the walk can see — an
+/// absent string and an empty one are one value by the time it runs — so the handlers refuse
+/// that themselves, under this same class (`crate::state::absent_required_parameter`).
 fn refusal_for(violation: &Violation) -> Option<Refused> {
+    if matches!(violation.kind, ViolationKind::MissingRequiredMember) {
+        return Some(Refused {
+            code: crate::scaffolded::MISSING_PARAMETER_SHAPE_ID.to_string(),
+            message: crate::state::missing_parameter_message(&modelled_member_name(
+                &violation.path,
+            )),
+        });
+    }
     // The class this service words the refusal with; the legacy query code reported beside
     // it is read off the MODEL for this same class ([`modelled_query_error_code`]), so the
     // refusal and the legacy report of it cannot name two different classes.
@@ -713,6 +735,49 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
     Some(Refused {
         code: class.to_string(),
         message: format!("Unknown Attribute {name}."),
+    })
+}
+
+/// The member name this service's MODEL declares for the member a refusal `path` names, or
+/// that path's own last segment when the model declares no member of it.
+///
+/// A refusal path spells each step in lowerCamel (`receiptHandle`), which is the path's own
+/// casing and not the model's: a refusal names the parameter as the API publishes it
+/// (`ReceiptHandle`), so the spelling is read back out of the model rather than recased here.
+fn modelled_member_name(path: &str) -> String {
+    let step = path.rsplit('.').next().unwrap_or(path);
+    modelled_member_names()
+        .get(step)
+        .cloned()
+        .unwrap_or_else(|| step.to_string())
+}
+
+/// Every member name this service's model declares, keyed by the lowerCamel spelling a
+/// refusal path names it in, built once per process out of the model's own shapes.
+///
+/// Two shapes declaring the same member name agree on its spelling, so one entry per
+/// spelling is all a refusal needs.
+fn modelled_member_names() -> &'static std::collections::BTreeMap<String, String> {
+    static MEMBERS: std::sync::OnceLock<std::collections::BTreeMap<String, String>> =
+        std::sync::OnceLock::new();
+    MEMBERS.get_or_init(|| {
+        let shapes = serde_json::from_str::<serde_json::Value>(MODEL)
+            .ok()
+            .and_then(|document| document.get("shapes").cloned());
+        let Some(serde_json::Value::Object(shapes)) = shapes else {
+            return std::collections::BTreeMap::new();
+        };
+        shapes
+            .values()
+            .filter_map(|shape| shape.get("members").and_then(serde_json::Value::as_object))
+            .flat_map(|members| members.keys())
+            .map(|member| {
+                (
+                    ::aws_smithy_schema_server::constraints::path::member(member),
+                    member.clone(),
+                )
+            })
+            .collect()
     })
 }
 

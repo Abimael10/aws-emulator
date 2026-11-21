@@ -219,6 +219,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as sqs;
 
+        // The members this call REQUIRES, in the order the model declares them
+        // (`ChangeMessageVisibilityRequest`): a request carrying no value for one of them
+        // named no queue, or no message, to act on, so it is refused as the absent
+        // parameter it is — before the handle is looked up, which is what tells a
+        // programming error apart from a handle that is present and unusable.
+        if let Some(absent) = sqs::absent_required_parameter(&[
+            ("QueueUrl", &input.queue_url),
+            ("ReceiptHandle", &input.receipt_handle),
+        ]) {
+            return Err(crate::scaffolded::Scaffolded::missing_parameter(absent));
+        }
+
         // "Values range: 0 to 43200" (`ChangeMessageVisibilityRequest$VisibilityTimeout`),
         // which is the range the queue's own attribute takes — the one place those bounds
         // are written.

@@ -136,6 +136,34 @@ fn invalid_without_value(parameter: &str, reason: &str) -> String {
     format!("Value for parameter {parameter} is invalid. Reason: {reason}")
 }
 
+/// The reason a refusal gives for a value outside the range its parameter publishes, in the
+/// other of the two sentences this service states that rule in: the pair of inequalities the
+/// value has to satisfy, which is what `WaitTimeSeconds` is refused with.
+fn at_most(minimum: i64, maximum: i64) -> String {
+    format!("Must be >= {minimum} and <= {maximum}, if provided.")
+}
+
+/// How a refusal states that an attribute's VALUE is not one the call accepts, with the
+/// rule it broke in the `Reason` clause: the template and both sentences spelled out here
+/// rather than imported.
+fn attribute_value(attribute: &str, reason: &str) -> String {
+    format!("Invalid value for the parameter {attribute}. Reason: {reason}")
+}
+
+/// How a refusal states that `parameter` was not supplied at all, spelled out here rather
+/// than imported so a wrong template in the service cannot make a row pass.
+fn absent(parameter: &str) -> String {
+    format!("The request must contain the parameter {parameter}.")
+}
+
+/// The reason a refusal gives for a value outside the range its parameter publishes: the
+/// bounds the value has to lie between, spelled out here rather than imported so a wrong
+/// template in the service cannot make a row pass. The bounds themselves are each
+/// parameter's own published range.
+fn between(minimum: i64, maximum: i64) -> String {
+    format!("Must be between {minimum} and {maximum}, if provided.")
+}
+
 /// How a refusal states that a `MessageGroupId`-style token is not one `member` accepts.
 fn bad_token(value: &str, member: &str) -> String {
     invalid(
@@ -259,6 +287,58 @@ async fn every_input_refusal_carries_a_code_this_service_has() {
             code: "MissingParameter",
             message: "The request must contain the parameter TagKeys.".to_string(),
         },
+        // A required member the request carries no value for: the same class, named for the
+        // modelled member, and answered BEFORE whatever that member names is looked up.
+        Row {
+            case: "a delete whose ReceiptHandle carries no text",
+            operation: "DeleteMessage",
+            address: Address::Url("standard"),
+            request: json!({"ReceiptHandle": ""}),
+            code: "MissingParameter",
+            message: absent("ReceiptHandle"),
+        },
+        Row {
+            case: "a delete carrying no ReceiptHandle member at all",
+            operation: "DeleteMessage",
+            address: Address::Url("standard"),
+            request: json!({}),
+            code: "MissingParameter",
+            message: absent("ReceiptHandle"),
+        },
+        Row {
+            case: "a delete whose QueueUrl carries no text",
+            operation: "DeleteMessage",
+            address: Address::None,
+            request: json!({"QueueUrl": "", "ReceiptHandle": "anything"}),
+            code: "MissingParameter",
+            message: absent("QueueUrl"),
+        },
+        Row {
+            case: "a visibility change whose ReceiptHandle carries no text",
+            operation: "ChangeMessageVisibility",
+            address: Address::Url("standard"),
+            request: json!({"ReceiptHandle": "", "VisibilityTimeout": 30}),
+            code: "MissingParameter",
+            message: absent("ReceiptHandle"),
+        },
+        Row {
+            case: "a cancellation whose TaskHandle carries no text",
+            operation: "CancelMessageMoveTask",
+            address: Address::None,
+            request: json!({"TaskHandle": ""}),
+            code: "MissingParameter",
+            message: absent("TaskHandle"),
+        },
+        // A handle this service minted and cannot resolve: a VALUE the parameter does not
+        // accept, stated without echoing the handle back.
+        Row {
+            case: "a cancellation naming a task handle no task answers to",
+            operation: "CancelMessageMoveTask",
+            address: Address::None,
+            request: json!({"TaskHandle": "6f57b2cc-0000-4000-8000-000000000000"}),
+            code: "InvalidParameterValue",
+            message: "Value for parameter TaskHandle is invalid.".to_string(),
+        },
         // A FIFO send the queue cannot deduplicate.
         Row {
             case: "a FIFO send with no MessageDeduplicationId on a queue that derives none",
@@ -373,11 +453,7 @@ async fn every_input_refusal_carries_a_code_this_service_has() {
             address: Address::Url("standard"),
             request: json!({"MaxNumberOfMessages": 0}),
             code: "InvalidParameterValue",
-            message: invalid(
-                "0",
-                "MaxNumberOfMessages",
-                "Must be between 1 and 10, if provided.",
-            ),
+            message: invalid("0", "MaxNumberOfMessages", &between(1, 10)),
         },
         Row {
             case: "a MaxNumberOfMessages one past its range",
@@ -385,11 +461,7 @@ async fn every_input_refusal_carries_a_code_this_service_has() {
             address: Address::Url("standard"),
             request: json!({"MaxNumberOfMessages": 11}),
             code: "InvalidParameterValue",
-            message: invalid(
-                "11",
-                "MaxNumberOfMessages",
-                "Must be between 1 and 10, if provided.",
-            ),
+            message: invalid("11", "MaxNumberOfMessages", &between(1, 10)),
         },
         Row {
             case: "a WaitTimeSeconds one past its range",
@@ -397,11 +469,7 @@ async fn every_input_refusal_carries_a_code_this_service_has() {
             address: Address::Url("standard"),
             request: json!({"WaitTimeSeconds": 21}),
             code: "InvalidParameterValue",
-            message: invalid(
-                "21",
-                "WaitTimeSeconds",
-                "Must be >= 0 and <= 20, if provided.",
-            ),
+            message: invalid("21", "WaitTimeSeconds", &at_most(0, 20)),
         },
         Row {
             case: "a VisibilityTimeout one past its range",
@@ -409,11 +477,15 @@ async fn every_input_refusal_carries_a_code_this_service_has() {
             address: Address::Url("standard"),
             request: json!({"VisibilityTimeout": 43_201}),
             code: "InvalidParameterValue",
-            message: invalid(
-                "43201",
-                "VisibilityTimeout",
-                "Must be >= 0 and <= 43200, if provided.",
-            ),
+            message: invalid("43201", "VisibilityTimeout", &between(0, 43_200)),
+        },
+        Row {
+            case: "a negative VisibilityTimeout, below its range",
+            operation: "ReceiveMessage",
+            address: Address::Url("standard"),
+            request: json!({"VisibilityTimeout": -1}),
+            code: "InvalidParameterValue",
+            message: invalid("-1", "VisibilityTimeout", &between(0, 43_200)),
         },
         Row {
             case: "a message movement rate of zero, below its range",
@@ -615,6 +687,36 @@ async fn every_input_refusal_carries_a_code_this_service_has() {
             request: json!({"Attributes": {"Policy": "{not json"}}),
             code: "InvalidAttributeValue",
             message: "Invalid value for the parameter Policy.".to_string(),
+        },
+        // A document attribute whose own documentation defines its members states, in the
+        // Reason clause, that the value is not the JSON map it defines.
+        Row {
+            case: "an update naming a RedrivePolicy that is not a JSON map",
+            operation: "SetQueueAttributes",
+            address: Address::Url("standard"),
+            request: json!({"Attributes": {"RedrivePolicy": "not a document"}}),
+            code: "InvalidAttributeValue",
+            message: attribute_value("RedrivePolicy", "Redrive policy is not a valid JSON map."),
+        },
+        // The attribute that designates the kind of queue, on a call that is not the
+        // create: on the queue that CARRIES it the kind is settled and cannot be changed,
+        // so the refusal is about the value; on a standard queue, which carries no such
+        // attribute at all, it is about the name.
+        Row {
+            case: "an update naming the queue-type designator on a FIFO queue",
+            operation: "SetQueueAttributes",
+            address: Address::Url("fifo"),
+            request: json!({"Attributes": {"FifoQueue": "true"}}),
+            code: "InvalidAttributeValue",
+            message: attribute_value("FifoQueue", "Modifying queue type is not supported."),
+        },
+        Row {
+            case: "an update naming the queue-type designator on a standard queue",
+            operation: "SetQueueAttributes",
+            address: Address::Url("standard"),
+            request: json!({"Attributes": {"FifoQueue": "true"}}),
+            code: "InvalidAttributeName",
+            message: "Unknown Attribute FifoQueue.".to_string(),
         },
         Row {
             case: "an update naming a MessageRetentionPeriod below its range",

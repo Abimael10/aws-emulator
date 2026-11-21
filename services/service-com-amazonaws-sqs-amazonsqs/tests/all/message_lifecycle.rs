@@ -336,7 +336,9 @@ async fn an_unknown_queue_url_is_queue_does_not_exist_everywhere() {
 /// A receipt handle the queue never minted is `ReceiptHandleIsInvalid` (404), with the
 /// service's one fixed sentence for a value that is not a receipt handle — while
 /// repeating the delete the queue DID mint a handle for succeeds, because a delete is
-/// idempotent ("the request succeeds, but the message might not be deleted").
+/// idempotent ("the request succeeds, but the message might not be deleted"). A request
+/// that supplies no handle at all is neither: the required parameter was not supplied, so
+/// it is refused as that before anything is looked up.
 #[tokio::test]
 async fn a_handle_the_queue_never_minted_is_receipt_handle_is_invalid() {
     let sqs = Emulator::new();
@@ -375,7 +377,6 @@ async fn a_handle_the_queue_never_minted_is_receipt_handle_is_invalid() {
 
     for handle in [
         "garbage",
-        "",
         "00000000-0000-4000-8000-000000000000",
         "AQEBzbVv…+not+base64/at+all==",
     ] {
@@ -395,6 +396,28 @@ async fn a_handle_the_queue_never_minted_is_receipt_handle_is_invalid() {
             Some("The input receipt handle is invalid."),
             "case handle {handle:?}: expected the fixed sentence, with nothing of the \
              request in it, got {answer:?}"
+        );
+    }
+
+    // A request that supplies NO handle is a different fault, and is reported before any
+    // handle is looked up: the required parameter was not supplied, which is a programming
+    // error in the caller rather than a handle the queue cannot use.
+    for (case, body) in [
+        ("no ReceiptHandle member at all", json!({ "QueueUrl": url })),
+        (
+            "a ReceiptHandle carrying no text",
+            json!({ "QueueUrl": url, "ReceiptHandle": "" }),
+        ),
+    ] {
+        let (status, answer) = sqs.call("DeleteMessage", &body).await;
+        assert_eq!(
+            (status, error_code(&answer).as_str(), answer["message"].as_str()),
+            (
+                400,
+                "MissingParameter",
+                Some("The request must contain the parameter ReceiptHandle.")
+            ),
+            "case {case}: got {status} {answer:?}"
         );
     }
 }

@@ -636,9 +636,9 @@ async fn a_message_move_task_cannot_span_two_regions() {
     .await;
     assert_eq!(
         (status, error_code(&parsed).as_str()),
-        (404, "ResourceNotFoundException"),
-        "case cancelling from another region: the handle names no task there, \
-         got {status} with {parsed}"
+        (400, "InvalidParameterValue"),
+        "case cancelling from another region: the handle resolves no task there, so the \
+         parameter carried a value this call cannot accept, got {status} with {parsed}"
     );
 
     // And the task is still the home region's to cancel.

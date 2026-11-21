@@ -187,6 +187,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The members this call REQUIRES, in the order the model declares them
+        // (`DeleteMessageRequest`): a request carrying no value for one of them named no
+        // queue, or no message, to delete, so it is refused as the absent parameter it is —
+        // before the handle is looked up, so the commonest programming error is reported as
+        // the missing parameter it is rather than as a handle that is present and unusable.
+        if let Some(absent) = sqs::absent_required_parameter(&[
+            ("QueueUrl", &input.queue_url),
+            ("ReceiptHandle", &input.receipt_handle),
+        ]) {
+            return Err(crate::scaffolded::Scaffolded::missing_parameter(absent));
+        }
+
         let store = sqs::service_state(&*self.engine).ok_or_else(|| {
             DeleteMessageErrorModeled::UnsupportedOperation(sqs::store_unavailable())
         })?;

@@ -196,6 +196,11 @@ use std::time::{Duration, SystemTime};
 /// a message sent during the wait is handed over promptly, long enough not to spin.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// The range `MaxNumberOfMessages` publishes: "Valid values: 1 to 10. Default: 1"
+/// (`ReceiveMessageRequest$MaxNumberOfMessages`). The member carries no modelled `@range`,
+/// so the bound its refusal states is read from here.
+const MAX_NUMBER_OF_MESSAGES_RANGE: (i32, i32) = (1, 10);
+
 /// Does `requested` ask for the message attribute (or system attribute) `name`?
 ///
 /// The forms Amazon SQS accepts in `MessageAttributeNames`: `All` selects every
@@ -307,25 +312,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The maximum number of messages to return. ... Valid values: 1 to 10.
         // Default: 1." (ReceiveMessageRequest$MaxNumberOfMessages)
         let max_messages = input.max_number_of_messages.unwrap_or(1);
-        if !(1..=10).contains(&max_messages) {
+        if !(MAX_NUMBER_OF_MESSAGES_RANGE.0..=MAX_NUMBER_OF_MESSAGES_RANGE.1)
+            .contains(&max_messages)
+        {
             return Err(Scaffolded::invalid_parameter_value(sqs::invalid_parameter_message(
                 &max_messages.to_string(),
                 "MaxNumberOfMessages",
-                "Must be between 1 and 10, if provided.",
+                &sqs::bounded_parameter_reason(
+                    i64::from(MAX_NUMBER_OF_MESSAGES_RANGE.0),
+                    i64::from(MAX_NUMBER_OF_MESSAGES_RANGE.1),
+                ),
             )));
         }
         // Each caller-chosen span is clamped against the range the model documents for
-        // the queue attribute that carries the same meaning, BEFORE anything waits on it.
-        for (member, value, attribute) in [
+        // the queue attribute that carries the same meaning, BEFORE anything waits on it,
+        // and each is refused with the sentence Amazon SQS words a range refusal of THAT
+        // member in: the span of a delivery states its bounds as a range, and the span a
+        // receive waits states them as the pair of inequalities.
+        for (member, value, attribute, reason) in [
             (
                 "VisibilityTimeout",
                 input.visibility_timeout,
                 sqs::VISIBILITY_TIMEOUT,
+                sqs::bounded_parameter_reason as fn(i64, i64) -> String,
             ),
             (
                 "WaitTimeSeconds",
                 input.wait_time_seconds,
                 sqs::RECEIVE_MESSAGE_WAIT_TIME_SECONDS,
+                sqs::bounded_parameter_inequality_reason as fn(i64, i64) -> String,
             ),
         ] {
             let (min, max) = sqs::integer_bounds(attribute);
@@ -333,7 +348,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(Scaffolded::invalid_parameter_value(sqs::invalid_parameter_message(
                     &given.to_string(),
                     member,
-                    &format!("Must be >= {min} and <= {max}, if provided."),
+                    &reason(min, max),
                 )));
             }
         }

@@ -21,6 +21,12 @@
 //! the caller's whitespace, its member order and whether it quoted the numeric count do not
 //! survive into what is reported. The rows spell ONE policy every way a client might write
 //! it and assert the single document they all read back as.
+//!
+//! The FORM rule: a value the service cannot read as the JSON MAP the attribute's own
+//! documentation defines carries no configuration to judge at all, so it is refused as that
+//! attribute's VALUE with the attribute's own `Reason` clause — the clause being the only
+//! thing that tells a malformed document apart from the refusals of the members inside a
+//! readable one.
 
 use serde_json::{json, Value};
 
@@ -563,5 +569,184 @@ async fn one_redrive_allow_policy_reads_back_in_one_rendering_whatever_its_spell
             "case {case}: SetQueueAttributes must report the permission {supplied} in one \
              rendering, got {stored:?}"
         );
+    }
+}
+
+/// The refusal class an attribute VALUE the call does not accept carries.
+const INVALID_ATTRIBUTE_VALUE: &str = "InvalidAttributeValue";
+
+/// The template a refused attribute VALUE is worded in, with the rule it broke stated after
+/// it — spelled out here rather than imported, so a drifting constant in the service cannot
+/// make a row pass.
+fn attribute_refusal(attribute: &str, reason: &str) -> String {
+    format!("Invalid value for the parameter {attribute}. Reason: {reason}")
+}
+
+/// The sentence Amazon SQS answers a `RedrivePolicy` that is no JSON map with. Source: the
+/// recorded 400 response of that refusal; the attribute's value is documented as "a JSON
+/// object" (`smithy_query(query="doc",shape="com.amazonaws.sqs#SetQueueAttributesRequest",
+/// member="Attributes")`).
+const REDRIVE_POLICY_NOT_A_MAP: &str = "Redrive policy is not a valid JSON map.";
+
+/// The sentence it answers a `RedriveAllowPolicy` whose document is not the shape that
+/// attribute documents with, which is the same rule for the other redrive attribute.
+const REDRIVE_ALLOW_POLICY_NOT_A_MAP: &str =
+    "Amazon SQS can't create the redrive allow policy. The redrive allow policy must be a JSON \
+     object whose sourceQueueArns parameter lists Amazon SQS queue ARNs.";
+
+/// A value of a document attribute that this service cannot read as the JSON MAP the
+/// attribute's own documentation defines is refused with that attribute's own `Reason`
+/// clause, through both paths that write a queue attribute, and leaves the attribute as it
+/// was.
+///
+/// The rows span what the rule generalises over rather than one example: the ATTRIBUTE whose
+/// document it is (both redrive attributes), and the FORM of the value — text that is no
+/// JSON at all, a truncated document, a bare word, a number, a quoted string and a JSON list
+/// — with the document each attribute DOES admit carried alongside, so a service that refused
+/// everything with the right sentence would fail the table too. The `Policy` attribute, whose
+/// document this service does not define member by member, carries no such clause, and
+/// [`super::refusal_taxonomy`] pins that it still names the attribute alone.
+#[tokio::test]
+async fn a_document_attribute_that_is_no_json_map_is_refused_with_its_own_reason() {
+    // (case, attribute, the value a write submits, the reason the refusal must state, or
+    // `None` for a value the attribute admits)
+    let admitted_allow_policy = r#"{"redrivePermission":"denyAll"}"#;
+    let rows: Vec<(&str, &str, String, Option<&str>)> = vec![
+        (
+            "a redrive policy that is plain text",
+            "RedrivePolicy",
+            "not a document".to_string(),
+            Some(REDRIVE_POLICY_NOT_A_MAP),
+        ),
+        (
+            "a redrive policy whose document is truncated",
+            "RedrivePolicy",
+            r#"{"deadLetterTargetArn": "#.to_string(),
+            Some(REDRIVE_POLICY_NOT_A_MAP),
+        ),
+        (
+            "a redrive policy that is a bare word",
+            "RedrivePolicy",
+            "deadLetterTargetArn".to_string(),
+            Some(REDRIVE_POLICY_NOT_A_MAP),
+        ),
+        (
+            "a permission document that is plain text",
+            "RedriveAllowPolicy",
+            "allowAll".to_string(),
+            Some(REDRIVE_ALLOW_POLICY_NOT_A_MAP),
+        ),
+        (
+            "a permission document that is truncated",
+            "RedriveAllowPolicy",
+            r#"{"redrivePermission":"#.to_string(),
+            Some(REDRIVE_ALLOW_POLICY_NOT_A_MAP),
+        ),
+        (
+            "a redrive policy the attribute admits",
+            "RedrivePolicy",
+            policy(&expected_arn(STANDARD_TARGET), json!(COUNT_RANGE.0)),
+            None,
+        ),
+        (
+            "a permission document the attribute admits",
+            "RedriveAllowPolicy",
+            admitted_allow_policy.to_string(),
+            None,
+        ),
+    ];
+
+    for (index, (case, attribute, supplied, reason)) in rows.iter().enumerate() {
+        let router = emulator();
+        create_targets(&router).await;
+        // The queue the write addresses already carries a document in the attribute under
+        // test, so a refused write has to leave THAT document in force.
+        let held = match *attribute {
+            "RedrivePolicy" => policy(&expected_arn(STANDARD_TARGET), json!(COUNT_RANGE.1)),
+            _ => admitted_allow_policy.to_string(),
+        };
+        let url = create_ok(
+            &router,
+            &format!("form-source-{index}"),
+            &json!({ attribute.to_string(): held.clone() }),
+        )
+        .await;
+
+        let (status, parsed) = call(
+            &router,
+            "SetQueueAttributes",
+            &json!({"QueueUrl": url, "Attributes": { attribute.to_string(): supplied }}),
+        )
+        .await;
+        let stored = all_attributes(&router, &url).await.get(*attribute).cloned();
+        match reason {
+            None => assert_eq!(
+                status, 200,
+                "case {case}: expected the document accepted, got {status} with {parsed}"
+            ),
+            Some(reason) => {
+                assert_eq!(
+                    (
+                        status,
+                        error_code(&parsed).as_str(),
+                        parsed["message"].as_str()
+                    ),
+                    (
+                        400,
+                        INVALID_ATTRIBUTE_VALUE,
+                        Some(attribute_refusal(attribute, reason).as_str())
+                    ),
+                    "case {case}: expected the refusal to state the attribute's own form rule, \
+                     got {status} with {parsed}"
+                );
+                assert_eq!(
+                    stored.as_deref(),
+                    Some(held.as_str()),
+                    "case {case}: a refused write must leave the stored document untouched, got \
+                     {stored:?}"
+                );
+            }
+        }
+
+        // The CREATE path judges the same value the same way, and a refused create leaves no
+        // queue behind.
+        let created = format!("form-created-{index}");
+        let (status, parsed) = create(
+            &router,
+            &created,
+            &json!({ attribute.to_string(): supplied }),
+        )
+        .await;
+        match reason {
+            None => assert_eq!(
+                status, 200,
+                "case {case} on CreateQueue: expected the document accepted, got {status} with \
+                 {parsed}"
+            ),
+            Some(reason) => {
+                assert_eq!(
+                    (
+                        status,
+                        error_code(&parsed).as_str(),
+                        parsed["message"].as_str()
+                    ),
+                    (
+                        400,
+                        INVALID_ATTRIBUTE_VALUE,
+                        Some(attribute_refusal(attribute, reason).as_str())
+                    ),
+                    "case {case} on CreateQueue: expected the refusal to state the attribute's \
+                     own form rule, got {status} with {parsed}"
+                );
+                let (status, parsed) =
+                    call(&router, "GetQueueUrl", &json!({"QueueName": created})).await;
+                assert_eq!(
+                    (status, error_code(&parsed).as_str()),
+                    (400, "QueueDoesNotExist"),
+                    "case {case}: a refused create must leave no queue behind, got {status} with \
+                     {parsed}"
+                );
+            }
+        }
     }
 }
