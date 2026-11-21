@@ -1438,9 +1438,17 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// Which claim on that pump is the live one: a pump releases its own claim and never a
     /// later pump's.
     pub clock_pump_generation: u64,
-    /// The running pump's task handle, kept so the pump it replaces is aborted rather than
-    /// merely forgotten.
-    pub clock_pump: Option<::tokio::task::JoinHandle<()>>,
+    /// A weak reference to the token the running pump OWNS ([`ClockPumpLife`]), which is what
+    /// says whether the claim above is still held by a pump that exists: the token is dropped
+    /// whenever that task ends, however it ended, so a claim whose token can no longer be
+    /// upgraded is one the next door takes over. Recorded in the same critical section the
+    /// claim is taken in, which is what the task handle below cannot be.
+    pub clock_pump_life: Option<::std::sync::Weak<ClockPumpLife>>,
+    /// The running pump's task handle and the generation of the claim it was spawned under,
+    /// kept so a pump this service started stays reachable, and so abortable, rather than
+    /// detached — and keyed by that generation so an earlier pump's handle cannot replace a
+    /// later one's, which is what would otherwise abort the pump holding the claim.
+    pub clock_pump: Option<(u64, ::tokio::task::JoinHandle<()>)>,
     /// The tasks the HANDED-OFF executions of caller-supplied code are running on — a job
     /// run's script ([`hand_off_job_script`]) and an interactive session's statement — kept so
     /// an execution this service began is reachable, and so abortable, rather than detached.

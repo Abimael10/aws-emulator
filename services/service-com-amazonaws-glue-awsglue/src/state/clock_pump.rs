@@ -39,6 +39,30 @@
 //! bounded by [`MAX_CLOCK_WAKE_UPS`] wake-ups, and it stands down as soon as the store owes
 //! nothing and has nothing queued. With no async runtime to spawn onto there is no pump, and
 //! the transitions are materialised by the next reader instead.
+//!
+//! # A claim is only as good as the pump holding it
+//!
+//! The claim is what keeps a second pump from running, so a claim nobody is holding any more
+//! would stop EVERY later pump from starting — and the publication is the pump's alone, so
+//! from then on nothing this store queues would ever be published, however many runs came to
+//! rest. The claim is therefore kept beside a token the pump's own task OWNS
+//! ([`ClockPumpLife`]): the token is dropped whenever that task ends, whether it stood down,
+//! reached its wake-up cap, panicked or was dropped before it finished, so a claim whose token
+//! is gone is not a claim and the next door takes it over. The token is recorded in the SAME
+//! critical section the claim is taken in, so the span between taking a claim and spawning the
+//! task that holds it is covered too.
+//!
+//! Why a token and not the task handle itself: a handle exists only once the task has been
+//! spawned, which is after the critical section the claim was taken in, so between those two
+//! points there is no handle to ask — and a store that read "no handle yet" as "no pump" would
+//! start a second pump against the same claim. The token has no such window, because it is
+//! created where the claim is.
+//!
+//! The task's HANDLE is kept beside both ([`ComAmazonawsGlueAwsglueState::clock_pump`]), so a
+//! pump this service started stays reachable rather than detached — under the generation of the
+//! claim it was spawned for, because a handle cannot be stored in the critical section its
+//! claim was taken in and a late-arriving one must not replace, and so abort, the pump that now
+//! holds the claim.
 
 use ::std::time::{Duration, SystemTime};
 
@@ -101,18 +125,35 @@ impl ComAmazonawsGlueAwsglueState {
         }
     }
 
-    /// Claim the single pump for this store: the claim's GENERATION when the caller may start
-    /// one, `None` when one is already running.
+    /// Claim the single pump for this store: the claim's GENERATION and the token the pump is
+    /// to hold, or `None` when a pump really is running.
     ///
     /// The generation is what makes a release safe: a pump releases its own claim and never a
-    /// later pump's (see [`Self::release_clock_pump`]).
-    fn start_clock_pump(&mut self) -> Option<u64> {
-        if self.clock_pump_running {
+    /// later pump's (see [`Self::release_clock_pump`]). The token is what makes the claim
+    /// RECOVERABLE: a claim whose pump has ended without releasing it is taken over here
+    /// ([`Self::clock_pump_is_running`]), so the publication this store owes is never parked
+    /// behind a pump that no longer exists.
+    fn start_clock_pump(&mut self) -> Option<(u64, ::std::sync::Arc<ClockPumpLife>)> {
+        if self.clock_pump_is_running() {
             return None;
         }
+        let life = ::std::sync::Arc::new(ClockPumpLife);
+        // Recorded under the same guard the claim is taken under, and alive from here: the
+        // caller holds the token until the task it spawns owns it.
+        self.clock_pump_life = Some(::std::sync::Arc::downgrade(&life));
         self.clock_pump_running = true;
         self.clock_pump_generation = self.clock_pump_generation.wrapping_add(1);
-        Some(self.clock_pump_generation)
+        Some((self.clock_pump_generation, life))
+    }
+
+    /// Whether a pump that EXISTS is holding the claim: it was taken, and the token the pump
+    /// holding it owns is still alive.
+    fn clock_pump_is_running(&self) -> bool {
+        self.clock_pump_running
+            && self
+                .clock_pump_life
+                .as_ref()
+                .is_some_and(|life| life.strong_count() > 0)
     }
 
     /// Release the claim `generation` took — and ONLY that one.
@@ -125,18 +166,34 @@ impl ComAmazonawsGlueAwsglueState {
         }
     }
 
-    /// Keep the running pump's task handle, aborting the one it replaces.
+    /// Keep the handle of the pump that took the claim `generation`, so a pump this service
+    /// started stays abortable, and abort the EARLIER pump's handle it replaces.
     ///
-    /// The replaced handle is a pump that has already ended — by standing down, or on its
-    /// wake-up cap — so the abort is normally a no-op; it is what guarantees the invariant
-    /// anyway, that no earlier pump task is still running beside the one that now holds the
-    /// claim.
-    fn set_clock_pump(&mut self, handle: ::tokio::task::JoinHandle<()>) {
-        if let Some(previous) = self.clock_pump.replace(handle) {
-            previous.abort();
+    /// The handle of one pump cannot be stored in the same critical section its claim was taken
+    /// in — it exists only once the task has been spawned — so a handle may arrive after a
+    /// later pump has taken the claim. Such a handle belongs to a pump that has already stood
+    /// down, so it is DROPPED rather than kept, and the handle the store keeps stays the one of
+    /// the pump holding the claim: replacing unconditionally would abort that live pump, which
+    /// would leave the claim held by a task that no longer runs.
+    fn set_clock_pump(&mut self, generation: u64, handle: ::tokio::task::JoinHandle<()>) {
+        if self.clock_pump_generation != generation {
+            return;
+        }
+        // The handle this replaces is an EARLIER pump's — one generation is minted per spawn, and
+        // a handle lands here only while its own claim is still the live one — and that pump has
+        // already stood down, so aborting it is what guarantees no earlier pump task runs beside
+        // the one holding the claim.
+        if let Some((_, earlier)) = self.clock_pump.replace((generation, handle)) {
+            earlier.abort();
         }
     }
 }
+
+/// What a running pump OWNS for as long as its task is alive, so the claim it took can be told
+/// from one no pump is holding any more. See this module's docs; the store keeps a weak
+/// reference to it ([`ComAmazonawsGlueAwsglueState::clock_pump_life`]).
+#[derive(Debug)]
+pub struct ClockPumpLife;
 
 /// Start this store's clock pump, unless one is already running.
 ///
@@ -150,13 +207,16 @@ pub fn drive_clock(
     let Ok(runtime) = ::tokio::runtime::Handle::try_current() else {
         return;
     };
-    let Some(generation) = state.lock().start_clock_pump() else {
+    let Some((generation, life)) = state.lock().start_clock_pump() else {
         return;
     };
     let callback = callback.clone();
     let pumped = ::engine::ServiceState::clone(state);
     let state = ::engine::ServiceState::clone(state);
     let handle = runtime.spawn(async move {
+        // Held for as long as this task runs and dropped whatever ends it, which is what lets
+        // the next door tell this claim from one nobody is holding.
+        let _life = life;
         // `true` only if the wake-up cap below is what ended the loop; a pump that ran out of
         // work has already released its claim inside the one critical section that observed it
         // ([`ComAmazonawsGlueAwsglueState::next_due_or_release_pump`]).
@@ -192,7 +252,7 @@ pub fn drive_clock(
             state.lock().release_clock_pump(generation);
         }
     });
-    // The handle is kept so the pump it replaces is aborted rather than merely forgotten: that
-    // is what guarantees no earlier pump task runs beside the one holding the claim.
-    pumped.lock().set_clock_pump(handle);
+    // The handle is kept so a pump this service started stays abortable rather than detached,
+    // under the claim it was spawned for ([`ComAmazonawsGlueAwsglueState::set_clock_pump`]).
+    pumped.lock().set_clock_pump(generation, handle);
 }

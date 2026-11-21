@@ -70,7 +70,11 @@ raise ValueError("the input partition is malformed")
 /// Amazon S3 is mounted because a run reads its script from it; EventBridge and SQS because
 /// the publication goes onto the account's default bus and a rule on that bus delivers it to
 /// a queue.
-fn emulator_with_a_bus() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+///
+/// Shared with the suite that pins the publication against a claim on the store's clock pump
+/// that no pump is holding any more ([`crate::job_run_event_pump_liveness`]), so both read one
+/// spelling of this mounting.
+pub(crate) fn emulator_with_a_bus() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = crate::wire::emulator_on(Arc::clone(&engine));
     router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
