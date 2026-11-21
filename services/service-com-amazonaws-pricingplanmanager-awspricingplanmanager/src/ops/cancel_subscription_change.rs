@@ -206,13 +206,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // "Cancels a PENDING scheduled change": a subscription carrying none has nothing
-        // to cancel, so the request conflicts with the current state of the resource.
+        // "Cancels a PENDING scheduled change": a subscription carrying none is not in the
+        // state this operation requires, which is the modelled business-rule refusal
+        // (`ValidationException`, HTTP 400, "… the subscription might not be in the required
+        // state for this operation") and not the conflict, which answers a request weighed
+        // against the record's current VERSION or against a change already in flight on it.
         let Some(change) = record.scheduled_change.as_ref() else {
-            return Err(CancelSubscriptionChangeErrorModeled::ConflictException(
-                ConflictException {
-                    message: "the subscription has no scheduled change to cancel".to_string(),
-                    resource_id: arn,
+            return Err(CancelSubscriptionChangeErrorModeled::ValidationException(
+                ValidationException {
+                    message: NO_SCHEDULED_CHANGE_MESSAGE.to_string(),
+                    resource_id: Some(arn),
                 },
             )
             .into());
@@ -226,13 +229,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if effective.secs().saturating_sub(now.secs()) < CHANGE_PROCESSING_WINDOW_SECONDS {
                 let effective_date = crate::state::format_date_time(effective)
                     .unwrap_or_else(|| effective.secs().to_string());
-                return Err(CancelSubscriptionChangeErrorModeled::ConflictException(
-                    ConflictException {
+                return Err(CancelSubscriptionChangeErrorModeled::ValidationException(
+                    ValidationException {
                         message: format!(
-                            "the scheduled change takes effect at {effective_date} and is \
-                             already being processed; it can no longer be cancelled"
+                            "The scheduled change takes effect at {effective_date} and is \
+                             already being processed; it can no longer be cancelled."
                         ),
-                        resource_id: arn,
+                        resource_id: Some(arn),
                     },
                 )
                 .into());
@@ -253,6 +256,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// How this operation states a subscription that carries no change it could cancel.
+///
+/// The whole sentence is fixed text for this error class: it interpolates nothing from the
+/// request or from state, so the subscription the request named travels in `resourceId`
+/// ("the identifier of the resource that failed validation") rather than in the message.
+const NO_SCHEDULED_CHANGE_MESSAGE: &str = "No scheduled updates found for this subscription.";
+
 /// How close to its effective instant a scheduled change is "within the processing
 /// window", and so can no longer be cancelled.
 ///
@@ -260,4 +270,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// emulator's own choice. It is measured against the change's stored `effectiveDate`,
 /// which `UpdateSubscription` and `CancelSubscription` set to the end of the current
 /// billing period.
-const CHANGE_PROCESSING_WINDOW_SECONDS: i64 = 60 * 60;
+///
+/// Published so a test can place a change relative to the window rather than restate the
+/// span the handler applies.
+pub const CHANGE_PROCESSING_WINDOW_SECONDS: i64 = 60 * 60;

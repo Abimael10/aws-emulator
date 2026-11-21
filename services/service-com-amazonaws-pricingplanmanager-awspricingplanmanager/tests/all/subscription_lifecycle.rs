@@ -18,8 +18,9 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_pricingplanmanager_awspricingplanmanager::ops::cancel_subscription_change::CHANGE_PROCESSING_WINDOW_SECONDS;
 use service_com_amazonaws_pricingplanmanager_awspricingplanmanager::state::{
-    format_date_time, parse_date_time,
+    format_date_time, now as state_now, parse_date_time,
     ComAmazonawsPricingplanmanagerAwspricingplanmanagerState as ServiceState, LIST_PAGE_SIZE,
     MAX_SUBSCRIPTIONS, MAX_SUBSCRIPTION_RESOURCES, PLAN_TIERS_ASCENDING,
 };
@@ -1140,20 +1141,13 @@ async fn a_change_whose_due_instant_has_passed_is_applied_before_the_next_answer
             scheduled.body
         );
 
-        // Move the stored due instant into the past: the clock now owes the change.
-        {
-            let state = engine.state::<ServiceState>();
-            let mut store = state.lock();
-            let record = store
-                .subscriptions
-                .get_mut(&arn)
-                .expect("the subscription is stored");
-            let change = record
-                .scheduled_change
-                .as_mut()
-                .expect("the pending change is stored");
-            change.due_at = aws_smithy_types::DateTime::from_secs(1_600_000_000);
-        }
+        // Move the stored instants of the change into the past: the clock now owes it.
+        move_change_instants(
+            &engine,
+            &arn,
+            aws_smithy_types::DateTime::from_secs(1_600_000_000),
+            case.operation,
+        );
 
         let fetched = call(&router, "GetSubscription", json!({"arn": arn.clone()}), None).await;
         match case.settled_tier {
@@ -2061,7 +2055,7 @@ async fn adding_a_resource_the_subscription_already_covers_is_refused() {
 /// modelled outcome rather than the scaffold's 501: an association and a disassociation of
 /// a resource no plan family requires are served 200 and land on the stored set, and a
 /// `CancelSubscriptionChange` against a subscription carrying no change is the modelled
-/// conflict.
+/// business-rule refusal.
 ///
 /// Each row runs on its OWN subject with that subject's current tag, so no row's answer
 /// depends on what the row before it left behind.
@@ -2104,8 +2098,8 @@ async fn the_resource_and_change_operations_are_served() {
         Case {
             operation: "CancelSubscriptionChange",
             resources: None,
-            status: 409,
-            code: Some("ConflictException"),
+            status: 400,
+            code: Some("ValidationException"),
             held: with_zone.clone(),
             included: with_zone.clone(),
         },
@@ -2989,13 +2983,13 @@ async fn a_pending_change_is_cancelled_and_the_subscription_is_as_it_was() {
         )
         .await;
         assert_eq!(
-            nothing.status, 409,
-            "case {label}: a subscription with no pending change must answer 409, got {} {:?}",
+            nothing.status, 400,
+            "case {label}: a subscription with no pending change must answer 400, got {} {:?}",
             nothing.status, nothing.body
         );
         assert_eq!(
             nothing.error_code.as_deref(),
-            Some("ConflictException"),
+            Some("ValidationException"),
             "case {label}: unexpected error code for {:?}",
             nothing.body
         );
@@ -3010,20 +3004,12 @@ async fn a_pending_change_is_cancelled_and_the_subscription_is_as_it_was() {
 
         // Well clear of the processing window, so the change is still the caller's to
         // cancel. The instant is written rather than waited for.
-        {
-            let state = engine.state::<ServiceState>();
-            let mut store = state.lock();
-            let record = store
-                .subscriptions
-                .get_mut(&arn)
-                .expect("the subscription is stored");
-            let change = record
-                .scheduled_change
-                .as_mut()
-                .expect("the pending change is stored");
-            change.due_at = parse_date_time("2099-01-01T00:00:00Z")
-                .expect("the instant is a representable date-time");
-        }
+        move_change_instants(
+            &engine,
+            &arn,
+            parse_date_time("2099-01-01T00:00:00Z").expect("the instant is a representable date-time"),
+            label,
+        );
 
         let cancelled = call(
             &router,
@@ -3060,4 +3046,244 @@ async fn a_pending_change_is_cancelled_and_the_subscription_is_as_it_was() {
             "case {label}: dropping the change is a write, so the ETag moves"
         );
     }
+}
+
+/// A `CancelSubscriptionChange` the stored subscription has no cancellable change for is
+/// refused as a business-rule validation failure — HTTP 400 `ValidationException`, the
+/// error whose modelled meaning is that "the subscription might not be in the required
+/// state for this operation" — and never as the HTTP 409 conflict, which answers a request
+/// weighed against the record's current revision or against a change already in flight on
+/// it. The refusal is inert: the record and its entity tag are exactly what they were.
+///
+/// The rows differ along the subject (tier, resource count, approval mode and so status)
+/// and along WHY it has no change this call can cancel: three were never given one, one
+/// had its pending change dropped by an earlier cancel, and one carries a change already
+/// inside the processing window. The no-change rows carry one fixed sentence that
+/// interpolates nothing; the window row names the change's effective instant, which is
+/// WRITTEN into the store the handler reads, so no row depends on when the suite runs.
+#[tokio::test]
+async fn a_cancel_with_no_cancellable_change_is_a_validation_failure() {
+    /// What the subject carries by the time the asserted call is made.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Subject {
+        /// Never given a scheduled change.
+        Untouched,
+        /// Given a pending downgrade that an earlier cancel already dropped.
+        ChangeAlreadyCancelled,
+        /// Carrying a pending cancellation whose effective instant is inside the
+        /// processing window, so it is no longer the caller's to cancel.
+        ChangeInProcessingWindow,
+    }
+
+    struct Case {
+        tier: &'static str,
+        resources: usize,
+        approval: Option<&'static str>,
+        subject: Subject,
+    }
+
+    /// What the refusal's message has to be for a row.
+    enum Expected {
+        /// AWS's fixed sentence for the class, asserted in full.
+        Fixed(&'static str),
+        /// A sentence of the emulator's own, for a class AWS publishes no wording for:
+        /// what is required of it is that it names the instant held in the store, so only
+        /// that is asserted.
+        NamesInstant(String),
+    }
+
+    let cases = [
+        Case {
+            tier: "FREE",
+            resources: 1,
+            approval: None,
+            subject: Subject::Untouched,
+        },
+        Case {
+            tier: "PREMIUM",
+            resources: 3,
+            approval: Some("IMMEDIATE"),
+            subject: Subject::Untouched,
+        },
+        Case {
+            tier: "BUSINESS",
+            resources: 2,
+            approval: Some("MANUAL"),
+            subject: Subject::Untouched,
+        },
+        Case {
+            tier: "PREMIUM",
+            resources: 2,
+            approval: Some("IMMEDIATE"),
+            subject: Subject::ChangeAlreadyCancelled,
+        },
+        Case {
+            tier: "BUSINESS",
+            resources: 1,
+            approval: Some("IMMEDIATE"),
+            subject: Subject::ChangeInProcessingWindow,
+        },
+    ];
+
+    for case in &cases {
+        let label = format!(
+            "{}/{} resources/{:?}/{:?}",
+            case.tier, case.resources, case.approval, case.subject
+        );
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let router = router_on(Arc::clone(&engine));
+        let created = create(
+            &router,
+            create_body("CloudFront", case.tier, case.resources, case.approval),
+        )
+        .await;
+        let arn = created.string("arn");
+        let mut etag = created.require_etag(&label);
+
+        // Bring the subject into the state its row describes, and with it what the
+        // refusal's message has to be.
+        let expected_message = match case.subject {
+            Subject::Untouched => Expected::Fixed(NO_CANCELLABLE_CHANGE),
+            Subject::ChangeAlreadyCancelled => {
+                let scheduled = call(
+                    &router,
+                    "UpdateSubscription",
+                    json!({"arn": arn.clone(), "planTier": "FREE"}),
+                    Some(&etag),
+                )
+                .await;
+                assert_eq!(
+                    scheduled.status, 200,
+                    "case {label}: the downgrade must be scheduled, got {} {:?}",
+                    scheduled.status, scheduled.body
+                );
+                // Well clear of the processing window, so the first cancel is admitted.
+                move_change_instants(
+                    &engine,
+                    &arn,
+                    aws_smithy_types::DateTime::from_secs(
+                        state_now().secs() + 10 * CHANGE_PROCESSING_WINDOW_SECONDS,
+                    ),
+                    &label,
+                );
+                let cancelled = call(
+                    &router,
+                    "CancelSubscriptionChange",
+                    json!({"arn": arn.clone()}),
+                    Some(&scheduled.require_etag(&label)),
+                )
+                .await;
+                assert_eq!(
+                    cancelled.status, 200,
+                    "case {label}: the pending change must be cancellable, got {} {:?}",
+                    cancelled.status, cancelled.body
+                );
+                etag = cancelled.require_etag(&label);
+                Expected::Fixed(NO_CANCELLABLE_CHANGE)
+            }
+            Subject::ChangeInProcessingWindow => {
+                let scheduled =
+                    call(&router, "CancelSubscription", json!({"arn": arn.clone()}), Some(&etag))
+                        .await;
+                assert_eq!(
+                    scheduled.status, 200,
+                    "case {label}: the cancellation must be scheduled, got {} {:?}",
+                    scheduled.status, scheduled.body
+                );
+                etag = scheduled.require_etag(&label);
+                let effective = aws_smithy_types::DateTime::from_secs(
+                    state_now().secs() + CHANGE_PROCESSING_WINDOW_SECONDS / 2,
+                );
+                Expected::NamesInstant(move_change_instants(&engine, &arn, effective, &label))
+            }
+        };
+
+        let before = call(&router, "GetSubscription", json!({"arn": arn.clone()}), None).await;
+
+        let refused = call(
+            &router,
+            "CancelSubscriptionChange",
+            json!({"arn": arn.clone()}),
+            Some(&etag),
+        )
+        .await;
+        assert_eq!(
+            refused.status, 400,
+            "case {label}: expected HTTP 400, got {} {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_code.as_deref(),
+            Some("ValidationException"),
+            "case {label}: expected ValidationException, got {:?}",
+            refused.body
+        );
+        let message = refused.message(&label);
+        match &expected_message {
+            Expected::Fixed(sentence) => assert_eq!(
+                message, *sentence,
+                "case {label}: unexpected message for {:?}",
+                refused.body
+            ),
+            Expected::NamesInstant(instant) => assert!(
+                message.contains(instant.as_str()),
+                "case {label}: expected the refusal to name the stored effective instant \
+                 {instant:?}, got {message:?}"
+            ),
+        }
+        assert_eq!(
+            refused.opt_string("resourceId"),
+            Some(arn.clone()),
+            "case {label}: the refusal must name the subscription, got {:?}",
+            refused.body
+        );
+
+        // Inert: a refused cancel is not a write, so the record and its tag stand.
+        let after = call(&router, "GetSubscription", json!({"arn": arn.clone()}), None).await;
+        assert_eq!(
+            after.body, before.body,
+            "case {label}: a refused cancel must change nothing, got {:?}",
+            after.body
+        );
+        assert_eq!(
+            after.require_etag(&label),
+            etag,
+            "case {label}: a refused cancel must not move the ETag"
+        );
+    }
+}
+
+/// AWS's fixed sentence for a `CancelSubscriptionChange` against a subscription that
+/// carries no scheduled change: the whole string is the requirement, with no part of it
+/// taken from the request or from state.
+const NO_CANCELLABLE_CHANGE: &str = "No scheduled updates found for this subscription.";
+
+/// Move both instants of the change pending on `arn` to `instant`, and report how the wire
+/// renders it.
+///
+/// A stored change carries two: the `effectiveDate` a caller reads, which is what decides
+/// whether the change is still the caller's to cancel, and the instant this store APPLIES
+/// it at. A row places a change relative to one of them and must not be surprised by the
+/// other, so both are written to the one instant — and WRITTEN rather than waited for, so
+/// no row costs wall-clock time or depends on how fast the host runs.
+fn move_change_instants(
+    engine: &Arc<engine::InMemoryEngine>,
+    arn: &str,
+    instant: aws_smithy_types::DateTime,
+    case: &str,
+) -> String {
+    let state = engine.state::<ServiceState>();
+    let mut store = state.lock();
+    let record = store
+        .subscriptions
+        .get_mut(arn)
+        .unwrap_or_else(|| panic!("case {case}: the subscription is stored"));
+    let change = record
+        .scheduled_change
+        .as_mut()
+        .unwrap_or_else(|| panic!("case {case}: the pending change is stored"));
+    change.effective_date = Some(instant);
+    change.due_at = instant;
+    format_date_time(instant)
+        .unwrap_or_else(|| panic!("case {case}: the effective instant renders on the wire"))
 }

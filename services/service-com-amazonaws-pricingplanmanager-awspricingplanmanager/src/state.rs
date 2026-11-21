@@ -455,10 +455,11 @@ pub fn scheduled_change_pending(arn: &str) -> ConflictException {
 /// current one.
 ///
 /// An entity tag the service has not issued is an input the caller must correct — it
-/// re-reads the resource to learn the current tag — rather than a conflict with the
-/// resource's state, so this is the modelled `ValidationException` (HTTP 400) and not
-/// `ConflictException`, which is reserved for a request the record's own state refuses.
-/// The rejected tag is echoed so a client or a log names the value that was refused.
+/// re-reads the resource to learn the current tag — so this is the modelled
+/// `ValidationException` (HTTP 400), which is the class AWS was recorded answering a
+/// subscription mutation that carried a tag it had not issued; the model's
+/// `ConflictException` text names the `If-Match` case, so the recording is what decides it
+/// here. The rejected tag is echoed so a client or a log names the value that was refused.
 pub fn stale_etag(if_match: &str) -> ValidationException {
     ValidationException {
         message: format!(

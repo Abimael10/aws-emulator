@@ -1020,8 +1020,11 @@ async fn an_association_needs_an_active_subscription_with_nothing_pending() {
 // ---------------------------------------------------------------------------
 
 /// `CancelSubscriptionChange` drops the pending change and the subscription returns to the
-/// state it was in before it was scheduled; a subscription carrying no change has nothing
-/// to cancel, and a change already inside the processing window can no longer be cancelled.
+/// state it was in before it was scheduled; a subscription that carries no change this call
+/// can cancel — none scheduled at all, or one already inside the processing window — is
+/// refused as a business-rule validation failure (HTTP 400 `ValidationException`, "the
+/// subscription might not be in the required state for this operation") rather than as the
+/// conflict, which the model reserves for a request weighed against the record's revision.
 ///
 /// The rows differ along which change is pending (a downgrade, a cancellation) and how far
 /// off its effective instant is. The instant a row depends on is WRITTEN into the store the
@@ -1069,13 +1072,13 @@ async fn a_pending_change_is_cancelled_outside_the_processing_window() {
         )
         .await;
         assert_eq!(
-            nothing.status, 409,
-            "case {label:?}: a subscription with no pending change must answer 409, got {} {:?}",
+            nothing.status, 400,
+            "case {label:?}: a subscription with no pending change must answer 400, got {} {:?}",
             nothing.status, nothing.body
         );
         assert_eq!(
             nothing.error_code.as_deref(),
-            Some("ConflictException"),
+            Some("ValidationException"),
             "case {label:?}: unexpected error code for {:?}",
             nothing.body
         );
@@ -1109,9 +1112,15 @@ async fn a_pending_change_is_cancelled_outside_the_processing_window() {
         )
         .await;
         assert_eq!(
-            too_late.status, 409,
-            "case {label:?}: a change inside the processing window must answer 409, got {} {:?}",
+            too_late.status, 400,
+            "case {label:?}: a change inside the processing window must answer 400, got {} {:?}",
             too_late.status, too_late.body
+        );
+        assert_eq!(
+            too_late.error_code.as_deref(),
+            Some("ValidationException"),
+            "case {label:?}: unexpected error code for {:?}",
+            too_late.body
         );
         assert!(
             call(&router, "GetSubscription", json!({"arn": arn.clone()}), None)
