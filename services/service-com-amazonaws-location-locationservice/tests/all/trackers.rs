@@ -1099,12 +1099,11 @@ async fn a_devices_stored_history_is_bounded_and_keeps_the_newest_samples() {
 #[tokio::test]
 async fn a_second_sample_for_the_same_instant_replaces_the_first() {
     let (router, engine) = emulator_with_engine();
-    assert_eq!(
-        create_tracker(&router, json!({ "TrackerName": "fleet" }))
-            .await
-            .status,
-        200
-    );
+    // The samples below sit one second apart at positions a continent apart, so the
+    // mode that admits every one of them is the distance-filtering one: what this
+    // case is about is the (DeviceId, SampleTime) key, not the filter.
+    let created = json!({ "TrackerName": "fleet", "PositionFiltering": "DistanceBased" });
+    assert_eq!(create_tracker(&router, created.clone()).await.status, 200);
 
     // A sample is keyed by (DeviceId, SampleTime): re-reporting one instant
     // corrects it rather than adding a second sample for the same instant. Rows
@@ -1158,12 +1157,7 @@ async fn a_second_sample_for_the_same_instant_replaces_the_first() {
         );
 
         assert_eq!(delete_tracker(&router, "fleet").await.status, 200);
-        assert_eq!(
-            create_tracker(&router, json!({ "TrackerName": "fleet" }))
-                .await
-                .status,
-            200
-        );
+        assert_eq!(create_tracker(&router, created.clone()).await.status, 200);
     }
 }
 

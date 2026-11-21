@@ -8,11 +8,12 @@
 //! is reported per-entry in `Errors`; an unknown tracker is a
 //! `ResourceNotFoundException`.
 //!
-//! NOT enforced here, and scoped to its own gap issue: the tracker's
-//! `PositionFiltering` mode (`TimeBased` 30 s / `DistanceBased` 30 m /
-//! `AccuracyBased`) is stored and reported by `DescribeTracker` but is not applied
-//! to writes, so every in-domain update is stored where the real service would
-//! drop some of them.
+//! The named tracker's `PositionFiltering` mode (`TimeBased` 30 s /
+//! `DistanceBased` 30 m / `AccuracyBased` the summed measured accuracy) decides
+//! whether an accepted update is stored at all:
+//! [`crate::state::Tracker::record_filtered_position`] applies it. A filtered
+//! update is dropped silently — it is NOT reported in `Errors`, and the device's
+//! last known position stays at the sample stored before it.
 //!
 //! ## Shape of an operation
 //!
@@ -254,10 +255,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         for sample in accepted {
-            // `record_position` applies the retention window and the per-device
-            // and per-tracker bounds, so the stored history cannot grow without
-            // limit however many updates arrive.
-            tracker.record_position(sample);
+            // The tracker's `PositionFiltering` mode decides whether the update is
+            // stored at all; one it filters out is dropped silently, which is why
+            // the answer is not consulted here: a filtered entry is not a failed
+            // one and carries no `Errors` entry. For a stored sample,
+            // `record_filtered_position` also applies the retention window and the
+            // per-device and per-tracker bounds, so the stored history cannot grow
+            // without limit however many updates arrive.
+            tracker.record_filtered_position(sample);
         }
 
         // `UpdateTime` tracks when the tracker RESOURCE was last updated (the

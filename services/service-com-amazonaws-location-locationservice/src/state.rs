@@ -48,6 +48,16 @@ pub use tracker_consumers::{
     TRACKER_CONSUMERS_CURSOR,
 };
 
+/// Whether an update a tracker receives is stored at all, as the tracker's
+/// `PositionFiltering` mode decides, kept beside this module because the mode is a
+/// property of the tracker record and every write into a device's history is
+/// filtered by it.
+mod position_filtering;
+pub use position_filtering::{
+    DEFAULT_HORIZONTAL_ACCURACY_METRES, DISTANCE_FILTER_METRES, POSITION_FILTERING_ACCURACY_BASED,
+    POSITION_FILTERING_DISTANCE_BASED, POSITION_FILTERING_TIME_BASED, TIME_FILTER_MILLIS,
+};
+
 /// The sentence a value outside a member's documented set is refused with, kept
 /// beside this module because every such check in the crate words it the same way.
 mod value_sets;

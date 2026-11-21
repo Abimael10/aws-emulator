@@ -19,6 +19,11 @@
 //! either end), the number of samples a window selects (none, one, several, all), the
 //! page size (every divisor and non-divisor of the sample count, and the absent
 //! member), and the form of a malformed cursor.
+//!
+//! What a tracker STORES is decided by its `PositionFiltering` mode
+//! (`tests/all/position_filtering.rs` is the suite about that rule), so every case here
+//! names the mode that admits the samples it seeds and then asserts what the read
+//! reports of what the tracker holds.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -49,12 +54,19 @@ const SAMPLES: [&str; 5] = [
     "2024-03-01T12:00:40Z",
 ];
 
-async fn create_tracker(router: &MultiServiceRouter, name: &str) {
+/// Create `name` with the `PositionFiltering` mode a case needs.
+///
+/// The mode decides which updates the tracker STORES, so a case about what a stored
+/// history reports names the mode whose predicate admits every sample it seeds: a
+/// `DistanceBased` tracker for the cases whose samples sit kilometres apart but seconds
+/// apart in time, and `TimeBased` for the cases whose samples repeat one position hours
+/// apart.
+async fn create_tracker(router: &MultiServiceRouter, name: &str, position_filtering: &str) {
     let answer = call(
         router,
         "POST",
         "/tracking/v0/trackers",
-        Some(json!({ "TrackerName": name })),
+        Some(json!({ "TrackerName": name, "PositionFiltering": position_filtering })),
     )
     .await;
     assert_eq!(
@@ -123,9 +135,13 @@ fn iso_of_millis(millis: i64) -> String {
 ///
 /// The updates are sent newest-first and in two batches, so the ascending order a
 /// read reports is the one the store keeps rather than the order of arrival.
+///
+/// The tracker filters by DISTANCE and the seeded positions are a hundredth of a degree
+/// of longitude apart (hundreds of metres), so every sample is stored however close
+/// together in time the instants sit.
 async fn emulator_with_samples() -> MultiServiceRouter {
     let router = emulator();
-    create_tracker(&router, TRACKER).await;
+    create_tracker(&router, TRACKER, "DistanceBased").await;
     let update = |iso: &str, longitude: f64| {
         json!({
             "DeviceId": DEVICE,
@@ -270,7 +286,9 @@ async fn a_window_selects_the_half_open_sample_time_range() {
 #[tokio::test]
 async fn the_default_window_is_the_twenty_four_hours_before_the_request() {
     let router = emulator();
-    create_tracker(&router, TRACKER).await;
+    // The seeded samples repeat ONE position hours apart, so the mode that admits
+    // every one of them is the time-based default.
+    create_tracker(&router, TRACKER, "TimeBased").await;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -708,7 +726,9 @@ async fn an_unknown_tracker_is_not_found_and_a_sampleless_device_is_empty() {
 #[tokio::test]
 async fn one_sample_per_instant_survives_pagination() {
     let router = emulator();
-    create_tracker(&router, TRACKER).await;
+    // The positions below sit hundreds of metres apart, so a distance-filtering
+    // tracker stores each of them and the instants are what this case is about.
+    create_tracker(&router, TRACKER, "DistanceBased").await;
 
     let instant = "2024-03-01T12:00:00Z";
     // Two updates at the SAME instant in one batch, then a third at that instant in a
@@ -796,7 +816,7 @@ async fn one_sample_per_instant_survives_pagination() {
 #[tokio::test]
 async fn a_reported_sample_carries_every_stored_member() {
     let router = emulator();
-    create_tracker(&router, TRACKER).await;
+    create_tracker(&router, TRACKER, "TimeBased").await;
 
     let sample_time = "2024-03-01T12:00:00Z";
     let seeded = batch_update(
