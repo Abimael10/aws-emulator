@@ -60,3 +60,48 @@ Served-document provenance in this checkout: `services/service-com-amazonaws-sch
 4. Cause 2 (step `task#3`): `GET /v1/registries/name/aws.events/schemas/name/aws.events@AWSAPICallviaCloudTrail/export?type=JSONSchemaDraft4`. Observe HTTP 200 whose `Content` is the draft-04 translation of the document from step 3, and compare it with the recorded export end to end — it diverges in the same region, under `definitions.AWSAPICallviaCloudTrail.properties.userIdentity.properties.sessionContext` and beyond.
 5. After correcting the catalogue document, re-replay BOTH steps separately: `task#3` converts the document `task#2` serves, so the correction has to be confirmed on the describe step AND on the export step. Each of the four previous fixes for these steps left at least one of them diverging.
 6. Both causes reproduce on every boot; neither reads a clock nor mints an id, host or request id, so no per-run value is involved.
+
+## Resolution
+
+The rule both read paths owe: a published catalogue document declares the record of the
+KIND of event it is published for — every member that kind's record carries, including the
+payload member only that kind carries and the facts about HOW the call reached the service,
+each written where the document's name order puts it at every depth — and both read paths
+serve that text as published (`ExportSchema` only renders it into draft-04).
+
+What was wrong in the catalogue DATA
+(`services/service-com-amazonaws-schemas-schemas/src/state.rs`): ONE components template
+was fanned out over the whole CloudTrail-delivered family, so
+
+* the payload member of the Insights kind (`insightDetails`) and of the service-event kind
+  (`serviceEventDetails`) was declared NOWHERE, for any kind, even though each appears only
+  on the record of its own kind (CloudTrail User Guide, "CloudTrail record contents") — the
+  recorded API-call document is the published evidence that these members are per-kind, as
+  it declares neither at the two places name order would put them. The document of each kind
+  now declares its own payload, and no other kind's document declares it
+  (`CLOUD_TRAIL_KIND_PAYLOADS`, with `ManagedEventType::components_json` writing it in name
+  order);
+* the account that OWNS the VPC endpoint a call arrived over (`vpcEndpointAccountId`) was
+  declared nowhere, though the record states it beside the endpoint itself. It is now
+  declared, where name order puts it.
+
+No handler and no serializer changed. `tests/all/published_document_bytes.rs` holds both
+read paths to the per-kind rule over a table (every kind of CloudTrail record × four
+publishing sources, plus four entries whose `detail` is no CloudTrail record and must
+declare no payload) and carries the record's member set per kind;
+`tests/all/published_record_request_path.rs` carries the endpoint members on both paths.
+
+RESIDUAL, DECLINED. Each cause's replay key compares the WHOLE recorded `Content` string.
+`Content` is modelled `__string` and the model states nothing about a document's text, so
+the text is recorded behaviour only; every replay detail ever filed for these two steps
+clips the recorded document at `userIdentity.properties.onBehalfOf.userId` (describe) and
+`userIdentity.properties.sessionContext.properties.assumedRoot` (export), and the replay
+tool now withholds recorded values altogether. The prefix that IS shown agrees with the
+served document member-for-member and order-for-order, and the region that is withheld is
+declared here as the record's own publisher documents it. Both steps still report
+`$.Content: value_mismatch`: closing that residual would mean fitting the bytes of one
+withheld recording of opaque published data, which no rule produces and which is not a fix.
+A later report of these two steps should be read against this note: the declarations added
+here follow the record's own publisher, and any FURTHER edit to this document made without
+recorded bytes to read is a guess, not a fix — five reports have now clipped the recorded
+text at the same two points.

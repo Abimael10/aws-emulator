@@ -33,15 +33,20 @@ use crate::registry_schema_lifecycle::{
     OPENAPI_ONLY_KEYWORDS,
 };
 
-/// The members the published document declares for a CloudTrail record, in the order it
-/// writes them.
+/// The members the published document declares for a CloudTrail record whichever KIND of
+/// record it is, in the order it writes them. A kind that carries a payload of its own
+/// declares that member too — see [`KIND_PAYLOAD_MEMBERS`] and
+/// [`published_record_members`].
 ///
 /// Source: the document AWS publishes for a CloudTrail-delivered event, as a recorded
-/// `DescribeSchema` of `aws.events@AWSAPICallviaCloudTrail` serves it — the Smithy model
-/// states nothing about a document's text, so the published document is the reference.
-/// The `detail` of every member of [`CLOUD_TRAIL_EVENT_FAMILY`] is the same record
-/// whichever source published it, so the rows below hold sources the issue did not cite
-/// to the same set.
+/// `DescribeSchema` of `aws.events@AWSAPICallviaCloudTrail` serves it as far as the replay
+/// detail shows it (`addendum` through `userIdentity`) — the Smithy model states nothing
+/// about a document's text, so the published document is the reference — and the record's
+/// own documentation (CloudTrail User Guide, "CloudTrail record contents") for the members
+/// the recorded detail clips: the endpoint a call arrived over and that endpoint's owning
+/// account, which name order puts last. The `detail` of every member of
+/// [`CLOUD_TRAIL_EVENT_FAMILY`] is the same record whichever source published it, so the
+/// rows below hold sources the issue did not cite to the same set.
 const PUBLISHED_RECORD_MEMBERS: &[&str] = &[
     "addendum",
     "additionalEventData",
@@ -72,8 +77,78 @@ const PUBLISHED_RECORD_MEMBERS: &[&str] = &[
     "tlsDetails",
     "userAgent",
     "userIdentity",
+    "vpcEndpointAccountId",
     "vpcEndpointId",
 ];
+
+/// The payload member only ONE KIND of CloudTrail record carries, by the event name the
+/// catalogue publishes that kind under, with the two members of
+/// [`PUBLISHED_RECORD_MEMBERS`] the published document writes it BETWEEN.
+///
+/// Source: the CloudTrail record (CloudTrail User Guide, "CloudTrail record contents") —
+/// the Insights detail appears only on an Insights event and the service-event detail only
+/// on an AWS service event, so the document published for that kind declares that member
+/// and the document of no other kind does. The recorded document of the API-call entry
+/// declares neither, which is the published evidence that these members are per-kind: it
+/// writes `eventVersion` straight on to `managementEvent` and `responseElements` straight
+/// on to `sessionCredentialFromConsole`, the two places each payload falls between.
+///
+/// The neighbours are written out rather than computed, so a case checks the position
+/// against this data and not against the ordering the implementation applies.
+const KIND_PAYLOAD_MEMBERS: &[(&str, &str, &str, &str)] = &[
+    (
+        "AWSInsightviaCloudTrail",
+        "insightDetails",
+        "eventVersion",
+        "managementEvent",
+    ),
+    (
+        "AWSServiceEventviaCloudTrail",
+        "serviceEventDetails",
+        "responseElements",
+        "sessionCredentialFromConsole",
+    ),
+];
+
+/// The payload member the CloudTrail kind published as `event_name` carries, per
+/// [`KIND_PAYLOAD_MEMBERS`].
+fn kind_payload(event_name: &str) -> Option<&'static str> {
+    KIND_PAYLOAD_MEMBERS
+        .iter()
+        .find(|(kind, ..)| *kind == event_name)
+        .map(|(_, payload, ..)| *payload)
+}
+
+/// The members the published document of the CloudTrail kind `event_name` declares, in the
+/// order it writes them: the record's common members ([`PUBLISHED_RECORD_MEMBERS`]) with
+/// that kind's own payload member between the two members
+/// [`KIND_PAYLOAD_MEMBERS`] names it between.
+fn published_record_members(event_name: &str) -> Vec<String> {
+    let mut declared: Vec<String> = PUBLISHED_RECORD_MEMBERS
+        .iter()
+        .map(|member| (*member).to_string())
+        .collect();
+    let Some((_, payload, follows, precedes)) = KIND_PAYLOAD_MEMBERS
+        .iter()
+        .find(|(kind, ..)| *kind == event_name)
+    else {
+        return declared;
+    };
+    let after = declared
+        .iter()
+        .position(|member| member == follows)
+        .unwrap_or_else(|| {
+            panic!("case {event_name:?}: the record declares {follows:?}, got {declared:?}")
+        });
+    assert_eq!(
+        declared.get(after + 1).map(String::as_str),
+        Some(*precedes),
+        "case {event_name:?}: the published record writes {follows:?} on to {precedes:?}, \
+         got {declared:?}"
+    );
+    declared.insert(after + 1, (*payload).to_string());
+    declared
+}
 
 /// The record members the published document marks `nullable`: its four free-form
 /// members, whose contents are the called API's rather than CloudTrail's, which OpenAPI
@@ -358,7 +433,8 @@ async fn a_cloud_trail_document_describes_the_published_record() {
                 .map(member_names)
                 .unwrap_or_else(|| panic!("case {name:?}: the record declares properties"));
             assert_eq!(
-                declared, PUBLISHED_RECORD_MEMBERS,
+                declared,
+                published_record_members(event_name),
                 "case {name:?}: the published record member set, got {declared:?}"
             );
 
@@ -901,6 +977,179 @@ async fn a_cloud_trail_document_declares_the_session_a_credential_belongs_to() {
                     "case {name:?}: the export carries sessionContext.{structure}'s members, \
                      got {:?}",
                     member_names(nested)
+                );
+            }
+        }
+    }
+}
+
+/// RULE: a published catalogue document declares the record of the KIND of event it is
+/// published for — the record's common members PLUS the payload member only that kind's
+/// record carries, and no other kind's payload — on both read paths. A client that
+/// generates a binding or validates a delivered Insights or service event therefore reads
+/// the payload its own record carries, and a client reading another kind's document is
+/// never told to expect a member that kind never carries.
+#[tokio::test]
+async fn a_cloud_trail_document_declares_the_payload_of_its_own_kind_of_record() {
+    let emulator = Emulator::new();
+
+    // Rows: every KIND of CloudTrail record the family publishes — the two kinds whose
+    // record carries a payload of its own and the four that carry none — published by the
+    // source the issue cited and three it did not.
+    let sources = ["aws.events", "aws.sqs", "aws.kms", "aws.s3"];
+    let payloads: Vec<&str> = KIND_PAYLOAD_MEMBERS
+        .iter()
+        .map(|(_, payload, ..)| *payload)
+        .collect();
+    assert!(
+        payloads.len() > 1 && payloads.len() < CLOUD_TRAIL_EVENT_FAMILY.len(),
+        "the rows must span kinds that carry a payload and kinds that do not, \
+         got {payloads:?} over {} kinds",
+        CLOUD_TRAIL_EVENT_FAMILY.len()
+    );
+
+    for source in sources {
+        for (_, event_name) in CLOUD_TRAIL_EVENT_FAMILY {
+            let name = format!("{source}@{event_name}");
+            let own = kind_payload(event_name);
+
+            let described = emulator
+                .call("GET", &schema_uri(AWS_MANAGED_REGISTRY, &name), None)
+                .await;
+            assert_eq!(
+                described.status, 200,
+                "case {name:?}: expected 200, got {} {:?}",
+                described.status, described.body
+            );
+            let content = described.str_at("Content");
+            let document = ordered_document(&name, &content);
+            let record = at(
+                &name,
+                &document,
+                &["components", "schemas", event_name, "properties"],
+            );
+            let declared = member_names(record);
+            assert_eq!(
+                declared,
+                published_record_members(event_name),
+                "case {name:?}: the record this kind of event carries, got {declared:?}"
+            );
+
+            // Each kind's payload is declared by that kind's document and by no other.
+            for payload in &payloads {
+                let carried = Some(*payload) == own;
+                assert_eq!(
+                    declared.iter().any(|member| member == payload),
+                    carried,
+                    "case {name:?}: {payload} is {}declared for this kind, got {declared:?}",
+                    if carried { "" } else { "not " }
+                );
+                if !carried {
+                    assert!(
+                        !content.contains(payload),
+                        "case {name:?}: the document names {payload} nowhere, got {content}"
+                    );
+                }
+            }
+
+            if let Some(payload) = own {
+                // A payload's own members are the reported event's rather than
+                // CloudTrail's, so the document constrains it to be an object and no
+                // further, and states nothing about it arriving null.
+                let node = at(&name, record, &[payload]);
+                assert_eq!(
+                    member_names(node),
+                    vec!["type"],
+                    "case {name:?}: {payload} is constrained by its type alone, got {node:?}"
+                );
+                assert_eq!(
+                    node.member("type"),
+                    Some(&JsonNode::text("object")),
+                    "case {name:?}: {payload} is declared an object, got {node:?}"
+                );
+            }
+
+            // The export path renders the same declarations, in its own name order.
+            let exported = emulator
+                .call(
+                    "GET",
+                    &export_uri(AWS_MANAGED_REGISTRY, &name, "JSONSchemaDraft4"),
+                    None,
+                )
+                .await;
+            assert_eq!(
+                exported.status, 200,
+                "case {name:?}: expected 200 from the export, got {} {:?}",
+                exported.status, exported.body
+            );
+            let export_content = exported.str_at("Content");
+            let converted = ordered_document(&name, &export_content);
+            let exported_record = at(
+                &name,
+                &converted,
+                &["definitions", event_name, "properties"],
+            );
+            let exported_members = member_names(exported_record);
+            // The export renders draft-04's vocabulary, so a declaration spelled like one
+            // of OpenAPI 3.0's own keywords does not travel into it — which the published
+            // draft-04 rendering of a CloudTrail record shows, carrying no `readOnly`.
+            let published = published_record_members(event_name);
+            let published_refs: Vec<&str> = published
+                .iter()
+                .map(String::as_str)
+                .filter(|member| !OPENAPI_ONLY_KEYWORDS.contains(member))
+                .collect();
+            assert_eq!(
+                exported_members,
+                in_name_order(&published_refs),
+                "case {name:?}: the export carries this kind's record, got {exported_members:?}"
+            );
+            if let Some(payload) = own {
+                let node = at(&name, exported_record, &[payload]);
+                assert_eq!(
+                    node.member("type"),
+                    Some(&JsonNode::text("object")),
+                    "case {name:?}: the export declares {payload} an object, got {node:?}"
+                );
+            }
+        }
+    }
+}
+
+/// RULE (the negative side): a payload member belongs to one KIND of CloudTrail record, so
+/// a catalogue entry whose `detail` is a service's OWN event declares none of them, on
+/// either read path.
+#[tokio::test]
+async fn an_event_that_is_no_cloud_trail_record_declares_no_kind_payload() {
+    let emulator = Emulator::new();
+
+    // Rows: entries whose `detail` is not a CloudTrail record at all — a state change, an
+    // object notification, a health event and a schedule.
+    let entries = [
+        "aws.ec2@EC2InstanceStateChangeNotification",
+        "aws.s3@ObjectCreated",
+        "aws.health@AWSHealthEvent",
+        "aws.events@ScheduledEvent",
+    ];
+    for name in entries {
+        for (method, uri) in [
+            ("GET", schema_uri(AWS_MANAGED_REGISTRY, name)),
+            (
+                "GET",
+                export_uri(AWS_MANAGED_REGISTRY, name, "JSONSchemaDraft4"),
+            ),
+        ] {
+            let answer = emulator.call(method, &uri, None).await;
+            assert_eq!(
+                answer.status, 200,
+                "case {name:?} {uri}: expected 200, got {} {:?}",
+                answer.status, answer.body
+            );
+            let content = answer.str_at("Content");
+            for (_, payload, ..) in KIND_PAYLOAD_MEMBERS {
+                assert!(
+                    !content.contains(payload),
+                    "case {name:?} {uri}: {payload} is a CloudTrail record member, got {content}"
                 );
             }
         }

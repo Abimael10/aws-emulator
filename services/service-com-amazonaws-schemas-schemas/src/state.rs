@@ -2260,8 +2260,10 @@ pub const CLOUD_TRAIL_DETAIL_TYPE: &str = "AWS API Call via CloudTrail";
 ///
 /// The `detail` of every one of them IS a CloudTrail record, whose contents are the
 /// same whichever kind it records (CloudTrail User Guide, "CloudTrail record
-/// contents"), so one components template ([`CLOUD_TRAIL_COMPONENTS`]) serves the whole
-/// family — published under each event's own component name.
+/// contents") apart from the payload only that kind's record carries
+/// ([`CLOUD_TRAIL_KIND_PAYLOADS`]), so one components template
+/// ([`CLOUD_TRAIL_COMPONENTS`]) serves the whole family — published under each event's
+/// own component name, with that kind's payload declared on top of it.
 ///
 /// The `EventName` beside each `detail-type` is that detail-type with its spaces taken
 /// out, which is how the catalogue derives a schema's name; the pairs are written out
@@ -2335,14 +2337,15 @@ pub const CLOUD_TRAIL_EVENT_FAMILY: &[(&str, &str)] = &[
 ///   pattern the record writes it in, which is what a generated binding parses it with;
 /// * the record states HOW the call reached the service as well as WHO made it: a call
 ///   that arrived over a VPC endpoint is recorded with the endpoint it came in through
-///   (CloudTrail User Guide, "CloudTrail record contents"), so the document declares it —
-///   a validator fed this document would otherwise reject a delivered event that names
-///   the endpoint, and a binding generated from it could not read the endpoint an auditor
-///   joins on;
-/// * what the document leaves out of the record is the payload of ONE kind of record —
+///   and with the account that OWNS that endpoint (CloudTrail User Guide, "CloudTrail
+///   record contents"), so the document declares both — a validator fed this document
+///   would otherwise reject a delivered event that names them, and a binding generated
+///   from it could not read the endpoint, or the account an auditor joins it on;
+/// * what this template leaves out of the record is the payload of ONE kind of record —
 ///   the Insights detail and the service-event detail, each of which only an event of
-///   that kind carries. Every other member of the record is a fact about the call
-///   itself, so every other member is declared.
+///   that kind carries, and each of which the document published for THAT kind declares
+///   on its own ([`CLOUD_TRAIL_KIND_PAYLOADS`]). Every other member of the record is a
+///   fact about the call itself, so every other member is declared here, for every kind.
 ///
 /// The members keep the order the published document writes them in — by name, compared
 /// without regard to case, at every depth: it is served as written (see [`JsonNode`]),
@@ -2453,10 +2456,83 @@ const CLOUD_TRAIL_COMPONENTS: &str = r##"{
           "userName": {"type": "string"}
         }
       },
+      "vpcEndpointAccountId": {"type": "string"},
       "vpcEndpointId": {"type": "string"}
     }
   }
 }"##;
+
+/// The payload member the record of ONE KIND of CloudTrail-delivered event carries, by
+/// the name of the [`CLOUD_TRAIL_EVENT_FAMILY`] event that kind is published as.
+///
+/// A CloudTrail record states the same facts about the call it records whichever KIND of
+/// record it is, which is what [`CLOUD_TRAIL_COMPONENTS`] declares — with one exception:
+/// the kinds that have a payload of their own carry it under a member of their own, an
+/// Insights event the triggers of the insight it reports and a service event what the
+/// service reported, and each of those members appears only on the record of its own kind
+/// (CloudTrail User Guide, "CloudTrail record contents"). So the document the catalogue
+/// publishes for a kind declares that kind's payload member, and the document of every
+/// other kind declares none of them — which the published document of the API-call kind
+/// shows, declaring neither.
+///
+/// A payload's own members are the reported event's rather than CloudTrail's, so the
+/// document constrains it to be an object and no further, as it does every other member
+/// whose contents it does not state.
+const CLOUD_TRAIL_KIND_PAYLOADS: &[(&str, &str)] = &[
+    ("AWSInsightviaCloudTrail", "insightDetails"),
+    ("AWSServiceEventviaCloudTrail", "serviceEventDetails"),
+];
+
+/// The payload member the CloudTrail-delivered event published as `event_name` carries,
+/// per [`CLOUD_TRAIL_KIND_PAYLOADS`]; `None` for a kind whose record carries none.
+fn cloud_trail_kind_payload(event_name: &str) -> Option<&'static str> {
+    CLOUD_TRAIL_KIND_PAYLOADS
+        .iter()
+        .find(|(kind, _)| *kind == event_name)
+        .map(|(_, payload)| *payload)
+}
+
+/// `components` with `member` declared on the record `event_name` describes, as an object
+/// and no further, written where the document's name order puts it — by name, compared
+/// without regard to case, like every other declaration of the document.
+///
+/// `None` when `components` is not a document declaring that record's `properties`, which
+/// is a typo in the seed data rather than a runtime condition.
+fn with_declared_member(components: &str, event_name: &str, member: &str) -> Option<String> {
+    let mut document = JsonNode::parse(components)?;
+    {
+        let JsonNode::Object(schemas) = &mut document else {
+            return None;
+        };
+        let component = schemas
+            .iter_mut()
+            .find(|(name, _)| name == event_name)
+            .map(|(_, component)| component)?;
+        let JsonNode::Object(declarations) = component else {
+            return None;
+        };
+        let properties = declarations
+            .iter_mut()
+            .find(|(name, _)| name == "properties")
+            .map(|(_, properties)| properties)?;
+        let JsonNode::Object(members) = properties else {
+            return None;
+        };
+        let in_name_order = |name: &str| (name.to_lowercase(), name.to_string());
+        let at = members
+            .iter()
+            .position(|(name, _)| in_name_order(name) > in_name_order(member))
+            .unwrap_or(members.len());
+        members.insert(
+            at,
+            (
+                member.to_string(),
+                JsonNode::Object(vec![("type".to_string(), JsonNode::text("object"))]),
+            ),
+        );
+    }
+    Some(document.to_json())
+}
 
 /// The AWS event sources the managed catalogue holds a CloudTrail-delivered schema
 /// FOR — the `aws.<service>` namespaces whose CloudTrail records EventBridge delivers,
@@ -2804,9 +2880,30 @@ impl ManagedEventType {
     /// This event type's `components.schemas`, with the event's own component name
     /// substituted for [`EVENT_COMPONENT_PLACEHOLDER`]: one template serves a whole
     /// family of event types, each published under its own component name.
+    ///
+    /// A kind of CloudTrail record that carries a payload of its own
+    /// ([`CLOUD_TRAIL_KIND_PAYLOADS`]) has that member declared on top of the template,
+    /// where the document's name order puts it: the payload appears only on the record of
+    /// its own kind, so only the document published for that kind declares it.
     pub fn components_json(&self) -> String {
-        self.components
-            .replace(EVENT_COMPONENT_PLACEHOLDER, self.event_name)
+        let declared = self
+            .components
+            .replace(EVENT_COMPONENT_PLACEHOLDER, self.event_name);
+        match cloud_trail_kind_payload(self.event_name) {
+            // A template that declares no record for the component it is published under
+            // is a typo in the seed data above rather than a runtime condition — the rows
+            // are constants — so it fails here, in every build, rather than quietly
+            // serving a document missing a member the published one declares.
+            Some(payload) => with_declared_member(&declared, self.event_name, payload)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the seeded template of {} must declare the record of {}",
+                        self.schema_name(),
+                        self.event_name
+                    )
+                }),
+            None => declared,
+        }
     }
 
     /// This event type as the catalogue holds it. `None` when its document cannot be

@@ -1,19 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end HTTP tests for HOW a published CloudTrail document says the call reached
-//! the service: the member a record carries for the VPC endpoint a request arrived over.
+//! the service: the members a record carries for the VPC endpoint a request arrived over
+//! and for the account that owns that endpoint.
 //!
 //! RULE: the document a catalogue entry publishes declares its event's record WHOLE and
 //! writes the declarations in name order — every member the record states is declared, at
 //! the place that order puts it, so a client that generates a binding, feeds a validator,
 //! or diffs and hashes the text sees the same declarations AWS publishes. A CloudTrail
 //! record states where a call CAME FROM as well as who made it: a call that arrived over a
-//! VPC endpoint is recorded with the endpoint it came in through, so that member is
-//! declared too, after the identity element, because that is where its name falls. The
-//! draft-04 export of the same document carries it, rendered in name order like every
-//! other schema it translates. A document published for an event whose `detail` is NOT a
-//! CloudTrail record declares it nowhere: it is a member of that record, not of every
-//! event.
+//! VPC endpoint is recorded with the endpoint it came in through and with that endpoint's
+//! owning account, so those members are declared too, after the identity element, because
+//! that is where their names fall. The draft-04 export of the same document carries them,
+//! rendered in name order like every other schema it translates. A document published for
+//! an event whose `detail` is NOT a CloudTrail record declares them nowhere: they are
+//! members of that record, not of every event.
 //!
 //! Every case drives the real wire path, through the harness in
 //! `registry_schema_lifecycle.rs` — nothing here touches the state struct directly.
@@ -34,11 +35,15 @@ use crate::registry_schema_lifecycle::{
 /// as.
 ///
 /// Source: the record a CloudTrail-delivered event carries (CloudTrail User Guide,
-/// "CloudTrail record contents") — the VPC endpoint the request was made through. The
-/// emulator's own event plumbing reads `vpcEndpointId` off a record too (the shared
-/// CloudTrail record support in `services/common`), so a document that did not declare it
-/// would not describe the events the emulator delivers.
-const PUBLISHED_REQUEST_PATH_MEMBERS: &[(&str, &str)] = &[("vpcEndpointId", "string")];
+/// "CloudTrail record contents") — the VPC endpoint the request was made through and the
+/// account that owns that endpoint. The emulator's own event plumbing reads
+/// `vpcEndpointId` off a record too (the shared CloudTrail record support in
+/// `services/common`), so a document that did not declare it would not describe the events
+/// the emulator delivers.
+const PUBLISHED_REQUEST_PATH_MEMBERS: &[(&str, &str)] = &[
+    ("vpcEndpointAccountId", "string"),
+    ("vpcEndpointId", "string"),
+];
 
 /// The sources the cases run the rule over: the one the issue cited and three it did not.
 /// The `detail` of a CloudTrail-delivered event is the same record whichever source
