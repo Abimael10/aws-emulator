@@ -86,14 +86,31 @@ const INSTANCE_FAMILIES: &[&str] = &[
 /// (`smithy_query(query="operation", operation="DescribeImages")`: `range 0..25`).
 const MAX_PAGE: usize = 25;
 
-/// The ARN an image of this name carries: AppStream's `image` resource type, in the
-/// Region the request was signed for.
-fn image_arn(region: &str, name: &str) -> String {
+/// The ARN a published base image of this name carries: AppStream's `image` resource type,
+/// in the Region the request was signed for, under NO account — AWS publishes the same base
+/// image to every account, so nothing owns it.
+///
+/// Shared with the other suites in this target (`tests/all/published_image_catalog.rs`), so
+/// every suite states the published ARN form once.
+pub(crate) fn published_image_arn(region: &str, name: &str) -> String {
+    format!("arn:aws:appstream:{region}::image/{name}")
+}
+
+/// The ARN an image an ACCOUNT minted carries: the same resource type under this
+/// emulator's account. No published image is addressed by one.
+pub(crate) fn image_arn(region: &str, name: &str) -> String {
     format!("arn:aws:appstream:{region}:{ACCOUNT}:image/{name}")
 }
 
 /// One `DescribeImages` call that must succeed: its `Images` and its `NextToken`.
-async fn describe(emulator: &Emulator, case: &str, request: Value) -> (Vec<Value>, Option<Value>) {
+///
+/// Shared with the other suites in this target, so every catalog read goes through the
+/// same front-door call.
+pub(crate) async fn describe(
+    emulator: &Emulator,
+    case: &str,
+    request: Value,
+) -> (Vec<Value>, Option<Value>) {
     let payload = emulator.ok(case, "DescribeImages", request).await;
     let images = payload
         .get("Images")
@@ -104,7 +121,7 @@ async fn describe(emulator: &Emulator, case: &str, request: Value) -> (Vec<Value
 }
 
 /// The `Name` of each reported image, in the order they were reported.
-fn reported_names(images: &[Value]) -> Vec<String> {
+pub(crate) fn reported_names(images: &[Value]) -> Vec<String> {
     images
         .iter()
         .map(|image| {
@@ -117,7 +134,10 @@ fn reported_names(images: &[Value]) -> Vec<String> {
 }
 
 /// Every image the catalog holds, read through the front door with no filters.
-async fn catalog(emulator: &Emulator) -> Vec<Value> {
+///
+/// Shared with the other suites in this target, so every suite reads the whole catalog the
+/// same way.
+pub(crate) async fn catalog(emulator: &Emulator) -> Vec<Value> {
     let (images, next_token) = describe(emulator, "the whole catalog", json!({})).await;
     assert!(
         next_token.is_none(),
@@ -143,7 +163,7 @@ async fn the_catalog_is_reported_with_the_members_a_client_picks_an_image_by() {
             let name = image["Name"].as_str().unwrap_or("<no Name>").to_string();
             let case = format!("{region} {name}");
 
-            let expected_arn = image_arn(region, &name);
+            let expected_arn = published_image_arn(region, &name);
             assert_eq!(
                 image["Arn"].as_str().unwrap_or_default(),
                 expected_arn,
@@ -287,7 +307,7 @@ async fn a_read_reports_exactly_the_images_the_request_names() {
 
         let arns: Vec<String> = selection
             .iter()
-            .map(|name| image_arn(region, name))
+            .map(|name| published_image_arn(region, name))
             .collect();
         let case = format!("Arns {arns:?}");
         let (images, _) = describe(&emulator, &case, json!({ "Arns": arns })).await;
@@ -341,17 +361,24 @@ async fn a_name_or_arn_addressing_no_image_is_refused_with_awss_sentence() {
     // with the kind its own ARN carries.
     let rows: Vec<(String, &str, String)> = vec![
         (
-            image_arn(region, "absent"),
+            published_image_arn(region, "absent"),
             IMAGE_KIND,
             "absent".to_string(),
         ),
         (
-            image_arn("us-west-2", &stored),
+            published_image_arn("us-west-2", &stored),
             IMAGE_KIND,
             stored.clone(),
         ),
         (
             format!("arn:aws:appstream:{region}:999999999999:image/{stored}"),
+            IMAGE_KIND,
+            stored.clone(),
+        ),
+        (
+            // A published image belongs to no account, so naming this account in its ARN
+            // addresses nothing.
+            image_arn(region, &stored),
             IMAGE_KIND,
             stored.clone(),
         ),
@@ -397,23 +424,23 @@ async fn naming_both_the_names_and_the_arns_is_an_incorrect_parameter_combinatio
     let rows: Vec<(&str, Value)> = vec![
         (
             "the same image by name and by ARN",
-            json!({ "Names": [all[0].clone()], "Arns": [image_arn(region, &all[0])] }),
+            json!({ "Names": [all[0].clone()], "Arns": [published_image_arn(region, &all[0])] }),
         ),
         (
             "different images by name and by ARN",
-            json!({ "Names": [all[0].clone()], "Arns": [image_arn(region, &all[1])] }),
+            json!({ "Names": [all[0].clone()], "Arns": [published_image_arn(region, &all[1])] }),
         ),
         (
             "both, narrowed by Type",
             json!({
                 "Names": [all[0].clone()],
-                "Arns": [image_arn(region, &all[1])],
+                "Arns": [published_image_arn(region, &all[1])],
                 "Type": PUBLIC,
             }),
         ),
         (
             "a name and an ARN that address nothing",
-            json!({ "Names": ["absent"], "Arns": [image_arn(region, "absent")] }),
+            json!({ "Names": ["absent"], "Arns": [published_image_arn(region, "absent")] }),
         ),
     ];
 
@@ -607,7 +634,7 @@ async fn the_read_changes_nothing_a_later_caller_sees() {
     let requests: Vec<(&str, Value)> = vec![
         ("no filters", json!({})),
         ("by name", json!({ "Names": [all[0].clone()] })),
-        ("by ARN", json!({ "Arns": [image_arn(region, &all[1])] })),
+        ("by ARN", json!({ "Arns": [published_image_arn(region, &all[1])] })),
         ("by visibility", json!({ "Type": PUBLIC })),
         ("one image at a time", json!({ "MaxResults": 1 })),
     ];

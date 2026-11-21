@@ -12,11 +12,15 @@
 //! same rules.
 //!
 //! The shipped table below is a fixed snapshot of the base-image families AWS publishes,
-//! written with AWS's own base-image naming (`AppStream-<operating system>-<MM-DD-YYYY>`,
-//! the release date of the published image). One row per operating system this API models
-//! an image platform for; the platform tokens are `PlatformType`'s
-//! (`PLATFORM_TYPE_VALUES` in `ops/types/shared_types.rs`), and the supported instance
-//! families are the ones the model's `Image$SupportedInstanceFamilies` doc enumerates
+//! written with AWS's own base-image naming
+//! (`AppStream-[Graphics-<accelerator>-]<operating system>-<MM-DD-YYYY>`, the release date
+//! of the published image). It carries, for every operating system this API models an
+//! image platform for, the general-purpose base image, and for every operating system AWS
+//! publishes accelerated images for, one base image per graphics accelerator — so a client
+//! choosing an image finds one for each instance family it can launch a fleet on. The
+//! platform tokens are `PlatformType`'s (`PLATFORM_TYPE_VALUES` in
+//! `ops/types/shared_types.rs`), and the supported instance families are the ones the
+//! model's `Image$SupportedInstanceFamilies` doc enumerates
 //! (`smithy_query(query="doc", shape="Image", member="SupportedInstanceFamilies")`:
 //! General Purpose, Compute Optimized, Memory Optimized, Graphics G4, Graphics G5,
 //! Graphics G6).
@@ -70,13 +74,31 @@ pub const IMAGE_TYPE_NATIVE: &str = "NATIVE";
 /// no page of this read is larger than that whatever a request asks for.
 pub const DESCRIBE_IMAGES_PAGE_SIZE: usize = 25;
 
-/// `arn:aws:appstream:<region>:<account>:image/<name>`.
+/// `arn:aws:appstream:<region>:<account>:image/<name>` — the ARN of an image an account
+/// minted in `region`.
+///
+/// Nothing calls it yet: every operation that mints an image (a builder's snapshot, an
+/// import, a copy, a managed update) is still a scaffold, so every image the store holds
+/// today is a published one and takes [`published_image_arn`] instead. It states the owned
+/// form for the create that fills `ImageRecord::arn`.
 pub fn image_arn(region: &str, name: &str) -> String {
     ::emulator_server::emulator_arn(
         ARN_NAMESPACE,
         region,
         &format!("{IMAGE_ARN_RESOURCE_TYPE}/{name}"),
     )
+}
+
+/// `arn:aws:appstream:<region>::image/<name>` — the ARN of an image AWS publishes.
+///
+/// No account owns a published base image: AWS publishes the same image to every account,
+/// so the ARN's account field is EMPTY, the way the ARN of any resource the service itself
+/// owns names no account. An image an account minted in a Region carries that account
+/// ([`image_arn`], the owned counterpart of this builder) — which is why the shared
+/// `emulator_server::emulator_arn` helper cannot build this form: it always stamps the
+/// emulator's account into the ARN it returns, so only the owned builder goes through it.
+pub fn published_image_arn(region: &str, name: &str) -> String {
+    format!("arn:aws:{ARN_NAMESPACE}:{region}::{IMAGE_ARN_RESOURCE_TYPE}/{name}")
 }
 
 /// An RFC 3339 instant as the modelled timestamp; the epoch for text that is not one, so
@@ -138,12 +160,12 @@ pub struct ImageRecord {
 
 impl ImageRecord {
     /// The ARN this image reports to a request addressing `region`: the one its create
-    /// stamped, or — for a published base image, which every Region carries — the ARN of
-    /// the Region asked about.
+    /// stamped, or — for a published base image, which every Region and every account
+    /// carries — that Region's accountless published ARN.
     pub fn arn(&self, region: &str) -> String {
         self.arn
             .clone()
-            .unwrap_or_else(|| image_arn(region, &self.name))
+            .unwrap_or_else(|| published_image_arn(region, &self.name))
     }
 
     /// Render the stored record as the modelled `Image` every reader returns.
@@ -180,108 +202,250 @@ impl ImageRecord {
     }
 }
 
-/// One row of the shipped base-image table, as the published image states it.
-///
-/// Held as `&'static str` data rather than as built records so the table reads as the
-/// catalog it transcribes; [`seed_image_catalog`] projects each row onto an
-/// [`ImageRecord`].
-#[derive(Debug, Clone, Copy)]
-struct PublishedImage {
-    /// The image name a fleet or image builder names the image by.
-    name: &'static str,
-    /// The name to display for it.
-    display_name: &'static str,
-    /// What the image is.
-    description: &'static str,
-    /// The image's operating system, one of `PLATFORM_TYPE_VALUES`.
-    platform: &'static str,
-    /// The day AWS released this base image, RFC 3339 — the `PublicBaseImageReleasedDate`
-    /// the image reports, and the date its name carries.
-    released: &'static str,
-    /// The instance families a fleet or image builder may launch it on.
-    instance_families: &'static [&'static str],
-}
-
 /// The instance families a general-purpose base image supports: the non-graphics families
 /// the model's `Image$SupportedInstanceFamilies` doc enumerates.
 const GENERAL_INSTANCE_FAMILIES: &[&str] =
     &["General Purpose", "Compute Optimized", "Memory Optimized"];
 
-/// The instance families a graphics base image supports: the accelerated families of that
-/// same enumeration.
-const GRAPHICS_INSTANCE_FAMILIES: &[&str] = &["Graphics G4", "Graphics G5", "Graphics G6"];
+/// The accelerator a published graphics base image is built for.
+#[derive(Debug, Clone, Copy)]
+struct Accelerator {
+    /// The token the published image's name carries after `Graphics-`.
+    token: &'static str,
+    /// The instance family a fleet or image builder launches such an image on, as the
+    /// model's `Image$SupportedInstanceFamilies` doc names it. A graphics image runs on
+    /// the accelerated hardware it was built for and on no other, so this is the ONE
+    /// family it states support for.
+    family: &'static str,
+}
 
-/// The base images this emulator publishes to every account, one per operating system the
-/// model declares an image platform for, plus one graphics image — so a client choosing an
-/// image sees the whole shape of the published catalog rather than a single row.
-///
-/// Sorted by name, which is also the order a page of `DescribeImages` walks them in.
-const PUBLISHED_IMAGES: &[PublishedImage] = &[
-    PublishedImage {
-        name: "AppStream-AmazonLinux2-06-17-2024",
-        display_name: "Amazon Linux 2",
-        description: "AppStream 2.0 base image for Amazon Linux 2",
-        platform: "AMAZON_LINUX2",
-        released: "2024-06-17T00:00:00Z",
-        instance_families: GENERAL_INSTANCE_FAMILIES,
+/// One graphics accelerator per accelerated instance family the model's
+/// `Image$SupportedInstanceFamilies` doc enumerates, so the catalog carries an image a
+/// client can launch each of those families with.
+const GRAPHICS_ACCELERATORS: &[Accelerator] = &[
+    Accelerator {
+        token: "G4dn",
+        family: "Graphics G4",
     },
-    PublishedImage {
-        name: "AppStream-Graphics-WinServer2019-06-17-2024",
-        display_name: "Windows Server 2019 Graphics",
-        description: "AppStream 2.0 graphics base image for Windows Server 2019",
-        platform: "WINDOWS_SERVER_2019",
-        released: "2024-06-17T00:00:00Z",
-        instance_families: GRAPHICS_INSTANCE_FAMILIES,
+    Accelerator {
+        token: "G5",
+        family: "Graphics G5",
     },
-    PublishedImage {
-        name: "AppStream-RHEL8-06-17-2024",
-        display_name: "Red Hat Enterprise Linux 8",
-        description: "AppStream 2.0 base image for Red Hat Enterprise Linux 8",
-        platform: "RHEL8",
-        released: "2024-06-17T00:00:00Z",
-        instance_families: GENERAL_INSTANCE_FAMILIES,
-    },
-    PublishedImage {
-        name: "AppStream-RockyLinux8-06-17-2024",
-        display_name: "Rocky Linux 8",
-        description: "AppStream 2.0 base image for Rocky Linux 8",
-        platform: "ROCKY_LINUX8",
-        released: "2024-06-17T00:00:00Z",
-        instance_families: GENERAL_INSTANCE_FAMILIES,
-    },
-    PublishedImage {
-        name: "AppStream-UbuntuPro2404-06-17-2024",
-        display_name: "Ubuntu Pro 24.04",
-        description: "AppStream 2.0 base image for Ubuntu Pro 24.04",
-        platform: "UBUNTU_PRO_2404",
-        released: "2024-06-17T00:00:00Z",
-        instance_families: GENERAL_INSTANCE_FAMILIES,
-    },
-    PublishedImage {
-        name: "AppStream-WinServer2019-06-17-2024",
-        display_name: "Windows Server 2019",
-        description: "AppStream 2.0 base image for Windows Server 2019",
-        platform: "WINDOWS_SERVER_2019",
-        released: "2024-06-17T00:00:00Z",
-        instance_families: GENERAL_INSTANCE_FAMILIES,
-    },
-    PublishedImage {
-        name: "AppStream-WinServer2022-06-17-2024",
-        display_name: "Windows Server 2022",
-        description: "AppStream 2.0 base image for Windows Server 2022",
-        platform: "WINDOWS_SERVER_2022",
-        released: "2024-06-17T00:00:00Z",
-        instance_families: GENERAL_INSTANCE_FAMILIES,
-    },
-    PublishedImage {
-        name: "AppStream-WinServer2025-06-17-2024",
-        display_name: "Windows Server 2025",
-        description: "AppStream 2.0 base image for Windows Server 2025",
-        platform: "WINDOWS_SERVER_2025",
-        released: "2024-06-17T00:00:00Z",
-        instance_families: GENERAL_INSTANCE_FAMILIES,
+    Accelerator {
+        token: "G6",
+        family: "Graphics G6",
     },
 ];
+
+/// One operating system the published catalog carries base images for.
+#[derive(Debug, Clone, Copy)]
+struct PublishedOs {
+    /// The operating-system token a published image's name carries.
+    token: &'static str,
+    /// What that operating system is called, the subject of the image's description.
+    name: &'static str,
+    /// The image platform, one of `PLATFORM_TYPE_VALUES`.
+    platform: &'static str,
+    /// Whether AWS publishes accelerated base images for this operating system: a
+    /// graphics image is published per accelerator in [`GRAPHICS_ACCELERATORS`] for one
+    /// that has them, and none for one that does not.
+    graphics: bool,
+}
+
+/// The operating systems the published catalog covers: every one this API models an image
+/// platform for and still publishes base images under
+/// (`PLATFORM_TYPE_VALUES` in `ops/types/shared_types.rs`; `WINDOWS` and
+/// `WINDOWS_SERVER_2016` are the platforms of images published before this snapshot and
+/// carry no current base image).
+const PUBLISHED_OPERATING_SYSTEMS: &[PublishedOs] = &[
+    PublishedOs {
+        token: "AmazonLinux2",
+        name: "Amazon Linux 2",
+        platform: "AMAZON_LINUX2",
+        graphics: true,
+    },
+    PublishedOs {
+        token: "RHEL8",
+        name: "Red Hat Enterprise Linux 8",
+        platform: "RHEL8",
+        graphics: true,
+    },
+    PublishedOs {
+        token: "RockyLinux8",
+        name: "Rocky Linux 8",
+        platform: "ROCKY_LINUX8",
+        graphics: false,
+    },
+    PublishedOs {
+        token: "UbuntuPro2404",
+        name: "Ubuntu Pro 24.04",
+        platform: "UBUNTU_PRO_2404",
+        graphics: false,
+    },
+    PublishedOs {
+        token: "WinServer2019",
+        name: "Windows Server 2019",
+        platform: "WINDOWS_SERVER_2019",
+        graphics: true,
+    },
+    PublishedOs {
+        token: "WinServer2022",
+        name: "Windows Server 2022",
+        platform: "WINDOWS_SERVER_2022",
+        graphics: true,
+    },
+    PublishedOs {
+        token: "WinServer2025",
+        name: "Windows Server 2025",
+        platform: "WINDOWS_SERVER_2025",
+        graphics: true,
+    },
+];
+
+/// The release dates of the published base-image batches this catalog ships,
+/// `YYYY-MM-DD`.
+///
+/// AWS refreshes its published base images in batches and names every image of a batch
+/// after the day the batch was released, so the date is the `<MM-DD-YYYY>` tail of each
+/// image's name and the `PublicBaseImageReleasedDate` it reports. The shipped snapshot
+/// transcribes one such batch — the one this crate's catalog has carried since it was
+/// seeded, the `06-17-2024` tail of the published names it was written from; a batch AWS
+/// releases later is another entry here, and the images of every entry are published side
+/// by side, because a batch does not withdraw the one before it — which is why this is a
+/// list of batches rather than a single date, even while the snapshot ships one.
+const PUBLISHED_RELEASE_DATES: &[&str] = &["2024-06-17"];
+
+/// One published base image: an operating system, the accelerator it is built for when it
+/// is a graphics image, and the release date of the batch it belongs to.
+#[derive(Debug, Clone, Copy)]
+struct PublishedImage {
+    os: PublishedOs,
+    accelerator: Option<Accelerator>,
+    released: &'static str,
+}
+
+/// The date slot of a published image's name: the release date written `MM-DD-YYYY`, the
+/// form AWS's base-image names carry it in.
+fn name_date(released: &str) -> String {
+    let mut fields = released.split('-');
+    match (fields.next(), fields.next(), fields.next()) {
+        (Some(year), Some(month), Some(day)) => format!("{month}-{day}-{year}"),
+        _ => released.to_string(),
+    }
+}
+
+impl PublishedImage {
+    /// The name a fleet or image builder names this image by:
+    /// `AppStream-[Graphics-<accelerator>-]<operating system>-<MM-DD-YYYY>`, AWS's naming
+    /// of its published base images.
+    fn name(&self) -> String {
+        let date = name_date(self.released);
+        let os = self.os.token;
+        match self.accelerator {
+            Some(accelerator) => {
+                format!("AppStream-Graphics-{}-{os}-{date}", accelerator.token)
+            }
+            None => format!("AppStream-{os}-{date}"),
+        }
+    }
+
+    /// What the image is: the operating system it runs, and the accelerator it is built
+    /// for when it is a graphics image.
+    fn description(&self) -> String {
+        let os = self.os.name;
+        match self.accelerator {
+            Some(accelerator) => format!(
+                "AppStream 2.0 {} graphics base image for {os}",
+                accelerator.token
+            ),
+            None => format!("AppStream 2.0 base image for {os}"),
+        }
+    }
+
+    /// The instance families a fleet or image builder may launch this image on: the one
+    /// family a graphics image's accelerator serves, or the general-purpose families.
+    fn supported_instance_families(&self) -> Vec<String> {
+        match self.accelerator {
+            Some(accelerator) => vec![accelerator.family.to_string()],
+            None => GENERAL_INSTANCE_FAMILIES
+                .iter()
+                .map(|family| (*family).to_string())
+                .collect(),
+        }
+    }
+
+    /// The stored record this published image is read out of.
+    fn record(&self) -> ImageRecord {
+        let released = instant(&format!("{}T00:00:00Z", self.released));
+        let name = self.name();
+        ImageRecord {
+            // AWS publishes the image under its own name, so the name to display for it
+            // is that name.
+            display_name: Some(name.clone()),
+            description: Some(self.description()),
+            name,
+            // Every Region and every account carries the published image, so its ARN is
+            // the accountless one of the Region a request addresses rather than a stored
+            // one.
+            arn: None,
+            base_image_arn: None,
+            state: IMAGE_STATE_AVAILABLE.to_string(),
+            visibility: VISIBILITY_PUBLIC.to_string(),
+            // "Indicates whether an image builder can be launched from this image":
+            // a published base image is what an image builder starts from.
+            image_builder_supported: true,
+            // No image builder produced it, and nothing has gone wrong with it.
+            image_builder_name: None,
+            platform: self.os.platform.to_string(),
+            state_change_reason: None,
+            applications: Vec::new(),
+            // A published image was created when AWS released it.
+            created_time: released,
+            public_base_image_released_date: Some(released),
+            appstream_agent_version: None,
+            // Sharing permissions belong to an account's own private image.
+            image_permissions: None,
+            image_errors: Vec::new(),
+            latest_appstream_agent_version: None,
+            supported_instance_families: self.supported_instance_families(),
+            dynamic_app_providers_enabled: None,
+            image_shared_with_others: None,
+            managed_software_included: None,
+            image_type: Some(IMAGE_TYPE_NATIVE.to_string()),
+            image_software_metadata: None,
+        }
+    }
+}
+
+/// Every base image AWS publishes to every account in the shipped snapshot: for each
+/// release date of [`PUBLISHED_RELEASE_DATES`], the general-purpose image of each operating
+/// system of [`PUBLISHED_OPERATING_SYSTEMS`], and one graphics image per accelerator of
+/// [`GRAPHICS_ACCELERATORS`] for each operating system that has accelerated images — so a
+/// client choosing an image finds one for every platform and every instance family it can
+/// launch a fleet or an image builder with, under every release date still published.
+fn published_images() -> Vec<PublishedImage> {
+    PUBLISHED_RELEASE_DATES
+        .iter()
+        .flat_map(|released| {
+            PUBLISHED_OPERATING_SYSTEMS.iter().flat_map(move |os| {
+                let general = PublishedImage {
+                    os: *os,
+                    accelerator: None,
+                    released,
+                };
+                let graphics = GRAPHICS_ACCELERATORS
+                    .iter()
+                    .filter(|_| os.graphics)
+                    .map(move |accelerator| PublishedImage {
+                        os: *os,
+                        accelerator: Some(*accelerator),
+                        released,
+                    });
+                ::std::iter::once(general).chain(graphics)
+            })
+        })
+        .collect()
+}
 
 /// The image catalog a fresh store starts from: one record per published base image,
 /// keyed by the name a fleet or image builder names it by.
@@ -290,47 +454,10 @@ const PUBLISHED_IMAGES: &[PublishedImage] = &[
 /// that mints an image checks the map against
 /// [`super::MAX_RECORDS_PER_STORE`] before inserting.
 pub fn seed_image_catalog() -> BTreeMap<String, ImageRecord> {
-    PUBLISHED_IMAGES
+    published_images()
         .iter()
         .map(|published| {
-            let released = instant(published.released);
-            let record = ImageRecord {
-                name: published.name.to_string(),
-                // Every Region carries the published image, so its ARN is the one of the
-                // Region a request addresses rather than a stored one.
-                arn: None,
-                base_image_arn: None,
-                display_name: Some(published.display_name.to_string()),
-                description: Some(published.description.to_string()),
-                state: IMAGE_STATE_AVAILABLE.to_string(),
-                visibility: VISIBILITY_PUBLIC.to_string(),
-                // "Indicates whether an image builder can be launched from this image":
-                // a published base image is what an image builder starts from.
-                image_builder_supported: true,
-                // No image builder produced it, and nothing has gone wrong with it.
-                image_builder_name: None,
-                platform: published.platform.to_string(),
-                state_change_reason: None,
-                applications: Vec::new(),
-                // A published image was created when AWS released it.
-                created_time: released,
-                public_base_image_released_date: Some(released),
-                appstream_agent_version: None,
-                // Sharing permissions belong to an account's own private image.
-                image_permissions: None,
-                image_errors: Vec::new(),
-                latest_appstream_agent_version: None,
-                supported_instance_families: published
-                    .instance_families
-                    .iter()
-                    .map(|family| (*family).to_string())
-                    .collect(),
-                dynamic_app_providers_enabled: None,
-                image_shared_with_others: None,
-                managed_software_included: None,
-                image_type: Some(IMAGE_TYPE_NATIVE.to_string()),
-                image_software_metadata: None,
-            };
+            let record = published.record();
             (record.name.clone(), record)
         })
         .collect()
