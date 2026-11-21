@@ -9,7 +9,8 @@
 //! failed attempt made of its target's own API, never the payload document alone. A
 //! queue target is "the templated target type for the Amazon SQS SendMessage API
 //! operation" (`Target$SqsParameters`), and that request addresses its queue by the url
-//! Amazon SQS reports for it — `https://sqs.<region>.amazonaws.com/<accountId>/<name>`,
+//! Amazon SQS SERVES for it — which on an emulator served on no port of its own is that
+//! service's own published form, `https://sqs.<region>.amazonaws.com/<accountId>/<name>`,
 //! the Region being the one the target ARN labels — and carries the payload the attempt
 //! rendered under `MessageBody` (`smithy_query` query="operation" operation="SendMessage"
 //! on Amazon SQS's model: `QueueUrl`, `MessageBody`, `MessageGroupId`). So a consumer
@@ -386,10 +387,12 @@ fn attribute(message: &Value, name: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
-/// The url Amazon SQS addresses the queue an ARN names by:
-/// `https://sqs.<region>.amazonaws.com/<accountId>/<QueueName>`, over the Region and the
-/// account the ARN itself labels — `arn:<partition>:sqs:<region>:<account>:<QueueName>`.
-/// Pinned against the url that service reports for a queue of this account above.
+/// The url Amazon SQS serves for the queue an ARN names, on an emulator served on no port
+/// of its own: `https://sqs.<region>.amazonaws.com/<accountId>/<QueueName>`, over the
+/// Region and the account the ARN itself labels —
+/// `arn:<partition>:sqs:<region>:<account>:<QueueName>`. Pinned against the url that
+/// service reports for a queue of this account above; the address a SERVED emulator
+/// reports instead is spanned by `tests/all/queue_target_served_url.rs`.
 fn queue_url_of(queue_arn: &str) -> String {
     let fields: Vec<&str> = queue_arn.split(':').collect();
     let region = fields.get(3).copied().unwrap_or_default();

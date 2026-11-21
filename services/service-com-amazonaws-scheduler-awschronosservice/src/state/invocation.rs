@@ -951,7 +951,7 @@ async fn attempt(
     // What is reported is the failed EVENT — the request the attempt carried to the
     // target's own API ([`failed_event`]) — rather than the bare payload the target
     // was to be handed.
-    let event = failed_event(&pending.target, &pending.region, &body);
+    let event = failed_event(callback, &pending.target, &pending.region, &body).await;
     dead_letter(
         callback,
         metrics,
@@ -1285,7 +1285,12 @@ const DETAIL_MEMBER: &str = "Detail";
 ///
 /// `region` is the schedule's, for an ARN carrying no Region label of its own — the same
 /// fallback the invocation itself is made in ([`perform`]).
-fn failed_event(target: &Target, region: &str, payload: &str) -> String {
+async fn failed_event(
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+    target: &Target,
+    region: &str,
+    payload: &str,
+) -> String {
     let text = |value: &str| ::serde_json::Value::String(value.to_string());
     let arn = target.arn.as_str();
     let Some(parsed) = ::service_common::arn::parse(arn) else {
@@ -1299,8 +1304,12 @@ fn failed_event(target: &Target, region: &str, payload: &str) -> String {
     match parsed.vendor {
         SQS_ARN_NAMESPACE => {
             // A queue is addressed by its url rather than by its ARN, which is the one
-            // address this request can carry ([`queue_url`]).
-            let Some(url) = queue_url(region, parsed.account, parsed.resource) else {
+            // address this request can carry: the url Amazon SQS itself serves for the
+            // queue the target names ([`served_queue_url`]), which is the address the
+            // attempt was made to.
+            let Some(url) =
+                served_queue_url(callback, region, parsed.account, parsed.resource).await
+            else {
                 return payload.to_string();
             };
             request.insert(QUEUE_URL_MEMBER.to_string(), text(&url));
@@ -1405,8 +1414,13 @@ async fn dead_letter(
     };
     let region =
         ::service_common::arn::region_of(queue_arn, SQS_ARN_NAMESPACE).unwrap_or(&pending.region);
-    let url = ::service_common::arn::parse_of(queue_arn, SQS_ARN_NAMESPACE)
-        .and_then(|parsed| queue_url(region, parsed.account, parsed.resource));
+    let parsed = ::service_common::arn::parse_of(queue_arn, SQS_ARN_NAMESPACE);
+    let url = match parsed {
+        Some(parsed) => {
+            served_queue_url(callback, region, parsed.account, parsed.resource).await
+        }
+        None => None,
+    };
     let Some(url) = url else {
         metrics.count(
             &pending.group,
@@ -1496,12 +1510,14 @@ async fn deliver(
     let arn = target.arn.as_str();
     match parsed.vendor {
         SQS_ARN_NAMESPACE => {
-            let Some(queue_url) = queue_url(region, parsed.account, parsed.resource) else {
+            let Some(url) =
+                served_queue_url(callback, region, parsed.account, parsed.resource).await
+            else {
                 return Attempt::NotAttempted(format!("the target ARN {arn} names no queue"));
             };
             let mut request = sqs_client(callback, region)
                 .send_message()
-                .queue_url(queue_url)
+                .queue_url(url)
                 .message_body(body);
             // "The FIFO message group ID to use as the target" (`SqsParameters`):
             // such a queue takes no message without one, so the group the target
@@ -1648,17 +1664,59 @@ where
     }
 }
 
-/// The `QueueUrl` Amazon SQS addresses the queue of `name` in `account` by, or
-/// `None` when the ARN's fields name no queue.
+/// The `QueueUrl` the SQS SERVICE addresses the queue of `name` in `account` by, or
+/// `None` when the ARN's fields name no queue at all ([`queue_url`]).
 ///
 /// A queue's ARN names the queue DIRECTLY
-/// (`arn:<partition>:sqs:<region>:<account>:<QueueName>`), and the url every SQS
-/// operation takes is `<endpoint>/<account>/<QueueName>`. A resource field carrying
-/// a type separator addresses no queue, and an account field that is not an account
-/// id names none either — so neither reaches the url, which is what keeps a
-/// caller-written ARN from reshaping the address this invocation is made to. The
-/// Region in the host is the one the shared ARN reader already held to the Region
-/// grammar.
+/// (`arn:<partition>:sqs:<region>:<account>:<QueueName>`), and `SendMessage` addresses
+/// it by a `QueueUrl` instead — "the URL of the Amazon SQS queue", which is the string
+/// `CreateQueue` and `GetQueueUrl` report for that queue. So the ARN is translated by
+/// ASKING that service for the url it serves the queue by, rather than by composing one
+/// here: the invocation is then made to an address Amazon SQS answers at, and the
+/// request a dead-letter record states is replayable against the same endpoint the
+/// record's reader resolves that queue at. `GetQueueUrl` reports a url and writes
+/// nothing, so resolving one leaves the queue as it was.
+///
+/// A queue that service serves no url for — one no account of this endpoint holds — is
+/// addressed by the form AWS publishes a queue url in ([`queue_url`]): there is no
+/// served url to take, the attempt is made to that address all the same, and the record
+/// of it states the address the attempt carried.
+async fn served_queue_url(
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    account: &str,
+    name: &str,
+) -> Option<String> {
+    let addressed = queue_url(region, account, name)?;
+    let served = sqs_client(callback, region)
+        .get_queue_url()
+        .queue_name(name)
+        .queue_owner_aws_account_id(account)
+        .send()
+        .await;
+    let served = match served {
+        Ok(answer) => answer.queue_url().map(ToString::to_string),
+        Err(error) => {
+            ::tracing::debug!(
+                queue = %name,
+                error = ?error,
+                "Amazon SQS serves no url for a schedule's queue"
+            );
+            None
+        }
+    };
+    Some(served.unwrap_or(addressed))
+}
+
+/// The form AWS publishes a queue url in, for the queue of `name` in `account`, or
+/// `None` when the ARN's fields name no queue.
+///
+/// What an ARN's fields COME TO when no url is served for them ([`served_queue_url`]):
+/// a resource field carrying a path or a type separator addresses no queue, and an
+/// account field that is not an account id names none either — so neither reaches the
+/// url, which is what keeps a caller-written ARN from reshaping the address this
+/// invocation is made to. The Region in the host is the one the shared ARN reader
+/// already held to the Region grammar.
 fn queue_url(region: &str, account: &str, name: &str) -> Option<String> {
     /// How many digits an account id carries.
     const ACCOUNT_ID_DIGITS: usize = 12;
