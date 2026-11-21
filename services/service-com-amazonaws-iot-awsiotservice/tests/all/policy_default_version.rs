@@ -21,13 +21,16 @@
 //!
 //! The table spans what the rule generalises over — WHICH version is pointed at (the
 //! first, a middle one, the newest, and the one already in effect), how many versions the
-//! policy holds, and whether the version was created with `setAsDefault` — rather than one
-//! recorded request.
+//! policy holds (from one up to the most a policy may hold), how many times the pointer
+//! has already moved, and whether the version was created with `setAsDefault` — rather
+//! than one recorded request. Beside that, the pointer belongs to the policy the call
+//! named: an account holding several policies keeps one pointer per policy.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
+use service_com_amazonaws_iot_awsiotservice::state::MAX_POLICY_VERSIONS;
 use service_com_amazonaws_iot_awsiotservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -511,4 +514,209 @@ async fn pointing_at_what_the_account_does_not_hold_is_not_found() {
         "case {case}: a refused call writes nothing, got {}",
         read.text()
     );
+}
+
+/// RULE: whichever version the call names becomes the operative one, however many versions
+/// the policy holds and however many times the pointer has already moved — the last call
+/// decides, so a move overwrites the previous pointer rather than adding to it.
+#[tokio::test]
+async fn every_version_a_policy_holds_can_become_the_operative_one_in_turn() {
+    let case = "a policy holding every version it may hold";
+    let emulator = Emulator::new();
+    emulator.create_policy(case, "at-the-cap").await;
+
+    // The rows run from the policy's first version up to the most one may hold: the cap
+    // this crate keeps a policy's versions under
+    // (`service_com_amazonaws_iot_awsiotservice::state::MAX_POLICY_VERSIONS`), so the
+    // table spans the whole range of positions a pointer can name, its last entry
+    // included.
+    let mut versions = vec!["1".to_string()];
+    for index in 2..=MAX_POLICY_VERSIONS {
+        versions.push(
+            emulator
+                .create_version(case, "at-the-cap", index, false)
+                .await,
+        );
+    }
+    assert_eq!(
+        versions.len(),
+        MAX_POLICY_VERSIONS,
+        "case {case}: expected {MAX_POLICY_VERSIONS} versions to point at, got {versions:?}"
+    );
+
+    for (position, version_id) in versions.iter().enumerate() {
+        let pointed_at = emulator.set_default("at-the-cap", version_id).await;
+        assert_eq!(
+            pointed_at.status,
+            200,
+            "case {case}: pointing at version {version_id} must answer 200, got {} body {}",
+            pointed_at.status,
+            pointed_at.text()
+        );
+
+        let read = emulator.get_policy("at-the-cap").await;
+        assert_eq!(
+            read.member("defaultVersionId"),
+            *version_id,
+            "case {case}: GetPolicy must report version {version_id} as the operative one, \
+             got {}",
+            read.text()
+        );
+        assert_eq!(
+            read.member("policyDocument"),
+            document(position + 1),
+            "case {case}: GetPolicy must hand back version {version_id}'s document, got {}",
+            read.text()
+        );
+
+        let listed = emulator.list_versions("at-the-cap").await.flagged_versions();
+        let flagged: Vec<&String> = listed
+            .iter()
+            .filter(|(_, is_default)| *is_default)
+            .map(|(listed_id, _)| listed_id)
+            .collect();
+        assert_eq!(
+            flagged,
+            vec![version_id],
+            "case {case}: exactly version {version_id} is flagged after pointing at it, got \
+             {listed:?}"
+        );
+    }
+}
+
+/// RULE: the operative version is a property of the policy the call named, so a call that
+/// moves one policy's pointer — and a call refused for a version no policy holds — leaves
+/// every other policy's pointer where it was.
+///
+/// The refusal rows here deliberately revisit the 404 that
+/// [`pointing_at_what_the_account_does_not_hold_is_not_found`] states: what this case adds
+/// is that the refusal moves NO policy's pointer in an account holding several.
+#[tokio::test]
+async fn the_operative_version_moves_only_for_the_policy_the_call_named() {
+    let case = "three policies holding different numbers of versions";
+    let emulator = Emulator::new();
+
+    // (the policy, how many versions it holds): the rows differ in version count, so the
+    // policy the call names is not distinguishable by its shape.
+    let policies = [("one-version", 1usize), ("two-versions", 2), ("newest", 3)];
+    for (policy, held) in policies {
+        emulator.create_policy(case, policy).await;
+        for index in 2..=held {
+            emulator.create_version(case, policy, index, false).await;
+        }
+    }
+
+    // Each row moves ONE policy's pointer, and names what every policy must report
+    // afterwards.
+    let rows = [
+        PointerMove {
+            label: "the three-version policy is pointed at its middle version",
+            moved: "newest",
+            version_id: "2",
+            operative: [("one-version", "1"), ("two-versions", "1"), ("newest", "2")],
+        },
+        PointerMove {
+            label: "the two-version policy is pointed at its newest version",
+            moved: "two-versions",
+            version_id: "2",
+            operative: [("one-version", "1"), ("two-versions", "2"), ("newest", "2")],
+        },
+        PointerMove {
+            label: "the one-version policy is pointed at the version already in effect",
+            moved: "one-version",
+            version_id: "1",
+            operative: [("one-version", "1"), ("two-versions", "2"), ("newest", "2")],
+        },
+        PointerMove {
+            label: "the three-version policy is pointed at its newest version",
+            moved: "newest",
+            version_id: "3",
+            operative: [("one-version", "1"), ("two-versions", "2"), ("newest", "3")],
+        },
+    ];
+    for row in &rows {
+        let pointed_at = emulator.set_default(row.moved, row.version_id).await;
+        assert_eq!(
+            pointed_at.status,
+            200,
+            "case {}: expected 200, got {} body {}",
+            row.label,
+            pointed_at.status,
+            pointed_at.text()
+        );
+        assert_operative_versions(row.label, &emulator, &row.operative).await;
+    }
+
+    // A version the policy does NOT hold is the version miss, and it moves no policy's
+    // pointer. The rows differ in the FORM of the id: one the policy could hold but does
+    // not (one past its newest), and one no policy can ever hold because the number is
+    // larger than any version id this service mints.
+    for (label, version_id) in [
+        ("one past the policy's newest version", "4".to_string()),
+        (
+            "a number past every version id a policy is given",
+            "9".repeat(20),
+        ),
+    ] {
+        let refused = emulator.set_default("newest", &version_id).await;
+        assert_eq!(
+            refused.status,
+            404,
+            "case {label}: a version the policy does not hold is a 404, got {} body {}",
+            refused.status,
+            refused.text()
+        );
+        assert_eq!(
+            refused.member("message"),
+            format!("Policy version does not exist (name=newest, versionId={version_id})"),
+            "case {label}: got {}",
+            refused.text()
+        );
+        assert_operative_versions(
+            &format!("{label}, so the refused call wrote nothing"),
+            &emulator,
+            &[("one-version", "1"), ("two-versions", "2"), ("newest", "3")],
+        )
+        .await;
+    }
+}
+
+/// One row of the isolation table: the policy whose pointer the row moves, the version it
+/// names, and the version every policy in the account must report as its operative one
+/// afterwards.
+struct PointerMove {
+    label: &'static str,
+    moved: &'static str,
+    /// The version this row's call names.
+    version_id: &'static str,
+    /// `(policy, the version it reports as operative)`, one entry per policy.
+    operative: [(&'static str, &'static str); 3],
+}
+
+/// Assert what each policy named reports as its operative version, and that its document
+/// is that version's.
+async fn assert_operative_versions(
+    case: &str,
+    emulator: &Emulator,
+    expected: &[(&'static str, &'static str)],
+) {
+    for (policy, version_id) in expected {
+        let read = emulator.get_policy(policy).await;
+        assert_eq!(
+            read.member("defaultVersionId"),
+            *version_id,
+            "case {case}: {policy} must report version {version_id} as the operative one, \
+             got {}",
+            read.text()
+        );
+        let position: usize = version_id
+            .parse()
+            .expect("an operative version id this suite asserts is a number");
+        assert_eq!(
+            read.member("policyDocument"),
+            document(position),
+            "case {case}: {policy} must hand back version {version_id}'s document, got {}",
+            read.text()
+        );
+    }
 }
