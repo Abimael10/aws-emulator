@@ -44,11 +44,12 @@
 //! uses the model's pattern as written). What this service states, and all it states, is WHICH
 //! values each of those three types admits, because that is a fact about this service.
 //!
-//! One limit of that shared rendering, which it states too: an element set is read off the
-//! operation input schemas codegen derives from the model, and a member schema carries its own
-//! traits and not the members of the shape it targets — so only a TOP-LEVEL collection member
-//! resolves, and a collection nested inside a structure keeps the element path and the one
-//! requirement its element broke.
+//! An element set is read off the schemas codegen derives from the model, and a member schema
+//! carries its own traits and not the members of the shape it targets — so a collection member
+//! of an operation INPUT is looked up by its own name on that input, and one nested inside a
+//! structure or a union variant by its own name on the shape that DECLARES it
+//! ([`NESTED_COLLECTION_SHAPES`]). Rule 2 is about the member a constraint is declared at and
+//! not about where that member sits, so it holds at every depth.
 //!
 //! And one limit of rule 3: a type with no row of its own is listed from the values its model
 //! declares, which is right for a type nothing is known to publish differently. A recorded
@@ -56,7 +57,7 @@
 //! settles a row — not a reading of the model, which by then is the half that is behind.
 
 use ::aws_smithy_schema::Schema;
-use ::aws_smithy_schema_server::constraints::Violation;
+use ::aws_smithy_schema_server::constraints::{Violation, ViolationKind};
 use ::service_common::{validation, validation_message};
 use ::smithy_server_runtime::{Refusal, Refused};
 
@@ -265,6 +266,103 @@ const INPUT_SCHEMAS: &[&Schema] = {
     ]
 };
 
+/// The shapes this service's operation inputs NEST that declare a collection member of
+/// constrained SCALARS — the members a clause of rule 2's class can be stated at below the
+/// top level.
+///
+/// What they are read for: the element shape's constraint set is looked up by the member a
+/// clause is stated at, and codegen attaches a collection member's element constraints to that
+/// member's own schema — which, for a member of a nested structure or a union variant, lives
+/// on THAT shape's schema rather than on the operation input's. So a nested member is looked
+/// up by its OWN name here, which is also why a shape whose collection members hold
+/// STRUCTURES (every one of this service's filter criteria) is absent: a structure element
+/// declares no constraints of its own, and its own members keep their own paths.
+///
+/// A member several of these declare with the same element set reads the same either way, and
+/// one they declare differently resolves to nothing, which leaves the framework's own clause.
+/// `grep -n 'Vec<String>' src/ops/types/*.rs` over the shapes an operation INPUT reaches names
+/// exactly these; one missing from this list is not a wrong clause, only a clause stated at the
+/// offending element rather than at its member.
+const NESTED_COLLECTION_SHAPES: &[&Schema] = {
+    use crate::ops::types;
+
+    &[
+        // A code-security configuration's rule-set categories and continuous-integration
+        // events.
+        types::CODE_SECURITY_SCAN_CONFIGURATION_SCHEMA,
+        types::CONTINUOUS_INTEGRATION_SCAN_CONFIGURATION_SCHEMA,
+        // A connector's Azure regions and the subscription scope each scanning type covers.
+        types::AZURE_PROVIDER_DETAIL_CREATE_SCHEMA,
+        types::AZURE_PROVIDER_DETAIL_UPDATE_SCHEMA,
+        types::SCOPE_CONFIGURATION_INPUT_SCHEMA,
+        // A CIS scan configuration's target accounts and the days of its weekly schedule.
+        types::CREATE_CIS_TARGETS_SCHEMA,
+        types::UPDATE_CIS_TARGETS_SCHEMA,
+        types::WEEKLY_SCHEDULE_SCHEMA,
+        // The vulnerability ids a vulnerability search names.
+        types::SEARCH_VULNERABILITIES_FILTER_CRITERIA_SCHEMA,
+    ]
+};
+
+/// The requirement a clause stated at the collection member `collection` nests (rule 2): the
+/// element shape's whole declared constraint set, inside
+/// `Member must satisfy constraint: [ … ]`, or `None` where no handed-over shape declares a
+/// constraint on that member's elements — which leaves the clause the framework's own.
+///
+/// The constraints are the shared reading of the schemas
+/// ([`validation_message::element_constraint_set`]), the model's constraint for constraint, and
+/// the nesting is that module's too; what this adds is the two renderings this service states a
+/// requirement with wherever it states one — a `@pattern` without the whole-value anchors (the
+/// module header above), and an enumerated set as rule 3 lists it — so a requirement nested in
+/// a collection's clause and the same requirement on a member of its own read alike.
+///
+/// A member of an operation INPUT is looked up by its whole path, and one nested inside a
+/// structure or a union variant by its own member name on the shapes this service nests
+/// ([`NESTED_COLLECTION_SHAPES`]), since that is the schema codegen attached its element
+/// constraints to.
+fn stated_element_set(collection: &str) -> Option<String> {
+    let declared =
+        validation_message::element_constraint_set(INPUT_SCHEMAS, collection).or_else(|| {
+            let (_, nested) = collection.rsplit_once('.')?;
+            validation_message::element_constraint_set(NESTED_COLLECTION_SHAPES, nested)
+        })?;
+    let requirements: Vec<String> = declared.into_iter().map(stated_requirement).collect();
+    Some(validation_message::element_set_requirement(&requirements))
+}
+
+/// One constraint of an element shape as this service states that requirement: the framework's
+/// own sentence ([`validation_message::requirement`]) over the two renderings this service
+/// chooses — the expression without the model's whole-value anchors, and an enumerated set in
+/// the order rule 3 lists it.
+fn stated_requirement(kind: ViolationKind) -> String {
+    let stated = match kind {
+        // The CHECK always used the model's expression as written; only the quoting is this
+        // service's.
+        ViolationKind::Pattern(pattern) => ViolationKind::Pattern(validation::unanchored(&pattern)),
+        ViolationKind::EnumValue(values) => ViolationKind::EnumValue(stated_enum_values(&values)),
+        other => other,
+    };
+    validation_message::requirement(stated)
+}
+
+/// `declared` as this service lists an enumerated type's value set (rule 3), for a caller
+/// holding the values rather than a [`Violation`].
+///
+/// Routed through [`published`] rather than restating rule 3, so a set nested inside a
+/// collection's requirement and a set stated at a member of its own cannot drift apart.
+fn stated_enum_values(declared: &[String]) -> Vec<String> {
+    let listed = published(&Violation {
+        path: String::new(),
+        kind: ViolationKind::EnumValue(declared.to_vec()),
+        value: None,
+        sensitive: false,
+    });
+    match listed.kind {
+        ViolationKind::EnumValue(values) => values,
+        _ => declared.to_vec(),
+    }
+}
+
 /// `violation` with its enumerated value set as this service states one (rule 3): the values
 /// the service publishes, in the order its front door's own table of them is walked.
 ///
@@ -282,8 +380,9 @@ fn published(violation: &Violation) -> Violation {
 /// failure with its own status and code, and nothing about it is this service's to word.
 ///
 /// Rules 3 and 4 are applied to the violations BEFORE the clauses are rendered, so the clause
-/// itself, its member path and the words around the value set stay the framework's; rules 1 and
-/// 2 are the two choices the shared entry point takes.
+/// itself, its member path and the words around the value set stay the framework's; rule 1 and
+/// the element set rule 2 nests are the choices the shared entry point takes
+/// ([`stated_element_set`] for the second).
 pub(crate) fn refused(refusal: &Refusal) -> Option<Refused> {
     let Refusal::Invalid(violations) = refusal else {
         return None;
@@ -295,15 +394,16 @@ pub(crate) fn refused(refusal: &Refusal) -> Option<Refused> {
         .into_iter()
         .cloned()
         .collect();
-    validation_message::aws_validation_refusal_over_elements_withholding(
+    validation_message::aws_validation_refusal_over_elements_stating_withholding(
         &Refusal::Invalid(ordered),
-        INPUT_SCHEMAS,
         // This service quotes a `@pattern` requirement without the whole-value anchors the
         // model wraps the expression in.
         validation::unanchored,
         // Rule 1: no clause of this service's refusals states a value, whichever member it is
         // about, so the decision is the same for every member path.
         |_| true,
+        // Rule 2: the element shape's whole set, at whatever depth the collection member sits.
+        stated_element_set,
     )
 }
 

@@ -11,7 +11,9 @@
 //!    submitted;
 //! 2. a constraint the model declares on the ELEMENTS of a collection member is stated at that
 //!    member — no element position, no `member` step — with every requirement the element shape
-//!    declares nested inside `Member must satisfy constraint: [ … ]`;
+//!    declares nested inside `Member must satisfy constraint: [ … ]`, at whatever DEPTH that
+//!    member sits (an operation input's own member, one inside a structure it nests, one inside
+//!    a union variant, one several structures down);
 //! 3. an enumerated type's value set is listed in the order this service lists that type, which
 //!    is neither the model's declaration order nor sorted, over the values the service
 //!    publishes for it.
@@ -459,6 +461,532 @@ async fn a_value_inside_every_constraint_reaches_the_handler() {
                 .unwrap_or_default()
                 .contains("validation error detected"),
             "case {case:?}: a request inside every constraint must not be refused, got {answer}"
+        );
+    }
+}
+
+// =============================================================================
+// Rule 2 at DEPTH: a collection member nested inside a structure or a union variant.
+// =============================================================================
+
+/// `RuleSetCategory`'s value set as this service lists it — the element shape of a code
+/// security configuration's `ruleSetCategories`.
+/// Source: `smithy_query(query="shape", shape="RuleSetCategory")` for the membership the model
+/// declares (`SAST`, `IAC`, `SCA`).
+const RULE_SET_CATEGORY_SET: &str = "IAC, SAST, SCA";
+
+/// `ContinuousIntegrationScanEvent`'s value set as this service lists it.
+/// Source: `smithy_query(query="shape", shape="ContinuousIntegrationScanEvent")`.
+const CONTINUOUS_INTEGRATION_EVENT_SET: &str = "PULL_REQUEST, PUSH";
+
+/// `Day`'s value set as this service lists it — the days of a CIS weekly schedule.
+/// Source: `smithy_query(query="shape", shape="Day")` for the membership the model declares
+/// (`SUN` … `SAT`).
+const DAY_SET: &str = "THU, TUE, SAT, MON, SUN, WED, FRI";
+
+/// `AzureRegion`'s expression as a requirement quotes it: the model's `@pattern` without its
+/// leading `^` and trailing `$`.
+/// Source: `smithy_query(query="shape", shape="AzureRegion")` (`@length` 1..64).
+const AZURE_REGION_PATTERN: &str = "[a-zA-Z0-9-]+";
+
+/// `ScopeValue`'s expression as a requirement quotes it.
+/// Source: `smithy_query(query="shape", shape="ScopeValue")` (`@length` 36..36).
+const SCOPE_VALUE_PATTERN: &str = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+
+/// `TargetAccount`'s expression as a requirement quotes it — a CIS target account id, which
+/// declares no length bound of its own.
+/// Source: `smithy_query(query="shape", shape="TargetAccountList")`.
+const TARGET_ACCOUNT_PATTERN: &str = r"\d{12}|ALL_ACCOUNTS|SELF";
+
+/// `VulnId`'s expression as a requirement quotes it, which declares no length bound either.
+/// Source: `smithy_query(query="shape", shape="VulnIdList")`.
+const VULN_ID_PATTERN: &str = "CVE-[12][0-9]{3}-[0-9]{1,10}";
+
+/// An `AzureRegion`, a `ScopeValue` and an `AwsConfigConnectorArn` every one of their own
+/// constraints admits, so a `CreateConnector` row refuses exactly the member it means to.
+const AZURE_REGION: &str = "eastus";
+const SCOPE_VALUE: &str = "0123abcd-4567-89ef-0123-456789abcdef";
+const AWS_CONFIG_CONNECTOR_ARN: &str =
+    "arn:aws:config:us-east-1:111122223333:connector/azure/tenant/one";
+
+/// A `ScanConfigurationArn` and a `CisScanConfigurationArn` their own `@pattern`s admit, so an
+/// update row is refused for its nested collection and not for the resource it names.
+/// Source: `smithy_query(query="operation",
+/// operation="UpdateCodeSecurityScanConfiguration,UpdateCisScanConfiguration")`.
+const SCAN_CONFIGURATION_ARN: &str = "arn:aws:inspector2:us-east-1:000000000000:owner/\
+                                      000000000000/codesecurity-configuration/\
+                                      0123abcd-4567-89ab-cdef-0123456789ab";
+const CIS_SCAN_CONFIGURATION_ARN: &str = "arn:aws:inspector2:us-east-1:000000000000:owner/\
+                                          000000000000/cis-configuration/\
+                                          0123abcd-4567-89ab-cdef-0123456789ab";
+
+/// The nested set of an element shape whose only declared constraint is its `@pattern`.
+fn pattern_only(pattern: &str) -> String {
+    element_constraints(&[regular_expression(pattern)])
+}
+
+/// The nested set of an element shape declaring a `@length` band and a `@pattern`, in the
+/// order a clause states them: the maximum, the minimum, then the expression.
+fn length_and_pattern(max: u32, min: u32, pattern: &str) -> String {
+    element_constraints(&[
+        format!("Member must have length less than or equal to {max}"),
+        format!("Member must have length greater than or equal to {min}"),
+        regular_expression(pattern),
+    ])
+}
+
+/// The nested set of an element shape that is an enumerated type.
+fn enum_only(values: &str) -> String {
+    element_constraints(&[enum_value_set(values)])
+}
+
+/// `CreateCodeSecurityScanConfiguration`'s body carrying `configuration`; every other member
+/// is one the model admits.
+fn code_security_body(configuration: Value) -> Value {
+    json!({
+        "name": "inspector-scan-configuration",
+        "level": "ACCOUNT",
+        "configuration": configuration,
+    })
+}
+
+/// `CreateConnector`'s body with the Azure provider detail chosen by the caller.
+fn connector_body(azure_regions: Value, scope_values: Value) -> Value {
+    json!({
+        "name": "inspector-connector",
+        "provider": "AZURE",
+        "providerDetail": {
+            "azure": {
+                "awsConfigConnectorArn": AWS_CONFIG_CONNECTOR_ARN,
+                "scopeConfiguration": {
+                    "vmScanning": { "scopeType": "SUBSCRIPTION", "scopeValues": scope_values }
+                },
+                "azureRegions": azure_regions,
+            }
+        }
+    })
+}
+
+/// `CreateCisScanConfiguration`'s body with the schedule and the target accounts chosen by the
+/// caller.
+fn cis_body(schedule: Value, account_ids: Value) -> Value {
+    json!({
+        "scanName": "inspector-cis-scan",
+        "securityLevel": "LEVEL_1",
+        "schedule": schedule,
+        "targets": {
+            "accountIds": account_ids,
+            "targetResourceTags": { "env": ["production"] },
+        },
+    })
+}
+
+/// A daily schedule every one of its own constraints admits.
+fn daily_schedule() -> Value {
+    json!({ "daily": { "startTime": { "timeOfDay": "12:00", "timezone": "UTC" } } })
+}
+
+/// One row of the depth table: the case, the request, the member the clause must be stated at,
+/// and the nested requirement set it must carry.
+struct NestedRow {
+    case: &'static str,
+    uri: &'static str,
+    body: Value,
+    member: &'static str,
+    requirement: String,
+    /// A value the row submits that must NOT appear in the refusal.
+    submitted: &'static str,
+}
+
+/// The rows span what rule 2 generalises over: the OPERATION, the DEPTH of the collection
+/// member (an operation input's own member, one inside a structure, one inside a union
+/// variant, one four levels down), the element shape's CONSTRAINT CLASS (an enumerated value
+/// set, a `@pattern` alone, a `@length` band with a `@pattern`), HOW MANY constraints the
+/// element shape declares, WHICH element of the collection offends, HOW MANY of them do, and
+/// the FORM of the offending value.
+fn nested_rows() -> Vec<NestedRow> {
+    let rule_set_categories = |case, categories: Value, submitted| NestedRow {
+        case,
+        uri: "/codesecurity/scan-configuration/create",
+        body: code_security_body(json!({ "ruleSetCategories": categories })),
+        member: "configuration.ruleSetCategories",
+        requirement: enum_only(RULE_SET_CATEGORY_SET),
+        submitted,
+    };
+    let supported_events = |case, events: Value, submitted| NestedRow {
+        case,
+        uri: "/codesecurity/scan-configuration/create",
+        body: code_security_body(json!({
+            "ruleSetCategories": ["SAST"],
+            "continuousIntegrationScanConfiguration": { "supportedEvents": events },
+        })),
+        member: "configuration.continuousIntegrationScanConfiguration.supportedEvents",
+        requirement: enum_only(CONTINUOUS_INTEGRATION_EVENT_SET),
+        submitted,
+    };
+    let azure_regions = |case, regions: Value, submitted| NestedRow {
+        case,
+        uri: "/connector/create",
+        body: connector_body(regions, json!([SCOPE_VALUE])),
+        member: "providerDetail.azure.azureRegions",
+        requirement: length_and_pattern(64, 1, AZURE_REGION_PATTERN),
+        submitted,
+    };
+    let target_accounts = |case, account_ids: Value, submitted| NestedRow {
+        case,
+        uri: "/cis/scan-configuration/create",
+        body: cis_body(daily_schedule(), account_ids),
+        member: "targets.accountIds",
+        requirement: pattern_only(TARGET_ACCOUNT_PATTERN),
+        submitted,
+    };
+
+    vec![
+        // An enumerated element set one structure down, over several forms of bad value and
+        // two positions in the collection — the clause names the member either way.
+        rule_set_categories(
+            "a rule set category no release declares, in second position",
+            json!(["SAST", "NOT_A_REAL_RULE_SET_CATEGORY"]),
+            "NOT_A_REAL_RULE_SET_CATEGORY",
+        ),
+        rule_set_categories(
+            "the same category in first position",
+            json!(["NOT_A_REAL_RULE_SET_CATEGORY", "SAST"]),
+            "NOT_A_REAL_RULE_SET_CATEGORY",
+        ),
+        rule_set_categories(
+            "a rule set category in the wrong case",
+            json!(["sast"]),
+            "sast",
+        ),
+        rule_set_categories("an empty rule set category", json!([""]), ""),
+        rule_set_categories(
+            "two offending categories, which are one validation error about one member",
+            json!(["Sast", "Iac"]),
+            "Sast",
+        ),
+        // The same nested member under ANOTHER operation.
+        NestedRow {
+            case: "the same nested member under the update operation",
+            uri: "/codesecurity/scan-configuration/update",
+            body: json!({
+                "scanConfigurationArn": SCAN_CONFIGURATION_ARN,
+                "configuration": { "ruleSetCategories": ["NOT_A_REAL_RULE_SET_CATEGORY"] },
+            }),
+            member: "configuration.ruleSetCategories",
+            requirement: enum_only(RULE_SET_CATEGORY_SET),
+            submitted: "NOT_A_REAL_RULE_SET_CATEGORY",
+        },
+        // Another enumerated element set, two structures down.
+        supported_events(
+            "a continuous integration event no release declares",
+            json!(["NOT_A_REAL_EVENT"]),
+            "NOT_A_REAL_EVENT",
+        ),
+        supported_events(
+            "a continuous integration event in the wrong case, beside an admitted one",
+            json!(["PUSH", "pull_request"]),
+            "pull_request",
+        ),
+        // A `@length` band and a `@pattern` on the elements of a member inside a UNION variant.
+        azure_regions(
+            "an Azure region carrying a character the expression excludes",
+            json!(["east us"]),
+            "east us",
+        ),
+        azure_regions(
+            "a second Azure region that is empty",
+            json!([AZURE_REGION, ""]),
+            "",
+        ),
+        azure_regions(
+            "an Azure region past its length maximum",
+            json!([AZURE_REGION, "x".repeat(65)]),
+            AZURE_REGION,
+        ),
+        // The same classes four levels down: a union variant, then two structures.
+        NestedRow {
+            case: "a scope value that is not a subscription id",
+            uri: "/connector/create",
+            body: connector_body(json!([AZURE_REGION]), json!(["not-a-subscription"])),
+            member: "providerDetail.azure.scopeConfiguration.vmScanning.scopeValues",
+            requirement: length_and_pattern(36, 36, SCOPE_VALUE_PATTERN),
+            submitted: "not-a-subscription",
+        },
+        NestedRow {
+            case: "a second scope value in upper case, which its expression excludes",
+            uri: "/connector/create",
+            body: connector_body(
+                json!([AZURE_REGION]),
+                json!([SCOPE_VALUE, SCOPE_VALUE.to_uppercase()]),
+            ),
+            member: "providerDetail.azure.scopeConfiguration.vmScanning.scopeValues",
+            requirement: length_and_pattern(36, 36, SCOPE_VALUE_PATTERN),
+            submitted: SCOPE_VALUE,
+        },
+        // An element shape whose ONLY declared constraint is its expression.
+        target_accounts(
+            "a CIS target account that is not twelve digits",
+            json!(["notanaccount"]),
+            "notanaccount",
+        ),
+        target_accounts(
+            "a CIS target account token in the wrong case",
+            json!(["000000000000", "all_accounts"]),
+            "all_accounts",
+        ),
+        NestedRow {
+            case: "the same nested member under the CIS update operation",
+            uri: "/cis/scan-configuration/update",
+            body: json!({
+                "scanConfigurationArn": CIS_SCAN_CONFIGURATION_ARN,
+                "targets": { "accountIds": ["notanaccount"] },
+            }),
+            member: "targets.accountIds",
+            requirement: pattern_only(TARGET_ACCOUNT_PATTERN),
+            submitted: "notanaccount",
+        },
+        NestedRow {
+            case: "a vulnerability id that is not a CVE id",
+            uri: "/vulnerabilities/search",
+            body: json!({ "filterCriteria": { "vulnerabilityIds": ["not-a-cve"] } }),
+            member: "filterCriteria.vulnerabilityIds",
+            requirement: pattern_only(VULN_ID_PATTERN),
+            submitted: "not-a-cve",
+        },
+        // An enumerated element set inside a union variant.
+        NestedRow {
+            case: "a weekly schedule day no release declares",
+            uri: "/cis/scan-configuration/create",
+            body: cis_body(
+                json!({
+                    "weekly": {
+                        "startTime": { "timeOfDay": "12:00", "timezone": "UTC" },
+                        "days": ["MON", "FUNDAY"],
+                    }
+                }),
+                json!(["000000000000"]),
+            ),
+            member: "schedule.weekly.days",
+            requirement: enum_only(DAY_SET),
+            submitted: "FUNDAY",
+        },
+        // ...and the operation input's OWN collection member, which is the same rule stated at
+        // depth zero.
+        NestedRow {
+            case: "a finding ARN at the operation input's own member",
+            uri: "/findings/details/batch/get",
+            body: json!({ "findingArns": ["not-an-arn"] }),
+            member: "findingArns",
+            requirement: finding_arn_constraints(),
+            submitted: "not-an-arn",
+        },
+    ]
+}
+
+/// RULE 2 at every depth: each row is refused 400 `ValidationException` with the clause stated
+/// at the collection MEMBER — no element position, no `member` step, the element shape's whole
+/// declared set nested, and no value the request carried.
+#[tokio::test]
+async fn an_element_constraint_is_stated_at_its_collection_member_at_every_depth() {
+    let router = router();
+    for row in nested_rows() {
+        let (status, error_type, body) = post_in(&router, "us-east-1", row.uri, &row.body).await;
+        assert_eq!(
+            status, 400,
+            "case {:?}: expected 400, got {status} / {body}",
+            row.case
+        );
+        assert_eq!(
+            error_type.as_deref(),
+            Some("ValidationException"),
+            "case {:?}: expected ValidationException, got {error_type:?} / {body}",
+            row.case
+        );
+        let message = body["message"].as_str().unwrap_or_else(|| {
+            panic!("case {:?}: the refusal carries no message: {body}", row.case)
+        });
+        assert_eq!(
+            message,
+            one_error(row.member, &row.requirement),
+            "case {:?}: unexpected refusal wording, got {message:?}",
+            row.case
+        );
+        assert!(
+            !message.contains(".member'") && !message.contains(".1.") && !message.contains(".2."),
+            "case {:?}: the clause must name the member and no element position, got {message:?}",
+            row.case
+        );
+        assert!(
+            !message.contains(&format!("'{}'", row.submitted)),
+            "case {:?}: the refusal must not quote the submitted value, got {message:?}",
+            row.case
+        );
+    }
+}
+
+/// RULE 1 for a nested collection: the refusal does not vary with the value — every unmodelled
+/// rule set category is refused with one sentence, so a client matching it matches for every
+/// bad input rather than for one.
+#[tokio::test]
+async fn a_nested_element_refusal_is_the_same_sentence_for_every_rejected_value() {
+    let router = router();
+    // Rows differ along the FORM of the rejected value: emptiness, case, a trailing space,
+    // punctuation, a non-ASCII value, length, and how many elements offend.
+    let categories: [Value; 8] = [
+        json!([""]),
+        json!(["sast"]),
+        json!(["Sast"]),
+        json!(["SAST "]),
+        json!(["SAST=SAST"]),
+        json!(["КАТЕГОРИЯ"]),
+        json!(["A_RULE_SET_CATEGORY_THAT_IS_RATHER_LONGER_THAN_THE_OTHERS"]),
+        json!(["sast", "iac", "sca"]),
+    ];
+
+    let expected = one_error(
+        "configuration.ruleSetCategories",
+        &enum_only(RULE_SET_CATEGORY_SET),
+    );
+    for submitted in categories {
+        let body = code_security_body(json!({ "ruleSetCategories": submitted }));
+        let (status, _, answer) = post_in(
+            &router,
+            "us-east-1",
+            "/codesecurity/scan-configuration/create",
+            &body,
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {submitted:?}: expected 400, got {status} / {answer}"
+        );
+        assert_eq!(
+            answer["message"].as_str(),
+            Some(expected.as_str()),
+            "case {submitted:?}: every rejected value must be refused with one sentence, got \
+             {answer}"
+        );
+    }
+}
+
+/// A constraint the COLLECTION ITSELF broke keeps its own requirement: the grouping is about a
+/// constraint declared on the ELEMENTS, so a nested list over or under its own `@length` bound
+/// is not stated as an element set.
+#[tokio::test]
+async fn a_bound_on_the_nested_collection_itself_keeps_its_own_requirement() {
+    let router = router();
+    // Rows differ along WHICH bound the collection broke and which member carries it.
+    let cases: [(&str, &str, Value, &str, &str); 3] = [
+        (
+            "an empty rule set category list, under its minimum",
+            "/codesecurity/scan-configuration/create",
+            code_security_body(json!({ "ruleSetCategories": [] })),
+            "configuration.ruleSetCategories",
+            "Member must have length greater than or equal to 1",
+        ),
+        (
+            "a rule set category list past its maximum",
+            "/codesecurity/scan-configuration/create",
+            code_security_body(json!({ "ruleSetCategories": ["SAST", "IAC", "SCA", "SAST"] })),
+            "configuration.ruleSetCategories",
+            "Member must have length less than or equal to 3",
+        ),
+        (
+            "an empty Azure region list, under its minimum",
+            "/connector/create",
+            connector_body(json!([]), json!([SCOPE_VALUE])),
+            "providerDetail.azure.azureRegions",
+            "Member must have length greater than or equal to 1",
+        ),
+    ];
+
+    for (case, uri, body, member, requirement) in cases {
+        let (status, _, answer) = post_in(&router, "us-east-1", uri, &body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status} / {answer}"
+        );
+        assert_eq!(
+            answer["message"].as_str(),
+            Some(one_error(member, requirement).as_str()),
+            "case {case:?}: a bound on the collection itself keeps its own requirement, got \
+             {answer}"
+        );
+    }
+}
+
+/// A nested collection every element constraint admits reaches the HANDLER: the rows above fail
+/// for the element constraint they name and not because the request was malformed in some other
+/// way.
+///
+/// Each row states the status its operation answers once the boundary has let the request
+/// through — 200 for an implemented operation, and the 501 an operation still carrying the
+/// scaffold header answers (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' src/ops/`).
+#[tokio::test]
+async fn a_nested_collection_inside_every_element_constraint_reaches_the_handler() {
+    let router = router();
+    let served: [(&str, &str, Value); 5] = [
+        (
+            "rule set categories and continuous integration events the enums declare",
+            "/codesecurity/scan-configuration/create",
+            code_security_body(json!({
+                "ruleSetCategories": ["SAST", "IAC", "SCA"],
+                "continuousIntegrationScanConfiguration": {
+                    "supportedEvents": ["PULL_REQUEST", "PUSH"]
+                },
+            })),
+        ),
+        (
+            "Azure regions and scope values their own constraints admit",
+            "/connector/create",
+            connector_body(json!([AZURE_REGION]), json!([SCOPE_VALUE])),
+        ),
+        (
+            "CIS target accounts the expression admits",
+            "/cis/scan-configuration/create",
+            cis_body(daily_schedule(), json!(["000000000000", "SELF"])),
+        ),
+        (
+            "weekly schedule days the enum declares",
+            "/cis/scan-configuration/create",
+            cis_body(
+                json!({
+                    "weekly": {
+                        "startTime": { "timeOfDay": "12:00", "timezone": "UTC" },
+                        "days": ["MON", "FRI"],
+                    }
+                }),
+                json!(["000000000000"]),
+            ),
+        ),
+        (
+            "a vulnerability id the expression admits",
+            "/vulnerabilities/search",
+            json!({ "filterCriteria": { "vulnerabilityIds": ["CVE-2024-0001"] } }),
+        ),
+    ];
+
+    for (case, uri, body) in served {
+        let (status, error_type, answer) = post_in(&router, "us-east-1", uri, &body).await;
+        assert!(
+            status == 200 || status == 501,
+            "case {case:?}: expected the request to reach the handler, got {status} / \
+             {error_type:?} / {answer}"
+        );
+        assert_ne!(
+            error_type.as_deref(),
+            Some("ValidationException"),
+            "case {case:?}: a collection inside every element constraint must not be refused, \
+             got {answer}"
+        );
+        assert!(
+            !answer["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("validation error detected"),
+            "case {case:?}: a collection inside every element constraint must not be refused, \
+             got {answer}"
         );
     }
 }
