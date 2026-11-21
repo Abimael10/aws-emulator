@@ -39,5 +39,11 @@ base64 = "0.22"
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
+[dev-dependencies]
+# `test-util` on top of the workspace features: the suites that let a long poll's own
+# documented 60-second hold run out do it on a PAUSED clock, so virtual time carries the
+# wait and no test sleeps it out.
+tokio = { workspace = true, features = ["time", "test-util"] }
+
 [lints]
 workspace = true

@@ -2506,12 +2506,6 @@ pub struct Domain {
     /// [`new_run_id`]. Strictly increasing and never reused, so no two runs of this
     /// domain can be given the same `runId`.
     pub next_run_sequence: u64,
-    /// `(which kind of task, task-list name)` -> how many long polls of that kind are
-    /// open on that list of this domain RIGHT NOW. A poll is counted while it holds its
-    /// answer open and uncounted the instant it ends, which is what
-    /// [`MAX_POLLERS_PER_TASK_LIST`] is enforced against; an entry drops out of the map
-    /// when its last poller leaves, so the map holds only lists with live pollers.
-    pub pollers: HashMap<(TaskKind, String), usize>,
 }
 
 impl Domain {
@@ -2529,7 +2523,6 @@ impl Domain {
             executions: HashMap::new(),
             open_by_workflow_id: HashMap::new(),
             next_run_sequence: 0,
-            pollers: HashMap::new(),
         }
     }
 
@@ -3016,50 +3009,6 @@ impl Domain {
         parent_execution.schedule_decision_task_if_idle(at);
     }
 
-    /// How many decision-task long polls are open on `task_list` of this domain.
-    pub fn open_decision_pollers(&self, task_list: &str) -> usize {
-        self.open_pollers(TaskKind::Decision, task_list)
-    }
-
-    /// How many activity-task long polls are open on `task_list` of this domain.
-    pub fn open_activity_pollers(&self, task_list: &str) -> usize {
-        self.open_pollers(TaskKind::Activity, task_list)
-    }
-
-    /// How many long polls of `kind` are open on `task_list` of this domain.
-    pub fn open_pollers(&self, kind: TaskKind, task_list: &str) -> usize {
-        self.pollers
-            .get(&(kind, task_list.to_string()))
-            .copied()
-            .unwrap_or(0)
-    }
-
-    /// Count one more poller of `kind` on `task_list`, or answer `false` when that list
-    /// already holds [`MAX_POLLERS_PER_TASK_LIST`] of them — the admission a
-    /// `LimitExceededFault` refuses.
-    pub fn admit_poller(&mut self, kind: TaskKind, task_list: &str) -> bool {
-        let open = self
-            .pollers
-            .entry((kind, task_list.to_string()))
-            .or_insert(0);
-        if *open >= MAX_POLLERS_PER_TASK_LIST {
-            return false;
-        }
-        *open += 1;
-        true
-    }
-
-    /// Give back one poller slot of `kind` on `task_list`.
-    pub fn release_poller(&mut self, kind: TaskKind, task_list: &str) {
-        let key = (kind, task_list.to_string());
-        if let Some(open) = self.pollers.get_mut(&key) {
-            *open = open.saturating_sub(1);
-            if *open == 0 {
-                self.pollers.remove(&key);
-            }
-        }
-    }
-
     /// Drop this domain's open-run index entry for `(workflow_id, run_id)`, the move a
     /// close makes: the `workflowId` becomes startable again.
     ///
@@ -3097,6 +3046,11 @@ impl PollerSlot {
     /// Take one poller slot of `kind` on `(domain, task_list)` through the already-held
     /// `guard`, or answer `None` when that task list is at
     /// [`MAX_POLLERS_PER_TASK_LIST`].
+    ///
+    /// The count is kept per `(kind, domain, task_list)` on the store itself rather than
+    /// inside the domain record, so EVERY open long poll is counted and bounded — a poll
+    /// naming a domain the store does not hold included, which has no domain record to be
+    /// counted in and yet holds its answer open just as long.
     pub fn admit(
         state: &::engine::ServiceState<ComAmazonawsSwfSimpleworkflowserviceState>,
         guard: &mut ComAmazonawsSwfSimpleworkflowserviceState,
@@ -3105,9 +3059,7 @@ impl PollerSlot {
         task_list: &str,
     ) -> Option<Self> {
         guard
-            .domains
-            .get_mut(domain)?
-            .admit_poller(kind, task_list)
+            .admit_poller(kind, domain, task_list)
             .then(|| Self {
                 state: state.clone(),
                 kind,
@@ -3129,10 +3081,9 @@ impl ::std::fmt::Debug for PollerSlot {
 
 impl Drop for PollerSlot {
     fn drop(&mut self) {
-        let mut guard = self.state.lock();
-        if let Some(domain) = guard.domains.get_mut(&self.domain) {
-            domain.release_poller(self.kind, &self.task_list);
-        }
+        self.state
+            .lock()
+            .release_poller(self.kind, &self.domain, &self.task_list);
     }
 }
 
@@ -3142,9 +3093,62 @@ pub struct ComAmazonawsSwfSimpleworkflowserviceState {
     /// Domain name -> the domain. Domain names are unique per region, and this
     /// emulator serves one account, so the name is the whole key.
     pub domains: HashMap<String, Domain>,
+    /// `(which kind of task, domain name, task-list name)` -> how many long polls of that
+    /// kind are open on that list RIGHT NOW. A poll is counted while it holds its answer
+    /// open and uncounted the instant it ends, which is what [`MAX_POLLERS_PER_TASK_LIST`]
+    /// is enforced against; an entry drops out of the map when its last poller leaves, so
+    /// the map holds only lists with live pollers and never grows past the polls in flight.
+    /// The count lives here rather than on the domain record because a poll names its task
+    /// list before anything resolves the domain, so a poll of a name the store does not
+    /// hold is counted and bounded like any other.
+    pub pollers: HashMap<(TaskKind, String, String), usize>,
 }
 
 impl ComAmazonawsSwfSimpleworkflowserviceState {
+    /// How many decision-task long polls are open on `task_list` of `domain`.
+    pub fn open_decision_pollers(&self, domain: &str, task_list: &str) -> usize {
+        self.open_pollers(TaskKind::Decision, domain, task_list)
+    }
+
+    /// How many activity-task long polls are open on `task_list` of `domain`.
+    pub fn open_activity_pollers(&self, domain: &str, task_list: &str) -> usize {
+        self.open_pollers(TaskKind::Activity, domain, task_list)
+    }
+
+    /// How many long polls of `kind` are open on `task_list` of `domain`.
+    pub fn open_pollers(&self, kind: TaskKind, domain: &str, task_list: &str) -> usize {
+        self.pollers
+            .get(&(kind, domain.to_string(), task_list.to_string()))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Count one more poller of `kind` on `task_list` of `domain`, or answer `false` when
+    /// that list already holds [`MAX_POLLERS_PER_TASK_LIST`] of them — the admission a
+    /// `LimitExceededFault` refuses.
+    pub fn admit_poller(&mut self, kind: TaskKind, domain: &str, task_list: &str) -> bool {
+        let open = self
+            .pollers
+            .entry((kind, domain.to_string(), task_list.to_string()))
+            .or_insert(0);
+        if *open >= MAX_POLLERS_PER_TASK_LIST {
+            return false;
+        }
+        *open += 1;
+        true
+    }
+
+    /// Give back one poller slot of `kind` on `task_list` of `domain`.
+    pub fn release_poller(&mut self, kind: TaskKind, domain: &str, task_list: &str) {
+        let key = (kind, domain.to_string(), task_list.to_string());
+        if let Some(open) = self.pollers.get_mut(&key) {
+            *open = open.saturating_sub(1);
+            if *open == 0 {
+                self.pollers.remove(&key);
+            }
+        }
+    }
+
     /// The domain a `resourceArn` addresses: the stored domain whose own ARN is
     /// exactly this one.
     ///

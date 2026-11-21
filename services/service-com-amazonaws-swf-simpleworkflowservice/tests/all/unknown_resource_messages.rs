@@ -396,7 +396,7 @@ async fn an_absent_domain_is_reported_as_the_resource_whose_lookup_failed() {
     // is absent; an operation that WRITES — registering, deprecating, undeprecating or
     // deleting a type, starting, signalling, cancelling or terminating a run — resolves
     // the domain it writes into first, so an absent domain is named as the domain, as is
-    // a domain an operation merely works inside (a listing, a poll) or addresses
+    // a domain an operation merely works inside (a listing) or addresses
     // directly (a domain lifecycle call).
     let emulator = Emulator::new();
     let absent = "no-such-domain";
@@ -453,7 +453,10 @@ async fn an_absent_domain_is_reported_as_the_resource_whose_lookup_failed() {
     }
 
     // Domain-addressing, domain-scoped and domain-writing operations: the domain IS the
-    // resource that could not be resolved, so the message names it.
+    // resource that could not be resolved, so the message names it. The two LONG POLLS
+    // are not among them: a poll of a task list holds its answer open and completes
+    // empty rather than reporting a missing resource, which `poll_for_decision_task` and
+    // `poll_for_activity_task` assert.
     let domain_requests: Vec<(&str, Value)> = vec![
         ("DescribeDomain", json!({ "name": absent })),
         ("DeprecateDomain", json!({ "name": absent })),
@@ -462,14 +465,6 @@ async fn an_absent_domain_is_reported_as_the_resource_whose_lookup_failed() {
         (
             "ListOpenWorkflowExecutions",
             json!({ "domain": absent, "startTimeFilter": { "oldestDate": 0 } }),
-        ),
-        (
-            "PollForDecisionTask",
-            json!({ "domain": absent, "taskList": { "name": "tasks" } }),
-        ),
-        (
-            "PollForActivityTask",
-            json!({ "domain": absent, "taskList": { "name": "tasks" } }),
         ),
         (
             // A registration writes INTO the domain, so the domain is what must resolve.

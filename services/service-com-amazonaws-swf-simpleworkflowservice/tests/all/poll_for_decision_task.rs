@@ -14,10 +14,10 @@
 //! `previousStartedEventId`, and a page of the run's events. A task is handed out at most
 //! once, a list with nothing waiting is held open — the call is the documented long poll,
 //! so the empty result (`taskToken` an empty string) comes only once the documented
-//! 60-second timeout has passed — a task not completed within its own
-//! `startToCloseTimeout` is timed out
-//! and replaced by the server at the instant that duration runs out, and an unregistered
-//! domain is the modelled `UnknownResourceFault`.
+//! 60-second timeout has passed, whatever the reason the list holds nothing assignable,
+//! a `domain` that resolves to no stored domain included — and a task not completed
+//! within its own `startToCloseTimeout` is timed out and replaced by the server at the
+//! instant that duration runs out.
 //!
 //! Every row varies what the rule generalises over — where the task list came from, the
 //! identity's size, the `workflowId`'s shape, how many runs share one list, the task
@@ -29,9 +29,10 @@ use serde_json::{json, Value};
 use service_com_amazonaws_swf_simpleworkflowservice::ops::types::{
     DECISION_TASK_TIMEOUT_TYPE_VALUES, EVENT_TYPE_VALUES,
 };
+use service_com_amazonaws_swf_simpleworkflowservice::state::POLL_TIMEOUT;
 
 use super::workflow_execution_lifecycle::{
-    full_defaults, merge, seeded, string_at, whole_history, Emulator,
+    error_code, full_defaults, merge, seeded, string_at, whole_history, Emulator,
 };
 
 /// The workflow type every run in this suite is started with.
@@ -159,18 +160,24 @@ fn event_id_member(body: &Value, member: &str) -> i64 {
 }
 
 /// Assert a poll of a task list with NOTHING waiting holds the connection open instead
-/// of answering.
+/// of answering, for the whole of `probe`.
 ///
 /// `PollForDecisionTask` is a long poll: "the service holds the HTTP connection open and
 /// responds as soon a task becomes available. If no decision task is available in the
 /// specified task list before the timeout of 60 seconds expires, an empty result is
-/// returned." So a drained list answers nothing for that long; [`HOLD_OPEN_PROBE`] is far
-/// below the timeout, and a poll that answers inside it is the failure. (The empty answer
-/// the timeout eventually produces is asserted by the `decision_task_poller_cap` suite's
-/// own hold-open case, which does not wait the documented minute out either.)
-async fn assert_holds_open(emulator: &Emulator, case: &str, domain: &str, task_list: &str) {
+/// returned." So a drained list answers nothing for that long; a poll that answers inside
+/// `probe` is the failure. On the real clock the probe is [`HOLD_OPEN_PROBE`], far below
+/// the documented timeout; a case running on a PAUSED clock passes a probe up to that
+/// timeout, which virtual time carries without anything sleeping.
+async fn assert_holds_open_for(
+    emulator: &Emulator,
+    case: &str,
+    domain: &str,
+    task_list: &str,
+    probe: std::time::Duration,
+) {
     let answered = tokio::time::timeout(
-        HOLD_OPEN_PROBE,
+        probe,
         emulator.call(
             "PollForDecisionTask",
             &json!({ "domain": domain, "taskList": { "name": task_list } }),
@@ -182,6 +189,12 @@ async fn assert_holds_open(emulator: &Emulator, case: &str, domain: &str, task_l
         "case {case:?}: a poll of a task list with nothing waiting holds the connection \
          open rather than answering, got {answered:?}"
     );
+}
+
+/// Assert a poll of a task list with nothing waiting holds the connection open through
+/// [`HOLD_OPEN_PROBE`] — the real-clock probe every case on the real clock uses.
+async fn assert_holds_open(emulator: &Emulator, case: &str, domain: &str, task_list: &str) {
+    assert_holds_open_for(emulator, case, domain, task_list, HOLD_OPEN_PROBE).await;
 }
 
 /// One run polled for its first decision task.
@@ -804,18 +817,6 @@ async fn a_poll_the_service_cannot_serve_is_refused_without_changing_anything() 
     let list = "deciders-refusals";
     let run_id = start(&emulator, "refusals", "wf-refusals", Some(list), None, None).await;
 
-    // A domain that was never registered addresses no task list at all.
-    for domain in ["never-registered", "REFUSALS", "refusals-2"] {
-        emulator
-            .refused(
-                domain,
-                "PollForDecisionTask",
-                &json!({ "domain": domain, "taskList": { "name": list } }),
-                "UnknownResourceFault",
-            )
-            .await;
-    }
-
     // SWF's naming rule, which the model cannot express: "The specified string must not
     // start or end with whitespace. It must not contain a : (colon), / (slash), |
     // (vertical bar), or any control characters (\u0000-\u001f | \u007f-\u009f). Also, it
@@ -885,6 +886,44 @@ async fn a_poll_the_service_cannot_serve_is_refused_without_changing_anything() 
             .await;
     }
 
+    // A token addresses the task of ONE run, so the same token under a domain the store
+    // does not hold addresses no task at all: the modelled `UnknownResourceFault` naming
+    // the execution the token addresses, which is the leaf this paging read resolves.
+    for domain in ["never-registered", "REFUSALS", "refusals-2"] {
+        let case = format!("a token paged under {domain}");
+        let (status, body) = emulator
+            .call(
+                "PollForDecisionTask",
+                &json!({
+                    "domain": domain,
+                    "taskList": { "name": list },
+                    "nextPageToken": token.clone(),
+                    "maximumPageSize": 1,
+                }),
+            )
+            .await;
+        assert_eq!(
+            (
+                status,
+                error_code(&body).as_str(),
+                body.get("message").and_then(Value::as_str),
+            ),
+            (
+                400,
+                "UnknownResourceFault",
+                Some(
+                    format!(
+                        "Unknown execution: WorkflowExecution=[workflowId=wf-refusals, \
+                         runId={run_id}]"
+                    )
+                    .as_str()
+                ),
+            ),
+            "case {case:?}: paging a token under a domain the store does not hold is the \
+             modelled fault naming the execution the token addresses, got {body:?}"
+        );
+    }
+
     // The valid token still pages the same task, so the refusals changed nothing.
     let next = poll(
         &emulator,
@@ -941,4 +980,163 @@ async fn a_page_token_of_a_task_that_is_over_no_longer_pages() {
             "ValidationException",
         )
         .await;
+}
+
+/// Assert one answer is the documented EMPTY result of this long poll: 200, `taskToken`
+/// an empty string, and every other modelled member at the value that identifies no task.
+fn assert_empty_decision_task(case: &str, status: u16, body: &Value) {
+    assert_eq!(
+        status, 200,
+        "case {case:?}: a poll with nothing assignable completes the long poll rather \
+         than refusing it, got {status} with {body:?}"
+    );
+    let token = body.get("taskToken").and_then(Value::as_str).unwrap_or("");
+    assert!(
+        token.is_empty(),
+        "case {case:?}: the empty result's taskToken is an empty string, got {token:?} \
+         in {body:?}"
+    );
+    assert_eq!(
+        (
+            event_id_member(body, "startedEventId"),
+            event_id_member(body, "previousStartedEventId"),
+        ),
+        (0, 0),
+        "case {case:?}: the empty result reports no event ids, got {body:?}"
+    );
+    let events = body
+        .pointer("/events")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    assert_eq!(
+        events, 0,
+        "case {case:?}: the empty result carries no history events, got {body:?}"
+    );
+    assert!(
+        body.get("nextPageToken").is_none(),
+        "case {case:?}: the empty result pages nothing, got {body:?}"
+    );
+    for member in ["/workflowExecution/workflowId", "/workflowExecution/runId"] {
+        let named = body.pointer(member).and_then(Value::as_str).unwrap_or("");
+        assert!(
+            named.is_empty(),
+            "case {case:?}: the empty result names no run at {member}, got {named:?} in \
+             {body:?}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_poll_with_nothing_assignable_completes_empty_whether_or_not_its_domain_exists() {
+    // The rule one level up: this call is a long poll, so a poll that finds nothing
+    // assignable in the task list it names is HELD and then answered with the documented
+    // empty result — and a `domain` that resolves to no stored domain is one such list,
+    // because a poll only hands over a task that is waiting and no task is waiting under
+    // a name the store knows nothing about.
+    //
+    // Every row runs on a PAUSED clock: the documented hold is 60 seconds, so virtual
+    // time carries the wait while nothing sleeps, and a row that was refused instead of
+    // held would answer before the clock ever moved.
+    let emulator = Emulator::new();
+    let registered = "empty-poll";
+    seed(&emulator, registered).await;
+
+    // The modelled `DomainName` is `len 1..256`
+    // (`smithy_query(query="shape",shape="DomainName")`), so 256 characters is the
+    // longest name a request may carry at all.
+    let longest_name = "d".repeat(256);
+    // Rows vary WHY the list holds nothing assignable and the shape of the name that
+    // holds it: a registered domain with an idle list, a name never registered, a
+    // registered name differing only in case, a registered name with a suffix, the
+    // longest name the model admits, and a name outside ASCII — plus which task list is
+    // polled, including one no start ever named.
+    let rows: Vec<(&str, String, &str)> = vec![
+        (
+            "a registered domain whose list holds nothing",
+            registered.to_string(),
+            "deciders-idle",
+        ),
+        (
+            "a name that was never registered",
+            "never-registered".to_string(),
+            DEFAULT_LIST,
+        ),
+        (
+            "a registered name in another case",
+            registered.to_uppercase(),
+            DEFAULT_LIST,
+        ),
+        (
+            "a registered name with a suffix",
+            format!("{registered}-2"),
+            "deciders-elsewhere",
+        ),
+        (
+            "the longest name the model admits",
+            longest_name.clone(),
+            DEFAULT_LIST,
+        ),
+        (
+            "a name outside ASCII",
+            "dömäin-ünregistered".to_string(),
+            "déciders",
+        ),
+    ];
+
+    for (case, domain, task_list) in &rows {
+        // The HOLD itself, before the answer: half the documented timeout passes on the
+        // paused clock with the call still unanswered, so the empty result below is the
+        // end of a long poll and not an immediate answer.
+        assert_holds_open_for(&emulator, case, domain, task_list, POLL_TIMEOUT / 2).await;
+
+        let (status, body) = emulator
+            .call(
+                "PollForDecisionTask",
+                &json!({
+                    "domain": domain,
+                    "taskList": { "name": task_list },
+                    "identity": "decider-empty",
+                }),
+            )
+            .await;
+        assert_empty_decision_task(case, status, &body);
+    }
+
+    // A poll creates nothing: every name the polls above found nothing under is still
+    // unknown to the operations that address a domain directly.
+    for (case, domain, _) in rows.iter().skip(1) {
+        emulator
+            .refused(
+                case,
+                "DescribeDomain",
+                &json!({ "name": domain }),
+                "UnknownResourceFault",
+            )
+            .await;
+        emulator
+            .refused(
+                case,
+                "StartWorkflowExecution",
+                &json!({
+                    "domain": domain,
+                    "workflowId": "wf-unknown-domain",
+                    "workflowType": { "name": WORKFLOW_TYPE.0, "version": WORKFLOW_TYPE.1 },
+                }),
+                "UnknownResourceFault",
+            )
+            .await;
+    }
+
+    // And a poll that CAN be served still is: the run started now is handed over with a
+    // real token, so holding the empty polls open changed nothing about the positive path.
+    let case = "served after the empty polls";
+    let run_id = start(&emulator, registered, "wf-after-empty", None, None, None).await;
+    let answer = poll(&emulator, case, registered, DEFAULT_LIST, json!({})).await;
+    let token = handed_out_token(case, &answer);
+    assert_eq!(
+        string_at(&answer, "/workflowExecution/runId"),
+        run_id,
+        "case {case:?}: the waiting task is still handed over, got token {token:?} in \
+         {answer:?}"
+    );
 }

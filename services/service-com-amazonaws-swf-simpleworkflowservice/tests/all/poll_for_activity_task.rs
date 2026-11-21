@@ -12,9 +12,10 @@
 //! scheduling event: its `activityId`, its `activityType` and the `input` it was
 //! scheduled with, plus the new event's id as `startedEventId`, the run it belongs to and
 //! an opaque handle on that one task. A task is handed out at most once, a list with
-//! nothing waiting is held open (the call is the documented long poll), a task is timed
-//! out by the service itself at the instant the earliest of its own durations runs out,
-//! and an unregistered domain is the modelled `UnknownResourceFault`.
+//! nothing waiting is held open and then answered with the documented empty result
+//! (`taskToken` an empty string), whatever the reason the list holds nothing assignable —
+//! a `domain` that resolves to no stored domain included — and a task is timed out by the
+//! service itself at the instant the earliest of its own durations runs out.
 //!
 //! Every row varies what the rule generalises over — where the task list came from, the
 //! shape and size of the `activityId`, the `input` payload (absent, text, the modelled
@@ -30,6 +31,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_swf_simpleworkflowservice::ops::types::{
     ACTIVITY_TASK_TIMEOUT_TYPE_VALUES, EVENT_TYPE_VALUES,
 };
+use service_com_amazonaws_swf_simpleworkflowservice::state::POLL_TIMEOUT;
 
 use super::workflow_execution_lifecycle::{
     error_code, full_defaults, i64_at, merge, seeded, string_at, whole_history, Emulator,
@@ -236,16 +238,24 @@ fn events_typed(events: &[Value], event_type: &str) -> Vec<Value> {
 }
 
 /// Assert a poll of a task list with NOTHING waiting holds the connection open instead
-/// of answering.
+/// of answering, for the whole of `probe`.
 ///
 /// The call is a long poll — "the service holds the HTTP connection open and responds as
 /// soon as a task becomes available. The maximum time the service holds on to the request
-/// before responding is 60 seconds" — so a drained list answers nothing for that long;
-/// [`HOLD_OPEN_PROBE`] is far below the timeout, and a poll that answers inside it is the
-/// failure.
-async fn assert_holds_open(emulator: &Emulator, case: &str, domain: &str, task_list: &str) {
+/// before responding is 60 seconds" — so a drained list answers nothing for that long; a
+/// poll that answers inside `probe` is the failure. On the real clock the probe is
+/// [`HOLD_OPEN_PROBE`], far below the documented timeout; a case running on a PAUSED clock
+/// passes a probe up to that timeout, which virtual time carries without anything
+/// sleeping.
+async fn assert_holds_open_for(
+    emulator: &Emulator,
+    case: &str,
+    domain: &str,
+    task_list: &str,
+    probe: Duration,
+) {
     let answered = tokio::time::timeout(
-        HOLD_OPEN_PROBE,
+        probe,
         emulator.call(
             "PollForActivityTask",
             &json!({ "domain": domain, "taskList": { "name": task_list } }),
@@ -257,6 +267,12 @@ async fn assert_holds_open(emulator: &Emulator, case: &str, domain: &str, task_l
         "case {case:?}: a poll of a task list with no activity task waiting holds the \
          connection open rather than answering, got {answered:?}"
     );
+}
+
+/// Assert a poll of a task list with nothing waiting holds the connection open through
+/// [`HOLD_OPEN_PROBE`] — the real-clock probe every case on the real clock uses.
+async fn assert_holds_open(emulator: &Emulator, case: &str, domain: &str, task_list: &str) {
+    assert_holds_open_for(emulator, case, domain, task_list, HOLD_OPEN_PROBE).await;
 }
 
 /// One scheduled-then-polled activity task: where its task list came from, the shape of
@@ -642,23 +658,10 @@ async fn concurrent_pollers_of_one_list_are_each_handed_a_different_task() {
 }
 
 #[tokio::test]
-async fn an_unknown_domain_or_a_task_list_name_outside_the_naming_rule_is_refused() {
+async fn a_task_list_name_outside_the_naming_rule_is_refused() {
     let emulator = Emulator::new();
     let domain = "refusals";
     seed(&emulator, domain).await;
-
-    // A task list lives inside a domain, so a domain that was never registered — or one
-    // differing only in case — addresses no task list at all.
-    for unknown in ["never-registered", "REFUSALS", "refusals-2"] {
-        emulator
-            .refused(
-                unknown,
-                "PollForActivityTask",
-                &json!({ "domain": unknown, "taskList": { "name": REGISTERED_LIST } }),
-                "UnknownResourceFault",
-            )
-            .await;
-    }
 
     // The naming rule stated on every user-supplied SWF name, `taskList.name` included:
     // "The specified string must not start or end with whitespace. It must not contain a
@@ -691,13 +694,14 @@ async fn an_unknown_domain_or_a_task_list_name_outside_the_naming_rule_is_refuse
     let (status, body) = emulator
         .call(
             "PollForActivityTask",
-            &json!({ "domain": "never-registered", "taskList": { "name": REGISTERED_LIST } }),
+            &json!({ "domain": domain, "taskList": { "name": "activities:1" } }),
         )
         .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (400, "UnknownResourceFault"),
-        "a poll of an unregistered domain is 400 UnknownResourceFault, got {body:?}"
+        (400, "ValidationException"),
+        "a poll naming a task list outside the naming rule is 400 ValidationException, \
+         got {body:?}"
     );
     let after = whole_history(&emulator, domain, "wf-untouched", &run_id).await;
     assert_eq!(
@@ -893,4 +897,150 @@ async fn a_task_times_out_under_the_earliest_of_its_own_durations() {
         // than handed the task that is over.
         assert_holds_open(&emulator, row.case, domain, &list).await;
     }
+}
+
+/// Assert one answer is the documented EMPTY result of this long poll: 200, `taskToken`
+/// an empty string, and every other modelled member at the value that identifies no task.
+fn assert_empty_activity_task(case: &str, status: u16, body: &Value) {
+    assert_eq!(
+        status, 200,
+        "case {case:?}: a poll with nothing assignable completes the long poll rather \
+         than refusing it, got {status} with {body:?}"
+    );
+    for member in [
+        "/taskToken",
+        "/activityId",
+        "/activityType/name",
+        "/activityType/version",
+        "/workflowExecution/workflowId",
+        "/workflowExecution/runId",
+    ] {
+        let value = body.pointer(member).and_then(Value::as_str).unwrap_or("");
+        assert!(
+            value.is_empty(),
+            "case {case:?}: the empty result identifies no task at {member}, got \
+             {value:?} in {body:?}"
+        );
+    }
+    assert_eq!(
+        body.get("startedEventId").and_then(Value::as_i64).unwrap_or(0),
+        0,
+        "case {case:?}: the empty result reports no started event, got {body:?}"
+    );
+    assert!(
+        body.get("input").is_none(),
+        "case {case:?}: the empty result carries no input payload, got {body:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_poll_with_nothing_assignable_completes_empty_whether_or_not_its_domain_exists() {
+    // The rule one level up: this call is a long poll, so a poll that finds nothing
+    // assignable in the task list it names is HELD and then answered with the documented
+    // empty result — and a `domain` that resolves to no stored domain is one such list,
+    // because a poll only hands over a task that is waiting and no task is waiting under
+    // a name the store knows nothing about.
+    //
+    // Every row runs on a PAUSED clock: the documented hold is 60 seconds, so virtual
+    // time carries the wait while nothing sleeps, and a row that was refused instead of
+    // held would answer before the clock ever moved.
+    let emulator = Emulator::new();
+    let registered = "empty-activity-poll";
+    seed(&emulator, registered).await;
+
+    // The modelled `DomainName` is `len 1..256`
+    // (`smithy_query(query="shape",shape="DomainName")`), so 256 characters is the
+    // longest name a request may carry at all.
+    let longest_name = "d".repeat(256);
+    // Rows vary WHY the list holds nothing assignable and the shape of the name that
+    // holds it: a registered domain with an idle list, a name never registered, a
+    // registered name differing only in case, a registered name with a suffix, the
+    // longest name the model admits, and a name outside ASCII — plus which task list is
+    // polled, including one no decision ever scheduled into.
+    let rows: Vec<(&str, String, &str)> = vec![
+        (
+            "a registered domain whose list holds nothing",
+            registered.to_string(),
+            "activities-idle",
+        ),
+        (
+            "a name that was never registered",
+            "never-registered".to_string(),
+            REGISTERED_LIST,
+        ),
+        (
+            "a registered name in another case",
+            registered.to_uppercase(),
+            REGISTERED_LIST,
+        ),
+        (
+            "a registered name with a suffix",
+            format!("{registered}-2"),
+            "activities-elsewhere",
+        ),
+        (
+            "the longest name the model admits",
+            longest_name.clone(),
+            REGISTERED_LIST,
+        ),
+        (
+            "a name outside ASCII",
+            "dömäin-ünregistered".to_string(),
+            "activités",
+        ),
+    ];
+
+    for (case, domain, task_list) in &rows {
+        // The HOLD itself, before the answer: half the documented timeout passes on the
+        // paused clock with the call still unanswered, so the empty result below is the
+        // end of a long poll and not an immediate answer.
+        assert_holds_open_for(&emulator, case, domain, task_list, POLL_TIMEOUT / 2).await;
+
+        let (status, body) = emulator
+            .call(
+                "PollForActivityTask",
+                &json!({
+                    "domain": domain,
+                    "taskList": { "name": task_list },
+                    "identity": "worker-empty",
+                }),
+            )
+            .await;
+        assert_empty_activity_task(case, status, &body);
+    }
+
+    // A poll creates nothing: every name the polls above found nothing under is still
+    // unknown to the operations that address a domain directly.
+    for (case, domain, _) in rows.iter().skip(1) {
+        emulator
+            .refused(
+                case,
+                "DescribeDomain",
+                &json!({ "name": domain }),
+                "UnknownResourceFault",
+            )
+            .await;
+    }
+
+    // And a poll that CAN be served still is: the task scheduled now is handed over with
+    // a real token, so holding the empty polls open changed nothing about the positive
+    // path.
+    let case = "served after the empty polls";
+    start(&emulator, case, registered, "wf-after-empty").await;
+    decide(
+        &emulator,
+        case,
+        registered,
+        json!([schedule_decision("act-after-empty", json!({}))]),
+    )
+    .await;
+    let answer = poll(&emulator, case, registered, REGISTERED_LIST, None).await;
+    assert_eq!(
+        (
+            string_at(&answer, "/activityId"),
+            string_at(&answer, "/taskToken").is_empty(),
+        ),
+        ("act-after-empty".to_string(), false),
+        "case {case:?}: the waiting task is still handed over, got {answer:?}"
+    );
 }

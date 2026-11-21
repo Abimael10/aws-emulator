@@ -17,8 +17,8 @@
 //! however it ends.
 //!
 //! The suite varies what the rule generalises over: whether the list has a task waiting,
-//! which task list a poller is counted against, and how a poll ends (answered, or its
-//! caller gone).
+//! which task list a poller is counted against, whether the polled domain is registered
+//! at all, and how a poll ends (answered, or its caller gone).
 //!
 //! `poll_for_decision_task.rs` covers which task a poll is handed and what it answers
 //! with; this suite stands up its own harness because the poller count lives in this
@@ -31,7 +31,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_swf_simpleworkflowservice::state::{
-    service_state, ComAmazonawsSwfSimpleworkflowserviceState, MAX_POLLERS_PER_TASK_LIST,
+    service_state, ComAmazonawsSwfSimpleworkflowserviceState, TaskKind, MAX_POLLERS_PER_TASK_LIST,
     POLLER_LIMIT_EXCEEDED_MESSAGE,
 };
 use service_com_amazonaws_swf_simpleworkflowservice::EmulatedService;
@@ -127,10 +127,7 @@ impl Harness {
     fn open_pollers(&self, domain: &str, task_list: &str) -> usize {
         let state = self.state();
         let guard = state.lock();
-        guard
-            .domains
-            .get(domain)
-            .map_or(0, |domain| domain.open_decision_pollers(task_list))
+        guard.open_decision_pollers(domain, task_list)
     }
 
     /// This service's own store, reached the way its handlers reach it.
@@ -311,4 +308,54 @@ async fn a_task_list_admits_at_most_the_documented_number_of_simultaneous_poller
     }
     readmitted.abort();
     elsewhere.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_poll_is_counted_against_its_task_list_whether_or_not_its_domain_is_registered() {
+    // The rule one level up: the cap is counted against the task list a poll NAMES, and
+    // every poll that is held open is counted — including one naming a domain the store
+    // does not hold, which is held open exactly as long (it completes empty, which
+    // `poll_for_decision_task` asserts) and so takes up the same admission.
+    let harness = Arc::new(Harness::new());
+    let unknown = "never-registered-domain";
+
+    // Nothing was registered under this name, so no record of it exists to count a poll
+    // in; the store's own poller map is where the admission is recorded.
+    let polling = open_poll(&harness, unknown, DEFAULT_LIST);
+    await_pollers(&harness, unknown, DEFAULT_LIST, 1).await;
+
+    // And the slot is given back when that poll ends, however it ends.
+    polling.abort();
+    await_pollers(&harness, unknown, DEFAULT_LIST, 0).await;
+
+    // Filling the list to its cap is what turns the next poll of it into the quota's own
+    // refusal, on a name no registration ever created.
+    {
+        let state = harness.state();
+        let mut guard = state.lock();
+        for index in 0..MAX_POLLERS_PER_TASK_LIST {
+            assert!(
+                guard.admit_poller(TaskKind::Decision, unknown, DEFAULT_LIST),
+                "poller {index} of {MAX_POLLERS_PER_TASK_LIST} is admitted below the cap"
+            );
+        }
+    }
+    let (status, body) = tokio::time::timeout(
+        PROMPT,
+        harness.call("PollForDecisionTask", &poll_body(unknown, DEFAULT_LIST)),
+    )
+    .await
+    .expect("a poll past the cap is refused promptly rather than held open");
+    let code = error_code(&body);
+    assert_eq!(
+        (status, code.as_str(), body.get("message").and_then(Value::as_str)),
+        (
+            400,
+            "LimitExceededFault",
+            Some(POLLER_LIMIT_EXCEEDED_MESSAGE)
+        ),
+        "a poll past the per-task-list cap is 400 LimitExceededFault with this \
+         condition's fixed message, whether or not its domain is registered, got \
+         {status} {code} with {body:?}"
+    );
 }

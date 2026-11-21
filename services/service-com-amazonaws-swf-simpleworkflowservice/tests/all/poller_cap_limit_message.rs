@@ -103,13 +103,9 @@ fn identities() -> Vec<(&'static str, Option<String>)> {
 fn fill_pollers(harness: &Harness, domain: &str, kind: TaskKind, task_list: &str, count: usize) {
     let state = harness.state();
     let mut guard = state.lock();
-    let record = guard
-        .domains
-        .get_mut(domain)
-        .unwrap_or_else(|| panic!("domain {domain:?} was registered"));
     for index in 0..count {
         assert!(
-            record.admit_poller(kind, task_list),
+            guard.admit_poller(kind, domain, task_list),
             "case {domain:?}/{task_list:?}: poller {index} of {count} is admitted below the cap"
         );
     }
@@ -119,10 +115,7 @@ fn fill_pollers(harness: &Harness, domain: &str, kind: TaskKind, task_list: &str
 fn open_pollers(harness: &Harness, domain: &str, kind: TaskKind, task_list: &str) -> usize {
     let state = harness.state();
     let guard = state.lock();
-    guard
-        .domains
-        .get(domain)
-        .map_or(0, |record| record.open_pollers(kind, task_list))
+    guard.open_pollers(kind, domain, task_list)
 }
 
 /// The poll request for `operation` on one task list, with the row's optional identity

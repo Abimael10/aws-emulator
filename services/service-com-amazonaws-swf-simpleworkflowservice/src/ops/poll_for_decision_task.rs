@@ -262,17 +262,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // One poller slot per OPEN long poll, released when this handler's future ends
         // however it ends. Taking it is what bounds the pollers one task list admits;
         // the state lock is given back before the wait below, so a waiting poll holds
-        // nothing but its slot.
+        // nothing but its slot. The count is kept per `(domain, taskList.name)` on the
+        // store, so a poll naming a domain the store does not hold is admitted and
+        // bounded like any other.
         let slot = {
             let mut guard = state.lock();
-            if !guard.domains.contains_key(&input.domain) {
-                return Err(PollForDecisionTaskErrorModeled::UnknownResourceFault(
-                    UnknownResourceFault {
-                        message: Some(crate::state::unknown_domain_message(&input.domain)),
-                    },
-                )
-                .into());
-            }
             crate::state::PollerSlot::admit(
                 &state,
                 &mut guard,
@@ -333,18 +327,31 @@ fn answer_poll(
     // before the list is read: a run the clock closed has no task waiting in any list.
     // Scoped to the polled domain, which is the only one this answer reports on.
     guard.materialise_due_timeouts_in(&input.domain, now);
-    // A task list lives inside a domain, so an unregistered domain name addresses no
-    // task list at all: the modelled `UnknownResourceFault`, the same answer every
-    // other domain-scoped operation of this service gives it. A DEPRECATED domain is
-    // still a known one — deprecation stops new starts, while the runs already in it
-    // keep handing out their decision tasks.
+    // A task list lives inside a domain, so a domain name that resolves to no stored
+    // domain addresses no task list: it holds no assignable task, which is what this long
+    // poll waits on and what its empty result reports — the hand-over this operation
+    // performs is the only thing a missing domain would stop, and there is nothing to
+    // hand over. A DEPRECATED domain is still a known one — deprecation stops new starts,
+    // while the runs already in it keep handing out their decision tasks.
     let Some(domain) = guard.domains.get_mut(&input.domain) else {
-        return Err(PollForDecisionTaskErrorModeled::UnknownResourceFault(
-            UnknownResourceFault {
-                message: Some(crate::state::unknown_domain_message(&input.domain)),
-            },
-        )
-        .into());
+        // A poll carrying a `nextPageToken` waits for nothing: it asks for a further page
+        // of the task it was already handed, which IS a resource it addresses, and no
+        // such task lives under a name the store does not hold. That is the same
+        // `UnknownResourceFault` naming the execution the token addresses that a token of
+        // a run this domain does not hold is answered with — this read resolves its leaf
+        // directly, so the leaf is what the fault names.
+        if let Some(page) = resumed {
+            return Err(PollForDecisionTaskErrorModeled::UnknownResourceFault(
+                UnknownResourceFault {
+                    message: Some(crate::state::unknown_execution_message(
+                        &page.workflow_id,
+                        &page.run_id,
+                    )),
+                },
+            )
+            .into());
+        }
+        return Ok(None);
     };
 
     // The decision-task start-to-close timeout is the server's: a task handed over
