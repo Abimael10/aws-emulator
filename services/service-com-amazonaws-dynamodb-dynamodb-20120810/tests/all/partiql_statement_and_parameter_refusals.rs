@@ -4,14 +4,14 @@
 //! the set of inputs it holds for rather than over one statement.
 //!
 //! 1. A numeric PARAMETER is a number this service can CONVERT or it is not, and those are
-//!    two different refusals: a text whose exponent is no signed run of decimal digits \u2014 or
-//!    is a run no integer a decimal exponent is carried in can hold, which states a
-//!    magnitude no number has \u2014 is reported as a parameter that cannot be converted to a
-//!    numeric value (echoing the text), while a text whose exponent IS such a run states a
-//!    magnitude, and a magnitude outside the documented 10^-130..10^125 range is reported as
-//!    the over- or underflow it is, however many digits that exponent is written with. The
-//!    rows walk both sides of the width the exponent is carried in and both ends of the
-//!    documented range, on every surface that binds a parameter.
+//!    two different refusals: a text that states no decimal number — an exponent that is no
+//!    signed run of decimal digits, or one stating a magnitude wider than the signed 32-bit
+//!    integer a decimal exponent is held in — is reported as a parameter that cannot be
+//!    converted to a numeric value (echoing the text), while a text whose exponent that
+//!    integer CAN state names a magnitude, and a magnitude outside the documented
+//!    10^-130..10^125 range is reported as the over- or underflow it is. The rows walk both
+//!    sides of the width the exponent is held in and both ends of the documented range, on
+//!    every surface that binds a parameter.
 //! 2. A request that mixes reads and writes is refused as a whole, in the sentence the
 //!    SURFACE states for its own shape: a batch and a transaction word it differently, and
 //!    neither wording mentions the statements, so the rows vary how many statements the
@@ -138,57 +138,58 @@ const UNDERFLOW_CLAUSE: &str =
 
 /// The documented exponent range of a DynamoDB number: "Number: ... can have up to 38
 /// digits of precision. Exponent range is 10^-130 to 10^125" ("Service, Account, and Table
-/// Quotas"). The two limits of the integer the exponent is carried in are the 64-bit ones.
+/// Quotas"). The two limits of the integer a decimal exponent is held in are the 32-bit
+/// ones, which is the width that decides whether a text states a number at all.
 const MAX_EXPONENT: i32 = 125;
 const MIN_EXPONENT: i32 = -130;
-const MAX_SIGNED_64: &str = "9223372036854775807";
-const MIN_SIGNED_64: &str = "-9223372036854775808";
+const MAX_SIGNED_32: &str = "2147483647";
+const MIN_SIGNED_32: &str = "-2147483648";
 
 #[tokio::test]
 async fn a_numeric_parameter_outside_the_numeric_domain_states_the_rule_it_broke() {
     let router = seeded().await;
 
     // Each row: the case, the `N` text the parameter carries, and the whole sentence the
-    // refusal must state. The rows walk the two sides of the width the exponent is carried
-    // in — one past each of its limits, and far past it both ways — beside one past each
-    // end of the documented range, a magnitude far out of range that the integer still
-    // holds, a text that is no number at all, and a mantissa that normalises to zero under
-    // an exponent outside the documented range.
+    // refusal must state. The rows walk the two sides of the width the exponent is held
+    // in — one past each of its limits, far past it both ways, and far past any integer —
+    // beside AT each of its limits, one past each end of the documented range, a text that
+    // is no number at all, and a mantissa that normalises to zero under an exponent outside
+    // the documented range.
     let rows: Vec<(&str, String, String)> = vec![
         (
-            "an exponent one past the top of the integer it is carried in",
+            "an exponent far past the width of any integer",
             "1e9223372036854775808".to_string(),
             conversion_clause("1e9223372036854775808"),
         ),
         (
-            "an exponent one past the bottom of that integer",
+            "a negative exponent far past that width",
             "1e-9223372036854775809".to_string(),
             conversion_clause("1e-9223372036854775809"),
         ),
         (
-            "an exponent far past the width of that integer",
+            "an exponent of twenty-five digits",
             "1e99999999999999999999999".to_string(),
             conversion_clause("1e99999999999999999999999"),
         ),
         (
-            "an exponent past the width of a 32-bit scale",
+            "an exponent one past the top of the integer it is held in",
             "1e2147483648".to_string(),
-            OVERFLOW_CLAUSE.to_string(),
+            conversion_clause("1e2147483648"),
         ),
         (
-            "a negative exponent past that width",
+            "a negative exponent one past the bottom of that integer",
             "1e-2147483649".to_string(),
-            UNDERFLOW_CLAUSE.to_string(),
+            conversion_clause("1e-2147483649"),
         ),
         (
             "an exponent far past that width",
             "1e99999999999".to_string(),
-            OVERFLOW_CLAUSE.to_string(),
+            conversion_clause("1e99999999999"),
         ),
         (
             "an exponent far past that width, the other way",
             "1e-99999999999".to_string(),
-            UNDERFLOW_CLAUSE.to_string(),
+            conversion_clause("1e-99999999999"),
         ),
         (
             "a text that is no number at all",
@@ -202,17 +203,17 @@ async fn a_numeric_parameter_outside_the_numeric_domain_states_the_rule_it_broke
         ),
         (
             "an exponent at the top of that integer, which states a magnitude",
-            format!("1e{MAX_SIGNED_64}"),
+            format!("1e{MAX_SIGNED_32}"),
             OVERFLOW_CLAUSE.to_string(),
         ),
         (
             "an exponent at the bottom of that integer, which states a magnitude",
-            format!("1e{MIN_SIGNED_64}"),
+            format!("1e{MIN_SIGNED_32}"),
             UNDERFLOW_CLAUSE.to_string(),
         ),
         (
             "an exponent inside that integer but far past the documented range",
-            "1e92233720368547758".to_string(),
+            "1e2000000000".to_string(),
             OVERFLOW_CLAUSE.to_string(),
         ),
         (

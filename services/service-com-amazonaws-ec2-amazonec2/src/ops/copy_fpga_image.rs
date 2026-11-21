@@ -11,9 +11,11 @@
 //! 1. a source AFI this copy cannot resolve is told apart by the AFI id kind's
 //!    malformed-before-not-found pair, the same pair every operation of this service that
 //!    resolves an AFI by id answers: a value outside the form EC2 could have ISSUED an AFI id
-//!    in is 400 `InvalidFpgaImageID.Malformed` before any lookup
-//!    ([`crate::state::invalid_fpga_image_id_malformed`]), and an id inside that form the
-//!    store holds no AFI under is 400 `InvalidFpgaImageID.NotFound`
+//!    in, and a value inside that form no issue of this kind ever produced, are each 400
+//!    `InvalidFpgaImageID.Malformed` ([`crate::state::invalid_fpga_image_id_malformed`]),
+//!    because EC2's id form is an obfuscated identifier the service decodes before it looks
+//!    anything up; only an identifier this service DID issue and holds no AFI under any
+//!    longer is 400 `InvalidFpgaImageID.NotFound`
 //!    ([`crate::state::invalid_fpga_image_id_not_found`]) — the same two answers
 //!    `DeleteFpgaImage` and `ResetFpgaImageAttribute` give the same two causes, because which
 //!    of them a request earns is a fact of the ID it carried and not of the member or the
@@ -135,14 +137,15 @@ fn unreadable_source_fpga_image_id(fpga_image_id: &str) -> CopyFpgaImageError {
     crate::state::invalid_fpga_image_id_malformed(fpga_image_id)
 }
 
-/// Refuse a copy whose `SourceFpgaImageId` is an AFI id this account holds no AFI for: HTTP
-/// 400 `InvalidFpgaImageID.NotFound`, naming the id the request sent — the SECOND half of
-/// that pair.
+/// Refuse a copy whose `SourceFpgaImageId` is an AFI id this service ISSUED and holds no AFI
+/// for any longer: HTTP 400 `InvalidFpgaImageID.NotFound`, naming the id the request sent —
+/// the SECOND half of that pair.
 ///
-/// A well-formed id that resolves to nothing is a resource that is MISSING rather than an id
-/// the service cannot read, so it earns the not-found half here exactly as it does on the
-/// operations that act on an AFI of their own Region: which half a request earns is a fact of
-/// the id it carried, so the `SourceRegion` member beside it changes neither answer.
+/// An identifier this service issued is one it can READ, so a source it no longer holds is a
+/// resource that is MISSING rather than an id it cannot read: that is the one cause this half
+/// states, exactly as it is on the operations that act on an AFI of their own Region. Which
+/// half a request earns is a fact of the id it carried, so the `SourceRegion` member beside it
+/// changes neither answer.
 fn unknown_source_fpga_image_id(fpga_image_id: &str) -> CopyFpgaImageError {
     crate::state::invalid_fpga_image_id_not_found(fpga_image_id)
 }
@@ -286,10 +289,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Region: the store holds the AFIs of the Region this call was signed for, and the
         // `SourceRegion` checked above is validated rather than resolved against.
         //
-        // An id inside the issued form that the store holds no AFI under names a MISSING AFI,
-        // which is the NOT-FOUND half of the id kind's pair
-        // ([`unknown_source_fpga_image_id`]) — the same answer the operations that resolve an
-        // AFI of their own Region give the same cause.
+        // The source id is DECODED before it is resolved — EC2's long id form is an
+        // obfuscated identifier the service reads ahead of the lookup — so a value no issue
+        // of this kind ever produced is one this service cannot read, and it earns the
+        // malformed half of the pair exactly as it does on the operations that act on an AFI
+        // of their own Region ([`crate::state::ComAmazonawsEc2Amazonec2State::id_was_issued`]
+        // is the one reader of what was issued). Which half a request earns is a fact of the
+        // ID it carried, so the NOT-FOUND half ([`unknown_source_fpga_image_id`]) is reserved
+        // for an identifier this service DID issue and holds no AFI under any longer.
+        if !store.id_was_issued(FPGA_IMAGE_ID_PREFIX, &input.source_fpga_image_id) {
+            return Err(unreadable_source_fpga_image_id(&input.source_fpga_image_id));
+        }
         let source = store
             .fpga_images
             .get(&input.source_fpga_image_id)

@@ -274,7 +274,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(dev_eui) = dev_eui.as_deref() {
             if store.dev_eui_index.contains_key(dev_eui) {
                 return Err(CreateWirelessDeviceErrorModeled::ConflictException(
-                    crate::state::duplicate_dev_eui(),
+                    crate::state::duplicate_dev_eui(dev_eui),
                 )
                 .into());
             }

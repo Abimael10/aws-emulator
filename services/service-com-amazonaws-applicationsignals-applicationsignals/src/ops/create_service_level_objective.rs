@@ -263,14 +263,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::region_of(ctx.parts());
         let mut store = state.lock();
 
-        // A second create under a name already stored is a conflict, worded with the fixed
-        // sentence this service states for an identifier that is already taken
-        // ([`crate::state::slo_already_exists`]), which names neither the resource nor the
-        // identifier. The check and the insert below both run under this one lock, so of N
-        // creates racing on one name exactly one is admitted and every other is refused.
-        if store.slos.contains_key(input.name.as_str()) {
+        // A second create under a name already stored is a conflict, worded in the one
+        // sentence this service states about one SLO it names
+        // ([`crate::state::slo_already_exists`]): the ARN of the STORED objective that holds
+        // the identifier, which is what a client resolves to see what it collided with. The
+        // check and the insert below both run under this one lock, so of N creates racing on
+        // one name exactly one is admitted and every other is refused.
+        if let Some(stored) = store.slos.get(input.name.as_str()) {
             return Err(CreateServiceLevelObjectiveErrorModeled::ConflictException(
-                crate::state::slo_already_exists(),
+                crate::state::slo_already_exists(&stored.arn),
             )
             .into());
         }

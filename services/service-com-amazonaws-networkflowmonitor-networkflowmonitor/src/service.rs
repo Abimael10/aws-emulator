@@ -22,8 +22,8 @@
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — EDITED HERE. It serves the operation the generated routing
 //!   table names, under the layer that finishes every response of this service: one
-//!   request id, reported in the header and stated inside the envelope a client-error
-//!   refusal words (see [`sdk_envelope`]). The routing decision itself is still the
+//!   request id, reported in the header this protocol names a request in (see
+//!   [`sdk_envelope`]). The routing decision itself is still the
 //!   model's.
 //! - `override_refusal` — EDITED HERE. How this service words a request the
 //!   framework refused before any handler ran: AWS's own envelope and clauses, with
@@ -186,11 +186,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // not an input-constraint failure.
         //
         // A boundary refusal also keeps the framework's SHAPE whole: it closes at the
-        // constraint clause, with none of the envelope a refusal of this service's own
-        // carries (`sdk_envelope`). That envelope is stated by the layer that words a
-        // refusal this service DECIDED, and a constraint clause is not one of those: it
-        // is the framework's sentence about the request, reordered here in one respect
-        // and otherwise passed through.
+        // constraint clause. A refusal of this service's own closes at its sentence too —
+        // the envelope a client renders around either is the SDK's and reaches no wire
+        // (`sdk_envelope`).
         match refusal {
             Refusal::Invalid(violations) => Some(Refused {
                 code: VALIDATION_EXCEPTION.to_string(),

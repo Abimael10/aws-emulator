@@ -273,38 +273,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut state = state.lock();
 
-        // The TARGET of the put is the managed rule set `(Scope, Name, Id)` names, and
-        // it is the first judgement this handler takes against the store: an identity
-        // no managed rule set of this account carries names a resource that doesn't
-        // exist, so a publisher is told to create the set whatever else its body
-        // carries — a reference that can only be told apart from a usable one by
-        // reading the store included. Nothing is published either way.
-        if state
-            .managed_rule_set(&input.scope, &input.name, &input.id)
-            .is_none()
-        {
-            crate::state::audit(
-                "PutManagedRuleSetVersions",
-                &input.scope,
-                &input.name,
-                &input.id,
-                "WAFNonexistentItemException",
-            );
-            return Err(
-                PutManagedRuleSetVersionsErrorModeled::WAFNonexistentItemException(
-                    crate::state::nonexistent_item_exception(),
-                )
-                .into(),
-            );
-        }
-
-        // Once the set the put acts on is resolved, the RESOLUTION half of the
-        // reference judgement: every rule group a published version is defined by has
-        // to exist IN THIS SCOPE, because a version offered to customers runs the
-        // vendor's own rule group and a scope is a namespace. A reference that resolves
-        // to nothing is the same `WAFInvalidParameterException` a value that is no
-        // rule-group ARN at all is, and it is still reported before the token's own
-        // modelled form.
+        // The REFERENCES the request carries are judged before the TARGET it addresses:
+        // every rule group a published version is defined by has to exist IN THIS SCOPE,
+        // because a version offered to customers runs the vendor's own rule group and a
+        // scope is a namespace. A reference that resolves to nothing is the same
+        // `WAFInvalidParameterException` a value that is no rule-group ARN at all is — the
+        // one refusal WAF answers for every ARN it cannot use for that member — so a put is
+        // told about the reference it cannot use whether or not the set it names exists.
         //
         // Priced here too, out of the entries read before the set is borrowed to write
         // through: `ManagedRuleSetVersion$Capacity` is "the web ACL capacity units
@@ -334,6 +309,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             };
             published_capacities.insert(arn, entry.rule_group.capacity);
+        }
+
+        // The TARGET of the put is the managed rule set `(Scope, Name, Id)` names: an
+        // identity no managed rule set of this account carries names a resource that doesn't
+        // exist, so a publisher whose body WAF could use is told to create the set. Nothing
+        // is published either way.
+        if state
+            .managed_rule_set(&input.scope, &input.name, &input.id)
+            .is_none()
+        {
+            crate::state::audit(
+                "PutManagedRuleSetVersions",
+                &input.scope,
+                &input.name,
+                &input.id,
+                "WAFNonexistentItemException",
+            );
+            return Err(
+                PutManagedRuleSetVersionsErrorModeled::WAFNonexistentItemException(
+                    crate::state::nonexistent_item_exception(),
+                )
+                .into(),
+            );
         }
 
         // Only then the optimistic-lock token's own modelled constraints, which this

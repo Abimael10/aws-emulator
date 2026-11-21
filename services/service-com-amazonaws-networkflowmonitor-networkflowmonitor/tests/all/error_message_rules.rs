@@ -19,11 +19,11 @@
 //! constraint class — is the framework's and is unchanged.
 //!
 //! RULE 3 (how every client-error refusal CLOSES): a refusal this service's handlers
-//! answer states its sentence and then the envelope the layer that made the call states
-//! around a refused one — the service that answered, the HTTP status it answered with,
-//! the id of the request it answered and the attempts that call took. The three varying
-//! facts are the RESPONSE's, so the status in the text is the status the response carries
-//! and the id in the text is the id the response's own header reports.
+//! answer states its sentence and NOTHING after it — the envelope a client reads around a
+//! refused call (the service that answered, the HTTP status, the request id and the attempts
+//! that call took) is the SDK's rendering of facts its own call knows, and reaches no wire.
+//! The id of the request is reported in the header this protocol names a request in, fresh
+//! per call.
 //!
 //! Each suite is a TABLE whose rows differ along what the rule generalizes over:
 //! rule 1 over the resource type, the operation that reports it, the identifier's
@@ -38,9 +38,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
-use crate::harness::{
-    client_token, refusal_envelope, targets, Emulator, ACCOUNT_ID, REGION, SIGNING_NAME,
-};
+use crate::harness::{client_token, targets, Emulator, ACCOUNT_ID, REGION, SIGNING_NAME};
 
 /// How a missing MONITOR is worded: the fixed prefix `Monitor [`, the monitor's ARN,
 /// and `] doesn't exist`. The ARN namespace comes from the harness constant the other
@@ -528,23 +526,11 @@ async fn a_requirement_that_is_not_an_enum_keeps_the_frameworks_wording() {
     );
 }
 
-/// The whole message rule 3 requires: `sentence`, then the envelope stating the service
-/// that answered, the status it answered with, the id of the request it answered and the
-/// attempts that one refused call took.
+/// Assert `answer` is a client error whose message is `sentence` and nothing after it, and
+/// report the id its own header named the request by.
 ///
-/// The envelope's form is spelled once, in the harness ([`refusal_envelope`]), because the
-/// suites that assert how a condition is worded strip that same form off the message they
-/// compare; naming the service by its `sdkId` (`smithy_query(query="service_info")`:
-/// `NetworkFlowMonitor`) is part of it.
-fn with_envelope(sentence: &str, status: u16, request_id: &str) -> String {
-    format!("{sentence}{}", refusal_envelope(status, request_id))
-}
-
-/// Assert `answer` is a client error whose message is `sentence` closed by the envelope of
-/// its OWN call, and report the request id it stated.
-///
-/// The status and the id are read off the answer rather than written down, so the two
-/// values inside the text are asserted to be the two the response itself carries.
+/// The id is read off the answer's header rather than out of the text: the envelope a client
+/// renders around a refusal is the SDK's, so the message closes at the sentence.
 fn assert_envelope(case: &str, answer: &crate::harness::Answer, sentence: &str) -> String {
     assert!(
         (400..500).contains(&answer.status),
@@ -558,18 +544,17 @@ fn assert_envelope(case: &str, answer: &crate::harness::Answer, sentence: &str) 
          got {:?}",
         answer.request_id
     );
-    let expected = with_envelope(sentence, answer.status, &answer.request_id);
     assert_eq!(
         answer.text("message"),
-        expected,
-        "case {case:?}: expected {expected:?}, got {:?}",
+        sentence,
+        "case {case:?}: expected {sentence:?}, got {:?}",
         answer.text("message")
     );
     answer.request_id.clone()
 }
 
-/// RULE 3: every client-error refusal this service's handlers answer closes with the
-/// envelope of the call it refused.
+/// RULE 3: every client-error refusal this service's handlers answer states its sentence and
+/// nothing after it, and names its own call in the header.
 ///
 /// The rows span the error classes this service refuses a client with and their statuses —
 /// `ValidationException` (400), `ServiceQuotaExceededException` (402),
@@ -577,7 +562,7 @@ fn assert_envelope(case: &str, answer: &crate::harness::Answer, sentence: &str) 
 /// `ConflictException` (409) — the operations that answer them, and both kinds of
 /// sentence: one built from the request (an ARN, a limit) and one wholly fixed.
 #[tokio::test]
-async fn every_client_error_refusal_closes_with_the_envelope_of_its_own_call() {
+async fn every_client_error_refusal_states_its_sentence_alone() {
     let emulator = Emulator::new();
     let scope_arn = emulator.scope_for_monitors().await;
 
@@ -696,20 +681,20 @@ async fn every_client_error_refusal_closes_with_the_envelope_of_its_own_call() {
         BTreeSet::from([400u16, 402, 403, 404, 409]),
         "the rows must span every client-error status this service answers, got {statuses:?}"
     );
-    // Per REFUSAL, not per condition: no two of the refusals above stated one request id.
+    // Per REFUSAL, not per condition: no two of the refusals above named one request id.
     let distinct: BTreeSet<&String> = request_ids.iter().collect();
     assert_eq!(
         distinct.len(),
         request_ids.len(),
-        "each refusal states the id of its own call, got {request_ids:?}"
+        "each refusal names its own call, got {request_ids:?}"
     );
 }
 
-/// RULE 3's two halves that one refusal cannot show: the id is the response's OWN and a
-/// fresh one per call, and only a refusal this service's handlers word carries the
-/// envelope at all.
+/// RULE 3's two halves that one refusal cannot show: the id a response names its request by
+/// is a fresh one per call, and NO refusal — neither one this service's handlers word nor one
+/// the framework raises at the request boundary — carries the client's envelope in its text.
 #[tokio::test]
-async fn the_envelope_states_this_response_s_id_and_only_a_worded_refusal_carries_it() {
+async fn each_refusal_names_its_own_call_and_none_carries_the_clients_envelope() {
     let emulator = Emulator::new();
     let missing = "repeated-probe";
     let sentence = monitor_not_found(REGION, missing);
@@ -725,12 +710,12 @@ async fn the_envelope_states_this_response_s_id_and_only_a_worded_refusal_carrie
     assert_eq!(
         distinct.len(),
         ids.len(),
-        "three refusals of one condition are three calls, so each states its own id, got \
+        "three refusals of one condition are three calls, so each names its own, got \
          {ids:?}"
     );
 
-    // A refusal raised at the request BOUNDARY keeps the framework's wording, which words
-    // no envelope: the sentence a client reads there is the constraint clause alone.
+    // A refusal raised at the request BOUNDARY keeps the framework's wording, and it states
+    // no envelope either: the sentence a client reads there is the constraint clause alone.
     for (case, answer) in [
         (
             "a page size past the declared maximum",
@@ -740,11 +725,15 @@ async fn the_envelope_states_this_response_s_id_and_only_a_worded_refusal_carrie
             "a value outside a declared enum",
             emulator.list_monitors("?monitorStatus=NOT_A_REAL_VALUE").await,
         ),
+        (
+            "a resource this service holds nothing for",
+            emulator.get_monitor(missing).await,
+        ),
     ] {
         let message = answer.text("message");
         assert!(
-            !message.contains("(Service: "),
-            "case {case:?}: a refusal the framework raises words no envelope, got {message:?}"
+            !message.contains("(Service: ") && !message.contains("Status Code: "),
+            "case {case:?}: a refusal states its sentence alone, got {message:?}"
         );
     }
 

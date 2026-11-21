@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end tests for the member a `position`/`limit` collection of this service
-//! reports its PAGE under when the collection holds no element.
+//! End-to-end tests for what a `position`/`limit` collection of this service answers when
+//! the collection holds no element.
 //!
 //! Every case drives the real wire path — a `restJson1` HTTP request through the
 //! multi-service router into the mounted service — so what is asserted is what a client
@@ -13,8 +13,8 @@
 //! API.
 //!
 //! The rule, asserted over a TABLE of collections rather than one listing: a collection
-//! emptied of its last element answers with the page member (`item` on the wire) as the
-//! EMPTY list, and with neither a cursor nor a page-size echo beside it ([`empty_page_body`]).
+//! emptied of its last element answers with NO page member (`item` on the wire) at all, and
+//! with neither a cursor nor a page-size echo beside it ([`empty_page_body`]).
 //! The DEPLOYMENTS collection is asserted the same way by
 //! `crate::deployment_collection`, which owns it.
 //!
@@ -176,18 +176,18 @@ async fn emptied(gateway: &Gateway, collection: &str) -> String {
     }
 }
 
-/// The whole body a collection of this service answers once it holds no element: the page
-/// member as the EMPTY list — "the current page of elements from this collection" is a list a
-/// client counts — and nothing beside it, no cursor and no page-size echo. One body for every
-/// collection, because which collection it is changes nothing about a page of nothing.
+/// The whole body a collection of this service answers once it holds no element: NOTHING —
+/// no page member, because "the current page of elements from this collection" holds none, and
+/// nothing beside it either, no cursor and no page-size echo. One body for every collection,
+/// because which collection it is changes nothing about a page of nothing.
 ///
 /// `pub(crate)` so the sibling `collection_empty_page_member` suite reads the same spelling.
 pub(crate) fn empty_page_body() -> Value {
-    json!({ "item": [] })
+    json!({})
 }
 
 #[tokio::test]
-async fn an_emptied_collection_reports_the_empty_page_member_and_nothing_beside_it() {
+async fn an_emptied_collection_reports_no_page_member_and_nothing_beside_it() {
     for collection in COLLECTIONS {
         let gateway = Gateway::new();
         let uri = emptied(&gateway, collection).await;

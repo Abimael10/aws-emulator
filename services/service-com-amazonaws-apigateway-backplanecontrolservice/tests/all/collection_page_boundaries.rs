@@ -116,8 +116,8 @@ async fn a_collection_that_holds_no_element_reports_the_empty_page_member() {
 
     for (case, uri) in &rows {
         let answer = listed(&gateway, uri, case).await;
-        // The envelope every listing of this service is recorded answering an empty page
-        // with: the page member as the empty list
+        // The envelope every listing of this service answers an empty page with: no page
+        // member at all
         // (`crate::emptied_collection_page_member::empty_page_body`).
         let expected = crate::emptied_collection_page_member::empty_page_body();
         assert_eq!(
@@ -149,8 +149,8 @@ async fn a_collection_that_holds_no_element_reports_the_empty_page_member() {
         let answer = listed(&empty, uri, case).await;
         assert_eq!(
             answer.body,
-            json!({ "item": [] }),
-            "case {case}: expected the empty page member for a collection that holds no \
+            json!({}),
+            "case {case}: expected no page member for a collection that holds no \
              element, got {:?}",
             answer.body
         );

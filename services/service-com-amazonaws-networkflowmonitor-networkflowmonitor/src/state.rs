@@ -1217,37 +1217,24 @@ pub fn resource_arn(region: &str, resource_type: &str, id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("{resource_type}/{id}"))
 }
 
-/// What a refusal worded here writes where the envelope stated around the refused call
-/// goes ([`crate::service::sdk_envelope`]).
+/// What a refusal worded here states around its sentence: NOTHING.
 ///
-/// That envelope names the SERVICE that answered, the HTTP STATUS it answered with and the
-/// ID OF THE REQUEST being answered — three facts about the response, not about the
-/// request, and none of them known where a sentence is worded. So a refusal words its
-/// sentence and writes this marker after it, and the layer that finishes the response
-/// renders the envelope in its place, from the status that response carries and the one id
-/// that response names its request by. Nothing a request carries decides any part of it,
-/// and the message can hold no id of its own beside the one the response reports.
-pub const SDK_ENVELOPE_MARKER: &str = "{sdk-envelope}";
-
-/// `sentence` as a client is answered it: this service's own wording for the condition,
-/// then [`SDK_ENVELOPE_MARKER`] for the envelope the response is finished with.
+/// A client reads a refused call as the sentence the service worded followed by four facts
+/// its own call knows — the SERVICE that answered, the HTTP STATUS, the ID OF THE REQUEST and
+/// how many attempts reaching it took. That envelope is the SDK's rendering of the exception
+/// it raises, not part of the answer: the wire carries the sentence alone, and the request id
+/// travels in the header this protocol names a request in
+/// ([`crate::service::sdk_envelope`]).
 ///
-/// Every CLIENT-ERROR refusal of this service is worded through here, so a client parses
-/// the serving service, the status and the request id back out of one form whichever
-/// operation refused and whichever class it refused under. A SERVER error is not: the
-/// envelope states the attempts the refused call took, and only a refusal of the caller's
-/// own request is the one attempt there will ever be — a 500 is retried, so the count
-/// stated beside it would be a guess at how many times the caller will have tried.
+/// `sentence` as a client is answered it: this service's own wording for the condition, and
+/// nothing after it. Every CLIENT-ERROR refusal of this service is worded through here, so one
+/// condition reads one sentence whichever operation refused and whichever class it refused
+/// under.
 pub fn refusal_message(sentence: impl Into<String>) -> String {
-    let mut message = sentence.into();
-    message.push_str(SDK_ENVELOPE_MARKER);
-    message
+    sentence.into()
 }
 
 /// The modelled 500 for a request that could not reach this service's store.
-///
-/// Worded WITHOUT the envelope ([`refusal_message`]): see the note there on why a server
-/// error states no attempt count.
 pub fn state_unavailable() -> InternalServerException {
     InternalServerException {
         message: Some("the Network Flow Monitor state store is unavailable".to_string()),

@@ -3,16 +3,19 @@
 //! What a read that reports an item in an `Item` MEMBER answers when the projection it
 //! applied matched nothing, driven end to end.
 //!
-//! RULE under test: whether the key addresses a stored item is the only thing that decides
-//! whether such a read reports the member at all — "if there is no matching item, GetItem
-//! does not return any data and there will be no Item element in the response" (`GetItem`),
-//! and "if a requested item could not be retrieved, the corresponding ItemResponse object is
-//! Null" (`TransactGetItems$Responses`). The projection decides only the CONTENTS of what is
-//! reported, so an item that WAS found reports the member whatever its projection matched:
-//! a projection naming no location of that item reports the map with nothing in it that it
-//! projected to ("if the requested item has no projected attributes, the corresponding
-//! ItemResponse object is an empty Map" — the map of projected name-value pairs being the
-//! empty one), never the absence that stands for "there is no such item".
+//! RULE under test: a single-item read reports the member for every item it found — "if
+//! there is no matching item, GetItem does not return any data and there will be no Item
+//! element in the response" (`GetItem`) — so a projection naming no location of the item it
+//! was applied to reports the map with nothing in it that it projected to, and only a key
+//! holding no item reports no member at all.
+//!
+//! A TRANSACTIONAL read answers the same two facts in its own envelope: what it reports is
+//! the `ItemResponse` object, which carries an `Item` only where there were projected
+//! attributes to carry — "if a requested item could not be retrieved, the corresponding
+//! ItemResponse object is Null, or if the requested item has no projected attributes, the
+//! corresponding ItemResponse object is an empty Map" (`TransactGetItems$Responses`) — so a
+//! get whose projection matched nothing answers the empty `ItemResponse`, exactly as a get
+//! that retrieved no item does.
 //!
 //! The rows span what the rule generalises over: the FORM of the projection that matched
 //! nothing (an attribute the item does not hold, that attribute reached through an alias, a
@@ -285,16 +288,23 @@ async fn an_element_of_a_transactional_read_reports_it_the_same_way() {
             row.case
         );
         let reported = read["Responses"][0].get("Item").cloned();
+        // The `ItemResponse` carries the PROJECTED ATTRIBUTES, so the member is there only
+        // where the get had some: the map the single-item reader reports with nothing in
+        // it is the empty `ItemResponse` object here.
+        let expected = row
+            .reported
+            .clone()
+            .filter(|item| item.as_object().is_some_and(|pairs| !pairs.is_empty()));
         assert_eq!(
-            reported, row.reported,
-            "case {:?} (TransactGetItems): expected {:?}, got {read}",
-            row.case, row.reported
+            reported, expected,
+            "case {:?} (TransactGetItems): expected {expected:?}, got {read}",
+            row.case
         );
         assert_eq!(
-            reported.is_none(),
-            row.reported.is_none(),
-            "case {:?} (TransactGetItems): only a get that retrieved no item reports no \
-             member, got {read}",
+            read["Responses"][0].as_object().map(serde_json::Map::len),
+            Some(usize::from(expected.is_some())),
+            "case {:?} (TransactGetItems): a get with no projected attributes answers the \
+             empty ItemResponse, got {read}",
             row.case
         );
     }

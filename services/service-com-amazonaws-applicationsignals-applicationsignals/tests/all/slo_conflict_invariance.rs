@@ -3,15 +3,14 @@
 //! The INVARIANCE of the taken-name conflict: one sentence SHAPE for every refused create.
 //!
 //! The rule under test: a create whose `Name` is already stored is refused
-//! `ConflictException` with the fixed sentence of that error class — which states that a
-//! resource with the same identifier is already there and has no variable part at all. So the
-//! message a client reads carries nothing of the REFUSED request: not its description, not its
-//! service level indicator, not the goal or the tags it sent — and no identifier of the record
-//! that holds the name either.
+//! `ConflictException` with this service's one sentence about the SLO it collided with — that
+//! stored objective's ARN, and no other variable part. So the message a client reads carries
+//! nothing of the REFUSED request: not its description, not its service level indicator, not
+//! the goal or the tags it sent.
 //!
 //! Where [`super::refusal_prose`] pins the WORDING of that sentence, this suite pins its
 //! invariance: a table of refused creates that differ in everything a conflict could have
-//! been worded from must read the SAME sentence, and nothing of the
+//! been worded from must read the SAME sentence about the stored record, and nothing of the
 //! refused body may appear in it. The rows differ along the name's form (the character classes
 //! the modelled `ServiceLevelObjectiveName` pattern `^[0-9A-Za-z][-._0-9A-Za-z ]{0,126}[0-9A-Za-z]$`
 //! admits, including its shortest name), along which SLI member the stored record and the
@@ -22,7 +21,7 @@
 
 use serde_json::{json, Value};
 
-use crate::refusal_prose::{assert_name_already_taken, SAME_IDENTIFIER_ALREADY_EXISTS};
+use crate::refusal_prose::{assert_name_already_taken, same_identifier_already_exists};
 use crate::slo_evaluation_kind::request_based_sli_config;
 use crate::slo_lifecycle::{call, create, name_path_segment, router, sli_config};
 
@@ -75,11 +74,11 @@ fn rows() -> Vec<Row> {
     ]
 }
 
-/// RULE: every refused create reads the one fixed sentence of the conflict class, and nothing
-/// of the refused request — nor of the record that holds the name — reaches it.
+/// RULE: every refused create reads the one sentence of the conflict class about the stored
+/// record, and nothing of the refused request reaches it.
 #[tokio::test]
 async fn every_taken_identifier_refusal_reads_one_sentence_about_the_stored_record() {
-    let mut messages: Vec<(&str, String, String)> = Vec::new();
+    let mut messages: Vec<(&str, &str, String)> = Vec::new();
 
     for row in rows() {
         let router = router();
@@ -111,17 +110,21 @@ async fn every_taken_identifier_refusal_reads_one_sentence_about_the_stored_reco
             row.case
         );
         let message = answer["Message"].as_str().unwrap_or_default().to_string();
-        assert_name_already_taken(row.case, &message);
-        // Nothing of the REFUSED request, and no identifier of the stored record, is in the
-        // sentence.
-        for withheld in ["a different description", "95", "team", stored_arn.as_str()] {
+        assert_name_already_taken(row.case, row.name, &message);
+        // Nothing of the REFUSED request is in the sentence; the stored record's own ARN is.
+        for withheld in ["a different description", "95", "team"] {
             assert!(
                 !message.contains(withheld),
                 "case {}: expected a sentence carrying no {withheld:?}, got {message:?}",
                 row.case
             );
         }
-        messages.push((row.case, stored_arn.clone(), message));
+        assert!(
+            message.contains(&stored_arn),
+            "case {}: expected the stored record's ARN {stored_arn:?}, got {message:?}",
+            row.case
+        );
+        messages.push((row.case, row.name, message));
 
         // The refused create wrote nothing: the record under that name is still the one the
         // admitted create stored, read back through the Get.
@@ -155,11 +158,13 @@ async fn every_taken_identifier_refusal_reads_one_sentence_about_the_stored_reco
         );
     }
 
-    // One sentence over every row, byte for byte.
-    for (case, _stored_arn, message) in &messages {
+    // One sentence over every row, byte for byte: this service's sentence about the stored
+    // objective the create collided with.
+    for (case, name, message) in &messages {
+        let expected = same_identifier_already_exists(name);
         assert_eq!(
-            message, SAME_IDENTIFIER_ALREADY_EXISTS,
-            "case {case}: expected every refused create to read one sentence, got {message:?}"
+            message, &expected,
+            "case {case}: expected every refused create to read {expected:?}, got {message:?}"
         );
     }
 }

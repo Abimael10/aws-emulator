@@ -214,10 +214,9 @@ async fn an_action_read_against_the_stored_item_reports_its_own_cancellation_rea
     // Each row: the case, the actions, and the reason every action reports in request order.
     // They span the defect the failing action earns (an operand the stored value has the
     // wrong type for, a document path the stored item cannot hold, an attribute it does not
-    // carry, a change past the item-update ceiling), the POSITION of that action, and what
+    // carry), the POSITION of that action, and what
     // stands beside it — nothing, an action that succeeds, an action whose condition fails,
     // and a second failing action.
-    let oversize = "x".repeat(400 * 1024);
     let rows: Vec<CancellationRow> = vec![
         (
             "a sole action computing on a stored string",
@@ -233,11 +232,6 @@ async fn an_action_read_against_the_stored_item_reports_its_own_cancellation_rea
             "an action computing on an attribute the item does not carry",
             json!([update("SET fresh = absent + :one", json!({":one": {"N": "1"}}))]),
             vec![("ValidationError", Some(MISSING_ATTRIBUTE))],
-        ),
-        (
-            "an action whose change is past the item-update ceiling",
-            json!([update("SET big = :v", json!({":v": {"S": oversize.clone()}}))]),
-            vec![("ValidationError", Some(UPDATE_TOO_BIG))],
         ),
         (
             "an action that succeeds before the failing one",
@@ -355,6 +349,120 @@ async fn an_action_read_against_the_stored_item_reports_its_own_cancellation_rea
         read["Item"]["n"],
         json!({"N": "6"}),
         "case the committing control: the applied update reads back, got {read}"
+    );
+}
+
+/// RULE 1's boundary: the item-update CEILING is a quota on the item an action ASKS for, not
+/// an outcome of applying it, so crossing it refuses the whole CALL with the sentence the
+/// single-item path states and cancels nothing — no `CancellationReasons` list at all.
+///
+/// The rows differ along what the rule generalises over: WHERE the oversized action sits
+/// (alone, before an action that would succeed, after one, beside an action whose condition
+/// does not hold), and HOW it crosses the ceiling (one oversized value, and a value just past
+/// the ceiling spread over two clauses). Each row is driven beside a control the transaction
+/// commits, so what is asserted is the ceiling being crossed.
+#[tokio::test]
+async fn an_update_past_the_item_ceiling_refuses_the_call_rather_than_cancelling() {
+    let router = seeded().await;
+
+    // Past the documented 400 KB item ceiling in one value, and in two clauses that only
+    // cross it together.
+    let oversize = "x".repeat(400 * 1024);
+    let half = "y".repeat(210 * 1024);
+    let rows: Vec<(&str, Value)> = vec![
+        (
+            "the oversized action alone",
+            json!([update("SET big = :v", json!({":v": {"S": oversize.clone()}}))]),
+        ),
+        (
+            "the oversized action before one that would succeed",
+            json!([
+                update("SET big = :v", json!({":v": {"S": oversize.clone()}})),
+                put("after-the-ceiling")
+            ]),
+        ),
+        (
+            "the oversized action after one that would succeed",
+            json!([
+                put("before-the-ceiling"),
+                update("SET big = :v", json!({":v": {"S": oversize.clone()}}))
+            ]),
+        ),
+        (
+            "the oversized action beside a condition that does not hold",
+            json!([
+                failing_check(),
+                update("SET big = :v", json!({":v": {"S": oversize.clone()}}))
+            ]),
+        ),
+        (
+            "two clauses that cross the ceiling together",
+            json!([update(
+                "SET one = :a, two = :b",
+                json!({":a": {"S": half.clone()}, ":b": {"S": half.clone()}})
+            )]),
+        ),
+        (
+            // The value the update COMPUTES is what crosses the ceiling: neither operand
+            // does on its own, so this row is found while the change is applied rather
+            // than while the request is read.
+            "a value the update computes past the ceiling",
+            json!([update(
+                "SET joined = list_append(:a, :b)",
+                json!({":a": {"L": [{"S": half.clone()}]}, ":b": {"L": [{"S": half.clone()}]}})
+            )]),
+        ),
+    ];
+
+    for (case, actions) in rows {
+        let (status, answered) =
+            call(&router, "TransactWriteItems", json!({"TransactItems": actions})).await;
+        assert_eq!(
+            (status, error_code(&answered).as_str(), message(&answered)),
+            (400, "ValidationException", UPDATE_TOO_BIG.to_string()),
+            "case {case:?}: expected a 400 ValidationException {UPDATE_TOO_BIG:?}, got \
+             {status} with {answered}"
+        );
+        assert!(
+            answered.get("CancellationReasons").is_none(),
+            "case {case:?}: a refused call cancels nothing, so it reports no reason list, \
+             got {answered}"
+        );
+    }
+
+    // Nothing any refused call carried was applied, and the control commits: an update that
+    // stays inside the ceiling is served on the same item.
+    for key in ["after-the-ceiling", "before-the-ceiling"] {
+        let read = ok(
+            &router,
+            "GetItem",
+            json!({"TableName": ITEMS, "Key": {"pk": {"S": key}}, "ConsistentRead": true}),
+        )
+        .await;
+        assert!(
+            read.get("Item").is_none(),
+            "case {key:?}: the refused call wrote nothing, got {read}"
+        );
+    }
+    ok(
+        &router,
+        "TransactWriteItems",
+        json!({"TransactItems": [update(
+            "SET inside = :v",
+            json!({":v": {"S": "y".repeat(1024)}})
+        )]}),
+    )
+    .await;
+    let read = ok(
+        &router,
+        "GetItem",
+        json!({"TableName": ITEMS, "Key": {"pk": {"S": "one"}}, "ConsistentRead": true}),
+    )
+    .await;
+    assert_eq!(
+        read["Item"]["inside"]["S"].as_str().map(str::len),
+        Some(1024),
+        "case the committing control: an update inside the ceiling is applied, got {read}"
     );
 }
 

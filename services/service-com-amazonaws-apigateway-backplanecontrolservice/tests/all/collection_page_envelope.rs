@@ -295,19 +295,19 @@ async fn a_listing_that_asks_for_no_page_size_is_told_none() {
 }
 
 #[tokio::test]
-async fn a_collection_that_holds_nothing_reports_the_empty_page_member() {
+async fn a_collection_that_holds_nothing_reports_no_page_member() {
     for collection in COLLECTIONS {
         let gateway = Gateway::new();
 
-        // A collection that holds NO element reports its page as the EMPTY list.
+        // A collection that holds NO element has no page of elements to report, so the
+        // member is left out of the answer altogether.
         let empty = stand_up(&gateway, collection, 0).await;
         let case = format!("{collection}(the empty collection)");
         let answer = page(&gateway, &empty, "", &case).await;
         assert_eq!(
             answer.body.get("item"),
-            Some(&json!([])),
-            "case {case}: a collection with no element reports the empty page member, got \
-             {:?}",
+            None,
+            "case {case}: a collection with no element reports no page member, got {:?}",
             answer.body
         );
         assert!(
@@ -347,11 +347,10 @@ async fn a_collection_that_holds_nothing_reports_the_empty_page_member() {
 }
 
 #[tokio::test]
-async fn the_page_past_the_last_documentation_part_carries_the_empty_page_member() {
+async fn the_page_past_the_last_documentation_part_carries_no_page_member() {
     // The documentation-part cursor is a POINT in the collection's order rather than a
     // record of it, so a caller can ask for the window past the last part — and a window
-    // that selects no part carries the empty page member, as every page that holds nothing
-    // does.
+    // that selects no part carries no page member, as every page that holds nothing does.
     let gateway = Gateway::new();
     let listing = stand_up(&gateway, "GetDocumentationParts", 3).await;
     for cursor in [
@@ -363,7 +362,7 @@ async fn the_page_past_the_last_documentation_part_carries_the_empty_page_member
         let answer = page(&gateway, &listing, &format!("position={cursor}"), &case).await;
         assert_eq!(
             answer.body.get("item"),
-            Some(&json!([])),
+            None,
             "case {case}: the page past the last part holds nothing, got {:?}",
             answer.body
         );

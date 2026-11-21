@@ -96,14 +96,14 @@ async fn get_base_path_mappings_pages_through_creation_order_on_position_and_lim
     let domain_name = "collection.example.com";
     created_domain(&gateway, domain_name, json!({})).await;
 
-    // A domain name that carries no mapping is answered an EMPTY page: the page member as
-    // the empty list, the way every listing of this service reports a page of nothing — and
-    // nothing beside it either, because nothing follows a page that ended the collection.
+    // A domain name that carries no mapping is answered an EMPTY page: no page member at
+    // all, the way every listing of this service answers a page of nothing — and nothing
+    // beside it either, because nothing follows a page that ended the collection.
     let empty = page_of(&gateway, domain_name, "", "the empty collection").await;
     assert_eq!(
         empty,
-        json!({ "item": [] }),
-        "case the empty collection: expected the empty page member, got {empty:?}"
+        json!({}),
+        "case the empty collection: expected no page member, got {empty:?}"
     );
 
     // The creates differ along what the rule generalises over: the SPELLING of the base
@@ -556,14 +556,14 @@ async fn an_empty_page_of_this_collection_is_answered_with_the_empty_page_member
             let body = page_of(&gateway, &domain_name, query, &case).await;
             assert_eq!(
                 body,
-                json!({ "item": [] }),
-                "case {case}: expected the empty page member and nothing beside it, got \
+                json!({}),
+                "case {case}: expected no page member and nothing beside it, got \
                  {body:?}"
             );
         }
 
-        // The contrast: one mapping created again, and the page carries it — so the empty
-        // list is a page of nothing rather than this listing never filling it.
+        // The contrast: one mapping created again, and the page carries it — so the absent
+        // member is a page of nothing rather than this listing never filling it.
         created_mapping(
             &gateway,
             &domain_name,

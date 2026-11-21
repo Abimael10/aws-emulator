@@ -861,11 +861,8 @@ pub fn slo_not_found(region: &str, id: &str) -> ResourceNotFoundException {
 /// The predicate [`slo_arn_sentence`] states about an SLO this service does not hold.
 const SLO_DOES_NOT_EXIST: &str = "does not exist";
 
-/// The sentence a create whose identifier is ALREADY STORED is refused with: fixed text,
-/// stating that a resource with the same identifier is already there and naming neither the
-/// resource nor the identifier ([`slo_already_exists`]).
-pub const SAME_IDENTIFIER_ALREADY_EXISTS: &str =
-    "A resource with the same identifier already exists";
+/// The predicate [`slo_arn_sentence`] states about an SLO this service ALREADY holds.
+const SLO_ALREADY_EXISTS: &str = "already exists";
 
 /// The ONE sentence this service words a refusal ABOUT ONE PARTICULAR SLO IT CANNOT RESOLVE
 /// with: the resource's capitalised type name ([`SLO_RESOURCE_TYPE`]), the ARN that addresses
@@ -989,18 +986,15 @@ pub fn tagged_resource_type(resource_arn: &str) -> &'static str {
 /// The modelled `ConflictException` a create is refused with when the identifier it sent is
 /// already stored.
 ///
-/// Entirely FIXED text — the sentence AWS states for a create whose identifier a resource
-/// already holds — so it is the whole requirement for this error class: it names neither the
-/// resource kind nor the identifier that was taken. `ConflictException` carries only
-/// `Message`, so a sentence that quoted the identifier back would copy caller input into
-/// every client log recording the failure; what the caller has to correct is the identifier it
-/// just sent.
-///
-/// The refusal that cannot RESOLVE an SLO is a different class, and states the sentence this
-/// service words a refusal ABOUT ONE PARTICULAR SLO with ([`slo_not_found`]).
-pub fn slo_already_exists() -> ConflictException {
+/// The refusal is about ONE PARTICULAR SLO — the stored one whose identifier the create asked
+/// for — so it is worded in the one sentence this service states about one SLO it names
+/// ([`slo_arn_sentence`]): the resource's capitalised type name, that SLO's ARN in single
+/// quotes, and the predicate saying what is wrong with it. `arn` is the STORED record's own,
+/// which is the full resource identifier a client parses to resolve the resource it collided
+/// with.
+pub fn slo_already_exists(arn: &str) -> ConflictException {
     ConflictException {
-        message: SAME_IDENTIFIER_ALREADY_EXISTS.to_string(),
+        message: slo_arn_sentence(arn, SLO_ALREADY_EXISTS),
     }
 }
 

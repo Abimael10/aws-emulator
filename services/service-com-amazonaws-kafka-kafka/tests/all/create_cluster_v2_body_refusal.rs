@@ -4,9 +4,9 @@
 //! its place in the order of decisions.
 //!
 //! The rule under test: a `CreateClusterV2` body that names BOTH cluster types describes two
-//! different clusters, so it names one cluster type too many — it is refused on the
-//! BODY, with HTTP 400 `BadRequestException`, MSK's one fixed sentence stating that only one
-//! of the two may be given and NO
+//! different clusters, so it is no body this API accepts — it is refused on the
+//! BODY, with HTTP 400 `BadRequestException`, MSK's one sentence for a request body it will
+//! not accept and NO
 //! `invalidParameter`, because no single member is at fault. That decision is taken on the
 //! body alone, so it comes BEFORE every decision taken on a member's value or on the
 //! registry: a body naming both kinds reads the same sentence whether one of the blocks
@@ -31,13 +31,12 @@ use serde_json::{json, Value};
 use crate::kafka_harness::{assert_name_already_exists, Emulator, Reply};
 use crate::refusal_wording::PARAMETERS_NOT_VALID;
 
-/// MSK's fixed sentence for a create whose body names both cluster types, written out
+/// MSK's sentence for a create whose body names both cluster types, written out
 /// here rather than read from the service's own constant, so the wording is pinned by this
 /// suite instead of by the code under test: the two members are ALTERNATIVES, so a body
-/// carrying both names one cluster type too many, and the sentence states that only one may
-/// be given, naming nothing of the request.
-const ONE_CLUSTER_TYPE_MESSAGE: &str =
-    "You can specify only one cluster type, either provisioned or serverless.";
+/// carrying both is no body this API accepts, and the refusal is about that body rather than
+/// about any member of it.
+const INVALID_REQUEST_BODY_MESSAGE: &str = "Invalid request body";
 
 /// MSK's fixed sentence for a create that names NO cluster type, and the parameter it blames.
 const NO_CLUSTER_TYPE_MESSAGE: &str =
@@ -119,19 +118,20 @@ fn both_kinds_outside_a_modelled_bound(name: &str) -> Value {
     })
 }
 
-/// Assert `reply` is the selection refusal: the fixed sentence and no member named.
+/// Assert `reply` is the body-level refusal: MSK's sentence for a body it will not accept,
+/// and no member named.
 fn assert_one_cluster_type(reply: &Reply, case: &str) {
     assert_eq!(
         (reply.status, reply.error_code(), reply.error_message()),
-        (400, "BadRequestException", ONE_CLUSTER_TYPE_MESSAGE),
-        "case {case}: expected a 400 BadRequestException {ONE_CLUSTER_TYPE_MESSAGE:?}, got \
+        (400, "BadRequestException", INVALID_REQUEST_BODY_MESSAGE),
+        "case {case}: expected a 400 BadRequestException {INVALID_REQUEST_BODY_MESSAGE:?}, got \
          {} {}",
         reply.status,
         reply.body
     );
     assert!(
         reply.at("/invalidParameter").is_null(),
-        "case {case}: expected the selection refusal to name no member, got {}",
+        "case {case}: expected the body refusal to name no member, got {}",
         reply.body
     );
 }
@@ -188,7 +188,7 @@ async fn a_body_naming_both_cluster_types_is_refused_on_the_selection() {
         reply.body
     );
     assert_ne!(
-        NO_CLUSTER_TYPE_MESSAGE, ONE_CLUSTER_TYPE_MESSAGE,
+        NO_CLUSTER_TYPE_MESSAGE, INVALID_REQUEST_BODY_MESSAGE,
         "the two ways of getting the cluster type wrong must read different sentences"
     );
 

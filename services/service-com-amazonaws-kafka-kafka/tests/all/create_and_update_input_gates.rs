@@ -58,11 +58,10 @@ const GHOST_ID: &str = "11111111-2222-4333-8444-555555555555-1";
 const NO_CLUSTER_TYPE_MESSAGE: &str =
     "You must specify a cluster type, either provisioned or serverless.";
 
-/// What MSK answers a create whose body names BOTH cluster types: the fixed sentence stating
-/// that only one of the two may be given, which names no member at all — the two cluster-type
-/// members are alternatives, so a body carrying both names one too many.
-const ONE_CLUSTER_TYPE_MESSAGE: &str =
-    "You can specify only one cluster type, either provisioned or serverless.";
+/// What MSK answers a create whose body names BOTH cluster types: its sentence for a request
+/// body it will not accept, which names no member at all — the two cluster-type members are
+/// alternatives, so a body carrying both describes no cluster this API makes.
+const ONE_CLUSTER_TYPE_MESSAGE: &str = "Invalid request body";
 
 /// What MSK answers a request whose `CurrentVersion` is not a version token at all.
 const INVALID_CURRENT_VERSION_MESSAGE: &str = "Invalid parameter currentVersion.";

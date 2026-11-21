@@ -1069,12 +1069,23 @@ pub const TARGET_TRACKING_ENTRIES: &str = "target tracking configurations";
 
 // `ScalingInstruction$MinCapacity` and `$MaxCapacity` both target `ResourceCapacity`,
 // declared `{"type": "integer"}` with no `@range`
-// (`smithy_query(query="shape",shape="ResourceCapacity")`), and are documented only as
-// "The minimum capacity of the resource" / "The maximum capacity of the resource", so
-// NEITHER member carries a bound of its own: a resource whose floor is zero asks for a
-// minimum of zero and that is the band the plan registers for it. The one relation the
-// pair has to satisfy is the cross-member one in [`validate_scaling_instruction`], so no
-// constant here states a capacity floor.
+// (`smithy_query(query="shape",shape="ResourceCapacity")`), so the MODEL bounds neither
+// member and the service states the floor itself: a scaling instruction registers a band a
+// scalable resource is kept inside, and the floor of that band is one task, instance or unit
+// — the service refuses a minimum below it in its own prose
+// ([`MINIMUM_CAPACITY_BELOW_FLOOR`]). The other relation the pair has to satisfy is the
+// cross-member one, stated beside it in [`validate_scaling_instruction`].
+
+/// The least capacity a scaling instruction may set as the floor of the band it registers.
+pub const MIN_RESOURCE_CAPACITY: i32 = 1;
+
+/// The sentence a `MinCapacity` below [`MIN_RESOURCE_CAPACITY`] is refused with, naming the
+/// member in prose the way this service words a capacity relation.
+pub const MINIMUM_CAPACITY_BELOW_FLOOR: &str = "Minimum capacity cannot be less than 1";
+
+/// The sentence an inverted capacity band is refused with, worded the same way.
+pub const MAXIMUM_CAPACITY_BELOW_MINIMUM: &str =
+    "Maximum capacity cannot be less than minimum capacity";
 
 /// Lower bound of `ScalingInstruction$PredictiveScalingMaxCapacityBuffer`: "The range
 /// is 1-100."
@@ -1421,12 +1432,15 @@ fn validate_scaling_instruction(
         &instruction.scalable_dimension,
     )?;
 
-    // "The minimum capacity of the resource" / "The maximum capacity of the resource":
-    // neither member is bounded on its own, and the only relation between the two is
-    // that the band they describe is not inverted. The refusal names the members in
-    // prose, the way the service words them.
+    // "The minimum capacity of the resource" / "The maximum capacity of the resource": the
+    // floor of the band an instruction registers is [`MIN_RESOURCE_CAPACITY`], and the band
+    // itself is not inverted. Each refusal names the members in prose, the way the service
+    // words them.
+    if instruction.min_capacity < MIN_RESOURCE_CAPACITY {
+        return Err(MINIMUM_CAPACITY_BELOW_FLOOR.to_string());
+    }
     if instruction.max_capacity < instruction.min_capacity {
-        return Err("Maximum capacity cannot be less than minimum capacity".to_string());
+        return Err(MAXIMUM_CAPACITY_BELOW_MINIMUM.to_string());
     }
 
     // "The amount of time, in seconds, to buffer the run time of scheduled scaling

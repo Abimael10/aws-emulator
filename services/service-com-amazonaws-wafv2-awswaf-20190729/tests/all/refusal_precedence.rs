@@ -17,12 +17,11 @@
 //!    to the namespace asked about is the invalid-ARN refusal naming the ARN, because
 //!    the pairing is what the request got wrong.
 //! 3. A value WAF cannot even READ as the kind of ARN a member takes is judged from
-//!    the request alone, so it outranks everything a judgement needs the store for;
-//!    of the judgements that DO need the store, the TARGET the request acts on is
-//!    resolved first, so an identity the account holds nothing for is the
-//!    nonexistent-item refusal however the body's references resolve, and whether a
-//!    well-formed reference names a resource of the namespace addressed is judged
-//!    only against a target that exists.
+//!    the request alone, so it outranks everything a judgement needs the store for; and a
+//!    REFERENCE the body carries is judged before the TARGET the request acts on, so a put
+//!    naming a rule group that resolves to nothing is the invalid-ARN refusal whether or not
+//!    the set it addresses exists, while the nonexistent-item refusal is what a body WAF can
+//!    use is told about.
 //!
 //! Every call goes through the same front door a real client uses (the `Waf` harness
 //! in [`crate::web_acl_lifecycle`]), so what these tests observe is what an SDK
@@ -366,21 +365,20 @@ async fn an_arn_outside_the_scope_it_was_sent_with_is_refused_on_the_arn() {
     }
 }
 
-/// Rule 3: `PutManagedRuleSetVersions` reports the managed rule set the put targets
-/// ahead of a `VersionsToPublish` reference that only fails to RESOLVE, and keeps
-/// reporting a value that is no rule-group ARN at all ahead of both — and nothing is
-/// published either way.
+/// Rule 3: `PutManagedRuleSetVersions` reports a `VersionsToPublish` reference it cannot
+/// USE — a value that is no rule-group ARN at all, and one that only fails to RESOLVE —
+/// ahead of the managed rule set the put targets, because a reference the request carries is
+/// judged before the resource it addresses; the missing target is what a put whose body WAF
+/// CAN use is told about. Nothing is published either way.
 ///
 /// The rows cross each way the target identity can fail to resolve (an unknown name,
 /// an unknown id, both) with what the request asks to publish (nothing, a version
 /// defined by a rule group that exists, one defined by a well-formed rule-group ARN
 /// that resolves to nothing, two versions — one of each), so the answer is shown to
-/// turn on the target rather than on a reference the store is what tells apart. The
-/// same reference against the set that DOES exist is the invalid-ARN refusal, which
-/// is what keeps this from passing for an operation that never reported references at
-/// all.
+/// turn on the reference where there is one it cannot use and on the target where there is
+/// not.
 #[tokio::test]
-async fn a_put_reports_the_missing_target_before_a_reference_that_does_not_resolve() {
+async fn a_put_reports_a_reference_it_cannot_use_before_the_missing_target() {
     for scope in [SCOPE_REGIONAL, SCOPE_CLOUDFRONT] {
         let (waf, engine) = Waf::sharing_engine();
         let endpoint = if scope == SCOPE_CLOUDFRONT {
@@ -406,17 +404,20 @@ async fn a_put_reports_the_missing_target_before_a_reference_that_does_not_resol
                 WELL_FORMED_UUID.to_string(),
             ),
         ];
-        // What the request asks to publish. None of these changes the answer: the
-        // target is what does not resolve, and it is resolved first.
+        // What the request asks to publish, and which answer it earns: a body WAF can use
+        // leaves the missing TARGET as what is reported, and one carrying a reference it
+        // cannot use is told about that reference first.
         let publications = [
-            ("nothing to publish", Value::Null),
+            ("nothing to publish", Value::Null, None),
             (
                 "a version defined by a rule group that exists",
                 json!({ "Version_1.0": { "AssociatedRuleGroupArn": &group_arn } }),
+                None,
             ),
             (
                 "a version defined by a rule group that does not",
                 json!({ "Version_1.0": { "AssociatedRuleGroupArn": &absent_group } }),
+                Some(absent_group.clone()),
             ),
             (
                 "two versions, one of each",
@@ -424,11 +425,12 @@ async fn a_put_reports_the_missing_target_before_a_reference_that_does_not_resol
                     "Version_1.0": { "AssociatedRuleGroupArn": &group_arn },
                     "Version_2.0": { "AssociatedRuleGroupArn": &absent_group },
                 }),
+                Some(absent_group.clone()),
             ),
         ];
 
         for (identity, name, id) in &identities {
-            for (publication, versions) in &publications {
+            for (publication, versions, unusable) in &publications {
                 let case = format!("{scope}, {identity}, {publication}");
                 let mut request = json!({
                     "Name": name,
@@ -446,21 +448,35 @@ async fn a_put_reports_the_missing_target_before_a_reference_that_does_not_resol
                     status, 400,
                     "case {case:?}: expected a refusal, got status {status} and body {body}"
                 );
-                assert!(
-                    error_code(&body).ends_with("WAFNonexistentItemException"),
-                    "case {case:?}: expected WAFNonexistentItemException, got {body}"
-                );
-                assert_eq!(
-                    error_message(&body),
-                    NONEXISTENT_ITEM_MESSAGE,
-                    "case {case:?}: expected WAF's own sentence, got {body}"
-                );
+                match unusable {
+                    // A reference WAF cannot use is what the put is told about, whether or
+                    // not the set it names exists.
+                    Some(arn) => {
+                        assert_invalid_parameter(
+                            &body,
+                            FIELD_RESOURCE_ARN,
+                            arn,
+                            ARN_NOT_VALID,
+                            &case,
+                        );
+                    }
+                    None => {
+                        assert!(
+                            error_code(&body).ends_with("WAFNonexistentItemException"),
+                            "case {case:?}: expected WAFNonexistentItemException, got {body}"
+                        );
+                        assert_eq!(
+                            error_message(&body),
+                            NONEXISTENT_ITEM_MESSAGE,
+                            "case {case:?}: expected WAF's own sentence, got {body}"
+                        );
+                    }
+                }
             }
         }
 
-        // Against the set that DOES exist, the same reference IS what is reported:
-        // the question whether a well-formed reference resolves is reached once the
-        // target has.
+        // Against the set that DOES exist, the same reference is reported the same way: the
+        // reference is judged on its own and not against the target.
         let case = format!("{scope}, the existing set with a reference that resolves to nothing");
         let (status, body) = waf
             .call_from(
@@ -549,11 +565,11 @@ async fn a_put_reports_the_missing_target_before_a_reference_that_does_not_resol
     }
 }
 
-/// Rule 3, the whole order in one table: a value the put cannot even READ as a
-/// rule-group ARN outranks both the lock token's own modelled form and the target the
-/// put acts on; a reference that is well formed and only fails to RESOLVE outranks
-/// the token but NOT the target; and once every reference resolves, the token's form
-/// and then the token the set carries are what is judged.
+/// Rule 3, the whole order in one table: a reference the put cannot USE — a value it cannot
+/// even READ as a rule-group ARN, and one that is well formed and only fails to RESOLVE —
+/// outranks both the lock token's own modelled form and the target the put acts on; once
+/// every reference resolves, the token's form and then the token the set carries are what is
+/// judged, and the missing target is what a body WAF can use is told about.
 ///
 /// The rows cross HOW the reference fails to be one WAF can use (a value that is no
 /// ARN, another service's ARN, a wafv2 ARN of another resource kind — none of which
@@ -561,9 +577,8 @@ async fn a_put_reports_the_missing_target_before_a_reference_that_does_not_resol
 /// group of the other namespace, which can only be told apart from a usable one by
 /// reading the store) with the lock token (well formed, and three ways of failing
 /// `LockToken`'s modelled form) and with the target (the set the account holds, an
-/// identity nothing holds) — so a refusal that reported the token, or that reported a
-/// reference the store is what judges ahead of a target that does not exist, shows up
-/// as a difference between the rows.
+/// identity nothing holds) — so a refusal that reported the token, or the target, ahead of a
+/// reference the put cannot use shows up as a difference between the rows.
 #[tokio::test]
 async fn the_put_judges_its_references_its_token_and_its_target_in_wafs_order() {
     let (waf, engine) = Waf::sharing_engine();
@@ -656,49 +671,23 @@ async fn the_put_judges_its_references_its_token_and_its_target_in_wafs_order() 
         }
     }
 
-    // A reference the store is what judges comes after the target the put acts on:
-    // against the set the account holds it is the invalid-ARN refusal, and against an
-    // identity nothing holds the missing target is what WAF reports — whatever the
-    // token.
+    // A reference the store is what judges is reported the same way as one no store is
+    // needed to refuse: against the set the account holds and against an identity nothing
+    // holds alike, and whatever the token.
     for (reference, arn) in &unresolvable {
         for token in tokens {
-            let case =
-                format!("{reference}, LockToken {token:?}, against the set the account holds");
-            let (status, body) = waf
-                .call(
-                    "PutManagedRuleSetVersions",
-                    put(set_name, &set_id, token, arn),
-                )
-                .await;
-            assert_eq!(
-                status, 400,
-                "case {case:?}: expected the ARN refusal, got status {status} and body {body}"
-            );
-            assert_invalid_parameter(&body, FIELD_RESOURCE_ARN, arn, ARN_NOT_VALID, &case);
-
-            let case =
-                format!("{reference}, LockToken {token:?}, against an identity nothing holds");
-            let (status, body) = waf
-                .call(
-                    "PutManagedRuleSetVersions",
-                    put("never-provisioned", WELL_FORMED_UUID, token, arn),
-                )
-                .await;
-            assert_eq!(
-                status, 400,
-                "case {case:?}: expected the missing-target refusal, got status {status} \
-                 and body {body}"
-            );
-            assert_eq!(
-                error_code(&body),
-                "WAFNonexistentItemException",
-                "case {case:?}: the target the put acts on is resolved first, got {body}"
-            );
-            assert_eq!(
-                error_message(&body),
-                NONEXISTENT_ITEM_MESSAGE,
-                "case {case:?}: expected WAF's own sentence, got {body}"
-            );
+            for (target, name, id) in targets {
+                let case = format!("{reference}, LockToken {token:?}, against {target}");
+                let (status, body) = waf
+                    .call("PutManagedRuleSetVersions", put(name, id, token, arn))
+                    .await;
+                assert_eq!(
+                    status, 400,
+                    "case {case:?}: expected the ARN refusal, got status {status} and body \
+                     {body}"
+                );
+                assert_invalid_parameter(&body, FIELD_RESOURCE_ARN, arn, ARN_NOT_VALID, &case);
+            }
         }
     }
 
@@ -819,17 +808,22 @@ struct AddressedWrite {
     operation: &'static str,
     /// The body sent against an identity no resource of the account carries.
     missing: Value,
+    /// The class that body earns against the missing target: the nonexistent-item refusal
+    /// for a SAVE, which resolves its target first, and the invalid-ARN refusal for the
+    /// managed-rule-set PUBLISH, which judges the reference its body carries first.
+    missing_class: &'static str,
     /// The same body against the target that DOES exist, with the class it earns
     /// there — `None` for a body whose references all resolve, which that target
     /// would simply accept.
     live: Option<(Value, &'static str)>,
 }
 
-/// Rule 3 wherever it holds: every write that both ADDRESSES a target by identity and
-/// CARRIES a reference to another resource resolves the target first, so an identity
-/// the account holds nothing for is the nonexistent-item refusal and WAF's own
-/// sentence however the body's references resolve — and the same body against the
-/// target that exists is judged on those references.
+/// Rule 3 wherever it holds: a SAVE resolves the target it addresses before the references
+/// its body carries, so an identity the account holds nothing for is the nonexistent-item
+/// refusal and WAF's own sentence however those references resolve — while the managed-rule-set
+/// PUBLISH judges the reference first, so a version defined by a rule group that resolves to
+/// nothing is the invalid-ARN refusal whether or not the set exists. The same body against the
+/// target that exists is judged on those references either way.
 ///
 /// The rows are one per (operation, reference) pair the implemented slice can reach —
 /// a version publish referencing a rule group, a web-ACL save referencing a rule
@@ -838,7 +832,7 @@ struct AddressedWrite {
 /// the rule is asserted across the operations it holds for rather than only on the
 /// one the recorded case used. Nothing any row sends is stored.
 #[tokio::test]
-async fn every_write_resolves_its_target_before_the_references_its_body_carries() {
+async fn each_write_judges_its_target_and_its_references_in_wafs_order() {
     let (waf, engine) = Waf::sharing_engine();
     let (_group_id, group_arn, _group_lock) =
         create_rule_group(&waf, SCOPE_REGIONAL, "vendor-group", 100, json!([])).await;
@@ -913,12 +907,14 @@ async fn every_write_resolves_its_target_before_the_references_its_body_carries(
             case: "a publish referencing a rule group that exists",
             operation: "PutManagedRuleSetVersions",
             missing: put(absent_name, WELL_FORMED_UUID, WELL_FORMED_UUID, &group_arn),
+            missing_class: "WAFNonexistentItemException",
             live: None,
         },
         AddressedWrite {
             case: "a publish referencing a rule group that does not",
             operation: "PutManagedRuleSetVersions",
             missing: put(absent_name, WELL_FORMED_UUID, WELL_FORMED_UUID, &absent_group),
+            missing_class: "WAFInvalidParameterException",
             live: Some((
                 put(set_name, &set_id, &set_lock, &absent_group),
                 "WAFInvalidParameterException",
@@ -933,6 +929,7 @@ async fn every_write_resolves_its_target_before_the_references_its_body_carries(
                 WELL_FORMED_UUID,
                 rule_group_reference(&group_arn),
             ),
+            missing_class: "WAFNonexistentItemException",
             live: None,
         },
         AddressedWrite {
@@ -944,6 +941,7 @@ async fn every_write_resolves_its_target_before_the_references_its_body_carries(
                 WELL_FORMED_UUID,
                 rule_group_reference(&absent_group),
             ),
+            missing_class: "WAFNonexistentItemException",
             live: Some((
                 save_web_acl(
                     "live-acl",
@@ -963,6 +961,7 @@ async fn every_write_resolves_its_target_before_the_references_its_body_carries(
                 WELL_FORMED_UUID,
                 ip_set_reference(&ip_set_arn),
             ),
+            missing_class: "WAFNonexistentItemException",
             live: None,
         },
         AddressedWrite {
@@ -974,6 +973,7 @@ async fn every_write_resolves_its_target_before_the_references_its_body_carries(
                 WELL_FORMED_UUID,
                 ip_set_reference(&absent_ip_set),
             ),
+            missing_class: "WAFNonexistentItemException",
             live: Some((
                 save_rule_group(
                     "live-group",
@@ -990,21 +990,23 @@ async fn every_write_resolves_its_target_before_the_references_its_body_carries(
         let (status, body) = waf.call(write.operation, write.missing.clone()).await;
         assert_eq!(
             status, 400,
-            "case {:?}: expected the missing-target refusal, got status {status} and \
-             body {body}",
+            "case {:?}: expected a refusal, got status {status} and body {body}",
             write.case
         );
         assert!(
-            error_code(&body).ends_with("WAFNonexistentItemException"),
-            "case {:?}: the target is resolved before the body's references, got {body}",
-            write.case
+            error_code(&body).ends_with(write.missing_class),
+            "case {:?}: expected {}, got {body}",
+            write.case,
+            write.missing_class
         );
-        assert_eq!(
-            error_message(&body),
-            NONEXISTENT_ITEM_MESSAGE,
-            "case {:?}: expected WAF's own sentence, got {body}",
-            write.case
-        );
+        if write.missing_class == "WAFNonexistentItemException" {
+            assert_eq!(
+                error_message(&body),
+                NONEXISTENT_ITEM_MESSAGE,
+                "case {:?}: expected WAF's own sentence, got {body}",
+                write.case
+            );
+        }
 
         if let Some((request, code)) = &write.live {
             let (status, body) = waf.call(write.operation, request.clone()).await;

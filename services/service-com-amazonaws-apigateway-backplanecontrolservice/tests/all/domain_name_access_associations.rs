@@ -804,11 +804,11 @@ async fn the_resource_owner_filter_selects_by_owner() {
 }
 
 #[tokio::test]
-async fn the_collection_reports_its_page_member_whatever_the_page_holds() {
-    // The rule: this collection writes its page member — `item` on the wire — WHATEVER the
-    // page holds, so a page holding no element is an EMPTY LIST rather than an absent
-    // member and a client reads "this private custom domain name has no access
-    // association" off a list it can count. It is the one rule every `position`/`limit`
+async fn the_collection_reports_its_page_member_where_the_page_holds_one() {
+    // The rule: this collection writes its page member — `item` on the wire — where the page
+    // HOLDS an element, and nothing at all where it does not, so a client reads "this
+    // private custom domain name has no access association" off the member's absence. It is
+    // the one rule every `position`/`limit`
     // collection of this service reports its page under, which
     // `crate::collection_page_boundaries` asserts across the listings and
     // `crate::deployment_collection` for the deployments of an api.
@@ -816,8 +816,8 @@ async fn the_collection_reports_its_page_member_whatever_the_page_holds() {
     // The rows span every way a page of this collection comes out empty while the listing
     // still resolves — an account that never created an association, one whose last one was
     // deleted, and a `resourceOwner` filter selecting none of the ones it does hold — each
-    // crossed with the listing that DOES hold an element, so a handler answering an empty
-    // list unconditionally could not pass either.
+    // crossed with the listing that DOES hold an element, so a handler answering nothing
+    // unconditionally could not pass either.
     let gateway = Gateway::new();
     let domain = private_domain(&gateway, "page-member.example.com").await;
 
@@ -840,7 +840,7 @@ async fn the_collection_reports_its_page_member_whatever_the_page_holds() {
         "the created association",
     );
 
-    // Held: the member carries the one record, so the empty lists are the answer for an
+    // Held: the member carries the one record, so the absent member is the answer for an
     // empty PAGE rather than this collection's answer for every page.
     assert_eq!(
         listed_arns(&list_associations(&gateway, "").await.body, "one association"),
@@ -873,8 +873,8 @@ async fn the_collection_reports_its_page_member_whatever_the_page_holds() {
     }
 }
 
-/// Assert a listing reports a page member that is PRESENT, is a list and holds nothing —
-/// and that the page ending the collection hands back no cursor to carry on at.
+/// Assert a listing reports NO page member, because the page holds nothing — and that the
+/// page ending the collection hands back no cursor to carry on at.
 async fn assert_empty_page(gateway: &Gateway, query: &str, case: &str) {
     let answer = list_associations(gateway, query).await;
     assert_eq!(
@@ -882,19 +882,11 @@ async fn assert_empty_page(gateway: &Gateway, query: &str, case: &str) {
         "case {case}: expected 200, got {} with {:?}",
         answer.status, answer.body
     );
-    let member = answer
-        .body
-        .get("item")
-        .unwrap_or_else(|| panic!("case {case}: expected the page member, got {:?}", answer.body));
-    let items = member.as_array().unwrap_or_else(|| {
-        panic!(
-            "case {case}: expected the page to be a list, got {:?}",
-            answer.body
-        )
-    });
-    assert!(
-        items.is_empty(),
-        "case {case}: expected an empty page, got {items:?}"
+    assert_eq!(
+        answer.body.get("item"),
+        None,
+        "case {case}: expected no page member for a page of nothing, got {:?}",
+        answer.body
     );
     assert!(
         answer.body["position"].is_null(),

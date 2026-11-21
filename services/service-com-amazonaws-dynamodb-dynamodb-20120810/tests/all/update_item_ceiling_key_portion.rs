@@ -36,7 +36,7 @@
 
 use serde_json::{json, Value};
 
-use crate::emulator::{call, emulator, message, ok};
+use crate::emulator::{call, emulator, error_code, message, ok};
 use crate::table_items::create_active_table;
 
 /// The documented item ceiling, 400 KB.
@@ -208,18 +208,19 @@ async fn a_transactional_update_shares_the_single_item_ceiling() {
             transact(&table, shape, largest + 1),
         )
         .await;
-        // The ceiling is measured against the item the update would leave on the STORED one,
-        // so one byte past it is this action's own failure: the transaction is cancelled and
-        // the reason carries the single-item path's sentence.
+        // The ceiling is a quota on the item the update ASKS for rather than an outcome of
+        // applying it, so one byte past it refuses the whole CALL with the single-item path's
+        // sentence and cancels nothing.
         assert_eq!(
-            (
-                status,
-                body["CancellationReasons"][0]["Code"].as_str(),
-                body["CancellationReasons"][0]["Message"].as_str(),
-            ),
-            (400, Some("ValidationError"), Some(UPDATE_TOO_BIG)),
-            "case {:?}: expected the action cancelled one byte past the ceiling, got {status} \
+            (status, error_code(&body).as_str(), message(&body).as_str()),
+            (400, "ValidationException", UPDATE_TOO_BIG),
+            "case {:?}: expected the call refused one byte past the ceiling, got {status} \
              with {body}",
+            shape.case
+        );
+        assert!(
+            body.get("CancellationReasons").is_none(),
+            "case {:?}: a refused call cancels nothing, got {body}",
             shape.case
         );
         let stored = stored_length(&router, &table, shape).await;

@@ -308,22 +308,29 @@ pub fn device_profile_settings(requested: &LoRaWANDeviceProfile) -> LoRaWANDevic
 /// The sentence this service's 409 carries when a create claims a `DevEui` another
 /// device in the account already holds.
 ///
-/// The whole sentence is fixed: this refusal class names the identifier's kind, not the
-/// value the request submitted nor anything about the device that holds it, so a client
-/// can tell this conflict from the idempotency-token conflict the same operation raises
-/// with the same error code by matching the text, and the refusal discloses no state to a
-/// caller that cannot read it.
-pub const DUPLICATE_DEV_EUI_MESSAGE: &str = "Device with given DevEui already exists";
+/// The fixed text states that a device with the same key has been claimed, and the one
+/// variable part is the `DevEui` the REQUEST submitted — the identifier the caller has to
+/// change — so a client can tell this conflict from the idempotency-token conflict the same
+/// operation raises with the same error code by matching the text. Nothing about the device
+/// that holds the identifier is disclosed to a caller that cannot read it.
+///
+/// The template leaves a second identifier unfilled after the `DevEui`, which is where the
+/// DOUBLE SPACE in the text comes from; it is part of the sentence this service states, so it
+/// is written here as it is answered.
+pub fn duplicate_dev_eui_message(dev_eui: &str) -> String {
+    format!("DevEui {dev_eui}  with same key has been claimed")
+}
 
 /// The `ConflictException` body for a `DevEui` already registered in the account.
 ///
 /// One function, so every operation that claims a `DevEui` refuses a duplicate with the
-/// same body: [`DUPLICATE_DEV_EUI_MESSAGE`] and the two optional members the model merely
-/// permits (`ResourceId`, `ResourceType`) left unset, which keeps the owning device's
-/// identity out of a refusal served to a caller that cannot read it.
-pub fn duplicate_dev_eui() -> ConflictException {
+/// same body: [`duplicate_dev_eui_message`] about the identifier the request submitted, and
+/// the two optional members the model merely permits (`ResourceId`, `ResourceType`) left
+/// unset, which keeps the owning device's identity out of a refusal served to a caller that
+/// cannot read it.
+pub fn duplicate_dev_eui(dev_eui: &str) -> ConflictException {
     ConflictException {
-        message: Some(DUPLICATE_DEV_EUI_MESSAGE.to_string()),
+        message: Some(duplicate_dev_eui_message(dev_eui)),
         resource_id: None,
         resource_type: None,
     }

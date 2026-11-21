@@ -82,21 +82,6 @@ pub fn extra_region(index: usize) -> &'static str {
 /// clock already owes the terminal status to.
 pub const PAST_PROVISIONING: Duration = Duration::from_millis(900);
 
-/// The envelope a client-error refusal of this service closes with: the service that
-/// answered (this one, as its `sdkId` names it), the HTTP status it answered with, the id
-/// of the request it answered and the attempts that one refused call took
-/// (`service::sdk_envelope`).
-///
-/// It is stated here, once, because every suite that asserts how one condition is worded
-/// asserts the whole message a client reads — the sentence AND this envelope — through
-/// [`Answer::sentence`].
-pub fn refusal_envelope(status: u16, request_id: &str) -> String {
-    format!(
-        " (Service: NetworkFlowMonitor, Status Code: {status}, Request ID: {request_id}) \
-         (SDK Attempt Count: 1)"
-    )
-}
-
 /// One emulator holding exactly this service, dispatched over HTTP.
 pub struct Emulator {
     router: MultiServiceRouter,
@@ -133,23 +118,15 @@ impl Answer {
         self.error_type.contains(code) || self.text("__type").contains(code)
     }
 
-    /// The SENTENCE a refusal words: its `message` with the envelope THIS RESPONSE must
-    /// close it with stripped off ([`refusal_envelope`], over the status and the request id
-    /// this very response carries).
+    /// The SENTENCE a refusal words: its `message`, whole.
     ///
-    /// A suite asserting what one condition is worded as reads this, because the envelope's
-    /// request id differs per call and cannot be written down. It is not a weaker
-    /// assertion: the suffix stripped is the one exact envelope this response owes, so a
-    /// message that closes with anything else — a different service, status or id, or no
-    /// envelope at all — is returned WHOLE and fails the comparison. A message that words
-    /// no envelope (a refusal the framework raised at the request boundary) is likewise
-    /// returned whole, which is what those suites assert.
+    /// A refused call carries the sentence the service worded and nothing after it — the
+    /// envelope a client reads around it is the SDK's own rendering of facts its call
+    /// already knows, and no byte of it reaches the wire — so what a suite asserting how
+    /// one condition is worded compares is the message itself. The id of the request
+    /// travels in the header, read as [`Answer::request_id`].
     pub fn sentence(&self) -> String {
-        let message = self.text("message");
-        match message.strip_suffix(&refusal_envelope(self.status, &self.request_id)) {
-            Some(sentence) => sentence.to_string(),
-            None => message,
-        }
+        self.text("message")
     }
 }
 

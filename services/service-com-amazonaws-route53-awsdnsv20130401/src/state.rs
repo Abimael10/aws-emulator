@@ -1001,35 +1001,43 @@ impl StoredZone {
             // reports none.
             linked_service: linked_service::of_zone(self),
             // Read off the zone, so what the last accepted features update left
-            // is what every hosted-zone read reports.
-            features: Some(self.to_hosted_zone_features()),
+            // is what every hosted-zone read reports — and nothing at all for a zone no
+            // feature is configured on ([`StoredZone::reported_features`]).
+            features: self.reported_features(),
         }
     }
 
-    /// The `Features` every hosted-zone projection reports for this zone: the
-    /// status of each feature the container covers that the zone HAS one for.
+    /// The `Features` a hosted-zone projection reports for this zone, and NOTHING for a zone
+    /// no feature of the container is configured on.
     ///
-    /// `HostedZone$Features` carries "the features configuration for the hosted
-    /// zone, including accelerated recovery settings and status information", and
-    /// every zone has such a configuration — so the CONTAINER is answered by every
-    /// response that projects a `HostedZone`, whichever operation projected it: the
-    /// create, the single read, the comment update and both account-wide listings
-    /// all report the same zone and therefore the same features, because the member
-    /// belongs to the SHAPE and not to one operation's reading of it. A zone with no
-    /// feature status at all therefore reports the container EMPTY rather than
-    /// leaving it out.
+    /// `HostedZone$Features` carries "the features configuration for the hosted zone,
+    /// including accelerated recovery settings and status information": a zone that has no
+    /// such configuration has no features to report, so the container is left out of the
+    /// answer rather than reported empty. Whether it appears follows from the ZONE and not
+    /// from the operation that projected it, so the create, the single read, the comment
+    /// update and both account-wide listings all report the same zone the same way.
+    pub fn reported_features(&self) -> Option<HostedZoneFeatures> {
+        let features = self.to_hosted_zone_features();
+        let configured = features.accelerated_recovery_status.is_some()
+            || features.failure_reasons.is_some()
+            || features.public_dns_fallback_status.is_some();
+        configured.then_some(features)
+    }
+
+    /// The `Features` container's CONTENTS for this zone: the status of each feature the
+    /// container covers that the zone HAS one for.
     ///
     /// Which statuses it carries is what the zone's state decides: the
     /// accelerated-recovery status the zone is in or moving to, once a features
     /// update has configured the feature on it (`UpdateHostedZoneFeatures`, the one
     /// operation that configures one); the public-DNS fallback status of a zone the
-    /// feature applies to ([`StoredZone::public_dns_fallback_status`]); and no
+    /// feature is turned on for ([`StoredZone::public_dns_fallback_status`]); and no
     /// `FailureReasons`, because no features change this store accepts fails.
     pub fn to_hosted_zone_features(&self) -> HostedZoneFeatures {
         HostedZoneFeatures {
             accelerated_recovery_status: self.accelerated_recovery_status().map(str::to_string),
             failure_reasons: None,
-            // Reported only where the feature applies: see
+            // Reported only for a zone the feature is turned ON for: see
             // [`StoredZone::public_dns_fallback_status`].
             public_dns_fallback_status: self.public_dns_fallback_status().map(str::to_string),
         }
@@ -1048,22 +1056,23 @@ impl StoredZone {
     }
 
     /// The public-DNS fallback status a hosted-zone projection reports for this
-    /// zone: its posture while the feature applies to the zone, and NOTHING for a
-    /// zone it does not apply to.
+    /// zone: its posture while the feature is TURNED ON for the zone, and NOTHING for a
+    /// zone it is not turned on for.
     ///
-    /// Falling back to public DNS is a feature of a zone that is ANSWERED on the
-    /// public internet, so only a public zone has a status for it. A private
-    /// hosted zone is "visible only in the VPCs that you specify"
-    /// (`HostedZoneConfig$PrivateZone`) and is never answered publicly, so it
-    /// holds no fallback state to report — the same reason accelerated recovery,
-    /// the other recovery feature of the container, cannot be configured on one
-    /// (`crate::ops::update_hosted_zone_features`).
+    /// A status reports a feature a zone is configured for: a zone nothing turned the
+    /// fallback on for holds no fallback state, so a read reports none rather than a
+    /// default. Falling back to public DNS is also a feature of a zone that is ANSWERED on
+    /// the public internet, so only a public zone can have one at all — a private hosted
+    /// zone is "visible only in the VPCs that you specify"
+    /// (`HostedZoneConfig$PrivateZone`) and is never answered publicly, which is the same
+    /// reason accelerated recovery, the other recovery feature of the container, cannot be
+    /// configured on one (`crate::ops::update_hosted_zone_features`).
     ///
     /// Derived from the zone's own state, like [`StoredZone::serve_signature`]
     /// beside it, so whatever turns the feature on moves what every read reports
     /// by itself.
     pub fn public_dns_fallback_status(&self) -> Option<&'static str> {
-        if self.private_zone {
+        if self.private_zone || !self.public_dns_fallback_enabled {
             return None;
         }
         Some(self.public_dns_fallback_posture())

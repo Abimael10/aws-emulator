@@ -38,11 +38,13 @@ impl NumberKey {
         if !integral.bytes().chain(fractional.bytes()).all(|b| b.is_ascii_digit()) {
             return Err(NumberFault::NotNumeric);
         }
-        // WHETHER a text is an exponent at all is told apart from WHAT magnitude it
-        // states: a signed run of decimal digits is an exponent however wide it is
-        // written, and the magnitude it states is then held to the documented range as
-        // the over- or underflow it is. Only a text that is no signed decimal integer
-        // leaves the value one this service cannot convert to a number at all.
+        // WHETHER a text denotes a number at all is told apart from WHAT magnitude it
+        // states: an exponent is read as the signed 32-bit integer a decimal exponent is
+        // held in, and only a magnitude that integer CAN state is held to the documented
+        // range as the over- or underflow it is. A text whose exponent is no signed
+        // decimal integer, or states one wider than that integer reaches, denotes no
+        // decimal value at all and is refused as a text this service cannot convert to a
+        // number.
         let exponent = match exponent_text {
             Some(text) => signed_exponent(text)?,
             None => 0,
@@ -224,14 +226,17 @@ impl NumberKey {
 
 /// The decimal exponent `text` states, or the rule it breaks.
 ///
-/// Two faults are told apart here. A text that is no signed run of decimal digits —
-/// nothing after the exponent marker, a sign with no digits behind it, or a character that
-/// is not a digit — is a value that cannot be read as a number at all, and so is a run of
-/// digits NO integer a decimal exponent is carried in can hold: it states a magnitude no
-/// number has. Every run that integer DOES hold states a magnitude, which the caller then
-/// holds to the documented range as the over- or underflow it is. Leading zeros denote
-/// nothing, so the WIDTH of the run decides neither question — only the value its digits
-/// spell.
+/// `NotNumeric` whenever the text states no exponent a decimal value can carry: nothing
+/// after the exponent marker, a sign with no digits behind it, a character that is not a
+/// digit, or a run of digits stating a magnitude outside the signed 32-bit integer a
+/// decimal exponent is held in ([`MAX_EXPONENT_TEXT_DIGITS`] is the width that integer's
+/// widest magnitude is written at). Each of those leaves a text that denotes no decimal
+/// number, which is a different answer from a number whose magnitude a decimal CAN state
+/// and the documented range excludes: that one is the over- or underflow its sign names.
+///
+/// Leading zeros denote nothing, so the WIDTH of the run decides neither question on its
+/// own — only the value its digits spell, read as the SIGNED integer the text states, so
+/// the bottom of that integer's range is representable too.
 fn signed_exponent(text: &str) -> Result<i64, NumberFault> {
     let (negative, digits) = match text.strip_prefix('-') {
         Some(rest) => (true, rest),
@@ -246,6 +251,9 @@ fn signed_exponent(text: &str) -> Result<i64, NumberFault> {
     if significant.is_empty() {
         return Ok(0);
     }
+    if significant.len() > MAX_EXPONENT_TEXT_DIGITS {
+        return Err(NumberFault::NotNumeric);
+    }
     // Read as the SIGNED integer the text spells, so the bottom of that integer's range is
     // representable too.
     let signed = if negative {
@@ -253,5 +261,9 @@ fn signed_exponent(text: &str) -> Result<i64, NumberFault> {
     } else {
         significant.to_string()
     };
-    signed.parse::<i64>().map_err(|_| NumberFault::NotNumeric)
+    let exponent = signed.parse::<i64>().map_err(|_| NumberFault::NotNumeric)?;
+    // Inside the width of the integer a decimal exponent is held in, which is what makes
+    // this a number whose magnitude the documented range is then read against.
+    i32::try_from(exponent).map_err(|_| NumberFault::NotNumeric)?;
+    Ok(exponent)
 }

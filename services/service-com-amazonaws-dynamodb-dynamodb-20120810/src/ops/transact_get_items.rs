@@ -2,12 +2,13 @@
 
 //! @op TransactGetItems
 //! IMPLEMENTED: reports one `ItemResponse` per `TransactItems` entry, in request order,
-//! each carrying the stored item behind that `Get`'s `Key` — "if a requested item could not
-//! be retrieved, the corresponding ItemResponse object is Null, or if the requested item has
-//! no projected attributes, the corresponding ItemResponse object is an empty Map". A key
-//! that holds no item therefore reports an `ItemResponse` with no `Item`, while one whose
-//! projection matched no location of the item it found reports that `Item` as the empty map
-//! of projected pairs it projected to.
+//! each carrying the projected attributes of the stored item behind that `Get`'s `Key` —
+//! "if a requested item could not be retrieved, the corresponding ItemResponse object is
+//! Null, or if the requested item has no projected attributes, the corresponding
+//! ItemResponse object is an empty Map". An `ItemResponse` therefore carries an `Item`
+//! only where there were projected attributes to carry: a key that holds no item and a
+//! projection that matched no location of the item it found both report the empty
+//! `ItemResponse`.
 //!
 //! The items are read against the SAME stored items `GetItem` reads, so a transactional
 //! read sees what any earlier write left. An unknown — or not yet `ACTIVE` — table is
@@ -335,13 +336,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "ProjectionExpression - One or more attributes of the specified item to
             // retrieve from the table. [...] If no attribute names are specified, then
             // all attributes of the specified item are returned" (`Get`): what this
-            // element asked for of the item it found. Only a key that holds NO item
-            // reports no `Item` member — the `Null` ItemResponse of a get that "could not
-            // be retrieved" — so an element whose projection matched no location of its
-            // item reports the empty map of projected pairs that `ItemResponse` carries
-            // ([`crate::state::reported_item`]).
+            // element asked for of the item it found. What the element REPORTS is the
+            // projected pairs, and an element that has none of them reports the empty
+            // `ItemResponse` object rather than an `Item` with nothing in it — "if a
+            // requested item could not be retrieved, the corresponding ItemResponse
+            // object is Null, or if the requested item has no projected attributes, the
+            // corresponding ItemResponse object is an empty Map"
+            // (`TransactGetItems$Responses`) — so a key that held no item and a
+            // projection that named no location of the item it found answer alike.
             responses.push(ItemResponse {
-                item: crate::state::reported_item(item, projected.as_deref()),
+                item: crate::state::reported_item(item, projected.as_deref())
+                    .filter(|projected| !projected.is_empty()),
             });
         }
 

@@ -369,18 +369,17 @@ async fn the_collection_belongs_to_the_api_that_owns_it() {
 }
 
 #[tokio::test]
-async fn the_page_member_is_reported_whatever_the_page_holds() {
+async fn the_page_member_is_reported_where_the_page_holds_an_element() {
     let gateway = Gateway::new();
     let api = api_with_a_method(&gateway, "deployment-page-member").await;
 
-    // An api that never held a deployment: the member is THERE, carrying nothing — a client
-    // reads "nothing is deployed" off a list it can count, which is the answer recorded for
-    // this collection, rather than off a member that is not in the document at all.
+    // An api that never held a deployment: there is no page of elements to report, so the
+    // member is not in the document at all.
     let empty = get_deployments(&gateway, &api, "").await;
     assert_eq!(
-        empty.body["item"],
-        json!([]),
-        "case \"an api that never held a deployment\": expected the empty page member, got {:?}",
+        empty.body.get("item"),
+        None,
+        "case \"an api that never held a deployment\": expected no page member, got {:?}",
         empty.body
     );
 
@@ -424,9 +423,9 @@ async fn the_page_member_is_reported_whatever_the_page_holds() {
     }
     let emptied = get_deployments(&gateway, &api, "").await;
     assert_eq!(
-        emptied.body["item"],
-        json!([]),
-        "case \"an api a caller emptied\": expected the empty page member, got {:?}",
+        emptied.body.get("item"),
+        None,
+        "case \"an api a caller emptied\": expected no page member, got {:?}",
         emptied.body
     );
 }
@@ -527,9 +526,9 @@ async fn a_refused_deployment_leaves_the_listing_reporting_the_empty_page_member
             refusal.case, listed.status, listed.body
         );
         assert_eq!(
-            listed.body["item"],
-            json!([]),
-            "case {}: expected the page member present and empty after the refusal, got {:?}",
+            listed.body.get("item"),
+            None,
+            "case {}: expected no page member after the refusal, got {:?}",
             refusal.case,
             listed.body
         );
@@ -612,9 +611,9 @@ async fn a_deployment_the_callers_policies_deny_leaves_the_listing_reporting_the
             answer.status, answer.body
         );
         assert_eq!(
-            answer.body["item"],
-            json!([]),
-            "case {case}: expected the page member present and empty after the denial, got {:?}",
+            answer.body.get("item"),
+            None,
+            "case {case}: expected no page member after the denial, got {:?}",
             answer.body
         );
     }

@@ -9,12 +9,11 @@
 //! this crate's one wire-test harness, reused from `rest_api_lifecycle`.
 //!
 //! The rule, asserted over a SET of inputs rather than one call: a listing reports "the
-//! current page of elements from this collection" as a LIST a client counts — for every
-//! collection of this service whose empty page carries the member, a page that holds nothing
-//! is a success carrying that member as the EMPTY list, so a client counts the page it was
-//! served rather than branching on a member that is not there
-//! (`crate::emptied_collection_page_member::empty_page_body`, which also names the
-//! collections answered the other way).
+//! current page of elements from this collection" only where the page HOLDS an element — for
+//! every collection of this service, a page that holds nothing is a success carrying no page
+//! member at all
+//! (`crate::emptied_collection_page_member::empty_page_body`, the one reading of an empty
+//! page).
 //!
 //! The rows span the collections of this service a caller fills and empties again,
 //! crossed with the two ways a page comes to hold nothing while the listing still
@@ -248,9 +247,17 @@ async fn listed(gateway: &Gateway, uri: &str, case: &str) -> Value {
     answer.body
 }
 
-/// Assert `body` reports a page of `count` element(s): the member is always there, and
-/// carries exactly that many elements — the empty list for a page that holds nothing.
+/// Assert `body` reports a page of `count` element(s): the member carries exactly that many
+/// elements, and a page that holds none carries no member at all.
 fn assert_page_of(body: &Value, count: usize, case: &str) {
+    if count == 0 {
+        assert_eq!(
+            body.get("item"),
+            None,
+            "case {case}: expected no page member for a page of nothing, got {body:?}"
+        );
+        return;
+    }
     let items = body
         .get("item")
         .unwrap_or_else(|| panic!("case {case}: expected the page member, got {body:?}"));
@@ -265,13 +272,13 @@ fn assert_page_of(body: &Value, count: usize, case: &str) {
 }
 
 #[tokio::test]
-async fn a_collection_emptied_of_its_last_element_reports_the_empty_page_member() {
+async fn a_collection_emptied_of_its_last_element_reports_no_page_member() {
     for collection in EMPTIED {
         let gateway = Gateway::new();
         let row = stand_up(&gateway, collection).await;
 
-        // The one element it holds is on the page, which the emptied listing reports as
-        // the empty list.
+        // The one element it holds is on the page; the emptied listing reports no page at
+        // all.
         let case = format!("{collection}(one element)");
         let held = listed(&gateway, &row.listing, &case).await;
         assert_page_of(&held, 1, &case);
@@ -296,7 +303,7 @@ async fn a_collection_emptied_of_its_last_element_reports_the_empty_page_member(
 }
 
 #[tokio::test]
-async fn a_listing_narrowed_to_no_element_reports_the_empty_page_member() {
+async fn a_listing_narrowed_to_no_element_reports_no_page_member() {
     for collection in COLLECTIONS {
         let gateway = Gateway::new();
         let row = stand_up(&gateway, collection).await;
@@ -419,28 +426,50 @@ async fn every_paginated_listing_of_this_service_reports_its_page_as_the_listing
         ("GetSdkTypes", "/sdktypes".to_string(), None),
     ];
 
+    // The listings of the table above that are NOT `position`/`limit` collections:
+    // `GetStages` publishes neither member
+    // (`smithy_query(query="operation",operation="GetStages")`), so its `item` is the whole
+    // list of what it holds rather than a page of it, and it is the empty list for an api
+    // that holds no stage.
+    const UNPAGED: &[&str] = &["GetStages"];
+
     for (case, uri, held) in &rows {
         let body = listed(&gateway, uri, case).await;
-        // Every listing of this service reports its page member, as the empty list where the
-        // page holds nothing — the one body the shared reading of an empty page names
-        // (`crate::emptied_collection_page_member::empty_page_body`).
-        let Some(reported) = body.get("item") else {
-            panic!("case {case}: expected the page member, got {body:?}");
-        };
-        let elements = reported
-            .as_array()
-            .unwrap_or_else(|| panic!("case {case}: the page member must be a list, got {reported:?}"));
+        // Every PAGED listing of this service reports its page member where the page HOLDS
+        // an element, and none where it does not — the one body the shared reading of an
+        // empty page names (`crate::emptied_collection_page_member::empty_page_body`).
         match held {
-            Some(count) => assert_eq!(
-                elements.len(),
-                *count,
-                "case {case}: expected a page of {count} element(s), got {elements:?}"
+            Some(0) if !UNPAGED.contains(case) => assert_eq!(
+                body.get("item"),
+                None,
+                "case {case}: expected no page member for a page of nothing, got {body:?}"
             ),
-            None => assert!(
-                !elements.is_empty(),
-                "case {case}: the catalog this service publishes is never empty, got \
-                 {elements:?}"
-            ),
+            Some(count) => {
+                let Some(reported) = body.get("item") else {
+                    panic!("case {case}: expected the page member, got {body:?}");
+                };
+                let elements = reported.as_array().unwrap_or_else(|| {
+                    panic!("case {case}: the page member must be a list, got {reported:?}")
+                });
+                assert_eq!(
+                    elements.len(),
+                    *count,
+                    "case {case}: expected a page of {count} element(s), got {elements:?}"
+                );
+            }
+            None => {
+                let Some(reported) = body.get("item") else {
+                    panic!("case {case}: expected the page member, got {body:?}");
+                };
+                let elements = reported.as_array().unwrap_or_else(|| {
+                    panic!("case {case}: the page member must be a list, got {reported:?}")
+                });
+                assert!(
+                    !elements.is_empty(),
+                    "case {case}: the catalog this service publishes is never empty, got \
+                     {elements:?}"
+                );
+            }
         }
     }
 }

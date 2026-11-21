@@ -3017,18 +3017,18 @@ impl Page {
         self.applied_limit.filter(|_| self.next_position.is_some())
     }
 
-    /// The page of elements as the answer's collection member REPORTS it: ALWAYS present —
-    /// "the current page of elements from this collection" is a list a client counts, so a
-    /// page that holds no element is reported as the EMPTY list rather than left out of the
-    /// answer. That holds however the page came to be empty: a collection that holds no
-    /// element at all, one a caller emptied, a filter that selects none, and the window a
-    /// caller that walked to the end asks for.
+    /// The page of elements as the answer's collection member REPORTS it: present only where
+    /// the page HOLDS an element. "The current page of elements from this collection" is what
+    /// the member carries, so a page that holds none carries nothing and the member is left
+    /// out of the answer altogether — the empty object a client reads as a collection with
+    /// nothing on this page. That holds however the page came to be empty: a collection that
+    /// holds no element at all, one a caller emptied, a filter that selects none, and the
+    /// window a caller that walked to the end asks for.
     ///
-    /// One copy for every `position`/`limit` collection of this service: "the current page of
-    /// elements from this collection" is a list a client counts, so every listing of this
-    /// service reports it, and an empty page is the empty list.
+    /// One copy for every `position`/`limit` collection of this service, so no listing of this
+    /// service reports an empty page a second way.
     pub fn reported_items<Element>(&self, items: Vec<Element>) -> Option<Vec<Element>> {
-        Some(items)
+        (!items.is_empty()).then_some(items)
     }
 }
 

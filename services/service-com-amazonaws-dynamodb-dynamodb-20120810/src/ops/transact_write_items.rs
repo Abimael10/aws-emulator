@@ -1152,6 +1152,26 @@ fn refused_element(error: crate::state::RequestError) -> ElementRefusal {
     }
 }
 
+/// A refusal of ONE ACTION, unless it states the documented item-SIZE quota.
+///
+/// That quota is about the item a change ASKS for rather than about applying it — the same
+/// reading the single-item `UpdateItem` of the same expression takes — so crossing it refuses
+/// the CALL in that sentence and cancels nothing, whichever rule found it: a value the change
+/// would leave that is itself past the ceiling, or the item the change would leave as a whole.
+/// Every other value rule stays this action's own outcome.
+fn size_quota_refuses_the_call(error: crate::state::RequestError) -> ElementRefusal {
+    let states_the_size_quota = matches!(
+        &error,
+        crate::state::RequestError::Validation(message)
+            if message == crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE
+                || message == crate::state::ITEM_SIZE_EXCEEDED_MESSAGE
+    );
+    if states_the_size_quota {
+        return refused_call(error);
+    }
+    refused_element(error)
+}
+
 /// How an action answers a bad key: the cancellation its table's key schema decided, or
 /// the request-level refusal its own shape earned ([`crate::state::KeyRefusal`] owns
 /// which is which).
@@ -1366,11 +1386,13 @@ fn prepare_element<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
             // value has the wrong type for, a document path the stored item cannot hold,
             // an attribute it does not carry. None of it can be settled from the request
             // alone, so it is this ACTION that failed and the transaction is cancelled
-            // with that sentence against this action ([`ElementRefusal::Element`]).
+            // with that sentence against this action ([`ElementRefusal::Element`]) — except
+            // the documented item-SIZE quota, which the applied change can also cross and
+            // which refuses the call ([`size_quota_refuses_the_call`]).
             let touched = applied
                 .apply(&mut item)
                 .map_err(crate::state::refused_in_element)
-                .map_err(refused_element)?;
+                .map_err(size_quota_refuses_the_call)?;
             for attribute in touched.attributes() {
                 if attribute.as_str() == partition_key.as_str()
                     || Some(attribute.as_str()) == sort_key.as_deref()
@@ -1388,12 +1410,14 @@ fn prepare_element<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                 }
             }
             // The item this update LEAVES is read against the stored one, so every rule
-            // about it is this action's outcome too.
+            // about it is this action's outcome too — except the documented item-SIZE
+            // quota, which is a quota on what the change asks for and refuses the call
+            // ([`size_quota_refuses_the_call`]).
             for (attribute, value) in &item {
                 crate::state::check_attribute_value(attribute, value)
                     .map_err(crate::state::stated_for_an_update)
                     .map_err(crate::state::unenveloped)
-                    .map_err(refused_element)?;
+                    .map_err(size_quota_refuses_the_call)?;
             }
             crate::state::canonicalize_item(&mut item)
                 .map_err(crate::state::unenveloped)
@@ -1403,13 +1427,14 @@ fn prepare_element<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
             // what its key portion is charged
             // ([`crate::state::update_size_exceeded`]) plus the frame each clause
             // of the update costs
-            // ([`crate::state::ParsedUpdate::request_shape_charge`]). What it is measured
-            // against is the item the update would leave on the STORED one, so the
-            // transaction is cancelled with this action named rather than refused.
+            // ([`crate::state::ParsedUpdate::request_shape_charge`]). The ceiling is a
+            // quota on the item the update ASKS for rather than an outcome of applying it,
+            // so crossing it refuses the CALL in the sentence the single-item path states
+            // ([`crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE`]) and cancels nothing.
             if crate::state::update_size_exceeded(table, &item, applied.request_shape_charge()) {
-                return Err(ElementRefusal::Element(
+                return Err(refused_call(crate::state::RequestError::Validation(
                     crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE.to_string(),
-                ));
+                )));
             }
             table
                 .check_index_key_types(&item)

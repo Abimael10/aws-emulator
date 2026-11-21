@@ -46,10 +46,11 @@ const NULL_CLAUSE: &str = "One or more parameter values were invalid: Null attri
 const MAX_EXPONENT: i32 = 125;
 const MIN_EXPONENT: i32 = -130;
 
-/// The two limits of the integer a decimal exponent is carried in, as a text
-/// spells them.
-const MAX_SIGNED_64: &str = "9223372036854775807";
-const MIN_SIGNED_64: &str = "-9223372036854775808";
+/// The two limits of the signed 32-bit integer a decimal exponent is held in, as a text
+/// spells them, and one magnitude far past any integer.
+const MAX_SIGNED_32: &str = "2147483647";
+const MIN_SIGNED_32: &str = "-2147483648";
+const PAST_ANY_INTEGER: &str = "9223372036854775808";
 
 /// The clause a magnitude outside the documented range earns, either way out.
 const OVERFLOW_CLAUSE: &str =
@@ -507,14 +508,14 @@ async fn an_exponent_is_read_as_an_integer_and_then_range_checked() {
     let router = seeded().await;
 
     // Each row: the case, the `N` text, and the clause the refusal must carry — the
-    // magnitude clauses wherever the exponent is a run of digits the integer it is carried
+    // magnitude clauses wherever the exponent is a run of digits the integer it is held
     // in can hold and the magnitude it states leaves the documented range, however wide that
     // run is written, and the conversion clause for a text whose exponent is no such run at
-    // all or is one no such integer can hold. The rows walk one past each published bound,
-    // the limits of that integer and one past each of them, far past them, an exponent
-    // spelled with a long run of leading zeros, and a mantissa that normalises to zero
-    // (which has no magnitude of its own, so the exponent it wrote is what is held to the
-    // range).
+    // all or states a magnitude that integer cannot hold. The rows walk one past each
+    // published bound, the limits of that integer and one past each of them, far past them,
+    // an exponent spelled with a long run of leading zeros, and a mantissa that normalises
+    // to zero (which has no magnitude of its own, so the exponent it wrote is what is held
+    // to the range).
     let rows: Vec<(&str, String, String)> = vec![
         (
             "an exponent one past the documented maximum",
@@ -528,78 +529,78 @@ async fn an_exponent_is_read_as_an_integer_and_then_range_checked() {
         ),
         (
             "an exponent at the top of the integer it is read into",
-            format!("1E{MAX_SIGNED_64}"),
+            format!("1E{MAX_SIGNED_32}"),
             OVERFLOW_CLAUSE.to_string(),
         ),
         (
             "an exponent at the bottom of the integer it is read into",
-            format!("1E{MIN_SIGNED_64}"),
+            format!("1E{MIN_SIGNED_32}"),
             UNDERFLOW_CLAUSE.to_string(),
         ),
         (
             "a zero carrying an exponent at the top of that integer",
-            format!("0E{MAX_SIGNED_64}"),
+            format!("0E{MAX_SIGNED_32}"),
             OVERFLOW_CLAUSE.to_string(),
         ),
         (
             "a zero carrying an exponent at the bottom of that integer",
-            format!("0E{MIN_SIGNED_64}"),
+            format!("0E{MIN_SIGNED_32}"),
             UNDERFLOW_CLAUSE.to_string(),
         ),
         (
-            "an exponent one past the top of that integer",
-            "1E9223372036854775808".to_string(),
-            conversion_clause("1E9223372036854775808"),
+            "an exponent far past any integer",
+            format!("1E{PAST_ANY_INTEGER}"),
+            conversion_clause(&format!("1E{PAST_ANY_INTEGER}")),
         ),
         (
-            "an exponent one past the bottom of that integer",
+            "a negative exponent far past any integer",
             "1E-9223372036854775809".to_string(),
             conversion_clause("1E-9223372036854775809"),
         ),
         (
-            "an exponent far past the width of that integer",
+            "an exponent of twenty-five digits",
             "1E99999999999999999999999".to_string(),
             conversion_clause("1E99999999999999999999999"),
         ),
         (
-            "an exponent inside that integer but far past the documented range",
+            "an exponent of seventeen digits",
             "1E92233720368547758".to_string(),
-            OVERFLOW_CLAUSE.to_string(),
+            conversion_clause("1E92233720368547758"),
         ),
         (
-            "a negative exponent inside that integer but far past the documented range",
+            "a negative exponent of seventeen digits",
             "1E-92233720368547758".to_string(),
-            UNDERFLOW_CLAUSE.to_string(),
+            conversion_clause("1E-92233720368547758"),
         ),
         (
-            "a zero carrying an exponent inside that integer but past the documented range",
+            "a zero carrying an exponent of seventeen digits",
             "0E92233720368547758".to_string(),
-            OVERFLOW_CLAUSE.to_string(),
+            conversion_clause("0E92233720368547758"),
         ),
         (
-            "an exponent past the width of a 32-bit scale",
+            "an exponent one past the top of that integer",
             "1E2147483648".to_string(),
-            OVERFLOW_CLAUSE.to_string(),
+            conversion_clause("1E2147483648"),
         ),
         (
-            "a negative exponent past that width",
+            "an exponent one past the bottom of that integer",
             "1E-2147483649".to_string(),
-            UNDERFLOW_CLAUSE.to_string(),
+            conversion_clause("1E-2147483649"),
         ),
         (
             "an exponent far past that width",
             "1E99999999999".to_string(),
-            OVERFLOW_CLAUSE.to_string(),
+            conversion_clause("1E99999999999"),
         ),
         (
             "an exponent far past that width, the other way",
             "1E-99999999999".to_string(),
-            UNDERFLOW_CLAUSE.to_string(),
+            conversion_clause("1E-99999999999"),
         ),
         (
             "a signed exponent far past that width",
             "1E+99999999999".to_string(),
-            OVERFLOW_CLAUSE.to_string(),
+            conversion_clause("1E+99999999999"),
         ),
         (
             "an exponent past the maximum, spelled with a long run of leading zeros",

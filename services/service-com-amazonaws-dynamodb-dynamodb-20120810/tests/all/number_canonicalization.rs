@@ -190,7 +190,7 @@ fn refusal_rows() -> Vec<(&'static str, Value)> {
         json!({"v": {"N": "1e99999999999999999999999"}}),
     ));
     rows.push((
-        "an exponent inside that integer but far past the documented range",
+        "an exponent of seventeen digits, wider than the integer it is held in",
         json!({"v": {"N": "1e92233720368547758"}}),
     ));
     // PAST the documented range, with the exponent's TEXT padded far wider than the

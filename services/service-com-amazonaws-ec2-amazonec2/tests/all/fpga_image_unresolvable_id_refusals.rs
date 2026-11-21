@@ -16,16 +16,11 @@
 //!    * `DescribeFpgaImages` makes the SAME answer as for a value that is no AFI id at all:
 //!      it reports on "the AFIs available to you", so it judges the id it was given rather
 //!      than resolving one resource of the account's own Region;
-//!    * `CopyFpgaImage` answers `InvalidFpgaImageID.NotFound` with `Image ID '<id>' not
-//!      found.`: its source is named by a REGION and an id together, so the id is read for
-//!      its printed FORM and then resolved, and a value in that form it cannot resolve is a
-//!      source that is missing rather than one it cannot read;
-//!    * `DeleteFpgaImage` and `ResetFpgaImageAttribute`, which ACT on ONE named AFI OF THEIR
-//!      OWN REGION, answer the unreadable-id refusal instead: EC2's long id form is an
-//!      obfuscated identifier the service decodes before the lookup, so a value no issue of
-//!      this kind ever produced is one they cannot read — their `InvalidFpgaImageID.NotFound`
-//!      with `Image ID '<id>' not found.` is reserved for an identifier this service DID
-//!      issue, which rule 3 drives;
+//!    * `CopyFpgaImage`, `DeleteFpgaImage` and `ResetFpgaImageAttribute` answer the
+//!      unreadable-id refusal: EC2's long id form is an obfuscated identifier the service
+//!      decodes before the lookup, so a value no issue of this kind ever produced is one they
+//!      cannot read — their `InvalidFpgaImageID.NotFound` with `Image ID '<id>' not found.` is
+//!      reserved for an identifier this service DID issue, which rule 3 drives;
 //!    * `DescribeFpgaImageAttribute` answers the not-found code with EC2's common missing-id
 //!      sentence instead, naming the `fpga-image` resource type.
 //! 3. The two readings are about the ID and not about the operation's subject: the id of a
@@ -100,7 +95,7 @@ fn unreadable_message(fpga_image_id: &str) -> String {
 /// Every operation that resolves an AFI id, with the answer it makes for a value in the
 /// printed id form that this service never ISSUED.
 const RESOLVERS: [(&str, Unresolved); 5] = [
-    ("CopyFpgaImage", Unresolved::NotFoundImageId),
+    ("CopyFpgaImage", Unresolved::Unreadable),
     ("DescribeFpgaImages", Unresolved::Unreadable),
     ("DeleteFpgaImage", Unresolved::Unreadable),
     ("ResetFpgaImageAttribute", Unresolved::Unreadable),

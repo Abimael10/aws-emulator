@@ -141,19 +141,17 @@ const CLUSTER_TYPE_MEMBER: &str = "clusterType";
 const NO_CLUSTER_TYPE_MESSAGE: &str =
     "You must specify a cluster type, either provisioned or serverless.";
 
-/// What MSK answers a create whose body names BOTH cluster types: the fixed sentence stating
-/// that only one of the two may be given, naming nothing of the request.
+/// What MSK answers a create whose body names BOTH cluster types: its one sentence for a
+/// request BODY it will not accept, naming nothing of the request.
 ///
 /// The two cluster-type members are ALTERNATIVES, so a body carrying both describes two
-/// different clusters: the refusal says that only one may be named, which is the one thing
-/// the caller has to change. A create naming NEITHER kind makes no selection at all, so that
-/// one blames the cluster-type parameter the request left unset
+/// different clusters and is no body this API accepts at all — the refusal is about the body
+/// rather than about a member, which is why it names none and states this sentence. A create
+/// naming NEITHER kind does describe a request this API reads, and makes no selection in it,
+/// so that one blames the cluster-type parameter the request left unset
 /// ([`NO_CLUSTER_TYPE_MESSAGE`]). The two answers differ in message and in
-/// `invalidParameter`, so a client can tell the two input errors apart — and both differ from
-/// what a body MSK cannot deserialize at all earns, which is the framework's own refusal of a
-/// body it could not read.
-const ONE_CLUSTER_TYPE_MESSAGE: &str =
-    "You can specify only one cluster type, either provisioned or serverless.";
+/// `invalidParameter`, so a client can tell the two input errors apart.
+const INVALID_REQUEST_BODY_MESSAGE: &str = "Invalid request body";
 
 /// The member a serverless body carries its VPC configurations — and so the
 /// subnets each one is reached through — in, as the wire spells it.
@@ -277,10 +275,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let body = match (provisioned, serverless) {
             (Some(request), None) => ClusterBody::Provisioned(Box::new(request)),
             (None, Some(request)) => ClusterBody::Serverless(request),
-            // A body naming BOTH kinds asks for two clusters at once, so it names one
-            // cluster type too many: the refusal states that only one of the two may be
-            // given, and names no member, because either of them — and only one of them —
-            // could have stayed ([`both_cluster_types`]).
+            // A body naming BOTH kinds asks for two clusters at once, so it is no body this
+            // API accepts: the refusal is about the BODY and names no member
+            // ([`both_cluster_types`]).
             (Some(_), Some(_)) => return Err(both_cluster_types()),
             // A body naming NEITHER kind names no cluster type at all, and either
             // member would have named one, so the refusal blames the abstract
@@ -666,14 +663,13 @@ fn bad_request(parameter: &str, message: String) -> CreateClusterV2Error {
 }
 
 /// Refuse a create whose body names BOTH cluster types: the modeled
-/// `BadRequestException` carrying MSK's one sentence for a body that names one cluster type
-/// too many ([`ONE_CLUSTER_TYPE_MESSAGE`]) and NO `invalidParameter`, because the decision is
-/// taken on the PAIR the request carried rather than on one member at fault — either of the
-/// two could have stayed.
+/// `BadRequestException` carrying MSK's one sentence for a request body it will not accept
+/// ([`INVALID_REQUEST_BODY_MESSAGE`]) and NO `invalidParameter`, because the decision is
+/// taken on the BODY the request carried rather than on one member at fault.
 fn both_cluster_types() -> CreateClusterV2Error {
     CreateClusterV2ErrorModeled::BadRequestException(BadRequestException {
         invalid_parameter: None,
-        message: Some(ONE_CLUSTER_TYPE_MESSAGE.to_string()),
+        message: Some(INVALID_REQUEST_BODY_MESSAGE.to_string()),
     })
     .into()
 }

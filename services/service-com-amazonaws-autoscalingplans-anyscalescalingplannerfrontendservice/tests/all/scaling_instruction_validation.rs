@@ -122,6 +122,18 @@ fn refused_instruction_lists() -> Vec<(&'static str, Value)> {
             json!([with(&[("MinCapacity", json!(4)), ("MaxCapacity", json!(3))])]),
         ),
         (
+            "a minimum capacity below the floor of a band",
+            json!([with(&[("MinCapacity", json!(0))])]),
+        ),
+        (
+            "a band of no width below that floor",
+            json!([with(&[("MinCapacity", json!(0)), ("MaxCapacity", json!(0))])]),
+        ),
+        (
+            "a negative minimum capacity",
+            json!([with(&[("MinCapacity", json!(-1)), ("MaxCapacity", json!(10))])]),
+        ),
+        (
             "a maximum capacity below a zero minimum capacity",
             json!([with(&[("MinCapacity", json!(0)), ("MaxCapacity", json!(-1))])]),
         ),
@@ -409,16 +421,12 @@ fn accepted_instruction_lists() -> Vec<(&'static str, Value)> {
             json!([with(&[("MinCapacity", json!(7)), ("MaxCapacity", json!(7))])]),
         ),
         (
-            "a minimum capacity of one unit",
+            "a minimum capacity at the floor of a band",
             json!([with(&[("MinCapacity", json!(1))])]),
         ),
         (
-            "a zero minimum capacity — a scale-to-zero resource",
-            json!([with(&[("MinCapacity", json!(0))])]),
-        ),
-        (
-            "a band that is zero wide at zero",
-            json!([with(&[("MinCapacity", json!(0)), ("MaxCapacity", json!(0))])]),
+            "a band of no width at that floor",
+            json!([with(&[("MinCapacity", json!(1)), ("MaxCapacity", json!(1))])]),
         ),
         (
             "exactly as many target tracking configurations as the bound allows",
@@ -853,21 +861,20 @@ async fn describe_scaling_plan_resources_reports_an_empty_set_for_a_lookup_that_
 ///
 /// `ScalingInstruction$MinCapacity` and `$MaxCapacity` both target `ResourceCapacity`, an
 /// integer the model gives no `@range`
-/// (`smithy_query(query="shape",shape="ResourceCapacity,ScalingInstruction")`), and both
-/// are documented only as "The minimum capacity of the resource" / "The maximum capacity
-/// of the resource" — so neither member carries a bound of its own and only the relation
-/// between the two can be broken: a band whose maximum does not sit below its minimum is
-/// applied, and read back exactly as it was written. The rows differ along what that rule
-/// generalises over: the VALUE of the minimum (zero, one unit, several units) and the
-/// WIDTH of the band (nothing, one unit, wide).
+/// (`smithy_query(query="shape",shape="ResourceCapacity,ScalingInstruction")`), so the service
+/// states the band's rules itself: the floor of the band is one unit, and its maximum does not
+/// sit below its minimum. A band inside both is applied, and read back exactly as it was
+/// written. The rows differ along what that rule generalises over: the VALUE of the minimum
+/// (the floor itself, a few units up, far up) and the WIDTH of the band (nothing, one unit,
+/// wide).
 #[tokio::test]
 async fn a_capacity_band_is_applied_as_given_whatever_its_minimum() {
     for (label, min, max) in [
-        ("a scale-to-zero resource", 0, 1),
-        ("a band of no width at zero", 0, 0),
-        ("a zero minimum under a wide band", 0, 10_000),
-        ("a minimum of one unit", 1, 1),
+        ("a band at the floor", 1, 1),
+        ("a band one unit wide at the floor", 1, 2),
+        ("a wide band from the floor", 1, 10_000),
         ("a minimum several units up", 5, 25),
+        ("a minimum far up, of no width", 1_000, 1_000),
     ] {
         let emulator = Emulator::new();
         let instructions = json!([with(&[
@@ -931,8 +938,8 @@ async fn a_capacity_band_is_applied_as_given_whatever_its_minimum() {
              {resources}"
         );
 
-        // The inverted band is the one relation the pair has to satisfy, so one unit
-        // below this minimum is refused however low the minimum itself is.
+        // The two relations the pair has to satisfy: one unit below this minimum inverts the
+        // band, and a minimum below the floor is refused however wide the band is.
         let emulator = Emulator::new();
         let (status, code) = emulator
             .err(
@@ -954,24 +961,43 @@ async fn a_capacity_band_is_applied_as_given_whatever_its_minimum() {
              {code:?}",
             min - 1
         );
+        let (status, code) = emulator
+            .err(
+                "CreateScalingPlan",
+                json!({
+                    "ScalingPlanName": "my-plan",
+                    "ApplicationSource": stack_source(1),
+                    "ScalingInstructions": json!([with(&[
+                        ("MinCapacity", json!(0)),
+                        ("MaxCapacity", json!(max)),
+                    ])]),
+                }),
+            )
+            .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "ValidationException"),
+            "case {label:?} (0..{max}): a minimum below the floor is refused, got {status} / \
+             {code:?}"
+        );
     }
 }
 
-/// A plan over a scale-to-zero resource reaches the whole predictive-scaling surface.
+/// A plan whose band sits at the floor reaches the whole predictive-scaling surface.
 ///
 /// The members that configure predictive scaling are independent of the capacity band —
 /// `PredictiveScalingMode` "The predictive scaling mode", `DisableDynamicScaling`
 /// "Controls whether dynamic scaling by AWS Auto Scaling is disabled" — so a plan whose
-/// minimum capacity is zero is created, settles, reports those members as written, and
-/// answers every modelled `ForecastDataType`
+/// band is the narrowest one the service admits is created, settles, reports those members as
+/// written, and answers every modelled `ForecastDataType`
 /// (`smithy_query(query="shape",shape="ForecastDataType")`, mirrored as
 /// `FORECAST_DATA_TYPE_VALUES`).
 #[tokio::test]
-async fn a_forecast_only_plan_over_a_scale_to_zero_resource_is_reachable() {
+async fn a_forecast_only_plan_over_a_narrow_band_is_reachable() {
     let emulator = Emulator::new();
     let instructions = json!([with(&[
-        ("MinCapacity", json!(0)),
-        ("MaxCapacity", json!(1)),
+        ("MinCapacity", json!(1)),
+        ("MaxCapacity", json!(2)),
         (
             "PredefinedLoadMetricSpecification",
             json!({ "PredefinedLoadMetricType": "ASGTotalCPUUtilization" })
@@ -992,7 +1018,7 @@ async fn a_forecast_only_plan_over_a_scale_to_zero_resource_is_reachable() {
     assert_eq!(
         created.get("ScalingPlanVersion"),
         Some(&json!(1)),
-        "a forecast-only plan over a zero minimum is created at version 1, got {created}"
+        "a forecast-only plan over the narrowest band is created at version 1, got {created}"
     );
 
     emulator.make_all_due();
@@ -1017,8 +1043,8 @@ async fn a_forecast_only_plan_over_a_scale_to_zero_resource_is_reachable() {
     // Every forecast data type is reachable for the resource the plan instructs, over a
     // window around the current forecast interval. `points` requires each read to answer
     // 200 with a `Datapoints` list, and each quantity is reported per forecast interval of
-    // the requested window, so the zero-minimum plan is forecast over the same instants as
-    // an otherwise identical plan whose minimum is one unit: the band does not decide
+    // the requested window, so the narrow-band plan is forecast over the same instants as
+    // an otherwise identical plan whose band is wider: the band does not decide
     // which intervals a resource is forecast over. WHAT each data point carries, and
     // whether a resource has a forecast at all, are the forecast surface's own rules,
     // asserted by [`crate::forecast_datapoints`].
@@ -1026,8 +1052,8 @@ async fn a_forecast_only_plan_over_a_scale_to_zero_resource_is_reachable() {
     let window = (issued_at - 3_600, issued_at + 4 * 3_600);
     let twin = Emulator::new();
     let twin_instructions = json!([with(&[
-        ("MinCapacity", json!(1)),
-        ("MaxCapacity", json!(1)),
+        ("MinCapacity", json!(5)),
+        ("MaxCapacity", json!(25)),
         (
             "PredefinedLoadMetricSpecification",
             json!({ "PredefinedLoadMetricType": "ASGTotalCPUUtilization" })
@@ -1075,8 +1101,8 @@ async fn a_forecast_only_plan_over_a_scale_to_zero_resource_is_reachable() {
         .collect();
         assert_eq!(
             instants, twin_instants,
-            "case {data_type}: the zero-minimum plan is forecast over the same intervals \
-             as its one-unit twin, got {instants:?} against {twin_instants:?}"
+            "case {data_type}: the narrow-band plan is forecast over the same intervals \
+             as its wider twin, got {instants:?} against {twin_instants:?}"
         );
     }
 }

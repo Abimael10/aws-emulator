@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The two refusals a NUMBER's magnitude earns, on every surface a number arrives through.
+//! The refusals a NUMBER's magnitude earns, on every surface a number arrives through.
 //!
-//! The rule: an `N` text whose exponent is a signed run of decimal digits always states a
-//! MAGNITUDE — however many digits that run is written with — so a magnitude outside the
-//! documented exponent range is refused as the over- or underflow it is, by the sign of the
-//! exponent, and never as a text that could not be converted to a number. "Number: ... can
-//! have up to 38 digits of precision. Exponent range is 10^-130 to 10^125" ("Service,
-//! Account, and Table Quotas" in the Amazon DynamoDB Developer Guide).
+//! The rule: a magnitude a decimal CAN state and the documented exponent range excludes is
+//! refused as the over- or underflow it is, by the sign of the exponent ("Number: ... can
+//! have up to 38 digits of precision. Exponent range is 10^-130 to 10^125" — "Service,
+//! Account, and Table Quotas" in the Amazon DynamoDB Developer Guide), while a text whose
+//! exponent states a magnitude wider than the signed 32-bit integer a decimal exponent is
+//! held in denotes no decimal number at all and is refused as a text that cannot be
+//! converted to a numeric value, echoing the text.
 //!
 //! The rows differ along what the rule generalises over:
 //!
@@ -15,10 +16,10 @@
 //!   or a write, an expression value of a query, and the same three inside a transaction or
 //!   a batch — because the rule is the numeric domain's and not one operation's;
 //! * the WIDTH the exponent is written at: just past a published bound, at the limits of the
-//!   32-bit integer a decimal scale is held in, far past those limits in either direction,
-//!   with an explicit `+` sign, and padded with a long run of leading zeros;
-//! * the DIRECTION it left the range in, which is what decides which of the two sentences is
-//!   stated.
+//!   32-bit integer a decimal exponent is held in, one past and far past those limits in
+//!   either direction, with an explicit `+` sign, and padded with a long run of leading
+//!   zeros;
+//! * the DIRECTION it left the range in, which is what decides which sentence is stated.
 //!
 //! Which ENVELOPE a surface states its clause in is that surface's own — a clause about a
 //! value an input MEMBER carried is stated inside `1 validation error detected: `, one about
@@ -46,8 +47,13 @@ const OVERFLOW_CLAUSE: &str =
 const UNDERFLOW_CLAUSE: &str =
     "Number underflow. Attempting to store a number with magnitude smaller than supported range";
 
+/// The sentence a text that states no decimal number at all earns, echoing the text.
+fn conversion_clause(text: &str) -> String {
+    format!("The parameter cannot be converted to a numeric value: {text}")
+}
+
 /// The published bounds of the documented exponent range, and the two limits of the 32-bit
-/// integer a decimal scale is held in, as a text spells them.
+/// integer a decimal exponent is held in, as a text spells them.
 const MAX_EXPONENT: i32 = 125;
 const MIN_EXPONENT: i32 = -130;
 const MAX_SIGNED_32: &str = "2147483647";
@@ -81,7 +87,7 @@ async fn seeded() -> smithy_server_runtime::MultiServiceRouter {
 struct Magnitude {
     case: &'static str,
     text: String,
-    clause: &'static str,
+    clause: String,
 }
 
 /// The magnitudes outside the documented range, written at every width the rule
@@ -91,59 +97,61 @@ fn magnitudes() -> Vec<Magnitude> {
         Magnitude {
             case: "one past the documented maximum",
             text: format!("1e{}", MAX_EXPONENT + 1),
-            clause: OVERFLOW_CLAUSE,
+            clause: OVERFLOW_CLAUSE.to_string(),
         },
         Magnitude {
             case: "one past the documented minimum",
             text: format!("1e{}", MIN_EXPONENT - 1),
-            clause: UNDERFLOW_CLAUSE,
+            clause: UNDERFLOW_CLAUSE.to_string(),
         },
         Magnitude {
-            case: "at the top of the integer the scale is held in",
+            case: "at the top of the integer the exponent is held in",
             text: format!("1e{MAX_SIGNED_32}"),
-            clause: OVERFLOW_CLAUSE,
+            clause: OVERFLOW_CLAUSE.to_string(),
         },
         Magnitude {
             case: "at the bottom of that integer",
             text: format!("1e{MIN_SIGNED_32}"),
-            clause: UNDERFLOW_CLAUSE,
+            clause: UNDERFLOW_CLAUSE.to_string(),
         },
+        // Past the width of that integer the text states no decimal number at all, so it
+        // is refused as one that cannot be converted, echoed as the request wrote it.
         Magnitude {
             case: "one past the top of that integer",
             text: "1e2147483648".to_string(),
-            clause: OVERFLOW_CLAUSE,
+            clause: conversion_clause("1e2147483648"),
         },
         Magnitude {
             case: "one past the bottom of that integer",
             text: "1e-2147483649".to_string(),
-            clause: UNDERFLOW_CLAUSE,
+            clause: conversion_clause("1e-2147483649"),
         },
         Magnitude {
             case: "far past the width of that integer",
             text: "1e99999999999".to_string(),
-            clause: OVERFLOW_CLAUSE,
+            clause: conversion_clause("1e99999999999"),
         },
         Magnitude {
             case: "far past that width, the other way",
             text: "1e-99999999999".to_string(),
-            clause: UNDERFLOW_CLAUSE,
+            clause: conversion_clause("1e-99999999999"),
         },
         Magnitude {
             case: "far past that width with an explicit plus sign",
             text: "+1e99999999999".to_string(),
-            clause: OVERFLOW_CLAUSE,
+            clause: conversion_clause("+1e99999999999"),
         },
     ];
     // The padding denotes nothing, so what decides the refusal is the magnitude behind it.
     rows.push(Magnitude {
         case: "past the maximum behind a long run of leading zeros",
         text: format!("1e{}{}", "0".repeat(40), MAX_EXPONENT + 1),
-        clause: OVERFLOW_CLAUSE,
+        clause: OVERFLOW_CLAUSE.to_string(),
     });
     rows.push(Magnitude {
         case: "past the minimum behind a long run of leading zeros",
         text: format!("1e-{}{}", "0".repeat(40), (MIN_EXPONENT - 1).unsigned_abs()),
-        clause: UNDERFLOW_CLAUSE,
+        clause: UNDERFLOW_CLAUSE.to_string(),
     });
     rows
 }
@@ -280,11 +288,11 @@ async fn a_magnitude_outside_the_documented_range_states_which_way_it_left_it() 
             );
             let stated = message(&answered);
             // The sentence is the clause itself, in the envelope this surface states a
-            // clause in — and never the sentence for a text that is no number at all.
+            // clause in.
             let expected = if surface.enveloped {
                 format!("{ENVELOPE}{}", magnitude.clause)
             } else {
-                magnitude.clause.to_string()
+                magnitude.clause.clone()
             };
             assert_eq!(
                 stated, expected,
