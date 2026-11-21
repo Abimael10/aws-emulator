@@ -159,21 +159,9 @@ fn cursor_order(cursor: &str) -> LocationOrder {
 }
 
 /// Whether a stored part counts as `DOCUMENTED` for the request's `locationStatus`
-/// filter.
-///
-/// From `GetDocumentationPartsRequest$locationStatus`: "Valid values are `DOCUMENTED` for
-/// retrieving DocumentationPart resources with content and `UNDOCUMENTED` for
-/// DocumentationPart resources without content." A part's content is its `properties`
-/// content map, so a part whose map holds at least one key has content and one whose map
-/// is empty (`{}`) does not. The map is stored as the JSON object
-/// [`crate::ops::create_documentation_part::validated_properties`] read, so text that is
-/// no longer readable as one is judged by whether it carries anything at all.
-fn has_content(properties: &str) -> bool {
-    match ::serde_json::from_str::<::serde_json::Value>(properties) {
-        Ok(::serde_json::Value::Object(map)) => !map.is_empty(),
-        _ => !properties.trim().is_empty(),
-    }
-}
+/// filter: [`crate::ops::create_documentation_part::has_content`], the one reading of a
+/// part's content this crate has.
+use super::create_documentation_part::has_content;
 
 /// Whether `part` satisfies every filter the request set.
 ///

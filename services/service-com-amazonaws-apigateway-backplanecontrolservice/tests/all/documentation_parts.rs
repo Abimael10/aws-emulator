@@ -122,7 +122,12 @@ fn explicit_location(entity_type: &str, valid: &[&str]) -> Value {
 }
 
 /// `CreateDocumentationPart` with `location` and `properties` sent as given.
-async fn create_part(gateway: &Gateway, api: &str, location: Value, properties: &str) -> Answer {
+pub(crate) async fn create_part(
+    gateway: &Gateway,
+    api: &str,
+    location: Value,
+    properties: &str,
+) -> Answer {
     gateway
         .call(
             "POST",

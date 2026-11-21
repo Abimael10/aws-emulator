@@ -369,7 +369,9 @@ async fn a_documentation_record_that_already_exists_is_refused_with_the_record_n
     // makes valid — the valid-field sets are
     // `smithy_query(query="shape", shape="com.amazonaws.apigateway#DocumentationPartLocation")`
     // — because the sentence names the location that is already documented, member by
-    // member.
+    // member. Each row REPEATS the location its part was created with, which is what this
+    // sentence answers; a location naming that same entity another way resolves to the
+    // part instead (`documentation_part_identity`).
     let rows: Vec<(&str, Value, &str)> = vec![
         (
             "a second part of the whole API",

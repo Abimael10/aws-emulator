@@ -3,14 +3,17 @@
 //! @op CreateDocumentationPart
 //! IMPLEMENTED: stores one `DocumentationPart` under the API named by `restApiId` — its
 //! location completed from the entity type's valid fields, its content map kept as the
-//! JSON text the request supplied — and answers from the stored record.
+//! JSON text the request supplied — and answers from the stored record. The documentation
+//! of one API entity is ONE record: a request for an entity the API lists WITHOUT content
+//! writes that content under the part that is already there, and one for an entity the API
+//! already documents is the modelled conflict.
 //!
 //! This file also holds what the documentation-part family shares: the location rules
-//! ([`validated_location`]), the content-map rule ([`validated_properties`]), the
-//! record's identity ([`location_key`]) and the one renderer of the `DocumentationPart`
-//! body ([`documentation_part_body`]) — so `GetDocumentationPart`,
-//! `GetDocumentationParts` and `ImportDocumentationParts` cannot disagree with this
-//! operation about any of them.
+//! ([`validated_location`]), the content-map rule ([`validated_properties`]), whether a
+//! part has content ([`has_content`]), the record's identity ([`location_key`]) and the one
+//! renderer of the `DocumentationPart` body ([`documentation_part_body`]) — so
+//! `GetDocumentationPart`, `GetDocumentationParts` and `ImportDocumentationParts` cannot
+//! disagree with this operation about any of them.
 //!
 //! ## Shape of an operation
 //!
@@ -328,13 +331,31 @@ pub fn validated_properties(properties: &str) -> Result<String, String> {
     Ok(properties.to_string())
 }
 
+/// Whether a stored part HAS CONTENT — the one reading of that in this crate, so the
+/// `locationStatus` filter and the create agree about which parts are documented.
+///
+/// From `GetDocumentationPartsRequest$locationStatus`: "Valid values are `DOCUMENTED` for
+/// retrieving DocumentationPart resources with content and `UNDOCUMENTED` for
+/// DocumentationPart resources without content." A part's content is its `properties`
+/// content map, so a part whose map holds at least one key has content and one whose map
+/// is empty (`{}`) does not. The map is stored as the JSON object
+/// [`validated_properties`] read, so text that is no longer readable as one is judged by
+/// whether it carries anything at all.
+pub fn has_content(properties: &str) -> bool {
+    match ::serde_json::from_str::<::serde_json::Value>(properties) {
+        Ok(::serde_json::Value::Object(map)) => !map.is_empty(),
+        _ => !properties.trim().is_empty(),
+    }
+}
+
 /// A documentation part's identity: the API entity its location names.
 ///
 /// API Gateway documents a documentation part as "a documentation part for a targeted API
-/// entity", so the completed location is the record's key — which is what makes a second
-/// part at one location a conflict and what an import's `merge` mode lands on. Compared
-/// after [`validated_location`], so two locations that differ only in a member the request
-/// left to its default name ONE entity.
+/// entity", so the completed location is the record's key — which is what a call naming a
+/// location alone is written under, whether it is the create or an import's `merge` mode,
+/// and what `GetDocumentationParts` cursors a part by (`position` is the location, not the
+/// minted id). Compared after [`validated_location`], so two locations that differ only in
+/// a member the request left to its default name ONE entity.
 pub fn location_key(location: &DocumentationPartLocation) -> [String; 5] {
     [
         location.r#type.clone(),
@@ -357,8 +378,8 @@ pub fn part_at_location<'a>(
         .find(|part| location_key(&part.location) == key)
 }
 
-/// The `ConflictException` message for a location another documentation part of the same
-/// API already documents.
+/// The `ConflictException` message for a location the API already holds that same
+/// documentation part at.
 ///
 /// A fixed sentence followed by the location that is already documented, written as the
 /// members the location sets — each name beside its quoted value — and closed with a
@@ -485,40 +506,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
-        {
+        // Which record documents the entity this location names: the part that already
+        // documents it, read under the identity every operation of the family compares
+        // ([`location_key`]).
+        let documented = {
             let api = store.rest_apis.get(&input.rest_api_id).ok_or_else(|| {
                 CreateDocumentationPartErrorModeled::NotFoundException(NotFoundException {
                     message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
                 })
             })?;
-            // One part per request, and at most this many per API: the store cannot grow
-            // past the quota however many requests arrive.
-            if api.documentation_parts.len() >= crate::state::MAX_DOCUMENTATION_PARTS_PER_API {
+            let documented = match part_at_location(api, &location) {
+                // The entity is DOCUMENTED already: a part with content describes it, so a
+                // second part for it would make its documentation ambiguous. The modelled
+                // conflict, naming the location that already has one.
+                Some(part) if has_content(&part.properties) => {
+                    return Err(CreateDocumentationPartErrorModeled::ConflictException(
+                        ConflictException {
+                            message: Some(location_clash_message(&location)),
+                        },
+                    )
+                    .into());
+                }
+                // A part names the entity but carries no content — the UNDOCUMENTED record
+                // an import leaves for an entity its definition named without describing
+                // it (`GetDocumentationParts`'s own `locationStatus` is what reports those
+                // separately). This request is the content for it: it is written under
+                // THAT part's identifier, which is what documenting an entity the API
+                // already lists means, rather than as a second part of it.
+                Some(part) => Some((part.id.clone(), part.sequence)),
+                None => None,
+            };
+            // Only an entity the API does not document yet grows the collection, so the
+            // quota bounds the parts that are ADDED: a call landing on a part already there
+            // adds none, and the store cannot grow past the quota however many requests
+            // arrive.
+            if documented.is_none()
+                && api.documentation_parts.len() >= crate::state::MAX_DOCUMENTATION_PARTS_PER_API
+            {
                 return Err(CreateDocumentationPartErrorModeled::LimitExceededException(
                     LimitExceededException {
                         retry_after_seconds: None,
-                        message: Some(crate::state::quota_reached(
-                            "Documentation Parts",
-                            "API",
-                        )),
+                        message: Some(crate::state::quota_reached("Documentation Parts", "API")),
                     },
                 )
                 .into());
             }
-            // One documentation part per API entity: a second part at one location would
-            // make that entity's documentation ambiguous.
-            if part_at_location(api, &location).is_some() {
-                return Err(CreateDocumentationPartErrorModeled::ConflictException(
-                    ConflictException {
-                        message: Some(location_clash_message(&location)),
-                    },
-                )
-                .into());
-            }
-        }
-
-        let id = store.mint_id();
-        let sequence = store.next_sequence();
+            documented
+        };
+        // The documentation of one API entity is ONE record: a request for an entity the
+        // API already documents is written under that part's own identifier and creation
+        // rank, and only an entity nothing documents yet is given a fresh pair. A second
+        // part at one location would make that entity's documentation ambiguous.
+        let outcome = if documented.is_some() {
+            "documented"
+        } else {
+            "created"
+        };
+        let (id, sequence) = match documented {
+            Some(existing) => existing,
+            None => (store.mint_id(), store.next_sequence()),
+        };
 
         let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
             CreateDocumentationPartErrorModeled::NotFoundException(NotFoundException {
@@ -555,8 +602,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             caller = ?crate::state::request_caller(ctx.parts()),
             rest_api = ?input.rest_api_id,
             documentation_part = ?id,
-            outcome = "created",
-            "documentation part created",
+            outcome = outcome,
+            "documentation part written",
         );
         Ok(body)
     }
