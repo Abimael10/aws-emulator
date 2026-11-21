@@ -13,7 +13,10 @@
 //!    order), its `configuration` (the entries it declares, else the empty map) and both
 //!    artifact lists (empty where it declares no artifact).
 //! 2. PIPELINE TYPE — a declaration that states a `pipelineType` keeps it, and one that
-//!    states none is stored as the service's default type.
+//!    states none is stored as the service's default type. The same rule read through the
+//!    `ListPipelines` projection: every summary a listing serves reports the members of
+//!    its OWN pipeline — the type and mode its declaration resolved to, the version its
+//!    writes left it at, and the instants the store holds for it — on every page.
 //! 3. SHAPE DISCRIMINATOR — wherever a response carries an `ActionTypeId` or an
 //!    `EncryptionKey`, the structure carries the awsJson `__type` member naming its shape,
 //!    and no structure enclosing one carries a discriminator of its own. The rule is per
@@ -45,6 +48,10 @@ const RUN_ORDER_RANGE: (i64, i64) = (1, 999);
 
 /// The `PipelineType` the service stores a declaration that states none as.
 const DEFAULT_PIPELINE_TYPE: &str = "V2";
+
+/// The `ExecutionMode` the service stores a declaration that states none as
+/// (`PipelineDeclaration$executionMode`: "The default mode is SUPERSEDED").
+const DEFAULT_EXECUTION_MODE: &str = "SUPERSEDED";
 
 /// How many SUBSECOND digits an instant this service serializes may carry.
 ///
@@ -411,6 +418,255 @@ async fn assert_reads_report_type(emulator: &Emulator, case: &str, after: &str, 
     );
 }
 
+/// One pipeline of the FLEET a listing summarises: what its declaration states, what a
+/// later update states, and the members its own summary must then carry.
+struct FleetRow {
+    /// What makes this row different from the others.
+    case: &'static str,
+    /// The pipeline's name, which is also the key the listing orders by.
+    name: &'static str,
+    /// The `pipelineType` the create states, `None` for a declaration stating none.
+    created_type: Option<&'static str>,
+    /// The `executionMode` the create states, `None` for a declaration stating none.
+    created_mode: Option<&'static str>,
+    /// The `(pipelineType, executionMode)` a later update states, `None` for a pipeline
+    /// that is never updated.
+    updated: Option<(Option<&'static str>, Option<&'static str>)>,
+    /// The `pipelineType` the summary must report.
+    pipeline_type: &'static str,
+    /// The `executionMode` the summary must report.
+    execution_mode: &'static str,
+    /// The `version` the summary must report: the number the writes above left the
+    /// pipeline at.
+    version: i64,
+}
+
+/// One whole listing, page by page: every `PipelineSummary` `ListPipelines` serves for
+/// `page_size`, in the order the pages served them.
+///
+/// The walk is bounded by the fleet it is reading, so a cursor that failed to advance ends
+/// the test rather than looping.
+async fn whole_listing(emulator: &Emulator, page_size: Option<i64>, fleet: usize) -> Vec<Value> {
+    let mut summaries = Vec::new();
+    let mut next_token: Option<String> = None;
+    for _ in 0..=fleet {
+        let mut request = match page_size {
+            Some(size) => json!({"maxResults": size}),
+            None => json!({}),
+        };
+        if let Some(token) = next_token.take() {
+            request["nextToken"] = json!(token);
+        }
+        let page = emulator.ok("ListPipelines", &request).await;
+        let served = page["pipelines"].as_array().cloned().unwrap_or_default();
+        if let Some(size) = page_size {
+            assert!(
+                served.len() as i64 <= size,
+                "page size {page_size:?}: a page serves at most the requested number of \
+                 summaries, got {page}"
+            );
+        }
+        summaries.extend(served);
+        match page["nextToken"].as_str() {
+            Some(token) => next_token = Some(token.to_string()),
+            None => return summaries,
+        }
+    }
+    panic!("page size {page_size:?}: the listing of {fleet} pipelines never ran out of pages");
+}
+
+/// The millisecond a stored instant fell in — the number every projection of it reports.
+///
+/// `pub(crate)` beside [`epoch_millis`]: a suite that reads a stored instant out of
+/// another plane's store expects the same number from it.
+pub(crate) fn millis_of(time: SystemTime) -> i64 {
+    i64::try_from(
+        time.duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .expect("an instant this emulator's clock can read")
+}
+
+/// RULE 2 over a FLEET: every `PipelineSummary` a listing serves reports the members of
+/// ITS OWN pipeline — the type and mode its declaration resolved to, the version its
+/// writes left it at, and the instants the store holds for it — on every page of the
+/// listing.
+///
+/// Rows differ along what the rule generalises over: which type and mode the declaration
+/// states (including none at all, and the mode only the newer type accepts), whether a
+/// later update changed either, and the version the pipeline is left at. The listing is
+/// read at several page sizes, so a summary cannot be right only when one call serves the
+/// whole fleet, and the names are deliberately not in creation order, so a page carrying
+/// the wrong pipeline's values fails.
+#[tokio::test]
+async fn every_summary_in_a_listing_reports_its_own_pipelines_stored_members() {
+    let rows: [FleetRow; 5] = [
+        FleetRow {
+            case: "a declaration stating neither a type nor a mode",
+            name: "zeta-plain",
+            created_type: None,
+            created_mode: None,
+            updated: None,
+            pipeline_type: DEFAULT_PIPELINE_TYPE,
+            execution_mode: DEFAULT_EXECUTION_MODE,
+            version: 1,
+        },
+        FleetRow {
+            case: "a declaration stating the older type",
+            name: "mid-older",
+            created_type: Some("V1"),
+            created_mode: None,
+            updated: None,
+            pipeline_type: "V1",
+            execution_mode: DEFAULT_EXECUTION_MODE,
+            version: 1,
+        },
+        FleetRow {
+            case: "a declaration stating the newer type and a release-safety mode",
+            name: "alpha-queued",
+            created_type: Some("V2"),
+            created_mode: Some("QUEUED"),
+            updated: None,
+            pipeline_type: "V2",
+            execution_mode: "QUEUED",
+            version: 1,
+        },
+        FleetRow {
+            case: "a pipeline an update took down to the older type",
+            name: "kilo-downgraded",
+            created_type: None,
+            created_mode: None,
+            updated: Some((Some("V1"), None)),
+            pipeline_type: "V1",
+            execution_mode: DEFAULT_EXECUTION_MODE,
+            version: 2,
+        },
+        FleetRow {
+            case: "a pipeline an update took up to the newer type and a parallel mode",
+            name: "beta-upgraded",
+            created_type: Some("V1"),
+            created_mode: None,
+            updated: Some((Some("V2"), Some("PARALLEL"))),
+            pipeline_type: "V2",
+            execution_mode: "PARALLEL",
+            version: 2,
+        },
+    ];
+
+    let emulator = Emulator::new();
+    for row in &rows {
+        let mut declaration = declaration_with(row.name, approval(None, None));
+        if let Some(created_type) = row.created_type {
+            declaration["pipelineType"] = json!(created_type);
+        }
+        if let Some(created_mode) = row.created_mode {
+            declaration["executionMode"] = json!(created_mode);
+        }
+        emulator
+            .ok("CreatePipeline", &json!({"pipeline": declaration}))
+            .await;
+        if let Some((updated_type, updated_mode)) = row.updated {
+            let mut declaration = declaration_with(row.name, approval(None, None));
+            if let Some(updated_type) = updated_type {
+                declaration["pipelineType"] = json!(updated_type);
+            }
+            if let Some(updated_mode) = updated_mode {
+                declaration["executionMode"] = json!(updated_mode);
+            }
+            emulator
+                .ok("UpdatePipeline", &json!({"pipeline": declaration}))
+                .await;
+        }
+    }
+
+    // The instants the one store every handler reads holds for each pipeline, so what the
+    // summary must report is the millisecond each of them fell in rather than a shape.
+    let stored: BTreeMap<String, (i64, i64)> = {
+        let state = emulator.engine().state::<ServiceState>();
+        let state = state.lock();
+        rows.iter()
+            .map(|row| {
+                let pipeline = state
+                    .pipelines
+                    .get(row.name)
+                    .unwrap_or_else(|| panic!("case {:?}: the pipeline must be stored", row.case));
+                (
+                    row.name.to_string(),
+                    (millis_of(pipeline.created), millis_of(pipeline.updated)),
+                )
+            })
+            .collect()
+    };
+
+    let mut expected_order: Vec<&str> = rows.iter().map(|row| row.name).collect();
+    expected_order.sort_unstable();
+
+    // One summary at a time, a size that divides the fleet unevenly, the fleet exactly,
+    // one more than the fleet, and no `maxResults` at all.
+    let fleet = rows.len();
+    for page_size in [
+        Some(1),
+        Some(2),
+        Some(fleet as i64),
+        Some(fleet as i64 + 1),
+        None,
+    ] {
+        let summaries = whole_listing(&emulator, page_size, fleet).await;
+        let served: Vec<&str> = summaries
+            .iter()
+            .map(|summary| summary["name"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            served, expected_order,
+            "page size {page_size:?}: the listing serves every pipeline once, in name \
+             order, got {summaries:?}"
+        );
+
+        for row in &rows {
+            let summary = summaries
+                .iter()
+                .find(|summary| summary["name"] == json!(row.name))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {:?}: page size {page_size:?} must serve the pipeline's \
+                         summary, got {summaries:?}",
+                        row.case
+                    )
+                });
+            let case = format!("{} at page size {page_size:?}", row.case);
+            assert_eq!(
+                summary["pipelineType"],
+                json!(row.pipeline_type),
+                "case {case:?}: the summary must report the pipeline's stored type, got \
+                 {summary}"
+            );
+            assert_eq!(
+                summary["executionMode"],
+                json!(row.execution_mode),
+                "case {case:?}: the summary must report the pipeline's stored mode, got \
+                 {summary}"
+            );
+            assert_eq!(
+                summary["version"],
+                json!(row.version),
+                "case {case:?}: the summary must report the pipeline's stored version, got \
+                 {summary}"
+            );
+            let (created, updated) = stored[row.name];
+            for (member, expected) in [("created", created), ("updated", updated)] {
+                let path = format!("the summary of {}.{member}", row.name);
+                let actual = epoch_millis(&case, &path, &summary[member]);
+                assert_eq!(
+                    actual, expected,
+                    "case {case:?}: the summary must report {member} as the millisecond the \
+                     stored instant fell in, got {summary}"
+                );
+            }
+        }
+    }
+}
+
 /// RULE 3, as an INVARIANT over a whole response: every structure bound to a
 /// discriminated member carries its shape name in `__type`, and no other structure carries
 /// a `__type` at all.
@@ -618,7 +874,11 @@ async fn an_action_type_id_carries_its_shape_name_in_an_action_execution_record(
 /// The epoch-MILLISECONDS a serialized instant carries, asserting on the way that the
 /// number is one of the forms AWS writes: an epoch-seconds number with at most
 /// [`SUBSECOND_DIGITS`] fractional digits.
-fn epoch_millis(case: &str, path: &str, value: &Value) -> i64 {
+///
+/// `pub(crate)` so a suite that reads an instant out of ANOTHER plane's answer (the
+/// approval decision `approval_reviewer.rs` drives) reads it the same way rather than
+/// growing a second copy of this rule.
+pub(crate) fn epoch_millis(case: &str, path: &str, value: &Value) -> i64 {
     let seconds = value.as_f64().unwrap_or_else(|| {
         panic!("case {case:?}: {path} must be an epoch-seconds number, got {value}")
     });
