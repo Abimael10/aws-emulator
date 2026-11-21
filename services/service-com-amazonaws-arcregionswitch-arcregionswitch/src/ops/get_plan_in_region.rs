@@ -255,8 +255,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // clock already made due — owed at the same instant whether or not anybody called.
         // Every handler settles, so no two readers disagree about the current state.
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-        store.settle(now);
+        crate::state::settle_due(&state, ctx.callback(), now).await;
+        let store = state.lock();
 
         // One resolution step for the whole Region-scoped read: an `arn` no plan is
         // stored under and a stored plan this Region is not one of are the same refusal.

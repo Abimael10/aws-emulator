@@ -162,11 +162,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
         // Like every handler of this service: materialise the state changes the clock
         // already made due before reading the store, so no two handlers disagree about
         // what the current state is.
-        store.settle(now);
+        crate::state::settle_due(&state, ctx.callback(), now).await;
+        let mut store = state.lock();
 
         let Some(record) = store.plans.get_mut(&input.arn) else {
             return Err(UpdatePlanErrorModeled::ResourceNotFoundException(
@@ -191,6 +191,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.plan.triggers = input.triggers;
         record.plan.report_configuration = input.report_configuration;
         record.plan.service_quota_checks_enabled = input.service_quota_checks_enabled;
+        // The members the service materialises on every write: an update that supplies no
+        // alarms, no triggers and nothing about quota checks leaves the plan carrying all
+        // three, exactly as creating one does.
+        crate::state::materialise_plan_members(&mut record.plan);
         // Server-owned: the plan has been written once more, and this is when. `version`
         // is derived from the revision by `StoredPlan::as_plan`.
         record.revision += 1;

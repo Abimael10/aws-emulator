@@ -138,8 +138,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        crate::state::settle_due(&state, ctx.callback(), now).await;
         let mut store = state.lock();
-        store.settle(now);
         let Some(record) = store.plans.get_mut(&input.arn) else {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

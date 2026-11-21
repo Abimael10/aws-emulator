@@ -213,8 +213,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // clock already made due — owed at the same instant whether or not anybody called.
         // Every handler settles, so no two readers disagree about the current state.
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-        store.settle(now);
+        crate::state::settle_due(&state, ctx.callback(), now).await;
+        let store = state.lock();
 
         let Some(record) = store.plans.get(&input.plan_arn) else {
             return Err(

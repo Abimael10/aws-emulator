@@ -205,9 +205,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = crate::state::page_size(Some(input.max_results));
 
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
         // Materialise only what the clock already made due.
-        store.settle(now);
+        crate::state::settle_due(&state, ctx.callback(), now).await;
+        let store = state.lock();
 
         let key = (input.plan_arn.clone(), input.execution_id.clone());
         let Some(execution) = store.executions.get(&key) else {

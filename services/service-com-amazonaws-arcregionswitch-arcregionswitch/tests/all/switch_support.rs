@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
+use service_com_amazonaws_arcregionswitch_arcregionswitch::state as arc;
 use service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam;
 use service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts;
 use smithy_server_runtime::multi_service_router::MultiServiceRouter;
@@ -66,22 +67,28 @@ pub(crate) struct Emulator {
 impl Emulator {
     /// This one service.
     pub(crate) fn new() -> Self {
-        Self::with(false, false)
+        Self::with(false, false, false)
     }
 
     /// This service beside the IAM and STS services, so the policies and the session a
     /// case seeds are the ones those services hold.
     pub(crate) fn with_identity() -> Self {
-        Self::with(true, false)
+        Self::with(true, false, false)
     }
 
     /// This service beside EventBridge and Amazon SQS, so a rule's target really receives
     /// what this service publishes.
     pub(crate) fn with_events() -> Self {
-        Self::with(false, true)
+        Self::with(false, true, false)
     }
 
-    fn with(identity: bool, events: bool) -> Self {
+    /// This service beside AWS Lambda, so the functions a workflow step's custom action
+    /// names are real functions this emulator runs.
+    pub(crate) fn with_lambda() -> Self {
+        Self::with(false, false, true)
+    }
+
+    fn with(identity: bool, events: bool, lambda: bool) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // These suites exercise operation behaviour, not request signing.
@@ -112,6 +119,13 @@ impl Emulator {
             router.register_service(service_com_amazonaws_sqs_amazonsqs::EmulatedService::new(
                 Arc::clone(&engine),
             ));
+        }
+        if lambda {
+            router.register_service(
+                service_com_amazonaws_lambda_awsgirapiservice::EmulatedService::new(Arc::clone(
+                    &engine,
+                )),
+            );
         }
         Self { router, engine }
     }
@@ -234,6 +248,70 @@ impl Emulator {
             body,
         )
         .await
+    }
+
+    /// One AWS Lambda call in `region`, answering its HTTP status and parsed body.
+    ///
+    /// Lambda's model declares `restJson1`, so the request is addressed by method and URI
+    /// rather than by a target header, and the SigV4 credential scope is what routes it to
+    /// the `lambda` signing name. Only meaningful on an [`Emulator::with_lambda`].
+    pub(crate) async fn lambda(
+        &self,
+        region: &str,
+        method: &str,
+        uri: &str,
+        body: &Value,
+    ) -> (u16, Value) {
+        let request = http::Request::builder()
+            .method(method)
+            .uri(format!("https://lambda.{region}.amazonaws.com{uri}"))
+            .header("host", format!("lambda.{region}.amazonaws.com"))
+            .header("content-type", "application/json")
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 \
+                     Credential={ACCOUNT_KEY_ID}/20260101/{region}/lambda/aws4_request, \
+                     SignedHeaders=host, Signature=00"
+                ),
+            )
+            .body(bytes::Bytes::from(
+                serde_json::to_vec(body).expect("the request body serializes"),
+            ))
+            .expect("a well-formed request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let parsed = if response.body().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+        };
+        (status, parsed)
+    }
+
+    /// Apply the transitions the clock will owe `ahead` from now.
+    ///
+    /// The same `settle` every handler runs, at a later instant: a case about a window
+    /// measured in minutes cannot sleep for it, and sleeping would test the test machine
+    /// rather than the rule.
+    pub(crate) fn settle_ahead(&self, ahead: Duration) {
+        arc::service_state(&*self.engine)
+            .expect("the shared engine holds this service's store")
+            .lock()
+            .settle(SystemTime::now() + ahead);
+    }
+
+    /// Take, and DROP, the execution blocks the clock has reached and queued to be
+    /// performed, answering how many were abandoned.
+    ///
+    /// That is what a caller disconnecting while an invocation is outstanding leaves
+    /// behind: the step is being performed and nothing will ever answer it.
+    pub(crate) fn abandon_queued_work(&self) -> usize {
+        arc::service_state(&*self.engine)
+            .expect("the shared engine holds this service's store")
+            .lock()
+            .take_pending_lambda_steps()
+            .len()
     }
 }
 
@@ -367,18 +445,28 @@ pub(crate) fn approval_step(name: &str) -> Value {
     })
 }
 
-/// One step carrying a Lambda execution block: it invokes another service's function, so
-/// this emulator cannot perform it and the step fails.
-pub(crate) fn lambda_step(name: &str) -> Value {
+/// One step carrying an ARC routing control execution block: it flips a routing control in
+/// Route 53 ARC, which this emulator does not run, so the clock fails the execution that
+/// reaches it.
+///
+/// Members from `smithy_query(query="shape", shape="ArcRoutingControlConfiguration",
+/// model_path="services/service-com-amazonaws-arcregionswitch-arcregionswitch/smithy-model/com-amazonaws-arcregionswitch-arcregionswitch.json")`:
+/// `regionAndRoutingControls` is required and `timeoutMinutes` carries `@default: 60`.
+pub(crate) fn unperformable_step(name: &str) -> Value {
     json!({
         "name": name,
-        "executionBlockType": "CustomActionLambda",
+        "executionBlockType": "ARCRoutingControl",
         "executionBlockConfiguration": {
-            "customActionLambdaConfig": {
+            "arcRoutingControlConfig": {
                 "timeoutMinutes": 60,
-                "retryIntervalMinutes": 1.0,
-                "regionToRun": "activatingRegion",
-                "lambdas": [{"arn": format!("arn:aws:lambda:us-west-2:{ACCOUNT}:function:switch")}],
+                "regionAndRoutingControls": {
+                    "us-west-2": [{
+                        "routingControlArn": format!(
+                            "arn:aws:route53-recovery-control::{ACCOUNT}:controlpanel/abc/routingcontrol/def"
+                        ),
+                        "state": "On",
+                    }],
+                },
             }
         }
     })

@@ -159,11 +159,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
         // Materialise what the clock already made due first, so this update is applied to
         // the state a reader would see at the same instant — an execution the clock has
         // already finished is not one that can still be paused.
-        store.settle(now);
+        crate::state::settle_due(&state, ctx.callback(), now).await;
+        let mut store = state.lock();
 
         let key = (input.plan_arn.clone(), input.execution_id.clone());
         match store.apply_execution_update(&key, update, input.comment, now) {

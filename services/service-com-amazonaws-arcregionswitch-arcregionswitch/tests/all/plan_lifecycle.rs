@@ -193,29 +193,31 @@ pub(crate) fn default_workflows() -> Value {
     ])
 }
 
-/// One workflow whose `step_names` steps are each a Lambda execution block — a block that
-/// drives ANOTHER service's resources, which this emulator does not run, so the clock
-/// fails the execution when it reaches the first of them.
+/// One workflow whose `step_names` steps are each an ARC routing control execution block —
+/// a block that drives ANOTHER service's resources, which this emulator does not run, so
+/// the clock fails the execution when it reaches the first of them.
 ///
-/// Members from `smithy_query(query="shape", shape="CustomActionLambdaConfiguration",
+/// Members from `smithy_query(query="shape", shape="ArcRoutingControlConfiguration",
 /// model_path="services/service-com-amazonaws-arcregionswitch-arcregionswitch/smithy-model/com-amazonaws-arcregionswitch-arcregionswitch.json")`:
-/// `lambdas`, `retryIntervalMinutes` and `regionToRun` are required, `timeoutMinutes`
-/// carries `@default: 60`.
+/// `regionAndRoutingControls` is required, `timeoutMinutes` carries `@default: 60`.
 fn unrunnable_workflow(action: &str, step_names: &[&str]) -> Value {
     let steps: Vec<Value> = step_names
         .iter()
         .map(|name| {
             json!({
                 "name": name,
-                "executionBlockType": "CustomActionLambda",
+                "executionBlockType": "ARCRoutingControl",
                 "executionBlockConfiguration": {
-                    "customActionLambdaConfig": {
+                    "arcRoutingControlConfig": {
                         "timeoutMinutes": 60,
-                        "retryIntervalMinutes": 1.0,
-                        "regionToRun": "activatingRegion",
-                        "lambdas": [{
-                            "arn": format!("arn:aws:lambda:us-west-2:{ACCOUNT}:function:switch"),
-                        }],
+                        "regionAndRoutingControls": {
+                            "us-west-2": [{
+                                "routingControlArn": format!(
+                                    "arn:aws:route53-recovery-control::{ACCOUNT}:controlpanel/abc/routingcontrol/def"
+                                ),
+                                "state": "On",
+                            }],
+                        },
                     }
                 }
             })

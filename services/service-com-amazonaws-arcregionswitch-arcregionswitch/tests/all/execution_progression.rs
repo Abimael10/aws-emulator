@@ -155,23 +155,6 @@ fn approval_step(name: &str, timeout_minutes: u32) -> Value {
     })
 }
 
-/// One step carrying a Lambda execution block: it invokes another service's function, so
-/// this emulator cannot perform it.
-fn lambda_step(name: &str) -> Value {
-    json!({
-        "name": name,
-        "executionBlockType": "CustomActionLambda",
-        "executionBlockConfiguration": {
-            "customActionLambdaConfig": {
-                "timeoutMinutes": 60,
-                "retryIntervalMinutes": 1.0,
-                "regionToRun": "activatingRegion",
-                "lambdas": [{"arn": format!("arn:aws:lambda:us-west-2:{ACCOUNT}:function:switch")}],
-            }
-        }
-    })
-}
-
 /// One step carrying an ARC routing control execution block: it flips a routing control
 /// in Route 53 ARC, which this emulator does not run either.
 fn routing_control_step(name: &str) -> Value {
@@ -323,13 +306,6 @@ async fn the_clock_moves_an_execution_to_the_state_its_next_step_decides() {
             events: &["executionPending", "executionStarted", "stepPendingApproval"],
         },
         Progression {
-            case: "a Lambda block this emulator cannot run",
-            steps: || vec![lambda_step("Invoke")],
-            state: "failed",
-            step_statuses: &["failed"],
-            events: &["executionPending", "executionStarted", "executionFailed"],
-        },
-        Progression {
             case: "an ARC routing control block this emulator cannot run",
             steps: || vec![routing_control_step("Flip")],
             state: "failed",
@@ -345,7 +321,7 @@ async fn the_clock_moves_an_execution_to_the_state_its_next_step_decides() {
         },
         Progression {
             case: "an approval behind a block this emulator cannot run",
-            steps: || vec![lambda_step("Invoke"), approval_step("Approve", 60)],
+            steps: || vec![routing_control_step("Flip"), approval_step("Approve", 60)],
             state: "failed",
             step_statuses: &["failed", "notStarted"],
             events: &["executionPending", "executionStarted", "executionFailed"],

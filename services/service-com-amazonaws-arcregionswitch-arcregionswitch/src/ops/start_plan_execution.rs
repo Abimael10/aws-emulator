@@ -255,12 +255,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        // Materialise what the clock already owed every execution, performing the
+        // execution blocks it reached: the store guard is taken AFTER it, because
+        // performing one is an in-process call this emulator serves.
+        crate::state::settle_due(&state, ctx.callback(), now).await;
         // The whole synchronous half runs in this block, so the store guard is RELEASED at
         // its end: what follows is an in-process call this emulator serves, which must not
         // run under this service's lock.
         let (output, event) = {
             let mut store = state.lock();
-            store.settle(now);
 
             // A repeated `clientToken` answers with the execution its first use started;
             // the same token with different parameters is the modelled client-token
@@ -407,6 +410,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut step_states: Vec<StepState> = Vec::with_capacity(steps.len());
             let mut planned_steps: Vec<crate::state::PlannedStep> =
                 Vec::with_capacity(steps.len());
+            // Which Region each execution block's `regionToRun` names is decided by the
+            // Regions THIS execution shifts traffic between, captured with the steps.
+            let execution_regions = crate::state::custom_action_lambda::ExecutionRegions {
+                activating: activate_region.clone(),
+                deactivating: deactivate_region.clone(),
+                target: input.target_region.clone(),
+                counterpart: counterpart_region.clone(),
+            };
             for step in steps {
                 step_states.push(StepState {
                     name: Some(step.name.clone()),
@@ -415,7 +426,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     end_time: None,
                     step_mode: Some(input.mode.clone()),
                 });
-                planned_steps.push(crate::state::PlannedStep::of(step));
+                planned_steps.push(crate::state::PlannedStep::of(step, &execution_regions));
             }
 
             let seed = store.next_seed();

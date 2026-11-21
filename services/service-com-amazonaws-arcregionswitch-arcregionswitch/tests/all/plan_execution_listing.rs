@@ -147,22 +147,28 @@ fn error_code(body: &Value) -> String {
         .to_string()
 }
 
-/// One step carrying a Lambda execution block: it invokes another service's function,
-/// which this emulator does not run, so the clock fails the execution that reaches it.
+/// One step carrying an ARC routing control execution block: it flips a routing control
+/// in Route 53 ARC, which this emulator does not run, so the clock fails the execution
+/// that reaches it.
 ///
-/// Members from `smithy_query(query="shape", shape="CustomActionLambdaConfiguration",
+/// Members from `smithy_query(query="shape", shape="ArcRoutingControlConfiguration",
 /// model_path="services/service-com-amazonaws-arcregionswitch-arcregionswitch/smithy-model/com-amazonaws-arcregionswitch-arcregionswitch.json")`:
-/// `lambdas`, `retryIntervalMinutes` and `regionToRun` are required.
-fn lambda_step(name: &str) -> Value {
+/// `regionAndRoutingControls` is required and `timeoutMinutes` carries `@default: 60`.
+fn unperformable_step(name: &str) -> Value {
     json!({
         "name": name,
-        "executionBlockType": "CustomActionLambda",
+        "executionBlockType": "ARCRoutingControl",
         "executionBlockConfiguration": {
-            "customActionLambdaConfig": {
+            "arcRoutingControlConfig": {
                 "timeoutMinutes": 60,
-                "retryIntervalMinutes": 1.0,
-                "regionToRun": "activatingRegion",
-                "lambdas": [{"arn": format!("arn:aws:lambda:us-west-2:{ACCOUNT}:function:switch")}],
+                "regionAndRoutingControls": {
+                    "us-west-2": [{
+                        "routingControlArn": format!(
+                            "arn:aws:route53-recovery-control::{ACCOUNT}:controlpanel/abc/routingcontrol/def"
+                        ),
+                        "state": "On",
+                    }],
+                },
             }
         }
     })
@@ -193,7 +199,7 @@ async fn create_plan(emulator: &Emulator, name: &str) -> String {
         "recoveryApproach": "activePassive",
         "executionRole": format!("arn:aws:iam::{ACCOUNT}:role/ArcRegionSwitchRole"),
         "workflows": [
-            {"workflowTargetAction": "activate", "steps": [lambda_step("scale-up")]},
+            {"workflowTargetAction": "activate", "steps": [unperformable_step("scale-up")]},
             {"workflowTargetAction": "deactivate", "steps": [approval_step("confirm-shift")]},
         ],
     });
@@ -238,8 +244,8 @@ async fn plan_with_a_history(emulator: &Emulator) -> (String, Vec<Started>) {
     let plan_arn = create_plan(emulator, "listing").await;
     let mut history: Vec<Started> = Vec::new();
 
-    // 1. `activate` runs the Lambda block, which nothing here performs: the clock fails
-    //    the execution, which frees the plan for the next one.
+    // 1. `activate` runs the routing control block, which nothing here performs: the clock
+    //    fails the execution, which frees the plan for the next one.
     let case = "an activate execution that fails";
     let id = start(
         emulator,

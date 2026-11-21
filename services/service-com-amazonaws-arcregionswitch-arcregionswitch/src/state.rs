@@ -21,6 +21,7 @@
 //! | [`StoredExecution::events`] | [`MAX_EVENTS_PER_EXECUTION`] per execution | the oldest event is evicted (FIFO) |
 //! | [`ComAmazonawsArcregionswitchArcregionswitchState::client_tokens`] | [`MAX_CLIENT_TOKENS`] | the oldest record is evicted (FIFO) |
 //! | [`StoredPlan::tags`] | [`MAX_TAGS_PER_PLAN`] | `UntagResource`, or the request is refused |
+//! | [`ComAmazonawsArcregionswitchArcregionswitchState::pending_lambda_steps`] | one per execution | drained by the [`settle_due`] pass that queued it |
 //!
 //! Per-request cost is independent of how much is stored, too: [`settle`] walks only the
 //! transitions whose deadline has passed, through the
@@ -29,6 +30,8 @@
 //!
 //! [`settle`]: ComAmazonawsArcregionswitchArcregionswitchState::settle
 
+/// The `CustomActionLambda` execution block of a workflow step, performed.
+pub mod custom_action_lambda;
 /// The EventBridge event a plan execution publishes when it starts.
 pub mod execution_events;
 /// Whether the role a plan's `executionRole` names is one a plan execution could act as.
@@ -105,32 +108,45 @@ pub const CANCELED: &str = "canceled";
 /// nor declined inside the window its own execution block configures.
 pub const PLAN_EXECUTION_TIMED_OUT: &str = "planExecutionTimedOut";
 
-/// The state an execution reaches when the clock gets to a step this emulator cannot
-/// perform, from the model's `ExecutionState` enum.
+/// The state an execution reaches when a step of it was not performed, from the model's
+/// `ExecutionState` enum: the one this emulator cannot perform at all, and the custom
+/// action whose own Lambda invocation failed.
 ///
 /// It is the service's modelled FAILURE state, and it is the honest one: most of a
-/// Region switch workflow's execution blocks drive OTHER services' resources (Lambda,
-/// ECS, Auto Scaling, RDS, Route 53, ARC routing controls), which this emulator does not
-/// run, so nothing performed that step. Reporting `completed` would claim an outcome
-/// nothing produced, and staying `inProgress` for ever would report a run that is not
-/// running AND never release the plan. Failing with [`UNSUPPORTED_EXECUTION_REASON`]
-/// recorded on the execution's events says what happened and frees the plan.
+/// Region switch workflow's execution blocks drive OTHER services' resources (ECS, Auto
+/// Scaling, RDS, Route 53, ARC routing controls), which this emulator does not run, so
+/// nothing performed that step. Reporting `completed` would claim an outcome nothing
+/// produced, and staying `inProgress` for ever would report a run that is not running AND
+/// never release the plan. Failing with the reason recorded on the execution's events
+/// ([`UNSUPPORTED_EXECUTION_REASON`] for a block nothing here performs, and what the
+/// invocation failed with for one that was attempted) says what happened and frees the
+/// plan.
 ///
-/// A manual-approval block is the exception: it drives nothing outside this service, so
-/// the clock really does reach it (see [`PENDING_MANUAL_APPROVAL`]).
+/// Two block types are the exception, and the clock really does reach them: a manual
+/// approval drives nothing outside this service (see [`PENDING_MANUAL_APPROVAL`]), and a
+/// `CustomActionLambda` block drives AWS Lambda functions, which this emulator INVOKES
+/// (see [`custom_action_lambda`]).
 pub const FAILED: &str = "failed";
 
-/// Why a plan execution fails in this emulator, recorded on the `executionFailed` event
-/// `ListPlanExecutionEvents` reports, so a caller is told rather than left guessing.
+/// Why a plan execution whose step drives a resource outside this emulator fails,
+/// recorded on the `executionFailed` event `ListPlanExecutionEvents` reports, so a caller
+/// is told rather than left guessing.
 pub const UNSUPPORTED_EXECUTION_REASON: &str =
-    "This emulator does not run a Region switch workflow's execution blocks, which drive \
-     other services' resources, so the step this plan execution reached was not performed.";
+    "The step this plan execution reached configures an execution block that drives \
+     another service's resources, which this emulator does not run, so the step was not \
+     performed.";
 
 /// Why an execution waiting for a manual approval ends in [`PLAN_EXECUTION_TIMED_OUT`],
 /// recorded the same way.
 pub const APPROVAL_TIMEOUT_REASON: &str =
     "The manual-approval step was neither approved nor declined inside the approval \
      window its execution block configures, so the plan execution timed out.";
+
+/// Why a step whose execution block was being performed fails: the block's own timeout
+/// closed with no answer from the work it drove.
+pub const PERFORMANCE_TIMEOUT_REASON: &str =
+    "The step's execution block did not answer inside the timeout its configuration \
+     gives it, so the step was not performed.";
 
 /// The `StepStatus` of a step the clock has not reached, from the model's `StepStatus`
 /// enum
@@ -141,11 +157,17 @@ pub const STEP_NOT_STARTED: &str = "notStarted";
 /// for `ApprovePlanExecutionStep`.
 pub const STEP_PENDING_APPROVAL: &str = "pendingApproval";
 
-/// The `StepStatus` of a step that is done: a manual approval that was approved.
+/// The `StepStatus` of a step the clock has reached and whose execution block is BEING
+/// performed — a `CustomActionLambda` block whose Lambda invocation is outstanding.
+pub const STEP_RUNNING: &str = "running";
+
+/// The `StepStatus` of a step that is done: a manual approval that was approved, and a
+/// custom action whose Lambda functions returned.
 pub const STEP_COMPLETED: &str = "completed";
 
 /// The `StepStatus` of a step that reached a negative outcome of its own: one this
-/// emulator could not perform, and one whose manual approval was DECLINED.
+/// emulator could not perform, one whose Lambda invocation failed, and one whose manual
+/// approval was DECLINED.
 pub const STEP_FAILED: &str = "failed";
 
 /// The `StepStatus` of a step stopped from outside itself rather than by an outcome of its
@@ -164,8 +186,17 @@ pub const EVENT_EXECUTION_FAILED: &str = "executionFailed";
 /// The `ExecutionEventType` recorded when the clock stops at a manual-approval step.
 pub const EVENT_STEP_PENDING_APPROVAL: &str = "stepPendingApproval";
 
-/// The `ExecutionEventType` recorded when a manual-approval step is approved.
+/// The `ExecutionEventType` recorded when the clock STARTS performing a step's execution
+/// block.
+pub const EVENT_STEP_STARTED: &str = "stepStarted";
+
+/// The `ExecutionEventType` recorded when a step is done: a manual approval that was
+/// approved, and a custom action whose Lambda functions returned.
 pub const EVENT_STEP_SUCCEEDED: &str = "stepSucceeded";
+
+/// The `ExecutionEventType` recorded when a step reached a negative outcome of its own:
+/// the event carries what it failed with.
+pub const EVENT_STEP_FAILED: &str = "stepFailed";
 
 /// The `ExecutionEventType` recorded when an execution reaches [`COMPLETED`].
 pub const EVENT_EXECUTION_SUCCEEDED: &str = "executionSucceeded";
@@ -190,13 +221,14 @@ pub const EVENT_BEHAVIOR_CHANGED_TO_GRACEFUL: &str = "executionBehaviorChangedTo
 /// [`MODE_UNGRACEFUL`].
 pub const EVENT_BEHAVIOR_CHANGED_TO_UNGRACEFUL: &str = "executionBehaviorChangedToUngraceful";
 
-/// The approval window this emulator falls back to, in minutes.
+/// The block timeout this emulator falls back to, in minutes.
 ///
-/// It is the model's own default for the member that carries it
-/// (`ExecutionApprovalConfiguration$timeoutMinutes`, "The timeout value specified for
-/// the configuration", `@range(min: 1)`, `@default: 60`), so a stored block that somehow
-/// carries no usable value waits exactly as long as one that spells the default out.
-pub const DEFAULT_APPROVAL_TIMEOUT_MINUTES: u64 = 60;
+/// It is the model's own default for the member that carries it — `timeoutMinutes` ("The
+/// timeout value specified for the configuration", `@range(min: 1)`, `@default: 60`) on
+/// both `ExecutionApprovalConfiguration` and `CustomActionLambdaConfiguration` — so a
+/// stored block that somehow carries no usable value waits exactly as long as one that
+/// spells the default out.
+pub const DEFAULT_BLOCK_TIMEOUT_MINUTES: u64 = 60;
 
 /// The Region a request that carries no SigV4 credential scope is attributed to.
 /// Matches the Region generated emulators default to.
@@ -909,42 +941,70 @@ fn collect_route53_health_checks(
 pub struct PlannedStep {
     /// The step's name, as `StepState$name` reports it.
     pub name: String,
-    /// `Some(window)` when the step is a manual-approval execution block, and the window
-    /// its configuration gives the approval; `None` for every other block type, which
-    /// drives another service's resources and so is one this emulator cannot perform.
-    pub approval_window: Option<Duration>,
+    /// What the clock does when it reaches the step, decided by the kind of execution
+    /// block the step configures.
+    pub block: PlannedBlock,
+}
+
+/// What the clock does with one step's execution block when it reaches it.
+#[derive(Debug, Clone)]
+pub enum PlannedBlock {
+    /// A manual-approval block: the one execution block whose work is inside THIS service.
+    /// The clock stops at it for the window its configuration gives the approval, and
+    /// `ApprovePlanExecutionStep` is what moves it on.
+    ManualApproval(Duration),
+    /// A `CustomActionLambda` block: its AWS Lambda functions are INVOKED, and what they
+    /// answer is what the step comes to (see [`custom_action_lambda`]).
+    ///
+    /// `timeout` is how long the invocations have to come back, from the block's own
+    /// configuration ([`block_timeout`]): an invocation still outstanding at its end is one
+    /// the step never got an answer to.
+    CustomActionLambda {
+        action: custom_action_lambda::LambdaCustomAction,
+        timeout: Duration,
+    },
+    /// Every other block type: it drives another service's resources, which this emulator
+    /// does not run, so it is a step nothing performs.
+    Unperformable,
 }
 
 impl PlannedStep {
-    /// The clock's plan for one step of a stored workflow.
-    pub fn of(step: &Step) -> Self {
-        let approval_window = match &step.execution_block_configuration {
-            // A manual approval is the one execution block whose work is inside THIS
-            // service: it waits for `ApprovePlanExecutionStep` and drives nothing else.
+    /// The clock's plan for one step of a stored workflow, for an execution shifting
+    /// traffic between `regions`.
+    pub fn of(step: &Step, regions: &custom_action_lambda::ExecutionRegions) -> Self {
+        let block = match &step.execution_block_configuration {
             ExecutionBlockConfiguration::executionApprovalConfig(config) => {
-                Some(approval_window(config.timeout_minutes))
+                PlannedBlock::ManualApproval(block_timeout(config.timeout_minutes))
             }
-            _ => None,
+            ExecutionBlockConfiguration::customActionLambdaConfig(config) => {
+                PlannedBlock::CustomActionLambda {
+                    action: custom_action_lambda::LambdaCustomAction::of(config, regions),
+                    timeout: block_timeout(config.timeout_minutes),
+                }
+            }
+            _ => PlannedBlock::Unperformable,
         };
         Self {
             name: step.name.clone(),
-            approval_window,
+            block,
         }
     }
 }
 
-/// How long a manual-approval step waits, from the block's own configuration.
+/// How long a step waits on its execution block, from the block's own configuration.
 ///
-/// AWS documents the window on the block itself
-/// (`ExecutionApprovalConfiguration$timeoutMinutes`: "The timeout value specified for the
-/// configuration", `@range(min: 1)`, `@default: 60`), so the configured value is what is
-/// waited — this is not a duration the emulator chooses. A value the model does not admit
-/// falls back to its documented default.
-fn approval_window(timeout_minutes: i32) -> Duration {
+/// AWS documents the window on the block itself — `timeoutMinutes` ("The timeout value
+/// specified for the configuration", `@range(min: 1)`, `@default: 60`) on both
+/// `ExecutionApprovalConfiguration` and `CustomActionLambdaConfiguration` — so the
+/// configured value is what is waited: for an approval the window the decision has, and for
+/// a custom action the window its Lambda invocations have to come back in. This is not a
+/// duration the emulator chooses. A value the model does not admit falls back to its
+/// documented default.
+fn block_timeout(timeout_minutes: i32) -> Duration {
     let minutes = u64::try_from(timeout_minutes)
         .ok()
         .filter(|minutes| *minutes >= 1)
-        .unwrap_or(DEFAULT_APPROVAL_TIMEOUT_MINUTES);
+        .unwrap_or(DEFAULT_BLOCK_TIMEOUT_MINUTES);
     Duration::from_secs(minutes * 60)
 }
 
@@ -1007,6 +1067,13 @@ impl StoredExecution {
             .position(|step| step.status.as_deref() == Some(STEP_PENDING_APPROVAL))
     }
 
+    /// The position of the step whose execution block is BEING performed, while one is.
+    pub fn step_being_performed(&self) -> Option<usize> {
+        self.step_states
+            .iter()
+            .position(|step| step.status.as_deref() == Some(STEP_RUNNING))
+    }
+
     /// The position of the first step the clock has not reached yet.
     pub fn next_unreached_step(&self) -> Option<usize> {
         self.step_states
@@ -1062,12 +1129,44 @@ pub struct TokenRecord {
 enum Advance {
     /// Stop at the manual-approval step at this position, for the window given.
     HoldForApproval { index: usize, window: Duration },
+    /// Perform the `CustomActionLambda` block of the step at this position: its functions
+    /// are invoked once the store lock is gone, and
+    /// [`ComAmazonawsArcregionswitchArcregionswitchState::complete_lambda_step`] applies
+    /// what they answered, inside `timeout`.
+    PerformLambda {
+        index: usize,
+        action: custom_action_lambda::LambdaCustomAction,
+        timeout: Duration,
+    },
     /// The step at this position is an execution block this emulator cannot perform.
     UnsupportedStep(usize),
+    /// The step at this position was being performed and its block's timeout has closed
+    /// with no answer from the invocation.
+    PerformanceWindowClosed(usize),
     /// The approval window of the step at this position has closed undecided.
     ApprovalWindowClosed(usize),
     /// No step is left to reach.
     WorkflowDone,
+}
+
+/// One step whose execution block the clock has REACHED and that is being performed: what
+/// to invoke, and which step of which execution the outcome belongs to.
+///
+/// Queued by [`ComAmazonawsArcregionswitchArcregionswitchState::settle`], which holds the
+/// store lock and so cannot perform anything itself, and drained by [`settle_due`] — the
+/// one entry point every handler settles through. Bounded by the executions that exist:
+/// an execution whose step is being performed is owed no further transition until the
+/// outcome is applied, so it queues at most one entry at a time.
+#[derive(Debug, Clone)]
+pub struct PendingLambdaStep {
+    /// The execution the step belongs to, as `(plan ARN, executionId)`.
+    pub key: (String, String),
+    /// The step's position in that execution's step list.
+    pub index: usize,
+    /// The execution metadata every invocation of the block carries.
+    pub metadata: custom_action_lambda::InvocationMetadata,
+    /// The functions to invoke.
+    pub action: custom_action_lambda::LambdaCustomAction,
 }
 
 /// What [`ComAmazonawsArcregionswitchArcregionswitchState::apply_approval`] found when it
@@ -1162,6 +1261,9 @@ pub struct ComAmazonawsArcregionswitchArcregionswitchState {
     /// `(due instant, plan ARN, executionId)`. Sorted by deadline, so [`Self::settle`]
     /// touches only what is actually due.
     due_transitions: BTreeSet<(SystemTime, String, String)>,
+    /// The execution blocks the clock has reached that are performed outside this lock,
+    /// waiting for [`settle_due`] to perform them. Drained by the pass that queued them.
+    pending_lambda_steps: Vec<PendingLambdaStep>,
     /// Monotonic seed for the ids this service mints and for the token FIFO.
     seed: u64,
 }
@@ -1196,10 +1298,11 @@ impl ComAmazonawsArcregionswitchArcregionswitchState {
     ///
     /// The transitions are the workflow's own progression, one step at a time (see
     /// [`Self::advance_execution`]): the clock reaches a step, and the step either stops
-    /// the execution for a manual approval, or is one this emulator cannot perform and
-    /// fails it. A transition that lands another one in the past (a long-expired approval
-    /// window, say) is applied in the same pass, which is why this loop re-reads the
-    /// index rather than taking a snapshot of it.
+    /// the execution for a manual approval, is performed (a `CustomActionLambda` block,
+    /// queued here and invoked by [`settle_due`] once this lock is gone), or is one this
+    /// emulator cannot perform and fails it. A transition that lands another one in the
+    /// past (a long-expired approval window, say) is applied in the same pass, which is
+    /// why this loop re-reads the index rather than taking a snapshot of it.
     pub fn settle(&mut self, now: SystemTime) {
         while let Some(next) = self.due_transitions.pop_first() {
             if next.0 > now {
@@ -1208,6 +1311,83 @@ impl ComAmazonawsArcregionswitchArcregionswitchState {
             }
             let (due, plan_arn, execution_id) = next;
             self.advance_execution(&(plan_arn, execution_id), due);
+        }
+    }
+
+    /// Take the execution blocks the clock has reached that are performed outside this
+    /// lock, leaving none behind. [`settle_due`] is what calls it.
+    pub fn take_pending_lambda_steps(&mut self) -> Vec<PendingLambdaStep> {
+        std::mem::take(&mut self.pending_lambda_steps)
+    }
+
+    /// Apply what one `CustomActionLambda` step's functions answered: `Ok` for an
+    /// invocation that performed the step, `Err(why)` for one that did not.
+    ///
+    /// A performed step reports [`STEP_COMPLETED`] and the execution [`IN_PROGRESS`], with
+    /// the clock owing the next step after [`EXECUTION_START_SPAN`] — exactly where an
+    /// approved manual approval leaves an execution. A step whose invocation failed
+    /// reports [`STEP_FAILED`] and the execution [`FAILED`], with the reason on both the
+    /// `stepFailed` and the `executionFailed` event, and the plan released.
+    ///
+    /// The outcome applies only while the step is still the one being performed: an
+    /// execution a caller canceled, or one the step list of which has moved on, is not
+    /// moved by what came back. A PAUSED execution keeps its pause — the invocation
+    /// already ran, so the step is recorded as what it came to, and the resume is what
+    /// drives the workflow on.
+    pub fn complete_lambda_step(
+        &mut self,
+        pending: &PendingLambdaStep,
+        outcome: Result<(), String>,
+        now: SystemTime,
+    ) {
+        let key = &pending.key;
+        let Some(execution) = self.executions.get(key) else {
+            return;
+        };
+        let performing = execution
+            .step_states
+            .get(pending.index)
+            .and_then(|step| step.status.as_deref())
+            == Some(STEP_RUNNING);
+        if !performing || execution.is_terminal() {
+            return;
+        }
+        let paused = execution.is_paused();
+        let at = DateTime::from(now);
+        match outcome {
+            Ok(()) => {
+                let name = self.mark_step(key, pending.index, STEP_COMPLETED, at, true);
+                if !paused {
+                    if let Some(execution) = self.executions.get_mut(key) {
+                        execution.execution_state = IN_PROGRESS.to_string();
+                        execution.updated_at = at;
+                    }
+                }
+                self.push_detailed_event(key, EVENT_STEP_SUCCEEDED, name, None, None, at);
+                if !paused {
+                    self.schedule(key, Some(now + EXECUTION_START_SPAN));
+                }
+            }
+            Err(reason) => {
+                let name = self.mark_step(key, pending.index, STEP_FAILED, at, true);
+                if let Some(execution) = self.executions.get_mut(key) {
+                    execution.execution_state = FAILED.to_string();
+                    execution.updated_at = at;
+                    execution.end_time = Some(at);
+                    execution.resumes_to = None;
+                    execution.owed_on_resume = None;
+                }
+                self.push_detailed_event(
+                    key,
+                    EVENT_STEP_FAILED,
+                    name,
+                    None,
+                    Some(reason.clone()),
+                    at,
+                );
+                self.push_event(key, EVENT_EXECUTION_FAILED, Some(reason), at);
+                self.finish_execution(key);
+            }
         }
     }
 
@@ -1223,8 +1403,13 @@ impl ComAmazonawsArcregionswitchArcregionswitchState {
     ///
     /// * a step waiting for a manual approval whose window has closed →
     ///   [`PLAN_EXECUTION_TIMED_OUT`];
+    /// * a step being performed whose block's timeout has closed with no answer →
+    ///   [`FAILED`], with [`PERFORMANCE_TIMEOUT_REASON`];
     /// * the next step not reached yet, when it IS a manual-approval block →
     ///   [`PENDING_MANUAL_APPROVAL`], and the clock then owes the window's end;
+    /// * the next step not reached yet, when it is a `CustomActionLambda` block →
+    ///   [`IN_PROGRESS`] with the step [`STEP_RUNNING`], and its functions queued for
+    ///   [`settle_due`] to invoke;
     /// * the next step not reached yet, when it is any other block → [`FAILED`], because
     ///   that block drives another service's resources and nothing performed it;
     /// * no step left to reach → [`COMPLETED`].
@@ -1246,14 +1431,22 @@ impl ComAmazonawsArcregionswitchArcregionswitchState {
             return;
         } else if let Some(index) = execution.step_awaiting_approval() {
             Advance::ApprovalWindowClosed(index)
+        } else if let Some(index) = execution.step_being_performed() {
+            Advance::PerformanceWindowClosed(index)
         } else if let Some(index) = execution.next_unreached_step() {
-            match execution
-                .planned_steps
-                .get(index)
-                .and_then(|planned| planned.approval_window)
-            {
-                Some(window) => Advance::HoldForApproval { index, window },
-                None => Advance::UnsupportedStep(index),
+            match execution.planned_steps.get(index).map(|planned| &planned.block) {
+                Some(PlannedBlock::ManualApproval(window)) => Advance::HoldForApproval {
+                    index,
+                    window: *window,
+                },
+                Some(PlannedBlock::CustomActionLambda { action, timeout }) => {
+                    Advance::PerformLambda {
+                        index,
+                        action: action.clone(),
+                        timeout: *timeout,
+                    }
+                }
+                Some(PlannedBlock::Unperformable) | None => Advance::UnsupportedStep(index),
             }
         } else {
             // Every step of the workflow is done — or the workflow configures no
@@ -1279,6 +1472,55 @@ impl ComAmazonawsArcregionswitchArcregionswitchState {
                 // The clock owes the window's end, not the outcome: until then this is a
                 // call (`ApprovePlanExecutionStep`) the execution is waiting for.
                 self.schedule(key, Some(due + window));
+            }
+            Advance::PerformLambda {
+                index,
+                action,
+                timeout,
+            } => {
+                let name = self.mark_step(key, index, STEP_RUNNING, at, false);
+                if let Some(execution) = self.executions.get_mut(key) {
+                    execution.execution_state = IN_PROGRESS.to_string();
+                    execution.updated_at = at;
+                }
+                self.push_detailed_event(key, EVENT_STEP_STARTED, name.clone(), None, None, at);
+                // What the clock owes while the invocation is outstanding is the END of the
+                // window the block's own configuration gives it: the outcome itself comes
+                // from the functions, not from a deadline.
+                self.schedule(key, Some(due + timeout));
+                self.pending_lambda_steps.push(PendingLambdaStep {
+                    key: key.clone(),
+                    index,
+                    metadata: custom_action_lambda::InvocationMetadata {
+                        plan_arn: key.0.clone(),
+                        execution_id: key.1.clone(),
+                        step_name: name.unwrap_or_default(),
+                    },
+                    action,
+                });
+            }
+            Advance::PerformanceWindowClosed(index) => {
+                let name = self.mark_step(key, index, STEP_FAILED, at, true);
+                if let Some(execution) = self.executions.get_mut(key) {
+                    execution.execution_state = FAILED.to_string();
+                    execution.updated_at = at;
+                    execution.end_time = Some(at);
+                }
+                self.push_detailed_event(
+                    key,
+                    EVENT_STEP_FAILED,
+                    name,
+                    None,
+                    Some(PERFORMANCE_TIMEOUT_REASON.to_string()),
+                    at,
+                );
+                self.push_event(
+                    key,
+                    EVENT_EXECUTION_FAILED,
+                    Some(PERFORMANCE_TIMEOUT_REASON.to_string()),
+                    at,
+                );
+                self.finish_execution(key);
             }
             Advance::UnsupportedStep(index) => {
                 self.mark_step(key, index, STEP_FAILED, at, true);
@@ -1816,6 +2058,77 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsArcregionswitchArcregionswitchState>)
+}
+
+/// How many rounds of "settle, then perform what the clock reached" one call of
+/// [`settle_due`] drives.
+///
+/// Two steps of one workflow are never due at the same instant — the clock owes the next
+/// one a span after the one before — so one round is what a call normally takes, and this
+/// only bounds the work one request can be made to do.
+const MAX_SETTLE_ROUNDS: usize = 8;
+
+/// Materialise everything the clock owed at `now`, PERFORMING each execution block it
+/// reached that this emulator performs.
+///
+/// Every handler of this service runs this before it reads the store — the reporting ones
+/// included, which is what keeps them from disagreeing about what the current state is.
+/// It is [`ComAmazonawsArcregionswitchArcregionswitchState::settle`] plus the half that
+/// cannot be done under the store lock: a `CustomActionLambda` block's Lambda functions
+/// are invoked with the guard RELEASED (they are in-process calls this emulator serves),
+/// and what they answered is applied through
+/// [`ComAmazonawsArcregionswitchArcregionswitchState::complete_lambda_step`].
+///
+/// Only clock-owed work: every change it makes was due at `now` whether or not anybody
+/// called.
+pub async fn settle_due(
+    state: &::engine::ServiceState<ComAmazonawsArcregionswitchArcregionswitchState>,
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+    now: SystemTime,
+) {
+    for _ in 0..MAX_SETTLE_ROUNDS {
+        let pending = {
+            let mut store = state.lock();
+            store.settle(now);
+            store.take_pending_lambda_steps()
+        };
+        if pending.is_empty() {
+            return;
+        }
+        for step in pending {
+            let outcome = step.action.perform(callback, &step.metadata).await;
+            state.lock().complete_lambda_step(&step, outcome, now);
+        }
+    }
+}
+
+/// Whether a plan whose creation did not say either way has service quota checks on.
+///
+/// `Plan$serviceQuotaChecksEnabled` is "Indicates whether service quota checks are enabled
+/// for the Region switch plan"; the checks are part of what an evaluation of a plan does,
+/// and a plan created without the member reports them enabled, so this is the value a
+/// write materialises for a request that carries none.
+pub const SERVICE_QUOTA_CHECKS_DEFAULT: bool = true;
+
+/// Fill the members of a plan the service materialises on every write, so each read of
+/// the record reports them and the `Plan` projection stays a straight read of it.
+///
+/// `associatedAlarms` ("The associated application health alarms for a plan") and
+/// `triggers` ("The triggers for a plan") are the plan's alarm and trigger SETS: a plan
+/// configured with none has them empty rather than absent, which is the difference between
+/// a null collection and an empty one to a caller that iterates them. `serviceQuotaChecks`
+/// is a flag with a service default ([`SERVICE_QUOTA_CHECKS_DEFAULT`]), so a plan created
+/// without it carries the default rather than nothing.
+pub fn materialise_plan_members(plan: &mut Plan) {
+    if plan.associated_alarms.is_none() {
+        plan.associated_alarms = Some(::std::collections::HashMap::new());
+    }
+    if plan.triggers.is_none() {
+        plan.triggers = Some(Vec::new());
+    }
+    if plan.service_quota_checks_enabled.is_none() {
+        plan.service_quota_checks_enabled = Some(SERVICE_QUOTA_CHECKS_DEFAULT);
+    }
 }
 
 /// The Region a request is scoped to: the Region of its SigV4 credential scope, or

@@ -158,8 +158,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        crate::state::settle_due(&state, ctx.callback(), now).await;
         let mut store = state.lock();
-        store.settle(now);
 
         // The store is bounded: this emulator authenticates nobody, so it refuses rather
         // than letting a caller grow it without limit. `DeletePlan` is the release path.
@@ -221,25 +221,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let arn = crate::state::plan_arn(&input.name, seed);
 
         let record = crate::state::StoredPlan {
-            plan: Plan {
-                arn: arn.clone(),
-                description: input.description,
-                workflows: input.workflows,
-                execution_role: input.execution_role,
-                recovery_time_objective_minutes: input.recovery_time_objective_minutes,
-                associated_alarms: input.associated_alarms,
-                triggers: input.triggers,
-                report_configuration: input.report_configuration,
-                service_quota_checks_enabled: input.service_quota_checks_enabled,
-                name: input.name,
-                regions: input.regions,
-                recovery_approach: input.recovery_approach,
-                primary_region: input.primary_region,
-                // Server-owned: the account that owns the plan, and when it last changed.
-                owner: ::engine::emulator_account_id().to_string(),
-                // `version` is derived from the record's revision by `as_plan`.
-                version: None,
-                updated_at: Some(::aws_smithy_types::DateTime::from(now)),
+            plan: {
+                let mut plan = Plan {
+                    arn: arn.clone(),
+                    description: input.description,
+                    workflows: input.workflows,
+                    execution_role: input.execution_role,
+                    recovery_time_objective_minutes: input.recovery_time_objective_minutes,
+                    associated_alarms: input.associated_alarms,
+                    triggers: input.triggers,
+                    report_configuration: input.report_configuration,
+                    service_quota_checks_enabled: input.service_quota_checks_enabled,
+                    name: input.name,
+                    regions: input.regions,
+                    recovery_approach: input.recovery_approach,
+                    primary_region: input.primary_region,
+                    // Server-owned: the account that owns the plan, and when it last changed.
+                    owner: ::engine::emulator_account_id().to_string(),
+                    // `version` is derived from the record's revision by `as_plan`.
+                    version: None,
+                    updated_at: Some(::aws_smithy_types::DateTime::from(now)),
+                };
+                // The members the service materialises on every write: a plan created with
+                // no alarms, no triggers and nothing said about quota checks still carries
+                // all three, so every read of it reports them.
+                crate::state::materialise_plan_members(&mut plan);
+                plan
             },
             revision: 1,
             tags: requested_tags.into_iter().collect(),

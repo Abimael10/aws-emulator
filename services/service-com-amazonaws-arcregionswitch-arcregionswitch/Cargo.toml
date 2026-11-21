@@ -8,11 +8,13 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
-# `service-common` carries three readers this crate needs.
+# `service-common` carries four readers this crate needs.
 # `iam_authorization`: the shared evaluation of IAM policy documents against an action on
 # a resource, so this service's authorization gate (`src/service/authorization.rs`) reads
 # a document exactly as every other service does.
 # `iam_role`: which IAM entity a principal ARN names.
+# `arn`: the Region an ARN names, read under the Region grammar, for the endpoint a custom
+# action's Lambda invocation is addressed on (`src/state/custom_action_lambda.rs`).
 # `eventbridge_client`: the ONE construction of the in-process EventBridge client a
 # service publishing an event drives, which is how a plan execution's event reaches the
 # account's default bus (`src/state/execution_events.rs`).
@@ -27,6 +29,10 @@ service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # execution's event is published as. Only the generated client is needed — the emulator
 # supplies the transport.
 aws-sdk-eventbridge = { version = "1", default-features = false }
+# The AWS SDK for AWS Lambda, driven the same way: a workflow step's `CustomActionLambda`
+# execution block IS an invocation of the functions it names
+# (`src/state/custom_action_lambda.rs`).
+aws-sdk-lambda = { version = "1", default-features = false }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -45,16 +51,25 @@ tracing = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# One integration-test target rooted at `tests/all/main.rs`: `automod` declares a module
+# for every suite beside it, so adding a suite is adding a file.
+automod = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 # Mounted BESIDE this one in `tests/all/`: the IAM and STS services, whose stores hold the
 # roles and sessions the authorization gate reads; EventBridge and Amazon SQS, which carry
-# the plan-execution event a rule delivers to its target. DEV-ONLY for the event path —
-# `src/` reaches EventBridge through the SDK client above.
+# the plan-execution event a rule delivers to its target; and AWS Lambda, whose functions a
+# workflow step's custom action invokes. DEV-ONLY for those paths — `src/` reaches both
+# EventBridge and Lambda through the SDK clients above.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 service-com-amazonaws-eventbridge-awsevents = { workspace = true }
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
+# Writes the .zip deployment package the custom-action suite uploads for the functions it
+# has Lambda run, and encodes it the way `CreateFunction`'s `Code.ZipFile` carries one.
+zip = { version = "9", default-features = false, features = ["deflate"] }
+base64 = "0.22"
 
 [lints]
 workspace = true

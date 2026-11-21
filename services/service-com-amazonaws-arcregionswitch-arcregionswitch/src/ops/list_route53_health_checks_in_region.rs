@@ -311,8 +311,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `@readonly`: the only write is `settle`, which materialises the state changes the
         // clock already made due — owed at the same instant whether or not anybody called.
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-        store.settle(now);
+        crate::state::settle_due(&state, ctx.callback(), now).await;
+        let store = state.lock();
 
         // An `arn` no plan is stored under and a stored plan this Region is not one of
         // are the same refusal: from this Region's endpoint there is no such plan.

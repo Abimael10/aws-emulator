@@ -138,18 +138,24 @@ fn approval_step(name: &str, timeout_minutes: u32) -> Value {
     })
 }
 
-/// One step carrying a Lambda execution block: it invokes another service's function, so
-/// this emulator cannot perform it and the clock fails the execution when it gets there.
-fn lambda_step(name: &str) -> Value {
+/// One step carrying an ARC routing control execution block: it flips a routing control
+/// in Route 53 ARC, which this emulator does not run, so the clock fails the execution
+/// when it gets there.
+fn unperformable_step(name: &str) -> Value {
     json!({
         "name": name,
-        "executionBlockType": "CustomActionLambda",
+        "executionBlockType": "ARCRoutingControl",
         "executionBlockConfiguration": {
-            "customActionLambdaConfig": {
+            "arcRoutingControlConfig": {
                 "timeoutMinutes": 60,
-                "retryIntervalMinutes": 1.0,
-                "regionToRun": "activatingRegion",
-                "lambdas": [{"arn": format!("arn:aws:lambda:us-west-2:{ACCOUNT}:function:switch")}],
+                "regionAndRoutingControls": {
+                    "us-west-2": [{
+                        "routingControlArn": format!(
+                            "arn:aws:route53-recovery-control::{ACCOUNT}:controlpanel/abc/routingcontrol/def"
+                        ),
+                        "state": "On",
+                    }],
+                },
             }
         }
     })
@@ -275,7 +281,7 @@ async fn a_decision_is_refused_once_the_plan_is_ongoing_no_execution() {
             // The step the clock cannot perform comes first, so the execution ends
             // without the approval behind it ever being reached.
             Ending::FailedAtAnUnsupportedStep => {
-                vec![lambda_step("ScaleUp"), approval_step("Approve", 60)]
+                vec![unperformable_step("ScaleUp"), approval_step("Approve", 60)]
             }
             // The shortest window the member's range allows.
             Ending::ApprovalWindowClosed => vec![approval_step("Approve", 1)],

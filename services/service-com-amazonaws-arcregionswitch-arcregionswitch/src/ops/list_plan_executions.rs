@@ -180,10 +180,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = crate::state::page_size(Some(input.max_results));
 
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
         // `@readonly`: the only write is `settle`, which materialises the transitions the
         // clock already made due — owed at the same instant whether or not anybody called.
-        store.settle(now);
+        crate::state::settle_due(&state, ctx.callback(), now).await;
+        let store = state.lock();
 
         let Some(plan) = store.plans.get(&input.plan_arn) else {
             return Err(ListPlanExecutionsErrorModeled::ResourceNotFoundException(

@@ -149,8 +149,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // clock already made due — owed at the same instant whether or not anybody called.
         // Every handler settles, so no two readers disagree about the current state.
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-        store.settle(now);
+        crate::state::settle_due(&state, ctx.callback(), now).await;
+        let store = state.lock();
         let mut plans = Vec::with_capacity(page_size);
         let mut next_token = None;
         for (arn, record) in store.plans.range((from, ::std::ops::Bound::Unbounded)) {

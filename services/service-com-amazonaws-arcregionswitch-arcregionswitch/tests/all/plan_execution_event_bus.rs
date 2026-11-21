@@ -29,7 +29,8 @@ use service_com_amazonaws_arcregionswitch_arcregionswitch::state::execution_even
 };
 
 use crate::switch_support::{
-    approval_step, error_code, lambda_step, plan_with_steps, start_execution, Emulator, ACCOUNT,
+    approval_step, error_code, plan_with_steps, start_execution, unperformable_step, Emulator,
+    ACCOUNT,
     DELIVERY_DEADLINE, POLL_INTERVAL,
 };
 
@@ -271,7 +272,7 @@ async fn starting_an_execution_is_delivered_through_the_default_bus_of_its_regio
             case: "a workflow this emulator cannot perform a step of",
             region: "us-east-1",
             action: "activate",
-            steps: || vec![lambda_step("Invoke")],
+            steps: || vec![unperformable_step("Flip")],
         },
     ];
 

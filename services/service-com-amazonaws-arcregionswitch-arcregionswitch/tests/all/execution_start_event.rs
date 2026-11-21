@@ -19,8 +19,8 @@
 use serde_json::{json, Value};
 
 use crate::switch_support::{
-    approval_step, events_of, lambda_step, plan_with_steps, poll_until_state, start_execution,
-    Emulator,
+    approval_step, events_of, plan_with_steps, poll_until_state, start_execution,
+    unperformable_step, Emulator,
 };
 
 /// The event type an execution is created with.
@@ -77,7 +77,7 @@ const ROWS: &[Row] = &[
     },
     Row {
         case: "a block this emulator cannot perform",
-        steps: || vec![lambda_step("Invoke")],
+        steps: || vec![unperformable_step("Flip")],
         approve: false,
         terminal: &["failed"],
         events: &[PENDING, STARTED, "executionFailed"],

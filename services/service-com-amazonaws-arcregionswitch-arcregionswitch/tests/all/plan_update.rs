@@ -5,11 +5,12 @@
 //! The rule under test: an accepted `UpdatePlan` writes the plan's mutable configuration
 //! to exactly what the request carries — every member of `UpdatePlanRequest` other than
 //! `arn`, each `@cfnMutability: full`, so an omitted optional member leaves the plan
-//! without that configuration — leaves every member the request does not carry as it
-//! was, and makes a new server-owned `version` and `updatedAt`; an ARN no plan is stored
-//! under is refused with the modelled `ResourceNotFoundException` (HTTP 404), carrying the
-//! service's own plan-not-found message built from the ARN the request named, and writes
-//! nothing.
+//! without that configuration, EXCEPT for the three members the service materialises on
+//! every write ([`expected_member`], and [`crate::plan_defaulted_members`] for the rule) —
+//! leaves every member the request does not carry as it was, and makes a new server-owned
+//! `version` and `updatedAt`; an ARN no plan is stored under is refused with the modelled
+//! `ResourceNotFoundException` (HTTP 404), carrying the service's own plan-not-found
+//! message built from the ARN the request named, and writes nothing.
 //!
 //! The request/response helpers are shared with [`crate::plan_lifecycle`]: both suites
 //! drive the emulator through the same `MultiServiceRouter::dispatch` the router serves
@@ -49,6 +50,22 @@ const IMMUTABLE_MEMBERS: &[&str] = &[
 /// An IAM role ARN as `IamRoleArn`'s pattern requires it.
 fn role(name: &str) -> String {
     format!("arn:aws:iam::{ACCOUNT}:role/{name}")
+}
+
+/// What the plan reports for one mutable member after an update carrying `update`.
+///
+/// Every member is what the request carried — except the three the service MATERIALISES on
+/// every write: an update that omits the alarm set, the trigger list or the quota-check
+/// flag leaves the plan carrying the empty map, the empty list and the service default
+/// rather than nothing at all, which is the same rule a create follows (the whole table of
+/// it is [`crate::plan_defaulted_members`]).
+fn expected_member(member: &str, update: &Value) -> Value {
+    match (member, update[member].clone()) {
+        ("associatedAlarms", Value::Null) => json!({}),
+        ("triggers", Value::Null) => json!([]),
+        ("serviceQuotaChecksEnabled", Value::Null) => json!(true),
+        (_, carried) => carried,
+    }
 }
 
 /// The plan's `version`, as the server-owned revision string the model reports.
@@ -162,12 +179,14 @@ async fn update_plan_replaces_the_mutable_configuration_and_versions_the_plan() 
         let plan = body["plan"].clone();
 
         // Every mutable member is exactly what this request carried; one the request
-        // omitted is absent (`Value::Null` on both sides of the comparison).
+        // omitted is absent (`Value::Null` on both sides of the comparison), unless it is
+        // one of the three the service materialises.
         for member in MUTABLE_MEMBERS {
+            let expected = expected_member(member, &update);
             assert_eq!(
-                &plan[member], &update[member],
-                "case {case:?}: member {member} expected {}, got {}",
-                update[member], plan[member]
+                plan[member], expected,
+                "case {case:?}: member {member} expected {expected}, got {}",
+                plan[member]
             );
         }
 
