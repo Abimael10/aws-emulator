@@ -668,8 +668,10 @@ impl Session {
 /// the core generated for its listeners, self-signed and naming loopback, and this
 /// client is the emulator's own test connecting to a port the same process opened — so
 /// there is no authority to check it against.
+///
+/// Shared with the ActiveMQ suite, whose client dials the same core-owned TLS.
 #[derive(Debug)]
-struct AcceptTheEmulatorsCertificate(Arc<rustls::crypto::CryptoProvider>);
+pub(crate) struct AcceptTheEmulatorsCertificate(pub(crate) Arc<rustls::crypto::CryptoProvider>);
 
 impl rustls::client::danger::ServerCertVerifier for AcceptTheEmulatorsCertificate {
     fn verify_server_cert(

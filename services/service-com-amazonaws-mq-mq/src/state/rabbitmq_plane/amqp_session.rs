@@ -57,7 +57,8 @@ use ::emulator_server::{ListenerConn, NativeHandler};
 use ::tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::message_broker::{BrokerError, Message, REASON_REJECTED};
-use super::{message_broker, SharedMessageBroker};
+use super::message_broker;
+use crate::state::BrokerSocket;
 
 /// How many bytes one read off a connection takes at most.
 const READ_CHUNK: usize = 16 * 1024;
@@ -136,19 +137,6 @@ const DEFAULT_VHOST: &str = "/";
 
 /// The reply code a `mandatory` publish that reached no queue is returned with.
 const NO_ROUTE: u16 = 312;
-
-/// What every session on one broker's socket is served from.
-#[derive(Clone)]
-pub struct BrokerSocket {
-    /// The control plane's store, so a connection authenticates against the broker's
-    /// users as they are NOW — a user created or deleted while a session is open is in
-    /// force for the next connection.
-    pub state: ::engine::ServiceState<crate::state::ComAmazonawsMqMqState>,
-    /// Which broker this socket serves.
-    pub broker_id: String,
-    /// That broker's exchanges and queues, shared with every other session on it.
-    pub broker: SharedMessageBroker,
-}
 
 /// The AMQP server one broker's socket answers with.
 pub struct AmqpWire {

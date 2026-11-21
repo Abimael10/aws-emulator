@@ -240,7 +240,7 @@ mod tests {
             restart_completes_at: None,
             data_replication_role: None,
             published_host: "127.0.0.1".to_string(),
-            served_amqps: None,
+            served_endpoint: None,
         }
     }
 }

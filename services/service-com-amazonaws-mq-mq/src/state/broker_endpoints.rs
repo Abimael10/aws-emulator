@@ -71,6 +71,10 @@ impl WireProtocol {
 /// The order is the broker's own PROTOCOL order and not the spelling of the URI schemes:
 /// the first endpoint is the broker's primary (OpenWire/JMS) one, which is what a client
 /// that reads one endpoint rather than parsing every URI dials.
+///
+/// STOMP is the one of these this emulator opens the broker's own socket for
+/// ([`served_wire`]), so its endpoint is that socket's address; the rest name the broker's
+/// own host and the port Amazon MQ publishes that protocol on.
 const ACTIVEMQ_WIRE_PROTOCOLS: &[WireProtocol] = &[
     // OpenWire — the broker's primary wire, which JMS clients connect over.
     WireProtocol {
@@ -84,11 +88,11 @@ const ACTIVEMQ_WIRE_PROTOCOLS: &[WireProtocol] = &[
         port: 5_671,
         served: false,
     },
-    // STOMP.
+    // STOMP, which is the wire this emulator serves an ActiveMQ broker's own socket with.
     WireProtocol {
         scheme: "stomp+ssl",
         port: 61_614,
-        served: false,
+        served: true,
     },
     // MQTT.
     WireProtocol {
@@ -262,7 +266,7 @@ impl Broker {
     /// answers on; every other endpoint names the host the broker is published at and the
     /// port Amazon MQ publishes that protocol on.
     fn endpoint_of(&self, protocol: WireProtocol) -> String {
-        match &self.served_amqps {
+        match &self.served_endpoint {
             Some(served) if protocol.served => {
                 format!("{}://{}:{}", protocol.scheme, served.host, served.port)
             }

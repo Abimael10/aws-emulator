@@ -12,7 +12,10 @@
 //! The readings a BROKER's own answer needs, each one concern, live in this
 //! module's own files: [`broker_published_values`] (what the service decides for a
 //! broker its create did not), [`broker_endpoints`] (where a client reaches a running
-//! broker) and [`broker_configuration`] (the configuration a broker runs). The form a
+//! broker) and [`broker_configuration`] (the configuration a broker runs). The DATA
+//! PLANE a running broker answers its clients on — the socket, and the wire each engine
+//! is served — lives in [`broker_data_plane`], with one module per wire
+//! ([`rabbitmq_plane`], [`activemq_plane`]). The form a
 //! configuration revision's document is stored in lives in
 //! [`configuration_document`], and whether such a document parses for the engine it was
 //! sent as — the question that decides whether a write is accepted at all — in
@@ -21,34 +24,40 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
+/// The STOMP wire an ActiveMQ broker's clients speak.
+mod activemq_plane;
+/// The probes of the AMQP data plane's clock-driven readings (tests only).
+#[cfg(test)]
+mod amqp_probe;
 /// Which configuration revision a broker runs, and where it comes from.
 mod broker_configuration;
-/// The form a configuration revision's document is stored in.
-mod configuration_document;
-/// Whether a configuration document parses for the engine it is sent as.
-mod configuration_syntax;
+/// The socket a broker's clients connect to, and the address published for it.
+mod broker_data_plane;
 /// Whether a broker takes part in cross-Region data replication, and in which role.
 mod broker_data_replication;
 /// Where a client reaches a running broker: its console and its wire endpoints.
 mod broker_endpoints;
 /// The values the service decides for a broker rather than echoing from its create.
 mod broker_published_values;
-/// The socket a RabbitMQ broker's clients connect to, and the message broker behind it.
-mod rabbitmq_plane;
-/// The probes of the AMQP data plane's clock-driven readings (tests only).
-#[cfg(test)]
-mod amqp_probe;
 /// Restarting a broker, and the user changes a restart applies.
 mod broker_restart;
+/// The form a configuration revision's document is stored in.
+mod configuration_document;
+/// Whether a configuration document parses for the engine it is sent as.
+mod configuration_syntax;
+/// The AMQP 0-9-1 wire a RabbitMQ broker's clients speak, and the message broker behind it.
+mod rabbitmq_plane;
 
+pub use activemq_plane::*;
 pub use broker_configuration::*;
+pub use broker_data_plane::*;
 pub use broker_data_replication::*;
 pub use broker_endpoints::*;
+pub use broker_published_values::*;
 pub use broker_restart::*;
 pub use configuration_document::*;
 pub use configuration_syntax::*;
 pub use rabbitmq_plane::*;
-pub use broker_published_values::*;
 
 /// Region used for an ARN when the request carries no SigV4 credential scope to
 /// read one from.
@@ -380,9 +389,9 @@ pub struct Broker {
     pub published_host: String,
     /// The address of the socket this emulator OPENED for the broker, when its engine is
     /// one this emulator serves a wire for ([`serve_broker`]). It is what the broker's
-    /// `amqps://` endpoint publishes, so what a client dials is where the broker really
+    /// endpoint for that wire publishes, so what a client dials is where the broker really
     /// answers; `None` for a broker this emulator opened no socket for.
-    pub served_amqps: Option<ServedAddress>,
+    pub served_endpoint: Option<ServedAddress>,
 }
 
 impl Broker {

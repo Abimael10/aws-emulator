@@ -17484,6 +17484,7 @@ name = "service-com-amazonaws-mq-mq"
 version = "0.1.0"
 dependencies = [
  "amq-protocol",
+ "automod",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",

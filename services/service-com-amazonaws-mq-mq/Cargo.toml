@@ -42,6 +42,8 @@ service-common = { path = "../common" }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs`, so a suite is picked up by being there.
+automod = { workspace = true }
 hex = { workspace = true }
 # The data-plane suite drives a real AMQP 0-9-1 client against a broker's own socket in
 # ONE process: `rustls` / `tokio-rustls` run the client side of the TLS an `amqps://`

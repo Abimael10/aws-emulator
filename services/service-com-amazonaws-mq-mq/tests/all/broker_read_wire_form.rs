@@ -394,35 +394,33 @@ async fn a_broker_reports_the_members_the_service_decides_for_it() {
     }
 }
 
-/// The wire protocols an ActiveMQ broker publishes, as `(scheme, port)` IN THE ORDER
-/// Amazon MQ publishes them: OpenWire, AMQP, STOMP, MQTT, then WebSocket.
+/// The wire protocols an ActiveMQ broker publishes, as `(scheme, port, served)` IN THE
+/// ORDER Amazon MQ publishes them: OpenWire, AMQP, STOMP, MQTT, then WebSocket.
 ///
 /// Source: the Developer Guide's ActiveMQ broker endpoint table, which names the protocols
 /// in that order and gives each one's scheme and port; it is also the order the recorded
 /// Amazon MQ answer lists a broker's endpoints in. It is NOT the alphabetical order of the
 /// schemes, which `an_activemq_broker_lists_its_endpoints_by_wire_protocol` pins.
-const ACTIVEMQ_PROTOCOL_ORDER: &[(&str, u16)] = &[
+///
+/// `served` marks the protocol THIS EMULATOR opens a socket of its own for and answers:
+/// its endpoint names that socket's address, the port of a core-owned socket being the
+/// core's to assign, and the suite that speaks the protocol on it is `activemq_data_plane`.
+const ACTIVEMQ_PROTOCOL_ORDER: &[(&str, u16, bool)] = &[
     // OpenWire, the broker's primary (JMS) wire.
-    ("ssl", 61_617),
-    ("amqp+ssl", 5_671),
-    ("stomp+ssl", 61_614),
-    ("mqtt+ssl", 8_883),
-    ("wss", 61_619),
+    ("ssl", 61_617, false),
+    ("amqp+ssl", 5_671, false),
+    ("stomp+ssl", 61_614, true),
+    ("mqtt+ssl", 8_883, false),
+    ("wss", 61_619, false),
 ];
 
 /// What one engine's brokers publish: the engine, its wire protocols as
-/// `(scheme, port)` IN THE ORDER Amazon MQ publishes them, and the port its web console
-/// is published on.
+/// `(scheme, port, served)` IN THE ORDER Amazon MQ publishes them, and the port its web
+/// console is published on.
 struct PublishedAddresses {
     engine_type: &'static str,
-    protocols: &'static [(&'static str, u16)],
+    protocols: &'static [(&'static str, u16, bool)],
     console_port: u16,
-    /// Whether this engine's wire is one THIS EMULATOR opens a socket of its own for.
-    /// The endpoint published for such a protocol names that socket's address, because
-    /// an endpoint is an address the broker ANSWERS on and the port of a core-owned
-    /// socket is the core's to assign; every other endpoint names the port Amazon MQ
-    /// publishes the protocol on.
-    served_by_a_socket: bool,
 }
 
 /// The wire protocols and console port of each engine the model declares.
@@ -436,13 +434,11 @@ const PUBLISHED_PROTOCOLS: &[PublishedAddresses] = &[
         engine_type: ENGINE_TYPE_ACTIVEMQ,
         protocols: ACTIVEMQ_PROTOCOL_ORDER,
         console_port: 8_162,
-        served_by_a_socket: false,
     },
     PublishedAddresses {
         engine_type: ENGINE_TYPE_RABBITMQ,
-        protocols: &[("amqps", 5_671)],
+        protocols: &[("amqps", 5_671, true)],
         console_port: 443,
-        served_by_a_socket: true,
     },
 ];
 
@@ -513,56 +509,51 @@ async fn a_running_broker_publishes_its_console_and_one_endpoint_per_protocol() 
         );
 
         let endpoints = strings_at(instance, "/endpoints");
-        if row.served_by_a_socket {
-            // The protocols this emulator answers itself: one endpoint per protocol,
-            // each carrying that protocol's scheme and the address of the socket the
-            // core opened for the broker — which, being an address the broker ANSWERS
-            // on, is dialled here rather than compared against a hostname. The suite
-            // that speaks the protocol on it is `rabbitmq_data_plane`.
-            assert_eq!(
-                endpoints.len(),
-                row.protocols.len(),
-                "case {case:?}: expected one endpoint per published protocol, got \
-                 {endpoints:?}"
+        assert_eq!(
+            endpoints.len(),
+            row.protocols.len(),
+            "case {case:?}: expected one endpoint per published protocol, got {endpoints:?}"
+        );
+        for ((scheme, published_port, served), endpoint) in row.protocols.iter().zip(&endpoints) {
+            let prefix = format!("{scheme}://");
+            assert!(
+                endpoint.starts_with(&prefix),
+                "case {case:?}: expected an endpoint on {prefix:?}, got {endpoint:?}"
             );
-            for ((scheme, _published_port), endpoint) in row.protocols.iter().zip(&endpoints) {
-                let prefix = format!("{scheme}://");
-                assert!(
-                    endpoint.starts_with(&prefix),
-                    "case {case:?}: expected an endpoint on {prefix:?}, got {endpoint:?}"
-                );
-                let authority = endpoint.trim_start_matches(&prefix);
-                let (endpoint_host, port) = authority.rsplit_once(':').unwrap_or_else(|| {
-                    panic!("case {case:?}: expected the endpoint to name a port, got {endpoint:?}")
-                });
-                let port: u16 = port.parse().unwrap_or_else(|_| {
-                    panic!("case {case:?}: expected the endpoint to name a port, got {endpoint:?}")
-                });
-                // The core binds its listeners on the operator-chosen interface, which
-                // is loopback by default, so the address a broker publishes is this
-                // machine's own — pinned here, and then dialled as that literal.
+            if !served {
                 assert_eq!(
-                    endpoint_host, "127.0.0.1",
-                    "case {case:?}: expected the endpoint to name this machine's loopback \
-                     address, got {endpoint:?}"
+                    endpoint,
+                    &format!("{prefix}{host}:{published_port}"),
+                    "case {case:?}: a protocol this emulator does not answer names the broker's \
+                     own host and the port Amazon MQ publishes it on, got {endpoint:?}"
                 );
-                let dialled = tokio::net::TcpStream::connect(("127.0.0.1", port)).await;
-                assert!(
-                    dialled.is_ok(),
-                    "case {case:?}: the endpoint a running broker publishes must be an address \
-                     it answers on, but {endpoint:?} accepted no connection: {dialled:?}"
-                );
+                continue;
             }
-        } else {
-            let expected: Vec<String> = row
-                .protocols
-                .iter()
-                .map(|(scheme, port)| format!("{scheme}://{host}:{port}"))
-                .collect();
+            // A protocol this emulator answers itself: the endpoint carries the address of
+            // the socket the core opened for the broker — which, being an address the
+            // broker ANSWERS on, is dialled here rather than compared against a hostname.
+            // The suites that speak the protocol on it are `activemq_data_plane` and
+            // `rabbitmq_data_plane`.
+            let authority = endpoint.trim_start_matches(&prefix);
+            let (endpoint_host, port) = authority.rsplit_once(':').unwrap_or_else(|| {
+                panic!("case {case:?}: expected the endpoint to name a port, got {endpoint:?}")
+            });
+            let port: u16 = port.parse().unwrap_or_else(|_| {
+                panic!("case {case:?}: expected the endpoint to name a port, got {endpoint:?}")
+            });
+            // The core binds its listeners on the operator-chosen interface, which is
+            // loopback by default, so the address a broker publishes is this machine's
+            // own — pinned here, and then dialled as that literal.
             assert_eq!(
-                endpoints, expected,
-                "case {case:?}: expected one endpoint per published protocol, in the order \
-                 Amazon MQ publishes them {expected:?}, got {endpoints:?}"
+                endpoint_host, "127.0.0.1",
+                "case {case:?}: expected the endpoint to name this machine's loopback \
+                 address, got {endpoint:?}"
+            );
+            let dialled = tokio::net::TcpStream::connect(("127.0.0.1", port)).await;
+            assert!(
+                dialled.is_ok(),
+                "case {case:?}: the endpoint a running broker publishes must be an address \
+                 it answers on, but {endpoint:?} accepted no connection: {dialled:?}"
             );
         }
 
@@ -1237,7 +1228,7 @@ async fn an_activemq_broker_lists_its_endpoints_by_wire_protocol() {
             .collect();
         let expected: Vec<&str> = ACTIVEMQ_PROTOCOL_ORDER
             .iter()
-            .map(|(scheme, _port)| *scheme)
+            .map(|(scheme, _port, _served)| *scheme)
             .collect();
         assert_eq!(
             schemes, expected,
@@ -1246,13 +1237,28 @@ async fn an_activemq_broker_lists_its_endpoints_by_wire_protocol() {
         );
 
         // Each endpoint carries the port Amazon MQ publishes that protocol on, so the
-        // position of an endpoint and the protocol answered at it agree.
-        for ((scheme, port), endpoint) in ACTIVEMQ_PROTOCOL_ORDER.iter().zip(&endpoints) {
+        // position of an endpoint and the protocol answered at it agree — except for the
+        // one protocol this emulator answers itself, whose endpoint names the core-owned
+        // socket it is served on and whose port is the core's to assign.
+        for ((scheme, port, served), endpoint) in ACTIVEMQ_PROTOCOL_ORDER.iter().zip(&endpoints) {
             assert!(
-                endpoint.starts_with(&format!("{scheme}://")) && endpoint.ends_with(&format!(":{port}")),
-                "case {case:?}: expected the {scheme:?} endpoint on port {port}, got \
+                endpoint.starts_with(&format!("{scheme}://")),
+                "case {case:?}: expected the endpoint to carry the scheme {scheme:?}, got \
                  {endpoint:?}"
             );
+            if *served {
+                assert!(
+                    endpoint.starts_with(&format!("{scheme}://127.0.0.1:")),
+                    "case {case:?}: expected the {scheme:?} endpoint on the socket this \
+                     emulator answers it on, got {endpoint:?}"
+                );
+            } else {
+                assert!(
+                    endpoint.ends_with(&format!(":{port}")),
+                    "case {case:?}: expected the {scheme:?} endpoint on port {port}, got \
+                     {endpoint:?}"
+                );
+            }
         }
 
         // The order is the protocols' and not the schemes': sorting the schemes gives a
