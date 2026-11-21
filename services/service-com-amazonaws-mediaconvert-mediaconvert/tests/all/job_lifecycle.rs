@@ -1945,3 +1945,613 @@ async fn the_documented_job_workflow_runs_end_to_end() {
         "GetJob after CancelJob must report CANCELED"
     );
 }
+
+/// A job whose input is the video this service GENERATES — `Input$VideoGenerator`,
+/// "MediaConvert creates a video input with black frames… if you do not have a video input"
+/// — runs just as one with an input file does: the frames are CODED, the output file is
+/// written into the destination its group names, the job reaches `COMPLETE`, and each output
+/// reports the duration and frame size of the file that was written.
+///
+/// The rows span what the rule generalises over: whether the generator states a frame size
+/// or takes the default resolution its member documents, whether the output states both
+/// dimensions, one of them or neither, and the frame rate the output is written at — the
+/// duration is a whole number of THAT rate's frames.
+#[tokio::test]
+async fn a_job_whose_input_is_generated_video_runs_to_complete_and_reports_what_it_produced() {
+    use super::media_probe::{create_bucket, BUCKET};
+
+    /// One row: the generator the job's input states, the output's video description, and
+    /// what the produced file must report.
+    struct Case {
+        case: &'static str,
+        generator: Value,
+        video: Option<Value>,
+        /// The destination prefix and base name this row's output group writes to, and the
+        /// `NameModifier` its one output carries.
+        destination: &'static str,
+        name_modifier: &'static str,
+        duration_ms: i64,
+        frame: (i64, i64),
+        /// The key, inside the probe suite's bucket, the run must have written at.
+        written: &'static str,
+    }
+    let cases = vec![
+        Case {
+            case: "a generated input written at 30 frames a second",
+            generator: json!({ "duration": 1_000 }),
+            video: Some(json!({
+                "width": 320,
+                "height": 240,
+                "codecSettings": {
+                    "codec": "H_264",
+                    "h264Settings": {
+                        "framerateNumerator": 30,
+                        "framerateDenominator": 1
+                    }
+                }
+            })),
+            destination: "generated-a/movie",
+            name_modifier: "_a",
+            // 1 000ms of whole 30fps frames is 31 of them, which run 1 033ms.
+            duration_ms: 1_033,
+            frame: (320, 240),
+            written: "generated-a/movie_a.mp4",
+        },
+        Case {
+            case: "a generated input stating its own frame size, at the default rate",
+            generator: json!({ "duration": 300, "width": 160, "height": 120 }),
+            video: None,
+            destination: "generated-b/movie",
+            name_modifier: "_b",
+            // The default generator frame rate is 29.97, so 300ms is 9 whole frames, which
+            // run 300ms at that rate (9 x 1001 units of a 30 000 timescale).
+            duration_ms: 300,
+            frame: (160, 120),
+            written: "generated-b/movie_b.mp4",
+        },
+        Case {
+            case: "an output that states only its height, scaled from the generated frame",
+            generator: json!({
+                "duration": 200,
+                "framerateNumerator": 25,
+                "framerateDenominator": 1
+            }),
+            video: Some(json!({ "height": 120 })),
+            destination: "generated-c/movie",
+            name_modifier: "_c",
+            // 200ms at 25fps is 6 frames, which run 240ms.
+            duration_ms: 240,
+            // The default generated resolution is 540x360, scaled evenly to a height of 120.
+            frame: (180, 120),
+            written: "generated-c/movie_c.mp4",
+        },
+        Case {
+            case: "a generated input at a frame size large enough to be coded in slices",
+            generator: json!({ "duration": 500 }),
+            video: Some(json!({
+                "width": 1_280,
+                "height": 720,
+                "codecSettings": {
+                    "codec": "H_264",
+                    "h264Settings": {
+                        "framerateNumerator": 30,
+                        "framerateDenominator": 1
+                    }
+                }
+            })),
+            destination: "generated-d/movie",
+            name_modifier: "_d",
+            // 500ms of whole 30fps frames is 16 of them, which run 533ms — one sample per
+            // frame however the codec slices the picture.
+            duration_ms: 533,
+            frame: (1_280, 720),
+            written: "generated-d/movie_d.mp4",
+        },
+    ];
+
+    let emulator = Emulator::with_settle_span(SHORT_SETTLE)
+        .mount(service_com_amazonaws_s3_amazons3::EmulatedService::new);
+    create_bucket(&emulator).await;
+
+    let mut ids = Vec::new();
+    for case in &cases {
+        let mut output = json!({
+            "nameModifier": case.name_modifier,
+            "containerSettings": { "container": "MP4" }
+        });
+        if let Some(video) = &case.video {
+            output["videoDescription"] = video.clone();
+        }
+        let created = emulator
+            .create_job(json!({
+                "role": ROLE,
+                "settings": {
+                    "inputs": [{ "videoGenerator": case.generator }],
+                    "outputGroups": [{
+                        "name": "File Group",
+                        "outputs": [output],
+                        "outputGroupSettings": {
+                            "type": "FILE_GROUP_SETTINGS",
+                            "fileGroupSettings": {
+                                "destination": format!("s3://{BUCKET}/{}", case.destination)
+                            }
+                        }
+                    }]
+                }
+            }))
+            .await;
+        assert_eq!(
+            created.status, 201,
+            "case {:?}: CreateJob must succeed, got {} with body {}",
+            case.case, created.status, created.body
+        );
+        ids.push(created.string("/job/id"));
+    }
+
+    for (case, id) in cases.iter().zip(&ids) {
+        // The CONDITION, not a span: each row reads the job again until its run has ended.
+        let started = std::time::Instant::now();
+        let read = loop {
+            let read = emulator.get_job(id).await;
+            let status = read.string("/job/status");
+            if matches!(status.as_str(), "COMPLETE" | "ERROR" | "CANCELED") {
+                break read;
+            }
+            assert!(
+                started.elapsed() < RUN_DEADLINE,
+                "case {:?}: the clock never ran the job to a terminal status; it is \
+                 {status:?}",
+                case.case
+            );
+            tokio::time::sleep(RUN_POLL_PAUSE).await;
+        };
+        assert_eq!(
+            read.string("/job/status"),
+            "COMPLETE",
+            "case {:?}: a job whose input this service generates must reach COMPLETE, got {}",
+            case.case,
+            read.body
+        );
+        let output = read
+            .at("/job/outputGroupDetails")
+            .pointer("/0/outputDetails/0")
+            .cloned()
+            .unwrap_or(Value::Null);
+        assert_eq!(
+            output.pointer("/durationInMs").and_then(Value::as_i64),
+            Some(case.duration_ms),
+            "case {:?}: expected the produced file's duration of {}ms, got {output}",
+            case.case,
+            case.duration_ms
+        );
+        assert_eq!(
+            output
+                .pointer("/videoDetails/widthInPx")
+                .and_then(Value::as_i64),
+            Some(case.frame.0),
+            "case {:?}: expected a width of {}px, got {output}",
+            case.case,
+            case.frame.0
+        );
+        assert_eq!(
+            output
+                .pointer("/videoDetails/heightInPx")
+                .and_then(Value::as_i64),
+            Some(case.frame.1),
+            "case {:?}: expected a height of {}px, got {output}",
+            case.case,
+            case.frame.1
+        );
+
+        // And the file itself: a job that reports COMPLETE has written its output, so it is
+        // read back out of the S3 that owns it and must be an ISO base media file carrying
+        // coded video, under the media type of its container and carrying the id of the job
+        // that produced it.
+        let (status, headers, body) = emulator
+            .rest(
+                "s3",
+                "GET",
+                &format!("/{BUCKET}/{}", case.written),
+                Vec::new(),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: the output {:?} the job reported must be in the bucket, got {status} {}",
+            case.case,
+            case.written,
+            String::from_utf8_lossy(&body)
+        );
+        let header = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(
+            header("content-type"),
+            "video/mp4",
+            "case {:?}: the output is stored under the media type of its container",
+            case.case
+        );
+        assert_eq!(
+            header("x-amz-meta-mediaconvert-jobid"),
+            *id,
+            "case {:?}: the output records the id of the job that produced it",
+            case.case
+        );
+        assert_eq!(
+            body.get(4..8),
+            Some(b"ftyp".as_slice()),
+            "case {:?}: the output must be an ISO base media file, got {} bytes starting {:?}",
+            case.case,
+            body.len(),
+            body.get(..8)
+        );
+        assert!(
+            body.windows(4).any(|window| window == b"avc1"),
+            "case {:?}: the output must carry a coded AVC video track, got {} bytes",
+            case.case,
+            body.len()
+        );
+    }
+}
+
+/// One row of the run table: the media a job is given, the settings it is submitted with,
+/// what its `OutputGroupDetails` must report, and the object keys its run must have written.
+struct RunCase {
+    case: &'static str,
+    /// The key this row's input media is written at, inside the probe suite's bucket.
+    key: String,
+    /// The input file's own bytes, muxed by this crate's test muxer.
+    media: Vec<u8>,
+    /// The `Settings` the job is submitted with.
+    settings: Value,
+    /// How long the input runs, in milliseconds, from the tracks it was muxed with: what
+    /// every output of this row must report as its own duration, since the run carries the
+    /// input's samples into the output.
+    duration_ms: i64,
+    /// One entry per output group, each holding one `(width, height)` per output — `None`
+    /// for an output whose produced file carries no video at all.
+    frames: Vec<Vec<Option<(i64, i64)>>>,
+    /// The keys, inside the same bucket, the run must have written its outputs at.
+    written: Vec<String>,
+}
+
+/// How far a produced file's reported duration may differ from the input's.
+///
+/// A container states its duration in a timescale, so the value is exact to that
+/// timescale's resolution rather than to the millisecond; it is NOT a tolerance on time
+/// passing, which nothing here waits for.
+const DURATION_TOLERANCE_MS: i64 = 60;
+
+/// A job whose settings describe a transcode this service can perform RUNS: it leaves
+/// `SUBMITTED`, settles on `COMPLETE`, has written one output file per output into the
+/// destination its group names, and reports one `outputGroupDetails` entry per output group
+/// whose `outputDetails` carry the duration and the frame size of the file that output
+/// produced.
+///
+/// The rows span what the rule generalises over: how many output groups a job has and how
+/// many outputs each of them has, whether an output asks for a frame size of its own or
+/// takes the input's, which tracks the input carries (video and audio, video alone, audio
+/// alone), how long the input runs, and whether the destination names a place or a base
+/// name.
+///
+/// The media is REAL: each row's input is muxed by the sibling `media_probe` suite's ISO
+/// base media writer, written into a bucket of an S3 mounted beside MediaConvert on one
+/// engine, and the produced outputs are read back out of that same S3 — so what is asserted
+/// is a file the run really wrote.
+#[tokio::test]
+async fn a_processable_job_runs_to_complete_and_reports_what_it_produced() {
+    use super::media_probe::{
+        create_bucket, iso_bmff, put_object, s3_uri, AudioTrack, VideoTrack, BUCKET,
+    };
+
+    /// A video track of `frames` samples at 30 fps, in the geometry given.
+    fn video(width: u16, height: u16, frames: u32) -> VideoTrack {
+        VideoTrack {
+            width,
+            height,
+            timescale: 30_000,
+            frames,
+            sample_duration: 1_000,
+        }
+    }
+
+    /// An AAC track of `frames` frames at 48 kHz, stereo.
+    fn audio(frames: u32) -> AudioTrack {
+        AudioTrack {
+            sample_rate: ::mp4::SampleFreqIndex::Freq48000,
+            channels: ::mp4::ChannelConfig::Stereo,
+            frames,
+            samples_per_frame: 1_024,
+        }
+    }
+
+    /// One output group writing to `destination`, holding the outputs given.
+    fn group(destination: &str, outputs: Value) -> Value {
+        json!({
+            "name": "File Group",
+            "outputs": outputs,
+            "outputGroupSettings": {
+                "type": "FILE_GROUP_SETTINGS",
+                "fileGroupSettings": { "destination": destination }
+            }
+        })
+    }
+
+    /// One output in the MP4 container, with the name modifier given and, when it asks for
+    /// one, its own frame size.
+    fn output(name_modifier: &str, frame: Option<(i64, i64)>) -> Value {
+        let mut output = json!({
+            "nameModifier": name_modifier,
+            "containerSettings": { "container": "MP4" }
+        });
+        if let Some((width, height)) = frame {
+            output["videoDescription"] = json!({ "width": width, "height": height });
+        }
+        output
+    }
+
+    let bucket_uri = |prefix: &str| format!("s3://{BUCKET}/{prefix}");
+    let cases = vec![
+        RunCase {
+            case: "one output taking the input's own frame size",
+            key: "run/plain.mp4".to_string(),
+            media: iso_bmff(b"isom", Some(video(1280, 720, 60)), Some(audio(94))),
+            settings: json!({
+                "inputs": [{ "fileInput": s3_uri("run/plain.mp4") }],
+                "outputGroups": [group(&bucket_uri("plain-out/"), json!([output("_out", None)]))]
+            }),
+            // 94 AAC frames of 1024 samples at 48 kHz is the longer of the two tracks.
+            duration_ms: 2_005,
+            frames: vec![vec![Some((1280, 720))]],
+            written: vec!["plain-out/plain_out.mp4".to_string()],
+        },
+        RunCase {
+            case: "an output that asks for a frame size of its own",
+            key: "run/sized.mp4".to_string(),
+            media: iso_bmff(b"isom", Some(video(1920, 1080, 30)), None),
+            settings: json!({
+                "inputs": [{ "fileInput": s3_uri("run/sized.mp4") }],
+                "outputGroups": [group(
+                    &bucket_uri("sized-out/"),
+                    json!([output("_small", Some((640, 360)))]),
+                )]
+            }),
+            // 30 video samples of 1000 units at a 30 000 timescale is one second.
+            duration_ms: 1_000,
+            frames: vec![vec![Some((640, 360))]],
+            written: vec!["sized-out/sized_small.mp4".to_string()],
+        },
+        RunCase {
+            case: "two outputs in one group, one of them resized",
+            key: "run/two.mp4".to_string(),
+            media: iso_bmff(b"isom", Some(video(1280, 720, 90)), None),
+            settings: json!({
+                "inputs": [{ "fileInput": s3_uri("run/two.mp4") }],
+                "outputGroups": [group(
+                    &bucket_uri("two-out/"),
+                    json!([output("_hd", None), output("_sd", Some((854, 480)))]),
+                )]
+            }),
+            duration_ms: 3_000,
+            frames: vec![vec![Some((1280, 720)), Some((854, 480))]],
+            written: vec![
+                "two-out/two_hd.mp4".to_string(),
+                "two-out/two_sd.mp4".to_string(),
+            ],
+        },
+        RunCase {
+            case: "two output groups, each with its own destination",
+            key: "run/groups.mp4".to_string(),
+            media: iso_bmff(b"isom", Some(video(640, 480, 60)), None),
+            settings: json!({
+                "inputs": [{ "fileInput": s3_uri("run/groups.mp4") }],
+                "outputGroups": [
+                    group(&bucket_uri("groups-a/"), json!([output("_a", None)])),
+                    group(&bucket_uri("groups-b/"), json!([output("_b", Some((320, 240)))])),
+                ]
+            }),
+            duration_ms: 2_000,
+            frames: vec![vec![Some((640, 480))], vec![Some((320, 240))]],
+            written: vec![
+                "groups-a/groups_a.mp4".to_string(),
+                "groups-b/groups_b.mp4".to_string(),
+            ],
+        },
+        RunCase {
+            case: "an input carrying audio alone, so the output has no video stream",
+            key: "run/audio.mp4".to_string(),
+            media: iso_bmff(b"isom", None, Some(audio(47))),
+            settings: json!({
+                "inputs": [{ "fileInput": s3_uri("run/audio.mp4") }],
+                "outputGroups": [group(&bucket_uri("audio-out/"), json!([output("_a", None)]))]
+            }),
+            // 47 frames of 1024 samples at 48 kHz.
+            duration_ms: 1_002,
+            frames: vec![vec![None]],
+            written: vec!["audio-out/audio_a.mp4".to_string()],
+        },
+        RunCase {
+            case: "a destination that names a base name rather than a place",
+            key: "run/named.mp4".to_string(),
+            media: iso_bmff(b"isom", Some(video(1280, 720, 15)), None),
+            settings: json!({
+                "inputs": [{ "fileInput": s3_uri("run/named.mp4") }],
+                "outputGroups": [group(&bucket_uri("named-out/movie"), json!([output("_out", None)]))]
+            }),
+            duration_ms: 500,
+            frames: vec![vec![Some((1280, 720))]],
+            written: vec!["named-out/movie_out.mp4".to_string()],
+        },
+    ];
+
+    let emulator = Emulator::with_settle_span(SHORT_SETTLE)
+        .mount(service_com_amazonaws_s3_amazons3::EmulatedService::new);
+    create_bucket(&emulator).await;
+
+    // Every input is written and every job submitted first, so the jobs run beside one
+    // another rather than one row at a time.
+    let mut ids = Vec::new();
+    for case in &cases {
+        put_object(&emulator, &case.key, &case.media).await;
+        let created = emulator
+            .create_job(json!({ "role": ROLE, "settings": case.settings }))
+            .await;
+        assert_eq!(
+            created.status, 201,
+            "case {:?}: CreateJob must succeed, got {} with body {}",
+            case.case, created.status, created.body
+        );
+        assert_eq!(
+            created.string("/job/status"),
+            "SUBMITTED",
+            "case {:?}: a job a caller has just submitted is SUBMITTED, got {}",
+            case.case,
+            created.body
+        );
+        ids.push(created.string("/job/id"));
+    }
+
+    for (case, id) in cases.iter().zip(&ids) {
+        // The CONDITION, not a span: the due instants are stored and never slept for by a
+        // handler, so each row reads the job again until its run has ended.
+        let started = std::time::Instant::now();
+        let read = loop {
+            let read = emulator.get_job(id).await;
+            let status = read.string("/job/status");
+            if matches!(status.as_str(), "COMPLETE" | "ERROR" | "CANCELED") {
+                break read;
+            }
+            assert!(
+                started.elapsed() < RUN_DEADLINE,
+                "case {:?}: the clock never ran the job to a terminal status; it is \
+                 {status:?}",
+                case.case
+            );
+            tokio::time::sleep(RUN_POLL_PAUSE).await;
+        };
+        assert_eq!(
+            read.string("/job/status"),
+            "COMPLETE",
+            "case {:?}: a job whose transcode this service can perform must reach COMPLETE, \
+             got {}",
+            case.case,
+            read.body
+        );
+        assert_eq!(
+            read.at("/job/errorCode"),
+            &Value::Null,
+            "case {:?}: a job that completed failed at nothing, so it carries no ErrorCode, \
+             got {}",
+            case.case,
+            read.body
+        );
+        assert_eq!(
+            read.at("/job/errorMessage"),
+            &Value::Null,
+            "case {:?}: a job that completed carries no ErrorMessage, got {}",
+            case.case,
+            read.body
+        );
+        assert!(
+            read.at("/job/timing/finishTime").is_number(),
+            "case {:?}: a job that has run reports when it finished, got {}",
+            case.case,
+            read.body
+        );
+        assert!(
+            read.at("/job/warnings").is_array(),
+            "case {:?}: the warnings container is always reported, got {}",
+            case.case,
+            read.body
+        );
+
+        // One details entry per output group, one output entry per output, each carrying
+        // what the produced file measures.
+        let groups = read
+            .at("/job/outputGroupDetails")
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            groups.len(),
+            case.frames.len(),
+            "case {:?}: expected one outputGroupDetails entry per output group, got {}",
+            case.case,
+            read.body
+        );
+        for (index, (group, expected)) in groups.iter().zip(&case.frames).enumerate() {
+            let outputs = group
+                .pointer("/outputDetails")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            assert_eq!(
+                outputs.len(),
+                expected.len(),
+                "case {:?} group {index}: expected one outputDetails entry per output, got \
+                 {group}",
+                case.case
+            );
+            for (position, (output, frame)) in outputs.iter().zip(expected).enumerate() {
+                let duration = output
+                    .pointer("/durationInMs")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default();
+                assert!(
+                    (duration - case.duration_ms).abs() <= DURATION_TOLERANCE_MS,
+                    "case {:?} group {index} output {position}: expected the produced \
+                     file's duration of about {}ms, got {duration}ms in {output}",
+                    case.case,
+                    case.duration_ms
+                );
+                let reported = output.pointer("/videoDetails").map(|video| {
+                    (
+                        video
+                            .pointer("/widthInPx")
+                            .and_then(Value::as_i64)
+                            .unwrap_or_default(),
+                        video
+                            .pointer("/heightInPx")
+                            .and_then(Value::as_i64)
+                            .unwrap_or_default(),
+                    )
+                });
+                assert_eq!(
+                    reported, *frame,
+                    "case {:?} group {index} output {position}: expected the produced \
+                     file's frame size {frame:?}, got {reported:?} in {output}",
+                    case.case
+                );
+            }
+        }
+
+        // And the files themselves: a job that reports COMPLETE has written its outputs,
+        // so each one is read back out of the S3 that OWNS it, and what comes back is an
+        // ISO base media file.
+        for key in &case.written {
+            let (status, _, body) = emulator
+                .rest("s3", "GET", &format!("/{BUCKET}/{key}"), Vec::new())
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {:?}: the output {key:?} the job reported must be in the bucket, got \
+                 {status} {}",
+                case.case,
+                String::from_utf8_lossy(&body)
+            );
+            assert_eq!(
+                body.get(4..8),
+                Some(b"ftyp".as_slice()),
+                "case {:?}: the output {key:?} must be an ISO base media file, got {} bytes \
+                 starting {:?}",
+                case.case,
+                body.len(),
+                body.get(..8)
+            );
+        }
+    }
+}

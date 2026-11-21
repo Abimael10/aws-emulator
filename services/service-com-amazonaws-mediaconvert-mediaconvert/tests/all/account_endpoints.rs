@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end HTTP coverage of `DescribeEndpoints`: the account's API endpoint per
-//! region, the `DEFAULT`/`GET_ONLY` modes, and the request window `MaxResults` and
-//! `NextToken` are refused outside.
+//! End-to-end HTTP coverage of `DescribeEndpoints`: the endpoint a client is told to send
+//! this account's requests to, the `DEFAULT`/`GET_ONLY` modes, and the request window
+//! `MaxResults` and `NextToken` are refused outside.
 //!
 //! Every case drives the real restJson1 wire path — the router picks the service from the
 //! request's SigV4 scope, the framework deserializes and validates, the handler runs, and
@@ -93,14 +93,29 @@ impl Emulator {
         Self { router }
     }
 
-    /// `DescribeEndpoints` in `region`, with `body` as the request payload.
+    /// `DescribeEndpoints` in `region`, with `body` as the request payload, addressed to
+    /// this service's own regional host.
     async fn describe_endpoints(&self, region: &str, body: Value) -> Reply {
-        let request = ::http::Request::builder()
+        self.describe_endpoints_at(
+            region,
+            Some(&format!("mediaconvert.{region}.amazonaws.com")),
+            body,
+        )
+        .await
+    }
+
+    /// `DescribeEndpoints` in `region` as it arrives on `host` — the address the client
+    /// reached this emulator at, or no `Host` header at all.
+    async fn describe_endpoints_at(&self, region: &str, host: Option<&str>, body: Value) -> Reply {
+        let mut builder = ::http::Request::builder()
             .method("POST")
             .uri(ENDPOINTS_URI)
-            .header("host", format!("mediaconvert.{region}.amazonaws.com"))
             .header("authorization", authorization(region))
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        if let Some(host) = host {
+            builder = builder.header("host", host);
+        }
+        let request = builder
             .body(::bytes::Bytes::from(body.to_string()))
             .expect("build the request");
         let response = self.router.dispatch(request).await;
@@ -124,78 +139,88 @@ impl Emulator {
     }
 }
 
-/// Whether `url` is an account-specific MediaConvert endpoint in `region`: an HTTPS URL
-/// whose host is a hexadecimal, account-specific label under the regional service host
-/// (`https://<label>.mediaconvert.<region>.amazonaws.com`).
-///
-/// Checked structurally rather than against the handler's own formatter, so the test is
-/// not a second copy of the code under test.
-fn is_account_endpoint(url: &str, region: &str) -> bool {
-    let suffix = format!(".mediaconvert.{region}.amazonaws.com");
-    let Some(host) = url.strip_prefix("https://") else {
-        return false;
-    };
-    let Some(label) = host.strip_suffix(&suffix) else {
-        return false;
-    };
-    !label.is_empty() && label.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
-}
-
-/// The endpoint a region reports is the SAME URL on every later call, in either mode: it
-/// is minted once, persisted, and read back from the store afterwards. Different regions
-/// report different endpoints, because the URL names the region it serves.
+/// The endpoint reported is the address the request ARRIVED ON, whatever that address is:
+/// a client that re-points itself at `endpoints[0].url` has to reach this same service, so
+/// the URL carries the request's own host and no label this service invented. The rows
+/// differ along the FORM of that host — this service's published regional host, a loopback
+/// address with a port, a name with a port, a bare name — and the request that names no
+/// host at all is told this service's regional endpoint for the region it was signed for.
 #[tokio::test]
-async fn the_reported_endpoint_is_stable_per_region() {
+async fn the_reported_endpoint_is_the_address_that_serves_the_request() {
     let emulator = Emulator::new();
-    let mut seen: Vec<(String, String)> = Vec::new();
+    let region = "us-west-2";
+    let cases: [(Option<&str>, &str); 5] = [
+        (
+            Some("mediaconvert.us-west-2.amazonaws.com"),
+            "https://mediaconvert.us-west-2.amazonaws.com",
+        ),
+        (Some("127.0.0.1:9297"), "https://127.0.0.1:9297"),
+        (Some("localhost:8443"), "https://localhost:8443"),
+        (Some("emulator.internal"), "https://emulator.internal"),
+        // No `Host` at all: nothing states where the request arrived, so what is reported
+        // is this service's endpoint for the region the request was signed for.
+        (None, "https://mediaconvert.us-west-2.amazonaws.com"),
+    ];
 
-    for region in REGIONS {
-        // The first ask mints it; the request carries no `mode`, so the documented
-        // default (`DEFAULT`) applies.
-        let first = emulator.describe_endpoints(region, json!({})).await;
-        assert_eq!(
-            first.status, 200,
-            "case {region}: expected HTTP 200, got {} with body {}",
-            first.status, first.body
-        );
-        let Some(url) = first.only_url() else {
-            panic!(
-                "case {region}: expected exactly one endpoint, got {:?}",
-                first.urls()
-            );
-        };
-        assert!(
-            is_account_endpoint(&url, region),
-            "case {region}: expected an https://<label>.mediaconvert.{region}.amazonaws.com \
-             endpoint, got {url:?}"
-        );
-
-        // Every later ask reports what was stored, whichever mode asks for it.
+    for (host, expected) in cases {
         for body in [
             json!({}),
             json!({ "mode": "DEFAULT" }),
             json!({ "mode": "GET_ONLY" }),
             json!({ "maxResults": 20 }),
         ] {
-            let again = emulator.describe_endpoints(region, body.clone()).await;
+            let reply = emulator
+                .describe_endpoints_at(region, host, body.clone())
+                .await;
             assert_eq!(
-                again.status, 200,
-                "case {region} / {body}: expected HTTP 200, got {} with body {}",
-                again.status, again.body
+                reply.status, 200,
+                "case host={host:?} / {body}: expected HTTP 200, got {} with body {}",
+                reply.status, reply.body
             );
             assert_eq!(
-                again.only_url().as_deref(),
-                Some(url.as_str()),
-                "case {region} / {body}: expected the stored endpoint {url:?}, got {:?}",
-                again.urls()
+                reply.only_url().as_deref(),
+                Some(expected),
+                "case host={host:?} / {body}: expected the serving endpoint {expected:?}, \
+                 got {:?}",
+                reply.urls()
             );
             assert!(
-                again.body.get("nextToken").is_none(),
-                "case {region} / {body}: one endpoint fits in one page, so no nextToken is \
-                 due, got {}",
-                again.body
+                reply.body.get("nextToken").is_none(),
+                "case host={host:?} / {body}: one endpoint fits in one page, so no nextToken \
+                 is due, got {}",
+                reply.body
             );
         }
+    }
+}
+
+/// A request that states no host is told the endpoint of the region it was signed for, so
+/// the URL names that region and two regions never report the same one.
+#[tokio::test]
+async fn the_regional_endpoint_reported_names_the_region_asked_about() {
+    let emulator = Emulator::new();
+    let mut seen: Vec<(String, String)> = Vec::new();
+
+    for region in REGIONS {
+        // The request carries no `mode`, so the documented default (`DEFAULT`) applies.
+        let reply = emulator.describe_endpoints_at(region, None, json!({})).await;
+        assert_eq!(
+            reply.status, 200,
+            "case {region}: expected HTTP 200, got {} with body {}",
+            reply.status, reply.body
+        );
+        let Some(url) = reply.only_url() else {
+            panic!(
+                "case {region}: expected exactly one endpoint, got {:?}",
+                reply.urls()
+            );
+        };
+        assert_eq!(
+            url,
+            format!("https://mediaconvert.{region}.amazonaws.com"),
+            "case {region}: expected this service's endpoint for the region signed for, \
+             got {url:?}"
+        );
         seen.push((region.to_string(), url));
     }
 
@@ -206,7 +231,7 @@ async fn the_reported_endpoint_is_stable_per_region() {
             }
             assert_ne!(
                 url, other_url,
-                "case {region} vs {other_region}: an account endpoint names its own region, \
+                "case {region} vs {other_region}: a regional endpoint names its own region, \
                  so the two must differ, got {url:?} for both"
             );
         }

@@ -310,8 +310,10 @@ pub const MAX_PROBED_FILES: usize = 20;
 ///
 /// A CHOSEN ceiling too, for the same reason: the file is read whole — a container's index
 /// may sit anywhere in it — so the size a caller can make this operation hold in memory is
-/// bounded here rather than by whatever the object store happens to hold.
-const MAX_PROBED_FILE_BYTES: usize = 256 * 1024 * 1024;
+/// bounded here rather than by whatever the object store happens to hold. Published so a
+/// job's RUN reads a file to the same ceiling (`crate::state::job_run`): neither door of
+/// this service reads more of a caller's media than the other.
+pub(crate) const MAX_PROBED_FILE_BYTES: usize = 256 * 1024 * 1024;
 
 /// The `Format` values this service reports, spelled as the model's `Format` enum spells
 /// them. The catalogue is held against the generated `FORMAT_VALUES` by this module's own
@@ -438,11 +440,13 @@ async fn read_object(
             return Err(
                 match ::service_common::s3_object_read::answered_refusal(&error) {
                     // The store answered that it holds nothing at that address: the file
-                    // the request named is not there, which is the modelled 404 naming the
-                    // member the URL arrived in.
+                    // the request named is not there, which is the modelled 404 for a
+                    // missing media FILE ([`MISSING_FILE_MESSAGE`]) rather than the
+                    // template for a missing MediaConvert resource, because what is absent
+                    // is an object of the caller's and not a resource of this service's.
                     ::service_common::s3_object_read::ObjectRead::Absent => {
                         ProbeErrorModeled::NotFoundException(NotFoundException {
-                            message: Some(crate::state::not_found_message("fileUrl")),
+                            message: Some(MISSING_FILE_MESSAGE.to_string()),
                         })
                     }
                     // The store answered that the read is not permitted. The file may well
@@ -945,6 +949,15 @@ fn positive_count(value: i32) -> Option<i32> {
 fn positive_rate(value: i64) -> Option<i64> {
     (value > 0).then_some(value)
 }
+
+/// How this operation reports a media file the object store answered it holds nothing at.
+///
+/// FIXED text, interpolating nothing: what is absent is an OBJECT of the caller's, so the
+/// message states that the file is not there. The service's other not-found template — the
+/// one naming the input member a missing MediaConvert RESOURCE was referenced by
+/// (`crate::state::not_found_message`) — is for a resource of this service, and a media file
+/// is not one.
+const MISSING_FILE_MESSAGE: &str = "The file does not exist.";
 
 /// How this operation refuses a `FileUrl` that addresses no media file this emulator can
 /// read: it names the URL as sent and says what can be read instead.

@@ -10,8 +10,8 @@ build = "build.rs"
 engine = { workspace = true }
 # Opaque pagination tokens: hex-encode the cursor so it is not readable client state.
 hex = { workspace = true }
-# SHA-256: derives the account-specific label in the API endpoint URL
-# `DescribeEndpoints` reports, from the account id and the region alone.
+# SHA-256: derives the `x-amzn-requestid` this service stamps an error response with
+# (`src/service/error_envelope.rs`), from a per-process counter and the current instant.
 sha2 = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
@@ -69,6 +69,18 @@ mp4 = "0.14"
 # The RIFF/WAVE reader `Probe` reads a Wave file's format chunk with (sample rate,
 # channel count, bit depth, frame count), for the same reason.
 hound = "3.5"
+# The H.264 codec a job's run really CODES video with when the job asks this service to
+# GENERATE its input (`Input$VideoGenerator`, "MediaConvert creates a video input with
+# black frames"): there is no essence to carry over for such a job, so the frames are
+# encoded here and muxed into the output file through the workspace's one H.264/MP4 framing
+# seam (`service_common::h264_mp4`). `openh264` is a NATIVE component: its `-sys` crate
+# compiles the bundled Cisco C++ sources with `cc` at build time, as the Amazon IoT
+# SiteWise and Amazon Bedrock Runtime crates already take this same codec for their
+# rendered video, and it is a library computing over frames in-process — it opens no
+# listener, starts no process, reads no file and makes no outbound connection. The work one
+# job can ask of it is bounded before any of it starts (`MAX_GENERATED_FRAMES`,
+# `MAX_GENERATED_FRAME_PIXELS`, `MAX_GENERATED_PIXELS`) and runs on the blocking pool.
+openh264 = "0.9"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

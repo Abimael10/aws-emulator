@@ -2,14 +2,15 @@
 
 //! @op DescribeEndpoints
 //!
-//! Reports the account's API endpoint for the region the request is signed for.
+//! Reports the API endpoint a client is to send this account's MediaConvert requests to,
+//! for the region the request is signed for.
 //!
-//! `DEFAULT` mode (the default) answers the endpoint already stored for that region, or
-//! creates and persists one and answers it when none exists yet — the one write this
-//! operation's own documentation sanctions. `GET_ONLY` only reads: it answers the stored
-//! endpoint, or an empty list when the account has none in that region. An endpoint once
-//! stored is never rewritten, so the URL a caller reads back is the URL an earlier call
-//! persisted.
+//! `DEFAULT` mode (the default) answers the account's endpoint in that region, creating it
+//! when none exists yet — the one write this operation's own documentation sanctions.
+//! `GET_ONLY` only reads: it answers the endpoint when the account has one in that region,
+//! or an empty list when it has none. The URL reported is the address that SERVES the
+//! request (`crate::state::account_endpoint_url`), because the documented flow is to point
+//! the client at it and keep calling.
 //!
 //! ## Shape of an operation
 //!
@@ -213,17 +214,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or(DESCRIBE_ENDPOINTS_MODE_DEFAULT);
         let mut state = state.lock();
 
-        let url = match mode {
+        // What the store holds is whether the account HAS an endpoint in this region,
+        // which is the question the two modes differ on. The URL it is REPORTED as is the
+        // address that serves this very request (`crate::state::account_endpoint_url`):
+        // the documented client flow is to take `endpoints[0].url` and send the account's
+        // MediaConvert requests there, so a URL naming anything else points the client at
+        // a host that answers nothing.
+        let has_endpoint = match mode {
             // "Specify GET_ONLY to return your endpoints if any exist, or an empty list
             // if none exist" — a pure read, so an account with no endpoint in this region
             // still has none after this call.
-            DESCRIBE_ENDPOINTS_MODE_GET_ONLY => state.endpoint(&region).map(str::to_string),
+            DESCRIBE_ENDPOINTS_MODE_GET_ONLY => state.has_endpoint(&region),
             // "Specify DEFAULT for this operation to return your endpoints if any exist,
             // or to create an endpoint for you and return it if one doesn't already
-            // exist": the write this mode documents. An endpoint already stored comes
-            // back unchanged, which is what makes the URL stable.
+            // exist": the write this mode documents. A region the account already has an
+            // endpoint in is left exactly as it was.
             DESCRIBE_ENDPOINTS_MODE_DEFAULT => {
-                let Some(url) = state.ensure_endpoint(&region).map(str::to_string) else {
+                if !state.ensure_endpoint(&region) {
                     return Err(DescribeEndpointsErrorModeled::ServiceQuotaExceededException(
                         ServiceQuotaExceededException {
                             message: Some(format!(
@@ -233,8 +240,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         },
                     )
                     .into());
-                };
-                Some(url)
+                }
+                true
             }
             other => {
                 return Err(DescribeEndpointsErrorModeled::BadRequestException(
@@ -251,7 +258,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(DescribeEndpointsOutput {
             endpoints: Some(
-                url.map(|url| Endpoint { url: Some(url) })
+                has_endpoint
+                    .then(|| Endpoint {
+                        url: Some(crate::state::account_endpoint_url(ctx.parts(), &region)),
+                    })
                     .into_iter()
                     .collect(),
             ),

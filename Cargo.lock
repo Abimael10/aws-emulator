@@ -17012,6 +17012,7 @@ dependencies = [
  "hound",
  "http",
  "mp4",
+ "openh264",
  "serde_json",
  "service-com-amazonaws-acm-certificatemanager",
  "service-com-amazonaws-eventbridge-awsevents",

@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 use super::job_lifecycle::{Emulator, Reply, REGION};
 
 /// The bucket this suite creates and writes its media into.
-const BUCKET: &str = "mediaconvert-probe-media";
+pub(crate) const BUCKET: &str = "mediaconvert-probe-media";
 
 /// A bucket nothing ever creates, so S3 answers for it as the account holding nothing.
 const ABSENT_BUCKET: &str = "mediaconvert-probe-no-such-bucket";
@@ -57,25 +57,32 @@ const AUDIO_SAMPLE: &[u8] = &[0x21, 0x10, 0x05, 0x60];
 
 /// A video track to mux: `frames` samples of `sample_duration` units at `timescale`, so
 /// the rate a probe reads back is exactly `timescale / sample_duration`.
-struct VideoTrack {
-    width: u16,
-    height: u16,
-    timescale: u32,
-    frames: u32,
-    sample_duration: u32,
+///
+/// Shared with the `job_lifecycle` suite, which runs jobs over media muxed here rather than
+/// keeping a second muxer of its own.
+pub(crate) struct VideoTrack {
+    pub(crate) width: u16,
+    pub(crate) height: u16,
+    pub(crate) timescale: u32,
+    pub(crate) frames: u32,
+    pub(crate) sample_duration: u32,
 }
 
 /// An audio track to mux: `frames` frames of `samples_per_frame` samples at `sample_rate`.
-struct AudioTrack {
-    sample_rate: ::mp4::SampleFreqIndex,
-    channels: ::mp4::ChannelConfig,
-    frames: u32,
-    samples_per_frame: u32,
+pub(crate) struct AudioTrack {
+    pub(crate) sample_rate: ::mp4::SampleFreqIndex,
+    pub(crate) channels: ::mp4::ChannelConfig,
+    pub(crate) frames: u32,
+    pub(crate) samples_per_frame: u32,
 }
 
 /// An ISO base media file (MP4, QuickTime, 3GP, 3G2 — the `brand` decides which) carrying
 /// the tracks given, written with the ISO base media writer.
-fn iso_bmff(brand: &[u8; 4], video: Option<VideoTrack>, audio: Option<AudioTrack>) -> Vec<u8> {
+pub(crate) fn iso_bmff(
+    brand: &[u8; 4],
+    video: Option<VideoTrack>,
+    audio: Option<AudioTrack>,
+) -> Vec<u8> {
     let config = ::mp4::Mp4Config {
         major_brand: ::mp4::FourCC::from(*brand),
         minor_version: 512,
@@ -191,6 +198,14 @@ fn wave(channels: u16, sample_rate: u32, bits_per_sample: u16, frames: u32) -> V
 /// An emulator with S3 mounted beside MediaConvert on the same engine, holding one bucket.
 async fn emulator_with_bucket() -> Emulator {
     let emulator = Emulator::beside(service_com_amazonaws_s3_amazons3::EmulatedService::new);
+    create_bucket(&emulator).await;
+    emulator
+}
+
+/// Create this suite's bucket in the S3 mounted beside MediaConvert, so a file can be
+/// written into it. Shared with the `job_lifecycle` suite, which needs the same bucket under
+/// an emulator whose clock span is its own.
+pub(crate) async fn create_bucket(emulator: &Emulator) {
     // A create sent to a REGIONAL endpoint states its location constraint: the
     // unspecified constraint means us-east-1, and this suite signs for `REGION`.
     let (status, _, body) = emulator
@@ -212,12 +227,11 @@ async fn emulator_with_bucket() -> Emulator {
         "setup: CreateBucket must succeed, got {status} {}",
         String::from_utf8_lossy(&body)
     );
-    emulator
 }
 
 /// Write `bytes` to `key` and answer the entity tag S3 reported for the object, so what
 /// Probe reports as the file's metadata can be held against what the store holds.
-async fn put_object(emulator: &Emulator, key: &str, bytes: &[u8]) -> String {
+pub(crate) async fn put_object(emulator: &Emulator, key: &str, bytes: &[u8]) -> String {
     let (status, headers, body) = emulator
         .rest("s3", "PUT", &format!("/{BUCKET}/{key}"), bytes.to_vec())
         .await;
@@ -247,7 +261,7 @@ async fn probe(emulator: &Emulator, urls: &[&str]) -> Reply {
 }
 
 /// The `s3://` URI of a key in this suite's bucket.
-fn s3_uri(key: &str) -> String {
+pub(crate) fn s3_uri(key: &str) -> String {
     format!("s3://{BUCKET}/{key}")
 }
 
@@ -760,43 +774,56 @@ async fn a_file_that_cannot_be_probed_is_refused_for_why() {
         files: Value,
         status: u16,
         error_type: &'static str,
+        /// The message the row pins, where the text is the requirement for its error
+        /// class rather than a sentence this service words for the file it names.
+        message: Option<&'static str>,
     }
+    /// What a probe of a media file the object store holds nothing at answers: fixed text,
+    /// interpolating nothing, because what is absent is an object of the caller's rather
+    /// than a resource of this service's.
+    const MISSING_FILE: &str = "The file does not exist.";
     let refusals = vec![
         Refusal {
             case: "a key the bucket does not hold",
             files: json!([{ "fileUrl": s3_uri("in/never-written.mp4") }]),
             status: 404,
             error_type: "NotFoundException",
+            message: Some(MISSING_FILE),
         },
         Refusal {
             case: "a bucket this account does not hold",
             files: json!([{ "fileUrl": format!("s3://{ABSENT_BUCKET}/in/one.mp4") }]),
             status: 404,
             error_type: "NotFoundException",
+            message: Some(MISSING_FILE),
         },
         Refusal {
             case: "a URL that addresses no object this emulator can read",
             files: json!([{ "fileUrl": "https://example.com/in/one.mp4" }]),
             status: 400,
             error_type: "BadRequestException",
+            message: None,
         },
         Refusal {
             case: "an s3 URI with no key",
             files: json!([{ "fileUrl": format!("s3://{BUCKET}/") }]),
             status: 400,
             error_type: "BadRequestException",
+            message: None,
         },
         Refusal {
             case: "a fileUrl that carries no characters",
             files: json!([{ "fileUrl": "" }]),
             status: 400,
             error_type: "BadRequestException",
+            message: None,
         },
         Refusal {
             case: "no input file at all",
             files: json!([]),
             status: 400,
             error_type: "BadRequestException",
+            message: None,
         },
         Refusal {
             case: "more files than one call reads",
@@ -807,18 +834,21 @@ async fn a_file_that_cannot_be_probed_is_refused_for_why() {
             ),
             status: 400,
             error_type: "BadRequestException",
+            message: None,
         },
         Refusal {
             case: "a file that is not media",
             files: json!([{ "fileUrl": s3_uri("in/not-media.txt") }]),
             status: 422,
             error_type: "UnprocessableEntityException",
+            message: None,
         },
         Refusal {
             case: "a media file whose container signature is gone",
             files: json!([{ "fileUrl": s3_uri("in/headless.mp4") }]),
             status: 422,
             error_type: "UnprocessableEntityException",
+            message: None,
         },
         Refusal {
             case: "one readable file beside one that is not",
@@ -828,6 +858,7 @@ async fn a_file_that_cannot_be_probed_is_refused_for_why() {
             ]),
             status: 422,
             error_type: "UnprocessableEntityException",
+            message: None,
         },
     ];
     for refusal in &refusals {
@@ -858,6 +889,13 @@ async fn a_file_that_cannot_be_probed_is_refused_for_why() {
             refusal.case,
             reply.body
         );
+        if let Some(expected) = refusal.message {
+            assert_eq!(
+                message, expected,
+                "case {:?}: expected the message for that error class, got {message:?}",
+                refusal.case
+            );
+        }
         // No result is reported for a request that was refused: a partial list would
         // claim the files it left out were never asked about.
         assert_eq!(

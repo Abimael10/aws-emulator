@@ -199,6 +199,12 @@ pub fn drive_job_clock<Eng: Send + Sync + 'static>(
             // applies what the clock had already made due and nothing else.
             state.lock().settle(SystemTime::now());
             super::publish_pending(&callback, &*engine, &region).await;
+            // And the run every job that has BEGUN is owed: a client that reacts to a job
+            // on an EventBridge rule makes no further MediaConvert call, so its job's
+            // transcode cannot wait for a read that never comes
+            // ([`super::run_due_job_runs`]). With no store guard held, as the publication
+            // above is.
+            super::run_due_job_runs(&callback, &*engine, &region, None).await;
         }
         if capped {
             // Only THIS pump's claim, so a pump started since is left holding its own.

@@ -170,6 +170,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
+        // The job's RUN, for a job the clock has already let begin: the transcode was owed
+        // at this instant whether or not anybody polled, and making it here is what lets a
+        // polling client's job complete (`crate::state::run_due_job_runs`). It awaits, so
+        // it is made before the store is locked at all; the job this read is about is run
+        // first.
+        crate::state::run_due_job_runs(
+            ctx.callback(),
+            &*self.engine,
+            &region,
+            Some(input.id.as_str()),
+        )
+        .await;
         // The guard is taken and RELEASED around the read, so the publication below holds
         // no lock across the in-process call it makes.
         let reported = {

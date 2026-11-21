@@ -574,6 +574,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             error_message: None,
             error_code: None,
             unreadable_input,
+            // A submitted job has transcoded nothing: its run is made once the clock lets
+            // it begin (`crate::state::run_due_job_runs`), and what that run produced is
+            // what the job reports when it completes.
+            run: None,
+            run_claimed_at: None,
         };
 
         let id = match state.accept_job(record, now) {
