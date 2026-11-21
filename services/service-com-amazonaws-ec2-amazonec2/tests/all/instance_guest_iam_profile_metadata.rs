@@ -94,6 +94,7 @@ async fn a_guest_reads_the_instance_profile_its_machine_runs_as() {
         booted(&router, &engine, row.case, &instance_id).await;
         let identity = GuestIdentity {
             iam_role_name: row.role_name.map(str::to_string),
+            iam_role_credentials: None,
         };
 
         // The role listing: the one line naming the role a guest's agent reads to learn which

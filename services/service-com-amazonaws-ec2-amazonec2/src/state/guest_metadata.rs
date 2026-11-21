@@ -20,13 +20,15 @@
 //! guest knows about its machine): the id, the image, the type, the architecture, the
 //! addresses, the zone and the Region of that zone, the instant it was launched, the
 //! metadata options its launch chose, and the IAM instance profile it runs as — the profile
-//! this store holds for it and the name of the role that profile carries, which is the one
-//! fact of the machine another service owns ([`GuestMachine::running_as`]). Nothing is echoed
-//! from a request, and nothing is answered for a fact the record does not carry — a path
-//! whose value the instance has none of is a `404` rather than an invented value, which is
-//! why an instance running as no profile publishes no `iam/` category at all, and why the
-//! credentials AWS publishes UNDER a role's name are published by nothing here: a credential
-//! is minted by the credential store, never by a reader.
+//! this store holds for it, the name of the role that profile carries and the CREDENTIALS of
+//! that role, which are the facts of the machine another service owns
+//! ([`GuestMachine::running_as`]). Nothing is echoed from a request, and nothing is answered
+//! for a fact the record does not carry — a path whose value the instance has none of is a
+//! `404` rather than an invented value, which is why an instance running as no profile
+//! publishes no `iam/` category at all. The credentials published UNDER a role's name are a
+//! SESSION of that role minted by the token service ([`super::instance_role_credentials`]),
+//! handed to the machine by the caller that reaches its guest: a credential is minted by the
+//! credential store, never by a reader, so a machine nothing minted one for publishes none.
 //!
 //! The identity document is SIGNED: [`identity_document_signature`] is the RSASSA-PKCS1-v1_5
 //! signature of the document's own bytes under a 2048-bit key this process generates once
@@ -187,9 +189,52 @@ impl PublishedInstanceMetadata for GuestPrograms {
             // the form the operations that take one accept.
             IDENTITY_SIGNATURE_PATH => identity_document_signature(&identity_document(machine))
                 .map(|signature| vec![signature]),
-            _ => None,
+            // The CREDENTIALS of the role the machine runs as, published UNDER that role's
+            // name: "applications on the instance retrieve the security credentials provided
+            // by the role from the instance metadata item
+            // `iam/security-credentials/<role-name>`" (Amazon EC2 User Guide, "Use an IAM
+            // role to grant permissions to applications running on Amazon EC2 instances").
+            // The credentials are the ones minted for this machine
+            // ([`super::instance_role_credentials`]) — a credential is minted by the token
+            // service, never by a reader — so a machine nothing minted one for publishes
+            // nothing here, and so does a read under any other name than the role's.
+            other => other
+                .strip_prefix(IAM_SECURITY_CREDENTIALS_PATH)
+                .and_then(|under| under.strip_prefix('/'))
+                .and_then(|role_name| role_credentials(machine, role_name)),
         }
     }
+}
+
+/// The credentials document the machine publishes under the role name `role_name`, or `None`
+/// when it publishes none there: a machine running as no profile, one whose role nothing
+/// minted credentials for, and a name that is not the role the credentials belong to.
+///
+/// The members are the ones AWS's own document carries (Amazon EC2 User Guide, "Instance
+/// metadata categories"), each read off the minted session: its `Code` and `Type` are the
+/// words that document carries ([`super::ROLE_CREDENTIALS_SUCCESS`],
+/// [`super::ROLE_CREDENTIALS_TYPE`]), `LastUpdated` is when the session was minted and
+/// `Expiration` when it stops being valid, and the three credential members are the token
+/// service's own — nothing here constructs an access key id, a secret or a token.
+fn role_credentials(machine: &GuestMachine, role_name: &str) -> Option<Vec<String>> {
+    let credentials = machine
+        .instance_profile
+        .as_ref()?
+        .role_credentials
+        .as_ref()
+        .filter(|credentials| credentials.role_name == role_name)?;
+    Some(vec![
+        ::serde_json::json!({
+            "Code": super::ROLE_CREDENTIALS_SUCCESS,
+            "LastUpdated": iso8601_utc(credentials.issued_at),
+            "Type": super::ROLE_CREDENTIALS_TYPE,
+            "AccessKeyId": credentials.access_key_id,
+            "SecretAccessKey": credentials.secret_access_key,
+            "Token": credentials.session_token,
+            "Expiration": iso8601_utc(credentials.expires_at),
+        })
+        .to_string(),
+    ])
 }
 
 /// The metadata categories the listing of [`METADATA_PREFIX`] names, in the order the

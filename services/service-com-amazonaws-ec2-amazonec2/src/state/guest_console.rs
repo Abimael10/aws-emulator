@@ -210,6 +210,13 @@ pub struct GuestInstanceProfile {
     /// The NAME of the role the profile carries, which is the name the metadata service
     /// lists under `iam/security-credentials/`; `None` where nothing resolved it.
     pub role_name: Option<String>,
+    /// The CREDENTIALS of that role, which the metadata service publishes UNDER its name —
+    /// what every SDK, agent and script inside the guest signs its AWS calls with
+    /// ([`super::instance_role_credentials`]). A credential is minted by the token service
+    /// and never by a reader, so it reaches a machine the same way the role's name does
+    /// ([`GuestIdentity`]); `None` where nothing minted one for this guest, which publishes
+    /// no credentials rather than a document carrying no credential.
+    pub role_credentials: Option<super::GuestRoleCredentials>,
 }
 
 /// What the CALLER of a guest program supplies about the machine's IDENTITY — the part of it
@@ -219,10 +226,19 @@ pub struct GuestInstanceProfile {
 /// that is lives in IAM's own records; a caller that reaches a guest with the engine in hand
 /// resolves it there ([`ComAmazonawsEc2Amazonec2State::instance_profile_role_name`]) and hands
 /// it over here, so this store keeps no second copy of an IAM record.
+///
+/// The CREDENTIALS of that role travel the same way and for the same reason: a session of it
+/// is minted by the token service and recorded in the stores that resolve a credential's
+/// principal ([`super::instance_role_credentials`]), none of which this store holds, so the
+/// caller that reaches the guest with the engine and the emulator's credential store in hand
+/// mints one and hands it over.
 #[derive(Debug, Clone, Default)]
 pub struct GuestIdentity {
     /// The name of the role the instance's instance profile carries.
     pub iam_role_name: Option<String>,
+    /// The credentials of that role, which the guest's metadata service publishes under its
+    /// name ([`super::instance_role_credentials::instance_role_credentials`]).
+    pub iam_role_credentials: Option<super::GuestRoleCredentials>,
 }
 
 impl GuestMachine {
@@ -234,6 +250,7 @@ impl GuestMachine {
     pub fn running_as(mut self, identity: &GuestIdentity) -> Self {
         if let Some(profile) = self.instance_profile.as_mut() {
             profile.role_name = identity.iam_role_name.clone();
+            profile.role_credentials = identity.iam_role_credentials.clone();
         }
         self
     }
@@ -282,13 +299,15 @@ impl ComAmazonawsEc2Amazonec2State {
                 == super::METADATA_ENDPOINT_ENABLED,
             metadata_token_required: instance.detail.http_tokens == super::HTTP_TOKENS_REQUIRED,
             // The profile the instance runs as is this store's own record of it; the role it
-            // carries is IAM's, and is filled in by the caller that has that store in reach.
+            // carries is IAM's, and the credentials of that role are the token service's —
+            // both filled in by the caller that has those stores in reach.
             instance_profile: self
                 .iam_instance_profile_of_instance(&instance.instance_id)
                 .map(|profile| GuestInstanceProfile {
                     arn: profile.arn,
                     id: profile.id,
                     role_name: None,
+                    role_credentials: None,
                 }),
         }
     }

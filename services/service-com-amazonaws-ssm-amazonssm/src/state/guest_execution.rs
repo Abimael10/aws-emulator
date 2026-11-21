@@ -222,20 +222,30 @@ fn resolved_line(text: &str, values: &BTreeMap<String, Vec<String>>) -> String {
 /// profile carries is a fact IAM holds, so that service's own records answer it
 /// ([`ec2_store::instance_profile_role_name`], read before the guest's store is taken), and
 /// the guest's metadata service publishes it to a program that asks — the read an agent makes
-/// to learn the role it is running as.
+/// to learn the role it is running as. The CREDENTIALS of that role travel with it, minted by
+/// the token service for the instance ([`ec2_store::instance_role_credentials`]) out of
+/// `credentials`, the emulator's own credential store, which only a request's own context
+/// carries: a script inside the guest signs its AWS calls with them, so a call it makes is a
+/// call made by the role the instance runs as.
 pub fn perform_in_guest<Eng: Send + Sync + 'static>(
     engine: &Eng,
+    credentials: &::emulator_server::CredentialStore,
     instance_id: &str,
     commands: &[String],
     now: SystemTime,
 ) -> Option<ec2_store::GuestRun> {
-    let _ = now;
     let resolver = ::service_com_amazonaws_route53resolver_route53resolver::state::vpc_dns::view_from_instance(
         engine, instance_id,
     )
     .map(super::guest_resolver::resolver_programs);
     let identity = ec2_store::GuestIdentity {
         iam_role_name: ec2_store::instance_profile_role_name(engine, instance_id),
+        iam_role_credentials: ec2_store::instance_role_credentials(
+            engine,
+            credentials,
+            instance_id,
+            now,
+        ),
     };
     let ec2 = ec2_store::service_state(engine)?;
     let mut store = ec2.lock();

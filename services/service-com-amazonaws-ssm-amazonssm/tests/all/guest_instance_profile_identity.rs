@@ -131,7 +131,7 @@ async fn a_guest_reads_the_role_its_instance_profile_carries() {
 /// Create a role named `role_name` carrying the AWS-managed policy a managed node's profile
 /// carries, an instance profile named `profile_name` holding it, and answer the profile's
 /// name — the chain a template's generated names create, where the two names differ.
-async fn profile_carrying_role(
+pub(crate) async fn profile_carrying_role(
     emulator: &Emulator,
     case: &str,
     profile_name: &str,
@@ -173,7 +173,7 @@ async fn profile_carrying_role(
 }
 
 /// Look until this service reports `instance_id` as a managed node whose agent is responding.
-async fn online(emulator: &Emulator, case: &str, instance_id: &str) {
+pub(crate) async fn online(emulator: &Emulator, case: &str, instance_id: &str) {
     let deadline = Instant::now() + DEADLINE;
     loop {
         let (status, answered) = emulator
@@ -206,7 +206,7 @@ async fn online(emulator: &Emulator, case: &str, instance_id: &str) {
 
 /// Send `commands` to the node's guest through Run Command, and answer what the guest wrote
 /// once the invocation has succeeded.
-async fn read_in_guest(
+pub(crate) async fn read_in_guest(
     emulator: &Emulator,
     case: &str,
     instance_id: &str,

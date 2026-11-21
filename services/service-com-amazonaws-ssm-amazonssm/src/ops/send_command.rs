@@ -683,6 +683,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ::tokio::task::yield_now().await;
             let Some(run) = crate::state::guest_execution::perform_in_guest(
                 &*self.engine,
+                ctx.credential_store(),
                 &id,
                 &step.commands,
                 now,

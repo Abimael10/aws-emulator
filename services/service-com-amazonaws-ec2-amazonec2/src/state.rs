@@ -2736,6 +2736,12 @@ pub use guest_commands::*;
 pub mod guest_metadata;
 pub use guest_metadata::*;
 
+/// The CREDENTIALS one instance's guest is served for the IAM role its instance profile
+/// carries — a session of that role, minted by the token service and published by the guest's
+/// own metadata service. A SUBMODULE for the same reason [`image_usage_reports`] is one.
+pub mod instance_role_credentials;
+pub use instance_role_credentials::*;
+
 /// What one instance's GUEST sees of its own CPUs: the processors, cores and threads the
 /// launch's `CpuOptions` gave it, published to that guest as the files the kernel publishes
 /// them in and the programs that print them. A SUBMODULE for the same reason
