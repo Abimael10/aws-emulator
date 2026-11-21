@@ -55,8 +55,13 @@ use crate::cloudformation_provisions_lambda_event_source_mappings::{
 use crate::query_wire::{elements, physical_ids_of};
 
 /// The `StackStatus` the rule is stated in, and the one a create reports while it runs.
-const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
-const CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
+///
+/// `pub(crate)` for the reason [`template`] is: the suite that pins the rule for an UPDATE
+/// deploys the stack through its create first, and a second spelling of a status is a second
+/// thing to keep in step.
+pub(crate) const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
+/// See [`CREATE_COMPLETE`].
+pub(crate) const CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
 
 /// How long a row waits for the create to finish, and how long it hands the runtime back
 /// between two looks.
@@ -70,17 +75,23 @@ const WAIT: Duration = Duration::from_secs(180);
 const LOOK_AGAIN: Duration = Duration::from_millis(100);
 
 /// The logical ids every row's template declares its resources under.
-const SOURCE_ID: &str = "Source";
+///
+/// The two a reader of the deployed stack addresses — the source and the mapping — are
+/// `pub(crate)` for the reason [`template`] is.
+pub(crate) const SOURCE_ID: &str = "Source";
 const ROLE_ID: &str = "Role";
 const FUNCTION_ID: &str = "Consumer";
-const MAPPING_ID: &str = "Trigger";
+/// See [`SOURCE_ID`].
+pub(crate) const MAPPING_ID: &str = "Trigger";
 
 /// The partition key the DynamoDB row's table is declared with.
 const KEY_ATTRIBUTE: &str = "pk";
 
 /// Which event source a row's mapping polls.
+///
+/// `pub(crate)` for the reason [`template`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Source {
+pub(crate) enum Source {
     /// An Amazon DynamoDB table's stream, read through `Fn::GetAtt … StreamArn`.
     DynamodbStream,
     /// An Amazon Kinesis data stream.
@@ -95,7 +106,7 @@ impl Source {
     /// GetRecords, GetShardIterator, DescribeStream, and ListStreams Actions on your stream"
     /// for a shard source, and `ReceiveMessage`/`DeleteMessage`/`GetQueueAttributes` for a
     /// queue.
-    fn reader_actions(self) -> Vec<&'static str> {
+    pub(crate) fn reader_actions(self) -> Vec<&'static str> {
         match self {
             Self::DynamodbStream => vec![
                 "dynamodb:DescribeStream",
@@ -120,7 +131,7 @@ impl Source {
     /// The reference that resolves to the ARN of the source the mapping polls: a table
     /// publishes its stream's ARN under `StreamArn`, and a data stream and a queue publish
     /// their own under `Arn`.
-    fn arn_reference(self) -> Value {
+    pub(crate) fn arn_reference(self) -> Value {
         match self {
             Self::DynamodbStream => json!({"Fn::GetAtt": [SOURCE_ID, "StreamArn"]}),
             Self::KinesisStream | Self::SqsQueue => json!({"Fn::GetAtt": [SOURCE_ID, "Arn"]}),
@@ -128,7 +139,7 @@ impl Source {
     }
 
     /// The source resource itself, as the row's template declares it.
-    fn declared(self, stack: &str) -> Value {
+    pub(crate) fn declared(self, stack: &str) -> Value {
         match self {
             Self::DynamodbStream => json!({
                 "Type": "AWS::DynamoDB::Table",
@@ -154,14 +165,14 @@ impl Source {
 
     /// Whether a mapping on this source needs a starting position, which
     /// `CreateEventSourceMapping` requires of the two SHARD sources and takes for no queue.
-    fn reads_shards(self) -> bool {
+    pub(crate) fn reads_shards(self) -> bool {
         matches!(self, Self::DynamodbStream | Self::KinesisStream)
     }
 
     /// The ARN the mapping must report polling, computed from what the row declares — `None`
     /// for a table's stream, whose ARN carries the instant DynamoDB enabled the stream and so
     /// is checkable only by the table it nests in.
-    fn expected_arn(self, stack: &str) -> Option<String> {
+    pub(crate) fn expected_arn(self, stack: &str) -> Option<String> {
         let account = engine::emulator_account_id();
         match self {
             Self::DynamodbStream => None,
@@ -232,7 +243,7 @@ fn rows() -> Vec<Row> {
 /// `core/router/src/lib.rs` mounts them. Request authentication is off, as in every other
 /// suite here; the in-process call CloudFormation makes signs its request either way (the
 /// credential scope is what routes it).
-fn build_router() -> MultiServiceRouter {
+pub(crate) fn build_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -264,26 +275,43 @@ fn build_router() -> MultiServiceRouter {
     router
 }
 
-/// The template a row deploys: the event source, the execution role granted the poller's own
-/// reads of it, the function the mapping invokes, and the mapping itself, declared with the
-/// row's own batch size.
-fn template(row: &Row) -> String {
-    let source_arn = row.source.arn_reference();
+/// What a declaration states about the mapping ITSELF: the source it polls, the function it
+/// invokes, the batch size it is declared with, the starting position the two shard sources
+/// require, and the `Enabled` setting where the declaration states one at all.
+///
+/// `pub(crate)` for the reason [`template`] is.
+pub(crate) fn mapping_properties(source: Source, enabled: Option<bool>, batch_size: i64) -> Value {
     let mut mapping = json!({
-        "EventSourceArn": source_arn.clone(),
+        "EventSourceArn": source.arn_reference(),
         "FunctionName": {"Ref": FUNCTION_ID},
-        "BatchSize": row.batch_size,
+        "BatchSize": batch_size,
     });
-    if row.source.reads_shards() {
+    if source.reads_shards() {
         mapping["StartingPosition"] = json!("LATEST");
     }
-    if let Some(enabled) = row.enabled {
+    if let Some(enabled) = enabled {
         mapping["Enabled"] = json!(enabled);
     }
+    mapping
+}
+
+/// The template a row deploys: the event source, the execution role granted the poller's own
+/// reads of it, the function the mapping invokes, and the mapping itself, declared as
+/// `mapping` states it ([`mapping_properties`]).
+///
+/// `pub(crate)` — together with [`Source`], [`mapping_properties`], [`build_router`],
+/// [`published_id`] and [`reported_mapping`] — because the rule in this suite's header is
+/// stated about a stack OPERATION rather than about the create alone, and the suite that
+/// deploys the same declaration twice to pin it for an UPDATE
+/// (`cloudformation_event_source_mapping_update_stabilisation`) has to deploy the SAME stack
+/// this one does: a second copy of the template would make the two suites pin the rule for two
+/// different deployments.
+pub(crate) fn template(source: Source, stack: &str, mapping: &Value) -> String {
+    let source_arn = source.arn_reference();
     json!({
         "AWSTemplateFormatVersion": "2010-09-09",
         "Resources": {
-            SOURCE_ID: row.source.declared(row.stack),
+            SOURCE_ID: source.declared(stack),
             ROLE_ID: {
                 "Type": "AWS::IAM::Role",
                 "Properties": {
@@ -300,7 +328,7 @@ fn template(row: &Row) -> String {
                         "PolicyDocument": {
                             "Version": "2012-10-17",
                             "Statement": [{
-                                "Action": row.source.reader_actions(),
+                                "Action": source.reader_actions(),
                                 "Effect": "Allow",
                                 "Resource": source_arn,
                             }],
@@ -329,7 +357,9 @@ fn template(row: &Row) -> String {
 
 /// The physical id the stack publishes for one of its logical resources — for the mapping,
 /// the UUID Lambda minted ("Ref returns the event source mapping's ID").
-async fn published_id(
+///
+/// `pub(crate)` for the reason [`template`] is.
+pub(crate) async fn published_id(
     router: &MultiServiceRouter,
     case: &str,
     stack: &str,
@@ -352,7 +382,9 @@ async fn published_id(
 /// What Lambda reports for the mapping `uuid`, read ONCE: the rule is about the state that
 /// service is in at the instant the stack first reported the operation complete, so nothing
 /// here waits for the state to improve.
-async fn reported_mapping(router: &MultiServiceRouter, case: &str, uuid: &str) -> Value {
+///
+/// `pub(crate)` for the reason [`template`] is.
+pub(crate) async fn reported_mapping(router: &MultiServiceRouter, case: &str, uuid: &str) -> Value {
     let (status, _, body) = lambda(router, "GET", &format!("{MAPPINGS_URI}/{uuid}"), &[]).await;
     assert_eq!(
         status, 200,
@@ -363,22 +395,35 @@ async fn reported_mapping(router: &MultiServiceRouter, case: &str, uuid: &str) -
 }
 
 /// Why a stack did not reach the status a case expected, for the assertion's own message.
-async fn failure_reasons(router: &MultiServiceRouter, stack: &str) -> Vec<String> {
+///
+/// `pub(crate)` for the reason [`template`] is.
+pub(crate) async fn failure_reasons(router: &MultiServiceRouter, stack: &str) -> Vec<String> {
     let (_, events) =
         cloudformation(router, "DescribeStackEvents", &[("StackName", stack)]).await;
     elements(&events, "ResourceStatusReason")
 }
 
-/// Read the stack again until its create has FINISHED, in whatever status it finished in, and
-/// answer that status with the answer it was read from.
+/// Read the stack again until the operation that is running on it has FINISHED — until it
+/// reports none of the statuses it reports WHILE it runs (`while_running`) — and answer the
+/// status it finished in with the answer it was read from.
 ///
 /// The transitions on the way are owed on the clocks of the services that own the stack's
 /// resources, so this waits for the CONDITION rather than for a span — and the FIRST completed
-/// read is what the rule below is stated about, so nothing is waited out past it.
-async fn created(router: &MultiServiceRouter, stack: &str) -> (String, String) {
+/// read is what the rule below is stated about, so nothing is waited out past it. `while_running`
+/// is a SET because a successful operation has more than one in-progress status to pass through:
+/// an update that replaced a resource reports `UPDATE_COMPLETE_CLEANUP_IN_PROGRESS` while it
+/// deletes what it replaced, and a wait that stopped there would read a stack whose operation is
+/// still running as one that finished in that status.
+///
+/// `pub(crate)` for the reason [`template`] is.
+pub(crate) async fn deployment_finished(
+    router: &MultiServiceRouter,
+    stack: &str,
+    while_running: &[&str],
+) -> (String, String) {
     let giving_up_at = Instant::now() + WAIT;
     let mut last = stack_status(router, stack).await;
-    while last.0 == CREATE_IN_PROGRESS && Instant::now() < giving_up_at {
+    while while_running.contains(&last.0.as_str()) && Instant::now() < giving_up_at {
         tokio::time::sleep(LOOK_AGAIN).await;
         last = stack_status(router, stack).await;
     }
@@ -394,12 +439,13 @@ async fn a_stack_completes_only_once_lambda_settles_its_event_source_mapping() {
         let router = build_router();
         let case = row.case;
 
+        let declared = mapping_properties(row.source, row.enabled, row.batch_size);
         let (status, body) = cloudformation(
             &router,
             "CreateStack",
             &[
                 ("StackName", row.stack),
-                ("TemplateBody", &template(&row)),
+                ("TemplateBody", &template(row.source, row.stack, &declared)),
                 ("Capabilities.member.1", "CAPABILITY_IAM"),
             ],
         )
@@ -409,7 +455,8 @@ async fn a_stack_completes_only_once_lambda_settles_its_event_source_mapping() {
             "case {case:?}: expected HTTP 200 from CreateStack, got {status} with body {body}"
         );
 
-        let (reached, described) = created(&router, row.stack).await;
+        let (reached, described) =
+            deployment_finished(&router, row.stack, &[CREATE_IN_PROGRESS]).await;
         assert_eq!(
             reached, CREATE_COMPLETE,
             "case {case:?}: expected the stack to deploy, got {described} with resource \
