@@ -39,7 +39,17 @@ use crate::pipe_data_plane::{
     collect_at_least, collect_during, emulator, given_queue, sqs, wait_for_counted,
     wait_for_visible, QUIET,
 };
+use crate::pipe_execution_role::wait_for_state;
 use crate::pipe_lifecycle::{call, describe, REGION};
+use crate::pipe_update::update;
+
+/// The `PipeState` a pipe whose `DesiredState` is `RUNNING` rests in, and the one it rests
+/// in when it is `STOPPED`, beside the `RequestedPipeState` values `UpdatePipe` asks for —
+/// read from the crate rather than spelled again here.
+const RUNNING_STATE: &str = service_com_amazonaws_pipes_pipes::state::pipe_state::RUNNING;
+const STOPPED_STATE: &str = service_com_amazonaws_pipes_pipes::state::pipe_state::STOPPED;
+const RUN_REQUESTED: &str = service_com_amazonaws_pipes_pipes::state::requested_state::RUNNING;
+const STOP_REQUESTED: &str = service_com_amazonaws_pipes_pipes::state::requested_state::STOPPED;
 
 /// The role every pipe below names. Nothing in this suite turns on its policies.
 const ROLE: &str = "arn:aws:iam::000000000000:role/pipes-body-paths";
@@ -624,6 +634,259 @@ async fn the_reserved_pipe_variables_render_the_pipes_own_identity() {
         Some(source_arn.as_str()),
         "case {case:?}: expected the event variable to carry the record envelope, got \
          {rendered}"
+    );
+}
+
+/// RULE: a record's payload travels as the TEXT its producer sent, so a template
+/// placeholder that selects the payload member AS A WHOLE hands the stage those bytes
+/// unchanged — the spacing, the member order and the number spellings the producer wrote —
+/// wherever the place it stands in takes them: a template that is not JSON text, and a
+/// placeholder standing where a JSON value stands whose payload spells a document. Inside one
+/// of the template's own string literals, and standing as a JSON value for a payload that
+/// spells no document, the payload is written like any other value of its type — the
+/// template's quotes do the quoting — and a path DESCENDING into the payload reads the
+/// document that text spells.
+///
+/// The rows differ along what the rule generalises over: how one and the same document is
+/// SPELLED (compact, spaced, pretty-printed over several lines, members in an order no
+/// serializer would choose, a number a round trip would re-spell), the shape of the payload
+/// (object, list, text spelling no document at all, text carrying a quote and a newline), and
+/// where the placeholder stands (alone, as a value of a JSON template, inside one of that
+/// template's string literals, beside a path that descends into the same payload).
+#[tokio::test]
+async fn a_placeholder_selecting_the_whole_payload_delivers_it_as_sent() {
+    // (case, the template, the body as the producer sends it, the BYTES the target must
+    // receive)
+    let rows: Vec<(&str, &str, &str, &str)> = vec![
+        (
+            "a-spaced-json-object",
+            "<$.body>",
+            r#"{"marker": "as-sent-1", "n": 1}"#,
+            r#"{"marker": "as-sent-1", "n": 1}"#,
+        ),
+        (
+            "a-compact-json-object",
+            "<$.body>",
+            r#"{"marker":"as-sent-2"}"#,
+            r#"{"marker":"as-sent-2"}"#,
+        ),
+        (
+            // Members in an order of the producer's own, kept as written.
+            "members-in-the-producers-order",
+            "<$.body>",
+            r#"{"zebra": 1, "apple": 2}"#,
+            r#"{"zebra": 1, "apple": 2}"#,
+        ),
+        (
+            // A number a round trip through a parser would re-spell (1.50 -> 1.5), and
+            // escapes the producer wrote.
+            "a-number-and-escapes-a-round-trip-would-respell",
+            "<$.body>",
+            r#"{"amount": 1.50, "text": "she said \"hi\""}"#,
+            r#"{"amount": 1.50, "text": "she said \"hi\""}"#,
+        ),
+        (
+            "a-pretty-printed-json-object",
+            "<$.body>",
+            "{\n  \"marker\": \"as-sent-5\"\n}",
+            "{\n  \"marker\": \"as-sent-5\"\n}",
+        ),
+        (
+            "a-json-list",
+            "<$.body>",
+            "[1, 2, 3]",
+            "[1, 2, 3]",
+        ),
+        (
+            "text-that-spells-no-document",
+            "<$.body>",
+            "a plain body, no document",
+            "a plain body, no document",
+        ),
+        (
+            // Standing where a JSON value stands, the payload carries its own bytes into
+            // the template's own JSON.
+            "the-whole-payload-inside-a-json-template",
+            r#"{"wrapped": <$.body>}"#,
+            r#"{"marker": "as-sent-7", "n": 2}"#,
+            r#"{"wrapped": {"marker": "as-sent-7", "n": 2}}"#,
+        ),
+        (
+            // The other half of the rule in the same template: the whole payload as sent,
+            // beside a path that descends into the document it spells.
+            "the-payload-as-sent-beside-a-path-into-it",
+            r#"{"raw": <$.body>, "marker": "<$.body.marker>"}"#,
+            r#"{"marker": "as-sent-8",  "n": 3}"#,
+            r#"{"raw": {"marker": "as-sent-8",  "n": 3}, "marker": "as-sent-8"}"#,
+        ),
+        (
+            // Standing as a JSON value, a payload that spells NO document is no JSON of
+            // its own: it is the string it is, quoted by the render, so the template's own
+            // JSON still spells JSON.
+            "a-payload-spelling-no-document-as-a-json-value",
+            r#"{"wrapped": <$.body>}"#,
+            "a plain body, no document",
+            r#"{"wrapped": "a plain body, no document"}"#,
+        ),
+        (
+            // Inside one of the template's string literals the template's quotes do the
+            // quoting, so the payload's characters are escaped for the literal they land in
+            // rather than spliced raw.
+            "a-payload-inside-a-string-literal-of-the-template",
+            r#"{"wrapped": "<$.body>"}"#,
+            "he said \"hi\"\nthen left",
+            r#"{"wrapped": "he said \"hi\"\nthen left"}"#,
+        ),
+        (
+            // A payload spelling a document inside a string literal is written as that
+            // document's own JSON, quotes and all — the literal the author opened is broken
+            // rather than the document escaped, which is the form rule of the template and
+            // not the payload's own bytes.
+            "a-json-document-payload-inside-a-string-literal",
+            r#"{"wrapped": "<$.body>"}"#,
+            r#"{"id": "literal-1"}"#,
+            r#"{"wrapped": "{"id":"literal-1"}"}"#,
+        ),
+    ];
+
+    for (case, template, body, expected) in rows {
+        let router = emulator();
+        let (source_url, source_arn) = given_queue(&router, &format!("{case}-src")).await;
+        let (target_url, target_arn) = given_queue(&router, &format!("{case}-tgt")).await;
+        let created = call(
+            &router,
+            "POST",
+            &format!("/v1/pipes/{case}"),
+            Some(json!({
+                "Source": source_arn,
+                "Target": target_arn,
+                "RoleArn": ROLE,
+                "DesiredState": "RUNNING",
+                "SourceParameters": source_parameters(&[]),
+                "TargetParameters": { "InputTemplate": template },
+            })),
+            REGION,
+        )
+        .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: CreatePipe answered {} {}",
+            created.status, created.body
+        );
+        send(&router, &source_url, case, body).await;
+
+        let delivered = collect_at_least(&router, &target_url, 1, BUDGET).await;
+        let first = delivered
+            .first()
+            .unwrap_or_else(|| panic!("case {case:?}: nothing was delivered"));
+        assert_eq!(
+            first, expected,
+            "case {case:?}: expected the target to receive {expected:?}, got {first:?}"
+        );
+    }
+}
+
+/// RULE: which call set the pipe RUNNING is nothing to what it MOVES — a record withheld
+/// while `UpdatePipe(DesiredState=STOPPED)` held the pipe is delivered, once
+/// `UpdatePipe(DesiredState=RUNNING)` resumes it, carrying the payload its producer sent,
+/// byte for byte.
+///
+/// `tests/all/pipe_desired_state.rs` spans the toggle itself (the batching parameters it
+/// runs under, the size of the backlog it withholds); what is new here is the PAYLOAD the
+/// resumed delivery carries.
+#[tokio::test]
+async fn a_record_withheld_by_a_desired_state_toggle_is_delivered_as_sent() {
+    let case = "withheld-payload-as-sent";
+    let router = emulator();
+    let (source_url, source_arn) = given_queue(&router, &format!("{case}-src")).await;
+    let (target_url, target_arn) = given_queue(&router, &format!("{case}-tgt")).await;
+    let created = call(
+        &router,
+        "POST",
+        &format!("/v1/pipes/{case}"),
+        Some(json!({
+            "Source": source_arn,
+            "Target": target_arn,
+            "RoleArn": ROLE,
+            "DesiredState": "RUNNING",
+            "SourceParameters": source_parameters(&[]),
+            "TargetParameters": { "InputTemplate": "<$.body>" },
+        })),
+        REGION,
+    )
+    .await;
+    assert_eq!(
+        created.status, 200,
+        "case {case:?}: CreatePipe answered {} {}",
+        created.status, created.body
+    );
+    let reported = wait_for_state(&router, case, RUNNING_STATE, BUDGET).await;
+    assert_eq!(
+        reported, RUNNING_STATE,
+        "case {case:?}: the pipe reports {reported}, so it polls nothing"
+    );
+
+    // The control: the pipe does move a record while it runs, with its payload as sent.
+    let control = r#"{"marker": "control", "n": 1.50}"#;
+    send(&router, &source_url, case, control).await;
+    let delivered = collect_at_least(&router, &target_url, 1, BUDGET).await;
+    assert_eq!(
+        delivered,
+        vec![control.to_string()],
+        "case {case:?}: expected the running pipe to deliver {control:?} as sent"
+    );
+
+    // Stopped through UpdatePipe's own DesiredState, which is how a client that declares
+    // the state rather than calling StopPipe toggles a pipe.
+    let stopped = update(
+        &router,
+        case,
+        json!({ "RoleArn": ROLE, "DesiredState": STOP_REQUESTED }),
+    )
+    .await;
+    assert_eq!(
+        stopped.status, 200,
+        "case {case:?}: UpdatePipe answered {} {}",
+        stopped.status, stopped.body
+    );
+    let reported = wait_for_state(&router, case, STOPPED_STATE, BUDGET).await;
+    assert_eq!(
+        reported, STOPPED_STATE,
+        "case {case:?}: the pipe reports CurrentState {reported} after the stop"
+    );
+
+    // Withheld: sent while the pipe rests STOPPED, so nothing is delivered and the record
+    // stays waiting on the source.
+    let withheld = "{\n  \"marker\": \"withheld\",\n  \"n\": 2\n}";
+    send(&router, &source_url, case, withheld).await;
+    let quiet = collect_during(&router, &target_url, QUIET).await;
+    assert!(
+        quiet.is_empty(),
+        "case {case:?}: a pipe stopped through UpdatePipe must deliver nothing, got {quiet:?}"
+    );
+
+    // And back: the backlog is delivered with the payload the producer sent.
+    let resumed = update(
+        &router,
+        case,
+        json!({ "RoleArn": ROLE, "DesiredState": RUN_REQUESTED }),
+    )
+    .await;
+    assert_eq!(
+        resumed.status, 200,
+        "case {case:?}: UpdatePipe answered {} {}",
+        resumed.status, resumed.body
+    );
+    let drained = collect_at_least(&router, &target_url, 1, BUDGET).await;
+    assert_eq!(
+        drained,
+        vec![withheld.to_string()],
+        "case {case:?}: expected the withheld record delivered as sent, got {drained:?}"
+    );
+    let held = wait_for_counted(&router, &source_url, &HELD_ATTRIBUTES, 0, BUDGET).await;
+    assert_eq!(
+        held, 0,
+        "case {case:?}: expected the drained backlog consumed, the source holds {held}"
     );
 }
 

@@ -1580,7 +1580,10 @@ fn target_payloads<'a>(
         let payload = match run.target_template.as_deref() {
             None => Payload::Event(event),
             Some(template) => {
-                Payload::Rendered(render_template(template, read.as_ref(), &variables)?)
+                // The render reads the record BOTH ways, so it is handed the envelope as
+                // sent rather than the path view: a placeholder selecting the payload
+                // member as a whole carries the producer's own bytes.
+                Payload::Rendered(render_template(template, event, &variables)?)
             }
         };
         payloads.push(Delivery::of(payload, read));
@@ -2834,9 +2837,7 @@ fn read_payload(event: &Value) -> (Option<PayloadReading>, Cow<'_, Value>) {
     // list, which is what a clause names fields inside and what a path descends into. A
     // payload spelling a bare scalar names nothing to descend into and is read as the text
     // it is, the same reading the event-source poller of a Lambda function takes.
-    let document = ::serde_json::from_str::<Value>(&payload)
-        .ok()
-        .filter(|payload| payload.is_object() || payload.is_array());
+    let document = parsed_document(&payload);
     let reading = PayloadReading {
         member,
         format: if document.is_some() {
@@ -2863,6 +2864,26 @@ fn read_payload(event: &Value) -> (Option<PayloadReading>, Cow<'_, Value>) {
         members.insert(member.to_string(), read_as);
     }
     (Some(reading), Cow::Owned(view))
+}
+
+/// The JSON DOCUMENT `payload` spells — an object or a list — or `None` when it spells
+/// none.
+///
+/// The ONE reading of that question in this module: [`read_payload`] decides a payload's
+/// [`BodyFormat`] by it, and the render of a placeholder standing where a JSON value stands
+/// asks it of the payload's own text ([`input_template`]), so the two cannot disagree about
+/// what a document is. A payload spelling a bare scalar spells no document: there is nothing
+/// in it to name.
+fn parsed_document(payload: &str) -> Option<Value> {
+    ::serde_json::from_str::<Value>(payload)
+        .ok()
+        .filter(|payload| payload.is_object() || payload.is_array())
+}
+
+/// Whether the text a record's payload travels as spells a JSON document
+/// ([`parsed_document`]).
+fn spells_a_document(payload: &str) -> bool {
+    parsed_document(payload).is_some()
 }
 
 /// Which member of `event` carries its payload and the text that payload spells, or `None`
@@ -3333,9 +3354,10 @@ fn target_body(event: &Value) -> String {
 /// Every event of `batch` rendered through `template`, or the batch itself when the
 /// stage carries no template.
 ///
-/// Each render reads the event through its PATHS ([`path_view`]), so a placeholder naming
-/// a member of a valid-JSON message body renders that member; a stage handed the batch
-/// itself is handed the envelopes with their bodies as sent.
+/// Each render reads the event BOTH ways ([`render_template`]): a placeholder naming a
+/// member of a valid-JSON message body renders that member, and one naming the body itself
+/// renders it as sent; a stage handed the batch itself is handed the envelopes with their
+/// bodies as sent.
 ///
 /// This is the ENRICHMENT's reading of a render: the batch handed to an enrichment is one
 /// JSON array holding what the template rendered for each event, so each render enters it
@@ -3351,7 +3373,7 @@ fn transformed(
     batch
         .iter()
         .map(|event| {
-            render_template(template, path_view(event).as_ref(), variables)
+            render_template(template, event, variables)
                 .map(|rendered| rendered.value().clone())
         })
         .collect()
@@ -4883,6 +4905,10 @@ mod tests {
     /// RULE: a template placeholder and a target parameter read the SAME record, so a
     /// path into a valid-JSON message body renders the member it names through either —
     /// and the render is the value itself, unquoted where the template does not quote it.
+    ///
+    /// The render is handed the envelope AS SENT, which is what [`render_template`] takes
+    /// (it reads the record both ways itself); the target parameter is resolved against the
+    /// path view, which is what its own reader takes.
     #[test]
     fn a_path_into_a_json_body_renders_the_member_it_names() {
         let event = json!({
@@ -4901,13 +4927,13 @@ mod tests {
                 json!({"order": "a-7", "n": 3}),
             ),
             (
-                "the-parsed-body-itself",
+                "the-body-itself",
                 "<$.body>",
                 json!({"id": "a-7", "count": 3, "group": "orders"}),
             ),
         ];
         for (case, template, expected) in rows {
-            let rendered = render_template(template, view.as_ref(), &pipe())
+            let rendered = render_template(template, &event, &pipe())
                 .unwrap_or_else(|error| panic!("case {case:?}: {error}"));
             assert_eq!(
                 rendered.value(),

@@ -41,6 +41,22 @@
 //! than the event being failed over a member it happens not to carry — and never a payload
 //! carrying the path itself.
 //!
+//! A record's PAYLOAD member (an Amazon SQS body, a Kinesis record's data) is the one value
+//! the record carries as TEXT the producer wrote, so the two readings of a record meet
+//! there: a path DESCENDING into it names a value of the document that text spells, while a
+//! placeholder selecting the member AS A WHOLE stands for the payload itself. Where the
+//! place that placeholder stands in takes the producer's own bytes, they are what the render
+//! carries, byte for byte ([`payload_as_sent`]) — a pipe whose template is that one
+//! placeholder hands the stage the payload unchanged rather than a serializer's rendering of
+//! the document it spells. Those places are the ones the form above already names: a
+//! template that is not JSON text, whose placeholders carry their value's own characters,
+//! and a placeholder standing where a JSON VALUE stands whose payload spells a document,
+//! which is the one form whose own text IS the JSON of that value. Everywhere else the
+//! payload is written like any other value of its type — inside a string literal the
+//! template's quotes do the quoting, so a payload spelling no document contributes its
+//! characters escaped for that literal — and a payload spelling no document standing as a
+//! JSON value is the string it is, quoted by the render.
+//!
 //! The template's own JSON, on the other hand, is the AUTHOR's to get right, and it is read
 //! at authoring time rather than at delivery time: a template that is JSON text but spells
 //! no JSON document even once each of its placeholders stands for a value is one no write
@@ -166,6 +182,12 @@ impl Rendered {
 
 /// `event` rendered through `template` for the pipe `pipe` describes — the substitution
 /// this module's docs state, or why the render failed.
+///
+/// `event` is the record envelope as the stage is handed it, PAYLOAD MEMBER AS SENT, because
+/// the render reads the record both ways and only this one carries the producer's own bytes:
+/// a path DESCENDING into the payload is resolved against the document the payload spells
+/// ([`path_view`]), while a placeholder selecting that payload AS A WHOLE stands for the
+/// payload itself ([`payload_as_sent`]).
 pub(super) fn render_template(
     template: &str,
     event: &Value,
@@ -189,15 +211,42 @@ pub(super) fn render_template(
     // the substitution happens to produce: a render that breaks the template's JSON is
     // still the bytes the template's author asked for.
     let structured = opens_a_json_document(template);
+    // The record read BOTH ways, each reading taken ONCE for the whole render however many
+    // placeholders the template carries. The payload AS THE PRODUCER SENT IT is read off the
+    // envelope itself, beside whether that text spells a document — the one question the
+    // place rule below asks of it, which depends on the payload alone and not on where a
+    // placeholder stands. The record as a PATH reads it — that member replaced by the
+    // document the payload spells — is built on first use, because a template whose
+    // placeholders all select the payload as a whole needs it not at all.
+    let as_sent = payload_as_read(event);
+    let payload_spells_a_document = as_sent
+        .as_ref()
+        .is_some_and(|(_, text)| spells_a_document(text));
+    let mut read: Option<Cow<'_, Value>> = None;
     let mut rendered = String::with_capacity(template.len());
     let mut taken = 0usize;
     for (span, placeholder) in &placeholders {
-        let stands_for = filled(placeholder, event, pipe, received_at)?;
-        let written = written(
-            stands_for.as_ref(),
-            structured,
-            structured && inside_a_json_string(template, span.start),
+        // WHERE this placeholder stands, which decides how whatever it stands for is
+        // written: inside one of the template's own string literals, or where a JSON value
+        // stands.
+        let in_string = structured && inside_a_json_string(template, span.start);
+        let as_sent_here = payload_as_sent(
+            placeholder,
+            as_sent.as_ref(),
+            PayloadPlace {
+                spells_a_document: payload_spells_a_document,
+                structured,
+                in_string,
+            },
         );
+        let written = match as_sent_here {
+            Some(payload) => payload.to_string(),
+            None => {
+                let read = read.get_or_insert_with(|| path_view(event));
+                let stands_for = filled(placeholder, read.as_ref(), pipe, received_at)?;
+                written(stands_for.as_ref(), structured, in_string)
+            }
+        };
         let before = &template[taken..span.start];
         // Checked BEFORE the text grows, so what the render holds never passes the bound
         // rather than passing it and being refused afterwards.
@@ -210,6 +259,69 @@ pub(super) fn render_template(
     within_the_payload_bound(rendered.len() + rest.len())?;
     rendered.push_str(rest);
     Ok(Rendered::of(rendered))
+}
+
+/// Where one placeholder stands, as far as the payload is concerned: whether the payload
+/// spells a JSON document, and the two facts about the PLACE the form rules turn on.
+///
+/// The document question is the payload's alone, so it is answered once per render and
+/// carried here rather than asked per placeholder: a template carries up to a thousand
+/// placeholders ([`MAX_TEMPLATE_BYTES`]) and the payload is as large as the record its source
+/// admits, so asking it per placeholder would multiply one parse by the other.
+#[derive(Debug, Clone, Copy)]
+struct PayloadPlace {
+    /// Whether the payload's own text spells a JSON document ([`spells_a_document`]).
+    spells_a_document: bool,
+    /// Whether the template's own JSON is kept.
+    structured: bool,
+    /// Whether this placeholder stands inside one of that JSON's string literals.
+    in_string: bool,
+}
+
+/// The record's payload AS THE PRODUCER SENT IT when `placeholder` selects the payload
+/// member as a WHOLE and the place it stands in takes the producer's own bytes, and `None`
+/// for every other placeholder and every other place.
+///
+/// A record's payload travels as text — an Amazon SQS body as the text its producer sent, a
+/// Kinesis record's data as the base64 of the bytes it put — and that text is what the
+/// record carries: a placeholder naming the member itself therefore contributes those bytes,
+/// not a serializer's rendering of the document they spell, so a pipe whose template is that
+/// one placeholder hands the stage the payload unchanged. A placeholder that descends INTO
+/// the payload (`$.body.id`) names a value of the document the text spells instead, and is
+/// read from [`path_view`] like any other path.
+///
+/// Which paths select the member itself is decided by the path's own SEGMENTS
+/// (`service_common::json_reference_path`), so every spelling of that one segment (`$.body`,
+/// `$['body']`) is the same selection, and nothing longer is. It is decided FIRST, so a
+/// placeholder naming anything else costs this nothing but its own path's segments.
+///
+/// WHERE such a placeholder stands decides whether the producer's bytes are what stands
+/// there, under the form rules of this module's docs: in a template that is not JSON text
+/// every placeholder carries its value's own characters, so they are; standing where a JSON
+/// VALUE stands they are only when the payload spells a document, whose own text IS the JSON
+/// of that value; and inside one of the template's string literals they never are, because
+/// the template's quotes are what quote the value and a string's characters have to be
+/// escaped for the literal they land in. Every place this answers `None` for falls through to
+/// [`written`], which writes the payload as the value its type makes it.
+fn payload_as_sent<'a>(
+    placeholder: &Placeholder,
+    as_sent: Option<&'a (&'static str, Cow<'_, str>)>,
+    place: PayloadPlace,
+) -> Option<&'a str> {
+    let Placeholder::Path(path) = placeholder else {
+        return None;
+    };
+    let (member, text) = as_sent?;
+    let segments = ::service_common::json_reference_path::segments(path)?;
+    if segments != [::service_common::json_reference_path::Segment::Key((*member).to_string())] {
+        return None;
+    }
+    let place_takes_the_bytes = match (place.structured, place.in_string) {
+        (false, _) => true,
+        (true, true) => false,
+        (true, false) => place.spells_a_document,
+    };
+    place_takes_the_bytes.then_some(text.as_ref())
 }
 
 /// Whether a render of `bytes` is one this emulator delivers, or why it is not.
