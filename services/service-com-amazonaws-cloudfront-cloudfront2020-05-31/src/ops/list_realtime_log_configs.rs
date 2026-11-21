@@ -188,7 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // one (`InvalidArgument`). A name that could be one but names no stored
         // configuration is a configuration that does not exist, which is the resource this
         // listing is about and the reason it models `NoSuchRealtimeLogConfig`.
-        if let Some(marker) = input.marker.as_deref() {
+        if let Some(marker) = crate::state::resume_marker(input.marker.as_deref()) {
             if marker.is_empty() {
                 return Err(ListRealtimeLogConfigsErrorModeled::InvalidArgument(
                     crate::state::invalid_realtime_log_config_marker(),
@@ -207,7 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // response includes real-time log configurations in the list that occur after the
         // marker" — and walking the pages enumerates every configuration exactly once. The
         // store is ordered by name, so the resume point is a range bound rather than a scan.
-        let start = match input.marker.as_deref() {
+        let start = match crate::state::resume_marker(input.marker.as_deref()) {
             Some(marker) => Bound::Excluded(marker),
             None => Bound::Unbounded,
         };

@@ -178,7 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `Id` carries no pattern — so no value is outside it: a marker no stored list
         // carries is still a position in the one id order, and the page after it is served
         // rather than refused.
-        let start = match input.marker.as_deref() {
+        let start = match crate::state::resume_marker(input.marker.as_deref()) {
             Some(marker) => Bound::Excluded(marker),
             None => Bound::Unbounded,
         };

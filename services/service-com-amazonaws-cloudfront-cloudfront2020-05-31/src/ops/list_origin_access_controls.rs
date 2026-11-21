@@ -176,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // NextMarker from the current page's response": the marker is a resume point this
         // service handed out — an origin access control id — so a value outside that
         // shape was never one.
-        if let Some(marker) = input.marker.as_deref() {
+        if let Some(marker) = crate::state::resume_marker(input.marker.as_deref()) {
             if !crate::state::is_origin_access_control_id(marker) {
                 return Err(ListOriginAccessControlsErrorModeled::InvalidArgument(
                     InvalidArgument {
@@ -196,7 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `Marker` names where the previous page ENDED, so this page starts after it:
         // walking the pages enumerates every control exactly once. The store is ordered
         // by id, so the resume point is a range bound rather than a scan.
-        let start = match input.marker.as_deref() {
+        let start = match crate::state::resume_marker(input.marker.as_deref()) {
             Some(marker) => Bound::Excluded(marker),
             None => Bound::Unbounded,
         };

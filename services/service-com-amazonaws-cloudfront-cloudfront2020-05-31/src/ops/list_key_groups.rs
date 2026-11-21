@@ -166,7 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resume point this service handed out — a key group id — so a value outside that
         // shape was never one, and an unusable argument is the one refusal this listing
         // models.
-        if let Some(marker) = input.marker.as_deref() {
+        if let Some(marker) = crate::state::resume_marker(input.marker.as_deref()) {
             if !crate::state::is_key_group_id(marker) {
                 return Err(ListKeyGroupsErrorModeled::InvalidArgument(
                     crate::state::invalid_key_group_marker(),
@@ -183,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "the response includes key groups in the list that occur after the marker" — and
         // walking the pages enumerates every group exactly once. The store is ordered by
         // id, so the resume point is a range bound rather than a scan.
-        let start = match input.marker.as_deref() {
+        let start = match crate::state::resume_marker(input.marker.as_deref()) {
             Some(marker) => Bound::Excluded(marker),
             None => Bound::Unbounded,
         };

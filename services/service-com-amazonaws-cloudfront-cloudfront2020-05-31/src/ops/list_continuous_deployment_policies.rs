@@ -176,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not one was never a resume point (`InvalidArgument`), and one that is but names
         // no stored policy is a policy that does not exist — the only resource this
         // listing can be about, and the reason it models `NoSuchContinuousDeploymentPolicy`.
-        if let Some(marker) = input.marker.as_deref() {
+        if let Some(marker) = crate::state::resume_marker(input.marker.as_deref()) {
             if !crate::state::is_minted_uuid(marker) {
                 return Err(ListContinuousDeploymentPoliciesErrorModeled::InvalidArgument(
                     InvalidArgument {
@@ -200,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `Marker` names where the previous page ENDED, so this page starts after it:
         // walking the pages enumerates every policy exactly once. The store is ordered by
         // id, so the resume point is a range bound rather than a scan.
-        let start = match input.marker.as_deref() {
+        let start = match crate::state::resume_marker(input.marker.as_deref()) {
             Some(marker) => Bound::Excluded(marker),
             None => Bound::Unbounded,
         };

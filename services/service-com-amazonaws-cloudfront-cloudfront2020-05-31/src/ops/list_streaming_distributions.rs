@@ -159,7 +159,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // listing your RTMP distributions where they left off" — the marker is a resume
         // point this service handed out, a streaming distribution id, so a value outside
         // that shape was never one.
-        if let Some(marker) = input.marker.as_deref() {
+        if let Some(marker) = crate::state::resume_marker(input.marker.as_deref()) {
             if !crate::state::is_streaming_distribution_id(marker) {
                 return Err(ListStreamingDistributionsErrorModeled::InvalidArgument(
                     crate::state::invalid_streaming_distribution_marker(),
@@ -178,7 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `Marker` names where the previous page ENDED, so this page starts after it, and
         // walking the pages enumerates every streaming distribution exactly once. The
         // store is ordered by id, so the resume point is a range bound rather than a scan.
-        let start = match input.marker.as_deref() {
+        let start = match crate::state::resume_marker(input.marker.as_deref()) {
             Some(marker) => Bound::Excluded(marker),
             None => Bound::Unbounded,
         };

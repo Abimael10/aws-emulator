@@ -32,7 +32,7 @@
 
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
     MAX_ITEMS, MAX_ITEMS_INVALID_MESSAGE, MAX_ITEMS_REALTIME_LOG_CONFIGS,
-    NO_SUCH_REALTIME_LOG_CONFIG_MESSAGE, REALTIME_LOG_CONFIG_MARKER_INVALID_MESSAGE,
+    NO_SUCH_REALTIME_LOG_CONFIG_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -403,24 +403,20 @@ async fn an_unusable_page_size_or_marker_is_refused() {
         );
     }
 
-    // A configuration is identified by a name that is never empty, so an empty marker is no
-    // resume point at all rather than a name the store holds nothing under.
+    // An EMPTY marker names no resume point at all — there is no name to resume after — so
+    // the listing serves the FIRST page, which is the answer a request carrying no `Marker`
+    // gets (`crate::listing_marker_first_page` holds every listing of this service to that
+    // rule).
     let empty = list_configs(&router, "?Marker=").await;
     assert_eq!(
-        empty.status, 400,
-        "case an empty marker: expected HTTP 400, got {} with {}",
+        empty.status, 200,
+        "case an empty marker: expected the first page, got {} with {}",
         empty.status, empty.raw
     );
     assert_eq!(
-        empty.error_code(),
-        "InvalidArgument",
-        "case an empty marker: expected InvalidArgument, got {}",
-        empty.raw
-    );
-    assert_eq!(
-        empty.root().find_text("Message").unwrap_or_default(),
-        REALTIME_LOG_CONFIG_MARKER_INVALID_MESSAGE,
-        "case an empty marker: expected the marker constraint stated, got {}",
+        listed_names(empty.root()),
+        before,
+        "case an empty marker: expected the page a listing with no Marker serves, got {}",
         empty.raw
     );
 

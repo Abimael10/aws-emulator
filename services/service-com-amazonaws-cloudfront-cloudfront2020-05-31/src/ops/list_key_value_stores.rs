@@ -178,9 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the store does not hold is still a position in the one name order, so a page
         // resumes after it: this listing models no not-found refusal. Refused BEFORE the
         // store is reached, as the sibling listings refuse their own markers.
-        if input
-            .marker
-            .as_deref()
+        if crate::state::resume_marker(input.marker.as_deref())
             .is_some_and(|marker| !crate::state::is_key_value_store_name(marker))
         {
             return Err(ListKeyValueStoresErrorModeled::InvalidArgument(
@@ -198,7 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `Marker` names where the previous page ENDED, so this page starts after it. The
         // records are held under their names, so the resume point is a range bound rather
         // than a scan.
-        let start = match input.marker.as_deref() {
+        let start = match crate::state::resume_marker(input.marker.as_deref()) {
             Some(marker) => Bound::Excluded(marker),
             None => Bound::Unbounded,
         };

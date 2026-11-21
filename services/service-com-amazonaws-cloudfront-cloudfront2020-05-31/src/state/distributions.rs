@@ -120,6 +120,24 @@ pub struct CachedEdgeResponse {
     pub expires_at: SystemTime,
 }
 
+impl CachedEdgeResponse {
+    /// Whether the origin answer held here listed `tag` among the cache tags it stated in
+    /// `header` — the header `CacheTagConfig` names, lowercased as this entry holds the
+    /// origin's header names.
+    ///
+    /// "CloudFront reads the specified header from origin responses, parses the
+    /// comma-separated tag values, and stores them with the cached object": the tags are read
+    /// from the origin's OWN answer, which this entry holds whole, so an invalidation by tag
+    /// removes exactly the objects the origin tagged.
+    pub fn carries_cache_tag(&self, header: &str, tag: &str) -> bool {
+        self.headers
+            .iter()
+            .filter(|(name, _)| name == header)
+            .flat_map(|(_, value)| cache_tags_of_header_value(value))
+            .any(|listed| listed == tag)
+    }
+}
+
 /// How many cached responses one distribution's edge holds at once.
 ///
 /// A real edge cache is bounded by the storage of an edge location; this emulator holds
@@ -549,10 +567,28 @@ impl StoredDistribution {
             self.edge_cache.clear();
             return;
         }
+        // The header CloudFront extracts this distribution's cache tags from, where its
+        // configuration names one — read BEFORE the cache is walked, both because the walk
+        // borrows the cache and because every entry is matched against the one header the
+        // distribution is configured with. Lowercased, as a cached entry holds the origin's
+        // header names.
+        let tag_header = self
+            .config
+            .cache_tag_config
+            .as_ref()
+            .map(|config| config.header_name.to_lowercase());
         self.edge_cache.retain(|_, entry| {
-            !paths
-                .iter()
-                .any(|path| matches_path_pattern(path, &entry.path))
+            !paths.iter().any(|path| match cache_tag_of_item(path) {
+                // A cache TAG names every cached object the origin tagged with it, whatever
+                // path it was fetched under: "CloudFront reads the specified header from
+                // origin responses, parses the comma-separated tag values, and stores them
+                // with the cached object", so the tags one entry carries are the ones its
+                // own origin answer listed.
+                Some(tag) => tag_header
+                    .as_deref()
+                    .is_some_and(|header| entry.carries_cache_tag(header, tag)),
+                None => matches_path_pattern(path, &entry.path),
+            })
         });
     }
 

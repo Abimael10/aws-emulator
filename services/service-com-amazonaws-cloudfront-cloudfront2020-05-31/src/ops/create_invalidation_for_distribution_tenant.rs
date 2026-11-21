@@ -197,6 +197,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // "The value of Quantity and the size of Items don't match." A property of the
+        // REQUEST DOCUMENT alone — the batch's own `Paths` wrapper states a length beside the
+        // list it carries — so it is answered BEFORE the tenant the batch names is resolved,
+        // exactly as the distribution's own invalidation path answers it: a caller whose
+        // document disagrees with itself is told what to fix in it rather than sent looking
+        // for a resource that is beside the point.
+        if let Some(message) = crate::state::batch_quantity_mismatch(&input.invalidation_batch) {
+            return Err(
+                CreateInvalidationForDistributionTenantErrorModeled::InconsistentQuantities(
+                    InconsistentQuantities {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // "The ID of the distribution tenant": an invalidation is created under a tenant
         // this store holds, and the record it is stored on is the one every later read of
         // that tenant's invalidations answers from.
@@ -209,18 +226,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let tenant_id = tenant.id.clone();
-
-        // "The value of Quantity and the size of Items don't match."
-        if let Some(message) = crate::state::batch_quantity_mismatch(&input.invalidation_batch) {
-            return Err(
-                CreateInvalidationForDistributionTenantErrorModeled::InconsistentQuantities(
-                    InconsistentQuantities {
-                        message: Some(message),
-                    },
-                )
-                .into(),
-            );
-        }
+        // Whether the objects this tenant serves are cached under cache tags is the
+        // MULTI-TENANT DISTRIBUTION's own configuration: a tenant serves that distribution's
+        // behaviours, so the `CacheTagConfig` that has CloudFront extract tags from its
+        // origin responses is read from the distribution the tenant was created under.
+        let extracts_cache_tags = store
+            .distribution(&tenant.distribution_id)
+            .is_some_and(|distribution| crate::state::extracts_cache_tags(&distribution.config));
 
         // "Processing your request will cause you to exceed the maximum number of in-progress
         // invalidations." What CloudFront's invalidation quota bounds is the objects one
@@ -248,8 +260,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The path is relative to the distribution and must begin with a slash", and the
         // characters a URI path cannot carry unescaped have to be URL-encoded: the SAME rule
         // the distribution's own invalidation path applies, since a tenant's batch names
-        // objects the same way.
-        if crate::state::batch_names_invalid_path(&input.invalidation_batch) {
+        // objects the same way — including the cache TAG an item names where the
+        // distribution behind the tenant extracts tags from its origin responses.
+        if crate::state::batch_names_invalid_path(&input.invalidation_batch, extracts_cache_tags) {
             return Err(
                 CreateInvalidationForDistributionTenantErrorModeled::InvalidArgument(
                     crate::state::invalid_invalidation_paths(),

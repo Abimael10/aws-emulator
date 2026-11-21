@@ -583,14 +583,12 @@ async fn an_unusable_page_size_or_marker_is_refused() {
     }
 
     // Rows: a marker one character past the name length bound, one drawing from a
-    // character the name pattern excludes, one carrying a character class the pattern
-    // excludes entirely, and the empty marker — none of them a resume point this listing
-    // ever handed out.
+    // character the name pattern excludes, and one carrying a character class the pattern
+    // excludes entirely — none of them a resume point this listing ever handed out.
     let markers = [
         "x".repeat(MAX_KEY_VALUE_STORE_NAME + 1),
         "orders.by.region".to_string(),
         "store:1".to_string(),
-        String::new(),
     ];
     for marker in markers {
         let answer = list_stores(&router, &format!("?Marker={marker}")).await;
@@ -612,6 +610,22 @@ async fn an_unusable_page_size_or_marker_is_refused() {
             answer.raw
         );
     }
+
+    // The EMPTY marker is no such value: there is no name to resume after, so it names the
+    // FIRST page, which is what a request carrying no `Marker` is answered with
+    // (`crate::listing_marker_first_page` holds every listing of this service to that rule).
+    let empty = list_stores(&router, "?Marker=").await;
+    assert_eq!(
+        empty.status, 200,
+        "case the empty marker: expected the first page, got {} with {}",
+        empty.status, empty.raw
+    );
+    assert_eq!(
+        page_names(&empty),
+        order,
+        "case the empty marker: expected the page a listing with no Marker serves, got {}",
+        empty.raw
+    );
 
     let listed = list_stores(&router, "").await;
     assert_eq!(

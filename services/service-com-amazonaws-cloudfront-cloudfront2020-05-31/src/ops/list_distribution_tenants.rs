@@ -232,7 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // at: a value that is not one was never a resume point this service handed out
         // (`InvalidArgument`), and one that is but names no stored tenant names no entity,
         // which is what this listing's `EntityNotFound` is about.
-        if let Some(marker) = input.marker.as_deref() {
+        if let Some(marker) = crate::state::resume_marker(input.marker.as_deref()) {
             if !crate::state::is_distribution_tenant_id(marker) {
                 return Err(ListDistributionTenantsErrorModeled::InvalidArgument(
                     InvalidArgument {
@@ -255,7 +255,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // walking the pages enumerates every tenant that passes the filter exactly once. The
         // store is ordered by tenant id, so the resume point is a range bound rather than a
         // scan.
-        let start = match input.marker.as_deref() {
+        let start = match crate::state::resume_marker(input.marker.as_deref()) {
             Some(marker) => Bound::Excluded(marker),
             None => Bound::Unbounded,
         };

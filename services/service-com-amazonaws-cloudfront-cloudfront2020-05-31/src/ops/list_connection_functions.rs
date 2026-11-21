@@ -185,7 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // well-shaped id naming no stored connection function IS still a resume point — the
         // page after it is whatever the store holds beyond it — so it lists rather than
         // refuses.
-        if let Some(marker) = input.marker.as_deref() {
+        if let Some(marker) = crate::state::resume_marker(input.marker.as_deref()) {
             if !crate::state::is_connection_function_id(marker) {
                 return Err(ListConnectionFunctionsErrorModeled::InvalidArgument(
                     InvalidArgument {
@@ -203,7 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // pages enumerates every connection function of the stage exactly once. A connection
         // function is held under its id, which is what the store is ordered by, so the resume
         // point is a range bound rather than a scan.
-        let start = match input.marker.as_deref() {
+        let start = match crate::state::resume_marker(input.marker.as_deref()) {
             Some(marker) => Bound::Excluded(marker),
             None => Bound::Unbounded,
         };

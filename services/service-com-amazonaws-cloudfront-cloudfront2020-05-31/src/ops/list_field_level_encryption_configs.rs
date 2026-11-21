@@ -166,7 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // from the current page's response (which is also the ID of the last configuration on
         // that page)": the marker is a resume point this service handed out — a field-level
         // encryption configuration id — so a value outside that shape was never one.
-        if let Some(marker) = input.marker.as_deref() {
+        if let Some(marker) = crate::state::resume_marker(input.marker.as_deref()) {
             if !crate::state::is_field_level_encryption_config_id(marker) {
                 return Err(ListFieldLevelEncryptionConfigsErrorModeled::InvalidArgument(
                     crate::state::invalid_field_level_encryption_config_marker(),
@@ -183,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // results include configurations in the list that occur after the marker" — and
         // walking the pages enumerates every configuration exactly once. The store is ordered
         // by id, so the resume point is a range bound rather than a scan.
-        let start = match input.marker.as_deref() {
+        let start = match crate::state::resume_marker(input.marker.as_deref()) {
             Some(marker) => Bound::Excluded(marker),
             None => Bound::Unbounded,
         };

@@ -731,39 +731,74 @@ pub fn config_limit_exceeded(config: &DistributionConfig) -> Option<ConfigLimit>
         .as_ref()
         .map_or(0, |behaviors| items_len(&behaviors.items));
     if behaviors > MAX_CACHE_BEHAVIORS {
-        return Some(ConfigLimit::CacheBehaviors(format!(
-            "This distribution states {behaviors} cache behaviors; at most \
-             {MAX_CACHE_BEHAVIORS} are allowed per distribution"
-        )));
+        return Some(ConfigLimit::CacheBehaviors(
+            TOO_MANY_CACHE_BEHAVIORS_MESSAGE.to_string(),
+        ));
     }
 
     let lists = behavior_views(config);
-    let signers: usize = lists
-        .iter()
-        .filter_map(|behavior| behavior.trusted_signers)
-        .map(|signers| items_len(&signers.items))
-        .sum();
-    if signers > MAX_TRUSTED_SIGNERS {
-        return Some(ConfigLimit::TrustedSigners(format!(
-            "This distribution states {signers} trusted signers; at most \
-             {MAX_TRUSTED_SIGNERS} are allowed per distribution"
-        )));
+    // ASSOCIATED, not referenced: a trusted signer and a trusted key group are each
+    // associated WITH THE DISTRIBUTION, and a behaviour names one by id — so the same account
+    // or the same group named by several behaviours is one association, counted once, which
+    // is also the set the distribution reports as active
+    // ([`StoredDistribution::active_trusted_signers`],
+    // [`StoredDistribution::active_trusted_key_groups`], both built with [`first_seen`]).
+    // Counting references instead would refuse the ordinary signed-URL configuration, where
+    // every behaviour trusts the one key group.
+    let signers = first_seen(
+        lists
+            .iter()
+            .filter_map(|behavior| behavior.trusted_signers)
+            .flat_map(|signers| signers.items.as_deref().unwrap_or_default()),
+    );
+    if signers.len() > MAX_TRUSTED_SIGNERS {
+        return Some(ConfigLimit::TrustedSigners(
+            TOO_MANY_TRUSTED_SIGNERS_MESSAGE.to_string(),
+        ));
     }
 
-    let key_groups: usize = lists
-        .iter()
-        .filter_map(|behavior| behavior.trusted_key_groups)
-        .map(|groups| items_len(&groups.items))
-        .sum();
-    if key_groups > MAX_TRUSTED_KEY_GROUPS {
-        return Some(ConfigLimit::TrustedKeyGroups(format!(
-            "This distribution references {key_groups} key groups; at most \
-             {MAX_TRUSTED_KEY_GROUPS} are allowed per distribution"
-        )));
+    let key_groups = first_seen(
+        lists
+            .iter()
+            .filter_map(|behavior| behavior.trusted_key_groups)
+            .flat_map(|groups| groups.items.as_deref().unwrap_or_default()),
+    );
+    if key_groups.len() > MAX_TRUSTED_KEY_GROUPS {
+        return Some(ConfigLimit::TrustedKeyGroups(
+            TOO_MANY_KEY_GROUPS_ASSOCIATED_MESSAGE.to_string(),
+        ));
     }
 
     None
 }
+
+/// The sentence CloudFront refuses a configuration stating more cache behaviours than the
+/// distribution quota admits with, on the wire.
+///
+/// FIXED text, naming the MEMBER whose count broke the quota: the condition is a property of
+/// that member of the request rather than of any count in it, so neither the number submitted
+/// nor the quota itself belongs in it — which is how the recorded service words this refusal.
+pub const TOO_MANY_CACHE_BEHAVIORS_MESSAGE: &str =
+    "Your request contains more CacheBehaviors than are allowed per distribution.";
+
+/// The sentence CloudFront refuses a configuration associating more trusted signers with the
+/// distribution than the quota admits with — the modelled `TooManyTrustedSigners`, worded as
+/// the model documents that error shape ("Your request contains more trusted signers than are
+/// allowed per distribution.") and fixed for the reason
+/// [`TOO_MANY_CACHE_BEHAVIORS_MESSAGE`] is.
+pub const TOO_MANY_TRUSTED_SIGNERS_MESSAGE: &str =
+    "Your request contains more trusted signers than are allowed per distribution.";
+
+/// The sentence CloudFront refuses a configuration associating more key groups with the
+/// distribution than the quota admits with — the modelled
+/// `TooManyKeyGroupsAssociatedToDistribution`, worded as the model documents that error shape
+/// ("The number of key groups referenced by this distribution is more than the maximum
+/// allowed.") and fixed for the reason [`TOO_MANY_CACHE_BEHAVIORS_MESSAGE`] is.
+///
+/// NOT [`TOO_MANY_KEY_GROUPS_MESSAGE`], which is the ACCOUNT's own key-group quota.
+pub const TOO_MANY_KEY_GROUPS_ASSOCIATED_MESSAGE: &str =
+    "The number of key groups referenced by this distribution is more than the maximum \
+     allowed.";
 
 /// Every cache behaviour of `config` as the view that names the list wrappers they share:
 /// the default cache behaviour first, then the ordered ones.
@@ -1553,6 +1588,49 @@ pub fn is_invalidation_path(path: &str) -> bool {
     true
 }
 
+/// What an invalidation item carries instead of a path when it names a CACHE TAG rather than
+/// an object: the one character that tells the two apart, which is why it is no part of a
+/// path ([`UNSAFE_PATH_CHARACTERS`]).
+pub const CACHE_TAG_PREFIX: char = '#';
+
+/// Whether `item` of an invalidation batch names a cache TAG.
+///
+/// `CacheTagConfig` is "the HTTP header name from which CloudFront extracts cache tags from
+/// origin responses … You can then invalidate cached objects by tag using the
+/// `CreateInvalidation` API", and the header "value must contain comma-separated tag values
+/// (for example, `product:electronics, category:tv, brand:example`)" — so a tag is one entry
+/// of that list: a non-empty value carrying neither the comma that separates two tags nor
+/// whitespace, which the header's own spelling of a tag cannot carry either. An item naming
+/// one opens with [`CACHE_TAG_PREFIX`], the one character an object path cannot carry.
+pub fn is_cache_tag_item(item: &str) -> bool {
+    let Some(tag) = item.strip_prefix(CACHE_TAG_PREFIX) else {
+        return false;
+    };
+    !tag.is_empty()
+        && !tag.contains(',')
+        && !tag.contains(CACHE_TAG_PREFIX)
+        && !tag.chars().any(char::is_whitespace)
+}
+
+/// The cache tag an invalidation item names, or `None` when it names an object path.
+///
+/// The tag itself, without the [`CACHE_TAG_PREFIX`] the item carries it under, so it compares
+/// against the tags an origin response listed ([`cache_tags_of_header_value`]) as the same
+/// value.
+pub fn cache_tag_of_item(item: &str) -> Option<&str> {
+    is_cache_tag_item(item).then(|| item.trim_start_matches(CACHE_TAG_PREFIX))
+}
+
+/// The cache tags one origin response listed in the header `CacheTagConfig` names: "the
+/// header value must contain comma-separated tag values", so each entry is one tag, with the
+/// whitespace that may follow a comma trimmed off.
+pub fn cache_tags_of_header_value(value: &str) -> impl Iterator<Item = &str> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+}
+
 /// The characters an invalidation path cannot carry unescaped: the ones RFC 1738 calls
 /// unsafe in a URL, which CloudFront's own documentation requires URL-ENCODED. The `%` it
 /// also lists is admitted by [`is_invalidation_path`] only as the start of an escape.
@@ -1560,12 +1638,29 @@ pub(super) const UNSAFE_PATH_CHARACTERS: &[char] =
     &[' ', '"', '<', '>', '#', '{', '}', '|', '\\', '^', '[', ']', '`'];
 
 /// Whether an invalidation batch names no object to invalidate: one carrying a value that is
-/// no invalidation path ([`is_invalidation_path`]), or none at all — a batch IS the set of
-/// objects the invalidation removes from the caches, so an empty one describes no
-/// invalidation.
-pub fn batch_names_invalid_path(batch: &InvalidationBatch) -> bool {
+/// neither an invalidation path ([`is_invalidation_path`]) nor, where the resource extracts
+/// cache tags from its origin responses, a cache tag ([`is_cache_tag_item`]) — or none at
+/// all, since a batch IS the set of objects the invalidation removes from the caches, so an
+/// empty one describes no invalidation.
+///
+/// `extracts_cache_tags` is whether the distribution the batch is submitted against carries
+/// a `CacheTagConfig`: tag-based invalidation is what adding that member buys ("You can then
+/// invalidate cached objects by tag using the `CreateInvalidation` API"), so on a
+/// distribution that extracts no tags from its origin responses there is no tag for such an
+/// item to name.
+pub fn batch_names_invalid_path(batch: &InvalidationBatch, extracts_cache_tags: bool) -> bool {
     let paths = batch.paths.items.as_deref().unwrap_or_default();
-    paths.is_empty() || paths.iter().any(|path| !is_invalidation_path(path))
+    paths.is_empty()
+        || paths.iter().any(|path| {
+            !is_invalidation_path(path) && !(extracts_cache_tags && is_cache_tag_item(path))
+        })
+}
+
+/// Whether `config` has CloudFront extract cache tags from its origin responses — the
+/// `CacheTagConfig` member, "the HTTP header name from which CloudFront extracts cache tags
+/// from origin responses".
+pub fn extracts_cache_tags(config: &DistributionConfig) -> bool {
+    config.cache_tag_config.is_some()
 }
 
 /// The sentence CloudFront refuses a batch naming a path it cannot invalidate with, on the

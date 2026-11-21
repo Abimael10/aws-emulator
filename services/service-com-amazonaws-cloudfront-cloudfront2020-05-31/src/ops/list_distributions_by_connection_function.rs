@@ -169,7 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The response includes items in the list that occur after the marker" — the
         // marker is the distribution id the previous page ended at, so a value that is not
         // a distribution id was never a resume point this service handed out.
-        if let Some(marker) = input.marker.as_deref() {
+        if let Some(marker) = crate::state::resume_marker(input.marker.as_deref()) {
             if !crate::state::is_distribution_id(marker) {
                 return Err(ListDistributionsByConnectionFunctionErrorModeled::InvalidArgument(
                     InvalidArgument {
@@ -206,7 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(ListDistributionsByConnectionFunctionOutput {
             distribution_list: Some(crate::state::distribution_page(
                 &store.distributions,
-                input.marker.as_deref(),
+                crate::state::resume_marker(input.marker.as_deref()),
                 max_items,
                 page_size,
                 |stored| {

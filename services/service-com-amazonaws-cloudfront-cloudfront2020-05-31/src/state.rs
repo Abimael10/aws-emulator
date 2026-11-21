@@ -256,6 +256,23 @@ pub fn page_size(max_items: Option<i32>) -> Option<usize> {
     page_size_at(max_items, MAX_ITEMS)
 }
 
+/// The resume point a listing's `Marker` names, or `None` when the request names none.
+///
+/// A `Marker` is "where to begin in your list" — the identifier the previous page ended at —
+/// so a request that carries NO marker, and one that carries the EMPTY value, both ask for
+/// the FIRST page: there is no identifier to resume after. Every listing of this service
+/// echoes the marker it was given back as `Marker` ("the value you provided for the Marker
+/// request parameter"), and the value it echoes for a first page is the empty string, so the
+/// empty value is a marker this service itself hands out and a client that pages by echoing
+/// it is paging with a resume point rather than with a value this service never issued.
+///
+/// This is the ONE place a listing of this service reads that parameter, so the shape check a
+/// handler makes of a marker and the range bound its page walk starts from can never
+/// disagree about which requests name a resume point at all.
+pub fn resume_marker(marker: Option<&str>) -> Option<&str> {
+    marker.filter(|marker| !marker.is_empty())
+}
+
 /// The number of items one page of a listing whose own default page size is `default`
 /// serves: the `MaxItems` the request named, or `default` when it named none, bounded above
 /// by that same default — the default and the ceiling are one number per listing, so the
@@ -515,13 +532,19 @@ pub const MAX_INVALIDATIONS_PER_DISTRIBUTION: usize = 1_000;
 
 /// The most ordered cache behaviours ONE distribution's configuration may state.
 ///
-/// CloudFront's published quota is 25 cache behaviours per distribution (the Amazon
-/// CloudFront Developer Guide's "Quotas", general quotas on distributions). It is also
-/// what bounds the per-request work a stored configuration costs: every `Distribution`
-/// payload walks the default cache behaviour and each ordered one, so a configuration
-/// cannot be stored with an unbounded number of them. Over it, the refusal is the modelled
-/// `TooManyCacheBehaviors`: "You cannot create more cache behaviors for the distribution."
-pub const MAX_CACHE_BEHAVIORS: usize = 25;
+/// CloudFront's cache-behaviour quota is stated per DISTRIBUTION and counts every cache
+/// behaviour the distribution carries, the DEFAULT one included — so what the ordered
+/// `CacheBehaviors` list may state is that ceiling less the one default behaviour every
+/// configuration carries. The recorded service creates a distribution whose list states this
+/// many behaviours and refuses one stating one more, which is where this number comes from;
+/// the message it refuses with names the member rather than the count
+/// ([`TOO_MANY_CACHE_BEHAVIORS_MESSAGE`]).
+///
+/// It is also what bounds the per-request work a stored configuration costs: every
+/// `Distribution` payload walks the default cache behaviour and each ordered one, so a
+/// configuration cannot be stored with an unbounded number of them. Over it, the refusal is
+/// the modelled `TooManyCacheBehaviors`.
+pub const MAX_CACHE_BEHAVIORS: usize = 74;
 
 /// The most alternate domain names (CNAMEs) ONE distribution's configuration may state.
 ///
@@ -532,20 +555,26 @@ pub const MAX_CACHE_BEHAVIORS: usize = 25;
 /// allowed per distribution."
 pub const MAX_DISTRIBUTION_CNAMES: usize = 100;
 
-/// The most trusted signers ONE distribution's configuration may state, counted across
-/// its cache behaviours.
+/// The most trusted signers ONE distribution may be associated with, counted as the DISTINCT
+/// accounts its cache behaviours name.
 ///
 /// CloudFront's published quota is 5 trusted signers (Amazon Web Services accounts) for a
 /// distribution, and the modelled refusal is per distribution too: "Your request contains
-/// more trusted signers than are allowed per distribution."
+/// more trusted signers than are allowed per distribution." An account several behaviours
+/// name is ONE signer associated with the distribution, which is also the set the
+/// distribution reports as active, so the count is over the distinct accounts
+/// ([`config_limit_exceeded`]).
 pub const MAX_TRUSTED_SIGNERS: usize = 5;
 
-/// The most trusted key groups ONE distribution's configuration may state, counted across
-/// its cache behaviours.
+/// The most key groups ONE distribution may be associated with, counted as the DISTINCT key
+/// groups its cache behaviours name.
 ///
 /// CloudFront's published quota is 4 key groups associated with a single distribution, and
 /// the modelled refusal names the same scope: "The number of key groups referenced by this
-/// distribution is more than the maximum allowed."
+/// distribution is more than the maximum allowed." A group several behaviours trust — the
+/// ordinary signed-URL configuration, where one key group is trusted by every behaviour — is
+/// ONE key group associated with the distribution, which is also the set the distribution
+/// reports as active, so the count is over the distinct ids ([`config_limit_exceeded`]).
 pub const MAX_TRUSTED_KEY_GROUPS: usize = 4;
 
 /// The most objects ONE distribution, or ONE distribution tenant, may have invalidating at

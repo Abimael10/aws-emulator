@@ -162,7 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // from the current page's response (which is also the ID of the last profile on that
         // page)": the marker is a resume point this service handed out — a profile id — so a
         // value outside that shape was never one.
-        if let Some(marker) = input.marker.as_deref() {
+        if let Some(marker) = crate::state::resume_marker(input.marker.as_deref()) {
             if !crate::state::is_field_level_encryption_profile_id(marker) {
                 return Err(ListFieldLevelEncryptionProfilesErrorModeled::InvalidArgument(
                     crate::state::invalid_field_level_encryption_profile_marker(),
@@ -179,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // results include profiles in the list that occur after the marker" — and walking the
         // pages enumerates every profile exactly once. The store is ordered by id, so the
         // resume point is a range bound rather than a scan.
-        let start = match input.marker.as_deref() {
+        let start = match crate::state::resume_marker(input.marker.as_deref()) {
             Some(marker) => Bound::Excluded(marker),
             None => Bound::Unbounded,
         };

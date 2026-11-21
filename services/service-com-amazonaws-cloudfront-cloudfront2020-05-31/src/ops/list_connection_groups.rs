@@ -196,7 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is not one was never a resume point (`InvalidArgument`), and one that is but names
         // no stored group names no entity, which is what this listing's `EntityNotFound`
         // is about.
-        if let Some(marker) = input.marker.as_deref() {
+        if let Some(marker) = crate::state::resume_marker(input.marker.as_deref()) {
             if !crate::state::is_connection_group_id(marker) {
                 return Err(ListConnectionGroupsErrorModeled::InvalidArgument(
                     InvalidArgument {
@@ -219,7 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // walking the pages enumerates every group that passes the filter exactly once.
         // The store is ordered by id, so the resume point is a range bound rather than a
         // scan.
-        let start = match input.marker.as_deref() {
+        let start = match crate::state::resume_marker(input.marker.as_deref()) {
             Some(marker) => Bound::Excluded(marker),
             None => Bound::Unbounded,
         };

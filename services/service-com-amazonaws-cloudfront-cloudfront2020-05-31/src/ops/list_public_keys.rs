@@ -164,7 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // from the current page's response (which is also the ID of the last public key on
         // that page)": the marker is a resume point this service handed out — a public key
         // id — so a value outside that shape was never one.
-        if let Some(marker) = input.marker.as_deref() {
+        if let Some(marker) = crate::state::resume_marker(input.marker.as_deref()) {
             if !crate::state::is_public_key_id(marker) {
                 return Err(ListPublicKeysErrorModeled::InvalidArgument(
                     crate::state::invalid_public_key_marker(),
@@ -181,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "the results include public keys in the list that occur after the marker" — and
         // walking the pages enumerates every key exactly once. The store is ordered by id,
         // so the resume point is a range bound rather than a scan.
-        let start = match input.marker.as_deref() {
+        let start = match crate::state::resume_marker(input.marker.as_deref()) {
             Some(marker) => Bound::Excluded(marker),
             None => Bound::Unbounded,
         };

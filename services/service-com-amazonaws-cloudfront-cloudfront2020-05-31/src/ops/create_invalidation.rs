@@ -194,6 +194,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(now);
 
+        // "The value of Quantity and the size of Items don't match." A property of the
+        // REQUEST DOCUMENT alone — the batch's own `Paths` wrapper states a length beside the
+        // list it carries — so it is answered BEFORE the distribution the batch names is
+        // resolved: a caller whose document disagrees with itself is told what to fix in it
+        // rather than sent looking for a resource that is beside the point.
+        if let Some(message) = crate::state::batch_quantity_mismatch(&input.invalidation_batch) {
+            return Err(CreateInvalidationErrorModeled::InconsistentQuantities(
+                InconsistentQuantities {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         let Some(stored) = store.distribution(&input.distribution_id) else {
             return Err(CreateInvalidationErrorModeled::NoSuchDistribution(
                 // The identifier is read as a distribution identifier BEFORE the absent
@@ -204,16 +218,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-
-        // "The value of Quantity and the size of Items don't match."
-        if let Some(message) = crate::state::batch_quantity_mismatch(&input.invalidation_batch) {
-            return Err(CreateInvalidationErrorModeled::InconsistentQuantities(
-                InconsistentQuantities {
-                    message: Some(message),
-                },
-            )
-            .into());
-        }
 
         // "Processing your request will cause you to exceed the maximum number of in-progress
         // invalidations." What CloudFront's invalidation quota bounds is the objects one
@@ -239,9 +243,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The path is relative to the distribution and must begin with a slash", and the
         // characters a URI path cannot carry unescaped have to be URL-encoded: a value
         // breaking either names no object of this distribution to invalidate, and a batch
-        // naming none describes no invalidation. Refused before anything is stored, with the
-        // sentence the service states for the batch.
-        if crate::state::batch_names_invalid_path(&input.invalidation_batch) {
+        // naming none describes no invalidation. A distribution whose configuration carries a
+        // `CacheTagConfig` also has CloudFront extract cache tags from its origin responses,
+        // and "you can then invalidate cached objects by tag using the CreateInvalidation
+        // API", so on one of those an item naming a TAG names objects too. Refused before
+        // anything is stored, with the sentence the service states for the batch.
+        if crate::state::batch_names_invalid_path(
+            &input.invalidation_batch,
+            crate::state::extracts_cache_tags(&stored.config),
+        ) {
             return Err(CreateInvalidationErrorModeled::InvalidArgument(
                 crate::state::invalid_invalidation_paths(),
             )

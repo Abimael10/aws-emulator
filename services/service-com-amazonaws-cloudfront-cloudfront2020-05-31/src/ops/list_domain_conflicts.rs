@@ -326,7 +326,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this service handed out. Checked after the domain, as it was before the validation
         // resource moved ahead of both: the resource is the only member whose order this
         // service states, and the rest keep the order they had.
-        let resume = match input.marker.as_deref().filter(|marker| !marker.is_empty()) {
+        let resume = match crate::state::resume_marker(input.marker.as_deref()) {
             Some(marker) => match resume_point(marker) {
                 Some(resume) => Some(resume),
                 None => return Err(invalid_argument(INVALID_MARKER_MESSAGE)),

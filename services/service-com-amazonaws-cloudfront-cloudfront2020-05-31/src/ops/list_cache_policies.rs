@@ -194,7 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is not one was never a resume point (`InvalidArgument`), and one that is but names
         // no policy — neither a stored one nor a published managed one — is a policy that
         // does not exist, which is the reason this listing models `NoSuchCachePolicy`.
-        if let Some(marker) = input.marker.as_deref() {
+        if let Some(marker) = crate::state::resume_marker(input.marker.as_deref()) {
             if !crate::state::is_minted_uuid(marker) {
                 return Err(ListCachePoliciesErrorModeled::InvalidArgument(
                     crate::state::invalid_cache_policy_marker(),
@@ -244,7 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `Marker` names where the previous page ENDED, so this page starts after it in that
         // one order: walking the pages enumerates every policy exactly once.
-        let resume = input.marker.as_deref().map(listing_key);
+        let resume = crate::state::resume_marker(input.marker.as_deref()).map(listing_key);
         let mut items: Vec<CachePolicySummary> = Vec::new();
         let mut more_remain = false;
         for summary in candidates {

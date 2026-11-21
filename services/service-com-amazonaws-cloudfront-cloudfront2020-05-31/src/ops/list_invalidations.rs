@@ -202,7 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // would silently serve the first page again.
         let Some(invalidation_list) = crate::state::invalidation_page(
             &stored.invalidations,
-            input.marker.as_deref(),
+            crate::state::resume_marker(input.marker.as_deref()),
             max_items,
             page_size,
         ) else {
