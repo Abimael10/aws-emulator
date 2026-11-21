@@ -202,7 +202,15 @@ async fn cloudwatch(
 }
 
 /// The same call, requiring the 200 a well-formed read answers with.
-async fn cloudwatch_ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+///
+/// `pub(crate)` because every suite of this crate that reads these series back through
+/// CloudWatch's own API addresses it this one way, so two of them cannot read a different
+/// store or a different wire.
+pub(crate) async fn cloudwatch_ok(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> Value {
     let (status, parsed) = cloudwatch(router, operation, body).await;
     assert_eq!(
         status, 200,
@@ -212,7 +220,7 @@ async fn cloudwatch_ok(router: &MultiServiceRouter, operation: &str, body: &Valu
 }
 
 /// Wall-clock now as the epoch seconds every window below is measured against.
-fn now_secs() -> f64 {
+pub(crate) fn now_secs() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0.0, |since| since.as_secs_f64())
@@ -227,7 +235,10 @@ async fn wait_for_period_room() {
 
 /// The `app/<name>/<id>` suffix of a load balancer ARN, which is how an Elastic Load Balancing
 /// dimension names it.
-fn load_balancer_dimension(arn: &str) -> String {
+///
+/// `pub(crate)` with its target-group counterpart below: one derivation of each dimension
+/// value, so two suites cannot disagree about how a series is keyed.
+pub(crate) fn load_balancer_dimension(arn: &str) -> String {
     arn.split_once(":loadbalancer/")
         .map(|(_, suffix)| suffix.to_string())
         .unwrap_or_else(|| panic!("a load balancer ARN names its family and name: {arn}"))
@@ -235,7 +246,7 @@ fn load_balancer_dimension(arn: &str) -> String {
 
 /// The `targetgroup/<name>/<id>` suffix of a target group ARN, which is how that dimension names
 /// it.
-fn target_group_dimension(arn: &str) -> String {
+pub(crate) fn target_group_dimension(arn: &str) -> String {
     arn.split_once(":targetgroup/")
         .map(|(_, suffix)| format!("targetgroup/{suffix}"))
         .unwrap_or_else(|| panic!("a target group ARN names its resource type: {arn}"))

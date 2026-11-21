@@ -136,10 +136,10 @@ fn s3(router: &MultiServiceRouter) -> aws_sdk_s3::Client {
 /// balancer told to deliver into a bucket whose policy admits nothing is refused the attribute
 /// write, so the grant — the crate's one spelling of the documented policy — is what makes the
 /// rest of this suite about the RECORD rather than about the grant.
-async fn log_bucket(router: &MultiServiceRouter) {
+pub(crate) async fn log_bucket(router: &MultiServiceRouter, bucket: &str) {
     s3(router)
         .create_bucket()
-        .bucket(LOG_BUCKET)
+        .bucket(bucket)
         .create_bucket_configuration(
             aws_sdk_s3::types::CreateBucketConfiguration::builder()
                 .location_constraint(aws_sdk_s3::types::BucketLocationConstraint::from(REGION))
@@ -147,8 +147,8 @@ async fn log_bucket(router: &MultiServiceRouter) {
         )
         .send()
         .await
-        .unwrap_or_else(|error| panic!("setup: creating {LOG_BUCKET} must succeed, got {error:?}"));
-    crate::access_log_destination::grant_log_delivery(router, LOG_BUCKET).await;
+        .unwrap_or_else(|error| panic!("setup: creating {bucket} must succeed, got {error:?}"));
+    crate::access_log_destination::grant_log_delivery(router, bucket).await;
 }
 
 /// Every access-log FILE the log bucket holds, by key, with the record each one carries — the
@@ -157,13 +157,13 @@ async fn log_bucket(router: &MultiServiceRouter) {
 /// The file the delivery verified the destination with when logging was switched on is no
 /// record and carries no log line, so it is not read here; that object is pinned in
 /// `tests/all/access_log_destination.rs`.
-async fn delivered(router: &MultiServiceRouter) -> Vec<(String, String)> {
+async fn delivered(router: &MultiServiceRouter, bucket: &str) -> Vec<(String, String)> {
     let listed = s3(router)
         .list_objects_v2()
-        .bucket(LOG_BUCKET)
+        .bucket(bucket)
         .send()
         .await
-        .unwrap_or_else(|error| panic!("listing {LOG_BUCKET} must succeed, got {error:?}"));
+        .unwrap_or_else(|error| panic!("listing {bucket} must succeed, got {error:?}"));
     let mut records = Vec::new();
     for object in listed.contents() {
         let key = object.key().unwrap_or_default().to_string();
@@ -172,7 +172,7 @@ async fn delivered(router: &MultiServiceRouter) -> Vec<(String, String)> {
         }
         let fetched = s3(router)
             .get_object()
-            .bucket(LOG_BUCKET)
+            .bucket(bucket)
             .key(&key)
             .send()
             .await
@@ -196,14 +196,15 @@ async fn delivered(router: &MultiServiceRouter) -> Vec<(String, String)> {
 /// `seen` does not, waited for until the bucket holds it.
 ///
 /// Every key read is remembered, so the next row reads only its own record.
-async fn record_of(
+pub(crate) async fn record_of(
     router: &MultiServiceRouter,
+    bucket: &str,
     case: &str,
     seen: &mut Vec<String>,
 ) -> (String, String) {
     let deadline = Instant::now() + BUDGET;
     loop {
-        let held = delivered(router).await;
+        let held = delivered(router, bucket).await;
         let fresh: Vec<(String, String)> = held
             .into_iter()
             .filter(|(key, _)| !seen.contains(key))
@@ -228,7 +229,10 @@ async fn record_of(
 
 /// One record line read the way a reader of the log reads it: the fields are
 /// space-separated, and a quoted field carries its own spaces.
-fn fields(line: &str) -> Vec<String> {
+///
+/// `pub(crate)` because every suite of this crate that indexes a record's fields splits the
+/// line this one way, so two of them cannot disagree about where a field is.
+pub(crate) fn fields(line: &str) -> Vec<String> {
     let mut fields: Vec<String> = Vec::new();
     let mut field = String::new();
     let mut quoted = false;
@@ -411,7 +415,7 @@ async fn withdraw(router: &MultiServiceRouter, case: &str) {
 #[tokio::test]
 async fn an_access_log_records_what_answered_and_the_grant_is_read_on_every_request() {
     let (router, engine) = emulator();
-    log_bucket(&router).await;
+    log_bucket(&router, LOG_BUCKET).await;
 
     // The side channel the handler reports every invocation to, and the role whose one grant
     // admits that report.
@@ -595,7 +599,7 @@ async fn an_access_log_records_what_answered_and_the_grant_is_read_on_every_requ
         );
 
         // ... and the record the load balancer delivered for that very request.
-        let (key, line) = record_of(&router, row.case, &mut seen).await;
+        let (key, line) = record_of(&router, LOG_BUCKET, row.case, &mut seen).await;
         assert!(
             key.starts_with(&format!("{LOG_PREFIX}/AWSLogs/")),
             "case {:?}: expected the record under the configured prefix, got {key:?}",
@@ -692,7 +696,7 @@ struct LoggingRow {
 #[tokio::test]
 async fn a_load_balancer_with_logging_off_delivers_no_record() {
     let (router, engine) = emulator();
-    log_bucket(&router).await;
+    log_bucket(&router, LOG_BUCKET).await;
     let (lb_arn, published) = create_load_balancer(&router, "alb-access-log-off").await;
     let mut form = action("CreateListener");
     form.push(p("LoadBalancerArn", &lb_arn));
@@ -763,7 +767,7 @@ async fn a_load_balancer_with_logging_off_delivers_no_record() {
             "case {case:?}: expected the listener's own fixed response, got {:?}",
             answered.raw
         );
-        let held = delivered(&router).await;
+        let held = delivered(&router, LOG_BUCKET).await;
         assert_eq!(
             held.len(),
             *records,
