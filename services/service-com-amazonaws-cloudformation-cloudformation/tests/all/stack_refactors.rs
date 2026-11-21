@@ -218,7 +218,10 @@ enum ExpectedReason {
 /// in-progress status is admissible while the conclusion was not yet due when the request was
 /// SENT, and the settled one once it was due by the time the answer came back. That keeps the
 /// case honest on a loaded machine without accepting both answers at every instant.
-fn reportable(
+///
+/// Shared with `stack_refactor_execution.rs`, which holds the EXECUTION's own two statuses to
+/// the same rule.
+pub(crate) fn reportable(
     started: Instant,
     sent_at: Instant,
     answered_at: Instant,

@@ -426,6 +426,10 @@ pub mod stack_refactors;
 /// and resources it covers, which `ListStackRefactorActions` reports.
 pub mod stack_refactor_actions;
 
+/// EXECUTING a stack refactor: the stacks `ExecuteStackRefactor` creates and the resources it
+/// moves, which is what the plan's actions say it will do.
+pub mod stack_refactor_execution;
+
 /// The resource-signal waits of one stack operation: the barrier an
 /// `AWS::CloudFormation::WaitCondition` or a `CreationPolicy`'s `ResourceSignal` puts in a
 /// create or an update, and the signals `SignalResource` releases it with.

@@ -265,7 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every stack the refactor NAMES — in a definition or at either end of a move — in
         // the order it was first named, resolved exactly once.
         let covered: Vec<crate::state::stack_refactors::CoveredStack> =
-            named_stacks(&definitions, &mappings)
+            refactors::named_stacks(&definitions, &mappings)
                 .iter()
                 .map(|stack_name| store.covered_stack(&region, stack_name))
                 .collect();
@@ -330,28 +330,3 @@ fn declared_final_resources(
         .unwrap_or_default()
 }
 
-/// Every stack name the refactor uses, in the order it first used one and without repeats: a
-/// stack named by a definition and by both ends of a move is ONE stack, so it is resolved
-/// once and reports one id.
-fn named_stacks(
-    definitions: &[crate::state::stack_refactors::RefactorStackDefinition],
-    mappings: &[crate::state::stack_refactors::RefactorResourceMapping],
-) -> Vec<String> {
-    let mut seen: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
-    let mut named: Vec<String> = Vec::new();
-    let from_definitions = definitions
-        .iter()
-        .map(|definition| definition.stack_name.as_str());
-    let from_mappings = mappings.iter().flat_map(|mapping| {
-        [
-            mapping.source.stack_name.as_str(),
-            mapping.destination.stack_name.as_str(),
-        ]
-    });
-    for stack_name in from_definitions.chain(from_mappings) {
-        if seen.insert(stack_name) {
-            named.push(stack_name.to_string());
-        }
-    }
-    named
-}

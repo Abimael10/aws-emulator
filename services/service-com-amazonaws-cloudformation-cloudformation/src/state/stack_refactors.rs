@@ -31,6 +31,12 @@
 //! creation that FAILED leaves nothing executable, so the execution status stays
 //! `UNAVAILABLE`.
 //!
+//! An `AVAILABLE` plan is the one state an execution starts from
+//! ([`StoredStackRefactor::is_executable`]): executing it reports `EXECUTE_IN_PROGRESS` and
+//! concludes `EXECUTE_COMPLETE`, or `EXECUTE_FAILED` with the reason it could not be carried
+//! out ([`StoredStackRefactor::begin_execution`]) — and what that execution DOES to the stacks
+//! it covers is [`super::stack_refactor_execution`].
+//!
 //! ## The creation rides the clock
 //!
 //! Creating the refactor is ASYNCHRONOUS: CloudFormation answers the call with an id while it
@@ -166,16 +172,24 @@ pub struct RefactorResourceMapping {
     pub destination: RefactorResourceLocation,
 }
 
-/// The conclusion a refactor's creation is headed for, and the instant it becomes due.
+/// The conclusion a refactor's creation — or its EXECUTION — is headed for, and the instant it
+/// becomes due.
 #[derive(Debug, Clone)]
 pub struct PendingRefactorStatus {
     /// [`status::CREATE_COMPLETE`], or [`status::CREATE_FAILED`] for a plan that cannot be
-    /// carried out.
+    /// carried out. The status the record already rests in for a conclusion the refactor's
+    /// EXECUTION owes, whose own creation concluded long before.
     pub status: String,
     pub status_reason: Option<String>,
     /// The execution status that conclusion leaves: a completed creation makes the plan
-    /// `AVAILABLE`, a failed one leaves nothing to execute.
+    /// `AVAILABLE`, a failed one leaves nothing to execute, and an execution in flight
+    /// concludes [`execution_status::EXECUTE_COMPLETE`] or
+    /// [`execution_status::EXECUTE_FAILED`].
     pub execution_status: String,
+    /// `ExecutionStatusReason`: "a detailed explanation for the stack refactor
+    /// ExecutionStatus" — the one reason an execution could not be carried out, and `None`
+    /// for a conclusion that speaks for itself.
+    pub execution_status_reason: Option<String>,
     pub due_at: SystemTime,
 }
 
@@ -277,6 +291,9 @@ impl StoredStackRefactor {
                 status,
                 status_reason,
                 execution_status: settled_execution_status.to_string(),
+                // Nothing has executed, so there is nothing to explain about the execution
+                // status the creation leaves.
+                execution_status_reason: None,
                 due_at: now + crate::state::STATUS_TRANSITION_DELAY,
             }),
         }
@@ -294,6 +311,43 @@ impl StoredStackRefactor {
         self.status = pending.status;
         self.status_reason = pending.status_reason;
         self.execution_status = pending.execution_status;
+        self.execution_status_reason = pending.execution_status_reason;
+    }
+
+    /// Whether this refactor has a plan anything can EXECUTE.
+    ///
+    /// `ExecutionStatus` `AVAILABLE` is what a completed creation leaves and the one state an
+    /// execution starts from: a creation still in flight has no plan yet, one that FAILED left
+    /// none, and a refactor already executing or executed is past it.
+    pub fn is_executable(&self) -> bool {
+        self.execution_status == execution_status::AVAILABLE
+    }
+
+    /// Start this refactor's EXECUTION at `now`: the plan is being carried out, and the
+    /// conclusion the clock owes it falls due one [`crate::state::STATUS_TRANSITION_DELAY`]
+    /// later — the same span every other asynchronous conclusion of this service rides on.
+    ///
+    /// `failure` is the one reason the plan could not be carried out against the stacks as
+    /// they stand, where there is one: executing then concludes
+    /// [`execution_status::EXECUTE_FAILED`] with that reason rather than
+    /// [`execution_status::EXECUTE_COMPLETE`]. The refactor's own creation concluded long
+    /// before, so the `Status` it rests in is carried through unchanged.
+    pub fn begin_execution(&mut self, now: SystemTime, failure: Option<String>) {
+        let concludes = match &failure {
+            Some(_) => execution_status::EXECUTE_FAILED,
+            None => execution_status::EXECUTE_COMPLETE,
+        };
+        self.execution_status = execution_status::EXECUTE_IN_PROGRESS.to_string();
+        // The execution has not concluded yet, so it has nothing to explain: the reason the
+        // conclusion carries is installed with that conclusion.
+        self.execution_status_reason = None;
+        self.pending = Some(PendingRefactorStatus {
+            status: self.status.clone(),
+            status_reason: self.status_reason.clone(),
+            execution_status: concludes.to_string(),
+            execution_status_reason: failure,
+            due_at: now + crate::state::STATUS_TRANSITION_DELAY,
+        });
     }
 
     /// Whether `stack_refactor_id` addresses this record in `region`.
@@ -440,6 +494,63 @@ pub fn source_resource_does_not_exist(source: &RefactorResourceLocation) -> Stri
 /// service's "does not exist" family.
 pub fn does_not_exist(stack_refactor_id: &str) -> String {
     format!("Stack refactor [{stack_refactor_id}] does not exist")
+}
+
+/// The message answered when a request asks for a refactor to be EXECUTED that has no plan
+/// anything could execute: one whose creation has not concluded, one whose creation failed, and
+/// one already being executed or executed ([`StoredStackRefactor::is_executable`]).
+///
+/// The two variable parts are read off the request and the record it addresses — the id the
+/// request named and the `ExecutionStatus` the record is in — in the same frame this service
+/// refuses an execution of a change set that is in no state to be executed with
+/// ([`crate::state::change_set_not_executable_in_execution_status`]), since it is the same
+/// refusal about the same kind of state.
+pub fn not_executable_in_execution_status(stack_refactor_id: &str, execution_status: &str) -> String {
+    format!(
+        "Stack refactor [{stack_refactor_id}] cannot be executed in its current execution \
+         status of [{execution_status}]"
+    )
+}
+
+/// The `ExecutionStatusReason` of an execution that would take this Region past the stacks
+/// quota: a refactor that CREATES a stack is held to the same ceiling every other stack
+/// creation of this service is ([`crate::state::MAX_STACKS`]), and an execution that cannot
+/// create the stacks its plan names is one that cannot be carried out.
+pub fn stack_creation_past_quota() -> String {
+    format!(
+        "Limit for stacks exceeded: no more than {} stacks can exist in this account and \
+         Region",
+        crate::state::MAX_STACKS
+    )
+}
+
+/// Every stack name a refactor USES, in the order it first used one and without repeats: a
+/// stack named by a definition and by both ends of a move is ONE stack, so it is resolved once
+/// and reports one id.
+///
+/// The one reading of "which stacks is this refactor about", so the creation that resolves them
+/// and the execution that acts on them cannot disagree about the set.
+pub fn named_stacks(
+    definitions: &[RefactorStackDefinition],
+    mappings: &[RefactorResourceMapping],
+) -> Vec<String> {
+    let mut seen: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+    let mut named: Vec<String> = Vec::new();
+    let from_definitions = definitions
+        .iter()
+        .map(|definition| definition.stack_name.as_str());
+    let from_mappings = mappings.iter().flat_map(|mapping| {
+        [
+            mapping.source.stack_name.as_str(),
+            mapping.destination.stack_name.as_str(),
+        ]
+    });
+    for stack_name in from_definitions.chain(from_mappings) {
+        if seen.insert(stack_name) {
+            named.push(stack_name.to_string());
+        }
+    }
+    named
 }
 
 /// `Err(message)` for a refactor that would carry more than [`MAX_STACKS_PER_REFACTOR`] stack
