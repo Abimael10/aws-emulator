@@ -91,12 +91,15 @@ const BETWEEN_LOOKS: Duration = Duration::from_millis(50);
 /// `core/router/src/lib.rs` mounts them: a handler's SDK call is dispatched back into this same
 /// router and signed as the session of its own execution role, so the policies that decide it
 /// are the ones this suite wrote with IAM's own operations.
-struct Emulator {
+///
+/// `pub(crate)` so a sibling suite that needs the same five services, roles and hierarchy drives
+/// this fixture rather than a second copy of it.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The suite signs nothing: the `Authorization` header carries only the credential
@@ -167,7 +170,7 @@ impl Emulator {
     }
 
     /// The same call, with the answer read as the JSON document it carries.
-    async fn rest(
+    pub(crate) async fn rest(
         &self,
         signing_name: &str,
         host_prefix: &str,
@@ -288,7 +291,7 @@ impl Emulator {
 
     /// Create the execution role `role_name`, trusted by Lambda — written with IAM's own
     /// operations, so the role a session is minted of is the record `iam:CreateRole` wrote.
-    async fn execution_role(&self, role_name: &str) -> String {
+    pub(crate) async fn execution_role(&self, role_name: &str) -> String {
         let trust = json!({
             "Version": "2012-10-17",
             "Statement": [{
@@ -317,7 +320,7 @@ impl Emulator {
 
     /// The identity policy in force on `role_name` from now on, so a row is about the grant in
     /// force when the handler calls rather than the one in force when the role was made.
-    async fn role_policy(&self, what: &str, role_name: &str, document: &str) {
+    pub(crate) async fn role_policy(&self, what: &str, role_name: &str, document: &str) {
         self.iam(
             what,
             "PutRolePolicy",
@@ -395,7 +398,7 @@ impl Emulator {
     /// Read the function's configuration until Lambda reports it `Active`: provisioning is a
     /// transition the CLOCK owes after the create, so this looks again until it has happened
     /// instead of sleeping for a fixed span.
-    async fn await_function_active(&self, name: &str) {
+    pub(crate) async fn await_function_active(&self, name: &str) {
         let deadline = Instant::now() + PATIENCE;
         loop {
             let (status, _headers, parsed) = self
@@ -457,7 +460,7 @@ impl Emulator {
 
     /// What the data plane serves a caller OUTSIDE Lambda for this triple: a session of its own,
     /// polled once, answering the bytes the poll carried as its payload.
-    async fn served_bytes(&self, case: &str, triple: &Hierarchy) -> Vec<u8> {
+    pub(crate) async fn served_bytes(&self, case: &str, triple: &Hierarchy) -> Vec<u8> {
         let (status, _headers, started) = self
             .rest(
                 "appconfig",
@@ -514,7 +517,7 @@ fn form_decode(value: &str) -> String {
 }
 
 /// One identity policy document granting `actions` on `resource`.
-fn allow(actions: &[&str], resource: &str) -> String {
+pub(crate) fn allow(actions: &[&str], resource: &str) -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [{"Effect": "Allow", "Action": actions, "Resource": resource}],
@@ -524,12 +527,12 @@ fn allow(actions: &[&str], resource: &str) -> String {
 
 /// The document the DENIED sibling's role carries in every row: a function's ordinary logging
 /// grant and not one AppConfig action, which is the only way the two roles differ.
-const NO_APPCONFIG_ACTION: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}"#;
+pub(crate) const NO_APPCONFIG_ACTION: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}"#;
 
 /// The ARN of the configuration a session over this triple is served from, as AppConfig
 /// addresses one — stated here independently of the crates under test, so the sentence a refusal
 /// carries is compared against an ARN this suite built.
-fn configuration_arn(triple: &Hierarchy) -> String {
+pub(crate) fn configuration_arn(triple: &Hierarchy) -> String {
     format!(
         "arn:aws:appconfig:{REGION}:{}:application/{}/environment/{}/configuration/{}",
         engine::emulator_account_id(),
@@ -542,7 +545,7 @@ fn configuration_arn(triple: &Hierarchy) -> String {
 /// The assumed-role session a function's own calls are made as:
 /// `arn:aws:sts::<account>:assumed-role/<role name>/<function name>`, the identity AWS reports
 /// for a function's calls.
-fn session_principal(role_name: &str, function_name: &str) -> String {
+pub(crate) fn session_principal(role_name: &str, function_name: &str) -> String {
     format!(
         "arn:aws:sts::{}:assumed-role/{role_name}/{function_name}",
         engine::emulator_account_id()
@@ -552,7 +555,7 @@ fn session_principal(role_name: &str, function_name: &str) -> String {
 /// The sentence IAM refuses a request with when no document in force allows the action, built
 /// here from the principal, the action and the resource rather than read off the crates under
 /// test.
-fn denial(principal: &str, action: &str, resource: &str) -> String {
+pub(crate) fn denial(principal: &str, action: &str, resource: &str) -> String {
     format!(
         "User: {principal} is not authorized to perform: {action} on resource: {resource} \
          because no identity-based policy allows the {action} action"
@@ -594,15 +597,15 @@ def lambda_handler(event, context):
 "#;
 
 /// The document every handler above falls back to when its own read is refused.
-fn handler_default() -> Value {
+pub(crate) fn handler_default() -> Value {
     json!({"useNewBackend": false})
 }
 
 /// One AppConfig hierarchy, as its control plane minted it.
-struct Hierarchy {
-    application: String,
-    environment: String,
-    profile: String,
+pub(crate) struct Hierarchy {
+    pub(crate) application: String,
+    pub(crate) environment: String,
+    pub(crate) profile: String,
 }
 
 impl Hierarchy {
@@ -619,7 +622,11 @@ impl Hierarchy {
 /// Create an application, an environment and a hosted configuration profile under `names` and
 /// deploy `document` into it, all through AppConfig's own control plane — so what a handler
 /// reads is what a client deployed.
-async fn deploy(emulator: &Emulator, names: (&str, &str, &str), document: &str) -> Hierarchy {
+pub(crate) async fn deploy(
+    emulator: &Emulator,
+    names: (&str, &str, &str),
+    document: &str,
+) -> Hierarchy {
     let (application_name, environment_name, profile_name) = names;
     let application = emulator
         .created_id(
