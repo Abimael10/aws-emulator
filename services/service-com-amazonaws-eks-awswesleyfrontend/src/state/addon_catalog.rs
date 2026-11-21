@@ -454,13 +454,10 @@ pub(super) const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         // Deployment provisions access points and the node DaemonSet resolves the
         // mount targets it mounts through, so the catalog carries an entry per
         // service account the driver runs as — not just the controller's — each
-        // recommending the policy Amazon EKS publishes for the driver.
-        // BOTH of the driver's components call Amazon EFS: the controller
-        // Deployment provisions access points and the node DaemonSet resolves the
-        // mount targets it mounts through, so the catalog carries an entry per
-        // service account the driver runs as, each recommending the policy Amazon
-        // EKS publishes for the driver. WHICH of them a build publishes is the
-        // build's own ([`ADDON_POD_IDENTITY_FIRST_BUILD`]).
+        // recommending the policy Amazon EKS publishes for the driver. WHICH of
+        // them a build publishes is the build's own
+        // ([`ADDON_POD_IDENTITY_FIRST_BUILD`]), and a build of a line older than
+        // the one the driver gained pod identity support in publishes none.
         pod_identity: &[
             (
                 "efs-csi-controller-sa",
@@ -1583,8 +1580,11 @@ impl AddonCatalogRecord {
     /// the entries are the service accounts that build supports EKS Pod Identity
     /// for: a component's service account is published from the build in which that
     /// component gained pod identity support and from none older
-    /// ([`ADDON_POD_IDENTITY_FIRST_BUILD`]). An add-on whose components all had it
-    /// from the first published build reports the same list for every build.
+    /// ([`ADDON_POD_IDENTITY_FIRST_BUILD`]). A build older than every one of its
+    /// add-on's components gained that support in therefore publishes an EMPTY
+    /// list — pod identity is not something that build can be installed with at
+    /// all — while an add-on whose components all had it from its first published
+    /// build reports the same list for every build.
     pub fn to_pod_identity_configuration(
         &self,
         version: &AddonCatalogVersionRecord,
@@ -1606,13 +1606,15 @@ impl AddonCatalogRecord {
     /// this add-on: "A JSON schema that's used to validate the configuration
     /// values you provide when an add-on is created or updated".
     ///
-    /// The properties it declares are THIS add-on's own configurable keys
-    /// ([`AddonCatalogSeed::configuration_properties`], each with the JSON type
-    /// that key takes) and the ones every add-on's schema carries
-    /// ([`ADDON_COMMON_CONFIGURATION_PROPERTIES`]), beside the two the install
-    /// itself takes — the namespace the add-on is installed into and the service
-    /// account it runs as — and the properties the build cannot be installed
-    /// without. A document may set no other key, which is what
+    /// The properties it declares are THIS BUILD's own configurable keys
+    /// ([`Self::schema_properties`], each with the JSON type that key takes) —
+    /// the add-on's own ([`AddonCatalogSeed::configuration_properties`]) and the
+    /// ones every add-on's schema carries
+    /// ([`ADDON_COMMON_CONFIGURATION_PROPERTIES`]), declared where the document
+    /// of that build puts them ([`ADDON_SCHEMA_KEY_RELEASES`]). They are declared
+    /// beside the two keys the install itself takes, the namespace the add-on is
+    /// installed into and the service account it runs as, and the properties the
+    /// build cannot be installed without. A document may set no other key, which is what
     /// `additionalProperties: false` states, so a client reading the schema
     /// learns exactly the configuration surface of this add-on rather than a
     /// document shared by every one of them. Its `required` list is the build's
@@ -1695,17 +1697,22 @@ impl AddonCatalogRecord {
                 properties.insert("serviceAccount".to_string(), declared);
             }
         }
-        for (property, json_type) in &self.configuration_properties {
+        // The keys THIS BUILD's document declares at its root, and the keys each
+        // object-valued one of them declares: both are the build's own, because a
+        // key the add-on moved between its releases is declared where that build's
+        // document puts it ([`Self::schema_properties`]).
+        let declared_properties = self.schema_properties(version);
+        for (property, json_type) in &declared_properties {
             if json_type == "object" {
                 let title = schema_definition_title(property);
-                let nested = self.nested_properties(property);
+                let nested = self.nested_properties(version, property);
                 if references_definitions {
                     definitions
                         .entry(title.clone())
-                        .or_insert_with(|| object_definition(&title, nested));
+                        .or_insert_with(|| object_definition(&title, &nested));
                     properties.insert(property.clone(), definition_ref(&title));
                 } else {
-                    properties.insert(property.clone(), object_definition(&title, nested));
+                    properties.insert(property.clone(), object_definition(&title, &nested));
                 }
             } else {
                 properties.insert(
@@ -1777,12 +1784,66 @@ impl AddonCatalogRecord {
         })
     }
 
-    /// The keys the object-valued configuration key `property` of THIS add-on
-    /// declares; EMPTY for one whose own keys the catalog does not publish, which
-    /// is published as an object with no declared key rather than as one with
-    /// none allowed. See [`nested_configuration_properties`].
-    fn nested_properties(&self, property: &str) -> &'static [AddonSchemaProperty] {
-        nested_configuration_properties(&self.addon_name, property)
+    /// The keys the document this add-on publishes for ONE BUILD declares at its
+    /// ROOT, each with the JSON type that key takes, in the document's own
+    /// alphabetical order.
+    ///
+    /// They are the add-on's published keys
+    /// ([`AddonCatalogSeed::configuration_properties`], merged with the ones every
+    /// add-on's schema carries) with that build's own placement applied: a key the
+    /// add-on declares inside one of its objects from one of its releases on
+    /// ([`ADDON_SCHEMA_KEY_RELEASES`]) is a root key of every OLDER build's
+    /// document and of no newer one. Which keys a published document declares, and
+    /// where in the document they sit, is a property of the BUILD — a client
+    /// validates its `configurationValues` against the document published for the
+    /// build it is installing — so it is resolved per build rather than held once
+    /// per add-on.
+    pub(super) fn schema_properties(
+        &self,
+        version: &AddonCatalogVersionRecord,
+    ) -> Vec<(String, String)> {
+        let mut declared: BTreeMap<String, String> =
+            self.configuration_properties.iter().cloned().collect();
+        for moved in schema_key_releases(&self.addon_name) {
+            if moved.declared_in(version.release).is_none() {
+                declared.insert(moved.property.to_string(), moved.json_type.to_string());
+            } else if moved.declares_in(None) {
+                // This build declares the key inside an object, and the root is
+                // where another of its releases declares it: only a key the row
+                // itself places at the root is taken out of the root.
+                declared.remove(moved.property);
+            }
+        }
+        declared.into_iter().collect()
+    }
+
+    /// The keys the object-valued configuration key `property` declares in the
+    /// document THIS add-on publishes for one build; EMPTY for one whose own keys
+    /// the catalog does not publish, which is published as an object with no
+    /// declared key rather than as one with none allowed.
+    ///
+    /// Like the root keys ([`Self::schema_properties`]), they are the build's own:
+    /// a key the add-on moved into or out of this object at one of its releases
+    /// ([`ADDON_SCHEMA_KEY_RELEASES`]) is declared here only by the builds whose
+    /// document puts it here. See [`nested_configuration_properties`].
+    fn nested_properties(
+        &self,
+        version: &AddonCatalogVersionRecord,
+        property: &str,
+    ) -> Vec<AddonSchemaProperty> {
+        let mut declared: BTreeMap<&'static str, &'static str> =
+            nested_configuration_properties(&self.addon_name, property)
+                .iter()
+                .copied()
+                .collect();
+        for moved in schema_key_releases(&self.addon_name) {
+            if moved.declared_in(version.release) == Some(property) {
+                declared.insert(moved.property, moved.json_type);
+            } else if moved.declares_in(Some(property)) {
+                declared.remove(moved.property);
+            }
+        }
+        declared.into_iter().collect()
     }
 
     /// How `document` fails the configuration schema this entry publishes for
@@ -1848,10 +1909,7 @@ fn definition_ref(title: &str) -> ::serde_json::Value {
 /// it is on the root type, and why no key inside one is published as required:
 /// only the ROOT bounds the keys a document may set, and only the build's own
 /// required configuration is a key a document cannot leave out.
-fn object_definition(
-    title: &str,
-    properties: &'static [AddonSchemaProperty],
-) -> ::serde_json::Value {
+fn object_definition(title: &str, properties: &[AddonSchemaProperty]) -> ::serde_json::Value {
     let declared: ::serde_json::Map<String, ::serde_json::Value> = properties
         .iter()
         .map(|(property, json_type)| {
@@ -2158,6 +2216,96 @@ pub(super) fn nested_configuration_properties(
         .unwrap_or_default()
 }
 
+/// One configuration key an add-on declares in DIFFERENT PLACES in the documents
+/// of its own release lines: the key, where the add-on's older builds declare it,
+/// and where its builds from one release on declare it instead.
+///
+/// A published configuration schema is the set of values the chart of THAT BUILD
+/// exposes, so an add-on that reorganised its values — moving a component's
+/// switch into that component's own object, or lifting one out to the document
+/// root — publishes a different document for the builds either side of that
+/// release. `DescribeAddonConfiguration` resolves a `(addonName, addonVersion)`
+/// pair, and a client validates its `configurationValues` against the document
+/// published for the build it installs, so the place a key sits in is part of
+/// what the BUILD publishes and not of the add-on alone.
+///
+/// Source: the document each build publishes, which `aws eks
+/// describe-addon-configuration --addon-name <name> --addon-version <build>`
+/// reports — the same source the keys themselves are taken from
+/// ([`AddonCatalogSeed::configuration_properties`] and
+/// [`ADDON_NESTED_CONFIGURATION_PROPERTIES`], which carry the placement of the
+/// add-on's NEWEST line). The EFS CSI driver's access-point switch is such a key:
+/// the documents of its 1.x builds declare `deleteAccessPointRootDir` at the
+/// document root, and from the driver's 2.0 line on — the release that moved the
+/// controller's values under `controller` — the documents declare it inside the
+/// `controller` object instead.
+///
+/// An add-on whose document did not change over its published line needs no row:
+/// its builds all publish the keys the tables above carry, in the one place they
+/// carry them.
+pub(super) struct AddonSchemaKeyRelease {
+    /// The add-on whose documents declare the key, written as the catalog
+    /// publishes it.
+    pub(super) addon_name: &'static str,
+    /// The key itself.
+    pub(super) property: &'static str,
+    /// The JSON type the key takes, which is the same wherever it is declared:
+    /// the key moved, its value did not change.
+    pub(super) json_type: &'static str,
+    /// The object key the add-on's builds OLDER than [`Self::moved_in`] declare
+    /// it under, or `None` for the document's root.
+    pub(super) declared_before: Option<&'static str>,
+    /// The object key the builds from [`Self::moved_in`] on declare it under, or
+    /// `None` for the document's root.
+    pub(super) declared_from: Option<&'static str>,
+    /// The add-on's own release the key is declared at [`Self::declared_from`]
+    /// from, as `(major, minor, patch)`.
+    pub(super) moved_in: (u32, u32, u32),
+}
+
+impl AddonSchemaKeyRelease {
+    /// Where the build of the add-on's release `release` declares the key: the
+    /// object key it sits under, or `None` for the document's root.
+    fn declared_in(&self, release: (u32, u32, u32)) -> Option<&'static str> {
+        if release >= self.moved_in {
+            self.declared_from
+        } else {
+            self.declared_before
+        }
+    }
+
+    /// Whether one of the add-on's release lines declares the key at `parent` —
+    /// `None` being the document's root. Only a place this row names is one
+    /// another build's document has the key taken out of, so a key of the same
+    /// name declared somewhere else in the document is left alone.
+    fn declares_in(&self, parent: Option<&str>) -> bool {
+        self.declared_before == parent || self.declared_from == parent
+    }
+}
+
+/// Every key an add-on declares in a different place in different releases of its
+/// own. See [`AddonSchemaKeyRelease`].
+pub(super) const ADDON_SCHEMA_KEY_RELEASES: &[AddonSchemaKeyRelease] = &[AddonSchemaKeyRelease {
+    addon_name: "aws-efs-csi-driver",
+    property: "deleteAccessPointRootDir",
+    json_type: "boolean",
+    declared_before: None,
+    declared_from: Some("controller"),
+    moved_in: (2, 0, 0),
+}];
+
+/// The keys the add-on named `addon_name` declares in a different place in
+/// different releases of its own. See [`ADDON_SCHEMA_KEY_RELEASES`].
+pub(super) fn schema_key_releases(addon_name: &str) -> Vec<&'static AddonSchemaKeyRelease> {
+    // A vendor's rebuild of an add-on is the same software, so the documents its
+    // builds publish are the rebuilt add-on's own.
+    let published_for = rebuilt_addon(addon_name).unwrap_or(addon_name);
+    ADDON_SCHEMA_KEY_RELEASES
+        .iter()
+        .filter(|moved| moved.addon_name == published_for)
+        .collect()
+}
+
 /// The first build of an add-on from which one of its service accounts is part of
 /// the pod-identity configuration that add-on publishes, as `(the add-on's name,
 /// the service account, the add-on release it is published from)`. A service
@@ -2171,9 +2319,12 @@ pub(super) fn nested_configuration_properties(
 /// is told about the accounts that build can actually use pod identity for.
 ///
 /// Source: the minimum add-on version the Amazon EKS User Guide publishes for each
-/// add-on component that supports EKS Pod Identity — the EFS CSI driver's node
-/// component gained it in the driver's 2.1 line, after its controller, which has
-/// had it for every build the catalog publishes.
+/// add-on component that supports EKS Pod Identity. The EFS CSI driver's published
+/// history reaches back into its 1.x lines, well before the driver supported pod
+/// identity at all: its controller Deployment, the component that provisions the
+/// access points, can be given one from the driver's 2.0.7 release, and its node
+/// DaemonSet from the 2.1 line, so a build older than 2.0.7 publishes NO entry at
+/// all and one between the two publishes the controller's alone.
 ///
 /// Every OTHER service account the catalog publishes
 /// ([`AddonCatalogSeed::pod_identity`]) needs no row, because its add-on's
@@ -2183,8 +2334,10 @@ pub(super) fn nested_configuration_properties(
 /// reports the same list for every build. A row is REQUIRED for any component the
 /// guide publishes a later minimum version for; without one the catalog would
 /// publish that account for builds that cannot use it.
-pub(super) const ADDON_POD_IDENTITY_FIRST_BUILD: &[(&str, &str, (u32, u32, u32))] =
-    &[("aws-efs-csi-driver", "efs-csi-node-sa", (2, 1, 0))];
+pub(super) const ADDON_POD_IDENTITY_FIRST_BUILD: &[(&str, &str, (u32, u32, u32))] = &[
+    ("aws-efs-csi-driver", "efs-csi-controller-sa", (2, 0, 7)),
+    ("aws-efs-csi-driver", "efs-csi-node-sa", (2, 1, 0)),
+];
 
 /// The add-on release `service_account` is published from for the add-on named
 /// `addon_name`, or `None` for a service account every build of that add-on

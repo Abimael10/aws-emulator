@@ -17,15 +17,20 @@
 //! states the pair the request named
 //! (`crate::state::addon_schema_not_found_message`).
 //!
-//! The schema is the one the catalog holds for that build: the add-on's OWN
-//! configurable keys, each with the JSON type it takes, beside the namespace the
-//! add-on is installed into and the service account it runs as, and nothing else
-//! is allowed in a configuration document. Its `required` list is the build's own
-//! required configuration — the same thing that makes
-//! `AddonVersionInfo$requiresConfiguration` true for that build, so the flag
-//! `DescribeAddonVersions` publishes and the schema this operation publishes
-//! cannot disagree — and it is the same document `CreateAddon` validates
-//! `configurationValues` against.
+//! BOTH halves of the answer are the BUILD's own, not the add-on's. The schema is
+//! the one the catalog holds for that build: the add-on's OWN configurable keys,
+//! each with the JSON type it takes, declared where that build's own document
+//! declares them — a key the add-on moved between its releases sits where the
+//! requested build puts it — beside the namespace the add-on is installed into and
+//! the service account it runs as, and nothing else is allowed in a configuration
+//! document. Its `required` list is the build's own required configuration — the
+//! same thing that makes `AddonVersionInfo$requiresConfiguration` true for that
+//! build, so the flag `DescribeAddonVersions` publishes and the schema this
+//! operation publishes cannot disagree — and it is the same document `CreateAddon`
+//! validates `configurationValues` against. The pod-identity list names the
+//! Kubernetes service accounts THAT build supports EKS Pod Identity for, so a
+//! build older than the release its add-on gained that support in publishes an
+//! empty list.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
