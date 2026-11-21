@@ -25,7 +25,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::ops::types::NamedQuery;
+use crate::ops::types::{NamedQuery, UnprocessedNamedQueryId};
 
 /// How many named queries one workgroup holds in this emulator.
 ///
@@ -248,6 +248,45 @@ pub fn new_named_query_id() -> String {
 /// carries for an id it could not resolve say the same thing about the same miss.
 pub fn named_query_not_found(id: &str) -> String {
     format!("NamedQuery: {id} does not exist")
+}
+
+/// The error code a miss of a `NamedQueryId` is classified under: the id is well formed and
+/// this account simply holds no saved query behind it.
+///
+/// Its own class rather than [`super::ERROR_CODE_INVALID_INPUT`], which is for a request the
+/// caller must correct (a malformed id, a value out of range): a client branching on the
+/// class of one id's failure can tell "this saved query does not exist" — drop the id, or
+/// create the query again — from "your request is wrong". The same shape as
+/// [`super::ERROR_CODE_QUERY_EXECUTION_NOT_FOUND`] and
+/// [`super::ERROR_CODE_STATEMENT_NOT_FOUND`] for the other resources a batch read resolves
+/// by id.
+pub const ERROR_CODE_NAMED_QUERY_NOT_FOUND: &str = "NAMED_QUERY_NOT_FOUND";
+
+/// How a batch read of named queries reports ONE requested id it could not resolve.
+///
+/// A batch read answers in two parts rather than refusing the whole request, and the entry
+/// it reports an id under carries the CLASS of that id's failure under `ErrorCode`, which is
+/// what a client branches on for a partial answer. The two classes are decided one before
+/// the other:
+///
+/// * an id that is not a named query identifier at all — one outside the modelled
+///   `NamedQueryId`, 1 to 128 characters matching `^\S+$` — is the request itself being
+///   wrong, so the whole request is refused with the class a bad request carries
+///   ([`super::ERROR_CODE_INVALID_INPUT`]) before any handler sees it (see
+///   [`crate::service::input_validation`]);
+/// * an id that IS one and that this account holds no saved query under failed only at
+///   RESOLVING, which is its own class ([`ERROR_CODE_NAMED_QUERY_NOT_FOUND`]).
+///
+/// So an id reaching this far is well formed and the entry states the miss, in the one
+/// sentence a miss of that id is stated in ([`named_query_not_found`]). The ONE place such
+/// an entry is built, beside [`super::unprocessed_query_execution`], so every batch read of
+/// saved queries classifies a miss the same way.
+pub fn unprocessed_named_query(id: &str) -> UnprocessedNamedQueryId {
+    UnprocessedNamedQueryId {
+        named_query_id: Some(id.to_string()),
+        error_code: Some(ERROR_CODE_NAMED_QUERY_NOT_FOUND.to_string()),
+        error_message: Some(named_query_not_found(id)),
+    }
 }
 
 /// The refusal message for a create that would take `work_group` past

@@ -156,18 +156,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The partition is COMPUTED from state, id by id and in the order the request
         // listed them: an id the registry holds a query for is reported from that query,
         // and one it does not is "a named query ID that could not be processed", reported
-        // under `UnprocessedNamedQueryIds` with the reason — the same miss, worded the same
-        // way, as a single read of that id answers with.
+        // under `UnprocessedNamedQueryIds` with its own class for a permanent miss and the
+        // sentence a read of that id states — built in the one place such an entry is
+        // worded ([`crate::state::unprocessed_named_query`]).
         let mut queries: Vec<NamedQuery> = Vec::new();
         let mut unprocessed: Vec<UnprocessedNamedQueryId> = Vec::new();
         for id in &input.named_query_ids {
             match store.named_queries.query(id) {
                 Some(record) => queries.push(record.to_named_query()),
-                None => unprocessed.push(UnprocessedNamedQueryId {
-                    named_query_id: Some(id.clone()),
-                    error_code: Some(crate::state::ERROR_CODE_INVALID_INPUT.to_string()),
-                    error_message: Some(crate::state::named_query_not_found(id)),
-                }),
+                None => unprocessed.push(crate::state::unprocessed_named_query(id)),
             }
         }
 

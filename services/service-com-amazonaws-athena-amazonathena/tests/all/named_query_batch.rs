@@ -22,7 +22,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_athena_amazonathena::state::{
-    named_query_not_found, DEFAULT_WORK_GROUP, ERROR_CODE_INVALID_INPUT,
+    named_query_not_found, DEFAULT_WORK_GROUP, ERROR_CODE_NAMED_QUERY_NOT_FOUND,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -279,8 +279,8 @@ async fn an_id_the_registry_does_not_hold_is_reported_as_unprocessed() {
             let id = entry["NamedQueryId"].as_str().unwrap_or_default();
             assert_eq!(
                 entry["ErrorCode"].as_str(),
-                Some(ERROR_CODE_INVALID_INPUT),
-                "case {case:?}: expected the class of a refusal the request caused, got \
+                Some(ERROR_CODE_NAMED_QUERY_NOT_FOUND),
+                "case {case:?}: expected the class of a saved query that does not exist, got \
                  {entry:?}"
             );
             assert_eq!(

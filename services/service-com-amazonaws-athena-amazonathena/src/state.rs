@@ -2221,9 +2221,9 @@ pub fn work_group_disabled(name: &str) -> String {
 /// resource this account does not hold, a name already taken, a value outside a rule this
 /// service enforces. The code every Athena refusal carries unless the refusal class has
 /// one of its own ([`ERROR_CODE_QUERY_EXECUTION_NOT_FOUND`],
-/// [`ERROR_CODE_INVALID_QUERY_EXECUTION_STATE`]), and the one
-/// `BatchGetQueryExecution` reports beside [`query_execution_not_found`] on an
-/// `UnprocessedQueryExecutionId`.
+/// [`ERROR_CODE_NAMED_QUERY_NOT_FOUND`], [`ERROR_CODE_STATEMENT_NOT_FOUND`],
+/// [`ERROR_CODE_INVALID_QUERY_EXECUTION_STATE`]), and the one a batch read whose LIST
+/// breaks its modelled constraint is refused whole with, before any id is resolved.
 pub const ERROR_CODE_INVALID_INPUT: &str = "INVALID_INPUT";
 
 /// The error code of a refusal whose cause is that the `QueryExecutionId` names no
