@@ -242,12 +242,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Whether the caller may push a serial-console key at that instance at all is IAM's
         // decision, taken before anything about the account or the instance is reported, and
         // with no store guard of this service held. A serial-console push names no OS user, so
-        // it publishes no value for that condition key. Same rule, and the same gate, as
-        // `SendSSHPublicKey`.
+        // it publishes no value for that condition key, and the tag families are published
+        // only for a tag set the owner of the instance answered with in full
+        // (`Instance::known_tags`). Same rule, and the same gate, as `SendSSHPublicKey`.
         let resource = crate::state::authorization::instance_resource(&region, &input.instance_id);
         let conditions = crate::state::authorization::Conditions::new(
             None,
-            found.as_ref().map(|instance| &instance.tags),
+            found.as_ref().and_then(crate::state::Instance::known_tags),
         );
         if let Some(refusal) = crate::state::authorization::refusal(
             &*self.engine,

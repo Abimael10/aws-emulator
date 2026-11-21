@@ -242,11 +242,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Whether the caller may push a key at that instance at all is IAM's decision, and it
         // is taken BEFORE anything about the instance is reported: a caller holding no grant is
         // told it is not authorized rather than told what the account holds, and the decision
-        // is taken with no store guard of this service held.
+        // is taken with no store guard of this service held. The tag families are published
+        // only for a tag set the owner of the instance answered with in full
+        // (`Instance::known_tags`): for a record whose tags nothing reported they stay
+        // undeclared, so a clause over one of them leaves its statement undecided.
         let resource = crate::state::authorization::instance_resource(&region, &input.instance_id);
         let conditions = crate::state::authorization::Conditions::new(
             Some(&input.instance_os_user),
-            found.as_ref().map(|instance| &instance.tags),
+            found.as_ref().and_then(crate::state::Instance::known_tags),
         );
         if let Some(refusal) = crate::state::authorization::refusal(
             &*self.engine,

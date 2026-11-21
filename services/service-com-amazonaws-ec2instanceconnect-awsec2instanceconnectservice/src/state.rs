@@ -349,20 +349,25 @@ pub struct Instance {
     /// Whether this instance type supports the EC2 serial console ("Only Nitro instance
     /// types are currently supported", per `EC2InstanceTypeInvalidException`).
     pub serial_console_supported: bool,
-    /// The instance's tags, as EC2 reports them (`Instance$Tags`), keyed by tag key.
+    /// The instance's tags, as EC2 reports them (`Instance$Tags`), keyed by tag key — and
+    /// `None` for a record whose tag set nothing reported.
     ///
     /// Kept because an authorization decision about the instance is made over them: an
     /// identity policy may condition a key push on the tags of the instance it names
     /// ([`authorization::Conditions`]), and the tag set is the instance's own, so it is read
-    /// from whoever answered for the instance rather than invented here. A record whose tags
-    /// nothing reported carries none, which is not the same as an instance with no tags —
+    /// from whoever answered for the instance rather than invented here. `Some(set)` is the
+    /// COMPLETE set the owner of the instance answered with, so a key absent from it is a tag
+    /// the instance does not carry; `None` is the absence of an answer, which is not the same
+    /// as an instance with no tags and is why the field is optional rather than an empty map —
     /// see [`authorization::Conditions::new`], which only publishes the tag condition keys
     /// for a tag set that IS known.
-    pub tags: BTreeMap<String, String>,
+    pub tags: Option<BTreeMap<String, String>>,
 }
 
 impl Instance {
-    /// A registry entry.
+    /// A registry entry whose tag set nothing reported: a caller that knows the instance's
+    /// tags states them with [`Instance::with_tags`], and until it does no clause over a
+    /// resource tag can be decided against this record.
     pub fn new(
         instance_id: impl Into<String>,
         availability_zone: impl Into<String>,
@@ -376,7 +381,7 @@ impl Instance {
             instance_type: instance_type.into(),
             state,
             serial_console_supported,
-            tags: BTreeMap::new(),
+            tags: None,
         }
     }
 
@@ -386,16 +391,26 @@ impl Instance {
         self
     }
 
-    /// The same entry carrying `tags`, the tags the owner of the instance reports for it.
+    /// The same entry carrying `tags`, the COMPLETE set of tags the owner of the instance
+    /// reports for it — including the empty set, which states that the instance carries no
+    /// tags at all.
     pub fn with_tags<K: Into<String>, V: Into<String>>(
         mut self,
         tags: impl IntoIterator<Item = (K, V)>,
     ) -> Self {
-        self.tags = tags
-            .into_iter()
-            .map(|(key, value)| (key.into(), value.into()))
-            .collect();
+        self.tags = Some(
+            tags.into_iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect(),
+        );
         self
+    }
+
+    /// The instance's tag set where it is known in full, which is what a clause over a
+    /// resource tag can be decided against ([`authorization::Conditions::new`]).
+    #[must_use]
+    pub fn known_tags(&self) -> Option<&BTreeMap<String, String>> {
+        self.tags.as_ref()
     }
 }
 

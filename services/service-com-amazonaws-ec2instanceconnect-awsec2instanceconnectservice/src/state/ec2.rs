@@ -21,6 +21,8 @@
 //! rule is [`InstanceLookup::resolve`], which is where both pushes resolve the instance a
 //! key is pushed at.
 
+use std::collections::BTreeMap;
+
 use super::{
     ComAmazonawsEc2instanceconnectAwsec2instanceconnectserviceState as ServiceStore, Instance,
     InstanceState,
@@ -176,17 +178,9 @@ pub async fn instance(
         .unwrap_or(false);
 
     // The instance's tags are EC2's too (`Instance$Tags`), and a key push is authorized over
-    // them, so the whole set EC2 reported is carried back. A tag EC2 reports without a key or
-    // without a value is not a `(key, value)` pair an authorization clause can be decided
-    // against, so it is left out rather than filled in with an empty string.
-    let tags = reported
-        .tags()
-        .iter()
-        .filter_map(|tag| {
-            let (key, value) = (tag.key()?, tag.value()?);
-            Some((key.to_string(), value.to_string()))
-        })
-        .collect();
+    // them, so the set EC2 reported is carried back — as a set that is KNOWN only where EC2
+    // reported it in full ([`known_tags`]).
+    let tags = known_tags(reported.tags());
 
     InstanceLookup::Owned(Instance {
         instance_id: instance_id.to_string(),
@@ -200,6 +194,24 @@ pub async fn instance(
         serial_console_supported,
         tags,
     })
+}
+
+/// The tag set EC2 reported for an instance, where it reported it IN FULL, and `None` where it
+/// did not.
+///
+/// A key push is authorized over the tags of the instance it names, and publishing the tag
+/// condition keys for a set states, as a fact, that every key absent from it is a tag the
+/// instance does not carry ([`super::authorization::Conditions::new`]) — which only a set read
+/// in full supports. A tag EC2 reports without a key or without a value is not a
+/// `(key, value)` pair an authorization clause can be decided against, and inventing an empty
+/// string for the missing half would state a pair EC2 did not report, so a reported set
+/// carrying one is not known: none of it is published, rather than a set with that tag
+/// dropped being passed off as the complete one.
+fn known_tags(reported: &[::aws_sdk_ec2::types::Tag]) -> Option<BTreeMap<String, String>> {
+    reported
+        .iter()
+        .map(|tag| Some((tag.key()?.to_string(), tag.value()?.to_string())))
+        .collect()
 }
 
 /// Whether `instance_type` runs on the AWS Nitro System, as EC2's instance-type catalog
@@ -254,4 +266,80 @@ where
 {
     use ::aws_sdk_ec2::error::ProvideErrorMetadata;
     error.code().map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One `Instance$Tags` entry as EC2 reports it, with either half left out when it is
+    /// `None`.
+    fn tag(key: Option<&str>, value: Option<&str>) -> ::aws_sdk_ec2::types::Tag {
+        let mut builder = ::aws_sdk_ec2::types::Tag::builder();
+        if let Some(key) = key {
+            builder = builder.key(key);
+        }
+        if let Some(value) = value {
+            builder = builder.value(value);
+        }
+        builder.build()
+    }
+
+    /// One row: what the case is called, the tags EC2 reported, and the set that is then
+    /// known in full (`None` for a set that is not known).
+    type Row = (
+        &'static str,
+        Vec<::aws_sdk_ec2::types::Tag>,
+        Option<Vec<(&'static str, &'static str)>>,
+    );
+
+    /// A tag set EC2 reported in full is known, the empty set included — EC2 answered for the
+    /// instance, so an empty list is the fact that it carries no tags — while a set carrying a
+    /// tag either half of which EC2 did not report is not known at all, whatever else it
+    /// carries.
+    #[test]
+    fn a_tag_set_is_known_only_where_every_tag_ec2_reported_is_a_pair() {
+        let pair = ("Environment", "staging");
+        let rows: Vec<Row> = vec![
+            ("no tag reported at all", vec![], Some(vec![])),
+            (
+                "one whole pair",
+                vec![tag(Some(pair.0), Some(pair.1))],
+                Some(vec![pair]),
+            ),
+            (
+                "two whole pairs",
+                vec![
+                    tag(Some(pair.0), Some(pair.1)),
+                    tag(Some("Team"), Some("platform")),
+                ],
+                Some(vec![("Team", "platform"), pair]),
+            ),
+            (
+                "a value EC2 reported as empty, which is a value",
+                vec![tag(Some(pair.0), Some(""))],
+                Some(vec![(pair.0, "")]),
+            ),
+            ("a tag with no value", vec![tag(Some(pair.0), None)], None),
+            ("a tag with no key", vec![tag(None, Some(pair.1))], None),
+            (
+                "one whole pair beside a tag with no value",
+                vec![tag(Some(pair.0), Some(pair.1)), tag(Some("Team"), None)],
+                None,
+            ),
+        ];
+        for (case, reported, expected) in rows {
+            let expected = expected.map(|pairs| {
+                pairs
+                    .into_iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect::<BTreeMap<String, String>>()
+            });
+            let known = known_tags(&reported);
+            assert_eq!(
+                known, expected,
+                "case {case:?}: expected {expected:?}, got {known:?}"
+            );
+        }
+    }
 }

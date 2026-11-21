@@ -22,7 +22,8 @@
 //! performed under, the action and resource patterns a statement names (exact, prefix
 //! wildcard, whole wildcard, another instance), the effect and the order the statements are
 //! written in, the condition keys a push publishes (the instance's tags under both spellings
-//! AWS gives them, and the OS user the key is pushed for), the instance's tags being CHANGED
+//! AWS gives them, and the OS user the key is pushed for), how much is KNOWN about the
+//! instance's tag set when a resource-tag clause is decided, the instance's tags being CHANGED
 //! under an unchanged policy, a policy put and then deleted, and the two principals the
 //! decision cannot refuse.
 
@@ -292,12 +293,21 @@ impl Emulator {
     /// account's serial-console access on so a serial-console row is not refused for the
     /// account.
     fn register_the_instance(&self) {
+        self.register_the_instance_with(TagKnowledge::Reported(&[(TAG_KEY, TAG_VALUE)]));
+    }
+
+    /// The same running, Nitro instance, carrying exactly what `knowledge` says is known about
+    /// its tag set — which is the only thing the tag-knowledge table varies.
+    fn register_the_instance_with(&self, knowledge: TagKnowledge) {
         let state = self.state();
         let mut guard = state.lock();
-        guard.register_instance(
-            Instance::new(INSTANCE_ID, ZONE, "m5.large", InstanceState::Running, true)
-                .with_tags([(TAG_KEY, TAG_VALUE)]),
-        );
+        let instance = Instance::new(INSTANCE_ID, ZONE, "m5.large", InstanceState::Running, true);
+        guard.register_instance(match knowledge {
+            // The constructor the fallback registry's own records are built with: a record
+            // nothing answered for the tags of.
+            TagKnowledge::Unreported => instance,
+            TagKnowledge::Reported(tags) => instance.with_tags(tags.iter().copied()),
+        });
         guard.serial_console_access_enabled = true;
     }
 
@@ -1151,6 +1161,307 @@ async fn retagging_the_instance_flips_the_same_calls_decision() {
             assert_eq!(
                 stored, held,
                 "case {case:?}: expected the store to hold {held:?}, got {stored:?}"
+            );
+        }
+    }
+}
+
+/// What is known about the tag set of the instance a tag-knowledge row pushes at.
+#[derive(Debug, Clone, Copy)]
+enum TagKnowledge {
+    /// Nothing answered for the instance's tags, so its tag set is not known — not known to
+    /// be empty.
+    Unreported,
+    /// The owner of the instance reported its tags, so the set is known IN FULL: a key absent
+    /// from it is a tag the instance does not carry. The empty slice is an instance reported
+    /// to carry no tags at all.
+    Reported(&'static [(&'static str, &'static str)]),
+}
+
+impl TagKnowledge {
+    /// How the case names this row's knowledge.
+    fn stated(self) -> String {
+        match self {
+            Self::Unreported => "a tag set nothing reported".to_string(),
+            Self::Reported(&[]) => "a tag set reported as empty".to_string(),
+            Self::Reported(tags) => format!("the reported tag set {tags:?}"),
+        }
+    }
+}
+
+/// One row of the tag-knowledge table.
+struct TagRow {
+    /// What is known about the instance's tags when the push is decided.
+    knowledge: TagKnowledge,
+    /// The effect of the statement the resource-tag clause is written on.
+    effect: &'static str,
+    /// The condition key the clause names, under one of the two spellings AWS publishes a
+    /// resource tag as.
+    key: String,
+    /// The value the clause compares that key against.
+    value: &'static str,
+    expected: Expected,
+}
+
+/// RULE: the resource-tag condition families are published to the decision only for an
+/// instance whose tag set its owner reported IN FULL — publishing a family states, as a fact,
+/// that every key of it absent from the set is a tag the resource does not carry — so for an
+/// instance whose tag set nothing reported a clause over a resource tag leaves its statement
+/// undecided, which is fail-closed in both directions: an `Allow` that may not hold grants
+/// nothing, and a `Deny` that may hold still refuses.
+///
+/// The rows span the effect the clause is written on, what is known about the tag set (nothing
+/// reported, reported as empty, reported carrying the key, reported carrying another key),
+/// whether the reported value compares equal, and both spellings AWS publishes a resource tag
+/// under; every row is decided for BOTH operations, which publish the same tag families.
+#[tokio::test]
+async fn a_resource_tag_clause_is_published_only_for_a_tag_set_that_is_known() {
+    // Both operations under one action pattern, so a row's two pushes are decided by the same
+    // statements.
+    let action = "ec2-instance-connect:*";
+    let tagged: &[(&str, &str)] = &[(TAG_KEY, TAG_VALUE)];
+    let other_key: &[(&str, &str)] = &[(TEAM_TAG_KEY, WANTED_TEAM)];
+    let mut rows = Vec::new();
+    for prefix in ["aws:ResourceTag/", "ec2:ResourceTag/"] {
+        let key = format!("{prefix}{TAG_KEY}");
+        rows.extend([
+            // A deny whose clause cannot be decided still refuses.
+            TagRow {
+                knowledge: TagKnowledge::Unreported,
+                effect: "Deny",
+                key: key.clone(),
+                value: TAG_VALUE,
+                expected: Expected::ExplicitDeny,
+            },
+            // ... and so does one whose clause the reported set decides TRUE.
+            TagRow {
+                knowledge: TagKnowledge::Reported(tagged),
+                effect: "Deny",
+                key: key.clone(),
+                value: TAG_VALUE,
+                expected: Expected::ExplicitDeny,
+            },
+            // A reported set that compares unequal decides the clause FALSE, so the deny does
+            // not apply and the unconditional allow stands.
+            TagRow {
+                knowledge: TagKnowledge::Reported(tagged),
+                effect: "Deny",
+                key: key.clone(),
+                value: "production",
+                expected: Expected::Allowed,
+            },
+            // A set reported as empty is known: the key is absent, which is a fact.
+            TagRow {
+                knowledge: TagKnowledge::Reported(&[]),
+                effect: "Deny",
+                key: key.clone(),
+                value: TAG_VALUE,
+                expected: Expected::Allowed,
+            },
+            TagRow {
+                knowledge: TagKnowledge::Reported(other_key),
+                effect: "Deny",
+                key: key.clone(),
+                value: TAG_VALUE,
+                expected: Expected::Allowed,
+            },
+            // The same four readings on the allow side: an undecided clause grants nothing.
+            TagRow {
+                knowledge: TagKnowledge::Unreported,
+                effect: "Allow",
+                key: key.clone(),
+                value: TAG_VALUE,
+                expected: Expected::NoAllow,
+            },
+            TagRow {
+                knowledge: TagKnowledge::Reported(tagged),
+                effect: "Allow",
+                key: key.clone(),
+                value: TAG_VALUE,
+                expected: Expected::Allowed,
+            },
+            TagRow {
+                knowledge: TagKnowledge::Reported(tagged),
+                effect: "Allow",
+                key: key.clone(),
+                value: "production",
+                expected: Expected::NoAllow,
+            },
+            TagRow {
+                knowledge: TagKnowledge::Reported(&[]),
+                effect: "Allow",
+                key: key.clone(),
+                value: TAG_VALUE,
+                expected: Expected::NoAllow,
+            },
+        ]);
+    }
+
+    for (index, row) in rows.iter().enumerate() {
+        let clause = string_equals(&row.key, row.value);
+        let conditioned = statement(row.effect, action, "*", Some(&clause));
+        // A deny is read beside a grant that is not in doubt, so what the row decides is the
+        // deny's own clause; a conditional allow is the only statement in force.
+        let document = match row.effect {
+            "Deny" => policy(&format!(
+                "{},{conditioned}",
+                statement("Allow", action, "*", None)
+            )),
+            _ => policy(&conditioned),
+        };
+        let case = format!(
+            "{} {} {:?} at {}",
+            row.effect,
+            row.key,
+            row.value,
+            row.knowledge.stated()
+        );
+
+        for (operation, action_decided) in [
+            ("SendSSHPublicKey", "ec2-instance-connect:SendSSHPublicKey"),
+            (
+                "SendSerialConsoleSSHPublicKey",
+                "ec2-instance-connect:SendSerialConsoleSSHPublicKey",
+            ),
+        ] {
+            let case = format!("{case}, {operation}");
+            let emulator = Emulator::new();
+            emulator.register_the_instance_with(row.knowledge);
+            let user_name = format!("tag-knowledge-{index}-{operation}");
+            let key_id = emulator
+                .iam_user_key(&case, &user_name, Some(&document))
+                .await;
+            let pushed = ssh_key(&case);
+            let (status, body) = match operation {
+                "SendSSHPublicKey" => {
+                    emulator
+                        .push_ssh(&key_id, INSTANCE_ID, OS_USER, &pushed)
+                        .await
+                }
+                _ => emulator.push_serial(&key_id, INSTANCE_ID, &pushed).await,
+            };
+            assert_decision(
+                &case,
+                &user_name,
+                action_decided,
+                INSTANCE_ID,
+                row.expected,
+                status,
+                &body,
+            );
+
+            // An allowed push reaches the registered instance and stores its key; a refused one
+            // stores nothing, whichever of the two refusals it came to.
+            let state = emulator.state();
+            let now = Instant::now();
+            let guard = state.lock();
+            let stored = match operation {
+                "SendSSHPublicKey" => guard
+                    .active_ssh_key(INSTANCE_ID, OS_USER, now)
+                    .map(|key| key.public_key.clone()),
+                _ => guard
+                    .active_serial_console_key(INSTANCE_ID, SERIAL_CONSOLE_PORT, now)
+                    .map(|key| key.public_key.clone()),
+            };
+            if row.expected == Expected::Allowed {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: the allowed push must succeed, got {status} {body}"
+                );
+                assert_eq!(
+                    stored.as_deref(),
+                    Some(pushed.as_str()),
+                    "case {case:?}: the allowed push must store the key it pushed"
+                );
+            } else {
+                assert_eq!(
+                    stored, None,
+                    "case {case:?}: a refused push must store no key"
+                );
+            }
+        }
+    }
+}
+
+/// RULE: the same rule read from the OWNER of the instance — a tag set EC2 answered with is
+/// known, the empty one included, while an id EC2 holds no instance for leaves the tag set
+/// unknown, so a resource-tag clause is decided for the first and undecided for the second.
+#[tokio::test]
+async fn a_tag_set_ec2_reports_empty_is_known_to_be_empty() {
+    let launched = "an instance EC2 launched carrying no tags";
+    let emulator = Emulator::with_ec2();
+    let action = "ec2-instance-connect:SendSSHPublicKey";
+    let clause = string_equals(&format!("aws:ResourceTag/{TAG_KEY}"), TAG_VALUE);
+    let allow_everything = statement("Allow", action, "*", None);
+    let instance_id = emulator.launch_running_instance(launched, &[]).await;
+
+    // Each row: the instance the push names, the statements in force, and what the decision
+    // must come to.
+    let rows = [
+        (
+            "a deny over a tag EC2 reports the instance does not carry",
+            instance_id.clone(),
+            policy(&format!(
+                "{allow_everything},{}",
+                statement("Deny", action, "*", Some(&clause))
+            )),
+            Expected::Allowed,
+        ),
+        (
+            "an allow over a tag EC2 reports the instance does not carry",
+            instance_id.clone(),
+            policy(&statement("Allow", action, "*", Some(&clause))),
+            Expected::NoAllow,
+        ),
+        (
+            "a deny over a tag of an id EC2 holds no instance for",
+            ABSENT_INSTANCE_ID.to_string(),
+            policy(&format!(
+                "{allow_everything},{}",
+                statement("Deny", action, "*", Some(&clause))
+            )),
+            Expected::ExplicitDeny,
+        ),
+    ];
+
+    for (index, (case, target, document, expected)) in rows.into_iter().enumerate() {
+        let user_name = format!("ec2-tag-knowledge-{index}");
+        let key_id = emulator
+            .iam_user_key(case, &user_name, Some(&document))
+            .await;
+        let pushed = ssh_key(case);
+        let state = emulator.state();
+        // The key the store holds for this (instance, OS user) before the push: only an
+        // ALLOWED push may change it, and the rows share one emulator, so a refused row must
+        // leave whatever an earlier row stored exactly as it was.
+        let held = state
+            .lock()
+            .active_ssh_key(&target, OS_USER, Instant::now())
+            .map(|key| key.public_key.clone());
+        let (status, body) = emulator
+            .push_ssh(&key_id, &target, OS_USER, &pushed)
+            .await;
+        assert_decision(case, &user_name, action, &target, expected, status, &body);
+        let stored = state
+            .lock()
+            .active_ssh_key(&target, OS_USER, Instant::now())
+            .map(|key| key.public_key.clone());
+        if expected == Expected::Allowed {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the allowed push at the instance EC2 holds must succeed, got \
+                 {status} {body}"
+            );
+            assert_eq!(
+                stored.as_deref(),
+                Some(pushed.as_str()),
+                "case {case:?}: the allowed push must store the key it pushed"
+            );
+        } else {
+            assert_eq!(
+                stored, held,
+                "case {case:?}: a refused push must store no key, so the store must still hold \
+                 {held:?}, got {stored:?}"
             );
         }
     }
