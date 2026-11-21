@@ -73,6 +73,11 @@ pub fn watch<Eng: Send + Sync + 'static>(
 /// Ask the job's own service how it is doing, every
 /// [`super::PARKED_JOB_POLL_INTERVAL`], until there is no job to ask about any more.
 ///
+/// The first of those questions is asked one of the invoked service's own settle spans
+/// after it accepted the job ([`super::JobTask::first_report_due_at`]); the passes
+/// before it settle the store and look at the job record, as every pass does, but ask
+/// the service nothing.
+///
 /// The loop ENDS ON ITS OWN, without anybody calling: each pass settles the store
 /// first, which is what applies the time the task was allowed
 /// ([`super::JobTask::times_out_at`]) and removes the job record when that span has
@@ -137,6 +142,17 @@ async fn poll<Eng: Send + Sync + 'static>(
             }
             return;
         };
+
+        // The job is not asked about before the invoked service could have given it an
+        // outcome ([`super::JobTask::first_report_due_at`]): a report taken while that
+        // service is still starting the job could only say so, and the ANSWER to it
+        // resolves the task when the answer is a refusal — so asking sooner would end
+        // this execution before the job it submitted could itself have ended. The pass
+        // above has already settled the store, so the time the task was allowed and the
+        // stop of a job nobody waits for are applied at the usual cadence either way.
+        if super::now() < task.first_report_due_at {
+            continue;
+        }
 
         let (call, request) =
             integration::describing(task.api, task.family, task.job, &task.job_id, &task.naming);

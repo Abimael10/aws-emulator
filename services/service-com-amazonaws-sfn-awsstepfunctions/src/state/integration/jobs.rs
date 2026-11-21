@@ -86,6 +86,19 @@ pub struct RunAJob {
     /// access request each is subject to ([`JobTarget`]); `None` for an integration
     /// whose target resource is not stated, whose calls are then made as before.
     pub acts_on: Option<JobTarget>,
+    /// How long the invoked service holds a job it has just accepted before its own
+    /// clock can have given it an outcome — the span that service's submission falls
+    /// due after.
+    ///
+    /// The pattern asks for its FIRST report of a job that long after the submission
+    /// ([`crate::state::JobTask::first_report_due_at`]), because a report asked for
+    /// sooner could only say the job had not started yet: the job is still being
+    /// accepted, so nothing it did is knowable. That matters beyond the wasted call,
+    /// because the ANSWER to that first report is what resolves the task when the
+    /// answer is a refusal — so asking before the job's own span has run would end
+    /// the workflow waiting on the job before the job it submitted could itself have
+    /// ended, an order no caller of this pattern observes.
+    pub settles_after: Duration,
 }
 
 /// Where the resource the calls that REPORT and STOP a job are taken on is named.
@@ -324,6 +337,11 @@ pub const RUN_A_JOB: &[RunAJob] = &[
         // Both of those calls are taken on the EXECUTION the start minted, whose ARN
         // is the identifier it answered.
         acts_on: Some(JobTarget::Identifier),
+        // A child execution is THIS service's own job, and its outcome falls due one
+        // settle delay after the start that minted it
+        // ([`crate::state::EXECUTION_SETTLE_DELAY`]), so that is the span it is held
+        // in before there is anything to report.
+        settles_after: crate::state::EXECUTION_SETTLE_DELAY,
     },
     // An Athena query: `StartQueryExecution` answers `QueryExecutionId`,
     // `GetQueryExecution` reports `QueryExecution.Status.State`
@@ -360,6 +378,11 @@ pub const RUN_A_JOB: &[RunAJob] = &[
         // Both of those calls are taken on the WORKGROUP the query runs in, which the
         // starting request named ([`TARGET_RESOURCES`]).
         acts_on: Some(JobTarget::Started("athena:startQueryExecution")),
+        // A submitted query is QUEUED — "the query has been submitted to the service,
+        // and Athena will execute the query as soon as resources are available" — and
+        // then RUNNING before it completes, which in this emulator is the span an
+        // accepted submission's outcome falls due after ([`JOB_SETTLES_AFTER`]).
+        settles_after: JOB_SETTLES_AFTER,
     },
     // A Glue job run: `StartJobRun` answers `JobRunId`, `GetJobRun` reports
     // `JobRun.JobRunState` (`JobRunState`: STARTING, RUNNING, STOPPING, STOPPED,
@@ -400,5 +423,19 @@ pub const RUN_A_JOB: &[RunAJob] = &[
         // Both of those calls are taken on the JOB the run belongs to, which the
         // starting request named ([`TARGET_RESOURCES`]).
         acts_on: Some(JobTarget::Started("glue:startJobRun")),
+        // A started run is STARTING before it is RUNNING, each for the span an accepted
+        // submission's outcome falls due after ([`JOB_SETTLES_AFTER`]), so one span is
+        // the soonest the run can have reported anything at all.
+        settles_after: JOB_SETTLES_AFTER,
     },
 ];
+
+/// The span an emulated service holds a submission in before its own clock settles it,
+/// which is what the entries above whose job belongs to another service are held to.
+///
+/// Emulator span, not a published duration: a service here owes the outcome of an
+/// accepted submission to its clock a span after the call that started it, and this is
+/// that span. It is ONE such span, which for a job that walks several states — a Glue
+/// run is `STARTING` before it is `RUNNING` — is the first of them, so the reports this
+/// delays are exactly the ones that could only have said the job had not started.
+const JOB_SETTLES_AFTER: Duration = Duration::from_secs(3);

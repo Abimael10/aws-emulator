@@ -1127,6 +1127,10 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
                 .filter(|arn| arn.len() <= MAX_ARN_BYTES),
             region: region.to_string(),
             parked_at: planned.parked_at,
+            // The job was accepted by the very call that is recording it here, so the
+            // span the invoked service holds it in runs from THIS instant rather than
+            // from the offset the walk reached the state at.
+            first_report_due_at: after(super::now(), planned.job.settles_after),
             timeout_seconds: planned.timeout_seconds,
             frames: planned.frames,
             retained_bytes: 0,

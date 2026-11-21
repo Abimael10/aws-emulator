@@ -1534,6 +1534,19 @@ pub struct JobTask {
     /// The instant the state started the job, which the state's `TimeoutSeconds` —
     /// and this emulator's own ceiling on an unfinished job — are measured from.
     pub parked_at: SystemTime,
+    /// When the job may first be ASKED what it did: one of the invoked service's own
+    /// settle spans after it accepted the job
+    /// ([`integration::RunAJob::settles_after`]), read from the clock where the
+    /// submitted job was recorded, so the span runs from the submission the invoked
+    /// service has already taken.
+    ///
+    /// A report asked for before it could only say the job had not started, and the
+    /// answer to it — a refusal of the reporting call among them — is what resolves
+    /// the task: asking sooner would end the workflow waiting on the job before the
+    /// job could itself have ended. Only the REPORT waits for it; the time the task
+    /// was allowed, and the stop of a job nobody waits for any more, are applied on
+    /// every pass as before ([`super::run_a_job`]).
+    pub first_report_due_at: SystemTime,
     /// `TimeoutSeconds` of the state that started it, when it declares one.
     pub timeout_seconds: Option<u64>,
     /// The concurrent states that state is nested inside, as the walk recorded them
