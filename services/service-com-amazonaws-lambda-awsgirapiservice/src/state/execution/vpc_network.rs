@@ -54,7 +54,11 @@ use ::service_com_amazonaws_ec2_amazonec2::state as ec2;
 use ::service_common::vpc_dns_firewall::{
     FirewallDecision, VpcQueryFilters, OVERRIDE_DNS_TYPE_CNAME,
 };
-use ::simple_dns::rdata::{RData, A, CNAME, PTR};
+use ::service_common::vpc_private_dns::{
+    InVpcQuerySource, PrivateZoneAnswer, PrivateZoneCode, PrivateZoneRecord, QueryAdmission,
+    VpcPrivateDnsPlane, PROTOCOL_UDP,
+};
+use ::simple_dns::rdata::{RData, A, AAAA, CNAME, MX, NS, PTR, TXT};
 use ::simple_dns::{
     Name, Packet, PacketFlag, QCLASS, Question, ResourceRecord, CLASS, QTYPE, RCODE, TYPE,
 };
@@ -149,6 +153,15 @@ pub struct VpcAttachment {
     /// Where a query's firewall decision is read from, and `None` for an engine that vends no
     /// such register — then nothing filters the run's queries.
     filters: Option<VpcQueryFilters>,
+    /// The security groups the interfaces sit behind, by id — the member list a security-group
+    /// rule on the interface a query is ADDRESSED to is matched against, which is what decides
+    /// whether a query to a Resolver endpoint of the VPC is admitted.
+    groups: Vec<String>,
+    /// Where the Resolver data plane of this VPC is read from — which addresses of it answer
+    /// DNS besides the VPC's own resolver, and what the private hosted zones associated with it
+    /// hold — and `None` for an engine that vends no such register, which then has no Resolver
+    /// endpoint and no private zone anywhere.
+    plane: Option<VpcPrivateDnsPlane>,
 }
 
 /// The attachment of the function whose interfaces are `interface_ids`, read out of the
@@ -171,6 +184,7 @@ pub fn attachment_of<Eng: Send + Sync + 'static>(
     let store = state.lock();
     let mut interfaces: Vec<AttachedInterface> = Vec::with_capacity(interface_ids.len());
     let mut held_vpc: Option<String> = None;
+    let mut groups: Vec<String> = Vec::new();
     for interface_id in interface_ids {
         let Some(interface) = store.network_interfaces.get(interface_id.as_str()) else {
             continue;
@@ -189,6 +203,16 @@ pub fn attachment_of<Eng: Send + Sync + 'static>(
             interfaces.push(AttachedInterface { address, subnet });
             if held_vpc.is_none() {
                 held_vpc = interface.vpc_id.clone();
+            }
+            // The groups on the interface, which is what the function is a MEMBER of inside the
+            // VPC: a rule on another interface whose source is a security group admits this
+            // traffic only through one of them.
+            for group in interface.groups.iter().flatten() {
+                if let Some(group_id) = group.group_id.clone() {
+                    if !groups.contains(&group_id) {
+                        groups.push(group_id);
+                    }
+                }
             }
         }
     }
@@ -228,6 +252,8 @@ pub fn attachment_of<Eng: Send + Sync + 'static>(
         dns_support,
         region: region.to_string(),
         filters: VpcQueryFilters::of(engine),
+        groups,
+        plane: VpcPrivateDnsPlane::of(engine),
         vpc_id,
     })
 }
@@ -324,6 +350,23 @@ impl VpcAttachment {
                     continue;
                 }
                 None => {}
+            }
+            // The PRIVATE HOSTED ZONES associated with this VPC answer ahead of the VPC's own
+            // internal zone: a query asked inside a VPC is answered out of the private zones
+            // associated with it, authoritatively, and only a name NO such zone holds is left to
+            // the internal zone below. Which zones those are, and what they hold, are Route 53's
+            // and Route 53 Resolver's records, read out of the register that owns them
+            // ([`::service_common::vpc_private_dns`]).
+            if let Some(answered) = self.private_zone_answer(question) {
+                // A zone of the VPC holds the name, so its answer is authoritative.
+                reply.set_flags(PacketFlag::AUTHORITATIVE_ANSWER);
+                if answered.code == PrivateZoneCode::NxDomain {
+                    code = RESPONSE_NAME_ERROR;
+                }
+                for record in private_zone_records(&answered) {
+                    reply.answers.push(record);
+                }
+                continue;
             }
             match self.answer_for(&question.qname, question.qtype) {
                 Answer::Found(record) => {
@@ -426,6 +469,59 @@ impl VpcAttachment {
                 _other => None,
             })
             .collect()
+    }
+
+    /// What the PRIVATE HOSTED ZONES associated with this VPC hold for one question, and `None`
+    /// when no zone of it holds the name — a question those zones do not answer at all — as well
+    /// as for a question whose TYPE this resolver cannot name.
+    fn private_zone_answer(&self, question: &Question<'_>) -> Option<PrivateZoneAnswer> {
+        let plane = self.plane.as_ref()?;
+        let record_type = type_keyword(question.qtype)?;
+        plane.zone_answer(&self.vpc_id, &question.qname.to_string(), record_type)
+    }
+
+    /// The reply a DATAGRAM addressed to `destination`:`port` from inside this VPC is answered
+    /// with, and `None` when nothing comes back at all.
+    ///
+    /// Two kinds of address answer DNS in a VPC and they are gated differently. The VPC's own
+    /// resolver ([`Self::is_resolver`]) is behind no interface of the account and answers every
+    /// client of the VPC. An INBOUND Resolver endpoint adds addresses of its own, on elastic
+    /// network interfaces behind the endpoint's security groups: a query reaching one is
+    /// delivered only where a rule of those groups admits its protocol and port from this
+    /// attachment's own address, and one no rule admits is DROPPED — so nothing comes back at
+    /// all, which is what revoking such a rule looks like to the client. Which addresses those
+    /// are and what they admit is the Resolver service's own decision, read out of the register
+    /// that owns it ([`::service_common::vpc_private_dns`]).
+    #[must_use]
+    pub fn dns_reply(&self, destination: Ipv4Addr, port: u16, query: &[u8]) -> Option<Vec<u8>> {
+        let source_ip = self.private_address().map(|address| address.to_string());
+        let admission = match (self.plane.as_ref(), source_ip.as_deref()) {
+            (Some(plane), Some(source_ip)) => plane.admission(
+                &InVpcQuerySource {
+                    vpc_id: &self.vpc_id,
+                    source_ip,
+                    security_group_ids: &self.groups,
+                },
+                destination,
+                port,
+                // A datagram is a query carried over UDP, which is the protocol a rule on the
+                // addressed interface has to admit for it to be delivered.
+                PROTOCOL_UDP,
+            ),
+            _unregistered => QueryAdmission::NoServer,
+        };
+        match admission {
+            // A resolver of the VPC answers there and the query is admitted to it.
+            QueryAdmission::Admitted => self.resolved(query),
+            // One answers there and no rule admits this query: the packet is dropped.
+            QueryAdmission::Dropped => None,
+            // No Resolver endpoint answers there — which leaves the VPC's own resolver, at the
+            // two addresses it is reached at.
+            QueryAdmission::NoServer => self
+                .is_resolver(destination, port)
+                .then(|| self.resolved(query))
+                .flatten(),
+        }
     }
 
     /// What the resolver holds for ONE question.
@@ -531,6 +627,74 @@ fn filtered_answer(asked: &Name<'_>, decision: FirewallDecision) -> Option<Filte
             ))))
         }
     }
+}
+
+/// The TYPE keyword a question asks about, as a hosted zone's record sets are held under
+/// (`ResourceRecordSet$Type`), and `None` for a question type no record set carries — a request
+/// for every type at once, and one this emulator cannot name.
+///
+/// This is the whole set of types a private hosted zone's answer is carried in below
+/// ([`private_zone_record`]): a record set of another type is one no question here asks for.
+fn type_keyword(kind: QTYPE) -> Option<&'static str> {
+    match kind {
+        QTYPE::TYPE(TYPE::A) => Some("A"),
+        QTYPE::TYPE(TYPE::AAAA) => Some("AAAA"),
+        QTYPE::TYPE(TYPE::CNAME) => Some("CNAME"),
+        QTYPE::TYPE(TYPE::NS) => Some("NS"),
+        QTYPE::TYPE(TYPE::PTR) => Some("PTR"),
+        QTYPE::TYPE(TYPE::TXT) => Some("TXT"),
+        QTYPE::TYPE(TYPE::MX) => Some("MX"),
+        _other => None,
+    }
+}
+
+/// The answer section a private hosted zone's answer comes to, in the order the zone answered:
+/// one record per value it holds, and nothing at all for a value that is not one of its type —
+/// which is a record set the zone's own operations could not have written.
+fn private_zone_records(answered: &PrivateZoneAnswer) -> Vec<ResourceRecord<'static>> {
+    answered
+        .records
+        .iter()
+        .filter_map(private_zone_record)
+        .collect()
+}
+
+/// One record of such an answer, and `None` for a value that is not one of its own type.
+fn private_zone_record(record: &PrivateZoneRecord) -> Option<ResourceRecord<'static>> {
+    let owner = Name::new(&record.name).ok()?.into_owned();
+    // A record set's TTL is held as the model declares it (`ResourceRecordSet$TTL`, 0..172800),
+    // and the header field it is written into is an unsigned 32-bit count of seconds.
+    let ttl = u32::try_from(record.ttl).unwrap_or(0);
+    let value = record.value.trim();
+    let rdata = match record.record_type.to_ascii_uppercase().as_str() {
+        "A" => RData::A(A {
+            address: u32::from(value.parse::<Ipv4Addr>().ok()?),
+        }),
+        "AAAA" => RData::AAAA(AAAA {
+            address: u128::from(value.parse::<::std::net::Ipv6Addr>().ok()?),
+        }),
+        "CNAME" => RData::CNAME(CNAME(Name::new(value).ok()?.into_owned())),
+        "NS" => RData::NS(NS(Name::new(value).ok()?.into_owned())),
+        "PTR" => RData::PTR(PTR(Name::new(value).ok()?.into_owned())),
+        // A `TXT` record set holds its character strings quoted, which is how Route 53 takes
+        // and reports them; what travels on the wire is the string itself.
+        "TXT" => RData::TXT(
+            TXT::new()
+                .with_string(value.trim_matches('"'))
+                .ok()?
+                .into_owned(),
+        ),
+        // "<preference> <exchange>" is the one form an `MX` value takes.
+        "MX" => {
+            let (preference, exchange) = value.split_once(char::is_whitespace)?;
+            RData::MX(MX {
+                preference: preference.trim().parse::<u16>().ok()?,
+                exchange: Name::new(exchange.trim()).ok()?.into_owned(),
+            })
+        }
+        _other => return None,
+    };
+    Some(ResourceRecord::new(owner, CLASS::IN, ttl, rdata))
 }
 
 /// What one question came to in the resolver's own zone: a record, a name of its own zone with

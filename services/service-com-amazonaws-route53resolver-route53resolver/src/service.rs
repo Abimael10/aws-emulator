@@ -63,8 +63,16 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// ([`crate::state::dns_firewall::register_as_the_vpc_query_filter`]): DNS Firewall's rule
     /// groups are this service's records, and every component that ANSWERS a query asked inside
     /// a VPC reads their decision out of that register rather than holding a copy of the rules.
+    ///
+    /// It records the service as the engine's Resolver DATA PLANE the same way
+    /// ([`crate::state::vpc_dns_register::register_as_the_vpc_private_dns`]): which addresses of
+    /// a VPC answer DNS, what the security groups on an inbound endpoint's interfaces admit, and
+    /// what the private hosted zones associated with the VPC hold are this service's and Route
+    /// 53's records, so a component that CARRIES an in-VPC query reads them out of that register
+    /// too.
     pub fn new(engine: Arc<Eng>) -> Self {
         crate::state::dns_firewall::register_as_the_vpc_query_filter(&*engine);
+        crate::state::vpc_dns_register::register_as_the_vpc_private_dns(&*engine);
         Self {
             entry: crate::ServiceDefinition::new(engine),
         }

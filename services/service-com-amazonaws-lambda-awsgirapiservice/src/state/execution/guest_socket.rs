@@ -604,12 +604,14 @@ impl Sockets {
 
     /// Deliver ONE datagram to the address it is addressed to, and answer what came back.
     ///
-    /// The one address of the VPC this emulator answers a datagram at is the VPC's own DNS
-    /// server ([`super::vpc_network`]), which replies to the query a datagram addressed to it
-    /// carries. Every other address of the VPC takes the datagram and answers nothing, as a
+    /// The addresses of the VPC this emulator answers a datagram at are the ones its DNS is
+    /// served at ([`super::vpc_network::VpcAttachment::dns_reply`]): the VPC's own resolver, and
+    /// an inbound Route 53 Resolver endpoint's addresses while the security groups on them admit
+    /// the query. Every other address of the VPC takes the datagram and answers nothing, as a
     /// host with nothing bound to that port does — UDP reports nothing back, so the datagram
-    /// is simply lost — and an address the attachment has no route to is answered the way a
-    /// host with no route to it answers one, with nothing sent.
+    /// is simply lost — and so does one a security group does not admit; an address the
+    /// attachment has no route to is answered the way a host with no route to it answers one,
+    /// with nothing sent.
     ///
     /// An address of THIS MACHINE is the one case a datagram is REFUSED: the only datagram
     /// service this emulator runs is the in-process X-Ray daemon, which a handler delivers to
@@ -647,8 +649,7 @@ impl Sockets {
             .parse::<::std::net::Ipv4Addr>()
             .ok()
             .zip(inside)
-            .filter(|(destination, inside)| inside.is_resolver(*destination, port))
-            .and_then(|(_destination, inside)| inside.resolved(&payload))
+            .and_then(|(destination, inside)| inside.dns_reply(destination, port, &payload))
             .map(|reply| ::base64::engine::general_purpose::STANDARD.encode(reply));
         Ok(json!({
             "source": source,

@@ -264,22 +264,28 @@ impl VpcDnsView {
         let Ok(address) = server.trim().parse::<Ipv4Addr>() else {
             return Resolution::NoServer;
         };
-        let Some(server) = self
-            .servers
-            .iter()
-            .find(|held| held.address == address)
-        else {
-            return Resolution::NoServer;
-        };
-        let admitted = if protocol.eq_ignore_ascii_case(PROTOCOL_TCP) {
-            server.admits_tcp
-        } else {
-            server.admits_udp
-        };
-        if !admitted {
-            return Resolution::Dropped;
+        match self.admitted(address, protocol) {
+            None => Resolution::NoServer,
+            Some(false) => Resolution::Dropped,
+            Some(true) => Resolution::Answered(self.resolved(name, record_type)),
         }
-        Resolution::Answered(self.resolved(name, record_type))
+    }
+
+    /// Whether an address of this VPC answers DNS at `server` and, if it does, whether a query
+    /// carried over `protocol` from this view's own client is ADMITTED to it — `None` for an
+    /// address nothing of the VPC answers DNS at.
+    ///
+    /// The VPC's own resolver is behind no interface of the account, so it admits every client
+    /// of the VPC; an endpoint's address is behind the endpoint's security groups, and a query
+    /// no rule of them admits is dropped rather than refused.
+    #[must_use]
+    pub fn admitted(&self, server: Ipv4Addr, protocol: &str) -> Option<bool> {
+        let held = self.servers.iter().find(|held| held.address == server)?;
+        Some(if protocol.eq_ignore_ascii_case(PROTOCOL_TCP) {
+            held.admits_tcp
+        } else {
+            held.admits_udp
+        })
     }
 
     /// The address a client of this guest queries when it names no server itself: the one the
@@ -299,13 +305,34 @@ impl VpcDnsView {
         if let Some(blocked) = self.blocked(&asked, &record_type) {
             return blocked;
         }
-        let Some(zone) = self.zone_for(&asked) else {
-            return Answer {
-                code: ResponseCode::ServFail,
-                authoritative: false,
-                records: Vec::new(),
-            };
-        };
+        self.zone_answer(&asked, &record_type).unwrap_or(Answer {
+            code: ResponseCode::ServFail,
+            authoritative: false,
+            records: Vec::new(),
+        })
+    }
+
+    /// What the PRIVATE HOSTED ZONES of this VPC hold for the canonical name `asked` of
+    /// `record_type`, with no firewall decision applied — `None` when no zone of the VPC holds
+    /// the name, which is a question those zones do not answer at all rather than one they
+    /// answer with no record.
+    ///
+    /// Asked on its own by a component that has already read the firewall's decision for the
+    /// query it is carrying ([`::service_common::vpc_private_dns`]), so the rules are read once
+    /// per query however many planes the query passes through.
+    #[must_use]
+    pub fn zone_answer(&self, asked: &str, record_type: &str) -> Option<Answer> {
+        answer_from_zones(&self.zones, asked, record_type)
+    }
+}
+
+/// [`VpcDnsView::zone_answer`] over the zones alone, so a caller holding nothing but a reading of
+/// the zones ([`StoredVpcDns::private_zone_answer`]) is answered by the same lookup.
+fn answer_from_zones(zones: &[ViewZone], asked: &str, record_type: &str) -> Option<Answer> {
+    {
+        let asked = route53::canonical_dns_name(asked);
+        let record_type = record_type.trim().to_ascii_uppercase();
+        let zone = zone_for(zones, &asked)?;
         let mut records: Vec<AnsweredRecord> = Vec::new();
         // The name being resolved, and the name the answer is reported UNDER. They part company
         // at an ALIAS: an alias is answered with the referenced record set's data under the
@@ -334,11 +361,11 @@ impl VpcDnsView {
                     continue;
                 }
                 records.extend(answered(&reported_under, &record_type, set));
-                return Answer {
+                return Some(Answer {
                     code: ResponseCode::NoError,
                     authoritative: true,
                     records,
-                };
+                });
             }
             // "If … a CNAME record, Resolver returns the CNAME and then resolves the name it
             // points at" — which is why a query for an address is answered through an alias.
@@ -351,7 +378,7 @@ impl VpcDnsView {
                     .records
                     .keys()
                     .any(|(held_name, _)| held_name == &owner);
-                return Answer {
+                return Some(Answer {
                     // A name the zone holds some other type at exists: the answer is the one a
                     // resolver gives for a type that name carries none of, which is no record
                     // and no error.
@@ -362,7 +389,7 @@ impl VpcDnsView {
                     },
                     authoritative: true,
                     records,
-                };
+                });
             };
             records.extend(answered(&reported_under, TYPE_CNAME, alias));
             let Some(target) = alias
@@ -378,13 +405,15 @@ impl VpcDnsView {
             owner = target.clone();
             reported_under = target;
         }
-        Answer {
+        Some(Answer {
             code: ResponseCode::NoError,
             authoritative: true,
             records,
-        }
+        })
     }
+}
 
+impl VpcDnsView {
     /// What the DNS Firewall answers a query for the canonical name `asked` of `record_type`
     /// with, or `None` for a query it lets through — one no rule of the view matches, and one
     /// a matched `ALLOW` or `ALERT` rule permits.
@@ -429,18 +458,19 @@ impl VpcDnsView {
         }
     }
 
-    /// The zone of this view a query for `asked` is answered out of: the one whose name is the
-    /// LONGEST suffix of the name, and `None` when no zone of the VPC holds it.
-    ///
-    /// Whether a name is OF a zone is Route 53's own reading of it
-    /// ([`route53::name_is_in_zone`], which compares whole labels), so this resolver and the
-    /// zone's own operations cannot disagree about which names a zone owns.
-    fn zone_for(&self, asked: &str) -> Option<&ViewZone> {
-        self.zones
-            .iter()
-            .filter(|zone| route53::name_is_in_zone(asked, &zone.name))
-            .max_by_key(|zone| zone.name.len())
-    }
+}
+
+/// The zone of `zones` a query for `asked` is answered out of: the one whose name is the
+/// LONGEST suffix of the name, and `None` when no zone of the VPC holds it.
+///
+/// Whether a name is OF a zone is Route 53's own reading of it
+/// ([`route53::name_is_in_zone`], which compares whole labels), so this resolver and the
+/// zone's own operations cannot disagree about which names a zone owns.
+fn zone_for<'a>(zones: &'a [ViewZone], asked: &str) -> Option<&'a ViewZone> {
+    zones
+        .iter()
+        .filter(|zone| route53::name_is_in_zone(asked, &zone.name))
+        .max_by_key(|zone| zone.name.len())
 }
 
 /// One record set as the answer section carries it: one record per value.
@@ -466,113 +496,213 @@ pub fn view_from_instance<Eng: Send + Sync + 'static>(
     engine: &Eng,
     instance_id: &str,
 ) -> Option<VpcDnsView> {
-    let client = client_of(engine, instance_id)?;
-    let endpoints = inbound_endpoint_addresses(engine, &client.vpc_id);
-    let resolver_addresses = vpc_resolver_addresses(engine, &client.vpc_id);
-    // What the VPC's DHCP option set publishes to its instances is the VPC's own resolver, at
-    // the base of the range plus two where that is known and at the link-local address
-    // otherwise — both of which answer.
-    let nameserver = resolver_addresses
-        .iter()
-        .find(|address| address.octets() != VPC_RESOLVER_LINK_LOCAL_OCTETS)
-        .copied()
-        .unwrap_or_else(|| Ipv4Addr::from(VPC_RESOLVER_LINK_LOCAL_OCTETS));
-    let mut servers: Vec<DnsServer> = resolver_addresses
-        .into_iter()
-        .map(|address| DnsServer {
-            address,
-            // The VPC's own resolver is behind no interface of the account, so no security
-            // group stands between a client of the VPC and it.
-            admits_udp: true,
-            admits_tcp: true,
+    StoredVpcDns::of(engine)?.view_from_instance(instance_id)
+}
+
+/// The store handles this data plane is read off: this service's own Resolver endpoints, the
+/// Amazon EC2 inventory the client, the subnets and the security groups are facts of, Route 53's
+/// own hosted zones, and the DNS Firewall filtering the VPC.
+///
+/// A handle is an `Arc` on the state itself rather than on the engine, so what holds one keeps no
+/// engine alive and reads the SAME records the services' own operations write — which is what
+/// lets this data plane be REGISTERED for the components of other crates that carry an in-VPC
+/// query ([`super::vpc_dns_register`]).
+#[derive(Clone)]
+pub struct StoredVpcDns {
+    /// This service's own store, which holds the Resolver endpoints.
+    resolver: ::engine::ServiceState<super::ComAmazonawsRoute53resolverRoute53resolverState>,
+    /// Amazon EC2's store, or `None` for an engine that vends none — then there is no VPC, no
+    /// subnet and no security group to read.
+    ec2: Option<::engine::ServiceState<ec2::ComAmazonawsEc2Amazonec2State>>,
+    /// Route 53's store, or `None` for an engine that vends none — then no hosted zone answers.
+    route53: Option<::engine::ServiceState<route53::ComAmazonawsRoute53Awsdnsv20130401State>>,
+    /// The DNS Firewall filtering a VPC's queries, read off this service's own stores.
+    firewall: Option<super::dns_firewall::StoredFirewall>,
+}
+
+/// Written by hand rather than derived: the state handles inside carry no `Debug`, and what is
+/// diagnosable about this plane is which stores it reads.
+impl ::std::fmt::Debug for StoredVpcDns {
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        formatter
+            .debug_struct("StoredVpcDns")
+            .field("ec2", &self.ec2.is_some())
+            .field("route53", &self.route53.is_some())
+            .finish()
+    }
+}
+
+impl StoredVpcDns {
+    /// The data plane reading the stores of `engine`, or `None` for an engine that vends this
+    /// service none.
+    #[must_use]
+    pub fn of<Eng: Send + Sync + 'static>(engine: &Eng) -> Option<Self> {
+        Some(Self {
+            resolver: super::service_state(engine)?,
+            ec2: ec2::service_state(engine),
+            route53: route53::service_state(engine),
+            firewall: super::dns_firewall::StoredFirewall::of(engine),
         })
-        .collect();
-    servers.extend(admitted_endpoint_servers(engine, &client, &endpoints));
-    Some(VpcDnsView {
-        vpc_id: client.vpc_id.clone(),
-        source_ip: client.source_ip.clone(),
-        nameserver,
-        servers,
-        zones: zones_of_vpc(engine, &client.vpc_id),
-        firewall: super::dns_firewall::view_for_vpc(engine, &client.vpc_id),
-    })
+    }
+
+    /// The DNS a client running inside the instance `instance_id` names can reach, and `None`
+    /// when no store of this plane holds such an instance in a VPC.    ///
+    /// Call it with NO store guard held: it takes each store in turn and releases it before the
+    /// next.
+    #[must_use]
+    pub fn view_from_instance(&self, instance_id: &str) -> Option<VpcDnsView> {
+        let client = self.client_of(instance_id)?;
+        Some(self.view_for(&client))
+    }
+
+    /// The DNS a client of `vpc_id` at `source_ip`, a member of `security_group_ids`, can reach.
+    ///
+    /// What a client IS differs by the service that runs it — an instance, an execution
+    /// environment's network interface — so a caller that holds those three facts itself asks
+    /// with them rather than through a resource id this plane would have to resolve.
+    #[must_use]
+    pub fn view_for_client(
+        &self,
+        vpc_id: &str,
+        source_ip: &str,
+        security_group_ids: &[String],
+    ) -> VpcDnsView {
+        self.view_for(&DnsClient {
+            vpc_id: vpc_id.to_string(),
+            source_ip: source_ip.to_string(),
+            groups: security_group_ids.to_vec(),
+        })
+    }
+
+    /// What the private hosted zones associated with `vpc_id` hold for `name` of `record_type`,
+    /// read WITHOUT the rest of the view: a caller that has already decided WHERE its query went
+    /// asks only the zones ([`super::vpc_dns_register`]), so no Resolver endpoint is enumerated
+    /// and no security-group decision is made for it.
+    ///
+    /// `None` when no zone of that VPC holds the name at all — a question those zones do not
+    /// answer, rather than one they answer with no record.
+    #[must_use]
+    pub fn private_zone_answer(
+        &self,
+        vpc_id: &str,
+        name: &str,
+        record_type: &str,
+    ) -> Option<Answer> {
+        answer_from_zones(&self.zones_of_vpc(vpc_id), name, record_type)
+    }
+
+    /// One instant's reading of what `client` can reach and of what it answers.
+    fn view_for(&self, client: &DnsClient) -> VpcDnsView {
+        let endpoints = self.inbound_endpoint_addresses(&client.vpc_id);
+        let resolver_addresses = self.vpc_resolver_addresses(&client.vpc_id);
+        // What the VPC's DHCP option set publishes to its instances is the VPC's own resolver, at
+        // the base of the range plus two where that is known and at the link-local address
+        // otherwise — both of which answer.
+        let nameserver = resolver_addresses
+            .iter()
+            .find(|address| address.octets() != VPC_RESOLVER_LINK_LOCAL_OCTETS)
+            .copied()
+            .unwrap_or_else(|| Ipv4Addr::from(VPC_RESOLVER_LINK_LOCAL_OCTETS));
+        let mut servers: Vec<DnsServer> = resolver_addresses
+            .into_iter()
+            .map(|address| DnsServer {
+                address,
+                // The VPC's own resolver is behind no interface of the account, so no security
+                // group stands between a client of the VPC and it.
+                admits_udp: true,
+                admits_tcp: true,
+            })
+            .collect();
+        servers.extend(self.admitted_endpoint_servers(client, &endpoints));
+        VpcDnsView {
+            vpc_id: client.vpc_id.clone(),
+            source_ip: client.source_ip.clone(),
+            nameserver,
+            servers,
+            zones: self.zones_of_vpc(&client.vpc_id),
+            firewall: self
+                .firewall
+                .as_ref()
+                .map(|firewall| firewall.view_for_vpc(&client.vpc_id))
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The client `instance_id` names, read off Amazon EC2's own store.
+    fn client_of(&self, instance_id: &str) -> Option<DnsClient> {
+        let state = self.ec2.as_ref()?;
+        let store = state.lock();
+        let instance = store.instances.get(instance_id)?;
+        let subnet_id = instance.subnet_id.clone()?;
+        let vpc_id = store.subnets.get(&subnet_id)?.vpc_id.clone()?;
+        let groups = instance
+            .security_groups
+            .iter()
+            .filter_map(|(id, name)| match (id, name) {
+                (Some(id), _) => Some(id.clone()),
+                (None, Some(name)) => store.security_group_id_for_name(&vpc_id, name),
+                (None, None) => None,
+            })
+            .collect();
+        Some(DnsClient {
+            vpc_id,
+            source_ip: instance.private_ip.clone(),
+            groups,
+        })
+    }
 }
 
 /// The client a query comes from: where it is and what it is a member of.
 #[derive(Debug, Clone)]
 struct DnsClient {
-    /// The VPC the instance is in.
+    /// The VPC the client is in.
     vpc_id: String,
     /// Its private address, which is the source of its queries.
     source_ip: String,
-    /// The security groups the instance is a member of, by id — what a rule whose source is a
-    /// security group is matched against.
+    /// The security groups it is a member of, by id — what a rule whose source is a security
+    /// group is matched against.
     groups: Vec<String>,
 }
 
-/// The client `instance_id` names, read off Amazon EC2's own store.
-fn client_of<Eng: Send + Sync + 'static>(engine: &Eng, instance_id: &str) -> Option<DnsClient> {
-    let state = ec2::service_state(engine)?;
-    let store = state.lock();
-    let instance = store.instances.get(instance_id)?;
-    let subnet_id = instance.subnet_id.clone()?;
-    let vpc_id = store.subnets.get(&subnet_id)?.vpc_id.clone()?;
-    let groups = instance
-        .security_groups
-        .iter()
-        .filter_map(|(id, name)| match (id, name) {
-            (Some(id), _) => Some(id.clone()),
-            (None, Some(name)) => store.security_group_id_for_name(&vpc_id, name),
-            (None, None) => None,
-        })
-        .collect();
-    Some(DnsClient {
-        vpc_id,
-        source_ip: instance.private_ip.clone(),
-        groups,
-    })
-}
-
-/// The addresses the VPC's OWN resolver answers at: the link-local one, and
-/// [`VPC_RESOLVER_OFFSET`] past the base of each IPv4 range the VPC holds.
-///
-/// NONE for a VPC whose `enableDnsSupport` attribute is off: that attribute is what decides
-/// whether the Amazon-provided DNS server resolves queries in the VPC at all
-/// (`ModifyVpcAttribute`), and it is read through Amazon EC2's own accessor for it.
-fn vpc_resolver_addresses<Eng: Send + Sync + 'static>(
-    engine: &Eng,
-    vpc_id: &str,
-) -> Vec<Ipv4Addr> {
-    let Some(state) = ec2::service_state(engine) else {
-        // No Amazon EC2 store on this engine is no VPC to read the attribute of, so the
-        // link-local address every VPC's resolver answers at is all there is.
-        return vec![Ipv4Addr::from(VPC_RESOLVER_LINK_LOCAL_OCTETS)];
-    };
-    let store = state.lock();
-    let Some(vpc) = store.vpcs.get(vpc_id) else {
-        return Vec::new();
-    };
-    if !store
-        .vpc_attributes_of(vpc_id)
-        .is_none_or(|attributes| attributes.enable_dns_support)
-    {
-        return Vec::new();
-    }
-    let mut addresses = vec![Ipv4Addr::from(VPC_RESOLVER_LINK_LOCAL_OCTETS)];
-    let mut blocks: Vec<String> = vpc.cidr_block.clone().into_iter().collect();
-    for association in vpc.cidr_block_association_set.iter().flatten() {
-        if let Some(block) = association.cidr_block.clone() {
-            blocks.push(block);
+impl StoredVpcDns {
+    /// The addresses the VPC's OWN resolver answers at: the link-local one, and
+    /// [`VPC_RESOLVER_OFFSET`] past the base of each IPv4 range the VPC holds.
+    ///
+    /// NONE for a VPC whose `enableDnsSupport` attribute is off: that attribute is what decides
+    /// whether the Amazon-provided DNS server resolves queries in the VPC at all
+    /// (`ModifyVpcAttribute`), and it is read through Amazon EC2's own accessor for it.
+    fn vpc_resolver_addresses(&self, vpc_id: &str) -> Vec<Ipv4Addr> {
+        let Some(state) = self.ec2.as_ref() else {
+            // No Amazon EC2 store on this engine is no VPC to read the attribute of, so the
+            // link-local address every VPC's resolver answers at is all there is.
+            return vec![Ipv4Addr::from(VPC_RESOLVER_LINK_LOCAL_OCTETS)];
+        };
+        let store = state.lock();
+        let Some(vpc) = store.vpcs.get(vpc_id) else {
+            return Vec::new();
+        };
+        if !store
+            .vpc_attributes_of(vpc_id)
+            .is_none_or(|attributes| attributes.enable_dns_support)
+        {
+            return Vec::new();
         }
-    }
-    for block in blocks {
-        if let Some(address) = resolver_address_of_block(&block) {
-            if !addresses.contains(&address) {
-                addresses.push(address);
+        let mut addresses = vec![Ipv4Addr::from(VPC_RESOLVER_LINK_LOCAL_OCTETS)];
+        let mut blocks: Vec<String> = vpc.cidr_block.clone().into_iter().collect();
+        for association in vpc.cidr_block_association_set.iter().flatten() {
+            if let Some(block) = association.cidr_block.clone() {
+                blocks.push(block);
             }
         }
+        for block in blocks {
+            if let Some(address) = resolver_address_of_block(&block) {
+                if !addresses.contains(&address) {
+                    addresses.push(address);
+                }
+            }
+        }
+        addresses
     }
-    addresses
 }
 
 /// The resolver address of one IPv4 range: its base plus [`VPC_RESOLVER_OFFSET`].
@@ -596,115 +726,111 @@ struct EndpointAddress {
     groups: Vec<String>,
 }
 
-/// Every address an OPERATIONAL inbound Resolver endpoint of `vpc_id` has attached.
-fn inbound_endpoint_addresses<Eng: Send + Sync + 'static>(
-    engine: &Eng,
-    vpc_id: &str,
-) -> Vec<EndpointAddress> {
-    let Some(state) = super::service_state(engine) else {
-        return Vec::new();
-    };
-    let now = Instant::now();
-    let store = state.lock();
-    store
-        .resolver_endpoints
-        .values()
-        .filter(|endpoint| endpoint.host_vpc_id.as_deref() == Some(vpc_id))
-        .filter(|endpoint| endpoint.direction.eq_ignore_ascii_case(DIRECTION_INBOUND))
-        // An endpoint that has not reached its terminal status yet has no address serving
-        // anything: `ResolverEndpointStatus` `OPERATIONAL` is "the Resolver endpoint is
-        // ready to be used".
-        .filter(|endpoint| endpoint.status_at(now) == ENDPOINT_STATUS_OPERATIONAL)
-        .flat_map(|endpoint| {
-            endpoint
-                .ip_addresses
-                .iter()
-                .filter(|held| held.status_at(now) == IP_STATUS_ATTACHED)
-                .filter_map(|held| held.ip.as_deref()?.trim().parse::<Ipv4Addr>().ok())
-                .map(|address| EndpointAddress {
-                    address,
-                    groups: endpoint.security_group_ids.clone(),
-                })
-                .collect::<Vec<EndpointAddress>>()
-        })
-        .collect()
-}
-
-/// Each endpoint address as a server of the view, with what its security groups admit from
-/// this client — Amazon EC2's own decision over the rules it holds.
-fn admitted_endpoint_servers<Eng: Send + Sync + 'static>(
-    engine: &Eng,
-    client: &DnsClient,
-    addresses: &[EndpointAddress],
-) -> Vec<DnsServer> {
-    if addresses.is_empty() {
-        return Vec::new();
+impl StoredVpcDns {
+    /// Every address an OPERATIONAL inbound Resolver endpoint of `vpc_id` has attached.
+    fn inbound_endpoint_addresses(&self, vpc_id: &str) -> Vec<EndpointAddress> {
+        let now = Instant::now();
+        let store = self.resolver.lock();
+        store
+            .resolver_endpoints
+            .values()
+            .filter(|endpoint| endpoint.host_vpc_id.as_deref() == Some(vpc_id))
+            .filter(|endpoint| endpoint.direction.eq_ignore_ascii_case(DIRECTION_INBOUND))
+            // An endpoint that has not reached its terminal status yet has no address serving
+            // anything: `ResolverEndpointStatus` `OPERATIONAL` is "the Resolver endpoint is
+            // ready to be used".
+            .filter(|endpoint| endpoint.status_at(now) == ENDPOINT_STATUS_OPERATIONAL)
+            .flat_map(|endpoint| {
+                endpoint
+                    .ip_addresses
+                    .iter()
+                    .filter(|held| held.status_at(now) == IP_STATUS_ATTACHED)
+                    .filter_map(|held| held.ip.as_deref()?.trim().parse::<Ipv4Addr>().ok())
+                    .map(|address| EndpointAddress {
+                        address,
+                        groups: endpoint.security_group_ids.clone(),
+                    })
+                    .collect::<Vec<EndpointAddress>>()
+            })
+            .collect()
     }
-    let Some(state) = ec2::service_state(engine) else {
-        return Vec::new();
-    };
-    let store = state.lock();
-    addresses
-        .iter()
-        .map(|held| DnsServer {
-            address: held.address,
-            admits_udp: store.security_groups_admit_ingress(
-                &held.groups,
-                PROTOCOL_UDP,
-                DNS_PORT,
-                &client.source_ip,
-                &client.groups,
-            ),
-            admits_tcp: store.security_groups_admit_ingress(
-                &held.groups,
-                PROTOCOL_TCP,
-                DNS_PORT,
-                &client.source_ip,
-                &client.groups,
-            ),
-        })
-        .collect()
-}
 
-/// The private hosted zones associated with `vpc_id`, with the record sets each answers out
-/// of, read through Route 53's own store.
-///
-/// One entry per owner name and type: a name and type a zone holds a ROUTING GROUP at (a
-/// weighted, failover, multivalue or geolocation group, whose members share a name and type and
-/// differ by `SetIdentifier`) is answered here from the group's FIRST member in that order,
-/// which is the member Route 53's own answer path selects for a group carrying no policy. Which
-/// member a policy selects is that path's own decision (`TestDNSAnswer`), and it is not
-/// re-decided here.
-fn zones_of_vpc<Eng: Send + Sync + 'static>(engine: &Eng, vpc_id: &str) -> Vec<ViewZone> {
-    let Some(state) = route53::service_state(engine) else {
-        return Vec::new();
-    };
-    let store = state.lock();
-    store
-        .zones
-        .values()
-        .filter(|zone| zone.private_zone)
-        .filter(|zone| {
-            zone.vpcs
-                .iter()
-                .any(|vpc| vpc.vpc_id.as_deref() == Some(vpc_id))
-        })
-        .take(MAX_VIEW_ZONES)
-        .map(|zone| {
-            let mut records: BTreeMap<(String, String), ViewRecordSet> = BTreeMap::new();
-            for record in zone.records.values().take(MAX_VIEW_RECORDS_PER_ZONE) {
-                let key = (
-                    route53::canonical_dns_name(&record.name),
-                    record.r#type.to_ascii_uppercase(),
-                );
-                records.entry(key).or_insert_with(|| view_record_set(record));
-            }
-            ViewZone {
-                name: route53::canonical_dns_name(&zone.name),
-                records,
-            }
-        })
-        .collect()
+    /// Each endpoint address as a server of the view, with what its security groups admit from
+    /// this client — Amazon EC2's own decision over the rules it holds.
+    fn admitted_endpoint_servers(
+        &self,
+        client: &DnsClient,
+        addresses: &[EndpointAddress],
+    ) -> Vec<DnsServer> {
+        if addresses.is_empty() {
+            return Vec::new();
+        }
+        let Some(state) = self.ec2.as_ref() else {
+            return Vec::new();
+        };
+        let store = state.lock();
+        addresses
+            .iter()
+            .map(|held| DnsServer {
+                address: held.address,
+                admits_udp: store.security_groups_admit_ingress(
+                    &held.groups,
+                    PROTOCOL_UDP,
+                    DNS_PORT,
+                    &client.source_ip,
+                    &client.groups,
+                ),
+                admits_tcp: store.security_groups_admit_ingress(
+                    &held.groups,
+                    PROTOCOL_TCP,
+                    DNS_PORT,
+                    &client.source_ip,
+                    &client.groups,
+                ),
+            })
+            .collect()
+    }
+
+    /// The private hosted zones associated with `vpc_id`, with the record sets each answers out
+    /// of, read through Route 53's own store.
+    ///
+    /// One entry per owner name and type: a name and type a zone holds a ROUTING GROUP at (a
+    /// weighted, failover, multivalue or geolocation group, whose members share a name and type
+    /// and differ by `SetIdentifier`) is answered here from the group's FIRST member in that
+    /// order, which is the member Route 53's own answer path selects for a group carrying no
+    /// policy. Which member a policy selects is that path's own decision (`TestDNSAnswer`), and
+    /// it is not re-decided here.
+    fn zones_of_vpc(&self, vpc_id: &str) -> Vec<ViewZone> {
+        let Some(state) = self.route53.as_ref() else {
+            return Vec::new();
+        };
+        let store = state.lock();
+        store
+            .zones
+            .values()
+            .filter(|zone| zone.private_zone)
+            .filter(|zone| {
+                zone.vpcs
+                    .iter()
+                    .any(|vpc| vpc.vpc_id.as_deref() == Some(vpc_id))
+            })
+            .take(MAX_VIEW_ZONES)
+            .map(|zone| {
+                let mut records: BTreeMap<(String, String), ViewRecordSet> = BTreeMap::new();
+                for record in zone.records.values().take(MAX_VIEW_RECORDS_PER_ZONE) {
+                    let key = (
+                        route53::canonical_dns_name(&record.name),
+                        record.r#type.to_ascii_uppercase(),
+                    );
+                    records.entry(key).or_insert_with(|| view_record_set(record));
+                }
+                ViewZone {
+                    name: route53::canonical_dns_name(&zone.name),
+                    records,
+                }
+            })
+            .collect()
+    }
 }
 
 /// One stored record set as the view holds it.

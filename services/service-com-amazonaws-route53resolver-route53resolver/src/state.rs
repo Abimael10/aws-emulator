@@ -63,6 +63,9 @@ mod vpc_configs;
 /// associated with the VPC answer. `pub` because the component that reaches into a VPC client
 /// takes the view and answers its queries out of it.
 pub mod vpc_dns;
+/// This service's DNS data plane as the components of OTHER crates that CARRY an in-VPC query
+/// reach it: the register they ask, and this service's reading of it.
+pub mod vpc_dns_register;
 pub use dns_firewall::*;
 pub use domain_imports::*;
 pub use firewall_associations::*;
@@ -73,6 +76,7 @@ pub use resolver_rules::*;
 pub use tags::*;
 pub use vpc_configs::*;
 pub use vpc_dns::*;
+pub use vpc_dns_register::*;
 
 /// The region an ARN carries when the request's SigV4 scope names none.
 pub const DEFAULT_REGION: &str = "us-east-1";
