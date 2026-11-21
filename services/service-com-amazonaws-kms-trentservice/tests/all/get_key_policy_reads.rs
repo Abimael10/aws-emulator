@@ -16,14 +16,26 @@
 //! 3. "If no policy name is specified, the default value is default"
 //!    (`smithy_query(query="doc",shape="GetKeyPolicyRequest",member="PolicyName")`), so
 //!    omitting the member and naming `default` are the same request.
+//! 4. "Specify the key ID or key ARN of the KMS key"
+//!    (`smithy_query(query="doc",shape="GetKeyPolicyRequest",member="KeyId")`) — the
+//!    member takes a KEY identifier only, so an identifier that names an alias is
+//!    refused for its KIND before anything is resolved, rather than being resolved as
+//!    an alias and reported absent.
 
 use serde_json::{json, Value};
 
-use super::harness::{b64, create_key, describe, ok, reported_policy, router, text};
+use super::harness::{
+    alias_arn, b64, create_alias, create_key, describe, ok, refused, reported_policy, router, text,
+    REGION,
+};
 
 /// The only key policy name a KMS key has a policy under: "The only valid value is
 /// default" (`smithy_query(query="doc",shape="GetKeyPolicyResponse",member="PolicyName")`).
 const DEFAULT_POLICY_NAME: &str = "default";
+
+/// How an identifier of the wrong KIND is refused: the fixed sentence KMS words this
+/// refusal with, which carries nothing taken from the request or from state.
+const ALIASES_NOT_SUPPORTED: &str = "Key Aliases are not supported for this operation.";
 
 /// The whole `GetKeyPolicy` answer for `identifier` — both the document and the name it
 /// is served under — with `PolicyName` carried only when `policy_name` names it.
@@ -251,6 +263,184 @@ async fn the_served_document_does_not_move_when_the_key_is_written_for_another_r
             answer, served,
             "case {case:?}: {operation} must leave the key policy answer exactly as it was, \
              got {answer} (was {served})"
+        );
+    }
+}
+
+/// Rule 4: the reader's `KeyId` takes a KEY identifier — a key id or a key ARN — so an
+/// identifier that names an ALIAS is of the wrong KIND for the member, and is refused
+/// `InvalidArnException` with the fixed sentence BEFORE any alias or key is looked up.
+/// Because the judgement precedes the lookup, every alias identifier is refused
+/// identically: one naming a key this reader would happily serve, one naming nothing, one
+/// pinned by its ARN to another Region or account, and one under the namespace an Amazon
+/// Web Services managed key's alias lives in all get the same answer, and none of them
+/// discloses whether an alias of that name exists. A value that IS a key identifier but
+/// names no key is still reported as the missing key it is (`NotFoundException`), so the
+/// classification follows the identifier's kind and not merely its failure to resolve.
+///
+/// The rows differ in the form of the alias identifier (bare `alias/<name>` and an alias
+/// ARN), in the characters and length of the name, in the Region and account an ARN pins
+/// it to, in whether an alias of that name exists and what it targets, in how the request
+/// spells `PolicyName`, and in the key state of the key behind the alias.
+///
+/// Scope: this suite is about THIS reader, so the dimensions above are its own. That the
+/// same judgement is every such operation's — the span over operations rather than over
+/// identifiers — is [`super::refusal_fidelity`]'s
+/// `an_alias_identifier_is_refused_for_its_kind_before_anything_is_resolved`.
+#[tokio::test]
+async fn an_alias_identifier_is_refused_for_its_kind_rather_than_resolved() {
+    let router = router();
+    let account = engine::emulator_account_id();
+    // A 12-digit value that is an account id (`AccountIdType`) other than this one.
+    let other_account = if account == "210987654321" {
+        "123456789012"
+    } else {
+        "210987654321"
+    };
+    let metadata = create_key(&router, &json!({"Description": "alias target"})).await;
+    let key_id = text("setup", &metadata, "KeyId");
+    let key_arn = text("setup", &metadata, "Arn");
+
+    // Aliases this endpoint really holds, spanning the characters `AliasNameType`'s
+    // `^[a-zA-Z0-9:/_-]+$` pattern allows and its 256-character maximum
+    // (`smithy_query(query="shape",shape="AliasNameType")`).
+    let longest = format!("alias/{}", "a".repeat(250));
+    let held: [&str; 3] = ["alias/policy-target", "alias/Team_1-2:3/4", &longest];
+    for alias in held {
+        create_alias(&router, "setup", alias, &key_id).await;
+    }
+
+    // Rows: the case, and the identifier the request puts in `KeyId`.
+    let mut rows: Vec<(String, String)> = Vec::new();
+    for alias in held {
+        rows.push((format!("the bare name {alias}"), alias.to_string()));
+        rows.push((
+            format!("the alias ARN of {alias}"),
+            alias_arn(REGION, alias),
+        ));
+    }
+    rows.push((
+        "a bare name no alias of this endpoint answers to".to_string(),
+        "alias/absent".to_string(),
+    ));
+    rows.push((
+        "the alias ARN of a name no alias of this endpoint answers to".to_string(),
+        alias_arn(REGION, "alias/absent"),
+    ));
+    // A Region other than the one the request is signed for, derived from [`REGION`] so
+    // the row cannot degenerate into a same-Region one if that constant moves.
+    let other_region = if REGION == "us-west-2" {
+        "eu-west-1"
+    } else {
+        "us-west-2"
+    };
+    rows.push((
+        "an alias ARN pinned to another Region".to_string(),
+        format!("arn:aws:kms:{other_region}:{account}:alias/policy-target"),
+    ));
+    rows.push((
+        "an alias ARN pinned to another account".to_string(),
+        format!("arn:aws:kms:{REGION}:{other_account}:alias/policy-target"),
+    ));
+    rows.push((
+        "an alias under the aws/ namespace a managed key's alias lives in".to_string(),
+        "alias/aws/kms".to_string(),
+    ));
+    // The length of the NAME is immaterial to the kind of identifier it is: this member
+    // is bounded at 2048 characters of its own
+    // (`smithy_query(query="operation",operation="GetKeyPolicy")`), so a name one
+    // character past `AliasNameType`'s maximum still reaches this judgement.
+    rows.push((
+        "a bare name one character past AliasNameType's maximum".to_string(),
+        format!("alias/{}", "b".repeat(251)),
+    ));
+
+    // The positive control FIRST, so the rows below are known to be refused for the
+    // identifier rather than for the state of the service: both key identifier forms of
+    // the very key the aliases target serve the key's policy.
+    for identifier in [&key_id, &key_arn] {
+        let case = format!("the key named by {identifier}");
+        let answer = read_policy(&router, identifier, None).await;
+        served_document(&case, &answer);
+    }
+
+    for (case, identifier) in &rows {
+        // Rows: how the request spells `PolicyName` — left out, the one valid name, and
+        // another name — none of which is reached, the identifier being judged first.
+        for spelling in [None, Some(DEFAULT_POLICY_NAME), Some("Custom")] {
+            let case = format!("{case} with PolicyName {spelling:?}");
+            let mut request = json!({"KeyId": identifier});
+            if let Some(policy_name) = spelling {
+                request["PolicyName"] = json!(policy_name);
+            }
+            let (status, code, message) = refused(&router, REGION, "GetKeyPolicy", &request).await;
+            assert_eq!(
+                (status, code.as_str()),
+                (400, "InvalidArnException"),
+                "case {case:?}: expected HTTP 400 InvalidArnException, got {status} {code} \
+                 ({message:?})"
+            );
+            assert_eq!(
+                message, ALIASES_NOT_SUPPORTED,
+                "case {case:?}: expected {ALIASES_NOT_SUPPORTED:?}, got {message:?}"
+            );
+        }
+    }
+
+    // A value that IS a key identifier but names no key of this endpoint is the missing
+    // KEY it is — the error class the alias rows above must never be given. What is
+    // asserted here is that CLASS and nothing else: the status a key-not-found refusal
+    // carries is the subject of [`super::client_error_status`], which owns it for every
+    // operation that resolves a `KeyId`, so this suite does not restate it.
+    for (case, identifier) in [
+        (
+            "an unknown key id",
+            "00000000-1111-2222-3333-444444444444".to_string(),
+        ),
+        (
+            "an unknown key ARN",
+            format!("arn:aws:kms:{REGION}:{account}:key/00000000-1111-2222-3333-444444444444"),
+        ),
+    ] {
+        let (_status, code, message) =
+            refused(&router, REGION, "GetKeyPolicy", &json!({"KeyId": identifier})).await;
+        assert_eq!(
+            code, "NotFoundException",
+            "case {case:?}: a key identifier that names no key is the missing key it is, got \
+             {code} ({message:?})"
+        );
+    }
+
+    // The key state of the key behind the alias is not reached either: the same alias
+    // identifier is refused the same way while that key is disabled and while it is
+    // pending deletion — states in which the reader still serves the key's own
+    // identifiers.
+    for (case, operation, request) in [
+        (
+            "the target key disabled",
+            "DisableKey",
+            json!({"KeyId": key_id}),
+        ),
+        (
+            "the target key pending deletion",
+            "ScheduleKeyDeletion",
+            json!({"KeyId": key_id, "PendingWindowInDays": 7}),
+        ),
+    ] {
+        ok(&router, operation, &request).await;
+        served_document(case, &read_policy(&router, &key_id, None).await);
+        let (status, code, message) = refused(
+            &router,
+            REGION,
+            "GetKeyPolicy",
+            &json!({"KeyId": "alias/policy-target"}),
+        )
+        .await;
+        assert_eq!(
+            (status, code.as_str(), message.as_str()),
+            (400, "InvalidArnException", ALIASES_NOT_SUPPORTED),
+            "case {case:?}: an alias identifier must be refused for its kind whatever the \
+             state of the key behind it, got {status} {code} ({message:?})"
         );
     }
 }
