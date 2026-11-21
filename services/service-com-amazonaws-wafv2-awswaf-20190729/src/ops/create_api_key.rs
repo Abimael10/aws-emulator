@@ -3,13 +3,14 @@
 //! @op CreateAPIKey
 //! Mints one API key for the token domains the request names, stores it under the
 //! requested `Scope`, and answers the key value it stored — the record beside the key
-//! is what `ListAPIKeys` enumerates, and the key value itself carries the same
-//! definition sealed, which is what `GetDecryptedAPIKey` reads back out of it.
+//! is what `ListAPIKeys` enumerates and what `GetDecryptedAPIKey` reads the key's
+//! definition back out of.
 //!
 //! The key value itself is opaque ([`crate::state::new_api_key`]): "the generated,
 //! encrypted API key", unique and unpredictable per call, and rendered at the one
-//! width every key is rendered at whatever definition it carries, which a client
-//! copies into its JavaScript CAPTCHA integration and hands back to this service. It
+//! width every key is rendered at whatever definition it was minted over, which a
+//! client copies into its JavaScript CAPTCHA integration and hands back to this
+//! service. It
 //! is not an AWS credential — no request is signed with it, and the credential store
 //! mints only the kinds that are (an access key, a session) — so it is minted here,
 //! as the key's own record, and the response is the only place it appears.
@@ -264,9 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
-        let Some(api_key) =
-            crate::state::new_api_key(&input.scope, &token_domains, created_at_millis)
-        else {
+        let Some(api_key) = crate::state::new_api_key(&input.scope, created_at_millis) else {
             // The token could not be sealed, so there is no key to answer: the
             // mint failed inside the service, which is the system problem WAF
             // reports rather than a key a client could not decrypt.

@@ -17,7 +17,11 @@
 //! * it is the same width for every definition — one domain or the documented
 //!   maximum of five, the shortest domain the model allows or the longest — so a
 //!   key's width tells a reader nothing about what it was defined over;
-//! * it reads back to exactly that definition, through `GetDecryptedAPIKey`;
+//! * that one width is the SERVICE's own: a short envelope, narrower than the widest
+//!   definition a key could be minted over, so a key carries no definition and is
+//!   not one padded out to the maxima the model allows a definition;
+//! * it reads back to exactly that definition, through `GetDecryptedAPIKey` and
+//!   through the key's `ListAPIKeys` summary, both out of the key's own record;
 //! * two different definitions are two different keys, and no two mints answer one
 //!   value by accident.
 //!
@@ -322,6 +326,103 @@ async fn a_minted_keys_width_does_not_depend_on_its_definition() {
         first.is_some(),
         "the table must mint at least one key, got none"
     );
+}
+
+/// The widest definition a single key can be minted over, in bytes of token domain:
+/// the documented maximum of five domains (`CreateAPIKey`'s own doc), each as long
+/// as `TokenDomain` allows.
+const WIDEST_DEFINITION_BYTES: usize = MAX_TOKEN_DOMAINS_PER_API_KEY * MAX_TOKEN_DOMAIN_LENGTH;
+
+/// The one width a key is rendered at is a width of the SERVICE's choosing, not one
+/// drawn from the definition a key was minted over nor from the maxima the model
+/// puts on one: the envelope a key carries is narrower than the widest definition a
+/// key could be minted over — and narrower than its OWN definition wherever that
+/// definition is wider than the envelope — so no key can be carrying a definition,
+/// and none is a definition padded out to the widest the model permits.
+#[tokio::test]
+async fn a_minted_keys_width_is_narrower_than_any_definition_it_could_carry() {
+    let waf = Waf::new();
+    for definition in width_cases() {
+        let case = definition.case.clone();
+        let definition_bytes: usize = definition.domains.iter().map(String::len).sum();
+        let api_key = mint(&waf, &definition).await;
+        let carried = carried_bytes(&api_key, &case);
+        assert_eq!(
+            carried, API_KEY_ENVELOPE_LEN,
+            "case {case:?}: a key must carry the one envelope width \
+             ({API_KEY_ENVELOPE_LEN} bytes), got {carried} from {api_key:?}"
+        );
+        assert!(
+            carried < WIDEST_DEFINITION_BYTES,
+            "case {case:?}: a key ({carried} bytes) must be narrower than the widest \
+             definition a key could be minted over ({WIDEST_DEFINITION_BYTES} bytes), so \
+             the width is not drawn from one"
+        );
+        if definition_bytes > API_KEY_ENVELOPE_LEN {
+            assert!(
+                carried < definition_bytes,
+                "case {case:?}: a key ({carried} bytes) must be narrower than its own \
+                 definition ({definition_bytes} bytes), so the definition is not inside it"
+            );
+        }
+        assert!(
+            api_key.len() < MAX_API_KEY_LENGTH,
+            "case {case:?}: a key must be well inside APIKey's \
+             {MAX_API_KEY_LENGTH}-character ceiling, got {} characters",
+            api_key.len()
+        );
+    }
+}
+
+/// Keeping the definition OUT of the token loses nothing: both reads of a key — its
+/// decrypted form and its listing summary — report exactly the token domains the
+/// mint named, out of the key's own record, for every definition a key can be minted
+/// over.
+#[tokio::test]
+async fn both_reads_of_a_key_report_the_definition_it_was_minted_over() {
+    let waf = Waf::new();
+    for definition in definitions() {
+        let case = definition.case.clone();
+        let api_key = mint(&waf, &definition).await;
+        let mut expected = definition.domains.clone();
+        expected.sort();
+        expected.dedup();
+
+        let decrypted = decrypted_domains(&waf, definition.scope, &api_key).await;
+        assert_eq!(
+            decrypted, expected,
+            "case {case:?}: GetDecryptedAPIKey must report the domains the key was \
+             defined over, got {decrypted:?}"
+        );
+
+        let listed: Value = waf
+            .ok("ListAPIKeys", json!({ "Scope": definition.scope }))
+            .await;
+        let summary = listed["APIKeySummaries"]
+            .as_array()
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: ListAPIKeys must report summaries, got {listed}")
+            })
+            .iter()
+            .find(|summary| summary["APIKey"].as_str() == Some(api_key.as_str()))
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: ListAPIKeys must list the key just minted, got {listed}")
+            })
+            .clone();
+        let reported: Vec<String> = summary["TokenDomains"]
+            .as_array()
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: a summary must carry TokenDomains, got {summary}")
+            })
+            .iter()
+            .map(|domain| domain.as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: ListAPIKeys must report the domains the key was defined \
+             over, got {reported:?}"
+        );
+    }
 }
 
 /// A key reads back to exactly the definition it was minted over — the set of token

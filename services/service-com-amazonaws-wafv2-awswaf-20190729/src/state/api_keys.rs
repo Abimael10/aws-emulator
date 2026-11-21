@@ -15,13 +15,16 @@
 //!
 //! The token is rendered at ONE width, in ONE alphabet, for every key: a
 //! fixed-width envelope ([`API_KEY_ENVELOPE_LEN`]) over the standard base64
-//! alphabet with its `=` padding. The token CARRIES the key's definition — which is
-//! what lets `GetDecryptedAPIKey` read the domains back out of it — but it carries
-//! it inside a payload sealed at ONE width ([`API_KEY_SEALED_PAYLOAD_LEN`], the
-//! width the model's own bounds on a definition imply), so the width of a key is a
-//! property of the key and not of the definition a caller asked for. The record
-//! beside it ([`ApiKeyEntry`]) is what says the key EXISTS in a scope; the token is
-//! what says what it carries.
+//! alphabet with its `=` padding. What the envelope seals is the key's own
+//! bookkeeping — the layout it was sealed under, the scope it belongs to, when it
+//! was created and the key's own unpredictable identifier — and nothing that grows
+//! with the definition a caller asked for, so the one width is a short record this
+//! service fixes rather than one drawn from the widest list of token domains the
+//! model would allow. The definition a key was minted over lives in the key's own
+//! record beside it ([`ApiKeyEntry`]), which is where both `ListAPIKeys` and
+//! `GetDecryptedAPIKey` report it from; the token is what says the value is one
+//! this service minted, in which scope, and that it is not a value a client wrote
+//! itself.
 
 use super::*;
 
@@ -32,65 +35,65 @@ const API_KEY_NONCE_LEN: usize = 12;
 /// The authentication tag AES-GCM appends to the ciphertext, in bytes.
 const API_KEY_TAG_LEN: usize = 16;
 
-/// The byte that separates the fields of an API key's encrypted payload, and the
-/// byte the payload is padded to its fixed width with.
-///
-/// A `Scope` is one of two words and the other fields are digits and hex, so no
-/// field of the payload can contain a NUL — the split that reads the payload back is
-/// therefore exact for every key this service seals, and the padding past the last
-/// field is read as the empty fields it is.
-const API_KEY_FIELD_SEPARATOR: u8 = 0;
-
 /// The payload layout this service seals an API key under, so a value sealed under
 /// a layout this build does not know is not read as though it were this one.
-const API_KEY_PAYLOAD_LAYOUT: &str = "2";
+const API_KEY_PAYLOAD_LAYOUT: u8 = 3;
 
-/// The longest `TokenDomain` the model allows
-/// (`smithy_query(query="shape",shape="TokenDomain")` → `@length(1..253)`), which
-/// is what the width a payload is sealed at is drawn for.
-const MAX_TOKEN_DOMAIN_LENGTH: usize = 253;
+/// How many bytes of the payload the layout marker takes.
+const API_KEY_LAYOUT_LEN: usize = 1;
 
-/// How many characters the key's own identifier inside the payload carries: the 256
-/// bits of [`fresh_entropy`], two characters per byte.
+/// How many bytes of the payload name the scope the key belongs to: ONE, because a
+/// `Scope` is one of two values (`smithy_query(query="shape",shape="Scope")` →
+/// `CLOUDFRONT | REGIONAL`), so the payload carries the value's code rather than
+/// its word and a key's width cannot vary with which scope minted it.
+const API_KEY_SCOPE_LEN: usize = 1;
+
+/// The code [`SCOPE_CLOUDFRONT`] is sealed as.
+const API_KEY_SCOPE_CODE_CLOUDFRONT: u8 = 1;
+
+/// The code [`SCOPE_REGIONAL`] is sealed as.
+const API_KEY_SCOPE_CODE_REGIONAL: u8 = 2;
+
+/// How many bytes the creation instant takes in the payload: the big-endian
+/// milliseconds of the `i64` a modelled timestamp is compared at (see
+/// [`date_time_millis`]), so every instant — and every key — is the same width.
+const API_KEY_CREATED_AT_LEN: usize = ::std::mem::size_of::<i64>();
+
+/// How many bytes the key's own identifier inside the payload carries: the 256 bits
+/// of [`fresh_entropy`].
 ///
-/// The identifier is what makes the key UNPREDICTABLE: the rest of the payload is
-/// the definition the caller asked for, so without it a key would be a function of
-/// the request and anyone could write one.
-const API_KEY_ID_LENGTH: usize = 64;
+/// The identifier is what makes the key UNPREDICTABLE: everything else the payload
+/// carries is bookkeeping a reader could guess, so without it a key would be a
+/// function of the request and anyone could write one.
+const API_KEY_ID_LEN: usize = 32;
 
-/// The widest decimal rendering of a creation instant in the payload: the 19 digits
-/// of `i64::MAX` milliseconds plus a sign.
-const API_KEY_CREATED_AT_WIDTH: usize = 20;
+/// Where the scope's code sits in the payload.
+const API_KEY_SCOPE_AT: usize = API_KEY_LAYOUT_LEN;
 
-/// How many bytes the fields a key carries take at their widest: the layout, the
-/// longer of the two `Scope` words, a creation instant, the key's own identifier,
-/// and the separator between each pair.
-const API_KEY_FIELDS_MAX: usize = API_KEY_PAYLOAD_LAYOUT.len()
-    + SCOPE_CLOUDFRONT.len()
-    + API_KEY_CREATED_AT_WIDTH
-    + API_KEY_ID_LENGTH
-    + 3;
+/// Where the creation instant sits in the payload.
+const API_KEY_CREATED_AT_AT: usize = API_KEY_SCOPE_AT + API_KEY_SCOPE_LEN;
+
+/// Where the key's own identifier sits in the payload.
+const API_KEY_ID_AT: usize = API_KEY_CREATED_AT_AT + API_KEY_CREATED_AT_LEN;
 
 /// The ONE width, in bytes, the plaintext of every API key's envelope is sealed at:
-/// the fields a key carries plus the WIDEST definition a key can be minted over —
-/// [`MAX_TOKEN_DOMAINS_PER_API_KEY`] domains of [`MAX_TOKEN_DOMAIN_LENGTH`]
-/// characters, each behind its separator.
+/// the key's own bookkeeping and nothing else — the layout marker, the scope's code,
+/// the creation instant and the key's identifier, each at a width fixed by what it
+/// is.
 ///
-/// Every payload is padded to this width with [`API_KEY_FIELD_SEPARATOR`] before it
-/// is sealed, so a key defined over one short domain and a key defined over five
-/// long ones are the same number of bytes and the same number of characters: the
-/// width of a key says nothing about the definition it carries. The rendering a
-/// payload this wide produces is well inside the 2048 characters `APIKey` allows,
-/// which is the bound the model draws for a key that carries its own definition.
+/// No part of this width is drawn from the definition a key was minted over, nor
+/// from the maxima the model puts on one: the token domains of a key live in the
+/// key's record ([`ApiKeyEntry`]), not inside the token. So a key defined over one
+/// short domain and a key defined over the documented maximum of five long ones are
+/// the same number of bytes and the same number of characters — a key's width says
+/// nothing about the definition it carries — and that one width is a short envelope
+/// of this service's own rather than the widest definition the model would permit.
 const API_KEY_SEALED_PAYLOAD_LEN: usize =
-    API_KEY_FIELDS_MAX + MAX_TOKEN_DOMAINS_PER_API_KEY * (1 + MAX_TOKEN_DOMAIN_LENGTH);
-
-/// The widest `Scope` word is the one [`API_KEY_FIELDS_MAX`] is drawn from, so that
-/// figure stays a true maximum whatever the two words are.
-const _: () = assert!(SCOPE_CLOUDFRONT.len() >= SCOPE_REGIONAL.len());
+    API_KEY_LAYOUT_LEN + API_KEY_SCOPE_LEN + API_KEY_CREATED_AT_LEN + API_KEY_ID_LEN;
 
 /// The width, in bytes, of EVERY envelope a mint produces: the nonce, the
-/// fixed-width sealed payload and the tag.
+/// fixed-width sealed payload and the tag — a short record of the key's own
+/// bookkeeping, never a definition padded out to the widest one the model allows.
 ///
 /// A value that decodes to any other size is not one of this service's keys in any
 /// scope — a key's width is a property of the key, so there is one width to check
@@ -98,8 +101,8 @@ const _: () = assert!(SCOPE_CLOUDFRONT.len() >= SCOPE_REGIONAL.len());
 pub const API_KEY_ENVELOPE_LEN: usize =
     API_KEY_NONCE_LEN + API_KEY_SEALED_PAYLOAD_LEN + API_KEY_TAG_LEN;
 
-/// How many characters an envelope renders as: base64 carries four characters per
-/// three bytes, padded to the group.
+/// How many characters every envelope renders as: base64 carries four characters
+/// per three bytes, with its padding completing the last group.
 const API_KEY_RENDERED_LEN: usize = API_KEY_ENVELOPE_LEN.div_ceil(3) * 4;
 
 /// The longest value `APIKey` allows
@@ -108,6 +111,17 @@ const MAX_API_KEY_LENGTH: usize = 2048;
 
 /// The one width every key renders at is a width the model allows a key to have.
 const _: () = assert!(API_KEY_RENDERED_LEN <= MAX_API_KEY_LENGTH);
+
+/// The longest `TokenDomain` the model allows
+/// (`smithy_query(query="shape",shape="TokenDomain")` → `@length(1..253)`).
+const MAX_TOKEN_DOMAIN_LENGTH: usize = 253;
+
+/// The one width a key renders at is narrower than the definition a key can be
+/// minted over at its widest — [`MAX_TOKEN_DOMAINS_PER_API_KEY`] domains of
+/// [`MAX_TOKEN_DOMAIN_LENGTH`] characters — so no key this service mints can be
+/// carrying that definition, and the width cannot have been drawn from it.
+const _: () =
+    assert!(API_KEY_RENDERED_LEN < MAX_TOKEN_DOMAINS_PER_API_KEY * MAX_TOKEN_DOMAIN_LENGTH);
 
 /// The AEAD an API key's payload is sealed with, keyed for the lifetime of the
 /// process.
@@ -136,78 +150,72 @@ fn api_key_coder() -> &'static ::base64::engine::general_purpose::GeneralPurpose
     &::base64::engine::general_purpose::STANDARD
 }
 
-/// The bytes an API key's envelope seals, at the ONE width every key is sealed at:
-/// the layout, the scope the key was defined in, when it was created, the key's own
-/// identifier and the token domains it carries, in the order they are stored in
-/// ([`normalized_token_domains`]), padded to [`API_KEY_SEALED_PAYLOAD_LEN`] with
-/// [`API_KEY_FIELD_SEPARATOR`]; `None` when a field carries the separator itself or
-/// the fields do not fit that width, neither of which a definition the model allows
-/// can do.
-///
-/// The padding is what keeps the ENVELOPE one width: the domains travel inside the
-/// key, and the key is still the same width whatever they are.
-fn api_key_payload(
-    scope: &str,
-    token_domains: &[String],
-    created_at_millis: i64,
-) -> Option<Vec<u8>> {
-    let mut payload: Vec<u8> = Vec::with_capacity(API_KEY_SEALED_PAYLOAD_LEN);
-    for field in [
-        API_KEY_PAYLOAD_LAYOUT.to_string(),
-        scope.to_string(),
-        created_at_millis.to_string(),
-        ::hex::encode(fresh_entropy()),
-    ]
-    .iter()
-    .chain(token_domains.iter())
-    {
-        // A field carrying the separator itself would be read back as two fields, so
-        // it is not sealed at all: the split that reads a payload back stays exact
-        // for every key this service mints.
-        if field.as_bytes().contains(&API_KEY_FIELD_SEPARATOR) {
-            return None;
-        }
-        if !payload.is_empty() {
-            payload.push(API_KEY_FIELD_SEPARATOR);
-        }
-        payload.extend_from_slice(field.as_bytes());
+/// The code a `Scope` is sealed as, or `None` for a value that names no scope at
+/// all — a key is minted in one of the two namespaces the model has, and a value
+/// outside them names none.
+fn api_key_scope_code(scope: &str) -> Option<u8> {
+    if scope == SCOPE_CLOUDFRONT {
+        Some(API_KEY_SCOPE_CODE_CLOUDFRONT)
+    } else if scope == SCOPE_REGIONAL {
+        Some(API_KEY_SCOPE_CODE_REGIONAL)
+    } else {
+        None
     }
-    if payload.len() > API_KEY_SEALED_PAYLOAD_LEN {
-        return None;
-    }
-    payload.resize(API_KEY_SEALED_PAYLOAD_LEN, API_KEY_FIELD_SEPARATOR);
-    Some(payload)
 }
 
-/// A fresh API key value for a key defined in `scope` over `token_domains` at
-/// `created_at_millis`, or `None` when the payload could not be sealed.
+/// The `Scope` a sealed code names, or `None` for a code no scope is sealed as.
+fn api_key_scope_word(code: u8) -> Option<&'static str> {
+    match code {
+        API_KEY_SCOPE_CODE_CLOUDFRONT => Some(SCOPE_CLOUDFRONT),
+        API_KEY_SCOPE_CODE_REGIONAL => Some(SCOPE_REGIONAL),
+        _ => None,
+    }
+}
+
+/// The bytes an API key's envelope seals, at the ONE width every key is sealed at
+/// ([`API_KEY_SEALED_PAYLOAD_LEN`]): the layout marker, the code of the scope the
+/// key was defined in, when it was created, and the key's own fresh identifier.
+/// `None` when `scope` names neither namespace, which is no key to seal at all.
+///
+/// Every field is a fixed width, so the payload is one width for every key without
+/// anything being padded out to a maximum — and the definition the key was minted
+/// over is not among the fields, so no definition can widen it.
+fn api_key_payload(scope: &str, created_at_millis: i64) -> Option<Vec<u8>> {
+    let identifier = fresh_entropy();
+    let mut payload: Vec<u8> = Vec::with_capacity(API_KEY_SEALED_PAYLOAD_LEN);
+    payload.push(API_KEY_PAYLOAD_LAYOUT);
+    payload.push(api_key_scope_code(scope)?);
+    payload.extend_from_slice(&created_at_millis.to_be_bytes());
+    payload.extend_from_slice(identifier.get(..API_KEY_ID_LEN)?);
+    (payload.len() == API_KEY_SEALED_PAYLOAD_LEN).then_some(payload)
+}
+
+/// A fresh API key value for a key defined in `scope` at `created_at_millis`, or
+/// `None` when the payload could not be sealed.
 ///
 /// `CreateAPIKey` answers "the generated, encrypted API key", an `APIKey`
 /// (`@length(1..2048)`, `@pattern(\S)` —
 /// `smithy_query(query="shape",shape="APIKey")`), and the model gives the value no
 /// further syntax, because a client does not parse it: it copies the value into its
-/// JavaScript CAPTCHA integration and hands it back to this service. What the model
-/// does say is what the value IS — an encrypted key that contains the token domains
-/// it was defined over — so the value is that definition sealed: a fresh
-/// [`API_KEY_NONCE_LEN`]-byte nonce, the ciphertext of the fixed-width payload and
-/// its [`API_KEY_TAG_LEN`]-byte tag, rendered with [`api_key_coder`].
+/// JavaScript CAPTCHA integration and hands it back to this service. So the value is
+/// a sealed token — a fresh [`API_KEY_NONCE_LEN`]-byte nonce, the ciphertext of the
+/// fixed-width payload and its [`API_KEY_TAG_LEN`]-byte tag, rendered with
+/// [`api_key_coder`].
 ///
-/// Every envelope is [`API_KEY_ENVELOPE_LEN`] bytes, because the payload is sealed at
-/// one width whatever it carries, so every key this service mints is the same width:
-/// a key's width tells a reader nothing about the definition it was minted for — not
-/// how many token domains were named, nor how long they are.
+/// Every envelope is [`API_KEY_ENVELOPE_LEN`] bytes, because the payload carries the
+/// key's own bookkeeping at one width and carries no part of the definition the key
+/// was minted over, so every key this service mints is the same short width: a key's
+/// width tells a reader nothing about the definition it was minted for — not how
+/// many token domains were named, nor how long they are — and it does not grow with
+/// the widest definition the model would allow either.
 ///
-/// Each key carries its own identifier ([`API_KEY_ID_LENGTH`]), so two mints over
-/// one definition are two different values and no key can be predicted from the
+/// Each key carries its own identifier ([`API_KEY_ID_LEN`]), so two mints over one
+/// definition are two different values and no key can be predicted from the
 /// definition it was asked for. A key is nevertheless MINTED only for a definition
 /// the scope does not already hold one for
 /// ([`ComAmazonawsWafv2Awswaf20190729State::api_key_for_token_domains`]), so a scope
 /// holds one key per token-domain set however often a mint is called for it.
-pub fn new_api_key(
-    scope: &str,
-    token_domains: &[String],
-    created_at_millis: i64,
-) -> Option<String> {
+pub fn new_api_key(scope: &str, created_at_millis: i64) -> Option<String> {
     use ::aes_gcm::aead::Aead;
     use ::base64::Engine as _;
 
@@ -216,7 +224,7 @@ pub fn new_api_key(
     let sealed = api_key_cipher()
         .encrypt(
             ::aes_gcm::Nonce::from_slice(nonce),
-            api_key_payload(scope, token_domains, created_at_millis)?.as_slice(),
+            api_key_payload(scope, created_at_millis)?.as_slice(),
         )
         .ok()?;
     let mut envelope: Vec<u8> = Vec::with_capacity(nonce.len() + sealed.len());
@@ -225,17 +233,17 @@ pub fn new_api_key(
     Some(api_key_coder().encode(envelope))
 }
 
-/// What an API key's envelope carries: the definition the key was sealed over.
+/// What an API key's envelope carries: the bookkeeping the key was sealed with.
+///
+/// The token domains a key was defined over are NOT in here — they live in the
+/// key's own record ([`ApiKeyEntry`]), which is where every read reports them from —
+/// so that a key's width stays a property of the key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecryptedApiKey {
     /// The `Scope` the key was defined in.
     pub scope: String,
     /// `APIKeySummary$CreationTimestamp` as milliseconds since the Unix epoch.
     pub created_at_millis: i64,
-    /// "The token domains that are defined in this API key"
-    /// (`GetDecryptedAPIKeyResponse$TokenDomains`), in the order the key carries
-    /// them.
-    pub token_domains: Vec<String>,
 }
 
 /// The envelope `value` decodes to, or `None` when it is not one at all: not of the
@@ -275,32 +283,22 @@ pub fn decrypt_api_key(value: &str) -> Option<DecryptedApiKey> {
     let payload = api_key_cipher()
         .decrypt(::aes_gcm::Nonce::from_slice(nonce), sealed)
         .ok()?;
-    let mut fields = payload.split(|byte| *byte == API_KEY_FIELD_SEPARATOR);
-    if fields.next()? != API_KEY_PAYLOAD_LAYOUT.as_bytes() {
+    if payload.len() != API_KEY_SEALED_PAYLOAD_LEN {
         return None;
     }
-    let scope = ::std::str::from_utf8(fields.next()?).ok()?.to_string();
-    let created_at_millis = ::std::str::from_utf8(fields.next()?)
-        .ok()?
-        .parse::<i64>()
-        .ok()?;
-    // The key's own identifier is not part of the definition: it is read for its
-    // presence and its width, and then read past.
-    if fields.next()?.len() != API_KEY_ID_LENGTH {
+    if *payload.first()? != API_KEY_PAYLOAD_LAYOUT {
         return None;
     }
-    // What is left is the definition and then the padding that holds every key to
-    // one width. A `TokenDomain` is `@length(1..253)`, so no domain is empty and the
-    // padding is exactly the empty fields.
-    let token_domains = fields
-        .filter(|domain| !domain.is_empty())
-        .map(|domain| ::std::str::from_utf8(domain).map(str::to_string))
-        .collect::<Result<Vec<String>, _>>()
-        .ok()?;
+    let scope = api_key_scope_word(*payload.get(API_KEY_SCOPE_AT)?)?.to_string();
+    let created_at_millis = i64::from_be_bytes(
+        payload
+            .get(API_KEY_CREATED_AT_AT..API_KEY_ID_AT)?
+            .try_into()
+            .ok()?,
+    );
     Some(DecryptedApiKey {
         scope,
         created_at_millis,
-        token_domains,
     })
 }
 

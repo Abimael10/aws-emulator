@@ -214,12 +214,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The DECRYPTED key: the definition the key's own token carries, which is
-        // what this operation hands back. The record the scope holds is what said
-        // the key exists; the domains and the creation instant come out of the key
-        // itself, in the order it carries them. A key the scope holds whose token
-        // this service cannot open is a system problem, not a bad parameter.
-        let Some(decrypted) = crate::state::decrypt_api_key(&entry.api_key) else {
+        // The DECRYPTED key: the token is opened first, because only a token this
+        // service sealed — in THIS scope — is a key it can report anything for, and
+        // the definition it was minted over comes out of the key's own record, which
+        // is the one place this service holds it and the same place `ListAPIKeys`
+        // reports it from. A key the scope holds whose token this service cannot open
+        // is a system problem, not a bad parameter.
+        let Some(decrypted) = crate::state::decrypt_api_key(&entry.api_key)
+            .filter(|decrypted| decrypted.scope == entry.scope)
+        else {
             return Err(GetDecryptedAPIKeyErrorModeled::WAFInternalErrorException(
                 WAFInternalErrorException {
                     message: Some("the API key could not be decrypted".to_string()),
@@ -229,7 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(GetDecryptedAPIKeyOutput {
-            token_domains: Some(decrypted.token_domains),
+            token_domains: Some(entry.token_domains.clone()),
             creation_timestamp: Some(::aws_smithy_types::DateTime::from_millis(
                 decrypted.created_at_millis,
             )),
