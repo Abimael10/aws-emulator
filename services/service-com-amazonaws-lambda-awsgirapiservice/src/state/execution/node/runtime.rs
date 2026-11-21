@@ -11,11 +11,13 @@
 //! `Error`'s own `stack` is the trace.
 //!
 //! What it is NOT is the containment or the bounds. The whole host surface of a run is the
-//! three functions [`super::install_host`] installs — the invocation log, a package entry's
-//! source, and a core module's source — and this source takes all three off the global
-//! object once it holds them. The deadline, the step ceiling and the memory ceiling are the
-//! engine's and the host's ([`super::Bounds`]), so no rebinding or deletion of a name here
-//! can lift one.
+//! functions [`super::install_host`] installs — the invocation log, a package entry's source,
+//! a core module's source, the pure computations `crypto` and `zlib` are served by, the one
+//! reading of a host name the execution environment's own resolver answers, the one AWS SDK
+//! call and the one request a handler sends itself — and this source takes every one of them
+//! off the global object once it holds them. The deadline, the step ceiling and the memory
+//! ceiling are the engine's and the host's ([`super::Bounds`]), so no rebinding or deletion of
+//! a name here can lift one.
 //!
 //! The protocol between host and runtime is one frozen global, `__lambdaRuntime`, so the
 //! host's own engine surface stays as small as a string in and a string out:
@@ -56,6 +58,11 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
     var hostCipher = globalThis.__hostCipher;
     var hostCiphers = globalThis.__hostCiphers;
     var hostHkdf = globalThis.__hostHkdf;
+    var hostPbkdf2 = globalThis.__hostPbkdf2;
+    var hostDeflate = globalThis.__hostDeflate;
+    var hostInflate = globalThis.__hostInflate;
+    var hostCrc32 = globalThis.__hostCrc32;
+    var hostResolve = globalThis.__hostResolve;
     var hostRandomHex = globalThis.__hostRandomHex;
     var hostAwsCall = globalThis.__hostAwsCall;
     var hostHttpSend = globalThis.__hostHttpSend;
@@ -75,6 +82,11 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
     delete globalThis.__hostCipher;
     delete globalThis.__hostCiphers;
     delete globalThis.__hostHkdf;
+    delete globalThis.__hostPbkdf2;
+    delete globalThis.__hostDeflate;
+    delete globalThis.__hostInflate;
+    delete globalThis.__hostCrc32;
+    delete globalThis.__hostResolve;
     delete globalThis.__hostRandomHex;
     delete globalThis.__hostAwsCall;
     delete globalThis.__hostHttpSend;
@@ -148,17 +160,25 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
 
     // The absolute path an id names: what the handler reads as `__filename`, as a module's
     // own url, and as the path in a filesystem error.
+    //
+    // A path carries ONE separator per step, and a mount's root is a directory in its own
+    // right: the id of a root carries no tail at all, and the path of that directory is the
+    // mount itself — `/var/task`, never `/var/task/`. That is what a module sitting at the
+    // root of the deployment package reads as its own `__dirname`, and what a path joined
+    // onto it has to be built from.
     function filenameOf(id) {
         if (id.indexOf(CORE_PREFIX) === 0) {
             return 'node:' + id.slice(CORE_PREFIX.length);
         }
-        if (id.indexOf(LAYER_PREFIX) === 0) {
-            return LAYER_ROOT + '/' + tailOf(id);
+        var root = rootOf(id);
+        var mount = TASK_ROOT;
+        if (root === LAYER_PREFIX) {
+            mount = LAYER_ROOT;
+        } else if (root === RUNTIME_PREFIX) {
+            mount = RUNTIME_ROOT;
         }
-        if (id.indexOf(RUNTIME_PREFIX) === 0) {
-            return RUNTIME_ROOT + '/' + tailOf(id);
-        }
-        return TASK_ROOT + '/' + id;
+        var tail = tailOf(id);
+        return tail === '' ? mount : mount + '/' + tail;
     }
 
     // The id an absolute path names, or `null` for a path that is on no mount of this
@@ -290,9 +310,182 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
         return null;
     }
 
-    function packageCandidate(directory, request) {
+    // ---------------------------------------------------------------- package exports
+
+    // The conditions this runtime resolves a package's `exports` under, one set per KIND of
+    // load: a `require` takes the conditions node activates for one and an `import` takes its
+    // own, so a dependency that publishes a CommonJS entry point beside an ES one is resolved
+    // to the entry point for the way it is being loaded. `node` is the platform this is, and
+    // `default` is the unconditional fallback every map may end with.
+    //
+    // Which of a map's own keys applies is decided by the MAP's order — "the first condition
+    // that matches" — so these are sets a key has to be in, not an order.
+    var REQUIRE_CONDITIONS = ['node', 'node-addons', 'require', 'default'];
+    var IMPORT_CONDITIONS = ['node', 'node-addons', 'import', 'default'];
+
+    // The target a conditional value states, with `star` substituted for the `*` of a pattern
+    // key (and `null` where the key carried none). A string is the target itself, an array is
+    // the first of its alternatives that states one, and an object is a map of conditions.
+    // `null` for a value stating no target this resolution may take.
+    function exportTarget(held, star, conditions, hops) {
+        if (typeof held === 'string') {
+            return star === null ? held : held.split('*').join(star);
+        }
+        if (hops >= MAX_MANIFEST_HOPS || held === null || typeof held !== 'object') {
+            return null;
+        }
+        var picked = null;
+        var index = 0;
+        if (Array.isArray(held)) {
+            for (index = 0; index < held.length; index += 1) {
+                picked = exportTarget(held[index], star, conditions, hops + 1);
+                if (picked !== null) {
+                    return picked;
+                }
+            }
+            return null;
+        }
+        var keys = Object.keys(held);
+        for (index = 0; index < keys.length; index += 1) {
+            if (conditions.indexOf(keys[index]) >= 0) {
+                picked = exportTarget(held[keys[index]], star, conditions, hops + 1);
+                if (picked !== null) {
+                    return picked;
+                }
+            }
+        }
+        return null;
+    }
+
+    // Whether `held` is a SUBPATH MAP — every key of it names a subpath — as against the
+    // conditions of the single export `.` is, whose keys are condition names.
+    function subpathMap(held) {
+        var keys = Object.keys(held);
+        if (keys.length === 0) {
+            return false;
+        }
+        for (var index = 0; index < keys.length; index += 1) {
+            if (keys[index].charAt(0) !== '.') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // The target a package's `exports` states for `subpath` — `.` for the package itself and
+    // `./x` for a subpath of it — or `null` for a subpath that package does not export.
+    //
+    // An exact key wins; past it a key carrying `*` is a PATTERN, and the one whose literal
+    // prefix is longest is the one that applies, with what the `*` stood for substituted into
+    // its target. A value that is not a subpath map states the one export `.` is, which is the
+    // shorthand form `"exports": "./index.js"` and the conditions-only form both take.
+    function exportedTarget(exported, subpath, conditions) {
+        if (typeof exported !== 'object' || exported === null || Array.isArray(exported)
+            || !subpathMap(exported)) {
+            return subpath === '.' ? exportTarget(exported, null, conditions, 0) : null;
+        }
+        if (Object.prototype.hasOwnProperty.call(exported, subpath)) {
+            var exact = exportTarget(exported[subpath], null, conditions, 0);
+            if (exact !== null) {
+                return exact;
+            }
+        }
+        var keys = Object.keys(exported);
+        var best = null;
+        var longest = -1;
+        for (var index = 0; index < keys.length; index += 1) {
+            var key = keys[index];
+            var star = key.indexOf('*');
+            if (star < 0) {
+                continue;
+            }
+            var head = key.slice(0, star);
+            var tail = key.slice(star + 1);
+            if (subpath.indexOf(head) !== 0 || subpath.length < head.length + tail.length) {
+                continue;
+            }
+            if (tail !== '' && subpath.slice(subpath.length - tail.length) !== tail) {
+                continue;
+            }
+            if (head.length > longest) {
+                longest = head.length;
+                best = exportTarget(
+                    exported[key],
+                    subpath.slice(head.length, subpath.length - tail.length),
+                    conditions,
+                    0
+                );
+            }
+        }
+        return best;
+    }
+
+    // The package a bare specifier names, and the subpath of that package it asks for: the
+    // first segment is the package's name, or the first two where the name is a scoped one.
+    function packageSpecifier(request) {
+        var segments = request.split('/');
+        var count = request.charAt(0) === '@' ? 2 : 1;
+        if (segments.length < count || segments[0] === '') {
+            return null;
+        }
+        var rest = segments.slice(count).join('/');
+        return {
+            name: segments.slice(0, count).join('/'),
+            subpath: rest === '' ? '.' : './' + rest
+        };
+    }
+
+    // The entry the package at `root` exports for `subpath`, for a package whose manifest
+    // declares `exports`, and `null` for one that does not declare it at all — which is what
+    // tells this resolution apart from the legacy one.
+    //
+    // A package that DOES declare it is resolved through that map and through nothing else:
+    // "the exports field … encapsulates the package, preventing consumers from reaching inside
+    // it", so a file the map does not state is not an entry of that package even though the
+    // package carries it. The suffix and directory forms are still tried on the target the map
+    // states, because a map may name a directory's index or a path without its extension.
+    function exportedCandidate(root, subpath, conditions) {
+        var manifest = sourceOf(root + '/package.json');
+        if (manifest === null) {
+            return null;
+        }
+        var declared = null;
+        try {
+            declared = JSON.parse(manifest).exports;
+        } catch (error) {
+            declared = null;
+        }
+        if (declared === null || declared === undefined) {
+            return null;
+        }
+        var target = exportedTarget(declared, subpath, conditions);
+        var joined = target === null ? null : packagePath(root, target);
+        if (joined === null) {
+            // The package states no such export, so it has none: the resolution stops here
+            // rather than falling through to the file the map left unstated, and WHY it
+            // stopped is held for the caller to report ([`unexported`]).
+            unexported = {
+                subpath: subpath,
+                manifest: filenameOf(root + '/package.json')
+            };
+            return { entry: null };
+        }
+        return { entry: sourceOf(joined) !== null ? joined : fileCandidate(joined) };
+    }
+
+    function packageCandidate(directory, request, conditions) {
+        var named = packageSpecifier(request);
         var current = directory;
         for (;;) {
+            var root = named === null
+                ? null
+                : packagePath(current, 'node_modules/' + named.name);
+            var exported = root === null
+                ? null
+                : exportedCandidate(root, named.subpath, conditions);
+            if (exported !== null) {
+                return exported.entry;
+            }
             var base = packagePath(current, 'node_modules/' + request);
             var found = base === null ? null : fileCandidate(base);
             if (found !== null) {
@@ -356,7 +549,11 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
     // of the HOST resolves to nothing, because the only files there are are this
     // function's own — every branch below answers with a [`packagePath`], which is inside
     // a mount or null.
-    function resolveRequest(directory, request) {
+    function resolveRequest(directory, request, conditions) {
+        var active = conditions === undefined ? REQUIRE_CONDITIONS : conditions;
+        // Whatever the last resolution refused is no longer this one's: a specifier that
+        // resolves to nothing for any other reason is the module-not-found it is.
+        unexported = null;
         if (typeof request !== 'string' || request === '') {
             return null;
         }
@@ -381,7 +578,7 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
             var absolute = idOfPath(request);
             return absolute === null ? null : fileCandidate(absolute);
         }
-        return packageCandidate(directory, request);
+        return packageCandidate(directory, request, active);
     }
 
     // The modules the RUNTIME itself supplies under its own `node_modules`, which a bare
@@ -396,9 +593,39 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
         return id === null || sourceOf(id) === null ? null : id;
     }
 
+    // What the last resolution refused because the package's own `exports` map does not state
+    // the subpath asked for, held until the caller reports it ([`packageNotExported`]).
+    //
+    // The package WAS found, and it states that it does not export that path, which is a
+    // different failure from a module that is nowhere: node reports it under its own code, and
+    // a program branching on that code is what the difference is for. It is set by
+    // [`exportedCandidate`] and cleared at the head of every resolution.
+    var unexported = null;
+
+    // That refusal, taken off the holder: it answers ONE failure, so a later resolution that
+    // refused nothing reports a module that could not be found.
+    function takeUnexported() {
+        var held = unexported;
+        unexported = null;
+        return held;
+    }
+
     function moduleNotFound(request) {
+        var refused = takeUnexported();
+        if (refused !== null) {
+            return packageNotExported(refused);
+        }
         var error = new Error("Cannot find module '" + request + "'");
         error.code = 'MODULE_NOT_FOUND';
+        return error;
+    }
+
+    // The failure a specifier the package does not export fails with: the message node writes
+    // for it, naming the subpath that was asked for and the manifest that does not state it.
+    function packageNotExported(held) {
+        var error = new Error("Package subpath '" + held.subpath
+            + '\' is not defined by "exports" in ' + held.manifest);
+        error.code = 'ERR_PACKAGE_PATH_NOT_EXPORTED';
         return error;
     }
 
@@ -412,6 +639,10 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
     // the engine's own loader resolves is reached through no require chain, so there is no
     // require stack to name.
     function requireNotFound(request, frames) {
+        var refused = takeUnexported();
+        if (refused !== null) {
+            return packageNotExported(refused);
+        }
         var stack = frames === undefined || frames === null ? requireStack() : frames;
         var error = new Error(
             "Cannot find module '" + request + "'\nRequire stack:\n- " + stack.join('\n- ')
@@ -789,7 +1020,7 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
         }
         var baseId = idOfEngineName(base);
         var directory = baseId === null ? '' : directoryOf(baseId);
-        var resolved = resolveRequest(directory, name);
+        var resolved = resolveRequest(directory, name, IMPORT_CONDITIONS);
         return resolved === null ? null : engineName(resolved);
     }
 
@@ -1083,6 +1314,23 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
         installAbort();
         installErrorStack();
         installErrorText();
+        // The performance clock, and the worker types a program holds a channel's two ends
+        // by: taken off the core module that implements each, so a handler that imports the
+        // module and one that reads the global hold the same object.
+        globalThis.performance = requireId(CORE_PREFIX + 'perf_hooks').performance;
+        var threads = requireId(CORE_PREFIX + 'worker_threads');
+        globalThis.MessageChannel = threads.MessageChannel;
+        globalThis.MessagePort = threads.MessagePort;
+        globalThis.Worker = threads.Worker;
+        // The rest of the WHATWG surface ([`super::web_globals`]), installed with this
+        // runtime's own `require` so that those globals and the core modules behind them are
+        // one and the same. The installer is taken off the global object here, before a line
+        // of the package is loaded, exactly as the host functions were.
+        if (typeof globalThis.__installWebGlobals === 'function') {
+            var installWebGlobals = globalThis.__installWebGlobals;
+            delete globalThis.__installWebGlobals;
+            installWebGlobals(requireFrom('', [RUNTIME_ENTRY]));
+        }
         // "Error.stackTraceLimit ... The default value is 10": the number of frames an
         // error's own stack carries, which `NODE_OPTIONS` can set.
         Error.stackTraceLimit = 10;
@@ -2511,6 +2759,54 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
         // that resolves to nothing fails the way a `require` of the same specifier does.
         moduleNotFound: moduleNotFound,
         requireId: requireId,
+        // A FRESH instance of a module of this function's own mounts, which is what a
+        // WORKER's entry point is: a worker shares no module cache with the thread that
+        // started it, so the module is compiled and run again — with its own `module` and
+        // `exports`, its own `require` resolving from its own directory, and its own
+        // `__filename`/`__dirname`. `source` stands in for the file's own text, which is what
+        // an entry point passed as source rather than as a path is
+        // ([`core_modules`]'s `worker_threads`, `new Worker(code, { eval: true })`).
+        //
+        // It is no new reach: the path is resolved by the same [`idOfPath`] every other
+        // lookup goes through, so only an entry of this function's own mounts is read, and
+        // the `require` the instance is given is the one every module of the package gets.
+        freshModule: function (filename, source) {
+            var id = typeof filename === 'string' ? idOfPath(filename) : null;
+            if (id === null) {
+                return null;
+            }
+            var text = typeof source === 'string' ? source : sourceOf(id);
+            if (text === null) {
+                return null;
+            }
+            var named = filenameOf(id);
+            var directory = directoryOf(id);
+            return function () {
+                var module = {
+                    id: named,
+                    filename: named,
+                    exports: {},
+                    loaded: false,
+                    children: [],
+                    paths: searchPaths(directory)
+                };
+                var compiled = compileModule(
+                    named,
+                    'export default function (exports, require, module, __filename, '
+                        + '__dirname) {' + text + '\n};\n'
+                );
+                compiled.call(
+                    module.exports,
+                    module.exports,
+                    requireFrom(directory, [named, RUNTIME_ENTRY]),
+                    module,
+                    named,
+                    filenameOf(directory)
+                );
+                module.loaded = true;
+                return module.exports;
+            };
+        },
         // The three computations the `crypto` core module is served by, the symmetric
         // transform beside them, and the two reads the `fs` one answers from the read-only
         // mounts.
@@ -2548,6 +2844,49 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
                 throw new RangeError('Invalid key length');
             }
             return derived;
+        },
+        // The key the iterated construction derives from the parts a password-based
+        // derivation is given ([`super::digest::pbkdf2`]).
+        pbkdf2: function (parts, iterations, length) {
+            var derived = hostPbkdf2(parts, iterations, length);
+            if (derived === null || derived === undefined) {
+                throw new RangeError('Invalid key length');
+            }
+            return derived;
+        },
+        // The two directions of the DEFLATE stream the `zlib` core module computes
+        // ([`super::compress`]): the wrapper names the stream, and a wrapper this runtime
+        // does not compute — or a call past the host's own ceiling — is refused rather than
+        // answered with bytes of another stream.
+        deflate: function (format, level, data) {
+            var compressed = hostDeflate(format, level, data);
+            if (compressed === null || compressed === undefined) {
+                throw new Error('unsupported compression');
+            }
+            return compressed;
+        },
+        inflate: function (format, data) {
+            var inflated = hostInflate(format, data);
+            if (inflated === null || inflated === undefined) {
+                throw new Error('incorrect data check');
+            }
+            return inflated;
+        },
+        // The checksum that same module computes over bytes ([`super::compress::crc32`]).
+        crc32: function (data, seed) {
+            var checksum = hostCrc32(data, seed);
+            if (checksum === null || checksum === undefined) {
+                throw new RangeError('Invalid data length');
+            }
+            return checksum;
+        },
+        // The addresses a host name resolves to inside this execution environment, which is
+        // the ONE reading of a name the whole runtime shares
+        // ([`super::super::guest_resolver`]): a name no zone this emulator holds names an
+        // address under resolves to none.
+        resolveAddresses: function (host) {
+            var resolved = hostResolve(typeof host === 'string' ? host : '');
+            return resolved === null || resolved === undefined ? [] : resolved;
         },
         randomHex: function (count) {
             var drawn = hostRandomHex(count);

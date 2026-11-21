@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The three COMPUTATIONS the `crypto` core module is served by: a digest, a keyed digest,
-//! the key a digest derives and cryptographic random bytes.
+//! The COMPUTATIONS the `crypto` core module is served by: a digest, a keyed digest, the keys
+//! a digest derives and cryptographic random bytes.
 //!
 //! None of them is written here. A digest is the arithmetic the RustCrypto implementations
 //! this crate links already state, the keyed digest is `hmac` over one of them, the derived
-//! key is `hkdf` over the same, and the random bytes are the platform's own cryptographic
-//! source. They are host functions rather than guest source because that is where those
+//! keys are `hkdf` and `pbkdf2` over the same, and the random bytes are the platform's own
+//! cryptographic source. They are host functions rather than guest source because that is where those
 //! implementations are — not because the guest is given any new reach: an algorithm name and
 //! bytes go in, bytes come out, and nothing here opens a file, a socket or an environment.
 
@@ -102,6 +102,84 @@ pub(super) fn hkdf(
             ::hkdf::Hkdf::<$hash>::new(Some(&salt), &ikm)
                 .expand(&info, &mut bytes)
                 .ok()?;
+            ::hex::encode(bytes)
+        }};
+    }
+    let derived = match algorithm {
+        "md5" => derived!(::md5::Md5),
+        "sha1" => derived!(::sha1::Sha1),
+        "sha256" => derived!(::sha2::Sha256),
+        "sha384" => derived!(::sha2::Sha384),
+        "sha512" => derived!(::sha2::Sha512),
+        _ => return None,
+    };
+    Some(derived)
+}
+
+/// How many ITERATIONS one password-based derivation may be asked for.
+///
+/// A HOST bound on the work one `pbkdf2` call makes this process do, which is spent in host
+/// code outside the engine's own bounds, so a count past this is refused rather than run. It is
+/// far above the hundreds of thousands a password derivation is parameterised with today.
+pub(super) const MAX_PBKDF2_ITERATIONS: u32 = 10_000_000;
+
+/// How many keyed-digest ROUNDS one password-based derivation may run in total.
+///
+/// The cost of the construction is not the iteration count alone: it derives one BLOCK per
+/// digest length of key asked for, and runs the whole iteration count again for each of them
+/// (PKCS #5 §5.2). So the bound that bounds the work is on the PRODUCT — a call asking for 255
+/// blocks of ten million rounds each is not the same call as one asking for one block of them,
+/// and only this ceiling tells them apart. It is the iteration ceiling above, which leaves the
+/// ordinary single-block derivation at any count that ceiling allows.
+pub(super) const MAX_PBKDF2_ROUNDS: u64 = MAX_PBKDF2_ITERATIONS as u64;
+
+/// The length of the digest `algorithm` names, in bytes, which is how much key ONE block of a
+/// derivation yields; `None` for a name this module computes no digest for.
+#[must_use]
+pub(super) fn digest_bytes(algorithm: &str) -> Option<usize> {
+    let held = match algorithm {
+        "md5" => 16,
+        "sha1" => 20,
+        "sha256" => 32,
+        "sha384" => 48,
+        "sha512" => 64,
+        _ => return None,
+    };
+    Some(held)
+}
+
+/// The `length` bytes PBKDF2 derives from `password` under `algorithm`, salted with `salt` over
+/// `iterations` rounds — hex in, hex out.
+///
+/// The construction is not written here: it is the one its own crate states, over the same
+/// keyed digests as [`hmac`] above, so a key derived here is the key any other implementation
+/// of PKCS #5 derives from the same four inputs.
+#[must_use]
+pub(super) fn pbkdf2(
+    algorithm: &str,
+    password: &str,
+    salt: &str,
+    iterations: u32,
+    length: usize,
+) -> Option<String> {
+    let hash_bytes = digest_bytes(algorithm)?;
+    if !DIGEST_ALGORITHMS.contains(&algorithm) || length > MAX_DERIVED_BYTES || iterations == 0 {
+        return None;
+    }
+    // The WORK the call asks for, which is what the ceiling is on: one block per digest length
+    // of key, and the whole iteration count for each block. Computed before the derivation
+    // runs, because the derivation is a synchronous host call that nothing interrupts.
+    let blocks = length.div_ceil(hash_bytes).max(1) as u64;
+    if blocks * u64::from(iterations) > MAX_PBKDF2_ROUNDS {
+        return None;
+    }
+    let password = ::hex::decode(password).ok()?;
+    let salt = ::hex::decode(salt).ok()?;
+    // One arm per hash, because the construction is instantiated over the hash's type.
+    macro_rules! derived {
+        ($hash:ty) => {{
+            let mut bytes = vec![0_u8; length];
+            ::pbkdf2::pbkdf2_hmac::<$hash>(&password, &salt, iterations, &mut bytes);
             ::hex::encode(bytes)
         }};
     }
@@ -343,6 +421,118 @@ mod tests {
                 "case {case:?}: expected no key to be derived"
             );
         }
+    }
+
+    /// One published PBKDF2 test vector: the inputs the standard states and the key it
+    /// publishes for them.
+    struct Vector {
+        case: &'static str,
+        algorithm: &'static str,
+        password: &'static [u8],
+        salt: &'static [u8],
+        iterations: u32,
+        length: usize,
+        expected: &'static str,
+    }
+
+    /// RULE: a password-derived key is the iterated construction's own answer over its four
+    /// inputs, which is what makes a key derived here the key any other implementation derives.
+    ///
+    /// The rows are RFC 6070's published PBKDF2-HMAC-SHA-1 test vectors — case 1 (one
+    /// iteration), case 2 (two), case 3 (4096) and case 5 (a long password and salt with a
+    /// 25-byte key) — plus RFC 7914 §11's SHA-256 vector, so the rows differ along the
+    /// iteration count, the key length and the digest the construction stands on.
+    #[test]
+    fn a_password_derived_key_is_its_constructions_own() {
+        let cases: &[Vector] = &[
+            Vector {
+                case: "RFC 6070 case 1",
+                algorithm: "sha1",
+                password: b"password",
+                salt: b"salt",
+                iterations: 1,
+                length: 20,
+                expected: "0c60c80f961f0e71f3a9b524af6012062fe037a6",
+            },
+            Vector {
+                case: "RFC 6070 case 2",
+                algorithm: "sha1",
+                password: b"password",
+                salt: b"salt",
+                iterations: 2,
+                length: 20,
+                expected: "ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957",
+            },
+            Vector {
+                case: "RFC 6070 case 3",
+                algorithm: "sha1",
+                password: b"password",
+                salt: b"salt",
+                iterations: 4096,
+                length: 20,
+                expected: "4b007901b765489abead49d926f721d065a429c1",
+            },
+            Vector {
+                case: "RFC 6070 case 5",
+                algorithm: "sha1",
+                password: b"passwordPASSWORDpassword",
+                salt: b"saltSALTsaltSALTsaltSALTsaltSALTsalt",
+                iterations: 4096,
+                length: 25,
+                expected: "3d2eec4fe41c849b80c8d83662c0e44a8b291a964cf2f07038",
+            },
+            Vector {
+                case: "RFC 7914 section 11, over SHA-256",
+                algorithm: "sha256",
+                password: b"passwd",
+                salt: b"salt",
+                iterations: 1,
+                length: 64,
+                expected: "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc49ca9cccf179b645991664b39d77ef317c71b845b1e30bd509112041d3a19783",
+            },
+        ];
+        for Vector {
+            case,
+            algorithm,
+            password,
+            salt,
+            iterations,
+            length,
+            expected,
+        } in cases
+        {
+            let derived = pbkdf2(
+                algorithm,
+                &::hex::encode(password),
+                &::hex::encode(salt),
+                *iterations,
+                *length,
+            );
+            assert_eq!(
+                derived.as_deref(),
+                Some(*expected),
+                "case {case:?}: expected the published derived key, got {derived:?}"
+            );
+        }
+        // A digest this module does not compute derives nothing, and neither does a count, a
+        // length or a total amount of WORK outside the host's own bounds.
+        for (case, algorithm, iterations, length) in [
+            ("a digest this module does not compute", "sha3-256", 1_u32, 32_usize),
+            ("no iterations at all", "sha256", 0, 32),
+            ("a count past the host's ceiling", "sha256", MAX_PBKDF2_ITERATIONS + 1, 32),
+            ("a length past the host's ceiling", "sha256", 1, MAX_DERIVED_BYTES + 1),
+            // One block of this count is inside the ceiling; the same count over a key of many
+            // blocks is the product that is not, which is the bound the two factors alone
+            // would miss.
+            ("a product past the host's ceiling", "sha256", MAX_PBKDF2_ITERATIONS, 64),
+        ] {
+            assert!(
+                pbkdf2(algorithm, "0b", "", iterations, length).is_none(),
+                "case {case:?}: expected no key to be derived"
+            );
+        }
+        // The same count over ONE block is work the ceiling allows, which the vectors above
+        // derive: the bound is on the product and not on the count alone.
     }
 
     /// Random bytes are the count asked for, and two draws of a non-trivial count differ —

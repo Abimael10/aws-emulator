@@ -7002,6 +7002,16 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "pbkdf2"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
+dependencies = [
+ "digest 0.10.7",
+ "hmac 0.12.1",
+]
+
+[[package]]
+name = "pbkdf2"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112d82ceb8c5bf524d9af484d4e4970c9fd5a0cc15ba14ad93dccd28873b0629"
@@ -7580,7 +7590,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -8922,7 +8932,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d87af57419b594aa23fa95f09f0e06d80d84ba01c26148c43844cad6ff4485f0"
 dependencies = [
  "cfg-if",
- "pbkdf2",
+ "pbkdf2 0.13.0",
  "salsa20",
  "sha2 0.11.1",
 ]
@@ -15679,7 +15689,7 @@ dependencies = [
  "java-properties",
  "kafka-protocol",
  "lz4_flex",
- "pbkdf2",
+ "pbkdf2 0.13.0",
  "rand 0.9.5",
  "regex",
  "rustls",
@@ -16150,10 +16160,12 @@ dependencies = [
  "aws-smithy-types",
  "aws-types",
  "base64 0.22.1",
+ "brotli",
  "bytes",
  "cbc",
  "chrono",
  "chrono-tz",
+ "crc32fast",
  "ctr",
  "flate2",
  "form_urlencoded",
@@ -16171,6 +16183,7 @@ dependencies = [
  "libc",
  "md-5 0.10.6",
  "nix",
+ "pbkdf2 0.12.2",
  "percent-encoding",
  "rand 0.9.5",
  "regex",

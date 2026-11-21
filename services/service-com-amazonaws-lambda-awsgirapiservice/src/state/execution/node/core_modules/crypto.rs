@@ -44,6 +44,22 @@ var MAX_RANDOM_BYTES = 65536;
 // as the random draw's is above and for the same reason.
 var DIGEST_BYTES = { md5: 16, sha1: 20, sha256: 32, sha384: 48, sha512: 64 };
 
+// How many iterations one password-based derivation may ask for, and how many keyed-digest
+// ROUNDS it may run in total, which are the ceilings the HOST enforces
+// ([`super::super::digest::MAX_PBKDF2_ITERATIONS`], `MAX_PBKDF2_ROUNDS`): the rounds are spent
+// in host code, outside the engine's own bounds, so the bounds are stated on both sides of the
+// call. The derivation runs the whole iteration count once per BLOCK of key asked for, so what
+// bounds the work is the product.
+var MAX_PBKDF2_ITERATIONS = 10000000;
+var MAX_PBKDF2_ROUNDS = 10000000;
+
+// How many bytes one derivation may ask for, which is the ceiling the HOST enforces for both
+// derivations ([`super::super::digest::MAX_DERIVED_BYTES`]): the bytes are materialised in host
+// memory, outside the engine's own allocation ceiling. The extract-and-expand construction has
+// a tighter ceiling of its own per digest (255 times its length, RFC 5869 §2.3), which
+// `hkdfSync` states; the iterated one has none, so this host bound is what bounds it.
+var MAX_DERIVED_BYTES = 16320;
+
 function algorithmOf(name) {
     var wanted = String(name).toLowerCase().replace(/-/g, '');
     for (var index = 0; index < ALGORITHMS.length; index += 1) {
@@ -803,6 +819,57 @@ exports.hkdf = function (digest, ikm, salt, info, keylen, callback) {
     var derived = null;
     try {
         derived = exports.hkdfSync(digest, ikm, salt, info, keylen);
+    } catch (error) {
+        Promise.resolve().then(function () { done(error); });
+        return undefined;
+    }
+    Promise.resolve().then(function () { done(null, derived); });
+    return undefined;
+};
+// "Provides a synchronous Password-Based Key Derivation Function 2 (PBKDF2)
+// implementation": the iterated keyed digest of PKCS #5, computed by the host over the same
+// digests as the keyed digest above ([`super::super::digest::pbkdf2`]). The iteration count
+// and the key length are bounded on BOTH sides of the host call, as the derivation above is
+// and for the same reason: the work and the bytes are the host's.
+exports.pbkdf2Sync = function (password, salt, iterations, keylen, digest) {
+    var algorithm = algorithmOf(digest === undefined ? 'sha1' : digest);
+    var rounds = Math.trunc(Number(iterations));
+    var length = Math.trunc(Number(keylen));
+    if (!Number.isSafeInteger(rounds) || rounds < 1 || rounds > MAX_PBKDF2_ITERATIONS) {
+        var counted = new RangeError('The value of "iterations" is out of range. It must be '
+            + '>= 1 && <= ' + MAX_PBKDF2_ITERATIONS + '. Received ' + String(iterations));
+        counted.code = 'ERR_OUT_OF_RANGE';
+        throw counted;
+    }
+    var ceiling = MAX_DERIVED_BYTES;
+    if (!Number.isSafeInteger(length) || length < 0 || length > ceiling) {
+        var sized = new RangeError('The value of "keylen" is out of range. It must be >= 0 '
+            + '&& <= ' + ceiling + '. Received ' + String(keylen));
+        sized.code = 'ERR_OUT_OF_RANGE';
+        throw sized;
+    }
+    // One block of key per digest length, each of them the whole iteration count: what the
+    // host bounds is that product, so it is checked here too.
+    var blocks = Math.max(1, Math.ceil(length / DIGEST_BYTES[algorithm]));
+    if (blocks * rounds > MAX_PBKDF2_ROUNDS) {
+        var work = new RangeError('The value of "iterations" is out of range. It must be '
+            + '>= 1 && <= ' + Math.floor(MAX_PBKDF2_ROUNDS / blocks) + ' for a key of '
+            + length + ' bytes. Received ' + String(iterations));
+        work.code = 'ERR_OUT_OF_RANGE';
+        throw work;
+    }
+    var derived = host().pbkdf2(
+        [algorithm, hexOf(password), hexOf(salt)],
+        rounds,
+        length
+    );
+    return Buffer.from(derived, 'hex');
+};
+exports.pbkdf2 = function (password, salt, iterations, keylen, digest, callback) {
+    var done = typeof callback === 'function' ? callback : function () { return undefined; };
+    var derived = null;
+    try {
+        derived = exports.pbkdf2Sync(password, salt, iterations, keylen, digest);
     } catch (error) {
         Promise.resolve().then(function () { done(error); });
         return undefined;

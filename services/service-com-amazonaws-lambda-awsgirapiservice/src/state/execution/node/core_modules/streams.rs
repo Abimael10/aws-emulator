@@ -289,6 +289,9 @@ function Transform(options) {
     if (options !== undefined && options !== null && typeof options.transform === 'function') {
         this._transform = options.transform;
     }
+    if (options !== undefined && options !== null && typeof options.flush === 'function') {
+        this._flush = options.flush;
+    }
 }
 
 inherit(Transform, Duplex);
@@ -313,9 +316,26 @@ Transform.prototype._write = function (chunk, encoding, done) {
     });
 };
 
+// "transform._flush(callback)": the last chance a transform has to emit anything it was
+// holding, which is what a transform computing over the WHOLE input it was written pushes from.
+// It is called once the writing side has ended and before the reading side does, so what it
+// pushes is read before the `end` event.
 Transform.prototype._final = function (done) {
-    this.push(null);
-    done();
+    var self = this;
+    if (typeof this._flush !== 'function') {
+        this.push(null);
+        done();
+        return;
+    }
+    this._flush(function (error, transformed) {
+        if (error !== undefined && error !== null) {
+            self.emit('error', error);
+        } else if (transformed !== undefined && transformed !== null) {
+            self.push(transformed);
+        }
+        self.push(null);
+        done();
+    });
 };
 
 function PassThrough(options) {

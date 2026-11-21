@@ -20,9 +20,13 @@
 //!   nothing at all;
 //! * the host functions [`install_host`] installs are the whole host surface of a run —
 //!   the invocation log, a package entry's source and the package's entry list, a core
-//!   module's source, and the three pure computations `crypto` is served by (a digest, a
-//!   keyed digest and random bytes) — and the runtime source takes every one of them off
-//!   the global object as soon as it holds them
+//!   module's source, the pure computations `crypto` and `zlib` are served by (a digest, a
+//!   keyed digest, the two key derivations, a symmetric transform, random bytes, the two
+//!   directions of a deflate stream and a checksum), the ONE reading of a host name the
+//!   execution environment's own resolver answers ([`super::guest_resolver`], which asks
+//!   nothing of any network and answers out of this emulator's own zones), the ONE AWS SDK
+//!   call and the ONE request a handler sends itself — and the runtime source takes every one
+//!   of them off the global object as soon as it holds them
 //!   ([`runtime`]). What stays reachable from guest code is the runtime's own frozen
 //!   protocol object, through which a handler can at most decide its own answer — which
 //!   returning a value already does — because every bound is held here, in host code;
@@ -91,6 +95,12 @@ mod core_modules;
 /// The digests and random bytes the `crypto` core module is served by.
 mod digest;
 
+/// The deflate streams the `zlib` core module is served by.
+mod compress;
+
+/// The WHATWG globals a managed runtime defines beside the language's own.
+mod web_globals;
+
 /// The symmetric ciphers that same core module is served by.
 mod cipher;
 
@@ -154,6 +164,12 @@ const RUNTIME_ENTRY_UNIT: &str = "file:///var/runtime/index.mjs";
 /// rather than from any file of the deployment package, which node names under its internal
 /// module namespace.
 const RUNTIME_INTL_UNIT: &str = "node:internal/intl";
+
+/// The unit the source completing the runtime's own GLOBAL surface is compiled as
+/// ([`web_globals`]): the WHATWG globals a managed runtime defines beside the language's own,
+/// which node likewise holds under its internal module namespace rather than in any file of the
+/// deployment package.
+const RUNTIME_WEB_UNIT: &str = "node:internal/webglobals";
 
 /// One invocation to run: the package, the handler, and everything the runtime reports to
 /// it.
@@ -296,6 +312,10 @@ fn evaluate(request: &Run<'_>, capture: &Arc<Mutex<Capture>>, bounds: &Arc<Bound
         // `Intl` and the local-zone reading of `Date`, which stand on the zone database the
         // host looks a zone's offset up in ([`intl`]).
         evaluate_runtime_unit(&ctx, RUNTIME_INTL_UNIT, intl::INTL_SOURCE)?;
+        // The WHATWG globals the runtime defines beside the language's own ([`web_globals`]),
+        // installed before a line of the package is loaded — which is where a managed runtime
+        // has them, so a module BODY that reads one reads it.
+        evaluate_runtime_unit(&ctx, RUNTIME_WEB_UNIT, web_globals::WEB_GLOBALS_SOURCE)?;
         // The runtime is installed; from here it loads the handler's module, which is the
         // rest of the INIT phase. The engine is standing and nothing of the RUN's own code
         // has been read yet, so this is where the memory the run itself takes is measured
@@ -642,6 +662,99 @@ fn install_host(
             }),
         )
         .map_err(|error| format!("the key derivation could not be installed: {error}"))?;
+    // The PASSWORD-BASED derivation the same module computes, the same way: the parts travel
+    // as one list, with the iteration count and the length beside them ([`digest::pbkdf2`]).
+    globals
+        .set(
+            "__hostPbkdf2",
+            Func::from(|parts: Vec<String>, iterations: f64, length: f64| {
+                let part = |at: usize| parts.get(at).map_or("", String::as_str);
+                // Both numbers are spent in HOST memory and host time, outside the engine's own
+                // bounds, so each is checked before it becomes one: a value that is not a whole
+                // number inside the ceiling is refused rather than cast (an `as` cast of a
+                // large float saturates).
+                #[allow(clippy::cast_precision_loss)]
+                let whole = |value: f64, ceiling: usize| -> bool {
+                    value.is_finite()
+                        && value >= 0.0
+                        && value.fract() == 0.0
+                        && value <= ceiling as f64
+                };
+                if !whole(iterations, digest::MAX_PBKDF2_ITERATIONS as usize)
+                    || !whole(length, digest::MAX_DERIVED_BYTES)
+                {
+                    return None;
+                }
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                digest::pbkdf2(
+                    part(0),
+                    part(1),
+                    part(2),
+                    iterations as u32,
+                    length as usize,
+                )
+            }),
+        )
+        .map_err(|error| format!("the password derivation could not be installed: {error}"))?;
+    // The two directions of the DEFLATE stream the `zlib` core module computes: a wrapper name
+    // and hex bytes go in, hex bytes come out, and both are bounded in host memory
+    // ([`compress`]).
+    globals
+        .set(
+            "__hostDeflate",
+            Func::from(|format: String, level: f64, data: String| {
+                compress::deflate(&format, level, &data)
+            }),
+        )
+        .map_err(|error| format!("the compressor could not be installed: {error}"))?;
+    globals
+        .set(
+            "__hostInflate",
+            Func::from(|format: String, data: String| compress::inflate(&format, &data)),
+        )
+        .map_err(|error| format!("the decompressor could not be installed: {error}"))?;
+    globals
+        .set(
+            "__hostCrc32",
+            Func::from(|data: String, seed: f64| {
+                // The seed is the checksum state the guest held, which is one 32-bit value: a
+                // number that is not one is read as no state at all rather than cast (an `as`
+                // cast of a large float saturates).
+                #[allow(clippy::cast_precision_loss)]
+                let held = if seed.is_finite()
+                    && seed >= 0.0
+                    && seed.fract() == 0.0
+                    && seed <= f64::from(u32::MAX)
+                {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    {
+                        seed as u32
+                    }
+                } else {
+                    0
+                };
+                compress::crc32(&data, held).map(f64::from)
+            }),
+        )
+        .map_err(|error| format!("the checksum could not be installed: {error}"))?;
+    // The NAME SERVICE of the execution environment, which is what the `dns` core module
+    // answers from: ONE reading of a name for the whole run ([`super::guest_resolver`]), out of
+    // the zones this emulator can name an address in and out of nothing else — this machine's
+    // own loopback, the private zone of the VPC the function is attached to, and the names a
+    // DNS standard itself fixes. No lookup leaves this process, and a name no such zone holds
+    // resolves to nothing.
+    let inside = aws.and_then(AwsAccess::inside_vpc);
+    globals
+        .set(
+            "__hostResolve",
+            Func::from(move |host: String| {
+                super::guest_resolver::addresses_of(inside.as_ref(), &host)
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<String>>()
+            }),
+        )
+        .map_err(|error| format!("the name service could not be installed: {error}"))?;
     globals
         .set(
             "__hostEncode",
@@ -1939,7 +2052,6 @@ mod tests {
                 "a child process",
                 "require('child_process').execSync('ls /')",
             ),
-            ("a socket", "require('net')"),
             ("a native binding", "process.binding('fs')"),
             ("a host path above the task root", "require('../../../etc/passwd')"),
             (
@@ -1967,6 +2079,44 @@ mod tests {
                 "case {case}: expected the run to be refused the host, got {:?}",
                 finished.completion
             );
+        }
+    }
+
+    /// RULE: a module of the standard library whose own capability this runtime has none of is
+    /// importable all the same, and what is refused is the CALL that needs the capability — in
+    /// the platform's own failure, through that entry point's own channel.
+    ///
+    /// The rows are the three calls of `net` and `tls` that would hold a socket, which this
+    /// engine reaches the host through nothing to open: each reports the number a system call
+    /// that is not there answers with, and nothing is reported as connected, accepted or sent.
+    #[test]
+    fn a_call_that_would_hold_a_socket_is_refused() {
+        // Each row: the case, and the call the handler makes on the module it imported.
+        let cases: &[(&str, &str)] = &[
+            (
+                "a client connection",
+                "require('net').connect(443, 'example.com')",
+            ),
+            (
+                "a secure client connection",
+                "require('tls').connect(443, 'example.com')",
+            ),
+            ("a listening server", "require('net').createServer().listen(8080)"),
+        ];
+        for (case, call) in cases {
+            let source = format!(
+                "exports.handler = async () => new Promise((resolve) => {{ const held = \
+                 {call}; held.on('error', (error) => resolve({{ code: error.code, syscall: \
+                 error.syscall }})); }});"
+            );
+            let finished = ran(&source, "index.handler", None);
+            match &finished.completion {
+                Completion::Returned(payload) => assert!(
+                    payload.contains("\"ENOSYS\""),
+                    "case {case}: expected the call to be refused with ENOSYS, got {payload}"
+                ),
+                other => panic!("case {case}: expected the refusal to be reported, got {other:?}"),
+            }
         }
     }
 

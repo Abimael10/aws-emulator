@@ -9,19 +9,23 @@
 //! compiled, cached and reachable under both its bare and its `node:` name exactly as a
 //! package module is.
 //!
-//! Every one of them is COMPUTATION over values the run already holds: text, paths,
-//! formatting and event dispatch. None reaches a host file, socket, process or
-//! environment, because there is no host function here to reach one with — the whole host
-//! surface of a run is the three functions [`super::install_host`] installs. A module a
-//! Node program expects and this emulator does not supply is simply not resolvable, so a
-//! handler that needs one fails to import exactly as it would if the dependency were
-//! missing from its package; nothing here pretends to be a module it is not.
+//! Almost every one of them is COMPUTATION over values the run already holds: text, paths,
+//! formatting, compression, event dispatch. The exceptions are the two that answer from this
+//! EMULATOR rather than from the run — the HTTP client, whose one request the host carries
+//! into this emulator and no further ([`http`]), and the name service, which is the one
+//! resolver of the execution environment ([`dns`]) — and neither reaches a host file, socket,
+//! process or environment either, because there is no host function here to reach one with:
+//! the whole host surface of a run is what [`super::install_host`] installs. A module a Node
+//! program expects and this emulator does not supply is simply not resolvable, so a handler
+//! that needs one fails to import exactly as it would if the dependency were missing from its
+//! package; nothing here pretends to be a module it is not.
 //!
 //! A module whose whole capability this runtime HAS NONE OF is supplied all the same, with
-//! the calls that need that capability refused ([`child_process`]): the standard library is
-//! part of what a managed runtime promises, so an import of one of its modules has to load
-//! — a program whose module body imports one and whose running code handles the refusal is
-//! a program that runs — and what is answered for is the CALL rather than the import.
+//! the calls that need that capability refused ([`child_process`], [`sockets`]): the standard
+//! library is part of what a managed runtime promises, so an import of one of its modules has
+//! to load — a program whose module body imports one and whose running code handles the
+//! refusal is a program that runs — and what is answered for is the CALL rather than the
+//! import.
 
 /// The byte container and its codecs.
 mod buffer;
@@ -29,16 +33,28 @@ mod buffer;
 mod child_process;
 /// The digests, keyed digests and random bytes.
 mod crypto;
+/// The three modules a program observes its own execution through.
+mod diagnostics;
+/// The name service of the execution environment.
+mod dns;
 /// The in-memory filesystem a function has.
 mod fs;
 /// The HTTP client a handler sends a request of its own with.
 mod http;
+/// The lines a program reads off a stream, and the source it compiles at runtime.
+mod scripting;
+/// The stream-socket interfaces, on a runtime that holds no socket.
+mod sockets;
 /// The stream object model and the text decoder over it.
 mod streams;
 /// The environment report, the assertions, and the two text codecs.
 mod system;
 /// The scheduling calls, as modules.
 mod timers;
+/// The workers a program hands part of its work to.
+mod worker_threads;
+/// The compression a program asks its runtime for.
+mod zlib;
 
 /// Every core module, by the name a handler imports it under.
 pub(super) const CORE_MODULES: &[(&str, &str)] = &[
@@ -65,6 +81,20 @@ pub(super) const CORE_MODULES: &[(&str, &str)] = &[
     ("assert/strict", system::ASSERT_SOURCE),
     ("querystring", system::QUERYSTRING_SOURCE),
     ("url", system::URL_SOURCE),
+    // The socket modules, whose own capability this runtime has none of ([`sockets`]), and
+    // the name service it does answer from its own resolver ([`dns`]).
+    ("net", sockets::NET_SOURCE),
+    ("tls", sockets::TLS_SOURCE),
+    ("dns", dns::DNS_SOURCE),
+    ("dns/promises", dns::DNS_PROMISES_SOURCE),
+    ("zlib", zlib::ZLIB_SOURCE),
+    ("worker_threads", worker_threads::WORKER_THREADS_SOURCE),
+    ("perf_hooks", diagnostics::PERF_HOOKS_SOURCE),
+    ("async_hooks", diagnostics::ASYNC_HOOKS_SOURCE),
+    ("v8", diagnostics::V8_SOURCE),
+    ("vm", scripting::VM_SOURCE),
+    ("readline", scripting::READLINE_SOURCE),
+    ("readline/promises", scripting::READLINE_PROMISES_SOURCE),
 ];
 
 /// The source of the core module `name` names, or `None` when this emulator supplies none.
@@ -579,7 +609,7 @@ mod tests {
                 );
             }
         }
-        for absent in ["net", "worker_threads", "node:net", "", "node:"] {
+        for absent in ["http2", "inspector", "node:http2", "", "node:"] {
             assert!(
                 core_module_source(absent).is_none(),
                 "case {absent:?}: this emulator supplies no such core module, so none must \

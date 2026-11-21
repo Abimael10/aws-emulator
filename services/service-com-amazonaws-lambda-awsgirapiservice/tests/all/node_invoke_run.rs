@@ -866,7 +866,14 @@ async fn a_node_handler_cannot_reach_the_host() {
             "a child process",
             "require('child_process').execSync('ls /')",
         ),
-        ("a socket", "require('net')"),
+        // A socket is a host capability this runtime has none of: the module imports — a
+        // managed runtime's standard library is part of what it promises — and the call that
+        // would hold a connection is refused, which is what fails a handler that awaits it.
+        (
+            "a socket",
+            "new Promise((ok, no) => { const held = require('net').connect(443, \
+             'example.com'); held.on('error', no); })",
+        ),
         // The HTTP client the runtime does supply reaches only this emulator: a request to
         // an address off it is one the host does not make, so the handler fails on it.
         (
