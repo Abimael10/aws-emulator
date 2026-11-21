@@ -1637,30 +1637,38 @@ pub(super) fn glacier_quotas() -> Vec<QuotaRow> {
 /// `glue`, whose Data Catalog rows carry their description in the form
 /// `Catalog: <the quota's own name>`.
 ///
-/// That listing binds two of the codes this catalog had published the job-concurrency
-/// planes under to the crawler plane of an account and the function plane of one
-/// database, the code it had published the per-table partition plane under to the task
-/// DPUs an account may use at once, the code it had published the connection plane under
-/// to the concurrent column-statistics tasks of an account, and the code it had published
-/// the `StartCrawler` rate under to the trigger plane of an account; the job-concurrency
-/// planes, the partition plane, the connection plane and that call rate name no code it
-/// states, so they are left to the default-quota-set gap rather than served under another
-/// quota's code, and so are the codes this catalog had served the account-wide crawler and
-/// trigger planes under.
+/// That listing states the quota published under each of these codes, and each row below
+/// carries that quota's own name, value and sentence: the task DPUs an account may use at
+/// once (`L-08F3B322`), the crawler plane of an account (`L-11FA2C1A`), the function plane
+/// of one database (`L-1DD415D5`), the trigger plane of an account (`L-F1653A6D`), the
+/// column-statistics tasks an account may run at once (`L-3890A802`), the machine-learning
+/// TRANSFORMS of an account (`L-04CEE988`), the concurrent task runs of ONE such transform
+/// (`L-E15CE20A`), the connection plane of an account (`L-4256D6D2`) and the partitions of
+/// ONE table (`L-2C3F5401`).
+///
+/// The quotas this catalog had served under those codes — the database, workflow,
+/// development-endpoint and account-wide machine-learning-transform planes, the
+/// job-concurrency planes, and the `GetTable` and `StartCrawler` call rates — name no code
+/// that listing states, so they are published under no code at all rather than served
+/// under another quota's; so are the codes this catalog had served the account-wide
+/// crawler plane and the account's machine-learning transforms under.
 pub(super) fn glue_quotas() -> Vec<QuotaRow> {
     let rate = |code: &str, api: &str, per_second: f64| request_rate(code, "Glue", api, per_second);
     vec![
-        quota("Databases per account", 10_000.0)
+        // The machine-learning TRANSFORMS of an account, under the code the recorded
+        // listing binds that plane to and with the name, value and sentence it carries for
+        // it. The database plane of an account this catalog had served under the code names
+        // no code the listing states, so it is left to the default-quota-set gap.
+        quota("Number of machine learning transforms", 100.0)
             .code("L-04CEE988")
-            .describe("The maximum number of databases in your account."),
+            .describe("The maximum number of machine learning transforms for this account."),
         quota("Tables per database", 200_000.0)
             .code("L-071ABE08")
             .describe("The maximum number of tables per database."),
         // The compute capacity an account may use CONCURRENTLY, measured in data
         // processing units, which the recorded listing publishes under this code: a
         // capacity plane rather than the per-table partition plane this catalog had served
-        // under it, whose own code the listing does not state, so that plane is left to
-        // the default-quota-set gap.
+        // under it, which is published under `L-2C3F5401` below.
         quota("Max task DPUs per account", 1000.0)
             .code("L-08F3B322")
             .describe(
@@ -1679,39 +1687,47 @@ pub(super) fn glue_quotas() -> Vec<QuotaRow> {
         quota("Max functions per database", 100.0)
             .code("L-1DD415D5")
             .describe("The maximum number of functions per database."),
-        quota("Development endpoints per account", 5.0)
+        // The PARTITIONS of one table, under the code the recorded listing binds that plane
+        // to and with the name and sentence it carries for it; the value is the maximum the
+        // "AWS Glue endpoints and quotas" table publishes for the plane. The
+        // development-endpoint plane this catalog had served under the code names no code
+        // the listing states, so it is left to the default-quota-set gap.
+        quota("Max partitions per table", 10_000_000.0)
             .code("L-2C3F5401")
-            .describe("The maximum number of development endpoints in your account."),
-        // NOT published here: the code this catalog had served the account's trigger
-        // plane under. That plane is published under L-F1653A6D below, the code the
-        // recorded listing binds it to, and the listing states no quota this catalog can
-        // cite under this one, so it is left to the default-quota-set gap.
-        //
+            .describe("The maximum number of partitions per table."),
         // The COLUMN STATISTICS tasks an account may run at once, under the code the
-        // recorded listing binds that plane to, with the name and value it carries for it;
-        // the listing's sentence for the row is not stated by any source available here,
-        // so it carries no `Description` rather than one this catalog would be wording
-        // itself. The connection plane this catalog had served under the code names no
-        // code the listing states, so it is left to the default-quota-set gap.
+        // recorded listing binds that plane to, with the name, value and sentence it
+        // carries for it. The connection plane this catalog had served under the code is
+        // published under `L-4256D6D2` below, the code that listing binds it to.
         quota(
             "Number of column statistics tasks running concurrently per account",
             50.0,
         )
-        .code("L-3890A802"),
+        .code("L-3890A802")
+        .describe(
+            "The maximum number of column statistics tasks running concurrently in your \
+             account.",
+        ),
         quota("Security configurations per account", 200.0)
             .code("L-4071B0E3")
             .describe("The maximum number of security configurations in your account."),
-        quota("Workflows per account", 250.0)
+        // The CONNECTION plane of an account, under the code the recorded listing binds it
+        // to and with the name, value and sentence it carries for it. The workflow plane
+        // this catalog had served under the code names no code the listing states, so it is
+        // left to the default-quota-set gap.
+        quota("Max connection per account", 1000.0)
             .code("L-4256D6D2")
-            .describe("The maximum number of workflows in your account."),
+            .describe("The maximum number of connections in your account."),
         // The Data Catalog's global S3 path length limit, published under this code with
         // the catalog's own wording as its description and the name AWS spells it with.
         quota("Global s3 path max length", 2000.0)
             .code("L-4F4B522D")
             .describe("Catalog: global s3 path max length"),
-        quota("Machine learning transforms per account", 100.0)
-            .code("L-5E4153CA")
-            .describe("The maximum number of machine learning transforms in your account."),
+        // NOT published here: `L-5E4153CA`, the code this catalog had served the account's
+        // machine-learning transforms under. That plane is published under `L-04CEE988`
+        // above, the code the recorded listing binds it to, and the listing states no quota
+        // this catalog can cite under `L-5E4153CA`, so that code is left to the
+        // default-quota-set gap.
         quota("Max jobs per account", 2000.0)
             .code("L-611FDDE4")
             .describe("The maximum number of jobs in your account."),
@@ -1771,7 +1787,17 @@ pub(super) fn glue_quotas() -> Vec<QuotaRow> {
             .describe("Catalog: global maximum administrators"),
         rate("L-D987EC31", "GetPartition", 100.0),
         rate("L-DBA56E2F", "GetPartitions", 100.0),
-        rate("L-E15CE20A", "GetTable", 100.0),
+        // The concurrent task runs of ONE machine learning transform, under the code the
+        // recorded listing binds that plane to and with the name, value and sentence it
+        // carries for it: a counted concurrency plane rather than the `GetTable` call rate
+        // this catalog had served under the code, whose own code the listing does not
+        // state, so that rate is left to the default-quota-set gap.
+        quota("Concurrent machine learning task runs per transform", 3.0)
+            .code("L-E15CE20A")
+            .describe(
+                "The maximum number of concurrent task runs per machine learning transform \
+                 for this account.",
+            ),
         // The Ray compute plane of the account, measured in M-DPUs, under the code the
         // recorded listing binds it to and with the name that listing carries — which
         // the service publishes with a closing period — and which it publishes as not
@@ -1794,7 +1820,7 @@ pub(super) fn glue_quotas() -> Vec<QuotaRow> {
         // to, with the sentence that listing carries for it. The `StartCrawler` rate this
         // catalog had served under the code names no code the listing states, so it is
         // left to the default-quota-set gap.
-        quota("Triggers per account", 25_000.0)
+        quota("Max triggers per account", 1000.0)
             .code("L-F1653A6D")
             .describe("The maximum number of triggers in your account."),
         rate("L-F1AAB534", "StartJobRun", 50.0),

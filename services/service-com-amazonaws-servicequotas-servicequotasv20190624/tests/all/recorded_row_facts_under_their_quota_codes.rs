@@ -259,7 +259,7 @@ const ROWS: &[Row] = &[
     },
     // glue — the task DPUs an account may use at once and its trigger plane, under the
     // codes the recording binds them to, the label-file SIZE in megabytes, and the
-    // column-statistics plane whose sentence no source states.
+    // column-statistics plane with the sentence the recording carries for it.
     Row {
         service_code: "glue",
         quota_code: "L-08F3B322",
@@ -276,8 +276,8 @@ const ROWS: &[Row] = &[
     Row {
         service_code: "glue",
         quota_code: "L-F1653A6D",
-        quota_name: "Triggers per account",
-        value: 25_000.0,
+        quota_name: "Max triggers per account",
+        value: 1000.0,
         unit: "None",
         adjustable: true,
         description: Some("The maximum number of triggers in your account."),
@@ -302,7 +302,10 @@ const ROWS: &[Row] = &[
         value: 50.0,
         unit: "None",
         adjustable: true,
-        description: None,
+        description: Some(
+            "The maximum number of column statistics tasks running concurrently in your \
+             account.",
+        ),
         period: None,
     },
     // imagebuilder — the concurrent resource-state updates of an account and the
@@ -373,6 +376,11 @@ const DISPLACED_QUOTA_NAMES: &[(&str, &str)] = &[
     ("glue", "Partitions per table"),
     ("glue", "Connections per account"),
     ("glue", "Rate of StartCrawler requests"),
+    ("glue", "Databases per account"),
+    ("glue", "Workflows per account"),
+    ("glue", "Development endpoints per account"),
+    ("glue", "Machine learning transforms per account"),
+    ("glue", "Rate of GetTable requests"),
     ("imagebuilder", "Lifecycle policies"),
     ("imagebuilder", "Concurrent image builds"),
 ];
