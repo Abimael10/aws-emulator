@@ -13,9 +13,10 @@
 //! Four kinds of answer reach this, and [`AnswerMapping`] says which an entry holds: a
 //! BACKEND answer, whose `selectionPattern` picks the integration response that maps it; an
 //! AWS Lambda run that ERRORED, whose own error signal that pattern is matched against
-//! instead; a `MOCK`'s own rendered integration request, whose `statusCode` names that
-//! response; and an answer nothing maps — a proxy integration's response, and the response of
-//! an endpoint a request was passed on to — which IS the method response.
+//! instead; a `MOCK`'s own rendered integration request, whose `statusCode` is the result
+//! that pattern is matched against; and an answer nothing maps — a proxy integration's
+//! response, and the response of an endpoint a request was passed on to — which IS the method
+//! response.
 //!
 //! What the integration response that maps an answer may say about the method response is the
 //! status it is keyed by, the headers its `responseParameters` map and the body its
@@ -79,17 +80,26 @@ pub fn mapped(
         }
         AnswerMapping::Mock(code) => {
             let integration = mapping_integration(method)?;
-            // The status the rendered integration request named is the integration response
-            // the call maps to, and a rendering that named none maps to the DEFAULT
-            // integration response — the one with no `selectionPattern`, since a `MOCK`
-            // produces no backend response for a pattern to match.
+            // A `MOCK` answers no backend response, so its RESULT is the status its rendered
+            // request template named — and `selectionPattern` is matched against that status
+            // exactly as it is matched against the status an HTTP or Amazon Web Services back
+            // end answered ([`aws_integration::selected_matching`]): a `5\d{2}` branch covers
+            // a `503` result whatever status it maps that result ONTO, which is what
+            // `IntegrationResponse$statusCode` ("the status code that is used to map the
+            // integration response to an existing MethodResponse") is. A result no pattern
+            // covers maps to the response KEYED by that status where the integration holds
+            // one — the documented `MOCK` form, where the status the request template names
+            // is the response to return — and otherwise to the DEFAULT integration response,
+            // the one with no pattern; so does a rendering that named no result at all.
             let selected = code
                 .as_ref()
                 .and_then(|code| {
-                    integration
-                        .integration_responses
-                        .as_ref()
-                        .and_then(|responses| responses.get(code))
+                    aws_integration::selected_matching_pattern(integration, code).or_else(|| {
+                        integration
+                            .integration_responses
+                            .as_ref()
+                            .and_then(|responses| responses.get(code))
+                    })
                 })
                 .or_else(|| default_integration_response(integration));
             let Some(selected) = selected else {

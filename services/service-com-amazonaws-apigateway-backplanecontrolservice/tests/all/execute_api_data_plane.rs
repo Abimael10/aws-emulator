@@ -447,8 +447,9 @@ async fn an_integration_responses_selection_pattern_is_evaluated_server_side() {
     }
 
     // Rows differ along what the rule generalises over: which result the integration
-    // produced — one the unpatterned branch answers, one each patterned branch covers, a
-    // result no branch holds at all, and a rendering that names no result.
+    // produced — one the unpatterned branch answers, one each patterned branch covers, one a
+    // patterned branch covers and maps ONTO ANOTHER status, a result no pattern covers at
+    // all, and a rendering that names no result.
     let cases = [
         Case {
             name: "a result the unpatterned branch answers",
@@ -472,8 +473,19 @@ async fn an_integration_responses_selection_pattern_is_evaluated_server_side() {
             expected_header: None,
         },
         Case {
-            name: "a result no branch holds maps to the unpatterned one",
+            // The branch is selected by its PATTERN and not by the status it is keyed by:
+            // `IntegrationResponse$statusCode` is "the status code that is used to map the
+            // integration response to an existing MethodResponse", so a `5\d{2}` branch
+            // keyed `500` covers a `503` result and maps it onto its own `500`.
+            name: "a result a patterned branch covers maps onto that branch's own status",
             request_template: r#"{"statusCode": 503}"#,
+            expected_status: 500,
+            expected_body: r#"{"branch":"server"}"#,
+            expected_header: Some(("x-branch", "server")),
+        },
+        Case {
+            name: "a result no pattern covers maps to the unpatterned one",
+            request_template: r#"{"statusCode": 302}"#,
             expected_status: 200,
             expected_body: r#"{"route":"internal"}"#,
             expected_header: None,

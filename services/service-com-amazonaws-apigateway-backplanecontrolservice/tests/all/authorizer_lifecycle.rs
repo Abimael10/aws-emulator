@@ -10,7 +10,9 @@
 //!
 //! The tests assert RULES over sets of inputs, not one recorded call: the create/read
 //! round trip over a table spanning the modelled `AuthorizerType` catalog, which optional
-//! members the request carries and how many provider ARNs it sets; the cached-result TTL
+//! members the request carries and how many provider ARNs it sets; the `authType` every
+//! representation of one record reports, over that same catalog and over what a request
+//! supplies for the member; the cached-result TTL
 //! over its published window (each bound, values inside it and one past each bound) and
 //! the default the member documents for a request that sets none; the members each `type`
 //! documents as required; that a name does not identify an authorizer (two identical
@@ -18,6 +20,9 @@
 //! records that do and do not exist.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_apigateway_backplanecontrolservice::ops::create_authorizer::{
+    AUTH_TYPE_COGNITO_USER_POOLS, AUTH_TYPE_CUSTOM,
+};
 use service_com_amazonaws_apigateway_backplanecontrolservice::state::{
     DEFAULT_AUTHORIZER_RESULT_TTL_SECONDS, MAX_AUTHORIZERS_PER_API,
     MAX_AUTHORIZER_RESULT_TTL_SECONDS, MIN_AUTHORIZER_RESULT_TTL_SECONDS,
@@ -107,6 +112,7 @@ async fn a_created_authorizer_is_persisted_and_read_back_member_for_member() {
                 "type": "TOKEN",
                 "identitySource": "method.request.header.Auth",
                 "authorizerUri": lambda_uri("authorize"),
+                "authType": AUTH_TYPE_CUSTOM,
                 "authorizerResultTtlInSeconds": DEFAULT_AUTHORIZER_RESULT_TTL_SECONDS,
             }),
         ),
@@ -145,6 +151,7 @@ async fn a_created_authorizer_is_persisted_and_read_back_member_for_member() {
                 "name": "request-uncached",
                 "type": "REQUEST",
                 "authorizerUri": lambda_uri("request"),
+                "authType": AUTH_TYPE_CUSTOM,
                 "authorizerResultTtlInSeconds": 0,
             }),
         ),
@@ -162,6 +169,7 @@ async fn a_created_authorizer_is_persisted_and_read_back_member_for_member() {
                 "type": "REQUEST",
                 "authorizerUri": lambda_uri("request"),
                 "identitySource": "method.request.header.Auth,method.request.querystring.Name",
+                "authType": AUTH_TYPE_CUSTOM,
                 "authorizerResultTtlInSeconds": 120,
             }),
         ),
@@ -178,6 +186,7 @@ async fn a_created_authorizer_is_persisted_and_read_back_member_for_member() {
                 "type": "COGNITO_USER_POOLS",
                 "identitySource": "method.request.header.Authorization",
                 "providerARNs": [user_pool_arn("us-east-1_one")],
+                "authType": AUTH_TYPE_COGNITO_USER_POOLS,
                 "authorizerResultTtlInSeconds": DEFAULT_AUTHORIZER_RESULT_TTL_SECONDS,
             }),
         ),
@@ -203,6 +212,7 @@ async fn a_created_authorizer_is_persisted_and_read_back_member_for_member() {
                     user_pool_arn("us-east-1_b"),
                     user_pool_arn("us-east-1_c"),
                 ],
+                "authType": AUTH_TYPE_COGNITO_USER_POOLS,
                 "authorizerResultTtlInSeconds": MAX_AUTHORIZER_RESULT_TTL_SECONDS,
             }),
         ),
@@ -247,6 +257,206 @@ async fn a_created_authorizer_is_persisted_and_read_back_member_for_member() {
             read.body, created,
             "case {case}: GetAuthorizer must report the stored authorizer, got {:?} after {:?}",
             read.body, created
+        );
+    }
+}
+
+/// `GetAuthorizers` for `api`, asserting the modelled 200 and answering the `item` list.
+async fn listed_authorizers(gateway: &Gateway, api: &str) -> Vec<Value> {
+    let answer = gateway
+        .call("GET", &format!("/restapis/{api}/authorizers"), None)
+        .await;
+    assert_eq!(
+        answer.status, 200,
+        "case GetAuthorizers: expected 200, got {} with {:?}",
+        answer.status, answer.body
+    );
+    answer.body["item"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case GetAuthorizers: expected an item list, got {:?}", answer.body))
+        .clone()
+}
+
+/// `UpdateAuthorizer` on `authorizer` of `api` with `patches`, asserting the modelled 200 and
+/// answering the patched body.
+async fn patched_authorizer(
+    gateway: &Gateway,
+    api: &str,
+    authorizer: &str,
+    case: &str,
+    patches: Value,
+) -> Value {
+    let answer = gateway
+        .call(
+            "PATCH",
+            &format!("/restapis/{api}/authorizers/{authorizer}"),
+            Some(json!({ "patchOperations": patches })),
+        )
+        .await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case}: expected 200 from UpdateAuthorizer, got {} with {:?}",
+        answer.status, answer.body
+    );
+    answer.body
+}
+
+#[tokio::test]
+async fn every_representation_of_an_authorizer_reports_its_auth_type() {
+    // `Authorizer$authType` is an "optional customer-defined field, used in OpenAPI imports
+    // and exports without functional impact", and what an OpenAPI document names a KIND of
+    // authorization by is its `x-amazon-apigateway-authtype` — `custom` for an authorizer
+    // that calls a function of the developer's own and `cognito_user_pools` for one that
+    // authorizes against a user pool. So an authorizer created without the member carries
+    // the label its own `type` implies, one created WITH it carries exactly what the request
+    // supplied, and every representation of the record — the create's answer,
+    // `GetAuthorizer`, the `GetAuthorizers` item and the patched record `UpdateAuthorizer`
+    // answers — reports that one value.
+    struct Case {
+        /// What this row varies, for the assertion messages.
+        name: &'static str,
+        /// The `CreateAuthorizer` request, which differs along the authorizer `type` and
+        /// along what it supplies for `authType`.
+        request: Value,
+        /// The `authType` every representation of the stored record must report.
+        expected: &'static str,
+    }
+
+    // Rows differ along what the rule generalises over: the authorizer `type` (the whole
+    // modelled `AuthorizerType` catalog, from
+    // `smithy_query(query="shape", shape="com.amazonaws.apigateway#AuthorizerType")`) and
+    // what the request says about the member — nothing, the implied label itself, a label of
+    // the caller's own, and an empty value, which supplies no value at all.
+    let cases = vec![
+        Case {
+            name: "a TOKEN authorizer supplying no authType",
+            request: token_request("auth-type-token"),
+            expected: AUTH_TYPE_CUSTOM,
+        },
+        Case {
+            name: "a REQUEST authorizer supplying no authType",
+            request: json!({
+                "name": "auth-type-request",
+                "type": "REQUEST",
+                "authorizerUri": lambda_uri("request"),
+                "identitySource": "method.request.header.Auth",
+            }),
+            expected: AUTH_TYPE_CUSTOM,
+        },
+        Case {
+            name: "a COGNITO_USER_POOLS authorizer supplying no authType",
+            request: json!({
+                "name": "auth-type-cognito",
+                "type": "COGNITO_USER_POOLS",
+                "identitySource": "method.request.header.Authorization",
+                "providerARNs": [user_pool_arn("us-east-1_pool")],
+            }),
+            expected: AUTH_TYPE_COGNITO_USER_POOLS,
+        },
+        Case {
+            name: "a TOKEN authorizer supplying the implied label itself",
+            request: {
+                let mut request = token_request("auth-type-stated");
+                request["authType"] = json!(AUTH_TYPE_CUSTOM);
+                request
+            },
+            expected: AUTH_TYPE_CUSTOM,
+        },
+        Case {
+            name: "a TOKEN authorizer supplying a label of the caller's own",
+            request: {
+                let mut request = token_request("auth-type-caller");
+                request["authType"] = json!("oauth2");
+                request
+            },
+            expected: "oauth2",
+        },
+        Case {
+            name: "a COGNITO_USER_POOLS authorizer supplying an empty authType",
+            request: json!({
+                "name": "auth-type-empty",
+                "type": "COGNITO_USER_POOLS",
+                "identitySource": "method.request.header.Authorization",
+                "providerARNs": [user_pool_arn("us-east-1_pool")],
+                "authType": "",
+            }),
+            expected: AUTH_TYPE_COGNITO_USER_POOLS,
+        },
+    ];
+
+    let gateway = Gateway::new();
+    let (api, _root) = create_api(&gateway, "authorizer-auth-type").await;
+
+    for case in &cases {
+        let name = case.name;
+        let created = created_authorizer(&gateway, &api, name, case.request.clone()).await;
+        let id = string_member(&created, "id", name);
+        assert_eq!(
+            created["authType"].as_str(),
+            Some(case.expected),
+            "case {name:?}: expected CreateAuthorizer to report authType {:?}, got {:?}",
+            case.expected,
+            created["authType"]
+        );
+
+        let read = get_authorizer(&gateway, &api, &id).await;
+        assert_eq!(
+            read.body["authType"].as_str(),
+            Some(case.expected),
+            "case {name:?}: expected GetAuthorizer to report authType {:?}, got {:?}",
+            case.expected,
+            read.body
+        );
+
+        let listed = listed_authorizers(&gateway, &api).await;
+        let item = listed
+            .iter()
+            .find(|item| item["id"].as_str() == Some(id.as_str()))
+            .unwrap_or_else(|| panic!("case {name:?}: expected {id} among {listed:?}"));
+        assert_eq!(
+            item["authType"].as_str(),
+            Some(case.expected),
+            "case {name:?}: expected the GetAuthorizers item to report authType {:?}, got {item:?}",
+            case.expected
+        );
+
+        // A patch of ANOTHER member leaves the member where it stood: the record keeps the
+        // value it was created with.
+        let patched = patched_authorizer(
+            &gateway,
+            &api,
+            &id,
+            name,
+            json!([{ "op": "replace", "path": "/name", "value": format!("{id}-renamed") }]),
+        )
+        .await;
+        assert_eq!(
+            patched["authType"].as_str(),
+            Some(case.expected),
+            "case {name:?}: expected UpdateAuthorizer to report authType {:?}, got {patched:?}",
+            case.expected
+        );
+
+        // And a patch OF the member reports what it was patched to, on the same record.
+        let repatched = patched_authorizer(
+            &gateway,
+            &api,
+            &id,
+            name,
+            json!([{ "op": "replace", "path": "/authType", "value": "awsSigv4" }]),
+        )
+        .await;
+        assert_eq!(
+            repatched["authType"].as_str(),
+            Some("awsSigv4"),
+            "case {name:?}: expected the patched authType, got {repatched:?}"
+        );
+        let after = get_authorizer(&gateway, &api, &id).await;
+        assert_eq!(
+            after.body["authType"].as_str(),
+            Some("awsSigv4"),
+            "case {name:?}: expected GetAuthorizer to report the patched authType, got {:?}",
+            after.body
         );
     }
 }

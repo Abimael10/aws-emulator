@@ -128,14 +128,12 @@
 //! "for testing without actually invoking the backend" (`IntegrationType`), so its
 //! response is entirely the API's own records — the integration response the call's
 //! request template selects, the response template for the negotiated content type, and
-//! the headers the method response declares. That path is served in full, from state. One
-//! narrowing is worth stating: the status the request template names selects the
-//! integration response stored UNDER THAT STATUS CODE, and otherwise the default one — a
-//! `selectionPattern` is not matched against it, because a pattern is documented as
-//! choosing "an integration response based on the response from the back end" and a `MOCK`
-//! produces no back-end response to match. What a `MOCK` DID answer is its request
-//! template rendered against the call, so that is the payload its response template reads
-//! `$input` off.
+//! the headers the method response declares. That path is served in full, from state. What
+//! the request template names is the call's RESULT: the integration response whose
+//! `selectionPattern` matches that status maps it, as a pattern maps the status a back end
+//! answered, then the response stored UNDER that status code, and then the default one. What
+//! a `MOCK` DID answer is its request template rendered against the call, so that is the
+//! payload its response template reads `$input` off.
 //!
 //! The two types that name an HTTP ENDPOINT — `HTTP_PROXY`, "for integrating with the HTTP
 //! proxy integration", and `HTTP`, "for integrating an API method with an HTTP backend"
@@ -990,7 +988,11 @@ const WAF_FILTERED: GatewayRefusal = GatewayRefusal {
 
 /// The header API Gateway names the error shape of a refused request in, which is what an
 /// SDK reads a restJson1 error code out of.
-const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
+///
+/// Spelled as API Gateway spells it: an HTTP field name compares case-insensitively, so the
+/// casing is immaterial to a client reading the header off the wire, but a `TestInvokeMethod`
+/// report carries the headers as MEMBERS of a JSON map, where the name is compared verbatim.
+const ERROR_TYPE_HEADER: &str = "x-amzn-ErrorType";
 
 /// The exception class every refusal whose body is the `Forbidden` envelope is the wire
 /// form of: the endpoint refusing the call outright, whether because the API, the stage or
@@ -3829,13 +3831,13 @@ fn first_media_type(accepted: Option<&str>) -> Option<String> {
 /// The integration-response status code the selected `MOCK` request template names, or
 /// `None` when it names none.
 ///
-/// A `MOCK` integration's request template is where the call's status comes from: the
+/// A `MOCK` integration's request template is where the call's RESULT comes from: the
 /// documented form is a literal object carrying the status to return
-/// (`{"statusCode": 200}`), and that code is the key of the integration response the call
-/// maps to. This reads the template as it was RENDERED against the call, so a template that
-/// computes the status from the request names the code it produced; a rendering that is not
-/// such an object names no code, and the call then maps to the default integration response
-/// rather than to a code guessed at.
+/// (`{"statusCode": 200}`), and that code is what the integration responses are selected
+/// against ([`integration_response::mapped`]). This reads the template as it was RENDERED
+/// against the call, so a template that computes the status from the request names the code
+/// it produced; a rendering that is not such an object names no code, and the call then maps
+/// to the default integration response rather than to a code guessed at.
 fn mock_status_code(rendered: &str) -> Option<String> {
     let value: ::serde_json::Value = ::serde_json::from_str(rendered).ok()?;
     let status = value.get("statusCode")?;
@@ -3848,12 +3850,13 @@ fn mock_status_code(rendered: &str) -> Option<String> {
     }
 }
 
-/// The integration response a `MOCK` call maps to when its request mapping names none:
-/// the one with no `selectionPattern`.
+/// The integration response an answer no `selectionPattern` selects maps to: the one with no
+/// pattern, which is the api's catch-all.
 ///
 /// `selectionPattern` is "the regular expression (regex) pattern used to choose an
-/// integration response based on the response from the back end" — there is no back-end
-/// response here, so a patterned response is never chosen and the default one is.
+/// integration response based on the response from the back end", so a response that
+/// declares none is chosen by no result in particular and by every result no other response
+/// covers.
 fn default_integration_response(
     integration: &GetIntegrationOutput,
 ) -> Option<&GetIntegrationResponseOutput> {
@@ -4682,15 +4685,9 @@ fn sigv4_credential_elements(req: &RtRequest) -> Option<Vec<String>> {
 /// ([`GatewayRefusal::error_type`]) — the endpoint's own classes, not only the ones this
 /// service's control-plane model declares.
 fn refusal_response(api: Option<&RestApiEntry>, refusal: GatewayRefusal) -> RtResponse {
-    let error_type = refusal.error_type;
     let content_type = refusal.content_type();
     let rendered = refusal_rendering(api, refusal);
     let mut response = response_with(rendered.status, content_type, rendered.body);
-    if let Some(error_type) = error_type {
-        let _ = response
-            .headers_mut()
-            .try_insert(ERROR_TYPE_HEADER, error_type);
-    }
     for (name, value) in rendered.headers {
         if let Err(refused) = response
             .headers_mut()
@@ -4714,8 +4711,9 @@ pub struct RenderedRefusal {
     pub status: u16,
     /// The body it carries.
     pub body: Vec<u8>,
-    /// The headers the API's customization of this gateway response writes on it, by the
-    /// name the mapping declared; see [`refusal_rendering`].
+    /// The headers the answer carries: the exception class the refusal is the wire form of
+    /// ([`ERROR_TYPE_HEADER`]) and whatever the API's customization of this gateway response
+    /// maps onto the response, by the name the mapping declared; see [`refusal_rendering`].
     pub headers: BTreeMap<String, String>,
 }
 
@@ -4764,10 +4762,20 @@ pub fn refusal_rendering(api: Option<&RestApiEntry>, refusal: GatewayRefusal) ->
         Some(template) => template.into_bytes(),
         None => default_refusal_body(&refusal),
     };
+    let mut headers = gateway_response_headers(customized);
+    // The response NAMES the error shape it is the wire form of, in the header an SDK reads a
+    // restJson1 error code out of ([`ERROR_TYPE_HEADER`]), for every refusal whose exception
+    // class is known ([`GatewayRefusal::error_type`]). Part of the RENDERING rather than of
+    // the wire response, because it is a header of the answer the refusal produces: the
+    // simulated response a `TestInvokeMethod` reports carries it exactly as the served one
+    // does, which is what lets a client classify a refusal it tested for.
+    if let Some(error_type) = refusal.error_type {
+        headers.insert(ERROR_TYPE_HEADER.to_string(), error_type.to_string());
+    }
     RenderedRefusal {
         status,
         body,
-        headers: gateway_response_headers(customized),
+        headers,
     }
 }
 

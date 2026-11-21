@@ -1264,19 +1264,31 @@ pub(super) fn selected_matching<'a>(
     integration: &'a GetIntegrationOutput,
     subject: &str,
 ) -> Option<&'a GetIntegrationResponseOutput> {
+    selected_matching_pattern(integration, subject)
+        .or_else(|| default_integration_response(integration))
+}
+
+/// The integration response whose `selectionPattern` MATCHES `subject`, or `None` when none
+/// of them does.
+///
+/// The patterned half of [`selected_matching`], which stops short of the DEFAULT response:
+/// the one caller that needs the halves apart is a `MOCK`'s own mapping
+/// ([`super::integration_response`]), which falls back to the response keyed by the status its
+/// rendered request named before it falls back to the default.
+pub(super) fn selected_matching_pattern<'a>(
+    integration: &'a GetIntegrationOutput,
+    subject: &str,
+) -> Option<&'a GetIntegrationResponseOutput> {
     let responses = integration.integration_responses.as_ref()?;
     let mut ordered: Vec<&GetIntegrationResponseOutput> = responses.values().collect();
     ordered.sort_by(|left, right| left.status_code.cmp(&right.status_code));
-    ordered
-        .into_iter()
-        .find(|response| {
-            response
-                .selection_pattern
-                .as_deref()
-                .filter(|pattern| !pattern.is_empty())
-                .is_some_and(|pattern| pattern_matches(pattern, subject))
-        })
-        .or_else(|| default_integration_response(integration))
+    ordered.into_iter().find(|response| {
+        response
+            .selection_pattern
+            .as_deref()
+            .filter(|pattern| !pattern.is_empty())
+            .is_some_and(|pattern| pattern_matches(pattern, subject))
+    })
 }
 
 /// Whether the `selectionPattern` `pattern` matches `value`, which is the backend status for

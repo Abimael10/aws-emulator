@@ -16,7 +16,10 @@
 //! request declares (which selects the integration request template, and so the status),
 //! the media type it accepts (which selects the response template, and so the body), which
 //! member the header travels in, the integration type, the verb the method was put under,
-//! and which identifier of the three is unresolvable.
+//! and which identifier of the three is unresolvable. The integration response that MAPS
+//! what the integration produced is its own table
+//! ([`a_patterned_integration_response_maps_the_result_a_mock_produced`]), over the results
+//! a `selectionPattern` does and does not cover.
 //!
 //! Beside the headers a method's records render, every answer reports the TRACE CONTEXT of
 //! the call it answered, under `X-Amzn-Trace-Id` in both header maps
@@ -278,6 +281,147 @@ async fn put_method_response(
         "case PutMethodResponse({status}): expected 201, got {} with {:?}",
         answer.status, answer.body
     );
+}
+
+#[tokio::test]
+async fn a_patterned_integration_response_maps_the_result_a_mock_produced() {
+    // `IntegrationResponse$selectionPattern` is "the regular expression (regex) pattern used
+    // to choose an integration response based on the response from the back end", and
+    // `IntegrationResponse$statusCode` is "the status code that is used to map the
+    // integration response to an existing MethodResponse". A `MOCK` has no back end: its
+    // rendered request template IS what the integration produced, and the `statusCode` that
+    // rendering names is the result the patterns are matched against — so the branch whose
+    // pattern covers that result maps it ONTO that branch's own status and body, however
+    // different the two are, and a result no pattern covers maps to the branch keyed by it
+    // and otherwise to the branch with no pattern at all.
+    struct Case {
+        name: &'static str,
+        /// The `requestTemplates` entry of the `MOCK`, which for a `MOCK` is the result the
+        /// integration produced.
+        request_template: &'static str,
+        expected_status: i64,
+        expected_body: &'static str,
+    }
+
+    /// The body the branch with no pattern renders — the catch-all.
+    const DEFAULT_BODY: &str = r#"{"ok":true}"#;
+    /// The body the branch covering the 5xx class renders.
+    const UNAVAILABLE_BODY: &str = r#"{"error":"backend unavailable"}"#;
+
+    // Rows differ along what the rule generalises over: the result the integration produced
+    // — one a class pattern covers (twice, at two results of that class), one an exact
+    // pattern covers, one the unpatterned branch answers, one only a branch's own status key
+    // names, one no branch names at all, and a rendering that names no result.
+    let cases = [
+        Case {
+            name: "a result the 5xx pattern covers maps onto that branch's status",
+            request_template: r#"{"statusCode": 500}"#,
+            expected_status: 503,
+            expected_body: UNAVAILABLE_BODY,
+        },
+        Case {
+            name: "another result of the same class maps the same way",
+            request_template: r#"{"statusCode": 502}"#,
+            expected_status: 503,
+            expected_body: UNAVAILABLE_BODY,
+        },
+        Case {
+            name: "a result an exact pattern covers",
+            request_template: r#"{"statusCode": 404}"#,
+            expected_status: 404,
+            expected_body: r#"{"error":"missing"}"#,
+        },
+        Case {
+            name: "a result the unpatterned branch answers",
+            request_template: r#"{"statusCode": 200}"#,
+            expected_status: 200,
+            expected_body: DEFAULT_BODY,
+        },
+        Case {
+            name: "a result only a branch's own status names",
+            request_template: r#"{"statusCode": 201}"#,
+            expected_status: 201,
+            expected_body: r#"{"created":true}"#,
+        },
+        Case {
+            name: "a result no branch names maps to the unpatterned one",
+            request_template: r#"{"statusCode": 302}"#,
+            expected_status: 200,
+            expected_body: DEFAULT_BODY,
+        },
+        Case {
+            name: "a rendering that names no result maps to the unpatterned one",
+            request_template: r#"{"ok":false}"#,
+            expected_status: 200,
+            expected_body: DEFAULT_BODY,
+        },
+    ];
+
+    let gateway = Gateway::new();
+    let (api, root) = create_api(&gateway, "test-invoke-selection").await;
+
+    for (index, case) in cases.iter().enumerate() {
+        let resource = resource_under(&gateway, &api, &root, &format!("branch{index}")).await;
+        put_method(&gateway, &api, &resource, "GET").await;
+        put_integration(
+            &gateway,
+            &api,
+            &resource,
+            "GET",
+            json!({
+                "type": "MOCK",
+                "requestTemplates": { "application/json": case.request_template },
+            }),
+        )
+        .await;
+        // The branches: the unpatterned catch-all, one keyed by a status and carrying no
+        // pattern of its own, one covering a whole class and mapping it onto a status of its
+        // own, and one covering an exact result.
+        for (status, pattern, body) in [
+            ("200", None, DEFAULT_BODY),
+            ("201", None, r#"{"created":true}"#),
+            ("503", Some(r"5\d{2}"), UNAVAILABLE_BODY),
+            ("404", Some("404"), r#"{"error":"missing"}"#),
+        ] {
+            put_method_response(&gateway, &api, &resource, "GET", status, json!({})).await;
+            let mut request = json!({ "responseTemplates": { "application/json": body } });
+            if let Some(pattern) = pattern {
+                request["selectionPattern"] = json!(pattern);
+            }
+            put_integration_response(&gateway, &api, &resource, "GET", status, request).await;
+        }
+
+        let simulated = test_invoke(
+            &gateway,
+            &api,
+            &resource,
+            "GET",
+            json!({ "headers": { "Content-Type": "application/json" } }),
+        )
+        .await;
+        assert_eq!(
+            simulated.http_status, 200,
+            "case {:?}: expected TestInvokeMethod itself to answer 200, got {} with {:?}",
+            case.name, simulated.http_status, simulated.body
+        );
+        assert_eq!(
+            simulated.status(),
+            case.expected_status,
+            "case {:?}: expected the simulated status {}, got {} with {:?}",
+            case.name,
+            case.expected_status,
+            simulated.status(),
+            simulated.simulated_body()
+        );
+        assert_eq!(
+            simulated.simulated_body(),
+            case.expected_body,
+            "case {:?}: expected the selected branch's body {:?}, got {:?}",
+            case.name,
+            case.expected_body,
+            simulated.simulated_body()
+        );
+    }
 }
 
 /// The `uri` an `AWS`/`AWS_PROXY` integration naming a Lambda function carries, in the form

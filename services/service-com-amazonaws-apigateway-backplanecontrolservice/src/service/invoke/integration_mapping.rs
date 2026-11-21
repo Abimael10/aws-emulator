@@ -334,9 +334,9 @@ pub async fn performed_integration(
 ///
 /// `MOCK` is the one type that needs no backend, and it is performed in full from those
 /// records: the integration REQUEST template this call selects IS what the integration
-/// returns, and the `statusCode` that template carries names the integration response the
-/// call maps to. A call no template maps is passed through or refused as
-/// `passthroughBehavior` says.
+/// returns, and the `statusCode` that template carries is the RESULT the integration
+/// responses are selected against ([`integration_response::mapped`]). A call no template
+/// maps is passed through or refused as `passthroughBehavior` says.
 ///
 /// Every other type names a backend whose answer is not this api's records to produce: an
 /// `HTTP` or `HTTP_PROXY` naming an endpoint of this emulator is served by carrying its

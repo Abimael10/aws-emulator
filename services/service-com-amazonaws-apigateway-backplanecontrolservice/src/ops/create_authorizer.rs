@@ -258,6 +258,35 @@ pub const AUTHORIZER_TYPE_REQUEST: &str = "REQUEST";
 /// The `AuthorizerType` value for an Amazon Cognito user pool authorizer.
 pub const AUTHORIZER_TYPE_COGNITO_USER_POOLS: &str = "COGNITO_USER_POOLS";
 
+/// The `authType` of an authorization served by a Lambda authorizer — the label API
+/// Gateway names that KIND of authorization by, wherever it names it: the `authType` of the
+/// authorizer record and the `x-amazon-apigateway-authtype` its security scheme is exported
+/// under ([`super::get_export`]) are the same label.
+pub const AUTH_TYPE_CUSTOM: &str = "custom";
+
+/// The `authType` of an authorization served by an Amazon Cognito user pool authorizer; see
+/// [`AUTH_TYPE_CUSTOM`] for why one label serves both readers.
+pub const AUTH_TYPE_COGNITO_USER_POOLS: &str = "cognito_user_pools";
+
+/// The `authType` an authorizer whose request supplied none is stored with: the label its
+/// own `type` implies.
+///
+/// `authType` is an "optional customer-defined field, used in OpenAPI imports and exports
+/// without functional impact", and what it is used AS in those documents is the
+/// `x-amazon-apigateway-authtype` of the security scheme the authorizer becomes — so the
+/// value the service fills in for a request that supplies none is the label that document
+/// names this kind of authorization by: `custom` for a Lambda authorizer (a `TOKEN` or a
+/// `REQUEST` one, which authorize by calling a function of the developer's own) and
+/// `cognito_user_pools` for one that authorizes against a user pool. A type outside the
+/// catalog implies nothing, which the boundary validator has already refused.
+pub fn implied_auth_type(authorizer_type: &str) -> Option<&'static str> {
+    match authorizer_type {
+        AUTHORIZER_TYPE_TOKEN | AUTHORIZER_TYPE_REQUEST => Some(AUTH_TYPE_CUSTOM),
+        AUTHORIZER_TYPE_COGNITO_USER_POOLS => Some(AUTH_TYPE_COGNITO_USER_POOLS),
+        _ => None,
+    }
+}
+
 /// Refuse an authorizer whose configuration its own `type` does not admit.
 ///
 /// Every clause is the member's own documentation, which makes a member required for
@@ -433,12 +462,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // judges the authorizer as it will be stored — the same way `UpdateAuthorizer`
         // judges the patched record. The id and the creation rank are minted under the
         // store lock below, so they are filled in there.
+        // `authType` is the caller's where the request supplied one, and the label the
+        // authorizer's own `type` implies where it did not ([`implied_auth_type`]): the
+        // member is filled in at creation, so every later reader of the record — this
+        // operation's own answer, `GetAuthorizer(s)` and `UpdateAuthorizer`'s patched record
+        // — reports the one value rather than deriving one of its own.
+        let implied = implied_auth_type(&input.r#type).map(str::to_string);
         let mut entry = AuthorizerEntry {
             id: String::new(),
             name: input.name,
             r#type: input.r#type,
             provider_arns: input.provider_ar_ns.unwrap_or_default(),
-            auth_type: input.auth_type,
+            auth_type: input
+                .auth_type
+                .filter(|supplied| !supplied.is_empty())
+                .or(implied),
             authorizer_uri: input.authorizer_uri,
             authorizer_credentials: input.authorizer_credentials,
             identity_source: input.identity_source,

@@ -261,11 +261,13 @@ const AUTHTYPE_EXTENSION: &str = "x-amazon-apigateway-authtype";
 const AUTHTYPE_SIGV4: &str = "awsSigv4";
 
 /// The `x-amazon-apigateway-authtype` of a method authorized by a `TOKEN`/`REQUEST`
-/// authorizer of the API.
-const AUTHTYPE_CUSTOM: &str = "custom";
+/// authorizer of the API — the same label the authorizer's own `authType` carries, which is
+/// what that member is used as in an OpenAPI document.
+const AUTHTYPE_CUSTOM: &str = super::create_authorizer::AUTH_TYPE_CUSTOM;
 
-/// The `x-amazon-apigateway-authtype` of a method authorized by a Cognito user pool.
-const AUTHTYPE_COGNITO: &str = "cognito_user_pools";
+/// The `x-amazon-apigateway-authtype` of a method authorized by a Cognito user pool, named
+/// once beside the one above.
+const AUTHTYPE_COGNITO: &str = super::create_authorizer::AUTH_TYPE_COGNITO_USER_POOLS;
 
 /// The scheme name the SigV4 requirement of an `AWS_IAM` method is exported under.
 const SIGV4_SCHEME_NAME: &str = "sigv4";

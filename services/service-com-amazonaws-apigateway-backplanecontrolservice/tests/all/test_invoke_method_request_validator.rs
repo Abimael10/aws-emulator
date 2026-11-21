@@ -14,6 +14,10 @@
 //! declared, which part of the request is wrong (a missing required header, a missing
 //! required query parameter, a payload the model's schema does not admit, a payload that is
 //! not JSON at all), and the requests a validator that declares neither half admits.
+//!
+//! A refusal also NAMES its exception class, in the header an SDK reads a restJson1 error
+//! code out of, so each row asserts that class on both reported header views and on the
+//! wire.
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -34,6 +38,15 @@ const JSON: &str = "application/json";
 
 /// The body the `MOCK` integration answers when the validator admits the request.
 const SERVED: &str = r#"{"integration":"ran"}"#;
+
+/// The header API Gateway names a refusal's exception class in, as a `TestInvokeMethod`
+/// report spells it: an HTTP field name compares case-insensitively on the wire, but the
+/// reported headers are MEMBERS of a JSON map, where the name is compared verbatim.
+const ERROR_TYPE_HEADER: &str = "x-amzn-ErrorType";
+
+/// The exception class a request the method's own validator refuses is answered with — both
+/// halves of the validator earn a 400, so both name this class.
+const BAD_REQUEST: &str = "BadRequestException";
 
 /// A `POST` method with a `MOCK` integration answering 200 with [`SERVED`], carrying
 /// `method_request` — the validator, the models and the parameters the row declares.
@@ -84,6 +97,9 @@ async fn a_simulated_invocation_is_refused_by_the_methods_request_validator() {
         status: u16,
         /// The body both halves must answer, byte for byte.
         body: &'static str,
+        /// The exception class the answer names, or `None` for a request the validator
+        /// admits — a served answer is no refusal and names no class.
+        error_type: Option<&'static str>,
     }
 
     let cases = [
@@ -95,6 +111,7 @@ async fn a_simulated_invocation_is_refused_by_the_methods_request_validator() {
             payload: GOOD_BODY,
             status: 200,
             body: SERVED,
+            error_type: None,
         },
         Case {
             name: "a missing required header",
@@ -104,6 +121,7 @@ async fn a_simulated_invocation_is_refused_by_the_methods_request_validator() {
             payload: GOOD_BODY,
             status: 400,
             body: r#"{"message": "Missing required request parameters: [X-Required]"}"#,
+            error_type: Some(BAD_REQUEST),
         },
         Case {
             name: "a missing required query parameter",
@@ -113,6 +131,7 @@ async fn a_simulated_invocation_is_refused_by_the_methods_request_validator() {
             payload: GOOD_BODY,
             status: 400,
             body: r#"{"message": "Missing required request parameters: [tenant]"}"#,
+            error_type: Some(BAD_REQUEST),
         },
         Case {
             name: "a payload the model's schema does not admit",
@@ -122,6 +141,7 @@ async fn a_simulated_invocation_is_refused_by_the_methods_request_validator() {
             payload: r#"{"id":"a1"}"#,
             status: 400,
             body: r#"{"message": "Invalid request body"}"#,
+            error_type: Some(BAD_REQUEST),
         },
         Case {
             name: "a payload outside the schema's bounds",
@@ -131,6 +151,7 @@ async fn a_simulated_invocation_is_refused_by_the_methods_request_validator() {
             payload: r#"{"id":"a1","qty":0}"#,
             status: 400,
             body: r#"{"message": "Invalid request body"}"#,
+            error_type: Some(BAD_REQUEST),
         },
         Case {
             name: "a payload that is not a JSON document at all",
@@ -140,6 +161,7 @@ async fn a_simulated_invocation_is_refused_by_the_methods_request_validator() {
             payload: "not json",
             status: 400,
             body: r#"{"message": "Invalid request body"}"#,
+            error_type: Some(BAD_REQUEST),
         },
         Case {
             name: "a validator declaring the body half only ignores a missing parameter",
@@ -149,6 +171,7 @@ async fn a_simulated_invocation_is_refused_by_the_methods_request_validator() {
             payload: GOOD_BODY,
             status: 200,
             body: SERVED,
+            error_type: None,
         },
         Case {
             name: "a validator declaring the parameter half only ignores the payload",
@@ -158,6 +181,7 @@ async fn a_simulated_invocation_is_refused_by_the_methods_request_validator() {
             payload: r#"{"id":"a1"}"#,
             status: 200,
             body: SERVED,
+            error_type: None,
         },
         Case {
             name: "a validator declaring neither half admits everything",
@@ -167,6 +191,7 @@ async fn a_simulated_invocation_is_refused_by_the_methods_request_validator() {
             payload: "not json",
             status: 200,
             body: SERVED,
+            error_type: None,
         },
     ];
 
@@ -241,6 +266,30 @@ async fn a_simulated_invocation_is_refused_by_the_methods_request_validator() {
             case.body,
             simulated.simulated_body()
         );
+        // The class the refusal names, in both views of the reported headers: a client
+        // classifies a refusal it tested for exactly as it classifies one it was served.
+        assert_eq!(
+            simulated
+                .headers()
+                .get(ERROR_TYPE_HEADER)
+                .and_then(Value::as_str),
+            case.error_type,
+            "case {:?}: expected the reported {ERROR_TYPE_HEADER} to be {:?}, got {:?}",
+            case.name,
+            case.error_type,
+            simulated.headers()
+        );
+        let reported_values = simulated.body["multiValueHeaders"][ERROR_TYPE_HEADER].clone();
+        let expected_values = match case.error_type {
+            Some(class) => json!([class]),
+            None => Value::Null,
+        };
+        assert_eq!(
+            reported_values, expected_values,
+            "case {:?}: expected the reported multiValueHeaders {ERROR_TYPE_HEADER} to be \
+             {expected_values:?}, got {reported_values:?}",
+            case.name
+        );
 
         // The same records, reached through the deployed stage: one validator, so both
         // halves answer the same thing.
@@ -272,6 +321,17 @@ async fn a_simulated_invocation_is_refused_by_the_methods_request_validator() {
             case.name,
             case.body,
             answered.text()
+        );
+        // The wire carries the same class, under the same name: an HTTP field name compares
+        // case-insensitively, and the raw reading lowercases what it read.
+        let served_class = ERROR_TYPE_HEADER.to_ascii_lowercase();
+        assert_eq!(
+            answered.header(&served_class),
+            case.error_type,
+            "case {:?}: expected the deployed stage to name {:?} in {ERROR_TYPE_HEADER}, got {:?}",
+            case.name,
+            case.error_type,
+            answered.header(&served_class)
         );
     }
 }
