@@ -142,15 +142,23 @@ fn message(body: &Value) -> String {
 }
 
 /// One row: the case, the object key, its content, and — for content that parses — the
-/// transaction-set value `TestParsing` must carry through beside the ENVELOPE value
-/// `CreateStarterMappingTemplate` must fill its template's envelope with, or `None` when
-/// the content is not an interchange at all.
-type ReaderCase<'a> = (&'a str, &'a str, &'a str, Option<(&'a str, &'a str)>);
+/// transaction-set value `TestParsing` must carry through, the ENVELOPE value
+/// `CreateStarterMappingTemplate` must fill its template's envelope with, and the element
+/// position of the REQUESTED transaction set that surfaces that transaction-set value as a
+/// placeholder carrying it (`None` when the sample's own segment is not one the requested
+/// transaction set's table names, so no position of the template asks for it); `None` for
+/// the row as a whole when the content is not an interchange at all.
+type ReaderCase<'a> = (
+    &'a str,
+    &'a str,
+    &'a str,
+    Option<(&'a str, &'a str, Option<&'a str>)>,
+);
 
 /// RULE: a file that is an X12 interchange is parsed by every operation that reads one,
 /// and its values reach each operation's own answer — `TestParsing` carries the
-/// transaction set's own values, `CreateStarterMappingTemplate` fills its template's
-/// envelope from the interchange's envelope — while a file that is not an interchange is
+/// transaction set's own values, `CreateStarterMappingTemplate` fills the template it
+/// generates from the interchange it read — while a file that is not an interchange is
 /// refused by both with the reader's own sentence.
 #[tokio::test]
 async fn one_reader_answers_for_every_operation_that_reads_an_edi_document() {
@@ -161,19 +169,21 @@ async fn one_reader_answers_for_every_operation_that_reads_an_edi_document() {
             "an X12 850 with the classic delimiters",
             "shared/850.edi",
             X12_850,
-            Some(("PO12345", "000000001")),
+            Some(("PO12345", "000000001", Some("BEG_03"))),
         ),
         (
+            // The template is generated for an 850, whose table names no invoice beginning
+            // segment, so no element position of it asks for this sample's invoice number.
             "an X12 810 at release 005010 with pipe delimiters and newline terminators",
             "shared/810-pipe.edi",
             X12_810_PIPE,
-            Some(("INV-9", "000000002")),
+            Some(("INV-9", "000000002", None)),
         ),
         (
             "two transaction sets in one functional group",
             "shared/850-two.edi",
             X12_850_TWO_TRANSACTIONS,
-            Some(("PO-ONE", "000000003")),
+            Some(("PO-ONE", "000000003", Some("BEG_03"))),
         ),
         ("content that is not EDI", "shared/not-edi.txt", NOT_EDI, None),
         (
@@ -200,7 +210,7 @@ async fn one_reader_answers_for_every_operation_that_reads_an_edi_document() {
             call(&router, "CreateStarterMappingTemplate", starter_template_request(key)).await;
 
         match parsed_values {
-            Some((value, control_number)) => {
+            Some((value, control_number, position)) => {
                 assert_eq!(
                     parse_status, 200,
                     "case {case:?}: TestParsing must parse the file, got {parse_status} \
@@ -225,12 +235,22 @@ async fn one_reader_answers_for_every_operation_that_reads_an_edi_document() {
                     "case {case:?}: the template's envelope must carry the sample's \
                      {control_number:?}, got {mapping}"
                 );
-                // Its transaction-set values do not: those are the caller's to map.
-                assert!(
-                    !mapping.contains(value),
-                    "case {case:?}: the template must not carry the sample's {value:?}, got \
-                     {mapping}"
-                );
+                // Its transaction-set values reach the element position the requested
+                // transaction set's table gives them, as the placeholder CARRYING the value
+                // — which is how a caller reading the template knows which field of its own
+                // input belongs there.
+                match position {
+                    Some(position) => assert!(
+                        mapping.contains(&format!("PLACEHOLDER: {value}")),
+                        "case {case:?}: {position} must surface the sample's {value:?} as a \
+                         placeholder carrying it, got {mapping}"
+                    ),
+                    None => assert!(
+                        !mapping.contains(value),
+                        "case {case:?}: no element position of the requested transaction set \
+                         asks for the sample's {value:?}, got {mapping}"
+                    ),
+                }
             }
             None => {
                 assert_eq!(

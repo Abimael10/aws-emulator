@@ -23,9 +23,12 @@
 
 use quick_xml::events::Event;
 use serde_json::{json, Value};
-// `PLACEHOLDER` is the handler's own constant, so this test cannot drift from the value
-// it asserts on; `MAPPING_TYPE_VALUES` is the model's own member list.
-use service_com_amazonaws_b2bi_b2bi::ops::create_starter_mapping_template::PLACEHOLDER;
+// `PLACEHOLDER` and `SAMPLE_PLACEHOLDER_PREFIX` are the handler's own constants, so this
+// test cannot drift from the values it asserts on; `MAPPING_TYPE_VALUES` is the model's own
+// member list.
+use service_com_amazonaws_b2bi_b2bi::ops::create_starter_mapping_template::{
+    PLACEHOLDER, SAMPLE_PLACEHOLDER_PREFIX,
+};
 use service_com_amazonaws_b2bi_b2bi::ops::types::MAPPING_TYPE_VALUES;
 use service_com_amazonaws_b2bi_b2bi::scaffolded::NOT_FOUND_STATUS;
 
@@ -484,143 +487,440 @@ async fn the_same_request_always_answers_with_the_same_template() {
     }
 }
 
-/// One row of the sample table: the case, the sample's key and content, the mapping type,
-/// then what the generated template must carry — the sample's ST02, ISA06 and GS08 — and
-/// the (business field, sample value) pair the template must NOT carry the value of.
-type SampleCase<'a> = (
-    &'a str,
-    &'a str,
-    &'a str,
-    &'a str,
-    &'a str,
-    &'a str,
-    &'a str,
-    (&'a str, &'a str),
+/// A sample 810 invoice at release 005010, written with `|` between elements — the sample's
+/// own delimiters, transaction set and release, none of them any request's.
+const SAMPLE_810: &str = concat!(
+    "ISA|00|          |00|          |ZZ|INVSENDER      |ZZ|INVRECEIVER    ",
+    "|240201|0900|^|00501|000000009|0|P|>\n",
+    "GS|IN|INVSENDER|INVRECEIVER|20240201|0900|9|X|005010\n",
+    "ST|810|0009\n",
+    "BIG|20240201|INV-42|20240101|PO-77\n",
+    "SE|3|0009\n",
+    "GE|1|9\n",
+    "IEA|1|000000009\n",
 );
 
-/// RULE: `outputSampleLocation` fills the ENVELOPE element values of the template the
-/// requested transaction set and version determine, and nothing else: the sample's ISA/GS/ST
-/// values reach the template, while the document's members, its segments and their element
-/// positions stay the requested transaction set's — so no transaction-set value of the
-/// sample, and none of the X12 reader's own members (a `segment_id`, a detail-table loop,
-/// an envelope trailer), reaches the template, and every element of a body segment is the
-/// bare placeholder.
+/// A sample 850 whose detail table REPEATS: two line items, a description inside the first
+/// one, a reference whose value is a composite (two components, `>` between them, as this
+/// interchange's own ISA16 declares) and a transaction-totals summary.
+const SAMPLE_850_LINE_ITEMS: &str = concat!(
+    "ISA*00*          *00*          *ZZ*ITEMSENDER     *ZZ*ITEMRECEIVER   ",
+    "*240301*0800*U*00401*000000011*0*P*>~",
+    "GS*PO*ITEMSENDER*ITEMRECEIVER*20240301*0800*11*X*004010~",
+    "ST*850*0011~",
+    "BEG*00*SA*PO-ITEMS**20240301~",
+    "REF*DP*DEPT>01~",
+    "PO1*1*10*EA*25.00**BP*WIDGET001*VN*WIDGET-A~",
+    "PID*F****First widget~",
+    "PO1*2*5*EA*30.00**BP*WIDGET002*VN*WIDGET-B~",
+    "CTT*2~",
+    "SE*8*0011~",
+    "GE*1*11~",
+    "IEA*1*000000011~",
+);
+
+/// The 850's own detail loop member, as this service's X12 reader keys it.
+const ITEM_LOOP: &str = "PO1-8000_loop";
+
+/// One row of the sample table.
+struct SampleCase<'a> {
+    /// What this row is.
+    case: &'a str,
+    /// The object key the sample is stored at, and its content.
+    key: &'a str,
+    sample: &'a str,
+    /// The `mappingType`, `X12TransactionSet` and `X12Version` the request names.
+    mapping_type: &'a str,
+    transaction_set: &'a str,
+    version: &'a str,
+    /// Envelope values of the sample the template must carry verbatim.
+    envelope: &'a [&'a str],
+    /// `(element position, the sample's value at it)` pairs the template must carry as the
+    /// placeholder CARRYING that value.
+    filled: &'a [(&'a str, &'a str)],
+    /// Element positions that stay the bare placeholder.
+    bare: &'a [&'a str],
+    /// Text no part of the template may carry.
+    absent: &'a [&'a str],
+    /// For a sample whose detail table repeats: the loop member, one element position of its
+    /// opening segment, and the sample's value for that position in each occurrence, in
+    /// order.
+    detail_loop: Option<(&'a str, &'a str, &'a [&'a str])>,
+}
+
+/// The value a JSONATA template's transaction body carries at the element position `key`.
 ///
-/// The rows differ along what the rule generalises over: the sample's transaction set and
-/// release, the delimiters it is written with, and the requested mapping type.
+/// The body's segments are searched in document order, and the occurrences of a detail loop
+/// with them, so a position inside the loop is found as readily as one beside it.
+fn body_element(transaction: &Value, key: &str) -> Option<String> {
+    fn found(node: &Value, key: &str) -> Option<String> {
+        match node {
+            Value::Array(items) => items.iter().find_map(|item| found(item, key)),
+            Value::Object(members) => members.iter().find_map(|(member, child)| {
+                if member == key {
+                    child.as_str().map(str::to_string)
+                } else {
+                    found(child, key)
+                }
+            }),
+            _ => None,
+        }
+    }
+    found(&transaction["segments"], key)
+}
+
+/// The occurrences a JSONATA template's transaction body holds under the detail loop member
+/// `loop_key`.
+fn loop_occurrences(transaction: &Value, loop_key: &str) -> Vec<Value> {
+    transaction["segments"]
+        .as_array()
+        .map(|segments| {
+            segments
+                .iter()
+                .filter_map(|segment| segment.get(loop_key))
+                .filter_map(|occurrences| occurrences.as_array().cloned())
+                .flatten()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// RULE: a request that names an `outputSampleLocation` is answered with the template the
+/// requested transaction set and version determine, carrying what that sample holds at each
+/// element position it describes — an envelope element the sample's value itself, an element
+/// of a body segment the placeholder that CARRIES that value (the fixed
+/// [`SAMPLE_PLACEHOLDER_PREFIX`] and then the value), and a position the sample leaves empty
+/// the bare placeholder — with the reader's grouping of a repeating detail segment travelling
+/// with those values and none of its other members (a `segment_id`, an envelope trailer)
+/// reaching the template.
+///
+/// The rows differ along what the rule generalises over: the requested mapping type and
+/// transaction set, the sample's own transaction set and release, the delimiters it is
+/// written with, which element positions it fills, whether its detail table repeats, and
+/// whether the value it holds at a position is one element or a composite.
 #[tokio::test]
-async fn a_sample_fills_the_envelope_values_of_the_generated_template() {
+async fn a_sample_fills_the_element_values_of_the_generated_template() {
     let router = b2bi_router();
 
-    /// A sample 810 invoice at release 005010, written with `|` between elements — the
-    /// sample's own delimiters, transaction set and release, none of them the request's.
-    const SAMPLE_810: &str = concat!(
-        "ISA|00|          |00|          |ZZ|INVSENDER      |ZZ|INVRECEIVER    ",
-        "|240201|0900|^|00501|000000009|0|P|>\n",
-        "GS|IN|INVSENDER|INVRECEIVER|20240201|0900|9|X|005010\n",
-        "ST|810|0009\n",
-        "BIG|20240201|INV-42|20240101|PO-77\n",
-        "SE|3|0009\n",
-        "GE|1|9\n",
-        "IEA|1|000000009\n",
-    );
-
-    // Each row: the case, the sample's key and content, the mapping type, and what the
-    // template must carry — the sample's ST02 control number, its ISA06 sender and its GS08
-    // version — plus the (business field, sample value) pair the template must not carry.
     let cases: Vec<SampleCase<'_>> = vec![
-        (
-            "an 850 sample, JSONATA",
-            "samples/sample-850.edi",
-            X12_850_SAMPLE,
-            "JSONATA",
-            "0001",
-            "SENDER",
-            "004010",
-            ("BEG_03", "PO12345"),
-        ),
-        (
-            "an 850 sample, XSLT",
-            "samples/sample-850.edi",
-            X12_850_SAMPLE,
-            "XSLT",
-            "0001",
-            "SENDER",
-            "004010",
-            ("BEG_03", "PO12345"),
-        ),
-        (
-            "an 810 sample at release 5010 with pipe delimiters, JSONATA",
-            "samples/sample-810.edi",
-            SAMPLE_810,
-            "JSONATA",
-            "0009",
-            "INVSENDER",
-            "005010",
-            ("BIG_02", "INV-42"),
-        ),
+        SampleCase {
+            case: "an 850 sample, JSONATA",
+            key: "samples/sample-850.edi",
+            sample: X12_850_SAMPLE,
+            mapping_type: "JSONATA",
+            transaction_set: "X12_850",
+            version: "VERSION_4010",
+            envelope: &["SENDER", "000000001", "0001", "004010"],
+            filled: &[
+                ("BEG_01", "00"),
+                ("BEG_02", "SA"),
+                ("BEG_03", "PO12345"),
+                ("BEG_05", "20240101"),
+                ("N1_01", "ST"),
+                ("N1_02", "Acme Receiving"),
+            ],
+            // BEG04 is empty in the sample, and the sample carries no currency or item
+            // segment at all, so each of these stays the placeholder its table asks for.
+            bare: &["BEG_04", "BEG_12", "CUR_01", "PO1_01"],
+            absent: &[],
+            detail_loop: None,
+        },
+        SampleCase {
+            case: "an 850 sample, XSLT",
+            key: "samples/sample-850.edi",
+            sample: X12_850_SAMPLE,
+            mapping_type: "XSLT",
+            transaction_set: "X12_850",
+            version: "VERSION_4010",
+            envelope: &["SENDER", "000000001", "0001", "004010"],
+            filled: &[("BEG_03", "PO12345"), ("N1_02", "Acme Receiving")],
+            bare: &["BEG_04", "CUR_01"],
+            absent: &[],
+            detail_loop: None,
+        },
+        SampleCase {
+            case: "an 850 sample whose detail table repeats, JSONATA",
+            key: "samples/sample-850-items.edi",
+            sample: SAMPLE_850_LINE_ITEMS,
+            mapping_type: "JSONATA",
+            transaction_set: "X12_850",
+            version: "VERSION_4010",
+            envelope: &["ITEMSENDER", "000000011", "0011"],
+            filled: &[
+                ("BEG_03", "PO-ITEMS"),
+                ("REF_01", "DP"),
+                // The description sits INSIDE the first line item, and still reaches the
+                // position the requested transaction set's table gives it.
+                ("PID_05", "First widget"),
+                ("CTT_01", "2"),
+            ],
+            // REF02 holds a composite in the sample — several components, which no single
+            // element position of the template asks for — and PO1_10 is past the nine
+            // elements each line item fills.
+            bare: &["REF_02", "BEG_04", "PO1_10"],
+            absent: &["DEPT>01"],
+            detail_loop: Some((ITEM_LOOP, "PO1_09", &["WIDGET-A", "WIDGET-B"])),
+        },
+        SampleCase {
+            case: "an 850 sample whose detail table repeats, XSLT",
+            key: "samples/sample-850-items.edi",
+            sample: SAMPLE_850_LINE_ITEMS,
+            mapping_type: "XSLT",
+            transaction_set: "X12_850",
+            version: "VERSION_4010",
+            envelope: &["ITEMSENDER", "000000011", "0011"],
+            filled: &[("BEG_03", "PO-ITEMS"), ("CTT_01", "2")],
+            bare: &["REF_02", "BEG_04"],
+            absent: &[],
+            detail_loop: Some((ITEM_LOOP, "PO1_09", &["WIDGET-A", "WIDGET-B"])),
+        },
+        SampleCase {
+            case: "an 810 sample at release 5010 with pipe delimiters, requested as an 810",
+            key: "samples/sample-810.edi",
+            sample: SAMPLE_810,
+            mapping_type: "JSONATA",
+            transaction_set: "X12_810",
+            version: "VERSION_5010",
+            envelope: &["INVSENDER", "000000009", "0009", "005010"],
+            filled: &[
+                ("BIG_01", "20240201"),
+                ("BIG_02", "INV-42"),
+                ("BIG_04", "PO-77"),
+            ],
+            bare: &["BIG_05", "CUR_01"],
+            absent: &[],
+            detail_loop: None,
+        },
+        SampleCase {
+            // The document's members stay the REQUESTED transaction set's: the 850's table
+            // names no invoice beginning segment, so no position of this template asks for
+            // what the sample holds in one.
+            case: "an 810 sample against a request for an 850, JSONATA",
+            key: "samples/sample-810.edi",
+            sample: SAMPLE_810,
+            mapping_type: "JSONATA",
+            transaction_set: "X12_850",
+            version: "VERSION_4010",
+            envelope: &["INVSENDER", "000000009", "0009", "005010"],
+            filled: &[],
+            bare: &["BEG_01", "BEG_03", "CUR_01"],
+            absent: &["INV-42", "BIG_01", "PLACEHOLDER: "],
+            detail_loop: None,
+        },
     ];
 
-    for (case, key, body, mapping_type, st02, isa06, gs08, (field, sample_value)) in cases {
-        given_object(&router, key, body).await;
-        let mut request = request(mapping_type, "X12_850", "VERSION_4010");
-        request["outputSampleLocation"] = json!({ "bucketName": BUCKET, "key": key });
+    for row in cases {
+        let case = row.case;
+        given_object(&router, row.key, row.sample).await;
+        let mut request = request(row.mapping_type, row.transaction_set, row.version);
+        request["outputSampleLocation"] = json!({ "bucketName": BUCKET, "key": row.key });
         let (status, response) = call(&router, "CreateStarterMappingTemplate", request).await;
         let template = mapping_template(case, status, &response);
 
-        // The envelope values come from the SAMPLE, not from the request: the request names
-        // X12_850 / VERSION_4010 in every row, so an 810 sample at release 5010 proves the
-        // envelope was filled from the file.
-        for expected in [st02, isa06, gs08] {
+        // The envelope values come from the SAMPLE, not from the request: a sample at
+        // another release, written with other delimiters, proves the envelope was filled
+        // from the file.
+        for expected in row.envelope {
             assert!(
                 template.contains(expected),
-                "case {case:?}: the template must carry the sample's {expected:?}, got {template}"
+                "case {case:?}: the template's envelope must carry the sample's \
+                 {expected:?}, got {template}"
             );
         }
-        // …and NOTHING else is: no transaction-set value of the sample, no marker over one,
-        // and none of the X12 reader's own members.
-        for absent in [
-            sample_value,
-            "PLACEHOLDER: ",
-            "segment_id",
-            "_loop",
-            "SE_01",
-            "GE_01",
-            "IEA_01",
-        ] {
+        // None of the X12 reader's OWN members travels with those values.
+        for absent in ["segment_id", "SE_01", "GE_01", "IEA_01"]
+            .iter()
+            .chain(row.absent)
+        {
             assert!(
                 !template.contains(absent),
-                "case {case:?}: a template carries no {absent:?} (the sample fills envelope \
-                 values only; {field} is the caller's to map), got {template}"
+                "case {case:?}: a template carries no {absent:?}, got {template}"
             );
         }
-        // The body is the REQUESTED transaction set's table, every element position of its
-        // opening segment a bare placeholder — the 850's BEG, whatever the sample held.
-        if mapping_type == "JSONATA" {
+
+        if row.mapping_type == "JSONATA" {
             let (transaction, _, _) = segments(case, &template);
-            let opening = &transaction["segments"][0];
-            let positions = opening
-                .as_object()
-                .unwrap_or_else(|| panic!("case {case:?}: a segment is an object, got {opening}"));
-            for (index, (position, value)) in positions.iter().enumerate() {
+            for (position, sampled) in row.filled {
+                let expected = format!("{SAMPLE_PLACEHOLDER_PREFIX}{sampled}");
+                let actual = body_element(&transaction, position);
                 assert_eq!(
-                    position,
-                    &format!("BEG_{:02}", index + 1),
-                    "case {case:?}: the body opens with the 850's BEG segment, got {opening}"
+                    actual.as_deref(),
+                    Some(expected.as_str()),
+                    "case {case:?}: {position} must carry the sample's value as a \
+                     placeholder, got {actual:?} in {transaction}"
                 );
+            }
+            for position in row.bare {
+                let actual = body_element(&transaction, position);
                 assert_eq!(
-                    value.as_str(),
+                    actual.as_deref(),
                     Some(PLACEHOLDER),
-                    "case {case:?}: {position} must be the bare placeholder, got {value}"
+                    "case {case:?}: {position} must be the bare placeholder, got \
+                     {actual:?} in {transaction}"
                 );
+            }
+            match row.detail_loop {
+                Some((loop_key, position, values)) => {
+                    let occurrences = loop_occurrences(&transaction, loop_key);
+                    assert_eq!(
+                        occurrences.len(),
+                        values.len(),
+                        "case {case:?}: {loop_key} must hold one entry per occurrence the \
+                         sample repeats, got {occurrences:?}"
+                    );
+                    for (index, (occurrence, sampled)) in
+                        occurrences.iter().zip(values).enumerate()
+                    {
+                        let expected = format!("{SAMPLE_PLACEHOLDER_PREFIX}{sampled}");
+                        assert_eq!(
+                            occurrence[position].as_str(),
+                            Some(expected.as_str()),
+                            "case {case:?}: occurrence {index} of {loop_key} must carry \
+                             {position} from the sample, got {occurrence}"
+                        );
+                    }
+                }
+                None => assert!(
+                    !template.contains("_loop"),
+                    "case {case:?}: a sample whose detail table does not repeat leaves the \
+                     template no loop member, got {template}"
+                ),
+            }
+        } else {
+            let elements = xml_elements(case, &template);
+            let carries = |name: &str, text: &str| {
+                elements
+                    .iter()
+                    .any(|(element, value)| element == name && value == text)
+            };
+            for (position, sampled) in row.filled {
+                let expected = format!("{SAMPLE_PLACEHOLDER_PREFIX}{sampled}");
+                assert!(
+                    carries(position, &expected),
+                    "case {case:?}: <{position}> must carry {expected:?}, got {elements:?}"
+                );
+            }
+            for position in row.bare {
+                assert!(
+                    carries(position, PLACEHOLDER),
+                    "case {case:?}: <{position}> must be the bare placeholder, got \
+                     {elements:?}"
+                );
+            }
+            if let Some((loop_key, position, values)) = row.detail_loop {
+                assert!(
+                    elements.iter().any(|(element, _)| element == loop_key),
+                    "case {case:?}: the stylesheet must carry the sample's {loop_key} \
+                     grouping, got {elements:?}"
+                );
+                for sampled in values {
+                    let expected = format!("{SAMPLE_PLACEHOLDER_PREFIX}{sampled}");
+                    assert!(
+                        carries(position, &expected),
+                        "case {case:?}: one occurrence's <{position}> must carry \
+                         {expected:?}, got {elements:?}"
+                    );
+                }
             }
         }
     }
 }
 
-/// One row of the body-table test: the case, the `X12TransactionSet` and `X12Version`
-/// values, and the (segment id, element count) pairs the first segments of that transaction
-/// set's body carry.
+/// RULE: the placeholder a sample-derived element carries is the same sentinel the caller
+/// replaces everywhere else, followed by the value — so a client's "replace every
+/// PLACEHOLDER" step still finds every field it must fill.
+#[test]
+fn the_sample_placeholder_carries_the_sentinel_the_caller_replaces() {
+    assert_eq!(
+        SAMPLE_PLACEHOLDER_PREFIX,
+        format!("{PLACEHOLDER}: "),
+        "the sample placeholder is the sentinel, a colon and a space, got \
+         {SAMPLE_PLACEHOLDER_PREFIX:?}"
+    );
+}
+
+/// One row of the mapped-document table: the case, the sample's key and content, and the
+/// (element position, sample value) pairs the mapped document must carry as placeholders
+/// carrying those values.
+type MappedCase<'a> = (&'a str, &'a str, &'a str, Vec<(&'a str, &'a str)>);
+
+/// RULE: a starter template is a document the mapping operations evaluate, so the values a
+/// sample filled it with survive into `TestMapping`'s `mappedFileContent` — a caller handing
+/// the generated template straight to `TestMapping` gets back the document the sample
+/// described.
+///
+/// The rows differ along the sample's values and whether its detail table repeats, so a
+/// value inside the loop is asserted beside one outside it.
+#[tokio::test]
+async fn the_sample_derived_values_survive_into_the_mapped_document() {
+    let router = b2bi_router();
+
+    // Each row: the case, the sample's key and content, and the (element position, sample
+    // value) pairs the MAPPED document must carry as placeholders carrying those values.
+    let cases: Vec<MappedCase<'_>> = vec![
+        (
+            "an 850 sample",
+            "mapped/sample-850.edi",
+            X12_850_SAMPLE,
+            vec![("BEG_03", "PO12345"), ("N1_02", "Acme Receiving")],
+        ),
+        (
+            "an 850 sample whose detail table repeats",
+            "mapped/sample-850-items.edi",
+            SAMPLE_850_LINE_ITEMS,
+            vec![("BEG_03", "PO-ITEMS"), ("PO1_09", "WIDGET-A"), ("CTT_01", "2")],
+        ),
+    ];
+
+    for (case, key, sample, expected) in cases {
+        given_object(&router, key, sample).await;
+        let mut template_request = request("JSONATA", "X12_850", "VERSION_4010");
+        template_request["outputSampleLocation"] = json!({ "bucketName": BUCKET, "key": key });
+        let (status, response) =
+            call(&router, "CreateStarterMappingTemplate", template_request).await;
+        let template = mapping_template(case, status, &response);
+
+        // The generated template, applied to an empty input document the way a caller tries
+        // one out.
+        let (status, mapped) = call(
+            &router,
+            "TestMapping",
+            json!({
+                "fileFormat": "JSON",
+                "inputFileContent": "{}",
+                "mappingTemplate": template,
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the generated template must map, got {status} {mapped}"
+        );
+        // `mappedFileContent` carries the mapped file's TEXT as a JSON string, so the
+        // document takes two parses — the way a client reads it.
+        let member = mapped["mappedFileContent"].as_str().unwrap_or_else(|| {
+            panic!("case {case:?}: expected a mappedFileContent, got {mapped}")
+        });
+        let text: String = serde_json::from_str(member).unwrap_or_else(|failure| {
+            panic!("case {case:?}: mappedFileContent must hold the mapped text: {failure}")
+        });
+        let document: Value = serde_json::from_str(&text).unwrap_or_else(|failure| {
+            panic!("case {case:?}: the mapped file must be a JSON document: {failure}: {text}")
+        });
+        let transaction =
+            &document["interchanges"][0]["functional_groups"][0]["transactions"][0];
+        for (position, sampled) in expected {
+            let wanted = format!("{SAMPLE_PLACEHOLDER_PREFIX}{sampled}");
+            let actual = body_element(transaction, position);
+            assert_eq!(
+                actual.as_deref(),
+                Some(wanted.as_str()),
+                "case {case:?}: the mapped document must carry {position} as the sample's \
+                 placeholder, got {actual:?} in {text}"
+            );
+        }
+    }
+}
 type BodyTableCase<'a> = (&'a str, &'a str, &'a str, Vec<(&'a str, usize)>);
 
 /// RULE: every element of a segment INSIDE the transaction is the bare placeholder, one per

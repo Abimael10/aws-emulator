@@ -12,9 +12,9 @@
 //! into ONE `<SEGMENT>-8000_loop` entry of that transaction's `segments`, holding one
 //! object per occurrence. Every operation that answers the canonical document answers the
 //! same member names: `TestParsing`'s `parsedFileContent` and the `mappingTemplate`
-//! `CreateStarterMappingTemplate` generates, whose envelope `outputSampleLocation` fills
-//! from the sample and whose transaction-set elements are the bare placeholder the caller
-//! replaces.
+//! `CreateStarterMappingTemplate` generates, which `outputSampleLocation` fills from the
+//! sample — its envelope with the sample's values themselves and each element position of a
+//! body segment with the placeholder carrying the value the sample holds there.
 //!
 //! Each test states that rule over a TABLE whose rows differ along what it generalises
 //! over: the element (and so its canonical name), the transaction set (and so the segment
@@ -425,26 +425,49 @@ async fn a_detail_loop_is_grouped_as_one_entry_per_occurrence() {
 }
 
 /// One row of the sample table: the case, the sample's sender (ISA06), its interchange
-/// control number (ISA13), its body segments, and the (member, sample value) pairs of the
-/// transaction-set business fields the template must NOT carry the value of.
+/// control number (ISA13), its body segments, the (element position, sample value) pairs the
+/// template must carry as the placeholder CARRYING that value outside the detail loop, and
+/// one list of the same pairs per OCCURRENCE of that loop.
 type SampleCase<'a> = (
     &'a str,
     &'a str,
     &'a str,
     Vec<&'a str>,
     Vec<(&'a str, &'a str)>,
+    Vec<Vec<(&'a str, &'a str)>>,
 );
 
-/// RULE: a starter mapping template generated for `outputSampleLocation` carries THAT
-/// sample's envelope values — so a caller's mapping writes the envelope its own documents
-/// really have — while the transaction's body stays the requested transaction set's table:
-/// one entry per segment of it, every element position the bare placeholder, and none of
-/// the sample's own transaction-set values or of the reader's loop members.
+/// The value the transaction's `segments` carry at the element position `key`, a detail
+/// loop's occurrences searched with them.
+fn element_value(segments: &[Value], key: &str) -> Option<String> {
+    fn found(node: &Value, key: &str) -> Option<String> {
+        match node {
+            Value::Array(items) => items.iter().find_map(|item| found(item, key)),
+            Value::Object(members) => members.iter().find_map(|(member, child)| {
+                if member == key {
+                    child.as_str().map(str::to_string)
+                } else {
+                    found(child, key)
+                }
+            }),
+            _ => None,
+        }
+    }
+    segments.iter().find_map(|segment| found(segment, key))
+}
+
+/// RULE: a starter mapping template generated for `outputSampleLocation` carries what THAT
+/// sample holds at each element position it describes — the envelope elements the sample's
+/// values themselves, so a caller's mapping writes the envelope its own documents really
+/// have, and each element position of a body segment the placeholder carrying the value the
+/// sample holds there, grouped into the same detail loop the reader read, one object per
+/// occurrence — while the element positions the document asks for stay the requested
+/// transaction set's and a position the sample leaves empty stays the bare placeholder.
 ///
 /// The rows differ along the sample's envelope values, how many line items it holds and
 /// which business elements it fills.
 #[tokio::test]
-async fn a_template_generated_for_a_sample_carries_its_envelope_and_bare_placeholders() {
+async fn a_template_generated_for_a_sample_carries_its_values_as_placeholders() {
     let router = b2bi_router();
 
     let cases: Vec<SampleCase> = vec![
@@ -453,7 +476,8 @@ async fn a_template_generated_for_a_sample_carries_its_envelope_and_bare_placeho
             "SENDER",
             "000000001",
             vec!["BEG*00*SA*PO123456**20240101", "PO1*1*10*EA*9.99**VP*WIDGET-A"],
-            vec![("BEG_03", "PO123456"), ("PO1_07", "WIDGET-A")],
+            vec![("BEG_01", "00"), ("BEG_03", "PO123456")],
+            vec![vec![("PO1_01", "1"), ("PO1_07", "WIDGET-A")]],
         ),
         (
             "another sender, another control number, two line items",
@@ -464,15 +488,15 @@ async fn a_template_generated_for_a_sample_carries_its_envelope_and_bare_placeho
                 "PO1*1*1*CA*1.50**VP*BOLT-M6*VN*SUP-77",
                 "PO1*2*2*CA*2.50**VP*NUT-M6*VN*SUP-78",
             ],
+            vec![("BEG_03", "PO-RUSH-9"), ("BEG_05", "20240202")],
             vec![
-                ("BEG_03", "PO-RUSH-9"),
-                ("PO1_07", "BOLT-M6"),
-                ("PO1_09", "SUP-77"),
+                vec![("PO1_07", "BOLT-M6"), ("PO1_09", "SUP-77")],
+                vec![("PO1_07", "NUT-M6"), ("PO1_09", "SUP-78")],
             ],
         ),
     ];
 
-    for (case, sender, control, body, unmapped) in cases {
+    for (case, sender, control, body, heading, occurrences) in cases {
         let key = format!("canonical/sample-{control}.edi");
         let sample = interchange("850", sender, control, &body);
         given_object(&router, &key, &sample).await;
@@ -493,38 +517,63 @@ async fn a_template_generated_for_a_sample_carries_its_envelope_and_bare_placeho
             "case {case:?}: ISA13 must carry the sample's control number, got {reported}"
         );
 
-        // …and every element of the transaction set's own segments is the bare placeholder,
-        // whatever the sample held there.
+        // …and each element position of the body carries what the sample holds there, as the
+        // placeholder carrying it.
         let transaction = &reported["functional_groups"][0]["transactions"][0];
         let segments = transaction["segments"]
             .as_array()
             .cloned()
             .unwrap_or_else(|| panic!("case {case:?}: expected the transaction's segments"));
-        for segment in &segments {
-            let elements = segment
-                .as_object()
-                .unwrap_or_else(|| panic!("case {case:?}: a segment is an object, got {segment}"));
-            for (member, value) in elements {
+        for (position, value) in &heading {
+            let expected = format!("{PLACEHOLDER}: {value}");
+            let actual = element_value(&segments, position);
+            assert_eq!(
+                actual.as_deref(),
+                Some(expected.as_str()),
+                "case {case:?}: {position} must carry the sample's value as a placeholder, \
+                 got {actual:?} in {segments:?}"
+            );
+        }
+        // A position the sample leaves empty stays the bare placeholder: the element list is
+        // the requested transaction set's, not the sample's.
+        for position in ["BEG_04", "BEG_12", "CUR_01"] {
+            let actual = element_value(&segments, position);
+            assert_eq!(
+                actual.as_deref(),
+                Some(PLACEHOLDER),
+                "case {case:?}: {position} must be the bare placeholder, got {actual:?} in \
+                 {segments:?}"
+            );
+        }
+
+        // The line items are the loop the reader grouped them into, one object per
+        // occurrence, so a mapping addresses the second line item as the second entry.
+        let (member, items) = detail_loop(&segments)
+            .unwrap_or_else(|| panic!("case {case:?}: expected a line-item loop, got {segments:?}"));
+        assert_eq!(
+            member, "PO1-8000_loop",
+            "case {case:?}: the loop must be keyed as the reader keys it, got {member:?}"
+        );
+        assert_eq!(
+            items.len(),
+            occurrences.len(),
+            "case {case:?}: the loop must hold one entry per line item of the sample, got \
+             {items:?}"
+        );
+        for (index, (occurrence, expected)) in items.iter().zip(&occurrences).enumerate() {
+            assert!(
+                occurrence["segment_id"].is_null(),
+                "case {case:?}: occurrence {index} carries no reader marker, got {occurrence}"
+            );
+            for (position, value) in expected {
+                let wanted = format!("{PLACEHOLDER}: {value}");
                 assert_eq!(
-                    value.as_str(),
-                    Some(PLACEHOLDER),
-                    "case {case:?}: {member} must be the bare placeholder, got {segment}"
+                    occurrence[position].as_str(),
+                    Some(wanted.as_str()),
+                    "case {case:?}: occurrence {index} must carry {position} from the \
+                     sample, got {occurrence}"
                 );
             }
         }
-        let rendered = template.to_string();
-        for (member, value) in &unmapped {
-            assert!(
-                !rendered.contains(*value),
-                "case {case:?}: the template must not carry the sample's {member} value \
-                 {value:?}, got {rendered}"
-            );
-        }
-        // A detail-table loop is the READER's grouping of a sample's occurrences; a
-        // template describes the segment, not how many times this sample repeated it.
-        assert!(
-            detail_loop(&segments).is_none(),
-            "case {case:?}: a template carries no loop entry, got {segments:?}"
-        );
     }
 }

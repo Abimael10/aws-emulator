@@ -18,12 +18,15 @@
 //!   [`PLACEHOLDER`] value wherever the caller must supply an expression.
 //! * WITH `outputSampleLocation` the template is the SAME document — "if you provide a
 //!   sample EDI file with the same structure as the EDI files that you wish to generate,
-//!   then the service can generate a mapping template" — with the ENVELOPE element values
-//!   taken from that sample. The object is read through the emulator's own Amazon S3
-//!   service and parsed as an X12 interchange ([`super::test_parsing::parse_x12`]), and
-//!   only its element VALUES are read: the sample names no member and no element position
-//!   the requested transaction set does not ([`fill_envelope_from_sample`]). Only a sample
-//!   that genuinely does not resolve is the modelled `ResourceNotFoundException`.
+//!   then the service can generate a mapping template" — carrying what that sample holds
+//!   at each element position it describes: an ENVELOPE element takes the sample's value
+//!   itself, and an element of a body segment takes the placeholder that CARRIES that
+//!   value, [`SAMPLE_PLACEHOLDER_PREFIX`] followed by it ([`fill_from_sample`]). The object
+//!   is read through the emulator's own Amazon S3 service and parsed as an X12 interchange
+//!   ([`super::test_parsing::parse_x12`]), and only its element VALUES are read: the
+//!   members the document holds and the element positions each segment asks for stay the
+//!   requested transaction set's. Only a sample that genuinely does not resolve is the
+//!   modelled `ResourceNotFoundException`.
 //!
 //! ## The generated document
 //!
@@ -50,10 +53,14 @@
 //! as the X12 reader's `segment_id` marker does for a parsed document
 //! ([`super::test_parsing::parse_x12`]), because a mapping written against this template is
 //! evaluated into a document that reader's own output is compared with. A template
-//! generated FOR A SAMPLE carries the same members: the sample fills envelope VALUES only,
-//! so none of the reader's own members (the `segment_id` of a segment, its detail-table
-//! loops such as `PO1-8000_loop`, the envelope trailers it read) reaches a template, and
-//! every element of a body segment is the [`PLACEHOLDER`] its table position asks for.
+//! generated FOR A SAMPLE carries the same members, filled with what the sample holds: an
+//! envelope element carries the sample's value, an element of a body segment the
+//! [`SAMPLE_PLACEHOLDER_PREFIX`] placeholder carrying it, and a position the sample leaves
+//! empty the bare [`PLACEHOLDER`] its table asks for. Only the reader's GROUPING of a
+//! transaction set's repeating detail segment travels with those values — the sample's
+//! `PO1-8000_loop` becomes the template's, one object per occurrence — so a caller maps the
+//! second line item as the second entry of the loop; none of the reader's other members
+//! (the `segment_id` of a segment, the envelope trailers it read) reaches a template.
 //!
 //! ## Shape of an operation
 //!
@@ -250,17 +257,34 @@ use super::test_parsing::{
 /// caller recognises a field it must fill the same way whether or not it named a sample.
 pub const PLACEHOLDER: &str = "PLACEHOLDER";
 
+/// What a template carries at an element position of a body segment the named sample FILLS:
+/// the [`PLACEHOLDER`] the caller replaces, a colon and a space, and then the value the
+/// sample holds at that position ([`sampled_placeholder`]) — so a caller reading the
+/// template sees WHICH field of its own input belongs at that position, which is the point
+/// of supplying a sample, and still recognises the field as one it must fill.
+///
+/// The prefix is fixed; everything after it comes from the sample. An envelope element is
+/// not prefixed: it carries the sample's value itself, because the envelope of the
+/// interchange a mapping generates is the sample's envelope.
+pub const SAMPLE_PLACEHOLDER_PREFIX: &str = "PLACEHOLDER: ";
+
+/// The placeholder for a body element position the sample holds `value` at.
+fn sampled_placeholder(value: &str) -> String {
+    format!("{SAMPLE_PLACEHOLDER_PREFIX}{value}")
+}
+
 /// One node of a starter template's document tree, rendered to JSON for a `JSONATA`
 /// template and to XML for an `XSLT` one.
 ///
 /// It mirrors the tree a PARSED X12 interchange takes ([`super::test_parsing::Node`], the
 /// reader's own): the keys a starter template carries placeholders under are the keys a
 /// parsed interchange carries values under, which is what lets
-/// [`fill_envelope_from_sample`] read a sample's value for the element a template key
+/// [`fill_from_sample`] read a sample's value for the element a template key
 /// names.
 ///
 /// A map keeps its members in INSERTION order — the positional order of an X12 segment's
 /// elements — which a `serde_json::Value` (a sorted map) would lose.
+#[derive(Clone)]
 enum Node {
     /// A leaf: either a value the request determines or a placeholder.
     Text(String),
@@ -1267,7 +1291,8 @@ use super::test_parsing::Node as Parsed;
 /// holds functional groups, a functional group holds transactions.
 ///
 /// One envelope segment's elements sit at each level (ISA, GS, ST), so this is also the path
-/// [`fill_envelope_from_sample`] walks a sample down alongside the document it fills.
+/// [`fill_from_sample`] walks a sample down alongside the document it fills; the transaction
+/// the path ends at is where the transaction set's own body sits.
 const ENVELOPE_LEVELS: &[&str] = &[INTERCHANGES_KEY, FUNCTIONAL_GROUPS_KEY, TRANSACTIONS_KEY];
 
 /// The element a document key names, without the element's NAME: the segment id and the
@@ -1306,18 +1331,20 @@ fn first_repetition<'a>(members: &'a [(String, Parsed)], key: &str) -> Option<&'
     })
 }
 
-/// Fills the ENVELOPE element values of a generated starter template from the sample the
-/// request named: at each level of `levels` the value the sample carries for the element a
-/// key names replaces the one the request determined, or the placeholder, and the level
-/// below is read from the sample's first repetition of it.
+/// Fills a generated starter template from the sample the request named: at each level of
+/// `levels` the value the sample carries for the element a key names replaces the one the
+/// request determined, or the placeholder, the level below is read from the sample's first
+/// repetition of it, and the transaction the path ends at has its BODY filled as well
+/// ([`fill_body_from_sample`]).
 ///
-/// Nothing but a value is taken from the sample. The members the document holds, the segments
-/// the transaction carries and the element positions each of them asks for are the requested
-/// transaction set's ([`starter_document`]), so no member of the reader's own parsed document
-/// — a `segment_id`, a detail-table loop, an envelope trailer — reaches a template, every
-/// element of a body segment stays the [`PLACEHOLDER`] its table position asks for, and an
-/// envelope element the sample left empty stays the value the request determined.
-fn fill_envelope_from_sample(document: &mut Node, sample: Option<&Parsed>, levels: &[&str]) {
+/// Nothing but a value and the reader's grouping of a repeating detail segment is taken from
+/// the sample. The members the document holds, the segments the transaction carries and the
+/// element positions each of them asks for are the requested transaction set's
+/// ([`starter_document`]), so no `segment_id` and no envelope trailer of the reader's own
+/// parsed document reaches a template, an element position the sample leaves empty stays the
+/// [`PLACEHOLDER`] its table asks for, and an envelope element the sample left empty stays
+/// the value the request determined.
+fn fill_from_sample(document: &mut Node, sample: Option<&Parsed>, levels: &[&str]) {
     let Node::Map(members) = document else {
         return;
     };
@@ -1336,6 +1363,11 @@ fn fill_envelope_from_sample(document: &mut Node, sample: Option<&Parsed>, level
     }
 
     let Some((level, deeper)) = levels.split_first() else {
+        // The end of the envelope path: this is the transaction, whose own segments are the
+        // transaction set's body.
+        if let Some(sampled) = sampled {
+            fill_body_from_sample(members, sampled);
+        }
         return;
     };
     let nested = sampled.and_then(|sampled| first_repetition(sampled, level));
@@ -1345,8 +1377,213 @@ fn fill_envelope_from_sample(document: &mut Node, sample: Option<&Parsed>, level
         }
         if let Node::List { items, .. } = child {
             for item in items.iter_mut() {
-                fill_envelope_from_sample(item, nested, deeper);
+                fill_from_sample(item, nested, deeper);
             }
+        }
+    }
+}
+
+/// One entry of the sample's transaction body, as this service's X12 reader grouped it
+/// ([`super::test_parsing::parse_x12`]).
+enum SampledEntry<'a> {
+    /// A segment the sample carries at this point, by its X12 segment id, and its parsed
+    /// members.
+    Segment {
+        id: &'a str,
+        members: &'a [(String, Parsed)],
+    },
+    /// The repeating detail segment of the sample's own transaction set, grouped the way the
+    /// reader groups it: the member key it sits under (`PO1-8000_loop`), the id of the
+    /// segment that opens each occurrence, and one member list per occurrence.
+    Loop {
+        id: &'a str,
+        key: &'a str,
+        occurrences: Vec<&'a [(String, Parsed)]>,
+    },
+}
+
+impl SampledEntry<'_> {
+    /// The X12 segment id this entry carries the values of.
+    fn id(&self) -> &str {
+        match self {
+            Self::Segment { id, .. } | Self::Loop { id, .. } => id,
+        }
+    }
+}
+
+/// The `segments` list of a parsed envelope level — the body of a transaction, or of one
+/// occurrence of a detail loop — or nothing when it carries none.
+fn sampled_segments(members: &[(String, Parsed)]) -> &[Parsed] {
+    members
+        .iter()
+        .find_map(|(key, child)| match child {
+            Parsed::List { items, .. } if key == SEGMENTS_KEY => Some(items.as_slice()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// The member a parsed body entry carries a DETAIL LOOP under, when it is one: the reader
+/// keys a transaction set's repeating detail segment `<SEGMENT>-<position>_loop` and holds
+/// one object per occurrence under it.
+fn sampled_loop(members: &[(String, Parsed)]) -> Option<(&str, &[Parsed])> {
+    members.iter().find_map(|(key, child)| match child {
+        Parsed::List { items, .. } if key.ends_with(super::test_parsing::LOOP_KEY_SUFFIX) => {
+            Some((key.as_str(), items.as_slice()))
+        }
+        _ => None,
+    })
+}
+
+/// The X12 segment id the loop member `key` groups the occurrences of (`PO1-8000_loop` →
+/// `PO1`): the loop is named for the segment that opens it.
+fn loop_segment_id(key: &str) -> &str {
+    key.split('-').next().unwrap_or(key)
+}
+
+/// The X12 segment id a parsed body segment reports — the reader's `segment_id` marker — or,
+/// for a document that carries none, the segment its first element key names.
+fn sampled_segment_id(members: &[(String, Parsed)]) -> Option<&str> {
+    members
+        .iter()
+        .find_map(|(key, child)| match child {
+            Parsed::Text(value) if key == super::test_parsing::SEGMENT_ID_KEY => {
+                Some(value.as_str())
+            }
+            _ => None,
+        })
+        .or_else(|| {
+            members
+                .iter()
+                .find_map(|(key, _)| key.split('_').next().filter(|id| !id.is_empty()))
+        })
+}
+
+/// The sample's transaction body, flattened to the entries a generated segment can be filled
+/// from, in document order: one per segment, one per detail loop, and — after the loop it was
+/// read inside — one per segment an occurrence of that loop encloses, so a value the sample
+/// carries inside the loop still reaches the segment of the table that asks for it.
+fn sampled_body<'a>(transaction: &'a [(String, Parsed)]) -> Vec<SampledEntry<'a>> {
+    let mut entries: Vec<SampledEntry<'a>> = Vec::new();
+    for item in sampled_segments(transaction) {
+        let Parsed::Map(members) = item else {
+            continue;
+        };
+        if let Some((key, items)) = sampled_loop(members) {
+            let mut occurrences: Vec<&'a [(String, Parsed)]> = Vec::new();
+            let mut enclosed: Vec<SampledEntry<'a>> = Vec::new();
+            for occurrence in items {
+                let Parsed::Map(occurrence) = occurrence else {
+                    continue;
+                };
+                occurrences.push(occurrence.as_slice());
+                enclosed.extend(sampled_body(occurrence));
+            }
+            entries.push(SampledEntry::Loop {
+                id: loop_segment_id(key),
+                key,
+                occurrences,
+            });
+            entries.extend(enclosed);
+        } else if let Some(id) = sampled_segment_id(members) {
+            entries.push(SampledEntry::Segment { id, members });
+        }
+    }
+    entries
+}
+
+/// The X12 segment id a generated body segment carries: the segment its element keys name
+/// (`BEG_01` → `BEG`), which is what names such a segment at all ([`body_element_key`]).
+fn generated_segment_id(members: &[(String, Node)]) -> Option<&str> {
+    members
+        .first()
+        .and_then(|(key, _)| key.split('_').next())
+        .filter(|id| !id.is_empty())
+}
+
+/// Fills the body of a generated transaction from the sample's own transaction body: each
+/// generated segment takes the values the sample carries for the element positions that
+/// segment asks for, and a segment the sample repeats as a detail loop is grouped the way the
+/// sample groups it, one filled object per occurrence.
+///
+/// The sample's entries are consumed in document order, so a transaction set whose table
+/// names a segment twice fills each from its own occurrence; a segment the sample does not
+/// carry keeps the bare [`PLACEHOLDER`] at every position, and a segment the requested
+/// transaction set's table does not name is not added — the document's members are that
+/// table's.
+fn fill_body_from_sample(members: &mut [(String, Node)], sampled: &[(String, Parsed)]) {
+    let mut entries = sampled_body(sampled);
+    for (key, child) in members.iter_mut() {
+        if key.as_str() != SEGMENTS_KEY {
+            continue;
+        }
+        if let Node::List { items, .. } = child {
+            for item in items.iter_mut() {
+                fill_body_segment_from_sample(item, &mut entries);
+            }
+        }
+    }
+}
+
+/// Fills ONE generated body segment from the first sample entry left for its segment id,
+/// which that entry is then consumed by: a plain segment fills the object in place, and a
+/// detail loop replaces it with the loop member the sample holds its occurrences under.
+fn fill_body_segment_from_sample<'a>(segment: &mut Node, entries: &mut Vec<SampledEntry<'a>>) {
+    let Node::Map(members) = segment else {
+        return;
+    };
+    let Some(id) = generated_segment_id(members).map(str::to_string) else {
+        return;
+    };
+    let Some(at) = entries.iter().position(|entry| entry.id() == id) else {
+        return;
+    };
+    match entries.remove(at) {
+        SampledEntry::Segment {
+            members: sampled, ..
+        } => fill_elements_from_sample(members, sampled),
+        SampledEntry::Loop {
+            key, occurrences, ..
+        } => {
+            // Every occurrence asks for the same element positions — the ones the table gives
+            // the segment that opens the loop — each filled from its own occurrence.
+            let positions = members.clone();
+            let items: Vec<Node> = occurrences
+                .iter()
+                .map(|occurrence| {
+                    let mut occurrence_members = positions.clone();
+                    fill_elements_from_sample(&mut occurrence_members, occurrence);
+                    Node::Map(occurrence_members)
+                })
+                .collect();
+            *segment = Node::Map(vec![(
+                key.to_string(),
+                Node::List {
+                    item: SEGMENT_ITEM.to_string(),
+                    items,
+                },
+            )]);
+        }
+    }
+}
+
+/// The value the sample holds at each element position a generated segment asks for, as the
+/// placeholder that CARRIES it ([`sampled_placeholder`]).
+///
+/// A position the sample leaves empty, and one it holds a COMPOSITE element at — several
+/// components, which the template has no single key for — keep the bare [`PLACEHOLDER`] the
+/// table asks for.
+fn fill_elements_from_sample(members: &mut [(String, Node)], sampled: &[(String, Parsed)]) {
+    for (key, child) in members.iter_mut() {
+        let Node::Text(value) = child else {
+            continue;
+        };
+        let carried = sampled.iter().find_map(|(member, child)| match child {
+            Parsed::Text(text) if member == key && !text.is_empty() => Some(text.as_str()),
+            _ => None,
+        });
+        if let Some(carried) = carried {
+            *value = sampled_placeholder(carried);
         }
     }
 }
@@ -1539,13 +1776,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &version_release_industry_code,
         );
 
-        // `outputSampleLocation` fills the ENVELOPE values of that document: "if you provide
+        // `outputSampleLocation` fills that document from the sample: "if you provide
         // a sample EDI file with the same structure as the EDI files that you wish to
         // generate, then the service can generate a mapping template". The sample is read
         // through the emulator's own S3 service, parsed as an X12 interchange, and read for
-        // the value of each envelope element alone ([`fill_envelope_from_sample`]), so the
-        // document a caller maps is the same one either way. `ResourceNotFoundException` is
-        // kept for a sample that genuinely cannot be read.
+        // the VALUE it holds at each element position the document describes
+        // ([`fill_from_sample`]) — an envelope element carries that value, an element of a
+        // body segment the placeholder carrying it — so the document a caller maps is the
+        // same one either way. `ResourceNotFoundException` is kept for a sample that
+        // genuinely cannot be read.
         if let Some(sample) = input.output_sample_location.as_ref() {
             let region = crate::state::request_region(ctx.parts());
             let text = crate::state::read_edi_object(ctx, &region, sample, "outputSampleLocation")
@@ -1573,7 +1812,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                              {failure}"
                         ))
                     })?;
-            fill_envelope_from_sample(&mut document, Some(&parsed), ENVELOPE_LEVELS);
+            fill_from_sample(&mut document, Some(&parsed), ENVELOPE_LEVELS);
         }
         let mapping_template = match format {
             MappingFormat::Jsonata => render_json(&document).map_err(render_failed)?,
