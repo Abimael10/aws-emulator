@@ -77,7 +77,7 @@ pub fn vpc_origin_not_found() -> EntityNotFound {
 /// This is ALL the request alone decides about such an identifier, and it is what the
 /// operations ADDRESSED by one (`GetVpcOrigin$Id`,
 /// `ListDistributionsByVpcOriginId$VpcOriginId`) read their path member with. The SAME split
-/// [`unresolved_public_key_id`] makes for another resource of this service, over this kind's
+/// [`unresolved_key_group_id`] makes for another resource of this service, over this kind's
 /// own namespace: whether an identifier of this form was ever ISSUED is a property of the
 /// STORE, so a value of this form nothing answers to is a VPC origin that is ABSENT
 /// ([`vpc_origin_not_found`]), while every other value — another resource kind's identifier,

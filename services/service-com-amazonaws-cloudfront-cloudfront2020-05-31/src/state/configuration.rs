@@ -176,6 +176,29 @@ pub(super) fn quantity_disagreement(label: &str, quantity: i32, len: usize) -> O
     ))
 }
 
+/// The `InvalidArgument` message for a SWITCHED list wrapper whose `Enabled` flag and `Items`
+/// disagree, or `None` when they agree.
+///
+/// A wrapper that carries an `Enabled` flag beside its list states a switch over that list,
+/// and the two members are not independent: the switch is what the list is FOR, so an enabled
+/// wrapper with nothing in it switches nothing on and a disabled one carrying entries states
+/// entries nothing reads. CloudFront refuses both directions, and the two sentences are
+/// distinct so a caller is told which way round its wrapper is wrong; the only variable part
+/// of either is the wrapper's own member name, as the model declares it.
+///
+/// `len` is the number of `Items` the wrapper really carries — the same count
+/// [`quantity_disagreement`] compares `Quantity` against, and read AFTER it, so a wrapper
+/// whose stated length is wrong is refused on that first.
+pub(super) fn enabled_items_disagreement(label: &str, enabled: bool, len: usize) -> Option<String> {
+    match (enabled, len) {
+        (true, 0) => Some(format!("The parameter {label} must contain items if enabled.")),
+        (false, 1..) => Some(format!(
+            "The parameter {label} must not contain items if disabled."
+        )),
+        _ => None,
+    }
+}
+
 /// The list wrappers and the direct-only scalars one cache behaviour carries.
 ///
 /// `DefaultCacheBehavior` and `CacheBehavior` declare the same members, so both are
@@ -260,6 +283,23 @@ impl BehaviorLists<'_> {
             return Some("TrustedSigners");
         }
         None
+    }
+
+    /// Record every SWITCHED wrapper this behaviour carries — the ones whose `Enabled` flag
+    /// states a switch over their own list — each under its own member name, beside the
+    /// number of `Items` it carries.
+    ///
+    /// The two signer wrappers are those: `TrustedSigners` and `TrustedKeyGroups` each state
+    /// "whether … is enabled" beside the list the switch governs
+    /// (`smithy_query(query="shape",shape="TrustedSigners,TrustedKeyGroups")`), and no other
+    /// wrapper a cache behaviour carries has such a flag.
+    pub(super) fn collect_switches(&self, switches: &mut Vec<(&'static str, bool, usize)>) {
+        if let Some(signers) = self.trusted_signers {
+            switches.push(("TrustedSigners", signers.enabled, items_len(&signers.items)));
+        }
+        if let Some(groups) = self.trusted_key_groups {
+            switches.push(("TrustedKeyGroups", groups.enabled, items_len(&groups.items)));
+        }
     }
 
     /// Record every wrapper this behaviour carries, each under its OWN member name.
@@ -633,6 +673,9 @@ pub fn config_refusal_without_state(config: &DistributionConfig) -> Option<Creat
     if let Some(message) = config_quantity_mismatch(config) {
         return Some(CreateRefusal::InconsistentQuantities(message));
     }
+    if let Some(message) = config_switch_disagreement(config) {
+        return Some(CreateRefusal::InvalidArgument(message));
+    }
     if let Some(message) = origin_port_refusal(config) {
         return Some(CreateRefusal::InvalidArgument(message));
     }
@@ -895,6 +938,29 @@ pub fn config_quantity_mismatch(config: &DistributionConfig) -> Option<String> {
     counts
         .iter()
         .find_map(|(label, quantity, len)| quantity_disagreement(label, *quantity, *len))
+}
+
+/// The modelled `InvalidArgument` message for the first SWITCHED list wrapper in `config`
+/// whose `Enabled` flag and `Items` disagree, or `None` when every one of them agrees.
+///
+/// The switched wrappers are the signer ones a cache behaviour carries
+/// ([`BehaviorLists::collect_switches`]), and the rule holds for EVERY behaviour of a
+/// configuration — the default one and each ordered one — so this walks all of them in the
+/// order the configuration states them, which is the order a caller reads its own document
+/// in. Each is reported by its own member name and by nothing of the path that reaches it:
+/// the condition is a property of that one wrapper ([`enabled_items_disagreement`]).
+///
+/// Read AFTER the stated lengths agree with the lists beside them
+/// ([`config_quantity_mismatch`]), so a wrapper that is wrong about its own length is refused
+/// on that rather than on the switch.
+pub fn config_switch_disagreement(config: &DistributionConfig) -> Option<String> {
+    let mut switches: Vec<(&'static str, bool, usize)> = Vec::new();
+    for behavior in behavior_views(config) {
+        behavior.collect_switches(&mut switches);
+    }
+    switches
+        .iter()
+        .find_map(|(label, enabled, len)| enabled_items_disagreement(label, *enabled, *len))
 }
 
 /// The modelled `InconsistentQuantities` message for the first list wrapper in a
@@ -3503,47 +3569,19 @@ pub const MAX_PUBLIC_KEY_COMMENT: usize = MAX_ORIGIN_ACCESS_IDENTITY_COMMENT;
 /// public key — so nothing from the request belongs in the text and every path that raises
 /// this code reads the same.
 ///
-/// This is the answer an operation gives a WELL-FORMED public key id — one written the way
-/// CloudFront writes a public key identifier ([`is_public_key_id`]) — that the account holds
-/// no key under: the key was named readably and is simply not there. An `Id` outside that
-/// form is the identifier the service reports it cannot read instead
-/// ([`unresolved_public_key_id`]), and a public key id borne by a submitted DOCUMENT rather
-/// than by the request's path addresses nothing, so it is resolved against the store alone
-/// and reports the absent key whatever its shape.
+/// This is the answer EVERY operation addressed by a public key `Id` gives an `Id` the store
+/// holds no key under, whatever form that value takes: the model constrains that member no
+/// further than `string` — no `@pattern`, no `@length` — so its form is not something the
+/// route reads, and the STORE is what says whether a key answers to it. Recorded behaviour
+/// decides that: an `Id` written in another resource kind's form — a key group's UUID — is
+/// answered this very sentence, so the public key reads make no split of their own, unlike
+/// the reads of a resource whose identifier form IS fully specified
+/// ([`unresolved_key_group_id`]). A public key id borne by a submitted DOCUMENT rather than
+/// by the request's path addresses nothing either, so it too is resolved against the store
+/// alone and reports the absent key whatever its shape.
 pub fn no_such_public_key() -> crate::ops::types::NoSuchPublicKey {
     crate::ops::types::NoSuchPublicKey {
         message: Some(NO_SUCH_PUBLIC_KEY_MESSAGE.to_string()),
-    }
-}
-
-/// The modelled `NoSuchPublicKey` (HTTP 404) an operation ADDRESSED by a public key `Id` in
-/// its path answers an `Id` it cannot resolve.
-///
-/// The SAME split [`unresolved_key_group_id`] makes for another resource of this service,
-/// over this kind's own predicate ([`is_public_key_id`]):
-/// `GetPublicKey` and its siblings model this one not-found code, so one code and one status
-/// cover two conditions and the MESSAGE is what tells them apart, decided from the value
-/// alone and therefore before the store is consulted. Only a value written the way
-/// CloudFront writes a public key identifier — the public key namespace letter followed by an
-/// identifier body of the width it issues one at — is an identifier the service READS, so the
-/// store holding no key under it is the absent-key sentence
-/// ([`NO_SUCH_PUBLIC_KEY_MESSAGE`]); every other value — another resource kind's identifier,
-/// this namespace at a width CloudFront issues none at, a lower-cased identifier, a UUID, a
-/// name, a caller reference, a word — is the identifier the service reports it cannot read
-/// ([`id_format_invalid_message`]). Both sentences are fixed text and neither echoes the
-/// value submitted.
-///
-/// Only an identifier that ADDRESSES the operation is judged this way: a public key id borne
-/// by a submitted DOCUMENT (an `EncryptionEntity$PublicKeyId` on a field-level encryption
-/// profile write) addresses nothing, so it is resolved against the store alone and reports
-/// the absent key whatever its shape ([`no_such_public_key`]).
-pub fn unresolved_public_key_id(id: &str) -> crate::ops::types::NoSuchPublicKey {
-    if is_public_key_id(id) {
-        no_such_public_key()
-    } else {
-        crate::ops::types::NoSuchPublicKey {
-            message: Some(id_format_invalid_message("Id")),
-        }
     }
 }
 

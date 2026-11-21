@@ -4383,3 +4383,10 @@ pub use config_members::*;
 mod pagination_markers;
 pub use pagination_markers::*;
 
+/// Whether the CERTIFICATE a distribution's configuration names can serve the alternate
+/// domain names it claims: the Region a Certificate Manager ARN names, and what the service
+/// HOLDING the certificate records about it. A SUBMODULE for the same reason [`functions`] is
+/// one; `pub use` keeps every name reachable as `crate::state::<name>`.
+mod viewer_certificate;
+pub use viewer_certificate::*;
+

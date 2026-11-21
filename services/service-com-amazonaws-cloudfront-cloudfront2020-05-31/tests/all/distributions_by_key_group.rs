@@ -42,8 +42,9 @@ const NO_SUCH_KEY_GROUP_MESSAGE: &str = "The specified key group does not exist.
 
 /// One distribution under test: which of the created key groups its default cache behaviour
 /// trusts, which ones each of its ordered cache behaviours trusts, and whether the
-/// `TrustedKeyGroups` wrapper it submits is `Enabled`. An index is into the key groups
-/// [`create_groups`] creates, in order; an empty slice is a behaviour that submits no
+/// `TrustedKeyGroups` wrapper it submits is `Enabled` — a wrapper that names items has to be,
+/// since CloudFront refuses one that states items while switched off. An index is into the key
+/// groups [`create_groups`] creates, in order; an empty slice is a behaviour that submits no
 /// `TrustedKeyGroups` wrapper at all.
 ///
 /// `pub(crate)` with [`config_xml`] so a sibling suite that needs a distribution trusting a
@@ -114,10 +115,10 @@ const ROWS: &[Row] = &[
         enabled: true,
     },
     Row {
-        case: "the wrapper names group 0 with Enabled false",
-        default_groups: &[0],
+        case: "one behaviour names group 0 beside group 1",
+        default_groups: &[0, 1],
         ordered: &[],
-        enabled: false,
+        enabled: true,
     },
     Row {
         case: "no behaviour names a key group at all",

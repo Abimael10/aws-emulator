@@ -46,7 +46,6 @@ use crate::public_key_lifecycle::{create_key, get_key, pem, Key};
 /// The sentences CloudFront sends for these refusals, spelled out here rather than taken from
 /// the crate, so a reworded refusal fails this suite.
 const NO_SUCH_PUBLIC_KEY_MESSAGE: &str = "The specified CloudFront public key does not exist.";
-const ID_FORMAT_INVALID: &str = "Id format is invalid";
 const PUBLIC_KEY_IN_USE_MESSAGE: &str =
     "The Cloudfront public key is currently associated with either Key Group or a field level \
      encryption profile. Please disassociate the key before deleting.";
@@ -731,9 +730,9 @@ async fn an_id_no_key_holds_is_refused() {
     let mut flipped: Vec<char> = known.chars().collect();
     let last = flipped.len() - 1;
     flipped[last] = if flipped[last] == 'A' { 'B' } else { 'A' };
-    // Each row: the case, the `Id` submitted, and the sentence it is refused with — the
-    // absent-key sentence for a value written the way CloudFront writes a public key
-    // identifier, the unreadable-identifier sentence for every other value.
+    // Each row: the case, the `Id` submitted, and the sentence it is refused with — the `Id`
+    // is resolved against the STORE, so every value it holds no key under is the key reported
+    // ABSENT, whatever namespace or case the value is written in.
     let absent: [(&str, String, &str); 7] = [
         (
             "a public key id never minted",
@@ -748,27 +747,27 @@ async fn an_id_no_key_holds_is_refused() {
         (
             "the known id in lower case",
             known.to_lowercase(),
-            ID_FORMAT_INVALID,
+            NO_SUCH_PUBLIC_KEY_MESSAGE,
         ),
         (
             "a token that is no public key id",
             "not-a-public-key-id".to_string(),
-            ID_FORMAT_INVALID,
+            NO_SUCH_PUBLIC_KEY_MESSAGE,
         ),
         (
             "the caller reference rather than the id",
             present.caller_reference.clone(),
-            ID_FORMAT_INVALID,
+            NO_SUCH_PUBLIC_KEY_MESSAGE,
         ),
         (
             "a well-formed distribution id",
             "EDFDVBD6EXAMPL".to_string(),
-            ID_FORMAT_INVALID,
+            NO_SUCH_PUBLIC_KEY_MESSAGE,
         ),
         (
             "a well-formed key group id",
             "4fbc5e5c-1ee4-4f3b-9e9f-4a2a3b3b7c11".to_string(),
-            ID_FORMAT_INVALID,
+            NO_SUCH_PUBLIC_KEY_MESSAGE,
         ),
     ];
 

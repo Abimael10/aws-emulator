@@ -5,19 +5,18 @@
 //! RULE under test: the operations that address a public key by `Id` — `GetPublicKey`,
 //! `GetPublicKeyConfig`, `UpdatePublicKey` and `DeletePublicKey`
 //! (`smithy_query(query="operation",operation="GetPublicKey,GetPublicKeyConfig,UpdatePublicKey,DeletePublicKey")`)
-//! — model one 404 error, `NoSuchPublicKey`, so one code and one status cover two conditions
-//! and the MESSAGE is what tells them apart: an `Id` of the form CloudFront writes a public
-//! key identifier in that the store holds no key under is the key that is ABSENT, and every
-//! other value is the identifier the service reports it cannot READ. Neither sentence echoes
-//! anything the request submitted.
+//! — model one 404 error, `NoSuchPublicKey`, and resolve the `Id` against the STORE: the model
+//! constrains that member no further than `string`, so the form of the value decides nothing
+//! and every `Id` the store holds no key under is the key that is ABSENT. The sentence echoes
+//! nothing the request submitted.
 //!
 //! The rows span what the rule generalises over — a value's RELATION to this service's
 //! identifier namespaces. The point this suite adds to the
 //! sibling table in [`crate::refusal_message_fidelity`] is that the values it drives are ids
 //! that really do resolve: the key group id below names a key group `GetKeyGroup` answers 200
 //! for, and the public key id below names the key `GetPublicKey` answers 200 for, so each read
-//! is shown to resolve its OWN kind's id and to report every other as an identifier it cannot
-//! read.
+//! is shown to resolve its OWN kind's id and to report every other as the key it holds none
+//! of.
 //!
 //! The wire harness and the create helpers are the crate's own.
 
@@ -30,16 +29,13 @@ use crate::distribution_lifecycle::{emulator, is_minted_uuid};
 use crate::key_group_lifecycle::{create_group, get_group, Group};
 use crate::public_key_lifecycle::{create_key, get_key, pem, Key};
 
-/// The sentence `NoSuchPublicKey` carries for an `Id` OF a public key identifier's form that
-/// the store holds no key under, spelled out as a literal rather than read off the crate's
-/// producer, so the WORDING is what these rows are held to.
+/// The sentence `NoSuchPublicKey` carries for an `Id` the store holds no key under, spelled
+/// out as a literal rather than read off the crate's producer, so the WORDING is what these
+/// rows are held to.
 const NO_SUCH_PUBLIC_KEY: &str = "The specified CloudFront public key does not exist.";
 
-/// The sentence the same code carries for an `Id` outside that form.
-const ID_FORMAT_INVALID: &str = "Id format is invalid";
-
 #[tokio::test]
-async fn a_public_key_id_is_read_by_the_form_it_takes_before_the_store_is_consulted() {
+async fn a_public_key_id_is_resolved_against_the_store_whatever_form_it_takes() {
     let router = emulator();
 
     // The one public key the account holds, and the one key group: both ids are MINTED here
@@ -96,59 +92,41 @@ async fn a_public_key_id_is_read_by_the_form_it_takes_before_the_store_is_consul
         key_read.status, key_read.raw
     );
 
-    // (case, the `Id` the read is addressed with, the sentence it is refused with) — a live
-    // id of another kind, each other namespace this service mints ids in, a value in the
-    // public key namespace of no minted id's width, and ids that could have been public keys
-    // CloudFront issued. The form the value takes is what decides which sentence it earns.
-    let rows: Vec<(&str, String, &str)> = vec![
-        (
-            "a key group id that really names a key group",
-            group_id,
-            ID_FORMAT_INVALID,
-        ),
+    // (case, the `Id` the read is addressed with) — a live id of another kind, each other
+    // namespace this service mints ids in, a value in the public key namespace of no minted
+    // id's width, and ids that could have been public keys CloudFront issued. The STORE is
+    // what decides, so every one of them earns the one absent-key sentence.
+    let rows: Vec<(&str, String)> = vec![
+        ("a key group id that really names a key group", group_id),
         (
             "the public key prefix with a body of no minted id's width",
             format!("{PUBLIC_KEY_ID_PREFIX}2AA"),
-            ID_FORMAT_INVALID,
         ),
         (
             "a field-level encryption profile id",
             format!("{FIELD_LEVEL_ENCRYPTION_PROFILE_ID_PREFIX}4AAAAAAAAAAAA"),
-            ID_FORMAT_INVALID,
         ),
         (
             "a field-level encryption configuration id",
             format!("{FIELD_LEVEL_ENCRYPTION_CONFIG_ID_PREFIX}5AAAAAAAAAAAA"),
-            ID_FORMAT_INVALID,
         ),
         (
             "a public key id of this namespace that was never minted",
             "K2NEVERMINTED1".to_string(),
-            NO_SUCH_PUBLIC_KEY,
         ),
         (
             "another public key id of this namespace that was never minted",
             format!("{PUBLIC_KEY_ID_PREFIX}3ZZZZZZZZZZZZ"),
-            NO_SUCH_PUBLIC_KEY,
         ),
-        (
-            "the stored id in lower case",
-            key_id.to_lowercase(),
-            ID_FORMAT_INVALID,
-        ),
+        ("the stored id in lower case", key_id.to_lowercase()),
         (
             "the caller reference rather than the id",
             key.caller_reference.clone(),
-            ID_FORMAT_INVALID,
         ),
-        (
-            "a word of no CloudFront id shape at all",
-            "..".to_string(),
-            ID_FORMAT_INVALID,
-        ),
+        ("a word of no CloudFront id shape at all", "..".to_string()),
     ];
 
-    for (case, id, sentence) in &rows {
+    for (case, id) in &rows {
         let answer = get_key(&router, id).await;
         assert_eq!(
             answer.status, 404,
@@ -163,8 +141,8 @@ async fn a_public_key_id_is_read_by_the_form_it_takes_before_the_store_is_consul
         );
         let message = answer.root().find_text("Message").unwrap_or_default();
         assert_eq!(
-            message, *sentence,
-            "case {case:?} (Id {id:?}): expected {sentence:?}, got {message:?}"
+            message, NO_SUCH_PUBLIC_KEY,
+            "case {case:?} (Id {id:?}): expected {NO_SUCH_PUBLIC_KEY:?}, got {message:?}"
         );
         assert!(
             !message.contains(id.as_str()),

@@ -469,6 +469,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(create_refusal(refusal));
         }
+        // An alternate domain name is served only under a certificate that validates the
+        // authorization to use it, so the certificate the configuration names is resolved
+        // against the records of the services that HOLD certificates before a distribution
+        // exists to carry the alias. The pair rule — that a configuration claiming an alias
+        // names one custom certificate at all — is answered inside the shared create path,
+        // which is why only the resolution is here.
+        if let Some(message) =
+            crate::state::unusable_viewer_certificate(&*self.engine, &input.distribution_config)
+        {
+            return Err(create_refusal(
+                crate::state::CreateRefusal::InvalidViewerCertificate(message.to_string()),
+            ));
+        }
         // A Lambda@Edge association fires only where the function's execution role admits
         // the assume the edge makes of it, so a configuration naming a role this emulator's
         // records show it could not be invoked under is refused BEFORE a distribution — or

@@ -53,11 +53,6 @@ use crate::response_headers_policy_lifecycle::text;
 const IMMUTABLE_FIELDS_MESSAGE: &str =
     "You cannot modify encoded material and name of a public key once created.";
 
-/// The sentence the one 404 code carries for an `Id` OUTSIDE the form CloudFront writes a
-/// public key identifier in: the identifier the service reports it cannot read, naming the
-/// member that carried it. Spelled out as a literal for the reason above.
-const ID_FORMAT_INVALID: &str = "Id format is invalid";
-
 // ---------------------------------------------------------------------------
 // Calling the update
 // ---------------------------------------------------------------------------
@@ -651,12 +646,12 @@ async fn an_id_no_key_holds_is_refused() {
         (
             "the existing id in lower case",
             id.to_lowercase(),
-            ID_FORMAT_INVALID,
+            NO_SUCH_PUBLIC_KEY_MESSAGE,
         ),
         (
             "a token of no public key id's shape",
             "not-a-key".to_string(),
-            ID_FORMAT_INVALID,
+            NO_SUCH_PUBLIC_KEY_MESSAGE,
         ),
     ];
 

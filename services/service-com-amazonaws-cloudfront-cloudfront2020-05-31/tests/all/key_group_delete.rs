@@ -382,10 +382,10 @@ const REFERENCES: &[Row] = &[
         enabled: true,
     },
     Row {
-        case: "the wrapper names the group with Enabled false",
-        default_groups: &[0],
-        ordered: &[],
-        enabled: false,
+        case: "the wrapper names the group with Enabled true beside a spare group",
+        default_groups: &[0, 1],
+        ordered: &[&[1]],
+        enabled: true,
     },
 ];
 
@@ -396,9 +396,8 @@ fn references(row: &Row, index: usize) -> bool {
 }
 
 /// A key group a stored cache behaviour trusts cannot be deleted, and once no distribution
-/// references it the same delete lands — the STORED `TrustedKeyGroups` list is the gate, and
-/// the `Enabled` flag beside it says whether signed access is switched on rather than whether
-/// the group is named.
+/// references it the same delete lands — the STORED `TrustedKeyGroups` list is the gate,
+/// wherever in the configuration it sits and whatever else it names beside the group.
 ///
 /// The reference is released two ways, one per half of the suite: an update that drops it, and
 /// a delete of the whole referencing distribution.

@@ -55,6 +55,12 @@ service-com-amazonaws-servicequotas-servicequotasv20190624 = { workspace = true 
 # so a policy a client wrote with `iam:PutRolePolicy` decides this service's calls.
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# WHICH certificate a distribution presents to its viewers on an alternate domain name: the
+# `ViewerCertificate` names one kept in Certificate Manager or in Identity and Access
+# Management, and whether that certificate can serve the name at all — how it was come by, and
+# which hosts it covers — is the record of the service that HOLDS it, read over the shared
+# engine (`state::viewer_certificate`).
+service-com-amazonaws-acm-certificatemanager = { workspace = true }
 # The CloudWatch store the EDGE publishes the per-distribution metrics of the viewer
 # requests it serves to (the `AWS/CloudFront` namespace, `service::edge_metrics`).
 # CloudWatch refuses a `PutMetricData` into a reserved `AWS/` namespace, so a service's own
@@ -205,6 +211,11 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 # TLS client proves that half answers. It does not verify the emulator's self-signed
 # certificate, which is what a viewer of a local emulator does. TEST-ONLY.
 reqwest = { workspace = true }
+# The certificates the viewer-certificate suite brings into Certificate Manager: that suite
+# mounts the real emulated service on the same router and imports material through its own
+# `ImportCertificate`, so the record CloudFront reads is one a client really created.
+# TEST-ONLY — `src/` reads that service's store directly over the shared engine.
+aws-sdk-acm = { version = "1", default-features = false }
 
 [lints]
 workspace = true

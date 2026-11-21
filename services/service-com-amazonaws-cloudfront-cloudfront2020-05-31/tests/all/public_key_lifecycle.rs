@@ -50,15 +50,11 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-/// The sentence `NoSuchPublicKey` carries for an `Id` of the form CloudFront writes a public
-/// key identifier in that the store holds no key under: a property of the store rather than of
-/// the request, so it names no id. Spelled out here as a literal rather than read back off the
-/// crate's constant, so the WORDING is what these rows are held to.
+/// The sentence `NoSuchPublicKey` carries for an `Id` the store holds no key under: a property
+/// of the store rather than of the request, so it names no id. Spelled out here as a literal
+/// rather than read back off the crate's constant, so the WORDING is what these rows are held
+/// to.
 const NO_SUCH_PUBLIC_KEY: &str = "The specified CloudFront public key does not exist.";
-
-/// The sentence the same code carries for an `Id` OUTSIDE that form: the identifier the
-/// service reports it cannot read, naming the member that carried it.
-const ID_FORMAT_INVALID: &str = "Id format is invalid";
 
 /// The sentence `PublicKeyAlreadyExists` carries when the NAME a create submits is one
 /// another key of the account already holds, spelled out here for the same reason.
@@ -552,17 +548,16 @@ async fn create_persists_the_configuration_every_read_then_reports() {
 
     // An id no public key holds, in the forms such a value takes: an id of this namespace
     // that was never minted, a word of no id shape at all, a bare digit, and a well-formed
-    // identifier of another resource kind this service mints. The one 404 code covers two
-    // conditions and the SENTENCE tells them apart — the key reported ABSENT for a value
-    // written the way CloudFront writes a public key identifier, the identifier it cannot
-    // read for every other. BOTH readers of the one record answer the same way, under fixed
-    // text that names no part of the request. The wider table over this service's other
-    // namespaces is asserted in `refusal_message_fidelity`.
+    // identifier of another resource kind this service mints. The `Id` is resolved against
+    // the STORE, so every one of them is reported as the key that is ABSENT, under fixed text
+    // that names no part of the request. BOTH readers of the one record answer the same way.
+    // The wider table over this service's other namespaces is asserted in
+    // `refusal_message_fidelity`.
     for (id, sentence) in [
         ("K1AAAAAAAAAAAA", NO_SUCH_PUBLIC_KEY),
-        ("not-an-id", ID_FORMAT_INVALID),
-        ("0", ID_FORMAT_INVALID),
-        ("E1AAAAAAAAAAAA", ID_FORMAT_INVALID),
+        ("not-an-id", NO_SUCH_PUBLIC_KEY),
+        ("0", NO_SUCH_PUBLIC_KEY),
+        ("E1AAAAAAAAAAAA", NO_SUCH_PUBLIC_KEY),
     ] {
         for (reader, missing) in [
             ("GetPublicKey", get_key(&router, id).await),

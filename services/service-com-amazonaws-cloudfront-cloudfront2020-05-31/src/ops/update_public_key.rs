@@ -199,13 +199,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle(now);
 
         // The key being updated is looked up first: every refusal below is about the record
-        // this id names, and nothing is minted for an id the store does not hold. The FORM
-        // of the `Id` is a property of the request, so it decides which of the one code's
-        // two sentences the refusal carries
-        // ([`crate::state::unresolved_public_key_id`]).
+        // this id names, and nothing is minted for an id the store does not hold. The STORE is
+        // what resolves the `Id` — the model constrains it no further than `string` — so an
+        // `Id` no key answers to is the key that is absent, whatever form the value takes
+        // ([`crate::state::no_such_public_key`]).
         let Some(stored) = store.public_key(&input.id) else {
             return Err(UpdatePublicKeyErrorModeled::NoSuchPublicKey(
-                crate::state::unresolved_public_key_id(&input.id),
+                crate::state::no_such_public_key(),
             )
             .into());
         };
@@ -248,7 +248,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cannot miss. The `None` arm is the modelled 404 rather than a panic.
         let Some(stored) = store.apply_public_key_config(&input.id, config) else {
             return Err(UpdatePublicKeyErrorModeled::NoSuchPublicKey(
-                crate::state::unresolved_public_key_id(&input.id),
+                crate::state::no_such_public_key(),
             )
             .into());
         };

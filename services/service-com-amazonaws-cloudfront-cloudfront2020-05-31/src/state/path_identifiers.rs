@@ -36,10 +36,12 @@
 //!
 //! The same split, for the kinds whose identifier form IS decided by the value alone, is made
 //! by the free functions beside the refusals they answer with:
-//! [`super::unresolved_key_group_id`], [`super::unresolved_public_key_id`] and the two
+//! [`super::unresolved_key_group_id`] and the two
 //! field-level encryption records' ([`super::unresolved_field_level_encryption_config`],
 //! [`super::unresolved_field_level_encryption_profile`]). Those need no store, which is the one
-//! reason the ones below are methods.
+//! reason the ones below are methods. A kind whose recorded contract makes NO such split reads
+//! nothing of the value at all and reports the absent resource for every identifier it cannot
+//! resolve, which is what the public key reads do ([`super::no_such_public_key`]).
 //!
 //! Nothing here echoes the submitted value: both sentences are fixed text.
 

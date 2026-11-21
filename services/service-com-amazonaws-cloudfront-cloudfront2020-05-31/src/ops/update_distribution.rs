@@ -448,6 +448,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The same rule the create path applies to a wrapper that carries a switch over its
+        // own list: an update cannot leave a behaviour stating signers it has switched off,
+        // or a switch turned on over nothing.
+        if let Some(message) = crate::state::config_switch_disagreement(&input.distribution_config)
+        {
+            return Err(UpdateDistributionErrorModeled::InvalidArgument(InvalidArgument {
+                message: Some(message),
+            })
+            .into());
+        }
+
         // The same bound the create path applies: a configuration is walked on every
         // payload that reports it, so an update cannot store counts past CloudFront's
         // published quotas either.
@@ -495,6 +506,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // under a certificate that validates it, so an update cannot leave a distribution
         // carrying an alias its viewer certificate does not cover either.
         if let Some(message) = crate::state::alias_certificate_mismatch(&input.distribution_config)
+        {
+            return Err(UpdateDistributionErrorModeled::InvalidViewerCertificate(
+                InvalidViewerCertificate {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // And the other half of it: the certificate the configuration names, resolved against
+        // the records of the services that HOLD certificates, so an update cannot leave a
+        // distribution presenting one CloudFront could not serve the alias under.
+        if let Some(message) =
+            crate::state::unusable_viewer_certificate(&*self.engine, &input.distribution_config)
         {
             return Err(UpdateDistributionErrorModeled::InvalidViewerCertificate(
                 InvalidViewerCertificate {

@@ -453,13 +453,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if state.lock().at_distribution_capacity() {
             return Err(create_refusal(crate::state::too_many_distributions()));
         }
-        // The same three gates `CreateDistribution` applies in the same order, for the
-        // reasons it gives: the refusals the configuration carries by itself, then a
+        // The same four gates `CreateDistribution` applies in the same order, for the
+        // reasons it gives: the refusals the configuration carries by itself, then the
+        // certificate it names resolved against the services that hold certificates, then a
         // Lambda@Edge association whose execution role this emulator's records show the edge
         // could not assume, then the standard-logging bucket — all before a distribution or
         // a socket exists.
         if let Some(refusal) = crate::state::config_refusal_without_state(&distribution_config) {
             return Err(create_refusal(refusal));
+        }
+        if let Some(message) =
+            crate::state::unusable_viewer_certificate(&*self.engine, &distribution_config)
+        {
+            return Err(create_refusal(
+                crate::state::CreateRefusal::InvalidViewerCertificate(message.to_string()),
+            ));
         }
         if let Some(message) =
             crate::state::edge_association_role_refusal(ctx, &distribution_config).await
