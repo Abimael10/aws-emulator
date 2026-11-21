@@ -29,7 +29,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use service_com_amazonaws_accessanalyzer_accessanalyzer::state::MAX_RESOLVED_TRAILS;
 
-use crate::harness::{wire_reason, Emulator, Reply, REGION};
+use crate::harness::{role_arn, wire_reason, Emulator, Reply, REGION};
 
 /// The status a success that reports content carries.
 const OK: u16 = 200;
@@ -55,11 +55,6 @@ const OTHER_REGION: &str = "us-west-2";
 
 /// The bucket every trail below delivers into.
 const LOG_BUCKET: &str = "accessanalyzer-trail-logs";
-
-/// An IAM role ARN in this emulator's account, in the form `PrincipalArn`'s pattern requires.
-fn role_arn(name: &str) -> String {
-    format!("arn:aws:iam::{}:role/{name}", engine::emulator_account_id())
-}
 
 /// A CloudTrail trail ARN as a CLIENT writes one, in the form `CloudTrailArn`'s pattern
 /// requires (`^arn:[^:]*:cloudtrail:[^:]*:[^:]*:trail/.{1,576}$`).

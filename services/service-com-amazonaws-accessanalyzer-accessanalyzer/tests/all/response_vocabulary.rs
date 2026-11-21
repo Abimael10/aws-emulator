@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_accessanalyzer_accessanalyzer::ops::types::VALIDATION_EXCEPTION_REASON_VALUES;
 use service_com_amazonaws_accessanalyzer_accessanalyzer::state;
 
-use crate::harness::{wire_reason, Emulator, Reply, VALIDATION_REASONS};
+use crate::harness::{named_fields, wire_reason, Emulator, Reply, VALIDATION_REASONS};
 
 /// The route `CheckNoNewAccess` is bound to, from the crate's `OPERATIONS.md`:
 /// `POST /policy/check-no-new-access -> 200`.
@@ -86,26 +86,6 @@ async fn check_no_new_access(
             })),
         )
         .await
-}
-
-/// The names a refusal's `fieldList` carries, in reply order.
-fn named_fields(reply: &Reply) -> Vec<String> {
-    reply
-        .member("fieldList")
-        .and_then(Value::as_array)
-        .map(|fields| {
-            fields
-                .iter()
-                .map(|field| {
-                    field
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string()
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// The service's reason vocabulary IS the model's: the same discriminator/name pairs, and

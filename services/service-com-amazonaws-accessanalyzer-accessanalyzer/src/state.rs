@@ -995,18 +995,30 @@ pub fn policy_generation_not_found(job_id: &str) -> ValidationException {
     field_validation_exception("jobId", format!("Invalid jobId: {job_id} does not exist"))
 }
 
-/// The 400 for a cancel of a job that is no longer running.
+/// The 400 for a request asking a job to move into a status its current status does not
+/// allow — a cancel of a job that is no longer running.
 ///
 /// Cancelling stops work that is still in progress; a job that has already reached a
 /// terminal status has none left to stop, so the request is refused rather than silently
 /// doing nothing, and the message reports the status the job is actually in.
-pub fn policy_generation_not_cancelable(job_id: &str, status: &str) -> ValidationException {
+///
+/// AWS words a refused status change as `Invalid jobId: ` + the submitted id +
+/// `. Illegal status change from ` + the status the job is in + ` to ` + the status the
+/// call asked for. The fixed text is those three fragments; the variable parts are the
+/// `jobId` the request named and the two `JobStatus` values — the current one read from
+/// this service's own state, never from the request, and the target one the operation
+/// moves a job to. It stays distinct from [`policy_generation_not_found`], the other
+/// refusal the same operations render, because the model declares no error code that
+/// separates "no such job" from "illegal status change": the message is the only thing a
+/// client can tell them apart by.
+pub fn policy_generation_illegal_status_change(
+    job_id: &str,
+    from_status: &str,
+    to_status: &str,
+) -> ValidationException {
     field_validation_exception(
         "jobId",
-        format!(
-            "jobId must name a policy generation job in status {JOB_STATUS_IN_PROGRESS}, \
-             but {job_id} is in status {status}"
-        ),
+        format!("Invalid jobId: {job_id}. Illegal status change from {from_status} to {to_status}"),
     )
 }
 

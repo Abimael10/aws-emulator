@@ -33,7 +33,9 @@ use serde_json::{json, Value};
 use service_com_amazonaws_accessanalyzer_accessanalyzer::state::POLICY_GENERATION_SPAN;
 
 use crate::harness::{
-    is_timestamp, member, timestamp_at_least, wire_reason, Emulator, Reply, REGION,
+    is_timestamp, member, policy_generation_body as start_body, role_arn,
+    start_policy_generation_ok as start_ok, timestamp_at_least, trail_arn, user_arn, wire_reason,
+    Emulator, Reply,
 };
 
 /// The status a success that reports content carries.
@@ -72,82 +74,9 @@ fn field_validation_failed() -> &'static str {
     wire_reason("fieldValidationFailed")
 }
 
-/// An IAM role ARN in this emulator's account, in the form `PrincipalArn`'s pattern
-/// requires (`^arn:[^:]*:iam::[^:]*:(role|user)/.{1,576}$`).
-fn role_arn(name: &str) -> String {
-    format!("arn:aws:iam::{}:role/{name}", engine::emulator_account_id())
-}
-
-/// An IAM user ARN, the other principal kind that same pattern accepts.
-fn user_arn(name: &str) -> String {
-    format!("arn:aws:iam::{}:user/{name}", engine::emulator_account_id())
-}
-
-/// A CloudTrail trail ARN, in the form `CloudTrailArn`'s pattern requires
-/// (`^arn:[^:]*:cloudtrail:[^:]*:[^:]*:trail/.{1,576}$`).
-fn trail_arn(name: &str) -> String {
-    format!(
-        "arn:aws:cloudtrail:{REGION}:{}:trail/{name}",
-        engine::emulator_account_id()
-    )
-}
-
-/// The service role a generation reads the trail with; `RoleArn`'s pattern is the role
-/// half of the principal pattern.
-fn access_role() -> String {
-    role_arn("AccessAnalyzerMonitorServiceRole")
-}
-
 /// A `Trail` naming only the ARN — every other member of the shape is optional.
 fn trail(name: &str) -> Value {
     json!({ "cloudTrailArn": trail_arn(name) })
-}
-
-/// The request body of a start, from its parts. `trails` is the whole list, so a row can
-/// carry none, one or several.
-fn start_body(
-    principal_arn: &str,
-    trails: &[Value],
-    start_time: f64,
-    end_time: Option<f64>,
-    client_token: Option<&str>,
-) -> Value {
-    let mut details = json!({
-        "trails": trails,
-        "accessRole": access_role(),
-        "startTime": start_time,
-    });
-    if let Some(end_time) = end_time {
-        details["endTime"] = json!(end_time);
-    }
-    let mut body = json!({
-        "policyGenerationDetails": { "principalArn": principal_arn },
-        "cloudTrailDetails": details,
-    });
-    if let Some(token) = client_token {
-        body["clientToken"] = json!(token);
-    }
-    body
-}
-
-/// Start a generation that must be accepted, and answer the `jobId` it minted.
-async fn start_ok(emulator: &Emulator, case: &str, body: Value) -> String {
-    let reply = emulator.start_policy_generation(body).await;
-    assert_eq!(
-        (reply.status, reply.code()),
-        (OK, ""),
-        "case {case:?}: expected StartPolicyGeneration to answer {OK}, got {reply:?}"
-    );
-    let job_id = reply
-        .member("jobId")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    assert!(
-        !job_id.is_empty(),
-        "case {case:?}: expected a jobId in the response, got {reply:?}"
-    );
-    job_id
 }
 
 /// The `jobDetails` of a `GetGeneratedPolicy` reply.

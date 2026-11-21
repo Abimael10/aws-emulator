@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The TEXT this service puts on the wire for three message templates, driven end to end
+//! The TEXT this service puts on the wire for four message templates, driven end to end
 //! through the real router.
 //!
 //! Each rule is asserted over a table that spans the class the template generalises over,
@@ -17,11 +17,24 @@
 //!    resolves a job — with ONE template naming the submitted id.
 //! 3. A value outside a member's modelled `@pattern` is refused with the service's short
 //!    `Invalid <member>: <value>` sentence, which never carries the pattern itself.
+//! 4. A request asking a job to move into a status its CURRENT status does not allow is
+//!    refused with the service's illegal-status-change sentence, naming the identifier
+//!    from the request and both statuses — the current one read from the service's own
+//!    state. It stays distinct from template 2, which the same operations render for an
+//!    identifier that names nothing.
+
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+use service_com_amazonaws_accessanalyzer_accessanalyzer::state::{
+    policy_generation_illegal_status_change, JOB_STATUS_CANCELED, JOB_STATUS_IN_PROGRESS,
+};
 
 use crate::fixed_refusal_texts::message;
-use crate::harness::{wire_reason, Emulator, Reply, REGION};
+use crate::harness::{
+    member, named_fields, policy_generation_body, role_arn, start_policy_generation_ok, trail_arn,
+    user_arn, wire_reason, Emulator, Reply,
+};
 
 /// The fixed halves of the syntax-error sentence, either side of the position triple.
 const SYNTAX_ERROR_HEAD: &str = "Fix the JSON syntax error at index ";
@@ -302,39 +315,21 @@ impl JobCall {
     }
 }
 
-/// An IAM role ARN in the form `PrincipalArn`'s pattern requires
-/// (`^arn:[^:]*:iam::[^:]*:(role|user)/.{1,576}$`).
-fn role_arn(name: &str) -> String {
-    format!("arn:aws:iam::{}:role/{name}", engine::emulator_account_id())
-}
-
 /// Start a generation and answer the `jobId` it minted, so the table has a job that DOES
 /// exist beside the ones that do not.
 async fn start_generation(emulator: &Emulator, principal: &str) -> String {
-    let reply = emulator
-        .start_policy_generation(json!({
-            "policyGenerationDetails": { "principalArn": principal },
-            "cloudTrailDetails": {
-                "trails": [{
-                    "cloudTrailArn": format!(
-                        "arn:aws:cloudtrail:{REGION}:{}:trail/audit",
-                        engine::emulator_account_id()
-                    ),
-                }],
-                "accessRole": role_arn("AccessAnalyzerMonitorServiceRole"),
-                "startTime": 1_767_225_600.0,
-            },
-        }))
-        .await;
-    assert_eq!(
-        reply.status, 200,
-        "the fixture start must succeed, got {reply:?}"
-    );
-    reply
-        .member("jobId")
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("the start must answer a jobId, got {reply:?}"))
-        .to_string()
+    start_policy_generation_ok(
+        emulator,
+        "the fixture start",
+        policy_generation_body(
+            principal,
+            &[json!({ "cloudTrailArn": trail_arn("audit") })],
+            RANGE_START,
+            None,
+            None,
+        ),
+    )
+    .await
 }
 
 /// RULE 2: a `jobId` that names no policy generation job is refused with ONE template —
@@ -397,19 +392,10 @@ async fn an_unknown_job_id_is_refused_with_one_aws_worded_template() {
                 Some(wire_reason("fieldValidationFailed")),
                 "case {case:?}: the refusal must carry the required reason, got {reply:?}"
             );
-            let named: Vec<&str> = reply
-                .member("fieldList")
-                .and_then(Value::as_array)
-                .map(|fields| {
-                    fields
-                        .iter()
-                        .filter_map(|field| field.get("name").and_then(Value::as_str))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let named = named_fields(&reply);
             assert_eq!(
                 named,
-                vec!["jobId"],
+                vec!["jobId".to_string()],
                 "case {case:?}: expected fieldList to name jobId, got {reply:?}"
             );
         }
@@ -526,19 +512,10 @@ async fn a_value_outside_a_modelled_pattern_is_refused_with_the_services_own_sen
             );
         }
         // `fieldList` still names the member a client has to correct.
-        let named: Vec<&str> = reply
-            .member("fieldList")
-            .and_then(Value::as_array)
-            .map(|fields| {
-                fields
-                    .iter()
-                    .filter_map(|field| field.get("name").and_then(Value::as_str))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let named = named_fields(&reply);
         assert_eq!(
             named,
-            vec![PRINCIPAL_ARN],
+            vec![PRINCIPAL_ARN.to_string()],
             "case {case:?}: expected fieldList to name {PRINCIPAL_ARN}, got {reply:?}"
         );
     }
@@ -563,5 +540,352 @@ async fn a_value_outside_a_modelled_pattern_is_refused_with_the_services_own_sen
             reply.status, 200,
             "case {case:?}: a value inside the pattern must be served, got {reply:?}"
         );
+    }
+}
+
+/// The `JobStatus` a generation reports while it is still running: the one status a cancel
+/// can move a job out of. Taken from the crate's own constant for the model's enum value
+/// (`smithy_query(query="shape",shape="JobStatus")` reports `IN_PROGRESS`, `SUCCEEDED`,
+/// `FAILED`, `CANCELED`), so the table names the modelled status rather than a second copy
+/// of the string; the SENTENCE the rows expect is still written out here as a literal.
+const IN_PROGRESS: &str = JOB_STATUS_IN_PROGRESS;
+
+/// The status a cancel asks a job to move TO, from that same enum.
+const CANCELED: &str = JOB_STATUS_CANCELED;
+
+/// The statuses of that enum a cancel is refused from because the job has already stopped
+/// at one of them. `SUCCEEDED` is the one this emulator's clock produces on its own;
+/// `FAILED` is the one a generation whose analysis could not run reports, and the template
+/// has to render it the same way. (`CANCELED` is the fourth terminal value and is NOT in
+/// this list: re-cancelling a job that is already `CANCELED` is accepted, because the
+/// operation is `@idempotent`.)
+const REFUSED_FROM_STATUSES: &[&str] = &["SUCCEEDED", "FAILED"];
+
+/// How long a case keeps looking for the clock to owe a started generation its terminal
+/// status before it gives up. Generous beside the generation's own span: the CONDITION is
+/// polled until it holds, so a loaded machine only polls more often.
+const TERMINAL_STATUS_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long a poll waits before looking again.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// 2026-01-01T00:00:00Z in epoch seconds: the start of every analysed range below.
+const RANGE_START: f64 = 1_767_225_600.0;
+
+/// One day of an analysed range, in the same unit.
+const DAY: f64 = 86_400.0;
+
+/// The `status` `GetGeneratedPolicy` reports for a job.
+async fn reported_status(emulator: &Emulator, case: &str, job_id: &str) -> String {
+    let reply = emulator.get_generated_policy(job_id, "").await;
+    assert_eq!(
+        reply.status, 200,
+        "case {case:?}: the job must be readable, got {reply:?}"
+    );
+    let details = reply
+        .member("jobDetails")
+        .cloned()
+        .unwrap_or_else(|| panic!("case {case:?}: expected jobDetails, got {reply:?}"));
+    member(&details, "status")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("case {case:?}: expected a status, got {details:?}"))
+        .to_string()
+}
+
+/// Look again until the job has left `IN_PROGRESS`, and answer the status it settled in.
+///
+/// The status comes off the wire, so the sentence under test is asserted against the status
+/// this service itself reports rather than one the test assumed.
+async fn await_terminal_status(emulator: &Emulator, case: &str, job_id: &str) -> String {
+    let deadline = Instant::now() + TERMINAL_STATUS_DEADLINE;
+    loop {
+        let status = reported_status(emulator, case, job_id).await;
+        if status != IN_PROGRESS {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: the generation was still {IN_PROGRESS} after a generous wait"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// The `status` `ListPolicyGenerations` reports for `job_id` among the generations of
+/// `principal_arn`, so the sentence can be checked against the status EVERY read of the one
+/// record reports.
+async fn listed_status(
+    emulator: &Emulator,
+    case: &str,
+    principal_arn: &str,
+    job_id: &str,
+) -> String {
+    let reply = emulator
+        .list_policy_generations(&format!(
+            "?principalArn={}",
+            crate::harness::label(principal_arn)
+        ))
+        .await;
+    assert_eq!(
+        reply.status, 200,
+        "case {case:?}: the listing must be served, got {reply:?}"
+    );
+    let entry = reply
+        .member("policyGenerations")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("jobId").and_then(Value::as_str) == Some(job_id))
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("case {case:?}: expected {job_id} in {reply:?}"));
+    member(&entry, "status")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("case {case:?}: expected a status, got {entry:?}"))
+        .to_string()
+}
+
+/// RULE 4: a request asking a job to move into a status its CURRENT status does not allow
+/// is refused with the service's illegal-status-change sentence — `Invalid jobId: `, the id
+/// the request named, `. Illegal status change from `, the status the job is in, ` to `, the
+/// status the call asked for — with the current status read from the service's own state.
+///
+/// The rows differ along what the template generalises over: which job it is (so the id,
+/// its only request-borne variable part, differs), and the request form the job was started
+/// from — the principal kind, how many trails are named and which optional members each
+/// carries, whether the analysed range carries an end, and whether a `clientToken` was
+/// carried — none of which may reach the sentence. The recorded case (one trail naming only
+/// its ARN, a role principal, no analysed end) is the first row. Every job is started before
+/// any is polled, so the whole table waits out ONE generation span.
+#[tokio::test]
+async fn a_cancel_of_a_job_in_a_terminal_status_reports_the_illegal_status_change() {
+    let emulator = Emulator::new();
+    let principal = role_arn("illegal_status_change");
+    let rows: Vec<(&str, String, Value)> = vec![
+        (
+            "one trail naming only its ARN, a role principal, no analysed end",
+            principal.clone(),
+            policy_generation_body(
+                &principal,
+                &[json!({ "cloudTrailArn": trail_arn("isc-recorded-trail") })],
+                RANGE_START,
+                None,
+                None,
+            ),
+        ),
+        (
+            "three trails, a user principal, an explicit analysed end",
+            user_arn("illegal_status_change_user"),
+            policy_generation_body(
+                &user_arn("illegal_status_change_user"),
+                &[
+                    json!({ "cloudTrailArn": trail_arn("isc-trail-a") }),
+                    json!({ "cloudTrailArn": trail_arn("isc-trail-b"), "regions": ["us-west-2"] }),
+                    json!({ "cloudTrailArn": trail_arn("isc-trail-c"), "allRegions": true }),
+                ],
+                RANGE_START + DAY,
+                Some(RANGE_START + 2.0 * DAY),
+                None,
+            ),
+        ),
+        (
+            "a start carrying a clientToken",
+            role_arn("illegal_status_change_token"),
+            policy_generation_body(
+                &role_arn("illegal_status_change_token"),
+                &[json!({ "cloudTrailArn": trail_arn("isc-token-trail") })],
+                RANGE_START + 3.0 * DAY,
+                None,
+                Some("c2a2d6f4-5f0c-4a2e-9d0b-2f0a6d4c8e11"),
+            ),
+        ),
+        (
+            "a second job of the SAME principal, differing only in its id",
+            principal.clone(),
+            policy_generation_body(
+                &principal,
+                &[json!({ "cloudTrailArn": trail_arn("isc-recorded-trail") })],
+                RANGE_START + 4.0 * DAY,
+                None,
+                None,
+            ),
+        ),
+    ];
+
+    let mut started: Vec<(&str, String, String)> = Vec::new();
+    for (case, principal_arn, body) in rows {
+        let job_id = start_policy_generation_ok(&emulator, case, body).await;
+        started.push((case, principal_arn, job_id));
+    }
+
+    for (case, principal_arn, job_id) in &started {
+        let status = await_terminal_status(&emulator, case, job_id).await;
+        assert_eq!(
+            listed_status(&emulator, case, principal_arn, job_id).await,
+            status,
+            "case {case:?}: the listing must report the status the read reports"
+        );
+
+        let refused = emulator.cancel_policy_generation(job_id).await;
+        assert_eq!(
+            (refused.status, refused.code()),
+            (400, "ValidationException"),
+            "case {case:?}: expected the modelled 400 ValidationException, got {refused:?}"
+        );
+        let expected =
+            format!("Invalid jobId: {job_id}. Illegal status change from {status} to {CANCELED}");
+        assert_eq!(
+            message(&refused),
+            expected,
+            "case {case:?}: expected {expected:?}, got {:?}",
+            message(&refused)
+        );
+        // The neighbouring template of the same operation must not be what answered.
+        assert!(
+            !message(&refused).contains("does not exist"),
+            "case {case:?}: an existing job must not be refused as a missing one, got {refused:?}"
+        );
+        assert_eq!(
+            refused.member("reason").and_then(Value::as_str),
+            Some(wire_reason("fieldValidationFailed")),
+            "case {case:?}: the refusal must carry the required reason, got {refused:?}"
+        );
+        assert_eq!(
+            named_fields(&refused),
+            vec!["jobId".to_string()],
+            "case {case:?}: expected fieldList to name jobId, got {refused:?}"
+        );
+
+        // A refused cancel changed nothing, so the same call is refused with the same
+        // sentence — the status it reports is the job's, not a step of its own.
+        let again = emulator.cancel_policy_generation(job_id).await;
+        assert_eq!(
+            (again.status, again.code(), message(&again)),
+            (400, "ValidationException", expected.as_str()),
+            "case {case:?}: expected the refusal to be stable, got {again:?}"
+        );
+        assert_eq!(
+            reported_status(&emulator, case, job_id).await,
+            status,
+            "case {case:?}: a refused cancel must leave the job in the status it was in"
+        );
+    }
+}
+
+/// The boundary of RULE 4: the status that DOES allow the change is not refused, and the
+/// identifier that names no job at all keeps the other template.
+///
+/// Three cases, one per outcome the operation has beside the refusal above: a running job is
+/// cancelled, a job already `CANCELED` is cancelled again (`@idempotent`, so the same
+/// success and no message at all), and an id no start minted is refused as missing rather
+/// than as an illegal status change.
+#[tokio::test]
+async fn the_status_that_allows_a_cancel_and_an_unknown_job_are_not_illegal_status_changes() {
+    let emulator = Emulator::new();
+    let principal = role_arn("illegal_status_change_boundary");
+    let case = "a job cancelled while it is still running";
+    let job_id = start_policy_generation_ok(
+        &emulator,
+        case,
+        policy_generation_body(
+            &principal,
+            &[json!({ "cloudTrailArn": trail_arn("isc-boundary-trail") })],
+            RANGE_START,
+            None,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        reported_status(&emulator, case, &job_id).await,
+        IN_PROGRESS,
+        "case {case:?}: a generation starts {IN_PROGRESS}"
+    );
+    let stopped = emulator.cancel_policy_generation(&job_id).await;
+    assert_eq!(
+        (stopped.status, stopped.code()),
+        (204, ""),
+        "case {case:?}: a running generation is cancelled, got {stopped:?}"
+    );
+    assert!(
+        stopped.carries_no_content(),
+        "case {case:?}: the success reports no content, got {stopped:?}"
+    );
+    assert_eq!(
+        reported_status(&emulator, case, &job_id).await,
+        CANCELED,
+        "case {case:?}: the cancelled generation reports {CANCELED}"
+    );
+
+    let repeated_case = "a job that is already CANCELED, cancelled again";
+    let repeated = emulator.cancel_policy_generation(&job_id).await;
+    assert_eq!(
+        (repeated.status, repeated.code()),
+        (204, ""),
+        "case {repeated_case:?}: the repeated cancel answers the same success, got {repeated:?}"
+    );
+    assert_eq!(
+        message(&repeated),
+        "",
+        "case {repeated_case:?}: an accepted cancel carries no message, got {repeated:?}"
+    );
+
+    let unknown_case = "an id no start minted";
+    let unknown = "11111111-2222-4333-8444-555555555555";
+    let missing = emulator.cancel_policy_generation(unknown).await;
+    assert_eq!(
+        (missing.status, missing.code()),
+        (400, "ValidationException"),
+        "case {unknown_case:?}: expected the modelled 400 ValidationException, got {missing:?}"
+    );
+    let expected = format!("Invalid jobId: {unknown} does not exist");
+    assert_eq!(
+        message(&missing),
+        expected,
+        "case {unknown_case:?}: expected {expected:?}, got {:?}",
+        message(&missing)
+    );
+    assert!(
+        !message(&missing).contains("Illegal status change"),
+        "case {unknown_case:?}: a missing job is not an illegal status change, got {missing:?}"
+    );
+}
+
+/// RULE 4 over the whole status space it generalises over: the sentence renders EVERY
+/// terminal `JobStatus` the refusal applies to, including the `FAILED` one this emulator's
+/// own clock never produces, and whatever form the submitted id takes.
+///
+/// The constructor is driven directly because no wire call can put a job in `FAILED`; the
+/// expected text is written out here as a literal, so the row cannot be satisfied by reading
+/// the implementation's wording back.
+#[test]
+fn the_illegal_status_change_sentence_renders_every_status_it_refuses_from() {
+    // The forms a submitted id takes: the UUID a start mints, an id that is no UUID, and a
+    // single character.
+    let ids = ["acef2041-5fb4-4bdd-a201-aee420aa09d0", "no-such-job", "j"];
+    for from in REFUSED_FROM_STATUSES {
+        for job_id in ids {
+            let case = format!("{from} -> {CANCELED} for {job_id:?}");
+            let refusal = policy_generation_illegal_status_change(job_id, from, CANCELED);
+            let expected =
+                format!("Invalid jobId: {job_id}. Illegal status change from {from} to {CANCELED}");
+            assert_eq!(
+                refusal.message, expected,
+                "case {case:?}: expected {expected:?}, got {:?}",
+                refusal.message
+            );
+            let named: Vec<&str> = refusal
+                .field_list
+                .iter()
+                .flatten()
+                .map(|field| field.name.as_str())
+                .collect();
+            assert_eq!(
+                named,
+                vec!["jobId"],
+                "case {case:?}: expected the refusal to blame jobId, got {named:?}"
+            );
+        }
     }
 }

@@ -19,7 +19,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{member, Emulator, Reply, REGION};
+use crate::harness::{member, role_arn, trail_arn, Emulator, Reply};
 
 /// The status a success that reports content carries.
 const OK: u16 = 200;
@@ -29,19 +29,6 @@ const BAD_REQUEST: u16 = 400;
 
 /// The error code of that refusal.
 const VALIDATION: &str = "ValidationException";
-
-/// An IAM role ARN in this emulator's account, in the form `PrincipalArn`'s pattern requires.
-fn role_arn(name: &str) -> String {
-    format!("arn:aws:iam::{}:role/{name}", engine::emulator_account_id())
-}
-
-/// A CloudTrail trail ARN, in the form `CloudTrailArn`'s pattern requires.
-fn trail_arn(name: &str) -> String {
-    format!(
-        "arn:aws:cloudtrail:{REGION}:{}:trail/{name}",
-        engine::emulator_account_id()
-    )
-}
 
 /// A `StartPolicyGeneration` body whose analysed range carries the two values given, each as
 /// the JSON the row chose (a date-time string, or the protocol's epoch-seconds number).

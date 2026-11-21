@@ -178,8 +178,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if !job.is_in_progress(now) {
+            // A job that has reached a terminal status cannot move to CANCELED, so the
+            // refusal reports the status change the request asked for and the status the
+            // job is actually in.
             let (status, _) = job.status_at(now);
-            let refusal = crate::state::policy_generation_not_cancelable(&input.job_id, status);
+            let refusal = crate::state::policy_generation_illegal_status_change(
+                &input.job_id,
+                status,
+                crate::state::JOB_STATUS_CANCELED,
+            );
             drop(state);
             crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::ValidationRefused);
             return Err(CancelPolicyGenerationErrorModeled::ValidationException(refusal).into());

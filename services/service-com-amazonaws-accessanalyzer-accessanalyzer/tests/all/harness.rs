@@ -432,6 +432,100 @@ pub fn expected_arn_in(region: &str, name: &str) -> String {
     )
 }
 
+/// An IAM role ARN in this emulator's account, in the form `PrincipalArn`'s modelled
+/// pattern requires (`^arn:[^:]*:iam::[^:]*:(role|user)/.{1,576}$`).
+pub fn role_arn(name: &str) -> String {
+    format!("arn:aws:iam::{}:role/{name}", engine::emulator_account_id())
+}
+
+/// An IAM user ARN: the other principal kind that same pattern accepts.
+pub fn user_arn(name: &str) -> String {
+    format!("arn:aws:iam::{}:user/{name}", engine::emulator_account_id())
+}
+
+/// A CloudTrail trail ARN in this emulator's account and [`REGION`], in the form
+/// `CloudTrailArn`'s modelled pattern requires
+/// (`^arn:[^:]*:cloudtrail:[^:]*:[^:]*:trail/.{1,576}$`).
+pub fn trail_arn(name: &str) -> String {
+    format!(
+        "arn:aws:cloudtrail:{REGION}:{}:trail/{name}",
+        engine::emulator_account_id()
+    )
+}
+
+/// The service role a policy generation reads a trail with; `RoleArn`'s pattern is the role
+/// half of the principal pattern.
+pub fn access_role() -> String {
+    role_arn("AccessAnalyzerMonitorServiceRole")
+}
+
+/// The request body of a `StartPolicyGeneration`, from its parts. `trails` is the whole
+/// list, so a caller can carry none, one or several.
+pub fn policy_generation_body(
+    principal_arn: &str,
+    trails: &[Value],
+    start_time: f64,
+    end_time: Option<f64>,
+    client_token: Option<&str>,
+) -> Value {
+    let mut details = json!({
+        "trails": trails,
+        "accessRole": access_role(),
+        "startTime": start_time,
+    });
+    if let Some(end_time) = end_time {
+        details["endTime"] = json!(end_time);
+    }
+    let mut body = json!({
+        "policyGenerationDetails": { "principalArn": principal_arn },
+        "cloudTrailDetails": details,
+    });
+    if let Some(token) = client_token {
+        body["clientToken"] = json!(token);
+    }
+    body
+}
+
+/// Start a generation that must be accepted, and answer the `jobId` it minted.
+pub async fn start_policy_generation_ok(emulator: &Emulator, case: &str, body: Value) -> String {
+    let reply = emulator.start_policy_generation(body).await;
+    assert_eq!(
+        (reply.status, reply.code()),
+        (200, ""),
+        "case {case:?}: expected StartPolicyGeneration to answer 200, got {reply:?}"
+    );
+    let job_id = reply
+        .member("jobId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !job_id.is_empty(),
+        "case {case:?}: expected a jobId in the response, got {reply:?}"
+    );
+    job_id
+}
+
+/// The names a refusal's `fieldList` carries, in reply order.
+pub fn named_fields(reply: &Reply) -> Vec<String> {
+    reply
+        .member("fieldList")
+        .and_then(Value::as_array)
+        .map(|fields| {
+            fields
+                .iter()
+                .map(|field| {
+                    field
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Whether a `Timestamp` member carries an instant from this run's clock.
 ///
 /// The instant itself is generated per call, so only its shape and plausibility are
