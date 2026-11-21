@@ -74,7 +74,10 @@ fn control(control_name: &str) -> Value {
 
 /// Look at the framework until its deployment is reported terminal, or until
 /// the generous deadline above passes. Returns the read that reported it.
-async fn settled_framework(router: &MultiServiceRouter, name: &str) -> Value {
+///
+/// `pub(crate)` so a sibling suite in this test binary waits for the settled
+/// deployment through the same one poll rather than growing a second copy of it.
+pub(crate) async fn settled_framework(router: &MultiServiceRouter, name: &str) -> Value {
     let started = Instant::now();
     loop {
         let (status, read) = describe_framework(router, name).await;
