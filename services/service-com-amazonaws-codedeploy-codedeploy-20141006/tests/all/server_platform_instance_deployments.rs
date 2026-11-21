@@ -79,13 +79,17 @@ const LIFECYCLE_EVENTS: &[&str] = &[
 /// One emulator carrying CodeDeploy, Amazon EC2 and Amazon S3 over ONE shared
 /// engine, plus that engine: the deployment reads the instances and writes their
 /// guests through the stores that live in it.
-struct Fleet {
+///
+/// Visible to the crate's other suites: `server_platform_hook_time.rs` drives the same
+/// three services through the same front door, so the harness is shared rather than
+/// written twice.
+pub(crate) struct Fleet {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Fleet {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The suite signs nothing; the SigV4 credential scope is what routes each
@@ -135,7 +139,7 @@ impl Fleet {
     }
 
     /// Call one CodeDeploy `operation` that must succeed, answering its body.
-    async fn ok(&self, case: &str, operation: &str, body: Value) -> Value {
+    pub(crate) async fn ok(&self, case: &str, operation: &str, body: Value) -> Value {
         let (status, parsed) = self.call(operation, body).await;
         assert_eq!(
             status, 200,
@@ -187,7 +191,7 @@ impl Fleet {
 
     /// Upload `bundle` at `key`, creating the bucket the first time, through S3's
     /// own API — the way a client uploads a revision.
-    async fn upload(&self, case: &str, key: &str, bundle: &[u8]) {
+    pub(crate) async fn upload(&self, case: &str, key: &str, bundle: &[u8]) {
         let created = self.s3("PUT", &format!("/{BUCKET}"), b"").await;
         assert!(
             created == 200 || created == 409,
@@ -203,7 +207,12 @@ impl Fleet {
     /// Launch ONE instance carrying `tags`, with `user_data` as its boot program
     /// when the case gives it one, through EC2's own `RunInstances`; answers the
     /// instance id.
-    async fn launch(&self, case: &str, tags: &[(&str, &str)], user_data: Option<&str>) -> String {
+    pub(crate) async fn launch(
+        &self,
+        case: &str,
+        tags: &[(&str, &str)],
+        user_data: Option<&str>,
+    ) -> String {
         let mut params = vec![
             param("ImageId", AMI),
             param("InstanceType", "t3.micro"),
@@ -239,7 +248,7 @@ impl Fleet {
 
     /// Look again until EC2 reports `instance_id` running, which is when it is a
     /// host a deployment can go to.
-    async fn wait_until_running(&self, case: &str, instance_id: &str) {
+    pub(crate) async fn wait_until_running(&self, case: &str, instance_id: &str) {
         let deadline = Instant::now() + BUDGET;
         loop {
             let described = self
@@ -271,7 +280,12 @@ impl Fleet {
 
     /// An application and a deployment group of it carrying `selectors`, answering
     /// `(application name, group name)`.
-    async fn group(&self, case: &str, name: &str, selectors: Value) -> (String, String) {
+    pub(crate) async fn group(
+        &self,
+        case: &str,
+        name: &str,
+        selectors: Value,
+    ) -> (String, String) {
         let application = format!("app-{name}");
         let group = format!("dg-{name}");
         self.ok(
@@ -294,7 +308,7 @@ impl Fleet {
 
     /// Create a deployment of the revision at `key` and answer its id; `extras`
     /// carries the members the case sets beside the revision.
-    async fn deploy(
+    pub(crate) async fn deploy(
         &self,
         case: &str,
         application: &str,
@@ -322,7 +336,7 @@ impl Fleet {
 
     /// Look again until `deployment_id` holds a terminal status, answering its
     /// `deploymentInfo`.
-    async fn terminal(&self, case: &str, deployment_id: &str) -> Value {
+    pub(crate) async fn terminal(&self, case: &str, deployment_id: &str) -> Value {
         let deadline = Instant::now() + BUDGET;
         loop {
             let info = self
@@ -363,7 +377,12 @@ impl Fleet {
     }
 
     /// The `instanceTarget` `deployment_id` reports for `instance_id`.
-    async fn instance_target(&self, case: &str, deployment_id: &str, instance_id: &str) -> Value {
+    pub(crate) async fn instance_target(
+        &self,
+        case: &str,
+        deployment_id: &str,
+        instance_id: &str,
+    ) -> Value {
         self.ok(
             case,
             "GetDeploymentTarget",
@@ -394,12 +413,12 @@ fn param(name: &str, value: &str) -> (String, String) {
 }
 
 /// Percent-encode one form field the way an AWS SDK encodes an `ec2Query` body.
-fn form_encode(value: &str) -> String {
+pub(crate) fn form_encode(value: &str) -> String {
     ::percent_encoding::utf8_percent_encode(value, ::percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
 /// The text of the first `<tag>` of an XML body, if it carries one.
-fn element(body: &str, tag: &str) -> Option<String> {
+pub(crate) fn element(body: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let start = body.find(&open)? + open.len();
@@ -430,7 +449,7 @@ fn events_of(target: &Value) -> Vec<(String, String)> {
 }
 
 /// The lifecycle event `name` of a target, if it reports one.
-fn event_named(target: &Value, name: &str) -> Option<Value> {
+pub(crate) fn event_named(target: &Value, name: &str) -> Option<Value> {
     target["lifecycleEvents"]
         .as_array()?
         .iter()
@@ -442,7 +461,7 @@ fn event_named(target: &Value, name: &str) -> Option<Value> {
 /// `(source, destination)` and its `hooks` entries as `(lifecycle event, script
 /// location)`, in the form the AWS CodeDeploy User Guide's AppSpec reference writes
 /// them.
-fn app_spec(files: &[(&str, &str)], hooks: &[(&str, &str)]) -> String {
+pub(crate) fn app_spec(files: &[(&str, &str)], hooks: &[(&str, &str)]) -> String {
     let mut document = String::from("version: 0.0\nos: linux\n");
     if !files.is_empty() {
         document.push_str("files:\n");
@@ -464,7 +483,7 @@ fn app_spec(files: &[(&str, &str)], hooks: &[(&str, &str)]) -> String {
 }
 
 /// A zip revision bundle of `entries`, the way a client packages a revision.
-fn bundle(entries: &[(&str, &str)]) -> Vec<u8> {
+pub(crate) fn bundle(entries: &[(&str, &str)]) -> Vec<u8> {
     let mut writer = ::zip::ZipWriter::new(::std::io::Cursor::new(Vec::new()));
     let options: ::zip::write::FileOptions<'_, '_, ()> = ::zip::write::FileOptions::default();
     for (path, contents) in entries {

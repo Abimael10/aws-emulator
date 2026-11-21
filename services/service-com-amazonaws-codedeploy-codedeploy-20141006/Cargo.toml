@@ -124,6 +124,10 @@ percent-encoding = "2.3"
 # both are mounted beside CodeDeploy on one engine by the shared test harness.
 service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+# A client with no shell on a host reads it through Systems Manager Run Command, which is
+# how the `Server`-platform suite proves the revision a deployment installed is on the
+# instance for the agent in its guest to read.
+service-com-amazonaws-ssm-amazonssm = { workspace = true }
 
 [lints]
 workspace = true

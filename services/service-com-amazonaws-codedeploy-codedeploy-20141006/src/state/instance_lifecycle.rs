@@ -50,6 +50,17 @@
 //! CodeDeploy User Guide's "Environment variable availability"). Each is exported
 //! in the session the script runs in, with the value of THIS deployment's own
 //! records, so a script that reads one reads the deployment it is part of.
+//!
+//! # How long a hook takes
+//!
+//! A hook is the client's own program, and the time it takes is the time it STATES it took
+//! (`ComAmazonawsEc2Amazonec2State::run_in_instance_guest_with` answers it as
+//! `GuestRun::took`, since nothing of this process waits for a program). That time is the
+//! agent's, and it is REPORTED rather than waited for: the lifecycle events of one host
+//! occupy the run in order, each one's window beginning where the one before it ended
+//! ([`InstanceRun::work_millis`]), and the deployment's own window carries what every wave of
+//! its fleet stated ([`super::agent_deployment::stated_work_millis`]) — so a revision whose
+//! hook blocks is a deployment that reports it took that long.
 
 use ::service_com_amazonaws_ec2_amazonec2::state as instances;
 
@@ -140,6 +151,17 @@ const MAX_INSTALLED_FILES: usize = MAX_BUNDLE_ENTRIES;
 /// See [`MAX_INSTALLED_FILES`].
 const MAX_INSTALLED_BYTES: usize = MAX_BUNDLE_BYTES;
 
+/// How much STATED hook time one host's run may report.
+///
+/// A hook script is a client's own program and what it says it took is what the agent spent
+/// on it ([`::service_com_amazonaws_ec2_amazonec2::state::GuestRun::took`]), so the work one
+/// revision can have a deployment report for one host is bounded HERE, the way the spans a
+/// paced deployment is held open for are bounded ([`super::target_waves::MAX_RUN_SPANS`]):
+/// the same ceiling the host's own session holds one program's `sleep` to
+/// ([`::service_common::posix_shell_session::Bounds::sleep_seconds`]), so a revision cannot
+/// have one host's run report more time than one of its scripts could ask for.
+const MAX_HOST_WORK_MILLIS: i64 = 300_000;
+
 /// The directory the agent keeps one deployment's revision in on the host.
 ///
 /// The layout the CodeDeploy agent uses for its deployment root:
@@ -204,6 +226,11 @@ pub struct InstanceRun {
     pub events: Vec<LifecycleEvent>,
     /// The paths this deployment installed on the host.
     pub installed: Vec<String>,
+    /// How long the hook scripts of this run STATED they took, in milliseconds: the time the
+    /// agent spent on this host, which the deployment's own window then reports
+    /// ([`super::agent_deployment::stated_work_millis`]) and which the lifecycle events below
+    /// report as their own windows. Bounded by [`MAX_HOST_WORK_MILLIS`].
+    pub work_millis: i64,
 }
 
 /// What asking one instance to perform a deployment answered.
@@ -249,12 +276,16 @@ pub fn host_is_up<Eng: Send + Sync + 'static>(engine: &Eng, instance_id: &str) -
 /// only a REQUEST's context carries, and this work falls due on the clock whether
 /// or not anybody is calling. A guest the agent reaches therefore publishes the
 /// role's name and no credentials for it, rather than a session nothing minted.
+///
+/// `began_ms` is where this run begins on the deployment's own reported timeline — the
+/// instant of the pass, plus whatever the waves before this host's stated they took — which
+/// is what the lifecycle events of this run are stamped from (see the module docs).
 pub fn perform_on<Eng: Send + Sync + 'static>(
     engine: &Eng,
     work: &AgentWork,
     instance_id: &str,
     previous: Option<&InstanceArchive>,
-    now_ms: i64,
+    began_ms: i64,
 ) -> InstanceOutcome {
     let identity = instances::GuestIdentity {
         iam_role_name: instances::instance_profile_role_name(engine, instance_id),
@@ -273,7 +304,8 @@ pub fn perform_on<Eng: Send + Sync + 'static>(
         instance_id,
         work,
         identity,
-        now_ms,
+        began_ms,
+        work_millis: 0,
     };
     InstanceOutcome::Performed(agent.perform(previous))
 }
@@ -292,9 +324,11 @@ struct Agent<'a> {
     work: &'a AgentWork,
     /// What the guest's metadata service publishes about the role it runs as.
     identity: instances::GuestIdentity,
-    /// The instant of the pass this run is part of, which is when every lifecycle
-    /// event of it happened.
-    now_ms: i64,
+    /// Where this run began on the deployment's own reported timeline.
+    began_ms: i64,
+    /// How long the hooks performed so far stated they took, which is how far into the run
+    /// the next lifecycle event begins; see [`InstanceRun::work_millis`].
+    work_millis: i64,
 }
 
 /// What one lifecycle event came to: the `LifecycleEventStatus` it reached and the
@@ -363,9 +397,13 @@ impl Agent<'_> {
         let mut ended = false;
         for name in SERVER_LIFECYCLE_EVENTS {
             if ended {
-                events.push(self.event(name, &EventResult::skipped()));
+                let at = self.work_millis;
+                events.push(self.event(name, &EventResult::skipped(), at));
                 continue;
             }
+            // Where in the run this event began: the events of one host are performed in
+            // order, so each one starts where the one before it ended.
+            let began = self.work_millis;
             let result = match *name {
                 LIFECYCLE_EVENT_APPLICATION_STOP => self.application_stop(previous),
                 LIFECYCLE_EVENT_DOWNLOAD_BUNDLE => self.download_bundle(),
@@ -381,7 +419,7 @@ impl Agent<'_> {
                 ended = !(*name == LIFECYCLE_EVENT_APPLICATION_STOP
                     && self.work.ignore_application_stop_failures);
             }
-            events.push(self.event(name, &result));
+            events.push(self.event(name, &result, began));
         }
         InstanceRun {
             instance_id: self.instance_id.to_string(),
@@ -392,21 +430,27 @@ impl Agent<'_> {
             },
             events,
             installed,
+            work_millis: self.work_millis,
         }
     }
 
-    /// One lifecycle event as the modelled `LifecycleEvent` a target reports.
+    /// One lifecycle event as the modelled `LifecycleEvent` a target reports, having begun
+    /// `began_offset_ms` into the run.
     ///
-    /// Every event of one run happened at the instant of the pass that performed
-    /// it, which is the only instant this service holds for it; an event that was
-    /// never run has no end.
-    fn event(&self, name: &str, result: &EventResult) -> LifecycleEvent {
+    /// The run began at the instant of the pass that performed it, and the events of it
+    /// occupy that run in order: an event's window is from where the event before it ended
+    /// to where its own scripts stated they ended ([`InstanceRun::work_millis`]), so an
+    /// event whose scripts stated nothing begins and ends at the same instant. An event that
+    /// was never run has no end.
+    fn event(&self, name: &str, result: &EventResult, began_offset_ms: i64) -> LifecycleEvent {
+        let began = self.began_ms.saturating_add(began_offset_ms);
+        let ended = self.began_ms.saturating_add(self.work_millis);
         LifecycleEvent {
             lifecycle_event_name: Some(name.to_string()),
             diagnostics: result.diagnostics.clone(),
-            start_time: Some(timestamp(self.now_ms)),
+            start_time: Some(timestamp(began)),
             end_time: (result.status != LIFECYCLE_EVENT_STATUS_SKIPPED)
-                .then(|| timestamp(self.now_ms)),
+                .then(|| timestamp(ended)),
             status: Some(result.status.to_string()),
         }
     }
@@ -678,7 +722,11 @@ impl Agent<'_> {
                     HOST_UNREACHABLE_MESSAGE.to_string(),
                 );
             };
-            let log_tail = log_tail(&run.output);
+            let log_tail = log_tail(&run.output, &run.errors);
+            // What that script STATED it took is time the agent spent on this host, whether
+            // the script then succeeded or failed: the deployment is held open for it
+            // ([`InstanceRun::work_millis`]).
+            self.spent(run.took);
             if run.status != 0 {
                 return EventResult {
                     status: LIFECYCLE_EVENT_STATUS_FAILED,
@@ -701,6 +749,16 @@ impl Agent<'_> {
             status: LIFECYCLE_EVENT_STATUS_SUCCEEDED,
             diagnostics: last,
         }
+    }
+
+    /// Spend `took` of this run: the time a hook's program stated it took, held to what one
+    /// host's run may state in total ([`MAX_HOST_WORK_MILLIS`]).
+    fn spent(&mut self, took: ::std::time::Duration) {
+        let stated = i64::try_from(took.as_millis()).unwrap_or(i64::MAX);
+        self.work_millis = self
+            .work_millis
+            .saturating_add(stated)
+            .min(MAX_HOST_WORK_MILLIS);
     }
 
     /// The environment variables CodeDeploy makes available to a hook of
@@ -745,14 +803,25 @@ fn quoted(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-/// The last of what a script wrote, as `Diagnostics$logTail` reports it: the lines
-/// in the order the script wrote them, held to [`MAX_LOG_TAIL_BYTES`] from the END,
-/// which is what "the last portion of the diagnostic log" is.
-fn log_tail(output: &[String]) -> Option<String> {
-    if output.is_empty() {
+/// The last of what a script wrote, as `Diagnostics$logTail` reports it — "the last portion
+/// of the diagnostic log" — held to [`MAX_LOG_TAIL_BYTES`] from the END.
+///
+/// A script's log is what it wrote on BOTH streams: a hook that reports why it failed reports
+/// it the way a program does, on standard error, and the agent captures the script's output to
+/// its log rather than keeping one stream and dropping the other. The lines are the ones the
+/// guest answered ([`::service_com_amazonaws_ec2_amazonec2::state::GuestRun`] keeps the two
+/// apart, because the agent that delivers a script reports them separately), each stream in
+/// the order the script wrote it.
+fn log_tail(output: &[String], errors: &[String]) -> Option<String> {
+    if output.is_empty() && errors.is_empty() {
         return None;
     }
-    let whole = output.join("\n");
+    let whole = output
+        .iter()
+        .chain(errors.iter())
+        .cloned()
+        .collect::<Vec<String>>()
+        .join("\n");
     if whole.len() <= MAX_LOG_TAIL_BYTES {
         return Some(whole);
     }

@@ -12052,6 +12052,7 @@ dependencies = [
  "service-com-amazonaws-s3-amazons3",
  "service-com-amazonaws-sns-amazonsimplenotificationservice",
  "service-com-amazonaws-sqs-amazonsqs",
+ "service-com-amazonaws-ssm-amazonssm",
  "service-common",
  "sha2 0.10.9",
  "tar",

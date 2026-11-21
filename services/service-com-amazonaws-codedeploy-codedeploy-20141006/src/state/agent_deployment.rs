@@ -30,6 +30,18 @@
 //! due to complete, at which point a host the agent could not reach is reported as
 //! the `AGENT_ISSUE` the model names.
 //!
+//! # What the work COSTS the deployment
+//!
+//! What the agent does on a host takes however long that host's hooks stated they
+//! took ([`InstanceRun::work_millis`]), and nothing of this process waits for it:
+//! the time is REPORTED. So this pass records what each wave stated
+//! ([`AgentDeployment::wave_work_ms`]) and the deployment's own window carries all of
+//! it ([`stated_work_millis`], which is what the clock adds to the `completeTime` it
+//! reports), while the lifecycle events of one host are stamped from the instant that
+//! host's wave began on that same reported timeline. A deployment bounded to part of
+//! its fleet works through more waves, and so spends the declared work more times,
+//! than one that takes the whole fleet out of service at once.
+//!
 //! # What the outcome means
 //!
 //! A deployment whose group selected nothing has no host to install on and fails
@@ -120,6 +132,29 @@ pub struct AgentDeployment {
     /// this is what keeps the next pass from performing a host's hooks a second
     /// time.
     pub performed: Vec<String>,
+    /// How long the hooks of each WAVE's hosts stated they took, in milliseconds, by
+    /// wave ([`super::instance_lifecycle::InstanceRun::work_millis`]).
+    ///
+    /// The hosts of one wave are deployed to together, so a wave took as long as its
+    /// slowest host; the waves are worked through one at a time, so the deployment's
+    /// own reported window carries all of them ([`stated_work_millis`]). Empty for a
+    /// deployment no host of which has stated any work — every deployment of a
+    /// revision whose hooks do not block.
+    pub wave_work_ms: Vec<i64>,
+}
+
+/// How long `deployment`'s fleet STATED the work on it took, in milliseconds: the time
+/// every wave of it spent, which is what the deployment's own window reports beyond the
+/// spans this emulator gives a deployment ([`super::target_waves`]).
+///
+/// Zero for a deployment of a platform whose work is not done on hosts, and for one whose
+/// revision declares no hook that takes any time.
+#[must_use]
+pub fn stated_work_millis(deployment: &Deployment) -> i64 {
+    stated_through(
+        &deployment.agent.wave_work_ms,
+        deployment.agent.wave_work_ms.len(),
+    )
 }
 
 impl AgentDeployment {
@@ -142,6 +177,7 @@ impl AgentDeployment {
             declaration: content.and_then(appspec::declared_server_in_app_spec),
             unreachable_host: false,
             performed: Vec::new(),
+            wave_work_ms: Vec::new(),
         }
     }
 }
@@ -253,17 +289,37 @@ pub fn drive_due_instance_targets<Eng: Send + Sync + 'static>(engine: &Eng, now_
         }
         let mut runs: Vec<InstanceRun> = Vec::new();
         let mut unreachable: Vec<String> = Vec::new();
+        // What the waves of this deployment have stated they took, by wave, UPDATED as this
+        // pass goes round them: a pass that drives several waves at once — which is every
+        // pass that comes a wave span or more after the one before it — has to stamp a later
+        // wave's events after the work of the waves before it, including the waves it has
+        // just performed itself.
+        let mut stated = due.wave_work_ms.clone();
         for instance_id in &going_round {
             let previous = due.previous.get(instance_id);
+            // Where this host's run begins on the deployment's own reported timeline: the
+            // waves before its own were worked through first, and what they STATED they
+            // took is time this deployment reports ([`stated_work_millis`]), so a host of
+            // a later wave begins after them rather than beside them.
+            let wave = due.wave_of(instance_id).unwrap_or(0);
+            let began_ms = now_ms.saturating_add(stated_through(&stated, wave));
             match instance_lifecycle::perform_on(
                 engine,
                 &due.work,
                 instance_id,
                 previous,
-                now_ms,
+                began_ms,
             ) {
                 InstanceOutcome::NoGuest => unreachable.push(instance_id.clone()),
-                InstanceOutcome::Performed(run) => runs.push(run),
+                InstanceOutcome::Performed(run) => {
+                    // The hosts of one wave are deployed to together, so the wave took as
+                    // long as its slowest host.
+                    if stated.len() <= wave {
+                        stated.resize(wave.saturating_add(1), 0);
+                    }
+                    stated[wave] = stated[wave].max(run.work_millis);
+                    runs.push(run);
+                }
             }
         }
         // Whether the agent has now been round the WHOLE fleet, which is what the
@@ -302,9 +358,32 @@ struct DueRun {
     /// The hosts the agent has already been round for this deployment, so a pass
     /// goes round the rest rather than performing one host's hooks twice.
     performed: Vec<String>,
+    /// How long the waves already performed stated they took, by wave
+    /// ([`AgentDeployment::wave_work_ms`]): where the wave this pass performs begins on
+    /// the deployment's own reported timeline.
+    wave_work_ms: Vec<i64>,
     /// The instant the deployment was due to complete, which is how long a host
     /// that has not come up yet is waited for.
     completes_at_ms: i64,
+}
+
+impl DueRun {
+    /// Which wave of this deployment deploys to `instance_id`, when its fleet holds it.
+    fn wave_of(&self, instance_id: &str) -> Option<usize> {
+        self.hosts
+            .iter()
+            .find(|host| host.instance_id == instance_id)
+            .map(|host| host.wave)
+    }
+}
+
+/// How long the first `waves` waves of `wave_work_ms` stated they took, in milliseconds:
+/// where the wave after them begins on a deployment's own reported timeline.
+fn stated_through(wave_work_ms: &[i64], waves: usize) -> i64 {
+    wave_work_ms
+        .iter()
+        .take(waves)
+        .fold(0_i64, |total, work| total.saturating_add(*work))
 }
 
 /// The run every deployment that owes one at `now_ms` owes.
@@ -395,6 +474,7 @@ fn due_run_of(
         },
         previous,
         performed: deployment.agent.performed.clone(),
+        wave_work_ms: deployment.agent.wave_work_ms.clone(),
         completes_at_ms: deployment.completes_at_ms,
     }
 }
@@ -439,7 +519,21 @@ fn record(
             target.updated_at_ms = Some(now_ms);
         }
         deployment.agent.performed.push(run.instance_id.clone());
+        // And how long that host's hooks stated they took, onto the WAVE it is in: the
+        // wave is not finished until the agent is finished with its hosts, and they are
+        // deployed to together, so the wave takes as long as its slowest host.
+        if let Some(wave) = due.wave_of(&run.instance_id) {
+            let work = &mut deployment.agent.wave_work_ms;
+            if work.len() <= wave {
+                work.resize(wave.saturating_add(1), 0);
+            }
+            work[wave] = work[wave].max(run.work_millis);
+        }
     }
+    // The window the deployment is held open for is the one its waves were given: the
+    // work the hooks STATED they took is reported rather than waited for
+    // ([`stated_work_millis`]), so nothing here moves the instant the clock settles this
+    // deployment at.
     for instance_id in unreachable {
         // A host that never took the work reports the status of a target the
         // revision did not reach, and no lifecycle event of its own because none

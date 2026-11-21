@@ -33,6 +33,17 @@
 //! built-ins carry none, `minimumHealthyHosts` being the EC2/on-premises member —
 //! deploys to everything it resolved in ONE wave, which is the progression every
 //! reader of such a deployment saw before this module existed.
+//!
+//! How long one wave takes is one span of this emulator's own, and what the agent
+//! does on that wave's hosts is the work the revision declared there: a hook is the
+//! client's own program and the time it takes is the time it STATED it took
+//! ([`super::instance_lifecycle`] performs them, [`super::agent_deployment`] records
+//! what each wave stated). Nothing of this process waits for that time — it is
+//! REPORTED, as the window the deployment and its targets' lifecycle events occupy
+//! ([`super::agent_deployment::stated_work_millis`]) — so a deployment over h hosts
+//! bounded to c of them at once spends the declared work ceil(h / c) times, and a
+//! bounded deployment of such a revision therefore reports a longer window than the
+//! same revision deployed to the whole fleet at once.
 
 use crate::ops::types::MinimumHealthyHosts;
 
@@ -110,6 +121,10 @@ pub fn wave_count(targets: &[DeploymentTargetSnapshot]) -> usize {
 /// wave, and [`MAX_RUN_SPANS`] for one that paces, which is also what bounds the
 /// window of a deployment over a large fleet ([`waves_finished_at`] spreads its
 /// waves evenly across it).
+///
+/// What the agent then STATES it spent on those hosts is reported on top of this
+/// window, and waited for by nothing
+/// ([`super::agent_deployment::stated_work_millis`]).
 #[must_use]
 pub fn waves_complete_at_ms(starts_at_ms: i64, waves: usize) -> i64 {
     starts_at_ms.saturating_add(run_millis(waves))

@@ -2527,7 +2527,18 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
                     },
                 };
                 deployment.status = status.to_string();
-                deployment.complete_time_ms = Some(deployment.completes_at_ms);
+                // When it completed: the instant the clock owed it, plus the time the
+                // work on its own fleet STATED it took — a hook script is the client's
+                // own program and nothing of this process waits for it, so what it says
+                // it took is what the deployment reports it spent
+                // (`agent_deployment::stated_work_millis`). Zero for every deployment
+                // whose platform does no work on hosts, and for one whose hooks state no
+                // time, so those report exactly the window the clock gave them.
+                deployment.complete_time_ms = Some(
+                    deployment
+                        .completes_at_ms
+                        .saturating_add(agent_deployment::stated_work_millis(deployment)),
+                );
                 if status == DEPLOYMENT_STATUS_FAILED {
                     failed.push(id.clone());
                 }

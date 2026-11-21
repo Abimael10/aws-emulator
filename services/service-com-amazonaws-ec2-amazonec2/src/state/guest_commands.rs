@@ -30,6 +30,11 @@
 //! such program. Nothing here starts a process, opens a host file or reaches a socket, and
 //! nothing is written for a command that did not run.
 //!
+//! No thread of this process waits for a program either, so how long a run TOOK is what its
+//! commands state they took ([`GuestRun::took`]): a caller whose own work is not finished
+//! until the program is — an agent running a deployment's hook on the host — spends that
+//! time, and one that reports no duration ignores it.
+//!
 //! # A guest has to be up
 //!
 //! A program runs in a guest that is RUNNING and has BOOTED: an instance that is still
@@ -123,10 +128,28 @@ pub struct GuestRun {
     /// success, and the status a shell answers for a utility it could not find for a command
     /// this guest has no program for.
     pub status: i32,
+    /// How long the program STATED it took.
+    ///
+    /// The session performs the commands in process and spends none of this host's clock on
+    /// them, so the time a program took is the time it says it took
+    /// ([`::service_common::posix_shell_session::ShellSession::slept`]) — zero for one that
+    /// says nothing. A caller whose own API reports a duration, or whose work is not finished
+    /// until the program is, honours it; one that reports no duration ignores it.
+    pub took: ::std::time::Duration,
+}
+
+/// What performing one script in a session came to: what the run ANSWERED ([`GuestRun`]) and
+/// the tree it left behind, which becomes the machine's own storage.
+struct Performed {
+    /// What the run answered, as the caller reads it.
+    run: GuestRun,
+    /// The tree the script left behind.
+    volume: ::service_common::posix_shell_volume::ShellVolume,
 }
 
 /// Perform `script` in `session` and answer what it wrote on each stream, the status it ended
-/// on, and the tree it left behind — `None` for a run this process could not perform at all.
+/// on, how long it stated it took, and the tree it left behind — `None` for a run this process
+/// could not perform at all.
 ///
 /// The run happens on a THREAD OF ITS OWN, given a stack sized for the nesting bound the
 /// session was constructed with ([`MAX_GUEST_SCRIPT_STACK_BYTES`]): reading a script costs the
@@ -137,15 +160,7 @@ pub struct GuestRun {
 /// thread this process could not start, or one that ended without answering, is `None` — a run
 /// that performed nothing, which leaves the machine's storage exactly as it was rather than
 /// reporting an outcome nothing produced.
-fn performed(
-    mut session: ShellSession,
-    script: &str,
-) -> Option<(
-    Vec<String>,
-    Vec<String>,
-    i32,
-    ::service_common::posix_shell_volume::ShellVolume,
-)> {
+fn performed(mut session: ShellSession, script: &str) -> Option<Performed> {
     let run = move || {
         let mut status = session.run(script);
         if let Some(exited) = session.exit_status() {
@@ -154,12 +169,17 @@ fn performed(
         }
         let output = session.output().to_vec();
         let errors = session.errors().to_vec();
-        (
-            output,
-            errors,
-            status,
-            session.into_volume().unwrap_or_default(),
-        )
+        // What the script SAID it took, read before the session is consumed.
+        let took = session.slept();
+        Performed {
+            run: GuestRun {
+                output,
+                errors,
+                status,
+                took,
+            },
+            volume: session.into_volume().unwrap_or_default(),
+        }
     };
     ::std::thread::scope(|scope| {
         ::std::thread::Builder::new()
@@ -265,7 +285,7 @@ impl ComAmazonawsEc2Amazonec2State {
         let script = commands.join("\n");
         // A run nothing performed at all leaves the machine exactly as it was: there is no
         // outcome to report and nothing to write back.
-        let (output, errors, status, volume) = performed(session, &script)?;
+        let Performed { run, volume } = performed(session, &script)?;
         let written: ::std::collections::BTreeMap<String, String> = volume
             .stored_files()
             .map(|(path, contents)| (path.to_string(), contents.to_string()))
@@ -276,11 +296,7 @@ impl ComAmazonawsEc2Amazonec2State {
             instance.guest_files = written;
             instance.guest_runtime = services.taken();
         }
-        Some(GuestRun {
-            output,
-            errors,
-            status,
-        })
+        Some(run)
     }
 
     /// What the guest of the instance `instance_id` names holds at `path`, or `None` when it
