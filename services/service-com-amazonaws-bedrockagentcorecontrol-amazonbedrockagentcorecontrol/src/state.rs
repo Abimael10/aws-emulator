@@ -707,19 +707,12 @@ impl AgentRuntimeRecord {
     }
 
     /// This runtime's `AgentRuntime` list summary, at its latest version.
+    ///
+    /// The projection itself is [`Self::version_entry`], which a listing of this
+    /// runtime's VERSIONS renders every one of them through, so the two listings
+    /// cannot report one version differently.
     pub fn summary(&self, now: SystemTime) -> Option<AgentRuntime> {
-        let version = self.latest()?;
-        Some(AgentRuntime {
-            agent_runtime_arn: self.agent_runtime_arn.clone(),
-            agent_runtime_id: self.agent_runtime_id.clone(),
-            agent_runtime_version: version.version_string(),
-            agent_runtime_name: self.agent_runtime_name.clone(),
-            // `@required` on the summary, so a runtime created without a
-            // description reports the empty string rather than omitting it.
-            description: version.description.clone().unwrap_or_default(),
-            last_updated_at: timestamp(version.last_updated_at),
-            status: self.status_of(version, now).to_string(),
-        })
+        Some(self.version_entry(self.latest()?, now))
     }
 }
 
@@ -1741,6 +1734,11 @@ pub mod registry_entitlement;
 /// it. Re-exported, so a handler names `crate::state::…` for it exactly as it
 /// does for the runtime itself.
 pub mod agent_runtime_deletion;
+/// The versions ONE agent runtime holds and the `AgentRuntime` entry a listing
+/// reports each of them as, keyed so ascending key order is ascending version
+/// order. Re-exported, so a handler names `crate::state::…` for it exactly as it
+/// does for the runtime that holds the versions.
+pub mod agent_runtime_versions;
 /// The Kinesis data stream a memory's `streamDeliveryResources` names, and whether
 /// this account really holds it — the dependency a create of such a memory is
 /// resolved against before it is accepted. Re-exported, so a handler names
@@ -1762,6 +1760,7 @@ pub use harnesses::*;
 pub use name_conflicts::*;
 pub use agent_runtime_default_endpoint::*;
 pub use agent_runtime_deletion::*;
+pub use agent_runtime_versions::*;
 pub use harness_updates::*;
 pub use memory_stream_delivery::*;
 pub use api_key_credential_providers::*;
