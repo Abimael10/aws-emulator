@@ -584,27 +584,41 @@ impl ComAmazonawsInvoicingInvoicingState {
         }
     }
 
+    /// Every account of the requester's organization this service may be answered for:
+    /// the organization's MANAGEMENT account — the identity the caller authenticates as
+    /// ([`::engine::emulator_account_id`]) — together with every LINKED account
+    /// [`Self::linked_accounts`] derives from stored configurations.
+    ///
+    /// An operation documented over "linked accounts under the requester management
+    /// account organization" (`BatchGetInvoiceProfile`) is answered for the accounts of
+    /// the requester's OWN organization, and the requester is always inside it: the
+    /// account the caller authenticates as is that organization's management account, so
+    /// it is readable by the caller whatever else state holds. An account id the
+    /// organization does not contain is what such an operation refuses
+    /// ([`not_authorized_for_account`]).
+    ///
+    /// The caller's identity admits ONLY the caller's own account: every other id is in
+    /// this set exactly when a stored configuration links it, so a read never widens what
+    /// the requester may be answered for and nothing but a write changes it.
+    pub fn accounts_the_requester_may_read(&self) -> BTreeSet<String> {
+        let mut accounts = self.linked_accounts();
+        accounts.insert(::engine::emulator_account_id().to_string());
+        accounts
+    }
+
     /// Every LINKED account this service's state names under the requester's
     /// management-account organization.
     ///
-    /// An operation documented over "linked accounts under the requester management
-    /// account organization" (`BatchGetInvoiceProfile`) has to decide membership from
-    /// what the emulator actually holds, and this service's state names a linked account
-    /// of that organization in exactly two places: an invoice unit's `InvoiceReceiver`
-    /// ("the Amazon Web Services account ID chosen to be the receiver of an invoice
-    /// unit") and an invoice-unit rule's `LinkedAccounts` ("the list of
-    /// `LINKED_ACCOUNT` IDs where charges are included within the invoice unit") —
-    /// `smithy_query(query="shape", shape="InvoiceUnitRule")` and
-    /// `smithy_query(query="operation", operation="CreateInvoiceUnit")`.
+    /// This service's state names a linked account of that organization in exactly two
+    /// places: an invoice unit's `InvoiceReceiver` ("the Amazon Web Services account ID
+    /// chosen to be the receiver of an invoice unit") and an invoice-unit rule's
+    /// `LinkedAccounts` ("the list of `LINKED_ACCOUNT` IDs where charges are included
+    /// within the invoice unit") — `smithy_query(query="shape", shape="InvoiceUnitRule")`
+    /// and `smithy_query(query="operation", operation="CreateInvoiceUnit")`.
     ///
-    /// Membership is derived from those configurations and from NOTHING else. The
-    /// requester's own account ([`::engine::emulator_account_id`], the identity this
-    /// emulator presents to a caller) is the MANAGEMENT account of this organization, and
-    /// a management account is not one of its own organization's LINKED accounts: it is in
-    /// this set only when a stored configuration names it as a linked account, exactly as
-    /// any other account id is. This set is therefore also what an authorization check
-    /// over "linked accounts under the requester management account organization" reads —
-    /// the identity of the requester admits no account into it by itself.
+    /// Membership of this set is derived from those configurations and from NOTHING else:
+    /// it is the LINKED half of the organization, which
+    /// [`Self::accounts_the_requester_may_read`] adds the management account to.
     ///
     /// `BillSourceAccounts` is deliberately NOT a source: the model documents those as
     /// accounts that "can be payer accounts from other organizations that have
@@ -2029,7 +2043,8 @@ pub fn resource_tag_list(tags: &BTreeMap<String, String>) -> Vec<ResourceTag> {
 /// to report them from. Each is an optional member, so they are reported ABSENT —
 /// "not on file here" — rather than invented. `AccountId`, the member that says whose
 /// profile this is, is the one this service can answer, and it is answered only for an
-/// account [`ComAmazonawsInvoicingInvoicingState::linked_accounts`] holds.
+/// account [`ComAmazonawsInvoicingInvoicingState::accounts_the_requester_may_read`]
+/// holds.
 pub fn invoice_profile(account_id: &str) -> InvoiceProfile {
     InvoiceProfile {
         account_id: Some(account_id.to_string()),
@@ -2123,8 +2138,8 @@ pub fn no_such_resource_unnamed() -> ResourceNotFoundException {
 }
 
 /// The 403 an operation of this service answers when the requester may not read what it
-/// asked about: the account it asked about is not a linked account of the requester's
-/// organization ([`ComAmazonawsInvoicingInvoicingState::linked_accounts`]), so the
+/// asked about: the account it asked about is not one of the requester's organization
+/// ([`ComAmazonawsInvoicingInvoicingState::accounts_the_requester_may_read`]), so the
 /// requester is not authorized for that account's resources.
 ///
 /// The message is BUILT FROM THE REQUEST, as the recorded refusals of this service state

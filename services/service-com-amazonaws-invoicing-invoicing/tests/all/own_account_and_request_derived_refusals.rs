@@ -6,9 +6,9 @@
 //! body), so what these tests see is exactly what an SDK client sees.
 //!
 //! 1. `BatchGetInvoiceProfile` answers a profile for every account the requester may be
-//!    answered for — every account this service's state names as a LINKED account of the
-//!    requester's organization, the requester's OWN account included, which is readable on
-//!    exactly those terms and no others — and reserves the modelled 403
+//!    answered for — every account of its own organization: those this service's state
+//!    LINKS into it, plus the account the caller authenticates as, which is that
+//!    organization's management account — and reserves the modelled 403
 //!    `AccessDeniedException` for any other well-formed account id, refusing such a
 //!    request WHOLE.
 //! 2. A `ResourceNotFoundException` of the PROCUREMENT-PORTAL-PREFERENCE plane states a
@@ -156,10 +156,10 @@ async fn create_unit(
 }
 
 /// RULE 1, the positive half: an account a rule names as a linked account resolves to its
-/// invoice profile — the requester's own account among them, named as a linked account
-/// like any other — with every organization shape beside it: alone, repeated, and
-/// interleaved with other linked accounts, in which case the answer is one profile per
-/// account asked about in request order.
+/// invoice profile — as does the account the caller authenticates as, which its own
+/// organization contains whatever state holds — with every organization shape beside it:
+/// alone, repeated, and interleaved with other linked accounts, in which case the answer is
+/// one profile per account asked about in request order.
 #[tokio::test]
 async fn a_named_linked_account_resolves_to_its_invoice_profile() {
     let own = management_account().to_string();
@@ -204,8 +204,8 @@ async fn a_named_linked_account_resolves_to_its_invoice_profile() {
     for (label, requested, expected) in shapes {
         let router = emulator();
         // The rows name other linked accounts too, so the organization has to hold them;
-        // the requester's own account is in it for the one reason any account is — a rule
-        // names it as a linked account.
+        // the caller's own account is in it as its management account, and a rule naming it
+        // beside them changes nothing for it.
         create_unit(
             &router,
             "profiles-unit",
@@ -232,27 +232,19 @@ async fn a_named_linked_account_resolves_to_its_invoice_profile() {
     }
 
     // The bare case: nothing at all in state, which is how a client first meets this
-    // operation — the organization then names no linked account whatsoever, so every id is
-    // refused, the requester's own account included.
+    // operation — the organization then links no account whatsoever, yet the caller is
+    // still its management account, so the caller reads itself and every other id is
+    // refused.
     let router = emulator();
     let (status, body) = batch_get(&router, std::slice::from_ref(&own)).await;
     assert_eq!(
-        status, 403,
-        "case empty organization ({own}): expected HTTP 403, got {status} {body}"
+        status, 200,
+        "case empty organization ({own}): expected HTTP 200, got {status} {body}"
     );
-    assert!(
-        error_code(&body).contains("AccessDeniedException"),
-        "case empty organization ({own}): expected an AccessDeniedException, got {body}"
-    );
-    let refusal = format!("Account {own} is not authorized to access resources for account {own}");
     assert_eq!(
-        error_message(&body),
-        refusal,
-        "case empty organization ({own}): expected message {refusal:?}, got {body}"
-    );
-    assert!(
-        body.get("Profiles").is_none(),
-        "case empty organization ({own}): a refused batch reports no profiles, got {body}"
+        reported_accounts(&body),
+        vec![own.clone()],
+        "case empty organization ({own}): expected the caller's own profile, got {body}"
     );
     let stranger = account(41);
     let (status, body) = batch_get(&router, std::slice::from_ref(&stranger)).await;
@@ -263,6 +255,17 @@ async fn a_named_linked_account_resolves_to_its_invoice_profile() {
     assert!(
         error_code(&body).contains("AccessDeniedException"),
         "case empty organization ({stranger}): expected an AccessDeniedException, got {body}"
+    );
+    let refusal =
+        format!("Account {own} is not authorized to access resources for account {stranger}");
+    assert_eq!(
+        error_message(&body),
+        refusal,
+        "case empty organization ({stranger}): expected message {refusal:?}, got {body}"
+    );
+    assert!(
+        body.get("Profiles").is_none(),
+        "case empty organization ({stranger}): a refused batch reports no profiles, got {body}"
     );
 }
 
@@ -283,7 +286,7 @@ async fn an_account_outside_the_organization_is_refused_whole_with_the_modelled_
     .await;
 
     // Rows differing along the outsider's id and where it sits in the batch, including
-    // beside the requester's own account — which no longer makes the batch readable.
+    // beside the requester's own account — which does not make the batch readable.
     let cases: [(&str, Vec<String>, String); 5] = [
         ("an outsider alone", vec![account(31)], account(31)),
         (

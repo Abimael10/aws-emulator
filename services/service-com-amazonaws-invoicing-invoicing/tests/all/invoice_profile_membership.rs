@@ -6,14 +6,15 @@
 //! The operation is documented "This gets the invoice profile associated with a set of
 //! accounts. The accounts must be linked accounts under the requester management account
 //! organization" (`smithy_query(query="doc", shape="BatchGetInvoiceProfile")`), so the
-//! rule under test is: a profile is reported for exactly those account ids this service's
-//! state names as LINKED accounts of the requester's organization, and every other
-//! account id refuses the request WHOLE with the modelled 403 `AccessDeniedException`.
+//! rule under test is: a profile is reported for exactly those account ids the requester's
+//! own organization contains, and every other account id refuses the request WHOLE with
+//! the modelled 403 `AccessDeniedException`.
 //!
-//! Membership of the organization is read out of state and out of nothing else. The
-//! requester's own account is no exception: the requester is that organization's
-//! MANAGEMENT account, which is not one of its own organization's linked accounts, so it
-//! is answered only when a stored configuration names it as a linked account.
+//! That organization is this service's state plus the caller's identity: every account a
+//! stored configuration LINKS into it, together with the account the caller authenticates
+//! as, which is the organization's MANAGEMENT account and therefore inside it whatever
+//! state holds. So a configuration decides the answer for every account id but the
+//! caller's own, which is readable throughout.
 //!
 //! The table below spans every arrangement this service's state can take around one
 //! account id — named nowhere, named as an invoice unit's `InvoiceReceiver`, as an entry
@@ -165,7 +166,8 @@ async fn create_unit(
 /// Every way this service's state can name an account id, as the rows of the table
 /// below. The arrangement is applied to ONE `subject` account, so each row is driven
 /// twice: once with the requester's own account as the subject and once with an ordinary
-/// account id, which is what pins that membership does not depend on who asked.
+/// account id, which is what pins WHERE the two differ — a configuration decides the
+/// answer for an ordinary id, while the caller's own account is readable throughout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Arrangement {
     /// No invoice units at all — the organization as a fresh emulator holds it, which
@@ -355,9 +357,9 @@ async fn assert_refused(
 }
 
 /// A profile is reported for exactly the accounts the requester may be answered for: the
-/// LINKED accounts of the organization this service's state names. Every other account id
-/// — the requester's own included — is refused with the modelled 403 when no stored
-/// configuration places it in the organization.
+/// accounts of its own organization — those this service's state links into it, plus the
+/// account the caller authenticates as. Every other account id is refused with the modelled
+/// 403 when no stored configuration places it in the organization.
 #[tokio::test]
 async fn a_profile_is_reported_for_exactly_the_accounts_the_requester_may_read() {
     let arrangements = [
@@ -371,7 +373,8 @@ async fn a_profile_is_reported_for_exactly_the_accounts_the_requester_may_read()
         Arrangement::AsBillSourceAccountOnly,
     ];
     // The SAME arrangement applied to the requester's own account and to an ordinary
-    // account id: the answer must depend on the arrangement alone.
+    // account id: the arrangement decides the answer for the ordinary id, while the
+    // caller's own account is inside its own organization whatever the arrangement.
     let subjects = [
         ("the requester's own account", management_account().to_string()),
         ("an ordinary account id", account(11)),
@@ -382,10 +385,12 @@ async fn a_profile_is_reported_for_exactly_the_accounts_the_requester_may_read()
             let label = format!("{arrangement:?} for {subject_label}");
             let router = emulator();
             let membership = arrange(&router, arrangement, subject).await;
-            // What the requester may READ: exactly the accounts the arrangement placed in
-            // the organization — the requester's own account included, which is readable
-            // on the same terms as any other id and on no others.
-            let subject_is_readable = membership.subject_is_linked;
+            // What the requester may READ: the accounts the arrangement linked into the
+            // organization, plus the account the caller authenticates as — the
+            // organization's management account, which the caller may read whatever state
+            // holds.
+            let subject_is_readable =
+                membership.subject_is_linked || subject == management_account();
             let bystander_is_readable = membership.bystander_is_linked;
 
             if subject_is_readable {
@@ -451,21 +456,21 @@ async fn a_profile_is_reported_for_exactly_the_accounts_the_requester_may_read()
 
 /// The refusal is a READ that changes nothing: an account refused once is refused
 /// identically afterwards, and a later create that names it makes it readable — so
-/// membership tracks state and only state, the requester's own account included.
+/// membership tracks state for every account but the caller's own, which its identity
+/// places in the organization from the start.
 #[tokio::test]
 async fn membership_follows_state_and_a_refusal_changes_nothing() {
     let router = emulator();
     let own = management_account().to_string();
     let outsider = account(7);
 
-    // Nothing in state at all: the organization names no linked account whatsoever, so the
-    // requester's own account is refused like any other id, and a refused account id is
-    // refused twice over identically.
-    assert_refused(
+    // Nothing in state at all: the organization links no account whatsoever, yet the
+    // caller is still its management account, so the caller reads itself — while an id
+    // nothing names is refused, and refused twice over identically.
+    assert_reported(
         &router,
         "bare organization, the requester's own account",
         std::slice::from_ref(&own),
-        &own,
     )
     .await;
     let first = batch_get(&router, std::slice::from_ref(&outsider)).await;
@@ -496,8 +501,8 @@ async fn membership_follows_state_and_a_refusal_changes_nothing() {
     )
     .await;
 
-    // A create naming the requester's OWN account as a linked account is what makes that
-    // account readable — its identity as the caller never did.
+    // A create naming the requester's OWN account as a linked account changes nothing for
+    // it: the caller could already read itself, and may still.
     create_unit(
         &router,
         "admits-own-account",
