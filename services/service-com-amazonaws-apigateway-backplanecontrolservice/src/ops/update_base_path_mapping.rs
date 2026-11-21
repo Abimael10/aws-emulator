@@ -290,18 +290,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the reference, so a patch of the base path alone neither re-resolves nor
         // re-refuses what the create already accepted.
         if updated.rest_api_id != stored.rest_api_id || updated.stage != stored.stage {
-            let api = store
-                .rest_apis
-                .get(&updated.rest_api_id)
-                .ok_or_else(|| bad_request(crate::state::INVALID_REST_API_IDENTIFIER.to_string()))?;
+            // The same reading of the API identifier the create applies
+            // (`crate::state::rest_api_referenceable`): an API whose accepted removal is
+            // still in flight resolves, because a patch that races that delete was admitted
+            // against state that still held the API.
+            if !store.rest_api_referenceable(&updated.rest_api_id) {
+                return Err(bad_request(
+                    crate::state::INVALID_REST_API_IDENTIFIER.to_string(),
+                ));
+            }
             // A `stage` of `(none)` names NO stage — the mapping's callers name the stage
             // themselves — so it is not resolved against the API's stages.
             let named_stage = updated
                 .stage
                 .as_deref()
                 .filter(|stage| *stage != crate::state::NONE_BASE_PATH);
+            // The stages of an API whose removal is in flight are resolved from what it
+            // carried when the delete was accepted, which is the state the racing patch met.
             if let Some(stage) = named_stage {
-                if !api.stages.contains_key(stage) {
+                if !store.rest_api_stage_referenceable(&updated.rest_api_id, stage) {
                     return Err(bad_request(crate::state::NO_SUCH_STAGE.to_string()));
                 }
             }

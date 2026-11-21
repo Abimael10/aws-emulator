@@ -236,15 +236,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // one that resolves to none is this operation's BAD REQUEST, the classification
         // `crate::state::INVALID_REST_API_IDENTIFIER` is the sentence for, rather than the
         // missing record the domain name's own refusal reports.
-        let api = store
-            .rest_apis
-            .get(&input.rest_api_id)
-            .ok_or_else(|| bad_request(crate::state::INVALID_REST_API_IDENTIFIER.to_string()))?;
+        //
+        // An API whose `DeleteRestApi` has been accepted and whose removal is still in
+        // flight DOES resolve (`crate::state::rest_api_referenceable`): that delete answers
+        // 202, so a mapping created while it travels was admitted against state that still
+        // held the API — and is left naming an API that is gone, which is the orphaned
+        // mapping a caller racing the two calls gets.
+        if !store.rest_api_referenceable(&input.rest_api_id) {
+            return Err(bad_request(
+                crate::state::INVALID_REST_API_IDENTIFIER.to_string(),
+            ));
+        }
         // "The name of the API's stage that you want to use for this mapping": a stage of
         // THAT API, so a name no stage of it answers to is refused the same way, and a
-        // stored mapping never points at a stage that does not exist.
+        // stored mapping never points at a stage that does not exist. The stages of an API
+        // whose removal is in flight are resolved from what it carried when the delete was
+        // accepted, which is the state the racing call met.
         if let Some(stage) = &named_stage {
-            if !api.stages.contains_key(stage) {
+            if !store.rest_api_stage_referenceable(&input.rest_api_id, stage) {
                 return Err(bad_request(crate::state::NO_SUCH_STAGE.to_string()));
             }
         }

@@ -189,7 +189,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        store.rest_apis.remove(&input.rest_api_id);
+        // The delete is ACCEPTED here rather than finished: this operation answers 202, so
+        // the API's records are gone — every read of them answers its own missing-resource
+        // refusal from now on — while the removal is still travelling through the control
+        // plane. A call that races it and names this API by id, or a stage of it, is still
+        // resolved against the state it met (`crate::state::rest_api_referenceable` and
+        // `rest_api_stage_referenceable`), which is why a reference created in that window
+        // outlives the API it names.
+        let removed = store.rest_apis.remove(&input.rest_api_id);
+        let stages = removed
+            .map(|api| api.stages.keys().cloned().collect())
+            .unwrap_or_default();
+        store.accept_rest_api_delete(&input.rest_api_id, stages);
         Ok(DeleteRestApiOutput)
     }
 }

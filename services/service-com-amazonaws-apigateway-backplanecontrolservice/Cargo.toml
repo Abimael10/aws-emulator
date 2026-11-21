@@ -224,6 +224,8 @@ service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = t
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares tests/all/main.rs's suite modules, one per tests/all/<name>.rs.
+automod = { workspace = true }
 # A deployed method whose integration is `AWS_PROXY` is served by invoking a Lambda
 # function, and what the handler wrote is asserted where a client reads it — in the
 # DynamoDB table the handler put the item in — so both services are mounted on the test's

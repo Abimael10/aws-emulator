@@ -112,6 +112,12 @@ pub struct ComAmazonawsApigatewayBackplanecontrolserviceState {
     /// which is what a delete of the domain name (or a migration to another endpoint type)
     /// does.
     pub custom_domain_endpoints: BTreeMap<String, CustomDomainEndpoint>,
+    /// The REST API removals `DeleteRestApi` has ACCEPTED and that are still in flight,
+    /// keyed by the API id, each with the instant its removal completes. An API's own
+    /// records are gone from [`Self::rest_apis`] the moment the delete is accepted; this is
+    /// what a call racing that delete resolves the id against. See
+    /// [`REST_API_DELETION_SPAN`].
+    pub rest_api_deletions_in_flight: RestApiDeletionsInFlight,
     /// Drives [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`]: the creation rank stamped on each
     /// record so a listing can report creation order rather than id order.
     pub sequence_counter: u64,
@@ -4935,6 +4941,12 @@ pub use access_associations::*;
 /// policies in force on the account's CloudWatch role — the principal it makes every one of
 /// them as; see that module.
 pub mod log_delivery_role;
+
+/// The REST API removals this service has ACCEPTED and not yet finished — what a call that
+/// races a `DeleteRestApi` resolves the API id against; re-exported whole, so a handler
+/// still reaches each name as `crate::state::…`.
+mod rest_api_deletion;
+pub use rest_api_deletion::*;
 
 /// WHAT THIS EMULATOR ACCEPTS, read off a handle onto it — the one reading both planes that
 /// have to know whether a signature is verified ask; re-exported whole, so a reader still
