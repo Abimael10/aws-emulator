@@ -30,20 +30,20 @@ use crate::inference_deployment_lifecycle::{error_code, message, str_field, Emul
 
 /// An execution role inside `RoleArn`'s modelled pattern, for the `DefaultUserSettings`
 /// every `CreateDomain` must carry.
-const EXECUTION_ROLE: &str = "arn:aws:iam::123456789012:role/service-role/StudioRole";
+pub(crate) const EXECUTION_ROLE: &str = "arn:aws:iam::123456789012:role/service-role/StudioRole";
 
 /// How long a poll below gives the clock to settle a resource: far longer than the spans
 /// the state gives a profile's provisioning and a domain's teardown, so a loaded host
 /// still settles well inside it.
-const SETTLE_DEADLINE: Duration = Duration::from_secs(120);
+pub(crate) const SETTLE_DEADLINE: Duration = Duration::from_secs(120);
 
 /// How often a poll looks again. Only the loop's condition decides when it stops.
-const POLL_INTERVAL: Duration = Duration::from_millis(25);
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// The smallest `CreateDomain` request for a domain whose members authenticate with
 /// `auth_mode` — `AuthMode`'s members are `SSO` (IAM Identity Center) and `IAM`
 /// (`smithy_query(query="shape", shape="AuthMode")`).
-fn minimal_domain_with_auth(domain_name: &str, auth_mode: &str) -> Value {
+pub(crate) fn minimal_domain_with_auth(domain_name: &str, auth_mode: &str) -> Value {
     json!({
         "DomainName": domain_name,
         "AuthMode": auth_mode,
@@ -65,12 +65,12 @@ fn with_members(base: &Value, extra: &Value) -> Value {
 
 /// The ARN `UserProfileArn`'s modelled pattern gives the profile `user_profile_name` of
 /// `domain_id` in `region`.
-fn user_profile_arn(region: &str, domain_id: &str, user_profile_name: &str) -> String {
+pub(crate) fn user_profile_arn(region: &str, domain_id: &str, user_profile_name: &str) -> String {
     format!("arn:aws:sagemaker:{region}:{ACCOUNT}:user-profile/{domain_id}/{user_profile_name}")
 }
 
 /// The ARN `DomainArn`'s modelled pattern gives the domain `domain_id` in `region`.
-fn domain_arn(region: &str, domain_id: &str) -> String {
+pub(crate) fn domain_arn(region: &str, domain_id: &str) -> String {
     format!("arn:aws:sagemaker:{region}:{ACCOUNT}:domain/{domain_id}")
 }
 
@@ -209,17 +209,31 @@ async fn created_domain_with_auth(
 /// Waits for the CONDITION, never for a fixed time: the domain's provisioning is the
 /// clock's, and no call has to make it happen.
 pub(crate) async fn wait_for_domain_in_service(emulator: &Emulator, region: &str, domain_id: &str) {
+    wait_for_domain_status(emulator, region, domain_id, DOMAIN_STATUS_IN_SERVICE).await;
+}
+
+/// Poll `DescribeDomain` in `region` until `domain_id` reports `expected`.
+///
+/// The one poll loop every Studio suite waits for a domain's status with: a domain's
+/// provisioning and its teardown are both the clock's, so what a caller waits for is the
+/// CONDITION rather than a span.
+pub(crate) async fn wait_for_domain_status(
+    emulator: &Emulator,
+    region: &str,
+    domain_id: &str,
+    expected: &str,
+) {
     let describe = json!({ "DomainId": domain_id });
     let deadline = Instant::now() + SETTLE_DEADLINE;
     loop {
         let (status, described) = emulator.call_in(region, "DescribeDomain", &describe).await;
-        if status == 200 && str_field(&described, "Status") == DOMAIN_STATUS_IN_SERVICE {
+        if status == 200 && str_field(&described, "Status") == expected {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "case in-service-{domain_id}: the domain must reach {DOMAIN_STATUS_IN_SERVICE} on \
-             the clock, last read {status} {described}"
+            "case status-{domain_id}: the domain must reach {expected} on the clock, last read \
+             {status} {described}"
         );
         tokio::time::sleep(POLL_INTERVAL).await;
     }
