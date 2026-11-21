@@ -6,22 +6,24 @@
 //! with `awsJson1_0` bodies) and reads the effect back through `GetBenefitApplication`.
 //!
 //! The rule under test: a caller string a write operation persists is accepted only
-//! within the length the model states for that value — the bound on the member it is
-//! stored in and reported through — and one past it is refused 400 `ValidationException`
-//! with nothing stored, whether or not the operation's OWN input member happens to carry
-//! that `@length` in the model.
+//! within BOTH ends of the length the model states for that value — the bounds on the
+//! member it is stored in and reported through, and on the inputs the model constrains —
+//! and a value outside either end is refused 400 `ValidationException` with nothing
+//! stored, whether or not the operation's OWN input member happens to carry that
+//! constraint in the model.
 //!
 //! The rows span what the rule generalises over: which string (the reason that becomes
 //! `StatusReason`, the `ClientToken` the record keeps), which operation writes it
 //! (`RecallBenefitApplication`, whose members the model leaves unconstrained, and
 //! `CancelBenefitApplication`, whose `Reason` the model bounds), the position relative to
-//! each published bound (at it, one past it, and at the minimum) and the character width
-//! of the value (ASCII and multi-byte, since a `@length` counts characters).
+//! each published bound (at the maximum, one past it, at the minimum and below it) and the
+//! character width of the value (ASCII and multi-byte, since a `@length` counts
+//! characters).
 
 use serde_json::{json, Value};
 use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::state::{
-    member_validation_exception, MAX_CLIENT_TOKEN_LEN, MAX_STATUS_REASON_LEN, STATUS_IN_REVIEW,
-    STATUS_PENDING_SUBMISSION, VALIDATION_REASON_FIELD,
+    member_validation_exception, MAX_CLIENT_TOKEN_LEN, MAX_STATUS_REASON_LEN,
+    MIN_STATUS_REASON_LEN, STATUS_IN_REVIEW, STATUS_PENDING_SUBMISSION, VALIDATION_REASON_FIELD,
 };
 
 use crate::benefit_application_lifecycle::{error_code, text, Harness, CATALOG};
@@ -210,6 +212,171 @@ async fn a_persisted_reason_is_bounded_by_the_member_it_is_reported_through() {
         after["StatusReason"],
         json!(reason),
         "case {case:?}: a cancellation reason at the bound must round-trip, got {after:?}"
+    );
+}
+
+/// A reason a write records as `StatusReason` is accepted only from the MINIMUM of that
+/// member's bound upwards: the empty reason is refused 400 `ValidationException` with
+/// nothing stored on both operations that write the member — the one whose model bounds
+/// its own input and the one whose model leaves it unconstrained — while every reason of
+/// at least that length applies and round-trips.
+#[tokio::test]
+async fn a_persisted_reason_is_refused_below_the_minimum_of_its_bound() {
+    let harness = Harness::new();
+
+    // (case, the reason, whether it is inside the bound) — the shortest reason in one
+    // byte and in several (the bound counts characters), a whitespace reason of that
+    // length (whitespace is a character, which is what the modelled sibling's
+    // `^[\s\S]{1,1000}$` admits), a longer reason well inside the bound, and the empty
+    // reason, the one length below the minimum.
+    let rows: Vec<(&str, String, bool)> = vec![
+        (
+            "the shortest reason",
+            repeat("r", MIN_STATUS_REASON_LEN),
+            true,
+        ),
+        (
+            "a multi-byte reason of the shortest length",
+            repeat("é", MIN_STATUS_REASON_LEN),
+            true,
+        ),
+        (
+            "a whitespace reason of the shortest length",
+            repeat(" ", MIN_STATUS_REASON_LEN),
+            true,
+        ),
+        (
+            "a reason well inside the bound",
+            repeat("r", MIN_STATUS_REASON_LEN + 40),
+            true,
+        ),
+        ("an empty reason", String::new(), false),
+    ];
+
+    for (row, (case, reason, inside)) in rows.iter().enumerate() {
+        let id = recallable(&harness, case, &format!("tok-min-seed-{row}")).await;
+        let before = harness.get_in(case, CATALOG, &id).await;
+        let body = recall_body(CATALOG, &id, reason, Some(&format!("tok-min-{row}")));
+
+        if *inside {
+            harness.ok(case, "RecallBenefitApplication", &body).await;
+            let after = harness.get_in(case, CATALOG, &id).await;
+            assert_eq!(
+                after["Status"],
+                json!(STATUS_PENDING_SUBMISSION),
+                "case {case:?}: a reason inside the bound must be accepted, got {after:?}"
+            );
+            assert_eq!(
+                after["StatusReason"],
+                json!(reason),
+                "case {case:?}: the reason must round-trip, got {after:?}"
+            );
+            continue;
+        }
+
+        let (status, out) = harness.call("RecallBenefitApplication", &body).await;
+        assert_member_refusal(
+            case,
+            status,
+            &out,
+            "reason",
+            &too_short(MIN_STATUS_REASON_LEN),
+        );
+        let after = harness.get_in(case, CATALOG, &id).await;
+        assert_eq!(
+            after, before,
+            "case {case:?}: a refused recall must change nothing, got {after:?}"
+        );
+        assert_eq!(
+            after["Status"],
+            json!(STATUS_IN_REVIEW),
+            "case {case:?}: the application must still be submitted, got {after:?}"
+        );
+        assert_eq!(
+            after["StatusReason"],
+            Value::Null,
+            "case {case:?}: a refused recall must record no reason, got {after:?}"
+        );
+
+        // The refusal left the application recallable, so the rows pin a bound rather
+        // than a blanket refusal of this application.
+        harness
+            .ok(
+                &format!("{case}, then a reason inside the bound"),
+                "RecallBenefitApplication",
+                &recall_body(
+                    CATALOG,
+                    &id,
+                    "recalled for review",
+                    Some(&format!("tok-min-ok-{row}")),
+                ),
+            )
+            .await;
+        let recalled = harness.get_in(case, CATALOG, &id).await;
+        assert_eq!(
+            recalled["Status"],
+            json!(STATUS_PENDING_SUBMISSION),
+            "case {case:?}: the application must still be recallable after the refusal, \
+             got {recalled:?}"
+        );
+    }
+
+    // The same class on the OTHER operation that writes `StatusReason`: its `Reason` is
+    // modelled to admit 1 to 1000 characters, so the empty reason is refused there too —
+    // one stored member, one acceptance rule between the siblings that write it.
+    let case = "cancel, an empty reason";
+    let id = recallable(&harness, case, "tok-min-cancel-empty").await;
+    let before = harness.get_in(case, CATALOG, &id).await;
+    let (status, out) = harness
+        .call(
+            "CancelBenefitApplication",
+            &json!({
+                "Catalog": CATALOG,
+                "ClientToken": "tok-min-cancel-empty-tok",
+                "Identifier": id,
+                "Reason": "",
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected 400 for an empty reason, got {status} {out:?}"
+    );
+    assert_eq!(
+        error_code(&out),
+        "ValidationException",
+        "case {case:?}: expected ValidationException, got {out:?}"
+    );
+    let message = message_of(&out)
+        .unwrap_or_else(|| panic!("case {case:?}: the refusal carries no Message: {out:?}"));
+    assert_validation_invariants(case, &message);
+    let after = harness.get_in(case, CATALOG, &id).await;
+    assert_eq!(
+        after, before,
+        "case {case:?}: a refused cancellation must change nothing, got {after:?}"
+    );
+
+    // And a reason at the minimum IS accepted on that operation.
+    let case = "cancel, at the minimum";
+    let id = recallable(&harness, case, "tok-min-cancel-at").await;
+    let reason = repeat("c", MIN_STATUS_REASON_LEN);
+    harness
+        .ok(
+            case,
+            "CancelBenefitApplication",
+            &json!({
+                "Catalog": CATALOG,
+                "ClientToken": "tok-min-cancel-at-tok",
+                "Identifier": id,
+                "Reason": reason,
+            }),
+        )
+        .await;
+    let after = harness.get_in(case, CATALOG, &id).await;
+    assert_eq!(
+        after["StatusReason"],
+        json!(reason),
+        "case {case:?}: a cancellation reason at the minimum must round-trip, got {after:?}"
     );
 }
 

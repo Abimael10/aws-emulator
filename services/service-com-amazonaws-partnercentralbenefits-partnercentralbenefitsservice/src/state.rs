@@ -429,6 +429,20 @@ pub const MIN_FILE_NAME_LEN: usize = 1;
 /// read can never report a reason longer than the member it is reported through admits.
 pub const MAX_STATUS_REASON_LEN: usize = 1000;
 
+/// The shortest `StatusReason` this service stores on a benefit application: the `min` end
+/// of the SAME modelled constraint [`MAX_STATUS_REASON_LEN`] is the `max` end of, so both
+/// ends of one bound move together.
+///
+/// The model states that end on the input that writes this member where it constrains that
+/// input at all — `CancelBenefitApplicationInput$Reason` carries
+/// `@pattern("^[\s\S]{1,1000}$")` beside its `@length(max: 1000)`
+/// (`smithy_query(query="operation",operation="CancelBenefitApplication")`), which admits
+/// 1 to 1000 characters, so the centralized walk refuses an EMPTY reason there. The input
+/// that writes the member on the other operation is modelled as a bare `String`, so that
+/// handler applies this end itself with [`length_clause`]: one stored member has one
+/// acceptance rule whichever write sets it, and a recorded reason always says something.
+pub const MIN_STATUS_REASON_LEN: usize = 1;
+
 /// The bytes a stored request fingerprint occupies: a SHA-256 digest in hex.
 ///
 /// A spent `ClientToken` is kept with the fingerprint of the request that spent it (see
@@ -1135,9 +1149,11 @@ pub struct BenefitApplication {
     pub status: String,
     /// Why the application holds the status it holds, when the transition into it carried
     /// a reason. Replaced by every transition (see [`BenefitApplication::set_status`]), so
-    /// it never explains a status the application has left. At most
-    /// [`MAX_STATUS_REASON_LEN`] characters, the bound of the member it is reported
-    /// through, so a read never answers a reason longer than that member admits.
+    /// it never explains a status the application has left. Between
+    /// [`MIN_STATUS_REASON_LEN`] and [`MAX_STATUS_REASON_LEN`] characters, the bounds of
+    /// the member it is reported through and of the inputs that write it, so a read never
+    /// answers a reason longer than that member admits — and a recorded reason always
+    /// says something rather than being present and empty.
     pub status_reason: Option<String>,
     pub status_reason_codes: Vec<String>,
     pub created_at_millis: i64,
