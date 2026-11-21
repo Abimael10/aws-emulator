@@ -54,7 +54,7 @@ const PLATFORM_TYPES: &[&str] = &[
 
 /// The `FleetType` values the model admits (`FLEET_TYPE_VALUES` in
 /// `src/ops/types/shared_types.rs`), and the one an application may be attached to.
-const ELASTIC: &str = "ELASTIC";
+pub(crate) const ELASTIC: &str = "ELASTIC";
 const OTHER_FLEET_TYPES: &[&str] = &["ALWAYS_ON", "ON_DEMAND"];
 
 /// The ARN an application of this name carries in [`REGION`].
@@ -89,7 +89,11 @@ fn not_elastic_sentence(fleet_name: &str, fleet_type: &str) -> String {
 }
 
 /// Create the app block every application is created against.
-async fn create_app_block(emulator: &Emulator, case: &str) -> String {
+///
+/// Shared with the other suites in this target
+/// (`tests/all/application_fleet_association_fan_out.rs`), so every association suite
+/// builds its fixtures the same way.
+pub(crate) async fn create_app_block(emulator: &Emulator, case: &str) -> String {
     let created = emulator
         .ok(
             case,
@@ -110,7 +114,7 @@ async fn create_app_block(emulator: &Emulator, case: &str) -> String {
 }
 
 /// Create an application supporting `platforms`, and answer its ARN.
-async fn create_application(
+pub(crate) async fn create_application(
     emulator: &Emulator,
     case: &str,
     name: &str,
@@ -140,7 +144,7 @@ async fn create_application(
 }
 
 /// Create a fleet of `fleet_type` on `platform`.
-async fn create_fleet(
+pub(crate) async fn create_fleet(
     emulator: &Emulator,
     case: &str,
     name: &str,
