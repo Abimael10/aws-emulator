@@ -263,8 +263,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             vpc_security_group_ids,
             tags,
             source_config,
-            // Reported COPYING, with ACTIVE owed by the clock.
-            settles_at: Some(state::settle_instant()),
+            // Reported COPYING by this response, with ACTIVE owed by the clock from the
+            // moment it answers: the next caller to look sees the copy settled.
+            settles_at: Some(state::mint_settle_instant()),
         };
 
         let snapshot = record.as_snapshot();

@@ -173,8 +173,11 @@ async fn create_cluster(router: &MultiServiceRouter, case: &str, body: Value) ->
 
 /// Poll `GetCluster` until the cluster reports `status` — the status the clock owes it a
 /// short span after the call that started its current transition — and return it.
+///
+/// The deadline is deliberately generous (a minute of 50 ms looks): the suite waits for
+/// the CONDITION, so a loaded host must not be able to exhaust it.
 async fn wait_for_status(router: &MultiServiceRouter, cluster_arn: &str, status: &str) -> Value {
-    for _ in 0..100 {
+    for _ in 0..1200 {
         let cluster = get_cluster(router, cluster_arn).await;
         if cluster["status"].as_str() == Some(status) {
             return cluster;
@@ -349,11 +352,15 @@ async fn stopping_a_cluster_that_is_not_available_is_refused() {
 
     // Each row leaves the cluster in one status a stop may not act from, and names the
     // statuses the refused cluster may report afterwards (its own, or the one the clock
-    // owed it anyway). The rows span: a cluster still being built, one being changed, one
-    // already stopping, and one already stopped.
+    // owed it anyway). The rows span: a cluster being changed, one being restarted, one
+    // already stopping, and one already stopped. A cluster still being BUILT is not one
+    // of them: the status a mint is in belongs to the minting call's own response, and
+    // the next caller to look is answered the settled cluster, so a stop arriving after a
+    // create addresses an available cluster.
     enum Setup {
-        /// Stop the freshly created cluster, before the create settles.
-        WhileCreating,
+        /// Stop the settled cluster, let the stop settle, start it again, then stop it
+        /// while the restart is still in flight.
+        WhileStarting,
         /// Modify the settled cluster, then stop it while the change is in flight.
         WhileUpdating,
         /// Stop the settled cluster twice, the second time while the first is in flight.
@@ -363,16 +370,29 @@ async fn stopping_a_cluster_that_is_not_available_is_refused() {
     }
 
     let cases: &[(&str, Setup, &[&str])] = &[
-        ("a cluster still being created", Setup::WhileCreating, &["CREATING", "ACTIVE"]),
+        ("a cluster being restarted", Setup::WhileStarting, &["STARTING", "ACTIVE"]),
         ("a cluster being modified", Setup::WhileUpdating, &["UPDATING", "ACTIVE"]),
         ("a cluster already stopping", Setup::WhileStopping, &["STOPPING", "STOPPED"]),
         ("a cluster already stopped", Setup::WhenStopped, &["STOPPED"]),
     ];
 
-    for (index, (case, setup, allowed)) in cases.iter().enumerate() {
-        let name = format!("notavailable{index}");
+    for (case, setup, allowed) in cases.iter() {
         let cluster_arn = match setup {
-            Setup::WhileCreating => create_cluster(&router, case, create_body(&name, json!({}))).await,
+            Setup::WhileStarting => {
+                let arn = create_active_cluster(&router, case, json!({})).await;
+                let (status, response) = stop(&router, &arn).await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: the setup stop must be accepted, got {status} with {response}"
+                );
+                wait_for_status(&router, &arn, "STOPPED").await;
+                let (status, response) = start(&router, &arn).await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: the setup start must be accepted, got {status} with {response}"
+                );
+                arn
+            }
             Setup::WhileUpdating => {
                 let arn = create_active_cluster(&router, case, json!({})).await;
                 let (status, response) = update(&router, &arn, json!({"shardCapacity": 8})).await;

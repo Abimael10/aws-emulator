@@ -247,10 +247,11 @@ async fn get_ok(router: &MultiServiceRouter, cluster_arn: &str) -> Value {
 /// Read one cluster back until it reports `ACTIVE`, and return it.
 ///
 /// A cluster is modifiable only from a settled status, so a suite that updates a
-/// cluster it has just created waits here first: the move to `ACTIVE` is owed by the
-/// clock, so polling a read is all it takes.
+/// cluster waits here first: the move to `ACTIVE` is owed by the clock, so polling a
+/// read is all it takes. The deadline is deliberately generous (a minute of 50 ms
+/// looks): the wait is for the CONDITION, so a loaded host cannot exhaust it.
 async fn wait_until_active(router: &MultiServiceRouter, cluster_arn: &str) -> Value {
-    for _ in 0..100 {
+    for _ in 0..1200 {
         let cluster = get_ok(router, cluster_arn).await;
         if cluster["status"].as_str() == Some("ACTIVE") {
             return cluster;
@@ -388,26 +389,50 @@ async fn a_cluster_settles_from_creating_to_active_without_another_call() {
     let created = create_ok(&router, minimal_create("settling")).await;
     let cluster_arn = created["clusterArn"].as_str().expect("clusterArn").to_string();
 
-    // A caller acting straight after the create still sees the transient status.
+    // A caller acting straight after the create still sees the transient status: it is
+    // the create's OWN response that reports it.
     assert_eq!(
         created["status"].as_str(),
         Some("CREATING"),
         "case settling: a freshly created cluster must report CREATING, got {created}"
     );
 
-    // The transition is owed by the clock, so it happens with no further request.
-    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+    // The move to ACTIVE is owed by the clock, not asked for by a request: the first
+    // reader is answered the settled cluster, shards and all.
     let settled = get_ok(&router, &cluster_arn).await;
     assert_eq!(
         settled["status"].as_str(),
         Some("ACTIVE"),
-        "case settling: the cluster must settle to ACTIVE once the span has elapsed, got {settled}"
+        "case settling: the cluster must be settled for the first reader, got {settled}"
     );
     assert!(
         settled["shards"]
             .as_array()
             .is_some_and(|shards| shards.iter().all(|s| s["status"] == json!("ACTIVE"))),
         "case settling: a settled cluster's shards settle with it, got {settled}"
+    );
+
+    // The same for a change to the cluster this store now holds, where the clock owes the
+    // settled status a span later: no request asks for the move, and polling a read is
+    // all it takes to see it.
+    let path = format!("/cluster/{}", label(&cluster_arn));
+    let (status, updated) = call(&router, "PUT", &path, Some(json!({"shardCapacity": 8}))).await;
+    assert_eq!(
+        status, 200,
+        "case settling an update: the modification must be accepted, got {status} with \
+         {updated}"
+    );
+    assert_eq!(
+        updated["cluster"]["status"].as_str(),
+        Some("UPDATING"),
+        "case settling an update: the accepted modification reports UPDATING, got {updated}"
+    );
+    let settled = wait_until_active(&router, &cluster_arn).await;
+    assert!(
+        settled["shards"]
+            .as_array()
+            .is_some_and(|shards| shards.iter().all(|s| s["status"] == json!("ACTIVE"))),
+        "case settling an update: a settled cluster's shards settle with it, got {settled}"
     );
 }
 
@@ -1336,6 +1361,491 @@ async fn a_snapshot_name_outside_its_modelled_length_is_refused() {
             );
         }
     }
+}
+
+/// Which reader reports the status of the resource a row mints.
+#[derive(Debug, Clone, Copy)]
+enum ReadBy {
+    /// `GetCluster`, and `ListClusters` for the summary form.
+    Cluster,
+    /// `GetClusterSnapshot`, and `ListClusterSnapshots` for the summary form.
+    Snapshot,
+}
+
+/// How a row mints the resource whose settle pacing it asserts.
+enum Mint {
+    /// `CreateCluster`, carrying the members this row names beyond the required minimum.
+    CreateCluster(Value),
+    /// `CreateClusterSnapshot` of a cluster the row creates first.
+    CreateSnapshot,
+    /// `CopyClusterSnapshot` of a snapshot the row creates first.
+    CopySnapshot,
+    /// `RestoreClusterFromSnapshot` from a snapshot the row creates first.
+    RestoreCluster,
+}
+
+/// One row: a call that MINTS a resource, the transient status its own response carries,
+/// and the reader that must report the settled status to the first caller that looks.
+struct MintRow {
+    case: &'static str,
+    mint: Mint,
+    transient: &'static str,
+    read_by: ReadBy,
+}
+
+/// Create one snapshot of `cluster_arn`, asserting it succeeded, and return its
+/// `snapshot` object.
+async fn create_snapshot_ok(
+    router: &MultiServiceRouter,
+    cluster_arn: &str,
+    snapshot_name: &str,
+) -> Value {
+    let (status, response) = call(
+        router,
+        "POST",
+        "/cluster-snapshot",
+        Some(json!({"clusterArn": cluster_arn, "snapshotName": snapshot_name})),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {snapshot_name:?}: expected CreateClusterSnapshot to answer 200, got {status} \
+         with {response}"
+    );
+    response["snapshot"].clone()
+}
+
+/// Read one snapshot back, asserting it succeeded, and return its `snapshot` object.
+async fn get_snapshot_ok(router: &MultiServiceRouter, snapshot_arn: &str) -> Value {
+    let path = format!("/cluster-snapshot/{}", label(snapshot_arn));
+    let (status, response) = call(router, "GET", &path, None).await;
+    assert_eq!(
+        status, 200,
+        "case {snapshot_arn}: expected GetClusterSnapshot to answer 200, got {status} with \
+         {response}"
+    );
+    response["snapshot"].clone()
+}
+
+/// The status ONE read of `arn` reports, through the reader its resource kind has.
+async fn read_status(router: &MultiServiceRouter, read_by: ReadBy, arn: &str) -> String {
+    let resource = match read_by {
+        ReadBy::Cluster => get_ok(router, arn).await,
+        ReadBy::Snapshot => get_snapshot_ok(router, arn).await,
+    };
+    resource["status"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {arn}: no `status` in {resource}"))
+        .to_string()
+}
+
+/// The status the LISTING reader reports for `arn`, so the two readers can be compared.
+async fn listed_status(router: &MultiServiceRouter, read_by: ReadBy, arn: &str) -> String {
+    let (path, collection, key) = match read_by {
+        ReadBy::Cluster => ("/clusters", "clusters", "clusterArn"),
+        ReadBy::Snapshot => ("/cluster-snapshots", "snapshots", "snapshotArn"),
+    };
+    let (status, response) = call(router, "GET", path, None).await;
+    assert_eq!(
+        status, 200,
+        "case {arn}: expected {path} to answer 200, got {status} with {response}"
+    );
+    let listed = response[collection]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {arn}: no `{collection}` array in {response}"))
+        .iter()
+        .find(|entry| entry[key].as_str() == Some(arn))
+        .unwrap_or_else(|| panic!("case {arn}: {path} did not list the minted resource"))
+        .clone();
+    listed["status"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {arn}: no `status` in {listed}"))
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_minted_resource_is_settled_for_the_first_caller_that_looks_after_the_mint() {
+    // The rule: the transient status of a resource a call MINTS belongs to that call's
+    // own response, and the move to the settled status is owed from the moment it
+    // answers — so the first caller to look afterwards is answered the settled resource,
+    // however soon or late it looks. The rows span every mint this service has and both
+    // transient statuses the mints report (`CREATING` and `COPYING`, values of the
+    // modelled `Status`), with two cluster shapes so the pacing is not a property of one
+    // record.
+    let rows: Vec<MintRow> = vec![
+        MintRow {
+            case: "a cluster of the required minimum",
+            mint: Mint::CreateCluster(json!({})),
+            transient: "CREATING",
+            read_by: ReadBy::Cluster,
+        },
+        MintRow {
+            case: "a multi-shard cluster carrying every optional member",
+            mint: Mint::CreateCluster(json!({
+                "shardCapacity": 8,
+                "shardCount": 3,
+                "shardInstanceCount": 2,
+                "subnetIds": ["subnet-1", "subnet-2"],
+                "vpcSecurityGroupIds": ["sg-1"],
+                "preferredBackupWindow": "01:00-01:30",
+                "backupRetentionPeriod": 7,
+            })),
+            transient: "CREATING",
+            read_by: ReadBy::Cluster,
+        },
+        MintRow {
+            case: "a snapshot of a cluster",
+            mint: Mint::CreateSnapshot,
+            transient: "CREATING",
+            read_by: ReadBy::Snapshot,
+        },
+        MintRow {
+            case: "a copy of a snapshot",
+            mint: Mint::CopySnapshot,
+            transient: "COPYING",
+            read_by: ReadBy::Snapshot,
+        },
+        MintRow {
+            case: "a cluster restored from a snapshot",
+            mint: Mint::RestoreCluster,
+            transient: "CREATING",
+            read_by: ReadBy::Cluster,
+        },
+    ];
+
+    let router = emulator();
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let minted = match &row.mint {
+            Mint::CreateCluster(extra) => {
+                let mut body = minimal_create(&format!("paced{index}"));
+                for (member, value) in extra.as_object().expect("an object") {
+                    body[member] = value.clone();
+                }
+                create_ok(&router, body).await
+            }
+            Mint::CreateSnapshot => {
+                let cluster = create_ok(&router, minimal_create(&format!("paced{index}"))).await;
+                let cluster_arn = cluster["clusterArn"].as_str().expect("clusterArn");
+                create_snapshot_ok(&router, cluster_arn, &format!("paced-snap-{index}")).await
+            }
+            Mint::CopySnapshot => {
+                let cluster = create_ok(&router, minimal_create(&format!("paced{index}"))).await;
+                let cluster_arn = cluster["clusterArn"].as_str().expect("clusterArn");
+                let source =
+                    create_snapshot_ok(&router, cluster_arn, &format!("paced-snap-{index}")).await;
+                let source_arn = source["snapshotArn"].as_str().expect("snapshotArn");
+                let path = format!("/cluster-snapshot/{}/copy", label(source_arn));
+                let (status, response) = call(
+                    &router,
+                    "POST",
+                    &path,
+                    Some(json!({"targetSnapshotName": format!("paced-copy-{index}")})),
+                )
+                .await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected CopyClusterSnapshot to answer 200, got {status} \
+                     with {response}"
+                );
+                response["snapshot"].clone()
+            }
+            Mint::RestoreCluster => {
+                let cluster = create_ok(&router, minimal_create(&format!("paced{index}"))).await;
+                let cluster_arn = cluster["clusterArn"].as_str().expect("clusterArn");
+                let source =
+                    create_snapshot_ok(&router, cluster_arn, &format!("paced-snap-{index}")).await;
+                let source_arn = source["snapshotArn"].as_str().expect("snapshotArn");
+                let path = format!("/cluster-snapshot/{}/restore", label(source_arn));
+                let (status, response) = call(
+                    &router,
+                    "POST",
+                    &path,
+                    Some(json!({"clusterName": format!("pacedrestore{index}")})),
+                )
+                .await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected RestoreClusterFromSnapshot to answer 200, got \
+                     {status} with {response}"
+                );
+                response["cluster"].clone()
+            }
+        };
+
+        // The minting call's OWN response is where the transient status lives.
+        assert_eq!(
+            minted["status"].as_str(),
+            Some(row.transient),
+            "case {case:?}: the minting call must report {:?}, got {minted}",
+            row.transient
+        );
+
+        let arn = match row.read_by {
+            ReadBy::Cluster => minted["clusterArn"].as_str(),
+            ReadBy::Snapshot => minted["snapshotArn"].as_str(),
+        }
+        .unwrap_or_else(|| panic!("case {case:?}: the minted resource carries no ARN: {minted}"))
+        .to_string();
+
+        // The FIRST look after the mint — no waiting, no second poll — is answered the
+        // settled status.
+        let first = read_status(&router, row.read_by, &arn).await;
+        assert_eq!(
+            first, "ACTIVE",
+            "case {case:?}: the first read after the mint must report ACTIVE, got {first:?}"
+        );
+        // Every reader agrees, and the settled status is where the resource stays.
+        let listed = listed_status(&router, row.read_by, &arn).await;
+        assert_eq!(
+            listed, "ACTIVE",
+            "case {case:?}: the listing must report the same settled status, got {listed:?}"
+        );
+        let again = read_status(&router, row.read_by, &arn).await;
+        assert_eq!(
+            again, "ACTIVE",
+            "case {case:?}: a settled resource stays settled, got {again:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_flow_that_chains_three_mints_settles_with_one_read_each() {
+    // A client that mints a resource and waits for it to be available looks once per
+    // transition, whatever its poll interval is: chaining three mints therefore costs
+    // three reads, and the resource each one yields is complete when that read answers.
+    // The two flows are the documented ones — copy a snapshot, and restore a cluster
+    // from one — and each row's third mint is read back for the members it must carry.
+    let router = emulator();
+
+    // Flow 1: create a cluster, snapshot it, copy the snapshot.
+    let cluster = create_ok(&router, minimal_create("chaincopy")).await;
+    let cluster_arn = cluster["clusterArn"].as_str().expect("clusterArn").to_string();
+    let status = read_status(&router, ReadBy::Cluster, &cluster_arn).await;
+    assert_eq!(
+        status, "ACTIVE",
+        "case the copy flow: one read must settle the created cluster, got {status:?}"
+    );
+
+    let source = create_snapshot_ok(&router, &cluster_arn, "chain-source").await;
+    let source_arn = source["snapshotArn"].as_str().expect("snapshotArn").to_string();
+    let status = read_status(&router, ReadBy::Snapshot, &source_arn).await;
+    assert_eq!(
+        status, "ACTIVE",
+        "case the copy flow: one read must settle the created snapshot, got {status:?}"
+    );
+
+    let (http_status, response) = call(
+        &router,
+        "POST",
+        &format!("/cluster-snapshot/{}/copy", label(&source_arn)),
+        Some(json!({"targetSnapshotName": "chain-copy"})),
+    )
+    .await;
+    assert_eq!(
+        http_status, 200,
+        "case the copy flow: CopyClusterSnapshot must answer 200, got {http_status} with \
+         {response}"
+    );
+    let copy_arn = response["snapshot"]["snapshotArn"]
+        .as_str()
+        .expect("snapshotArn")
+        .to_string();
+    let settled_copy = get_snapshot_ok(&router, &copy_arn).await;
+    assert_eq!(
+        settled_copy["status"].as_str(),
+        Some("ACTIVE"),
+        "case the copy flow: one read must settle the copy, got {settled_copy}"
+    );
+    // The resource that read reports is the finished copy: its own identity, the type a
+    // caller-made snapshot carries, and the cluster the source was taken from.
+    assert_ne!(
+        settled_copy["snapshotArn"].as_str(),
+        Some(source_arn.as_str()),
+        "case the copy flow: the copy must carry its own ARN, got {settled_copy}"
+    );
+    assert_eq!(
+        settled_copy["snapshotName"].as_str(),
+        Some("chain-copy"),
+        "case the copy flow: the copy takes the requested name, got {settled_copy}"
+    );
+    assert_eq!(
+        settled_copy["clusterArn"].as_str(),
+        Some(cluster_arn.as_str()),
+        "case the copy flow: the copy names the source's cluster, got {settled_copy}"
+    );
+    assert_eq!(
+        settled_copy["snapshotType"].as_str(),
+        Some(SNAPSHOT_TYPES[0]),
+        "case the copy flow: a caller-made copy is {:?}, got {settled_copy}",
+        SNAPSHOT_TYPES[0]
+    );
+
+    // Flow 2: create a cluster, snapshot it, restore a cluster from the snapshot.
+    let source_cluster = create_ok(
+        &router,
+        json!({
+            "clusterName": "chainrestoresrc", "authType": "PLAIN_TEXT",
+            "adminUserName": "restoreowner", "adminUserPassword": "Secret123!",
+            "shardCapacity": 4, "shardCount": 2,
+        }),
+    )
+    .await;
+    let source_cluster_arn = source_cluster["clusterArn"]
+        .as_str()
+        .expect("clusterArn")
+        .to_string();
+    let status = read_status(&router, ReadBy::Cluster, &source_cluster_arn).await;
+    assert_eq!(
+        status, "ACTIVE",
+        "case the restore flow: one read must settle the created cluster, got {status:?}"
+    );
+
+    let snapshot = create_snapshot_ok(&router, &source_cluster_arn, "chain-restorable").await;
+    let snapshot_arn = snapshot["snapshotArn"].as_str().expect("snapshotArn").to_string();
+    let status = read_status(&router, ReadBy::Snapshot, &snapshot_arn).await;
+    assert_eq!(
+        status, "ACTIVE",
+        "case the restore flow: one read must settle the created snapshot, got {status:?}"
+    );
+
+    let (http_status, response) = call(
+        &router,
+        "POST",
+        &format!("/cluster-snapshot/{}/restore", label(&snapshot_arn)),
+        Some(json!({"clusterName": "chainrestored"})),
+    )
+    .await;
+    assert_eq!(
+        http_status, 200,
+        "case the restore flow: RestoreClusterFromSnapshot must answer 200, got {http_status} \
+         with {response}"
+    );
+    let restored_arn = response["cluster"]["clusterArn"]
+        .as_str()
+        .expect("clusterArn")
+        .to_string();
+    let settled_restore = get_ok(&router, &restored_arn).await;
+    assert_eq!(
+        settled_restore["status"].as_str(),
+        Some("ACTIVE"),
+        "case the restore flow: one read must settle the restored cluster, got \
+         {settled_restore}"
+    );
+    // The restored cluster that read reports is complete: its own identity and endpoint,
+    // the source's shard topology, and the administrator the snapshot carried.
+    assert_ne!(
+        settled_restore["clusterArn"].as_str(),
+        Some(source_cluster_arn.as_str()),
+        "case the restore flow: the restored cluster must carry its own ARN, got \
+         {settled_restore}"
+    );
+    assert!(
+        settled_restore["clusterEndpoint"]
+            .as_str()
+            .is_some_and(|endpoint| endpoint.starts_with("chainrestored.")),
+        "case the restore flow: the restored cluster must carry its own endpoint, got \
+         {settled_restore}"
+    );
+    for member in ["shardCapacity", "shardCount", "adminUserName"] {
+        assert_eq!(
+            settled_restore.get(member),
+            source_cluster.get(member),
+            "case the restore flow: `{member}` must come from the source, expected {:?}, got \
+             {:?}",
+            source_cluster.get(member),
+            settled_restore.get(member)
+        );
+    }
+    assert_eq!(
+        settled_restore["shards"].as_array().map(Vec::len),
+        source_cluster["shardCount"].as_u64().map(|count| count as usize),
+        "case the restore flow: the restored cluster carries one shard per shardCount, got \
+         {settled_restore}"
+    );
+}
+
+#[tokio::test]
+async fn a_change_to_an_existing_cluster_keeps_its_transient_window() {
+    // The other half of the pacing rule: a change applied to a cluster this store ALREADY
+    // holds leaves it transient for a clock-owed span, because a cluster carries one
+    // change at a time — which is what the state-gated refusals are asked of. The rows
+    // differ in the change in flight and the refusal it produces.
+    let router = emulator();
+
+    // A modification in flight: the cluster is not modifiable again until it settles.
+    let created = create_ok(&router, minimal_create("windowupdate")).await;
+    let cluster_arn = created["clusterArn"].as_str().expect("clusterArn").to_string();
+    let path = format!("/cluster/{}", label(&cluster_arn));
+    let (status, accepted) = call(&router, "PUT", &path, Some(json!({"shardCapacity": 8}))).await;
+    assert_eq!(
+        status, 200,
+        "case a modification in flight: the first update must be accepted, got {status} with \
+         {accepted}"
+    );
+    assert_eq!(
+        accepted["cluster"]["status"].as_str(),
+        Some("UPDATING"),
+        "case a modification in flight: the accepted update reports UPDATING, got {accepted}"
+    );
+    let (status, refused) = call(&router, "PUT", &path, Some(json!({"shardCapacity": 16}))).await;
+    assert_eq!(
+        status, 409,
+        "case a modification in flight: a second update must be refused with 409, got {status} \
+         with {refused}"
+    );
+    assert_eq!(
+        error_code(&refused),
+        "ConflictException",
+        "case a modification in flight: expected a ConflictException, got {refused}"
+    );
+    // The clock owes the cluster its available status, so the very same update is taken
+    // once it has settled.
+    wait_until_active(&router, &cluster_arn).await;
+    let (status, retried) = call(&router, "PUT", &path, Some(json!({"shardCapacity": 16}))).await;
+    assert_eq!(
+        status, 200,
+        "case a modification in flight: the update must be accepted once settled, got {status} \
+         with {retried}"
+    );
+
+    // A stop in flight: the cluster is on its way to stopped, and a delete is refused
+    // from that status for as long as the stop is owed.
+    let created = create_ok(&router, minimal_create("windowstop")).await;
+    let stopped_arn = created["clusterArn"].as_str().expect("clusterArn").to_string();
+    let (status, stopping) = call(
+        &router,
+        "POST",
+        &format!("/cluster/{}/stop", label(&stopped_arn)),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case a stop in flight: the stop must be accepted, got {status} with {stopping}"
+    );
+    assert_eq!(
+        stopping["cluster"]["status"].as_str(),
+        Some("STOPPING"),
+        "case a stop in flight: the accepted stop reports STOPPING, got {stopping}"
+    );
+    let (status, refused) = call(
+        &router,
+        "DELETE",
+        &format!("/cluster/{}", label(&stopped_arn)),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case a stop in flight: a delete must be refused with 400 while the stop is owed, got \
+         {status} with {refused}"
+    );
+    assert_eq!(
+        error_code(&refused),
+        "ValidationException",
+        "case a stop in flight: expected a ValidationException, got {refused}"
+    );
 }
 
 #[tokio::test]

@@ -15,7 +15,7 @@
 //! modification carries, the values it carries, whether the two requests touch the same
 //! member or different ones, whether the second request carries an updatable member at
 //! all, and which transient status the cluster is in (a change still being applied, or a
-//! cluster still being created). Each suite drives the real wire path through
+//! cluster still being restarted). Each suite drives the real wire path through
 //! `MultiServiceRouter::dispatch`, as a client would.
 //!
 //! Each suite in this crate carries its own request harness (see
@@ -133,6 +133,18 @@ async fn update(
     call(router, "PUT", &path, Some(patch)).await
 }
 
+/// `POST /cluster/{clusterArn}` + `/stop` — one `StopCluster` call.
+async fn stop(router: &MultiServiceRouter, cluster_arn: &str) -> (u16, Value) {
+    let path = format!("/cluster/{}/stop", label(cluster_arn));
+    call(router, "POST", &path, None).await
+}
+
+/// `POST /cluster/{clusterArn}` + `/start` — one `StartCluster` call.
+async fn start(router: &MultiServiceRouter, cluster_arn: &str) -> (u16, Value) {
+    let path = format!("/cluster/{}/start", label(cluster_arn));
+    call(router, "POST", &path, None).await
+}
+
 /// `GET /cluster/{clusterArn}` — the stored cluster, asserted readable.
 async fn get_cluster(router: &MultiServiceRouter, cluster_arn: &str) -> Value {
     let path = format!("/cluster/{}", label(cluster_arn));
@@ -159,8 +171,11 @@ async fn create_cluster(router: &MultiServiceRouter, name: &str) -> String {
 
 /// Poll `GetCluster` until the cluster reports `ACTIVE` — the status the clock owes it a
 /// short span after the call that started its current transition — and return it.
+///
+/// The deadline is deliberately generous (a minute of 50 ms looks): the wait is for the
+/// CONDITION, so a loaded host cannot exhaust it.
 async fn wait_until_active(router: &MultiServiceRouter, cluster_arn: &str) -> Value {
-    for _ in 0..100 {
+    for _ in 0..1200 {
         let cluster = get_cluster(router, cluster_arn).await;
         if cluster["status"].as_str() == Some("ACTIVE") {
             return cluster;
@@ -168,6 +183,23 @@ async fn wait_until_active(router: &MultiServiceRouter, cluster_arn: &str) -> Va
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("case {cluster_arn}: the cluster never settled to ACTIVE");
+}
+
+/// Poll `GetCluster` until the cluster reports `status`, and return it. The deadline is
+/// as generous as [`wait_until_active`]'s, for the same reason.
+async fn wait_for_status(
+    router: &MultiServiceRouter,
+    cluster_arn: &str,
+    status: &str,
+) -> Value {
+    for _ in 0..1200 {
+        let cluster = get_cluster(router, cluster_arn).await;
+        if cluster["status"].as_str() == Some(status) {
+            return cluster;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("case {cluster_arn}: the cluster never reached {status}");
 }
 
 /// Create one cluster and return its `clusterArn` once it is settled and modifiable.
@@ -418,27 +450,40 @@ async fn two_concurrent_modifications_leave_exactly_one_accepted() {
 
 #[tokio::test]
 async fn a_cluster_that_is_not_yet_settled_is_not_modifiable() {
-    // A cluster still being created is in a transient status too, so the same rule
-    // refuses a modification of it. The rows differ in the member the modification
-    // carries.
+    // A cluster whose RESTART is still in flight is in a transient status too, so the same
+    // rule refuses a modification of it. The rows differ in the member the modification
+    // carries. (A cluster still being BUILT is not a row: the transient status of a minted
+    // resource belongs to the minting call's own response, so a modification arriving
+    // after a create reaches a settled cluster.)
     let patches: Vec<(&str, Value)> = vec![
         ("shardCapacity", json!({"shardCapacity": 8})),
         ("shardCount", json!({"shardCount": 4})),
         ("authType", json!({"authType": "SECRET_ARN"})),
-        ("subnetIds", json!({"subnetIds": ["subnet-while-creating"]})),
+        ("subnetIds", json!({"subnetIds": ["subnet-while-starting"]})),
         ("no updatable member", json!({})),
     ];
 
     let router = emulator();
     for (index, (case, patch)) in patches.iter().enumerate() {
-        let name = format!("creating{index}");
-        let cluster_arn = create_cluster(&router, &name).await;
-        let created = get_cluster(&router, &cluster_arn).await;
+        let name = format!("starting{index}");
+        let cluster_arn = create_active_cluster(&router, &name).await;
+        let (status, stopping) = stop(&router, &cluster_arn).await;
         assert_eq!(
-            created["status"].as_str(),
-            Some("CREATING"),
-            "case {case:?}: a cluster the service is still building reports CREATING, got \
-             {created}"
+            status, 200,
+            "case {case:?}: the setup stop must be accepted, got {status} with {stopping}"
+        );
+        wait_for_status(&router, &cluster_arn, "STOPPED").await;
+        let (status, starting) = start(&router, &cluster_arn).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the setup start must be accepted, got {status} with {starting}"
+        );
+        let restarting = get_cluster(&router, &cluster_arn).await;
+        assert_eq!(
+            restarting["status"].as_str(),
+            Some("STARTING"),
+            "case {case:?}: a cluster the service is still restarting reports STARTING, got \
+             {restarting}"
         );
 
         let (status, refused) = update(&router, &cluster_arn, patch.clone()).await;
@@ -453,7 +498,7 @@ async fn a_cluster_that_is_not_yet_settled_is_not_modifiable() {
             );
         }
 
-        // The same request is accepted once the create has settled.
+        // The same request is accepted once the restart has settled.
         wait_until_active(&router, &cluster_arn).await;
         let (status, retried) = update(&router, &cluster_arn, patch.clone()).await;
         assert_eq!(

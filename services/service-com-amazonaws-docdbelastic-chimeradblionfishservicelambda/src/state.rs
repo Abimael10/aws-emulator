@@ -16,14 +16,21 @@ use crate::ops::types::{
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime};
 
-/// How long after the call that starts it a cluster (or snapshot) status transition the
-/// clock owes becomes due.
+/// How long after the call that starts it a status transition of a resource this store
+/// ALREADY holds — the change `UpdateCluster`, `StopCluster` or `StartCluster` applies to
+/// a cluster that was already there — becomes due.
 ///
 /// The emulator never sleeps for it: the due instant is stored on the record and
-/// materialised by whoever next looks at that record. The span is deliberately
-/// non-zero, so a caller acting straight after `CreateCluster` still observes
-/// `CREATING` and the state errors that go with it.
-const SETTLE_AFTER: Duration = Duration::from_millis(500);
+/// materialised by whoever next looks at that record. The span is non-zero because a
+/// cluster carries one change at a time: while the change it has taken is still in
+/// flight the cluster is not available for the next one, which is the refusal
+/// [`ensure_modifiable`], [`ensure_available`], [`ensure_startable`] and
+/// [`ensure_deletable`] answer from the record's own transient status. It is wide enough
+/// that a caller acting right after the change still meets that refusal on a machine
+/// under load.
+///
+/// A resource a call MINTS has no such span: see [`mint_settle_instant`].
+const SETTLE_AFTER: Duration = Duration::from_secs(3);
 
 /// Per-service state for com-amazonaws-docdbelastic-chimeradblionfishservicelambda. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -220,12 +227,26 @@ impl ::std::fmt::Debug for ClusterRecord {
 }
 
 impl ClusterRecord {
-    /// Start a status transition the clock owes: the transient `status` now, and the
-    /// settled status that transient one leads to ([`settled_status`]) once
-    /// [`SETTLE_AFTER`] has elapsed.
+    /// Start a status transition the clock owes a cluster this store already holds: the
+    /// transient `status` now, and the settled status that transient one leads to
+    /// ([`settled_status`]) once [`SETTLE_AFTER`] has elapsed.
     pub fn begin_transition(&mut self, status: &str) {
+        self.begin_transition_due_at(status, settle_instant());
+    }
+
+    /// Start the transition a MINT owes the cluster it has just built: the transient
+    /// `status` for this call's own response, and the settled status due the moment that
+    /// response is answered ([`mint_settle_instant`]), so the next caller to look —
+    /// reader or writer — is answered the settled cluster.
+    pub fn begin_mint_transition(&mut self, status: &str) {
+        self.begin_transition_due_at(status, mint_settle_instant());
+    }
+
+    /// The one writer of a transition: the transient status on the cluster and every
+    /// shard it owns, and the instant the settled status it leads to becomes due.
+    fn begin_transition_due_at(&mut self, status: &str, due: Instant) {
         self.status = status.to_string();
-        self.settles_at = Some(settle_instant());
+        self.settles_at = Some(due);
         for shard in &mut self.shards {
             shard.status = status.to_string();
         }
@@ -436,9 +457,27 @@ pub fn request_region(parts: &::smithy_server_runtime::http::request::Parts) -> 
         .unwrap_or_else(|| "us-east-1".to_string())
 }
 
-/// The instant a transition started now becomes due.
+/// The instant a transition of a resource this store already holds, started now,
+/// becomes due ([`SETTLE_AFTER`]).
 pub fn settle_instant() -> Instant {
     Instant::now() + SETTLE_AFTER
+}
+
+/// The instant the transition a MINT starts becomes due: the moment the minting call
+/// answers.
+///
+/// A resource a call mints — a cluster, a cluster restored from a snapshot, a snapshot,
+/// a copy of one — reports its transient status (`CREATING`, `COPYING`) in the response
+/// of the call that minted it, which is the one answer that observed the resource mid
+/// transition. Its settled status is owed from the moment that call answers, so the
+/// FIRST caller to look at the record afterwards is answered the settled resource rather
+/// than being made to look again: a client that creates a resource and then polls for it
+/// converges on its first poll, whatever its poll interval is.
+///
+/// Nothing is withheld by this: whoever looks next materialises a move that was already
+/// due at that instant whether or not anybody called.
+pub fn mint_settle_instant() -> Instant {
+    Instant::now()
 }
 
 /// Now, as the UTC instant string every `*Time` member of this service carries.

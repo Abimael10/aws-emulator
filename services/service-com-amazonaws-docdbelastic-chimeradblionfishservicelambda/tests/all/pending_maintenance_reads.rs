@@ -158,8 +158,11 @@ async fn get_cluster(router: &MultiServiceRouter, cluster_arn: &str) -> Value {
 
 /// Poll `GetCluster` until the cluster reports `ACTIVE` — the status the clock owes it
 /// after a create, a restore or an update — and return it.
+///
+/// The deadline is deliberately generous (a minute of 50 ms looks): the wait is for the
+/// CONDITION, so a loaded host cannot exhaust it.
 async fn settled_cluster(router: &MultiServiceRouter, cluster_arn: &str) -> Value {
-    for _ in 0..80 {
+    for _ in 0..1200 {
         let cluster = get_cluster(router, cluster_arn).await;
         if cluster["status"].as_str() == Some("ACTIVE") {
             return cluster;

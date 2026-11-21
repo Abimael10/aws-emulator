@@ -218,8 +218,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             vpc_security_group_ids,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             source_config,
-            // Reported CREATING, with ACTIVE owed by the clock.
-            settles_at: Some(state::settle_instant()),
+            // Reported CREATING by this response, with ACTIVE owed by the clock from
+            // the moment it answers: the next caller to look sees the snapshot settled.
+            settles_at: Some(state::mint_settle_instant()),
         };
 
         let snapshot = record.as_snapshot();

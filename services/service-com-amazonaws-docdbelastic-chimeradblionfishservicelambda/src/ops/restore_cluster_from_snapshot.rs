@@ -257,7 +257,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut record = state::ClusterRecord {
             cluster_name: cluster_name.clone(),
             cluster_arn: cluster_arn.clone(),
-            // `begin_transition` below sets the status and the instant it settles at.
+            // `begin_mint_transition` below sets the status and the instant it settles
+            // at.
             status: String::new(),
             settles_at: None,
             cluster_endpoint: state::cluster_endpoint(&cluster_name, &cluster_id, &region),
@@ -285,8 +286,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nothing is pending for a cluster that has only just been restored.
             pending_maintenance_actions: Vec::new(),
         };
-        // A restored cluster is reported CREATING and the clock owes it ACTIVE.
-        record.begin_transition(state::STATUS_CREATING);
+        // This response reports the restored cluster CREATING; the clock owes it ACTIVE
+        // from the moment this call answers, so the next caller to look sees it settled.
+        record.begin_mint_transition(state::STATUS_CREATING);
 
         let cluster = record.as_cluster();
         guard.cluster_names.insert(cluster_name, cluster_arn.clone());

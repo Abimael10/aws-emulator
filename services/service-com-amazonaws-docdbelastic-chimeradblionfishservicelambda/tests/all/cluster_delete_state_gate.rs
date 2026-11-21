@@ -192,13 +192,16 @@ async fn create_cluster(router: &MultiServiceRouter, case: &str, name: &str, ext
 
 /// Poll `GetCluster` until the cluster reports `status` — the status the clock owes it a
 /// short span after the call that started its current transition — and return it.
+///
+/// The deadline is deliberately generous (a minute of 50 ms looks): the wait is for the
+/// CONDITION, so a loaded host cannot exhaust it.
 async fn wait_for_status(
     router: &MultiServiceRouter,
     case: &str,
     cluster_arn: &str,
     status: &str,
 ) -> Value {
-    for _ in 0..100 {
+    for _ in 0..1200 {
         let cluster = get_cluster(router, case, cluster_arn).await;
         if cluster["status"].as_str() == Some(status) {
             return cluster;
@@ -377,27 +380,40 @@ async fn deleting_a_cluster_that_is_stopping_is_refused_and_it_settles_stopped()
 #[tokio::test]
 async fn deleting_a_cluster_in_a_status_that_admits_it_still_succeeds() {
     // The rows differ in the status the cluster is in when the delete arrives: its settled
-    // available status, and the transient status a create leaves it in — a delete is how a
-    // caller gets rid of a cluster the service has not finished bringing up, so neither
-    // status blocks one.
+    // available status, and the transient status a restart leaves it in — a delete is how a
+    // caller gets rid of a cluster whose last change is still in flight, so neither status
+    // blocks one. A cluster still being BUILT is not a row: the status a mint is in belongs
+    // to the minting call's own response, so by the time a delete (or any other call)
+    // arrives the created cluster has settled.
     enum When {
         /// Delete the cluster once the create has settled.
         WhenActive,
-        /// Delete the freshly created cluster, before the create settles.
-        WhileCreating,
+        /// Delete the cluster while its restart is still in flight.
+        WhileStarting,
     }
 
     let router = emulator();
     for (when, suffix, expected) in [
         (When::WhenActive, "active", "ACTIVE"),
-        (When::WhileCreating, "creating", "CREATING"),
+        (When::WhileStarting, "starting", "STARTING"),
     ] {
         for shape in &shapes() {
             let case = format!("{} while {suffix}", shape.case);
             let name = format!("{}{suffix}", shape.name);
             let cluster_arn = match when {
                 When::WhenActive => create_active_cluster(&router, &case, &name, &shape.extra).await,
-                When::WhileCreating => create_cluster(&router, &case, &name, &shape.extra).await,
+                When::WhileStarting => {
+                    let arn = create_active_cluster(&router, &case, &name, &shape.extra).await;
+                    stop(&router, &case, &arn).await;
+                    wait_for_status(&router, &case, &arn, "STOPPED").await;
+                    let (status, response) = start(&router, &arn).await;
+                    assert_eq!(
+                        status, 200,
+                        "case {case:?}: the setup start must be accepted, got {status} with \
+                         {response}"
+                    );
+                    arn
+                }
             };
             let before = get_cluster(&router, &case, &cluster_arn).await;
             assert_eq!(
@@ -551,16 +567,17 @@ async fn starting_a_stopped_cluster_lets_it_be_deleted_again() {
 #[tokio::test]
 async fn starting_a_cluster_that_is_not_stopped_is_refused() {
     // A start acts only on a stopped cluster, so the rows span the statuses it may not
-    // act from: still being created, settled available, and still stopping.
+    // act from: carrying a change that is still in flight, settled available, and still
+    // stopping.
     enum Setup {
-        WhileCreating,
+        WhileUpdating,
         WhenActive,
         WhileStopping,
     }
 
     let router = emulator();
     let cases: &[(&str, Setup, &[&str])] = &[
-        ("a cluster still being created", Setup::WhileCreating, &["CREATING", "ACTIVE"]),
+        ("a cluster carrying a change in flight", Setup::WhileUpdating, &["UPDATING", "ACTIVE"]),
         ("an available cluster", Setup::WhenActive, &["ACTIVE"]),
         ("a cluster still stopping", Setup::WhileStopping, &["STOPPING", "STOPPED"]),
     ];
@@ -568,7 +585,18 @@ async fn starting_a_cluster_that_is_not_stopped_is_refused() {
     for (index, (case, setup, allowed)) in cases.iter().enumerate() {
         let name = format!("notstopped{index}");
         let cluster_arn = match setup {
-            Setup::WhileCreating => create_cluster(&router, case, &name, &json!({})).await,
+            Setup::WhileUpdating => {
+                let arn = create_active_cluster(&router, case, &name, &json!({})).await;
+                let path = format!("/cluster/{}", label(&arn));
+                let (status, response) =
+                    call(&router, "PUT", &path, Some(json!({"shardCapacity": 8}))).await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: the setup modification must be accepted, got {status} with \
+                     {response}"
+                );
+                arn
+            }
             Setup::WhenActive => create_active_cluster(&router, case, &name, &json!({})).await,
             Setup::WhileStopping => {
                 let arn = create_active_cluster(&router, case, &name, &json!({})).await;

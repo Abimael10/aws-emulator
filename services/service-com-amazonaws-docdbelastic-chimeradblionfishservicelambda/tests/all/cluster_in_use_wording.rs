@@ -12,7 +12,7 @@
 //! cluster, whichever in-flight change and whichever transient status produced it.
 //!
 //! The table below differs along what the rule generalises over: the status the cluster
-//! is in when the modification arrives (still being built, still being changed, being
+//! is in when the modification arrives (carrying a change, carrying a resize, being
 //! stopped, settled stopped, being restarted), the cluster's name, and the member the
 //! refused modification carries. One sentence must serve every row, which is exactly
 //! what a message built from the cluster's name or status cannot do.
@@ -44,8 +44,9 @@ const IN_USE_SENTENCE: &str = "Can't perform operation on cluster as it's in use
 const CLUSTER_TYPE: &str = "Cluster";
 
 /// How long a poll loop waits for a transition the clock owes before giving up. Generous
-/// on purpose: the suite waits for the CONDITION, never for a fixed time.
-const POLL_ATTEMPTS: usize = 400;
+/// on purpose: the suite waits for the CONDITION, never for a fixed time, so a loaded
+/// host cannot exhaust it.
+const POLL_ATTEMPTS: usize = 1200;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// A SigV4 `Authorization` header for this service in [`REGION`].
@@ -200,12 +201,18 @@ async fn start(router: &MultiServiceRouter, cluster_arn: &str) {
 }
 
 /// How a row gets its cluster out of the settled available status.
+///
+/// A cluster still being BUILT is not one of these: a mint reports its transient status
+/// in its own response and the next caller to look is answered the settled cluster, so a
+/// modification arriving after a create reaches an available cluster. What is left is
+/// every status a change to an EXISTING cluster leaves it in, plus the settled status
+/// that is not the available one.
 #[derive(Debug, Clone, Copy)]
 enum Setup {
-    /// A cluster the service is still building.
-    WhileCreating,
     /// A cluster carrying a modification that is still in flight.
     WhileUpdating,
+    /// A cluster carrying a resize of its shard count that is still in flight.
+    WhileResizing,
     /// A cluster whose stop is still in flight.
     WhileStopping,
     /// A cluster whose stop has settled: not transient, but not available either.
@@ -228,10 +235,18 @@ struct Row {
 async fn arrange(router: &MultiServiceRouter, row: &Row) -> String {
     let cluster_arn = create_cluster(router, row.name).await;
     match row.setup {
-        Setup::WhileCreating => {}
         Setup::WhileUpdating => {
             wait_for_status(router, &cluster_arn, "ACTIVE").await;
             let (status, response) = update(router, &cluster_arn, json!({"shardCapacity": 4})).await;
+            assert_eq!(
+                status, 200,
+                "case {:?}: the first modification must be accepted, got {status} with {response}",
+                row.case
+            );
+        }
+        Setup::WhileResizing => {
+            wait_for_status(router, &cluster_arn, "ACTIVE").await;
+            let (status, response) = update(router, &cluster_arn, json!({"shardCount": 3})).await;
             assert_eq!(
                 status, 200,
                 "case {:?}: the first modification must be accepted, got {status} with {response}",
@@ -262,16 +277,16 @@ async fn arrange(router: &MultiServiceRouter, row: &Row) -> String {
 fn rows() -> Vec<Row> {
     vec![
         Row {
-            case: "a cluster still being built",
+            case: "a cluster carrying a modification still in flight",
             name: "fleetalpha",
-            setup: Setup::WhileCreating,
-            status: "CREATING",
+            setup: Setup::WhileUpdating,
+            status: "UPDATING",
             patch: json!({"shardCapacity": 8}),
         },
         Row {
-            case: "a cluster carrying a modification still in flight",
+            case: "a cluster carrying a shard-count resize still in flight",
             name: "fleetbravo",
-            setup: Setup::WhileUpdating,
+            setup: Setup::WhileResizing,
             status: "UPDATING",
             patch: json!({"shardCount": 7}),
         },
