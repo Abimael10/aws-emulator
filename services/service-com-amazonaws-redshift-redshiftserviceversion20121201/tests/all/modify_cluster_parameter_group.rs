@@ -320,7 +320,9 @@ struct ValueCase {
 /// Redshift writes a set as a comma-separated list of literals (`true,false`)
 /// or inclusive numeric ranges (`-15-2`, `0-10`, `0,100-2147483647`), so each
 /// published range is covered on BOTH bounds and one past each, and a parameter
-/// that publishes no set is covered too.
+/// that publishes no set is covered too. A published literal in another CASE is
+/// not a row here: the set is read without regard to case, so such a value is
+/// taken in the set's own spelling (`crate::parameter_group_catalog_rules`).
 #[tokio::test]
 async fn the_published_allowed_values_set_decides_which_values_are_taken() {
     let emulator = Emulator::new();
@@ -439,12 +441,6 @@ async fn the_published_allowed_values_set_decides_which_values_are_taken() {
             parameter: "use_fips_ssl",
             value: "false",
             accepted: true,
-        },
-        ValueCase {
-            case: "a literal in the wrong case",
-            parameter: "use_fips_ssl",
-            value: "TRUE",
-            accepted: false,
         },
         ValueCase {
             case: "a value outside a two-literal set",

@@ -236,7 +236,7 @@ async fn the_credential_gate_precedes_every_judgement_of_the_scope() {
     let silent = token(&emulator, &[]).await;
     assert_eq!(
         (silent.status, silent.error_code().as_deref()),
-        (400, Some("MalformedInput")),
+        (400, Some("ValidationError")),
         "case \"no cluster identifier at all\": expected the boundary to refuse it, got {} / \
          {:?} with body {}",
         silent.status,

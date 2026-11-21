@@ -12,12 +12,47 @@ pub const PARAMETER_SOURCE_ENGINE_DEFAULT: &str = "engine-default";
 /// `Parameter$Source` for a value a caller set on the group.
 pub const PARAMETER_SOURCE_USER: &str = "user";
 
-/// The `Source` values a `DescribeClusterParameters` request may filter on, in
-/// the documented order.
+/// `Parameter$Source` for a value the SERVICE itself sets, beside the family's
+/// engine default and a caller's own.
 ///
-/// Source: `smithy_query(query="doc", shape="DescribeClusterParametersMessage",
-/// member="Source")` — "Valid Values: user | engine-default".
-pub const PARAMETER_SOURCES: [&str; 2] = [PARAMETER_SOURCE_USER, PARAMETER_SOURCE_ENGINE_DEFAULT];
+/// Source: `smithy_query(query="doc", shape="Parameter", member="Source")` — "The
+/// source of the parameter value, SUCH AS \"engine-default\" or \"user\"", which
+/// names two of the three the service reports and leaves the set open. This
+/// emulator sets no parameter itself, so nothing is ever REPORTED under it — a
+/// filter naming it is still a legal filter, and selects nothing.
+pub const PARAMETER_SOURCE_SYSTEM: &str = "system";
+
+/// The `Source` values a `DescribeClusterParameters` request may filter on, in the
+/// order the refusal of a value outside them lists them.
+///
+/// The domain is the set of sources a reported `Parameter$Source` can name —
+/// `engine-default`, `system` and `user` — and not the two the member's own
+/// documentation gives as examples (`smithy_query(query="doc",
+/// shape="DescribeClusterParametersMessage", member="Source")` says "Valid Values:
+/// user | engine-default"): recorded behaviour admits a filter on the service's
+/// own source too, which the member's documentation does not mention. A filter is
+/// a filter, so one naming a source nothing is reported under selects nothing
+/// rather than being refused.
+pub const PARAMETER_SOURCES: [&str; 3] = [
+    PARAMETER_SOURCE_ENGINE_DEFAULT,
+    PARAMETER_SOURCE_SYSTEM,
+    PARAMETER_SOURCE_USER,
+];
+
+/// Why a `Source` outside [`PARAMETER_SOURCES`] is refused, naming the value the
+/// request carried and the domain it is outside of.
+///
+/// Amazon Redshift's own wording for this error class: a fixed prefix, the
+/// submitted value, and then the fixed list of the sources a filter may name, in
+/// the order [`PARAMETER_SOURCES`] holds them — so the only variable part is the
+/// value the request sent. The caller answers it with the Query API's
+/// `InvalidParameterValue`.
+pub fn invalid_parameter_source_message(source: &str) -> String {
+    format!(
+        "Invalid Source: {source}. Allowed values are: {}",
+        PARAMETER_SOURCES.join(", ")
+    )
+}
 
 /// `ClusterParameterGroupStatus$ParameterApplyStatus` /
 /// `ClusterParameterStatus$ParameterApplyStatus` for a value the database
@@ -95,16 +130,29 @@ pub fn parameter_value_max_len(name: &str) -> Option<usize> {
 /// stored for a cluster to fail on later. The parameter publishes no
 /// `AllowedValues`, so the domain cannot be stated as a value set — which is why
 /// the check lives here beside [`EngineParameter::admits`] rather than in it.
+///
+/// The refusal is [`invalid_json_parameter_value_message`]: one sentence for the
+/// whole class, naming the parameter whose document could not be read.
 pub fn json_parameter_value_refusal(name: &str, value: &str) -> Result<(), String> {
     if name != WLM_JSON_CONFIGURATION {
         return Ok(());
     }
     match serde_json::from_str::<serde_json::Value>(value) {
         Ok(serde_json::Value::Array(_)) => Ok(()),
-        _ => Err(format!(
-            "the value of '{name}' must be a JSON list of workload management queues."
-        )),
+        _ => Err(invalid_json_parameter_value_message(name)),
     }
+}
+
+/// Why the value a request carried for a parameter whose value is a JSON DOCUMENT
+/// is not one. See [`json_parameter_value_refusal`].
+///
+/// Amazon Redshift's own wording for this error class: it states that the JSON is
+/// invalid and names the parameter it could not read, and nothing else — the value
+/// is NOT echoed, there is no trailing punctuation, and the sentence says nothing
+/// about the shape the document had to take. The caller answers it with the Query
+/// API's `InvalidParameterValue`.
+pub fn invalid_json_parameter_value_message(parameter_name: &str) -> String {
+    format!("Invalid JSON for {parameter_name}")
 }
 
 /// Why a request naming a parameter the group's family does not publish is
@@ -139,6 +187,27 @@ pub const DATA_TYPE_STRING: &str = "string";
 /// in `Parameter$AllowedValues` ("The valid range of values for the
 /// parameter").
 pub(super) const BOOLEAN_ALLOWED_VALUES: &str = "true,false";
+
+/// The other pair of words a SWITCH is set with, each beside the published
+/// literal ([`BOOLEAN_ALLOWED_VALUES`]) it stands for.
+///
+/// Recorded behaviour: a parameter whose `Parameter$DataType` is
+/// [`DATA_TYPE_BOOLEAN`] is served a value of `on` as well as one of `true`, and
+/// reports the published literal afterwards — so this pair is part of the
+/// parameter's domain and not a second spelling the response carries. The pair is
+/// the whole of it: a word of ASSENT (`yes`) is NOT one of these words, and is
+/// refused as the non-boolean value it is.
+const SWITCH_SPELLINGS: [(&str, &str); 2] = [("on", "true"), ("off", "false")];
+
+/// The published boolean literal `value` sets a switch to, or `None` when it is
+/// not one of the words a switch is set with. Read without regard to ASCII case,
+/// as every published value of this catalog is.
+fn switch_literal(value: &str) -> Option<&'static str> {
+    SWITCH_SPELLINGS
+        .iter()
+        .find(|(spelling, _)| value.eq_ignore_ascii_case(spelling))
+        .map(|(_, literal)| *literal)
+}
 
 /// One engine default parameter: a setting every cluster parameter group of a
 /// published family publishes, with the value it carries before anybody changes
@@ -203,7 +272,14 @@ impl EngineParameter {
         }
     }
 
-    /// Whether the published `AllowedValues` set admits `value`.
+    /// Whether the published `AllowedValues` set admits `value`; see
+    /// [`Self::admitted_value`], which also says what the set SPELLS it.
+    pub fn admits(&self, value: &str) -> bool {
+        self.admitted_value(value).is_some()
+    }
+
+    /// The value this parameter HOLDS for `value`, or `None` when the published
+    /// `AllowedValues` set does not admit it at all.
     ///
     /// Source: `smithy_query(query="doc", shape="Parameter",
     /// member="AllowedValues")` — "The valid range of values for the parameter".
@@ -211,25 +287,42 @@ impl EngineParameter {
     /// either a literal value (`true,false`) or, for a numeric parameter, an
     /// INCLUSIVE range written `low-high` with a possibly negative low (`-15-2`,
     /// `0-10`, `0,100-2147483647`). A parameter that publishes no set admits
-    /// every value the engine itself parses, so it admits whatever it is given.
-    pub fn admits(&self, value: &str) -> bool {
+    /// every value the engine itself parses, so it holds whatever it is given.
+    ///
+    /// A published LITERAL is matched without regard to ASCII case, and what the
+    /// parameter then holds is the SET's spelling of it rather than the request's
+    /// (recorded behaviour: a boolean parameter set to `TRUE` is served, and the
+    /// value the group reports afterwards is the published `true`). A value inside
+    /// a published numeric range is held as the request wrote it: the set spells
+    /// out the bounds, not the numbers between them.
+    ///
+    /// A parameter whose `Parameter$DataType` is [`DATA_TYPE_BOOLEAN`] is a
+    /// SWITCH, so it also takes the other pair of words a switch is set with
+    /// ([`switch_literal`]) and holds the published literal that pair stands for.
+    pub fn admitted_value(&self, value: &str) -> Option<String> {
         let Some(allowed) = self.allowed_values else {
-            return true;
+            return Some(value.to_string());
         };
         let numeric = self.data_type == DATA_TYPE_INTEGER;
-        allowed.split(',').map(str::trim).any(|item| {
-            if item == value {
-                return true;
+        // What a SWITCH was set to, in the vocabulary its published set is
+        // written in; every other parameter's value stands for itself.
+        let wanted = match self.data_type {
+            DATA_TYPE_BOOLEAN => switch_literal(value).unwrap_or(value),
+            _ => value,
+        };
+        allowed.split(',').map(str::trim).find_map(|item| {
+            if item.eq_ignore_ascii_case(wanted) {
+                return Some(item.to_string());
             }
             if !numeric {
-                return false;
+                return None;
             }
-            let Some((low, high)) = allowed_range(item) else {
-                return false;
-            };
+            let (low, high) = allowed_range(item)?;
             value
                 .parse::<i64>()
-                .is_ok_and(|wanted| (low..=high).contains(&wanted))
+                .ok()
+                .filter(|wanted| (low..=high).contains(wanted))
+                .map(|_| value.to_string())
         })
     }
 
@@ -295,6 +388,25 @@ pub fn parameter_value_refusal(parameter: &EngineParameter, value: &str) -> Opti
     ))
 }
 
+/// The value `parameter` HOLDS for the value a request carried for it
+/// ([`EngineParameter::admitted_value`]), or why the published set does not admit
+/// it at all ([`parameter_value_refusal`]).
+///
+/// The one call every path that SETS a parameter value makes, so what a group
+/// holds and what a refusal says are decided together and cannot disagree.
+pub fn admitted_parameter_value(
+    parameter: &EngineParameter,
+    value: &str,
+) -> Result<String, String> {
+    match parameter.admitted_value(value) {
+        Some(admitted) => Ok(admitted),
+        // `admitted_value` answers `None` for exactly the values the published
+        // set does not admit, which is when `parameter_value_refusal` words one.
+        None => Err(parameter_value_refusal(parameter, value)
+            .unwrap_or_else(|| parameter_not_found_message(parameter.name))),
+    }
+}
+
 /// One `AllowedValues` item read as an inclusive numeric range, or `None` when
 /// the item is not one.
 ///
@@ -322,9 +434,9 @@ pub(super) fn allowed_range(item: &str) -> Option<(i64, i64)> {
 /// emulator's to rephrase. The entries whose change an associated cluster sees
 /// only after a reboot are published `static` (`enable_case_sensitive_identifier`,
 /// `enable_user_activity_logging`, `require_ssl`, `statement_timeout`,
-/// `use_fips_ssl`, `wlm_json_configuration`); every other setting applies
-/// dynamically. Every setting in the catalog is one a caller may change, hence
-/// [`EngineParameter::is_modifiable`] on all of them.
+/// `use_fips_ssl`); every other setting, `wlm_json_configuration` included,
+/// applies dynamically. Every setting in the catalog is one a caller may change,
+/// hence [`EngineParameter::is_modifiable`] on all of them.
 pub const ENGINE_DEFAULT_PARAMETERS: &[EngineParameter] = &[
     EngineParameter {
         name: "auto_analyze",
@@ -365,7 +477,7 @@ pub const ENGINE_DEFAULT_PARAMETERS: &[EngineParameter] = &[
     EngineParameter {
         name: "enable_user_activity_logging",
         default_value: "false",
-        description: "Logs each query run against the database to the user activity log.",
+        description: "parameter for audit logging purpose",
         data_type: DATA_TYPE_BOOLEAN,
         allowed_values: Some(BOOLEAN_ALLOWED_VALUES),
         apply_type: APPLY_TYPE_STATIC,
@@ -446,10 +558,10 @@ pub const ENGINE_DEFAULT_PARAMETERS: &[EngineParameter] = &[
     EngineParameter {
         name: "wlm_json_configuration",
         default_value: "[{\"auto_wlm\":true}]",
-        description: "The workload management configuration, as a JSON array of queues.",
+        description: "wlm json configuration",
         data_type: DATA_TYPE_STRING,
         allowed_values: None,
-        apply_type: APPLY_TYPE_STATIC,
+        apply_type: APPLY_TYPE_DYNAMIC,
         is_modifiable: true,
     },
 ];

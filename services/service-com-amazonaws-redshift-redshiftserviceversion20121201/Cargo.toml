@@ -102,6 +102,10 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# One `mod` per `tests/all/<name>.rs`, so a suite is declared by being there
+# rather than by a hand-kept list. A workspace dependency this repository
+# already locks.
+automod = { workspace = true }
 # `tokio`'s timer, for the one test that waits out a clock-owed transition. The
 # crate's regular dependency on tokio keeps the workspace feature set; features
 # are additive and are not recorded in Cargo.lock, so this adds no locked

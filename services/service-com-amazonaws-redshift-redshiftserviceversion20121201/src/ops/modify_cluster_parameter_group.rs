@@ -292,21 +292,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ModifyClusterPara
                     )));
                 }
             }
+            // A value whose own FORM the parameter fixes — the JSON document
+            // `wlm_json_configuration` carries — is refused in the vocabulary of
+            // that parameter and not of the wire, the same way a value outside
+            // the published set is below, so neither sentence names a member.
             if let Err(reason) = st::json_parameter_value_refusal(name, &value) {
                 return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
-                    format!("Invalid value for {member}.ParameterValue: {reason}"),
+                    reason,
                 ));
             }
             // A value the published set does not admit is refused in the
             // vocabulary of the PARAMETER the caller set — its data type, or the
             // range the catalogue advertises — and not in the vocabulary of the
-            // wire, which is why this one sentence names no member.
-            if let Some(refusal) = st::parameter_value_refusal(parameter, &value) {
-                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
-                    refusal,
-                ));
-            }
-            resolved.push((parameter, value));
+            // wire, which is why this one sentence names no member. A value the
+            // set DOES admit is taken in the set's own spelling of it, which is
+            // what the group then reports.
+            let admitted = st::admitted_parameter_value(parameter, &value)
+                .map_err(crate::scaffolded::Scaffolded::invalid_parameter_value)?;
+            resolved.push((parameter, admitted));
         }
 
         // Nothing can be refused any more, so the group takes every value: the

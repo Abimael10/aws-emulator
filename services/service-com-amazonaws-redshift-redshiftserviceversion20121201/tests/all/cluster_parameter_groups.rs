@@ -267,13 +267,28 @@ async fn a_created_parameter_group_is_reported_exactly_as_stored() {
     );
 }
 
-/// One row of a syntax table: the case name, the requested name, and whether the
-/// documented syntax admits it.
+/// One row of a syntax table: the case name, the requested name, whether the
+/// documented syntax admits it, and the whole sentence the refusal carries when
+/// it does not (empty for an admitted name).
 struct NameCase {
     case: &'static str,
     requested_name: String,
     accepted: bool,
+    refusal: &'static str,
 }
+
+/// The sentence a `ParameterGroupName` outside the identifier GRAMMAR is refused
+/// with: the shared validator's fixed text, naming the parameter under the
+/// RDS-family name that validator reports it as and echoing nothing the request
+/// sent.
+const NAME_IS_NOT_AN_IDENTIFIER: &str = "The parameter DBParameterGroupName is not a valid \
+     identifier. Identifiers must begin with a letter; must contain only ASCII letters, digits, \
+     and hyphens; and must not end with a hyphen or contain two consecutive hyphens.";
+
+/// The sentence a `ParameterGroupName` past the documented maximum LENGTH is
+/// refused with, which the same validator reaches before the grammar.
+const NAME_IS_TOO_LONG: &str = "The parameter DBParameterGroupName is not a valid identifier \
+     because it is longer than 255 characters.";
 
 /// The documented `ParameterGroupName` syntax, on each published bound and one
 /// past it, and on each forbidden form.
@@ -290,61 +305,73 @@ async fn the_parameter_group_name_syntax_is_enforced() {
             case: "at the lower bound",
             requested_name: name_of_length(1),
             accepted: true,
+            refusal: "",
         },
         NameCase {
             case: "at the upper bound",
             requested_name: name_of_length(255),
             accepted: true,
+            refusal: "",
         },
         NameCase {
             case: "one past the upper bound",
             requested_name: name_of_length(256),
             accepted: false,
+            refusal: NAME_IS_TOO_LONG,
         },
         NameCase {
             case: "one below the lower bound",
             requested_name: String::new(),
             accepted: false,
+            refusal: NAME_IS_NOT_AN_IDENTIFIER,
         },
         NameCase {
             case: "mixed case is admitted, not refused",
             requested_name: "MixedCase".to_string(),
             accepted: true,
+            refusal: "",
         },
         NameCase {
             case: "hyphens inside the name",
             requested_name: "a-b-c".to_string(),
             accepted: true,
+            refusal: "",
         },
         NameCase {
             case: "first character is a digit",
             requested_name: "1group".to_string(),
             accepted: false,
+            refusal: NAME_IS_NOT_AN_IDENTIFIER,
         },
         NameCase {
             case: "first character is a hyphen",
             requested_name: "-group".to_string(),
             accepted: false,
+            refusal: NAME_IS_NOT_AN_IDENTIFIER,
         },
         NameCase {
             case: "ends with a hyphen",
             requested_name: "group-".to_string(),
             accepted: false,
+            refusal: NAME_IS_NOT_AN_IDENTIFIER,
         },
         NameCase {
             case: "two consecutive hyphens",
             requested_name: "gr--oup".to_string(),
             accepted: false,
+            refusal: NAME_IS_NOT_AN_IDENTIFIER,
         },
         NameCase {
             case: "neither alphanumeric nor hyphen: underscore",
             requested_name: "gr_oup".to_string(),
             accepted: false,
+            refusal: NAME_IS_NOT_AN_IDENTIFIER,
         },
         NameCase {
             case: "neither alphanumeric nor hyphen: dot",
             requested_name: "gr.oup".to_string(),
             accepted: false,
+            refusal: NAME_IS_NOT_AN_IDENTIFIER,
         },
     ];
 
@@ -371,12 +398,34 @@ async fn the_parameter_group_name_syntax_is_enforced() {
             );
         } else {
             assert_eq!(
-                (answer.status, answer.error_code()),
-                (400, Some("ValidationException".to_string())),
-                "case {}: expected 400 ValidationException, got {} / {:?}",
+                (
+                    answer.status,
+                    answer.error_code(),
+                    answer.text("Message")
+                ),
+                (
+                    400,
+                    Some("InvalidParameterValue".to_string()),
+                    Some(case.refusal.to_string())
+                ),
+                "case {}: expected 400 InvalidParameterValue {:?}, got {} / {:?} / {:?}",
                 case.case,
+                case.refusal,
                 answer.status,
-                answer.error_code()
+                answer.error_code(),
+                answer.text("Message")
+            );
+            // The sentence states the rule and nothing the request sent: the
+            // offending name is never echoed back.
+            assert!(
+                case.requested_name.is_empty()
+                    || !answer
+                        .text("Message")
+                        .unwrap_or_default()
+                        .contains(&case.requested_name),
+                "case {}: expected the refusal not to echo the name, got {:?}",
+                case.case,
+                answer.text("Message")
             );
         }
     }

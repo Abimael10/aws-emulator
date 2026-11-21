@@ -375,7 +375,7 @@ async fn the_published_catalog_carries_the_documented_settings() {
             "[{\"auto_wlm\":true}]",
             "string",
             None,
-            "static",
+            "dynamic",
         ),
     ];
 
@@ -427,7 +427,7 @@ async fn a_value_a_group_holds_replaces_the_engine_default_and_sources_to_user()
         ("no held value", &[]),
         ("one dynamic parameter", &[("statement_timeout", "60000")]),
         (
-            "one static parameter",
+            "one parameter whose value is a JSON document",
             &[("wlm_json_configuration", "[{\"query_group\":[\"etl\"]}]")],
         ),
         (

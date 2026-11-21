@@ -566,7 +566,7 @@ async fn a_create_naming_no_cluster_or_no_single_target_action_is_refused() {
         .await;
     assert_eq!(
         (silent.status, silent.error_code().as_deref()),
-        (400, Some("MalformedInput")),
+        (400, Some("ValidationError")),
         "case a request naming no target action: expected the boundary to refuse it, got {} / \
          {:?} with body {}",
         silent.status,

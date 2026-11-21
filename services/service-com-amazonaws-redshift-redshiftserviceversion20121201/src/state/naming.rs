@@ -277,6 +277,44 @@ pub fn check_identifier_syntax(
     Ok(())
 }
 
+/// The NAME the shared validator that judges a parameter group's name reports it
+/// under.
+///
+/// Recorded behaviour, and the same split [`ClusterIdentifierParameter`] states
+/// for a cluster identifier: the grammar check a parameter-group name is judged by
+/// is a validator shared with the rest of the RDS family, so the sentence it
+/// answers names the member under THAT family's own name rather than under the
+/// Redshift member's. The message is what a caller matches on, so the name is
+/// stated here once instead of at each call site.
+pub const PARAMETER_GROUP_NAME_PARAMETER: &str = "DBParameterGroupName";
+
+/// Refuse a `ParameterGroupName` a create has to MINT under the identifier
+/// grammar, naming the parameter the shared validator reports it under
+/// ([`PARAMETER_GROUP_NAME_PARAMETER`]).
+///
+/// The same two refusals as [`check_identifier_syntax`], in the order the
+/// validator reaches them — the documented maximum length of a parameter group
+/// name ([`PARAMETER_GROUP_NAME_RULE`]) first, then the grammar
+/// ([`identifier_syntax_holds`]) — so a value that breaks both is refused for
+/// being too long. Neither sentence echoes the value the request carried.
+///
+/// Only a name a CREATE mints is judged this way: a name an operation merely
+/// dereferences is resolved rather than parsed, and the default parameter group of
+/// a family carries a `.` in its name, which this grammar does not admit.
+pub fn check_parameter_group_identifier(value: &str) -> Result<(), String> {
+    let max_len = PARAMETER_GROUP_NAME_RULE.max_len;
+    if value.chars().count() > max_len {
+        return Err(identifier_too_long_message(
+            PARAMETER_GROUP_NAME_PARAMETER,
+            max_len,
+        ));
+    }
+    if !identifier_syntax_holds(value) {
+        return Err(invalid_identifier_message(PARAMETER_GROUP_NAME_PARAMETER));
+    }
+    Ok(())
+}
+
 /// The syntax rule Redshift documents for a DATABASE object name — a database
 /// user, a database name or a database group name.
 ///

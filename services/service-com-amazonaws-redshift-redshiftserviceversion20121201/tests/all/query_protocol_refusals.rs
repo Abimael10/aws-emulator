@@ -349,13 +349,16 @@ async fn a_delete_without_a_final_snapshot_decision_is_a_parameter_combination()
 }
 
 /// One row of the parameter-domain table: the name-value pair a modify carries,
-/// whether the family's published catalog admits it, and whether the name is one
-/// the family does not publish at all (which carries its own sentence).
+/// whether the family's published catalog admits it, the value the group HOLDS
+/// for it once it is taken (the published set's own spelling, which is not always
+/// the one the request sent), and whether the name is one the family does not
+/// publish at all (which carries its own sentence).
 struct DomainCase {
     case: &'static str,
     parameter: &'static str,
     value: &'static str,
     admitted: bool,
+    holds: &'static str,
     unpublished_name: bool,
 }
 
@@ -363,6 +366,8 @@ struct DomainCase {
 /// publishes, and anything outside that domain — a name the family does not
 /// publish, or a value the published `AllowedValues` set does not admit — is
 /// refused with `InvalidParameterValue`, with the whole request left unapplied.
+/// A value the set DOES admit is taken in the set's own spelling: the published
+/// literals are read without regard to case.
 ///
 /// Source: the `AllowedValues` of `state::ENGINE_DEFAULT_PARAMETERS`, which is
 /// what `smithy_query(query="doc", shape="Parameter", member="AllowedValues")`
@@ -382,6 +387,7 @@ async fn a_parameter_outside_the_published_domain_is_an_invalid_parameter_value(
             parameter: "require_ssl",
             value: "true",
             admitted: true,
+            holds: "true",
             unpublished_name: false,
         },
         DomainCase {
@@ -389,6 +395,7 @@ async fn a_parameter_outside_the_published_domain_is_an_invalid_parameter_value(
             parameter: "require_ssl",
             value: "maybe",
             admitted: false,
+            holds: "",
             unpublished_name: false,
         },
         DomainCase {
@@ -396,13 +403,25 @@ async fn a_parameter_outside_the_published_domain_is_an_invalid_parameter_value(
             parameter: "enable_user_activity_logging",
             value: "1",
             admitted: false,
+            holds: "",
+            unpublished_name: false,
+        },
+        // The published literals are read without regard to case, and what the
+        // group then holds is the SET's spelling of the value, not the request's.
+        DomainCase {
+            case: "a boolean parameter given the set's value in upper case",
+            parameter: "use_fips_ssl",
+            value: "TRUE",
+            admitted: true,
+            holds: "true",
             unpublished_name: false,
         },
         DomainCase {
-            case: "a boolean parameter given the set's value in another case",
-            parameter: "use_fips_ssl",
-            value: "TRUE",
-            admitted: false,
+            case: "a boolean parameter given the set's value in mixed case",
+            parameter: "auto_mv",
+            value: "False",
+            admitted: true,
+            holds: "false",
             unpublished_name: false,
         },
         DomainCase {
@@ -410,6 +429,7 @@ async fn a_parameter_outside_the_published_domain_is_an_invalid_parameter_value(
             parameter: "max_concurrency_scaling_clusters",
             value: "10",
             admitted: true,
+            holds: "10",
             unpublished_name: false,
         },
         DomainCase {
@@ -417,6 +437,7 @@ async fn a_parameter_outside_the_published_domain_is_an_invalid_parameter_value(
             parameter: "max_concurrency_scaling_clusters",
             value: "11",
             admitted: false,
+            holds: "",
             unpublished_name: false,
         },
         DomainCase {
@@ -424,6 +445,7 @@ async fn a_parameter_outside_the_published_domain_is_an_invalid_parameter_value(
             parameter: "wlm_json_configuration",
             value: "[{\"auto_wlm\":true}]",
             admitted: true,
+            holds: "[{\"auto_wlm\":true}]",
             unpublished_name: false,
         },
         DomainCase {
@@ -431,6 +453,7 @@ async fn a_parameter_outside_the_published_domain_is_an_invalid_parameter_value(
             parameter: "wlm_json_configuration",
             value: "[{\"auto_wlm\":true",
             admitted: false,
+            holds: "",
             unpublished_name: false,
         },
         DomainCase {
@@ -438,6 +461,7 @@ async fn a_parameter_outside_the_published_domain_is_an_invalid_parameter_value(
             parameter: "wlm_json_configuration",
             value: "{\"auto_wlm\":true}",
             admitted: false,
+            holds: "",
             unpublished_name: false,
         },
         DomainCase {
@@ -445,6 +469,7 @@ async fn a_parameter_outside_the_published_domain_is_an_invalid_parameter_value(
             parameter: "wlm_json_configuration",
             value: "auto",
             admitted: false,
+            holds: "",
             unpublished_name: false,
         },
         DomainCase {
@@ -452,6 +477,7 @@ async fn a_parameter_outside_the_published_domain_is_an_invalid_parameter_value(
             parameter: "no_such_parameter",
             value: "1",
             admitted: false,
+            holds: "",
             unpublished_name: true,
         },
         DomainCase {
@@ -459,6 +485,7 @@ async fn a_parameter_outside_the_published_domain_is_an_invalid_parameter_value(
             parameter: "shared_buffers",
             value: "128MB",
             admitted: false,
+            holds: "",
             unpublished_name: true,
         },
         DomainCase {
@@ -466,6 +493,7 @@ async fn a_parameter_outside_the_published_domain_is_an_invalid_parameter_value(
             parameter: "REQUIRE_SSL",
             value: "true",
             admitted: false,
+            holds: "",
             unpublished_name: true,
         },
         DomainCase {
@@ -473,6 +501,7 @@ async fn a_parameter_outside_the_published_domain_is_an_invalid_parameter_value(
             parameter: "search_path",
             value: "$user, public, staging",
             admitted: true,
+            holds: "$user, public, staging",
             unpublished_name: false,
         },
     ];
@@ -490,9 +519,10 @@ async fn a_parameter_outside_the_published_domain_is_an_invalid_parameter_value(
                 .map(|(_, value, source)| (value.as_str(), source.as_str()));
             assert_eq!(
                 held,
-                Some((row.value, state::PARAMETER_SOURCE_USER)),
-                "case {}: expected the group to hold the value with Source user, got {held:?}",
-                row.case
+                Some((row.holds, state::PARAMETER_SOURCE_USER)),
+                "case {}: expected the group to hold {:?} with Source user, got {held:?}",
+                row.case,
+                row.holds
             );
             continue;
         }

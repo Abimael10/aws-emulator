@@ -109,9 +109,10 @@ async fn seed_existing_group(emulator: &Emulator) {
 /// `smithy_query(query="operation",operation="ModifyCluster,DeleteCluster,DescribeClusterParameters,CreateClusterParameterGroup")`),
 /// a handler refusal the model cannot express the query-protocol code the service
 /// itself answers (`InvalidParameterCombination` for members that cannot stand
-/// together), a body the codec
-/// could not read `MalformedInput`, a value outside a declared bound `ValidationError`,
-/// and an `Action` naming no modelled operation `InvalidAction`.
+/// together), an input the walk refused — an absent required member as much as a
+/// value outside a declared bound — the one input-refusal code this service names
+/// both with (`ValidationError`), and an `Action` naming no modelled operation
+/// `InvalidAction`.
 fn error_cases() -> Vec<ErrorCase> {
     // The family of the engine version this service publishes, read off the store's own
     // seed rather than spelled here.
@@ -169,7 +170,7 @@ fn error_cases() -> Vec<ErrorCase> {
             action: "ModifyCluster",
             params: Vec::new(),
             status: 400,
-            code: "MalformedInput",
+            code: "ValidationError",
         },
         ErrorCase {
             case: "a value one past a declared length bound",

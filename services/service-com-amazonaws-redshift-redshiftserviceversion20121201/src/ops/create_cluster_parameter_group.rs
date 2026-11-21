@@ -209,12 +209,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateClusterPara
         // The request's own values first: a name that cannot be a parameter group
         // name, and a family no engine version offers, are refused before the
         // store is changed at all.
-        if let Err(message) = st::check_identifier(
-            st::PARAMETER_GROUP_NAME_RULE,
-            "ParameterGroupName",
-            &input.parameter_group_name,
-        ) {
-            return Err(crate::scaffolded::Scaffolded::validation(message));
+        if let Err(message) = st::check_parameter_group_identifier(&input.parameter_group_name) {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                message,
+            ));
         }
         // "This value is stored as a lower-case string", so the stored name — the
         // one uniqueness is decided on and the one every read reports — is the

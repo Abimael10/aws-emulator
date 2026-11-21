@@ -182,15 +182,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Specify user to show parameters that are different form the default.
         // Similarly, specify engine-default to show parameters that are the same
-        // as the default parameter group. Valid Values: user | engine-default" —
-        // a request naming anything else names no parameter type, so it is
-        // refused before the store is read at all.
+        // as the default parameter group" — a request naming a source the service
+        // reports no parameter under at all (`st::PARAMETER_SOURCES`) names no
+        // parameter type, so it is refused before the store is read at all.
         if let Some(source) = input.source.as_deref() {
             if !st::PARAMETER_SOURCES.contains(&source) {
-                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
-                    "Invalid value for Source: '{source}'. Valid Values: {}",
-                    st::PARAMETER_SOURCES.join(" | ")
-                )));
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    st::invalid_parameter_source_message(source),
+                ));
             }
         }
 

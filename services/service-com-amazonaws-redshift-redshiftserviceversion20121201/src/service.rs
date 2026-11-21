@@ -24,8 +24,9 @@
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   before any handler ran. Taken here: every input refusal carries this
+//!   service's one input-refusal code ([`INPUT_REFUSAL_CODE`]) over the shared
+//!   rendering of AWS's envelope.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -57,6 +58,19 @@ use smithy_server_runtime::{
     http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// The error code Amazon Redshift names a refusal of a request's INPUT with: a
+/// `@required` member the request did not carry, and a value outside a bound,
+/// a pattern or an enumerated set the model declares.
+///
+/// It is the code the query protocols name a refused VALUE with
+/// (`vendor/smithy-server-runtime/src/pre_dispatch.rs`), and it is stated here for
+/// every input refusal because that is what the recordings show: the framework
+/// names a request whose absent required member the codec found while reading it
+/// with the other query code (`MalformedInput`), while Amazon Redshift answers an
+/// absent required member with the same validation code a bad value gets. A client
+/// branches on the code, so the two layers' findings are not told apart by it.
+const INPUT_REFUSAL_CODE: &str = "ValidationError";
 
 /// The `com-amazonaws-redshift-redshiftserviceversion20121201` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -117,15 +131,28 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service state it. Every such refusal of this service carries ONE code,
+        // [`INPUT_REFUSAL_CODE`], whichever layer of the walk found it — which is
+        // what this seam is for: the framework tells an absent required member
+        // apart from a value outside a bound, because the codec finds the first
+        // while READING the request and the walk finds the second afterwards, and
+        // names them with two different query-protocol codes. Amazon Redshift
+        // names both with the one validation code, so a client branching on the
+        // code cannot see which layer refused it.
+        //
+        // The MESSAGE is the shared rendering of AWS's own envelope over the
+        // framework's clauses (`service_common::validation_message`), so nothing
+        // about the sentence — the count word, the member paths or the
+        // requirements — is spelled per service.
+        //
+        // An authentication refusal is declined: it is a 403 under its own code
+        // rather than an input refusal, and this seam is handed no detail of
+        // which credential failure it was.
+        let message = ::service_common::validation_message::aws_validation_refusal(refusal)?.message;
+        Some(Refused {
+            code: INPUT_REFUSAL_CODE.to_string(),
+            message,
+        })
     }
 
     fn override_routing_error(

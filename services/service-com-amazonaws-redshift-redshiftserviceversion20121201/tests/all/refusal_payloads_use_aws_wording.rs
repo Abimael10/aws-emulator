@@ -83,7 +83,10 @@ struct ValueRefusal {
 /// literals (`true,false`) or inclusive numeric ranges (`-15-2`, `0-10`,
 /// `0,100-2147483647`), so each published range is covered one past BOTH of its
 /// bounds, and the table holds parameters the issue did not cite
-/// (`extra_float_digits`, `statement_timeout`, `auto_mv`, `use_fips_ssl`).
+/// (`extra_float_digits`, `statement_timeout`, `auto_mv`, `use_fips_ssl`). A
+/// published literal in another CASE is not among them: the set is read without
+/// regard to case, so such a value is served rather than refused (which
+/// `crate::query_protocol_refusals` covers).
 #[tokio::test]
 async fn a_parameter_value_refusal_is_worded_from_the_parameter_not_from_the_wire() {
     let emulator = Emulator::new();
@@ -98,12 +101,6 @@ async fn a_parameter_value_refusal_is_worded_from_the_parameter_not_from_the_wir
             parameter: "require_ssl",
             value: "maybe",
             message: "parameter value is not a valid boolean:maybe",
-        },
-        ValueRefusal {
-            case: "a published literal in the wrong case for a boolean",
-            parameter: "auto_mv",
-            value: "TRUE",
-            message: "parameter value is not a valid boolean:TRUE",
         },
         ValueRefusal {
             case: "a number for a boolean",
