@@ -12,14 +12,17 @@
 //! One entity per module: the Rule record and its lookups live in [`rules`], the
 //! Deployment record in [`deployments`], the Template record in [`templates`] and the
 //! Scope record in [`scopes`], re-exported here so `crate::state::<name>` keeps naming
-//! every one of them.
+//! every one of them. The references those records hold between one another — the graph a
+//! delete consults before removing anything — live in [`references`].
 
 mod deployments;
+mod references;
 mod rules;
 mod scopes;
 mod templates;
 
 pub use deployments::*;
+pub use references::*;
 pub use rules::*;
 pub use scopes::*;
 pub use templates::*;

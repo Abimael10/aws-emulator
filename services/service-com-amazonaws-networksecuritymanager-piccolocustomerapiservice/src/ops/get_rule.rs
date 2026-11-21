@@ -180,13 +180,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let Some(rule) = store.rule_by_identifier(&input.rule_identifier) else {
+            // The wording this service states for a rule miss: fixed text and the rule id
+            // the identifier names. The rule read words its own miss rather than taking
+            // the shared sentence the other entity reads state (the exception
+            // `crate::state::RESOURCE_NOT_FOUND_MESSAGE` documents).
+            let rule_id = crate::state::rule_id_in(&input.rule_identifier);
             return Err(GetRuleErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "no rule answers to the identifier {:?}",
-                        input.rule_identifier
-                    ),
-                    resource_id: Some(input.rule_identifier.clone()),
+                    message: format!("Rule not found: {rule_id}"),
+                    resource_id: Some(rule_id.to_string()),
                     resource_type: Some(crate::state::RESOURCE_TYPE_RULE.to_string()),
                 },
             )

@@ -96,3 +96,19 @@ impl State {
         self.rules.get(&id)
     }
 }
+
+/// The `ruleId` a `ruleIdentifier` names, whether or not a rule still answers to it: the
+/// resource segment of the ARN the model documents the identifier to be ("This is the
+/// rule's Amazon Resource Name (ARN)"), with the version suffix a version-qualified
+/// identifier carries dropped ([`super::is_entity_version`]), or the value itself when it
+/// carries neither.
+///
+/// What a miss reports, so the error names the rule rather than the whole ARN the caller
+/// sent.
+pub fn rule_id_in(identifier: &str) -> &str {
+    let unversioned = match identifier.rsplit_once(':') {
+        Some((head, suffix)) if super::is_entity_version(suffix) => head,
+        _ => identifier,
+    };
+    unversioned.split('/').next_back().unwrap_or(unversioned)
+}
