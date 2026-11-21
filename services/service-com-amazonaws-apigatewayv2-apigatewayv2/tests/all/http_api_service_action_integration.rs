@@ -26,7 +26,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use quick_xml::events::Event;
-use quick_xml::Reader;
+use quick_xml::name::ResolveResult;
+use quick_xml::{NsReader, Reader};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -1668,5 +1669,322 @@ async fn a_queue_subtype_route_is_performed_as_the_role_its_credentials_arn_name
             1,
             "case {case:?}: expected the queue to be untouched"
         );
+    }
+}
+
+/// The namespace the QUERY interface of the queue api declares every document it answers in:
+/// `http://queue.amazonaws.com/doc/<version>/`, whose version is the api version that model
+/// states (`smithy_query(query="service_info")` on the Amazon SQS model: `2012-11-05`). A
+/// client of such an interface reads the envelope with a namespace-aware reader, so the binding
+/// is part of the answer and not decoration on it.
+const QUEUE_QUERY_NAMESPACE: &str = "http://queue.amazonaws.com/doc/2012-11-05/";
+
+/// The one route every row of the suite below carries, and the path its client posts to.
+const ACTION_ROUTE_KEY: &str = "POST /act";
+const ACTION_PATH: &str = "/act";
+
+/// Every element of the document the route answered: the PATH of local names leading to it from
+/// the document element, joined by `/`, the namespace the element itself RESOLVES into, and the
+/// character data it carries.
+///
+/// Read with `quick-xml`'s NAMESPACE-aware reader, which is how a client of a query interface
+/// reads one: a default namespace declared on the document element is in scope on every element
+/// under it, and that is what makes a path like `SendMessageResponse/SendMessageResult/MessageId`
+/// resolvable by a client asking for it in the serving interface's own namespace. A body that is
+/// not a well-formed document fails the case rather than reading as nothing.
+fn resolved_elements(case: &str, answered: &Value) -> Vec<(String, String, String)> {
+    let body = answered.as_str().unwrap_or_default().to_string();
+    let mut reader = NsReader::from_str(&body);
+    let mut open: Vec<String> = Vec::new();
+    let mut found: Vec<(String, String, String)> = Vec::new();
+    loop {
+        match reader.read_resolved_event() {
+            Ok((resolved, Event::Start(start) | Event::Empty(start))) => {
+                let namespace = match resolved {
+                    ResolveResult::Bound(uri) => String::from_utf8_lossy(uri.0).to_string(),
+                    _ => String::new(),
+                };
+                open.push(String::from_utf8_lossy(start.local_name().as_ref()).to_string());
+                found.push((open.join("/"), namespace, String::new()));
+            }
+            Ok((_, Event::Text(text))) => {
+                let decoded = text.xml10_content().unwrap_or_else(|error| {
+                    panic!("case {case:?}: the answer must decode: {error}")
+                });
+                let path = open.join("/");
+                if let Some(element) = found.last_mut() {
+                    if element.0 == path {
+                        element.2.push_str(&decoded);
+                    }
+                }
+            }
+            Ok((_, Event::End(_))) => {
+                open.pop();
+            }
+            Ok((_, Event::Eof)) => return found,
+            Ok(_) => {}
+            Err(error) => {
+                panic!("case {case:?}: expected a well-formed document, got {error} in {body:?}")
+            }
+        }
+    }
+}
+
+/// The character data of every element the document carries at `path`, in document order.
+fn at_path<'a>(elements: &'a [(String, String, String)], path: &str) -> Vec<&'a str> {
+    elements
+        .iter()
+        .filter(|(element, _namespace, _text)| element == path)
+        .map(|(_element, _namespace, text)| text.as_str())
+        .collect()
+}
+
+/// RULE: the answer a first-class subtype route relays is the SERVING interface's own document,
+/// read the way that interface's client reads it — for the queue api's query interface, the
+/// `{Action}Response` element declared in that interface's namespace, carrying the members the
+/// action's output declares under `{Action}Result` (and no result element for an action whose
+/// output declares none) beside the `ResponseMetadata` naming the request, every element of it
+/// in that same namespace — so the value a client asks for by its documented path, such as the
+/// id of the message a send just enqueued, is the value the owning service holds.
+#[tokio::test]
+async fn a_queue_subtype_route_answers_the_serving_interfaces_own_namespaced_document() {
+    /// One case: the action, the permission it needs, the queue it acts on, the mapping, the
+    /// request, and what a client must then be able to read off the answer.
+    struct Row {
+        case: &'static str,
+        subtype: &'static str,
+        permission: &'static str,
+        /// A FIFO queue, the one kind whose send is answered a `SequenceNumber`.
+        fifo: bool,
+        /// The messages already waiting on the queue when the route is invoked.
+        waiting: &'static [&'static str],
+        /// Whether the invoke carries the receipt handle of a message a consumer took off the
+        /// queue, which is the value a delete is mapped from.
+        carries_handle: bool,
+        parameters: fn(&str) -> Value,
+        body: &'static str,
+        /// Whether the answer has to carry a message, which is a condition a read is polled
+        /// for rather than a time waited.
+        answers_a_message: bool,
+        /// The paths a client reads a value at: each must resolve into the interface's
+        /// namespace and carry a value.
+        read_at: &'static [&'static str],
+        /// The paths the answer must carry NO element at.
+        absent: &'static [&'static str],
+        /// Whether the id under the result element is the id the consumer then reads off the
+        /// queue — what a client of a send correlates its send by.
+        correlates_the_queued_id: bool,
+    }
+    // Rows differ along the ACTION performed (each of the four first-class queue subtypes),
+    // along the kind of queue it acts on, and so along WHICH members the answer carries: a
+    // send answered an id, the same send answered a sequence too, a read answered a whole
+    // message, and the two actions whose output declares no member at all.
+    let rows: &[Row] = &[
+        Row {
+            case: "a send of a mapped body to a standard queue",
+            subtype: "SQS-SendMessage",
+            permission: SEND_MESSAGE_ACTION,
+            fifo: false,
+            waiting: &[],
+            carries_handle: false,
+            parameters: |url| json!({ "QueueUrl": url, "MessageBody": "$request.body.msg" }),
+            body: r#"{"msg":"a marker"}"#,
+            answers_a_message: false,
+            read_at: &[
+                "SendMessageResponse/SendMessageResult/MessageId",
+                "SendMessageResponse/SendMessageResult/MD5OfMessageBody",
+                "SendMessageResponse/ResponseMetadata/RequestId",
+            ],
+            // `SendMessageResult$SequenceNumber` "applies only to FIFO queues", so a standard
+            // queue's send carries none.
+            absent: &["SendMessageResponse/SendMessageResult/SequenceNumber"],
+            correlates_the_queued_id: true,
+        },
+        Row {
+            case: "a send of a mapped body to a FIFO queue",
+            subtype: "SQS-SendMessage",
+            permission: SEND_MESSAGE_ACTION,
+            fifo: true,
+            waiting: &[],
+            carries_handle: false,
+            parameters: |url| {
+                json!({
+                    "QueueUrl": url,
+                    "MessageBody": "$request.body.msg",
+                    "MessageGroupId": "orders",
+                    "MessageDeduplicationId": "$request.body.msg",
+                })
+            },
+            // The text is the deduplication id too, which "can only include alphanumeric and
+            // punctuation characters" (`SendMessage$MessageDeduplicationId`).
+            body: r#"{"msg":"a-sequenced-marker"}"#,
+            answers_a_message: false,
+            read_at: &[
+                "SendMessageResponse/SendMessageResult/MessageId",
+                "SendMessageResponse/SendMessageResult/SequenceNumber",
+                "SendMessageResponse/ResponseMetadata/RequestId",
+            ],
+            absent: &[],
+            correlates_the_queued_id: true,
+        },
+        Row {
+            case: "a read of a queue holding one message",
+            subtype: "SQS-ReceiveMessage",
+            permission: RECEIVE_MESSAGE_ACTION,
+            fifo: false,
+            waiting: &["a marker a consumer reads"],
+            carries_handle: false,
+            parameters: |url| json!({ "QueueUrl": url, "MaxNumberOfMessages": "10" }),
+            body: "",
+            answers_a_message: true,
+            read_at: &[
+                "ReceiveMessageResponse/ReceiveMessageResult/Message/MessageId",
+                "ReceiveMessageResponse/ReceiveMessageResult/Message/Body",
+                "ReceiveMessageResponse/ReceiveMessageResult/Message/ReceiptHandle",
+                "ReceiveMessageResponse/ResponseMetadata/RequestId",
+            ],
+            absent: &[],
+            correlates_the_queued_id: false,
+        },
+        Row {
+            case: "a delete by the handle a consumer holds",
+            subtype: "SQS-DeleteMessage",
+            permission: DELETE_MESSAGE_ACTION,
+            fifo: false,
+            waiting: &["to be deleted"],
+            carries_handle: true,
+            parameters: |url| {
+                json!({ "QueueUrl": url, "ReceiptHandle": "$request.header.x-receipt-handle" })
+            },
+            body: "",
+            answers_a_message: false,
+            read_at: &["DeleteMessageResponse/ResponseMetadata/RequestId"],
+            // `DeleteMessage` declares no output member, so that interface writes no result
+            // element for it.
+            absent: &["DeleteMessageResponse/DeleteMessageResult"],
+            correlates_the_queued_id: false,
+        },
+        Row {
+            case: "a purge of a queue holding several",
+            subtype: "SQS-PurgeQueue",
+            permission: PURGE_QUEUE_ACTION,
+            fifo: false,
+            waiting: &["one", "two"],
+            carries_handle: false,
+            parameters: |url| json!({ "QueueUrl": url }),
+            body: "",
+            answers_a_message: false,
+            read_at: &["PurgeQueueResponse/ResponseMetadata/RequestId"],
+            absent: &["PurgeQueueResponse/PurgeQueueResult"],
+            correlates_the_queued_id: false,
+        },
+    ];
+    for row in rows {
+        let case = row.case;
+        let emulator = Emulator::new();
+        let role = emulator.role(case, Some(grant(row.permission))).await;
+        let url = if row.fifo {
+            emulator.fifo_queue(case, "subject.fifo").await
+        } else {
+            emulator
+                .queue_without_a_visibility_window(case, "subject")
+                .await
+        };
+        for waiting in row.waiting {
+            emulator.sent(case, &url, waiting).await;
+        }
+        let handle = if row.carries_handle {
+            emulator.one_handle(case, &url).await
+        } else {
+            String::new()
+        };
+        let headers: Vec<(&str, &str)> = if row.carries_handle {
+            vec![("x-receipt-handle", handle.as_str())]
+        } else {
+            Vec::new()
+        };
+        let endpoint = emulator
+            .api(
+                case,
+                subtype_integration(row.subtype, Some(&role), (row.parameters)(&url)),
+                ACTION_ROUTE_KEY,
+            )
+            .await
+            .1;
+
+        let (status, media_type, answered) = if row.answers_a_message {
+            emulator
+                .invoke_until_a_message_is_answered(case, &endpoint, ACTION_PATH)
+                .await
+        } else {
+            emulator
+                .answered(&endpoint, ACTION_PATH, &headers, row.body)
+                .await
+        };
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the action's own answer, got {status} {answered}"
+        );
+        assert_eq!(
+            media_type, XML_MEDIA_TYPE,
+            "case {case:?}: expected {XML_MEDIA_TYPE:?}, got {media_type:?} for {answered}"
+        );
+
+        // The document element is the action's own response element, declared in the serving
+        // interface's namespace, and every element under it resolves into that namespace — so
+        // a namespace-aware client reader finds each of them.
+        let action = row
+            .subtype
+            .split_once('-')
+            .map(|(_service, action)| action)
+            .unwrap_or_default();
+        let elements = resolved_elements(case, &answered);
+        let (path, namespace, _text) = elements.first().cloned().unwrap_or_default();
+        let response_element = format!("{action}Response");
+        assert_eq!(
+            (path.as_str(), namespace.as_str()),
+            (response_element.as_str(), QUEUE_QUERY_NAMESPACE),
+            "case {case:?}: expected the action's own response element in the interface's \
+             namespace, got {answered}"
+        );
+        for (path, namespace, _text) in &elements {
+            assert_eq!(
+                namespace, QUEUE_QUERY_NAMESPACE,
+                "case {case:?}: expected {path:?} to resolve into the interface's namespace, \
+                 got {namespace:?} in {answered}"
+            );
+        }
+
+        // And each value a client reads is at the path that interface states it at.
+        for path in row.read_at {
+            let values = at_path(&elements, path);
+            assert!(
+                values.len() == 1 && !values[0].is_empty(),
+                "case {case:?}: expected one value at {path:?}, got {values:?} in {answered}"
+            );
+        }
+        for path in row.absent {
+            assert!(
+                at_path(&elements, path).is_empty(),
+                "case {case:?}: expected no element at {path:?} in {answered}"
+            );
+        }
+
+        if row.correlates_the_queued_id {
+            // The id the client read is the id the queue holds for the message its send
+            // enqueued: that correlation is what the relayed document is for.
+            let received = emulator.received(case, &url).await;
+            assert_eq!(
+                received.len(),
+                1,
+                "case {case:?}: expected the mapped message on the queue, got {received:?}"
+            );
+            assert_eq!(
+                at_path(&elements, &format!("{action}Response/{action}Result/MessageId")),
+                vec![received[0]["MessageId"].as_str().unwrap_or_default()],
+                "case {case:?}: expected the id the answer carries to be the id the consumer \
+                 reads, got {answered} against {received:?}"
+            );
+        }
     }
 }
