@@ -117,6 +117,13 @@ async fn fixture(router: &MultiServiceRouter, pool_name: &str) -> Fixture {
         &user_pool_id,
         "rotating",
         &json!({
+            // An app client that rotates its refresh tokens carries no
+            // `ALLOW_REFRESH_TOKEN_AUTH`: the rotation replaces that flow.
+            "ExplicitAuthFlows": [
+                "ALLOW_USER_PASSWORD_AUTH",
+                "ALLOW_ADMIN_USER_PASSWORD_AUTH",
+                "ALLOW_USER_AUTH",
+            ],
             "RefreshTokenRotation": { "Feature": "ENABLED", "RetryGracePeriodSeconds": 30 },
         }),
     )

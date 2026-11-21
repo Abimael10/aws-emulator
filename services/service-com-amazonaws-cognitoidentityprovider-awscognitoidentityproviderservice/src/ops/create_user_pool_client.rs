@@ -351,6 +351,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_parameter(message.to_string()));
         }
 
+        // An app client that ROTATES its refresh tokens does not also enable the
+        // legacy refresh-token sign-in: the rotation configuration describes the
+        // renewal that replaces it, so the two together describe an app client
+        // that cannot exist ([`crate::state::rotation_auth_flow_violation`]). The
+        // rule lives in `state.rs` so this path and the update path enforce the
+        // same one, and it is asked among the other parameter rules — before any
+        // app client is minted, so a refused create leaves the pool with none.
+        if let Some(message) = crate::state::rotation_auth_flow_violation(
+            input.explicit_auth_flows.as_deref(),
+            input.refresh_token_rotation.as_ref(),
+        ) {
+            return Err(invalid_parameter(message));
+        }
+
         // The machine-to-machine grant is the only OAuth flow an app client that
         // issues it may carry: a request combining it with a user-facing grant
         // describes an app client that cannot exist, which is a parameter

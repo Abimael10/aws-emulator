@@ -928,7 +928,9 @@ async fn every_token_minting_operation_applies_what_its_trigger_answered() {
         &json!({
             "UserPoolId": user_pool_id,
             "ClientName": "rotating-app",
-            "ExplicitAuthFlows": ["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+            // An app client that rotates its refresh tokens carries no
+            // `ALLOW_REFRESH_TOKEN_AUTH`: the rotation replaces that flow.
+            "ExplicitAuthFlows": ["ALLOW_USER_PASSWORD_AUTH"],
             "RefreshTokenRotation": { "Feature": "ENABLED", "RetryGracePeriodSeconds": 0 },
         }),
     )

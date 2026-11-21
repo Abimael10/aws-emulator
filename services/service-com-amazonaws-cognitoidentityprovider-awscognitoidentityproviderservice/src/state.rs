@@ -299,6 +299,62 @@ pub fn exclusive_auth_flow_violation(flows: &[String]) -> Option<&'static str> {
     (names_exclusive_flow && names_another_flow).then_some(EXCLUSIVE_AUTH_FLOW_MESSAGE)
 }
 
+/// Whether `rotation` configures an app client that ROTATES its refresh tokens.
+///
+/// `RefreshTokenRotationType.Feature` is "the state of refresh token rotation for
+/// the current app client" and `FeatureType` carries one value for a setting that
+/// is switched on ([`FEATURE_ENABLED`], this service's model), so a configuration
+/// naming the other value — and a request or an app client carrying no rotation
+/// configuration at all — rotates nothing. The one reading of that question: the
+/// configuration rules below and the renewal path that consumes a rotated token
+/// ([`UserPoolClient::refresh_token_rotation_grace`]) both ask it here, so they
+/// cannot disagree about which app clients rotate.
+pub fn rotation_is_enabled(rotation: Option<&RefreshTokenRotationType>) -> bool {
+    rotation.is_some_and(|rotation| rotation.feature == FEATURE_ENABLED)
+}
+
+/// The message an app-client configuration owes when it switches refresh token
+/// rotation on while naming `flow`, the `ExplicitAuthFlows` value that enables the
+/// legacy refresh-token sign-in ([`REFRESH_TOKEN_AUTH_FLOWS`]).
+///
+/// One sentence whose only variable part is the flow NAME the request asked for, so
+/// the refusal states the value the caller has to drop and nothing else about the
+/// app client, the pool or the rotation settings.
+pub fn rotation_auth_flow_message(flow: &str) -> String {
+    format!(
+        "{flow} is not a permitted ExplicitAuthFlow when refresh token rotation is enabled."
+    )
+}
+
+/// [`rotation_auth_flow_message`] for a write whose `ExplicitAuthFlows` name the
+/// legacy refresh-token sign-in while its `RefreshTokenRotation` switches rotation
+/// on, and `None` for every configuration this service accepts.
+///
+/// Refresh token rotation replaces that legacy flow: "when enabled, your app client
+/// issues new ID, access, and refresh tokens when users renew their sessions with
+/// refresh tokens" (`RefreshTokenRotationType` in this service's model), and the
+/// renewal it describes is `GetTokensFromRefreshToken` rather than the
+/// `REFRESH_TOKEN_AUTH` sign-in `ALLOW_REFRESH_TOKEN_AUTH` enables — so the two
+/// together describe an app client that cannot exist, while either alone is a
+/// configuration an app client holds.
+///
+/// Asked of the members the REQUEST carries: the refusal names a flow the caller
+/// submitted, and a request that names no flows at all asks for none of them. Both
+/// the create and the update path ask this one function, so the two cannot disagree
+/// about what an app client may hold.
+pub fn rotation_auth_flow_violation(
+    flows: Option<&[String]>,
+    rotation: Option<&RefreshTokenRotationType>,
+) -> Option<String> {
+    if !rotation_is_enabled(rotation) {
+        return None;
+    }
+    flows?
+        .iter()
+        .find(|flow| REFRESH_TOKEN_AUTH_FLOWS.contains(&flow.as_str()))
+        .map(|flow| rotation_auth_flow_message(flow))
+}
+
 /// The message the ADMINISTRATIVE sign-in refuses with when the app client's
 /// stored `ExplicitAuthFlows` do not enable the requested flow.
 ///

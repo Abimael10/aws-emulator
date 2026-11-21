@@ -752,7 +752,7 @@ impl UserPoolClient {
     /// refused a negative value before any handler reads one.
     pub fn refresh_token_rotation_grace(&self) -> Option<Duration> {
         let rotation = self.refresh_token_rotation.as_ref()?;
-        if rotation.feature != FEATURE_ENABLED {
+        if !rotation_is_enabled(Some(rotation)) {
             return None;
         }
         let seconds = rotation

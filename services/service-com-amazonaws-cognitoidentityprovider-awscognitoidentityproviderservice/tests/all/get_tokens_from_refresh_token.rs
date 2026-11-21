@@ -198,10 +198,20 @@ async fn pool_with_client(
     let mut client_body = Map::new();
     client_body.insert("UserPoolId".to_string(), json!(user_pool_id));
     client_body.insert("ClientName".to_string(), json!("refresh-client"));
-    client_body.insert(
-        "ExplicitAuthFlows".to_string(),
-        json!(["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"]),
-    );
+    // An app client that ROTATES its refresh tokens carries no
+    // `ALLOW_REFRESH_TOKEN_AUTH`: the rotation replaces that legacy flow, and a
+    // create naming both is refused. Every other client of this suite keeps it.
+    let rotates = setup
+        .rotation
+        .as_ref()
+        .and_then(|rotation| rotation.get("Feature"))
+        .and_then(Value::as_str)
+        == Some("ENABLED");
+    let mut flows = vec!["ALLOW_USER_PASSWORD_AUTH"];
+    if !rotates {
+        flows.push("ALLOW_REFRESH_TOKEN_AUTH");
+    }
+    client_body.insert("ExplicitAuthFlows".to_string(), json!(flows));
     if let Some(rotation) = setup.rotation.clone() {
         client_body.insert("RefreshTokenRotation".to_string(), rotation);
     }
