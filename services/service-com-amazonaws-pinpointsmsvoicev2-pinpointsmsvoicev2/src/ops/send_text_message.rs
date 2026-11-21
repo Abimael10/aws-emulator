@@ -271,20 +271,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // A named protect configuration must exist. This emulator holds none (protect
-        // configurations are a later slice), so any id names a resource that is absent.
-        if let Some(protect_configuration_id) = input.protect_configuration_id {
-            return Err(SendTextMessageErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::resource_not_found_message(
-                        "protect-configuration",
-                        &protect_configuration_id,
-                    )),
-                    resource_type: Some("protect-configuration".to_string()),
-                    resource_id: Some(protect_configuration_id),
-                },
-            )
-            .into());
+        // A named protect configuration must name one this account holds; the member is a
+        // `ProtectConfigurationIdOrArn`, so either form names the stored record.
+        if let Some(named) = input.protect_configuration_id.as_deref() {
+            let id = crate::state::name_from_name_or_arn(named);
+            if !state.protect_configurations.contains_key(id) {
+                return Err(SendTextMessageErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::resource_not_found_message(
+                            "protect-configuration",
+                            id,
+                        )),
+                        resource_type: Some("protect-configuration".to_string()),
+                        resource_id: Some(id.to_string()),
+                    },
+                )
+                .into());
+            }
         }
 
         // The message type defaults to the one the number was leased for.

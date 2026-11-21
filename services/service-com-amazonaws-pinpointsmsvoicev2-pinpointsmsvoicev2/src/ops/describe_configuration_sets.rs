@@ -277,8 +277,9 @@ fn configuration_set_information(
         default_sender_id: record.default_sender_id.clone(),
         default_message_feedback_enabled: Some(record.default_message_feedback_enabled),
         created_timestamp: crate::state::to_timestamp(record.created_timestamp),
-        // No implemented operation associates a protect configuration with a set, so no
-        // stored record carries one to report.
-        protect_configuration_id: None,
+        // The protect configuration `AssociateProtectConfiguration` recorded on this set,
+        // which `DisassociateProtectConfiguration` clears. The member is modelled
+        // optional because it is present only while the set is associated with one.
+        protect_configuration_id: record.protect_configuration_id.clone(),
     }
 }

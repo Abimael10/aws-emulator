@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateProtectConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateProtectConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateProtectConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: records the link between a stored protect configuration and a stored
+//! configuration set on the set itself (see [`crate::state::ConfigurationSet`]), so every
+//! later read of that set reports it, and answers from the record just written.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +159,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateProtectConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateProtectConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateProtectConfiguration"))
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                AssociateProtectConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the configuration-set store is unavailable".to_string(),
+                        ),
+                        request_id: None,
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = store.lock();
+
+        // Both members are `…OrArn`, so either form names its resource; both stores are
+        // keyed by the bare name/id.
+        let set_name = crate::state::name_from_name_or_arn(&input.configuration_set_name);
+        let protect_configuration_id =
+            crate::state::name_from_name_or_arn(&input.protect_configuration_id);
+
+        // A link is recorded only between two resources this account holds, so neither
+        // end of it can name something that does not exist. The protect configuration is
+        // resolved first, and only its STORED identity is reported back, whichever form
+        // the request named it in.
+        let Some(protect_configuration) = state.protect_configurations.get(protect_configuration_id)
+        else {
+            return Err(
+                AssociateProtectConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::resource_not_found_message(
+                            "protect-configuration",
+                            protect_configuration_id,
+                        )),
+                        resource_type: Some("protect-configuration".to_string()),
+                        resource_id: Some(protect_configuration_id.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let protect_configuration_arn = protect_configuration.arn.clone();
+        let stored_id = protect_configuration.id.clone();
+
+        let Some(record) = state.configuration_sets.get_mut(set_name) else {
+            return Err(
+                AssociateProtectConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::resource_not_found_message(
+                            "configuration-set",
+                            set_name,
+                        )),
+                        resource_type: Some("configuration-set".to_string()),
+                        resource_id: Some(set_name.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The whole point of the operation: the link has to OUTLIVE this request, so every
+        // later read of the set reports it. A set holds at most one protect configuration,
+        // so this REPLACES the one it held, as the operation documents.
+        record.protect_configuration_id = Some(stored_id.clone());
+
+        // Read the response back out of the records the link was written between.
+        Ok(AssociateProtectConfigurationOutput {
+            configuration_set_arn: record.arn.clone(),
+            configuration_set_name: record.name.clone(),
+            protect_configuration_arn,
+            protect_configuration_id: stored_id,
+        })
     }
 }

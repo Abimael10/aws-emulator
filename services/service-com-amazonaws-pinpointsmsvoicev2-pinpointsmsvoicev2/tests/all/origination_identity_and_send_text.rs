@@ -25,7 +25,10 @@
 //!   destination removes exactly that one and a delete of the set takes them all;
 //! * `CreateProtectConfiguration` mints and persists a configuration whose every
 //!   reported member comes from the stored record, and `DescribeProtectConfigurations`
-//!   reports it back, narrowed by id, by filter and by page.
+//!   reports it back, narrowed by id, by filter and by page;
+//! * the protect configuration `AssociateProtectConfiguration` links to a configuration
+//!   set is persisted on that set, so every later read of the set reports it and narrows
+//!   on it, until `DisassociateProtectConfiguration` clears it.
 
 use std::sync::Arc;
 
@@ -2126,8 +2129,8 @@ async fn describe_configuration_sets_narrows_on_every_modelled_filter_name() {
 
     // One row per `ConfigurationSetFilterName` the model declares: the value under test
     // and the sets it is expected to select, in key order. `event-destination-name`,
-    // `matching-event-types` and `protect-configuration-id` select nothing, because no
-    // stored set carries an event destination or a protect configuration, and a record
+    // `matching-event-types` and `protect-configuration-id` select nothing, because none
+    // of these sets carries an event destination or a protect configuration, and a record
     // with no value for an attribute matches no filter value.
     let cases: Vec<(&str, String, Vec<&str>)> = vec![
         (
@@ -3505,4 +3508,652 @@ async fn describe_protect_configurations_narrows_by_filter_id_and_page() {
             "case {forged:?}: a forged NextToken must be refused, got {status} with {body}"
         );
     }
+}
+
+/// The `ConflictExceptionReason` a disassociate of a protect configuration the set is not
+/// associated with carries, from the model's `ConflictExceptionReason` enum.
+const NOT_ASSOCIATED_REASON: &str = "PROTECT_CONFIGURATION_NOT_ASSOCIATED_WITH_CONFIGURATION_SET";
+
+/// The `ProtectConfigurationId` the one entry a `DescribeConfigurationSets` for exactly
+/// one set reports, or `None` when that entry carries no such member.
+async fn described_protect_configuration(emulator: &Emulator, set: &str) -> Option<String> {
+    let described = emulator
+        .ok(
+            "DescribeConfigurationSets",
+            serde_json::json!({"ConfigurationSetNames": [set]}),
+        )
+        .await;
+    let entries = described
+        .get("ConfigurationSets")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("expected a ConfigurationSets list in {described}"));
+    assert_eq!(
+        entries.len(),
+        1,
+        "case {set:?}: a describe of one name reports one set, got {described}"
+    );
+    entries[0]
+        .get("ProtectConfigurationId")
+        .map(|value| match value.as_str() {
+            Some(id) => id.to_string(),
+            None => panic!("case {set:?}: ProtectConfigurationId must be a string, got {described}"),
+        })
+}
+
+/// Every stored set as `(ConfigurationSetName, its ProtectConfigurationId or None)`, in
+/// the order the whole-account describe reports them.
+async fn described_associations(emulator: &Emulator) -> Vec<(String, Option<String>)> {
+    let described = emulator
+        .ok("DescribeConfigurationSets", serde_json::json!({}))
+        .await;
+    described
+        .get("ConfigurationSets")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("expected a ConfigurationSets list in {described}"))
+        .iter()
+        .map(|entry| {
+            (
+                as_str(entry, "ConfigurationSetName"),
+                entry
+                    .get("ProtectConfigurationId")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            )
+        })
+        .collect()
+}
+
+/// One row of the association table: which stored set and which stored protect
+/// configuration are linked, and in which of the two forms each end is named.
+///
+/// `ConfigurationSetName` is a `ConfigurationSetNameOrArn` and `ProtectConfigurationId` a
+/// `ProtectConfigurationIdOrArn` on both `AssociateProtectConfiguration` and
+/// `DisassociateProtectConfiguration`, so the four combinations of forms are what the
+/// rule generalises over.
+struct AssociationCase {
+    case: &'static str,
+    set: usize,
+    protect: usize,
+    set_by_arn: bool,
+    protect_by_arn: bool,
+}
+
+/// The `ConfigurationSetName` / `ProtectConfigurationId` members one row's request
+/// carries: a bare name/id, or the ARN of the same resource.
+fn association_request(
+    case: &AssociationCase,
+    sets: &[String],
+    protects: &[String],
+) -> serde_json::Value {
+    let set = if case.set_by_arn {
+        configuration_set_arn(&sets[case.set])
+    } else {
+        sets[case.set].clone()
+    };
+    let protect = if case.protect_by_arn {
+        protect_configuration_arn(&protects[case.protect])
+    } else {
+        protects[case.protect].clone()
+    };
+    serde_json::json!({"ConfigurationSetName": set, "ProtectConfigurationId": protect})
+}
+
+/// The same row with each end named in the OTHER form, so the removal of a link is driven
+/// through identifiers the association was not made with.
+fn flipped(case: &AssociationCase) -> AssociationCase {
+    AssociationCase {
+        case: case.case,
+        set: case.set,
+        protect: case.protect,
+        set_by_arn: !case.set_by_arn,
+        protect_by_arn: !case.protect_by_arn,
+    }
+}
+
+/// Create `count` configuration sets named `<prefix>-<n>` and answer their names.
+async fn create_sets(emulator: &Emulator, prefix: &str, count: usize) -> Vec<String> {
+    let mut names = Vec::with_capacity(count);
+    for index in 0..count {
+        let name = format!("{prefix}-{index}");
+        emulator
+            .ok(
+                "CreateConfigurationSet",
+                serde_json::json!({"ConfigurationSetName": name}),
+            )
+            .await;
+        names.push(name);
+    }
+    names
+}
+
+/// Create `count` protect configurations and answer their minted ids.
+async fn create_protect_configurations(emulator: &Emulator, count: usize) -> Vec<String> {
+    let mut ids = Vec::with_capacity(count);
+    for index in 0..count {
+        let created = emulator
+            .ok(
+                "CreateProtectConfiguration",
+                protect_configuration_request(None, &[("Name", &format!("guard-{index}"))]),
+            )
+            .await;
+        ids.push(as_str(&created, "ProtectConfigurationId"));
+    }
+    ids
+}
+
+#[tokio::test]
+async fn an_associated_protect_configuration_is_reported_by_every_later_read_of_the_set() {
+    let emulator = Emulator::new();
+    let sets = create_sets(&emulator, "guarded", 4).await;
+    let protects = create_protect_configurations(&emulator, 2).await;
+
+    // One row per combination of the two identifier forms each end of the link accepts,
+    // spread over four sets and two protect configurations, so no row's outcome depends
+    // on another's.
+    let cases = vec![
+        AssociationCase {
+            case: "set by name, protect configuration by id",
+            set: 0,
+            protect: 0,
+            set_by_arn: false,
+            protect_by_arn: false,
+        },
+        AssociationCase {
+            case: "set by ARN, protect configuration by id",
+            set: 1,
+            protect: 1,
+            set_by_arn: true,
+            protect_by_arn: false,
+        },
+        AssociationCase {
+            case: "set by name, protect configuration by ARN",
+            set: 2,
+            protect: 0,
+            set_by_arn: false,
+            protect_by_arn: true,
+        },
+        AssociationCase {
+            case: "set by ARN, protect configuration by ARN",
+            set: 3,
+            protect: 1,
+            set_by_arn: true,
+            protect_by_arn: true,
+        },
+    ];
+
+    for case in &cases {
+        let set = &sets[case.set];
+        let protect = &protects[case.protect];
+        let associated = emulator
+            .ok(
+                "AssociateProtectConfiguration",
+                association_request(case, &sets, &protects),
+            )
+            .await;
+        // Whatever form the request named them in, the response reports each resource by
+        // its own stored identity.
+        assert_eq!(
+            (
+                as_str(&associated, "ConfigurationSetName"),
+                as_str(&associated, "ConfigurationSetArn"),
+                as_str(&associated, "ProtectConfigurationId"),
+                as_str(&associated, "ProtectConfigurationArn"),
+            ),
+            (
+                set.clone(),
+                configuration_set_arn(set),
+                protect.clone(),
+                protect_configuration_arn(protect),
+            ),
+            "case {:?}: expected the stored identity of both resources, got {associated}",
+            case.case
+        );
+        // The point of the operation: the link outlives the request.
+        assert_eq!(
+            described_protect_configuration(&emulator, set).await,
+            Some(protect.clone()),
+            "case {:?}: the set must report the protect configuration it was associated with",
+            case.case
+        );
+    }
+
+    // Every set reports its OWN link, and a protect configuration may be associated with
+    // more than one set (both rows above that name `protects[0]` stand).
+    let mut expected: Vec<(String, Option<String>)> = cases
+        .iter()
+        .map(|case| (sets[case.set].clone(), Some(protects[case.protect].clone())))
+        .collect();
+    expected.sort();
+    assert_eq!(
+        described_associations(&emulator).await,
+        expected,
+        "every stored set must report the protect configuration associated with it"
+    );
+
+    // And the member disappears again on disassociate — driven through the OTHER
+    // identifier form, so the removal does not depend on how the link was made.
+    for case in &cases {
+        let set = &sets[case.set];
+        let protect = &protects[case.protect];
+        let disassociated = emulator
+            .ok(
+                "DisassociateProtectConfiguration",
+                association_request(&flipped(case), &sets, &protects),
+            )
+            .await;
+        assert_eq!(
+            (
+                as_str(&disassociated, "ConfigurationSetName"),
+                as_str(&disassociated, "ConfigurationSetArn"),
+                as_str(&disassociated, "ProtectConfigurationId"),
+                as_str(&disassociated, "ProtectConfigurationArn"),
+            ),
+            (
+                set.clone(),
+                configuration_set_arn(set),
+                protect.clone(),
+                protect_configuration_arn(protect),
+            ),
+            "case {:?}: expected the stored identity of both resources, got {disassociated}",
+            case.case
+        );
+        assert_eq!(
+            described_protect_configuration(&emulator, set).await,
+            None,
+            "case {:?}: a disassociated set must report no protect configuration",
+            case.case
+        );
+    }
+    assert_eq!(
+        described_associations(&emulator).await,
+        sets.iter()
+            .map(|set| (set.clone(), None))
+            .collect::<Vec<(String, Option<String>)>>(),
+        "no set may report a protect configuration once every link is removed"
+    );
+}
+
+#[tokio::test]
+async fn associating_a_second_protect_configuration_replaces_the_sets_current_one() {
+    let emulator = Emulator::new();
+    let sets = create_sets(&emulator, "replaced", 2).await;
+    let protects = create_protect_configurations(&emulator, 3).await;
+
+    // `AssociateProtectConfiguration` documents that a set can only be associated with
+    // one protect configuration at a time and that associating replaces its current one,
+    // so each row names the id the set reports after the associate it describes.
+    let rows: Vec<(usize, usize, &str)> = vec![
+        (0, 0, "the first association"),
+        (0, 1, "a second protect configuration replaces the first"),
+        (0, 1, "the same one again leaves the set where it was"),
+        (0, 2, "a third replaces the second"),
+    ];
+    for (set, protect, case) in rows {
+        emulator
+            .ok(
+                "AssociateProtectConfiguration",
+                serde_json::json!({
+                    "ConfigurationSetName": sets[set],
+                    "ProtectConfigurationId": protects[protect],
+                }),
+            )
+            .await;
+        assert_eq!(
+            described_protect_configuration(&emulator, &sets[set]).await,
+            Some(protects[protect].clone()),
+            "case {case:?}: the set must report exactly the protect configuration last \
+             associated with it"
+        );
+    }
+
+    // One protect configuration, several sets: associating it with a second set leaves the
+    // first one's link alone.
+    emulator
+        .ok(
+            "AssociateProtectConfiguration",
+            serde_json::json!({
+                "ConfigurationSetName": sets[1],
+                "ProtectConfigurationId": protects[2],
+            }),
+        )
+        .await;
+    assert_eq!(
+        described_associations(&emulator).await,
+        vec![
+            (sets[0].clone(), Some(protects[2].clone())),
+            (sets[1].clone(), Some(protects[2].clone())),
+        ],
+        "a protect configuration may be associated with more than one configuration set"
+    );
+
+    // Removing one of the two links removes only that one.
+    emulator
+        .ok(
+            "DisassociateProtectConfiguration",
+            serde_json::json!({
+                "ConfigurationSetName": sets[0],
+                "ProtectConfigurationId": protects[2],
+            }),
+        )
+        .await;
+    assert_eq!(
+        described_associations(&emulator).await,
+        vec![
+            (sets[0].clone(), None),
+            (sets[1].clone(), Some(protects[2].clone())),
+        ],
+        "a disassociate must clear the link on the set it names and no other"
+    );
+}
+
+#[tokio::test]
+async fn describe_configuration_sets_narrows_by_the_protect_configuration_id_it_reports() {
+    let emulator = Emulator::new();
+    let sets = create_sets(&emulator, "filtered", 3).await;
+    let protects = create_protect_configurations(&emulator, 2).await;
+    for (set, protect) in [(0usize, 0usize), (1, 1)] {
+        emulator
+            .ok(
+                "AssociateProtectConfiguration",
+                serde_json::json!({
+                    "ConfigurationSetName": sets[set],
+                    "ProtectConfigurationId": protects[protect],
+                }),
+            )
+            .await;
+    }
+
+    // The `protect-configuration-id` filter selects on the value the describe reports, so
+    // one row per shape of that selection: each stored id, both at once (OR within one
+    // filter), and an id no set carries. The third set carries no value for the attribute,
+    // so no filter value selects it.
+    let cases: Vec<(&str, Vec<String>, Vec<String>)> = vec![
+        (
+            "the first association",
+            vec![protects[0].clone()],
+            vec![sets[0].clone()],
+        ),
+        (
+            "the second association",
+            vec![protects[1].clone()],
+            vec![sets[1].clone()],
+        ),
+        (
+            "either association",
+            vec![protects[0].clone(), protects[1].clone()],
+            vec![sets[0].clone(), sets[1].clone()],
+        ),
+        (
+            "an id no set is associated with",
+            vec!["protect-configuration-00000000".to_string()],
+            vec![],
+        ),
+    ];
+    for (case, values, expected) in &cases {
+        let described = emulator
+            .ok(
+                "DescribeConfigurationSets",
+                serde_json::json!({
+                    "Filters": [{"Name": "protect-configuration-id", "Values": values}],
+                }),
+            )
+            .await;
+        assert_eq!(
+            &described_set_names(&described),
+            expected,
+            "case {case:?}: expected the sets associated with {values:?}, got {described}"
+        );
+    }
+
+    // The filter AND-s with another one, and stops selecting a set once its link is gone.
+    emulator
+        .ok(
+            "DisassociateProtectConfiguration",
+            serde_json::json!({
+                "ConfigurationSetName": sets[0],
+                "ProtectConfigurationId": protects[0],
+            }),
+        )
+        .await;
+    let after = emulator
+        .ok(
+            "DescribeConfigurationSets",
+            serde_json::json!({
+                "Filters": [{"Name": "protect-configuration-id", "Values": [protects[0]]}],
+            }),
+        )
+        .await;
+    assert_eq!(
+        described_set_names(&after),
+        Vec::<String>::new(),
+        "case \"after a disassociate\": no set may be selected by a link that was removed, \
+         got {after}"
+    );
+    let both = emulator
+        .ok(
+            "DescribeConfigurationSets",
+            serde_json::json!({
+                "Filters": [
+                    {"Name": "protect-configuration-id", "Values": [protects[1]]},
+                    {"Name": "default-message-feedback-enabled", "Values": ["false"]},
+                ],
+            }),
+        )
+        .await;
+    assert_eq!(
+        described_set_names(&both),
+        vec![sets[1].clone()],
+        "case \"AND across filters\": expected the associated set that also matches, got {both}"
+    );
+}
+
+/// One row of the refusal table: the operation, the request and the modelled failure it
+/// must answer with.
+struct AssociationRefusal {
+    case: &'static str,
+    operation: &'static str,
+    request: serde_json::Value,
+    code: &'static str,
+    message: String,
+}
+
+#[tokio::test]
+async fn the_protect_configuration_association_refuses_what_it_cannot_record() {
+    let emulator = Emulator::new();
+    let sets = create_sets(&emulator, "refusing", 2).await;
+    let protects = create_protect_configurations(&emulator, 2).await;
+    // `sets[0]` is associated with `protects[0]`; `sets[1]` with nothing.
+    emulator
+        .ok(
+            "AssociateProtectConfiguration",
+            serde_json::json!({
+                "ConfigurationSetName": sets[0],
+                "ProtectConfigurationId": protects[0],
+            }),
+        )
+        .await;
+
+    // One row per end of the link that can name nothing, for both operations, plus the two
+    // states in which a set is not associated with the protect configuration named.
+    let cases = vec![
+        AssociationRefusal {
+            case: "associating with a set that does not exist",
+            operation: "AssociateProtectConfiguration",
+            request: serde_json::json!({
+                "ConfigurationSetName": "absent-set",
+                "ProtectConfigurationId": protects[0],
+            }),
+            code: "ResourceNotFoundException",
+            message: not_found_text("configuration-set", "absent-set"),
+        },
+        AssociationRefusal {
+            case: "associating a protect configuration that does not exist",
+            operation: "AssociateProtectConfiguration",
+            request: serde_json::json!({
+                "ConfigurationSetName": sets[0],
+                "ProtectConfigurationId": "protect-configuration-00000000",
+            }),
+            code: "ResourceNotFoundException",
+            message: not_found_text("protect-configuration", "protect-configuration-00000000"),
+        },
+        AssociationRefusal {
+            case: "disassociating from a set that does not exist",
+            operation: "DisassociateProtectConfiguration",
+            request: serde_json::json!({
+                "ConfigurationSetName": "absent-set",
+                "ProtectConfigurationId": protects[0],
+            }),
+            code: "ResourceNotFoundException",
+            message: not_found_text("configuration-set", "absent-set"),
+        },
+        AssociationRefusal {
+            case: "disassociating a protect configuration that does not exist",
+            operation: "DisassociateProtectConfiguration",
+            request: serde_json::json!({
+                "ConfigurationSetName": sets[0],
+                "ProtectConfigurationId": "protect-configuration-00000000",
+            }),
+            code: "ResourceNotFoundException",
+            message: not_found_text("protect-configuration", "protect-configuration-00000000"),
+        },
+        AssociationRefusal {
+            case: "disassociating one the set is not associated with",
+            operation: "DisassociateProtectConfiguration",
+            request: serde_json::json!({
+                "ConfigurationSetName": sets[0],
+                "ProtectConfigurationId": protects[1],
+            }),
+            code: "ConflictException",
+            message: conflict_text(NOT_ASSOCIATED_REASON, "protect-configuration", &protects[1]),
+        },
+        AssociationRefusal {
+            case: "disassociating from a set associated with nothing",
+            operation: "DisassociateProtectConfiguration",
+            request: serde_json::json!({
+                "ConfigurationSetName": sets[1],
+                "ProtectConfigurationId": protects[0],
+            }),
+            code: "ConflictException",
+            message: conflict_text(NOT_ASSOCIATED_REASON, "protect-configuration", &protects[0]),
+        },
+    ];
+
+    for AssociationRefusal {
+        case,
+        operation,
+        request,
+        code,
+        message,
+    } in cases
+    {
+        let (status, body) = emulator.call(operation, request).await;
+        assert_eq!(
+            (status, error_code(&body), as_str(&body, "Message")),
+            (400, code.to_string(), message),
+            "case {case:?}: expected the modelled refusal, got {status} with {body}"
+        );
+    }
+
+    // A refused request changed nothing, and the second disassociate of one link is itself
+    // refused rather than reported as a removal.
+    assert_eq!(
+        described_associations(&emulator).await,
+        vec![
+            (sets[0].clone(), Some(protects[0].clone())),
+            (sets[1].clone(), None),
+        ],
+        "a refused association must leave every stored link where it was"
+    );
+    emulator
+        .ok(
+            "DisassociateProtectConfiguration",
+            serde_json::json!({
+                "ConfigurationSetName": sets[0],
+                "ProtectConfigurationId": protects[0],
+            }),
+        )
+        .await;
+    let (status, body) = emulator
+        .call(
+            "DisassociateProtectConfiguration",
+            serde_json::json!({
+                "ConfigurationSetName": sets[0],
+                "ProtectConfigurationId": protects[0],
+            }),
+        )
+        .await;
+    assert_eq!(
+        (status, error_code(&body), as_str(&body, "Message")),
+        (
+            400,
+            "ConflictException".to_string(),
+            conflict_text(NOT_ASSOCIATED_REASON, "protect-configuration", &protects[0]),
+        ),
+        "case \"a repeated disassociate\": the link is gone, so the second call conflicts, \
+         got {status} with {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_send_resolves_a_named_protect_configuration_against_the_store() {
+    let emulator = Emulator::new();
+    let leased = request_number(
+        &emulator,
+        number_request(
+            "US",
+            MESSAGE_TYPE_VALUES[0],
+            NUMBER_CAPABILITY_VALUES[0],
+            REQUESTABLE_NUMBER_TYPE_VALUES[0],
+        ),
+    )
+    .await;
+    let protects = create_protect_configurations(&emulator, 1).await;
+
+    // `SendTextMessage$ProtectConfigurationId` is a `ProtectConfigurationIdOrArn`, so
+    // either form of a stored configuration's identity names it; an id no configuration
+    // carries is the resource that is absent.
+    let accepted = [
+        ("by id", protects[0].clone()),
+        ("by ARN", protect_configuration_arn(&protects[0])),
+    ];
+    for (case, identifier) in accepted {
+        let sent = emulator
+            .ok(
+                "SendTextMessage",
+                serde_json::json!({
+                    "DestinationPhoneNumber": "+14255550123",
+                    "OriginationIdentity": leased,
+                    "MessageBody": "hello",
+                    "ProtectConfigurationId": identifier,
+                }),
+            )
+            .await;
+        assert!(
+            !as_str(&sent, "MessageId").is_empty(),
+            "case {case:?}: a send through a stored protect configuration must be accepted, \
+             got {sent}"
+        );
+    }
+
+    let (status, body) = emulator
+        .call(
+            "SendTextMessage",
+            serde_json::json!({
+                "DestinationPhoneNumber": "+14255550123",
+                "OriginationIdentity": leased,
+                "MessageBody": "hello",
+                "ProtectConfigurationId": "protect-configuration-00000000",
+            }),
+        )
+        .await;
+    assert_eq!(
+        (status, error_code(&body), as_str(&body, "Message")),
+        (
+            400,
+            "ResourceNotFoundException".to_string(),
+            not_found_text("protect-configuration", "protect-configuration-00000000"),
+        ),
+        "case \"an id no protect configuration carries\": expected the modelled refusal, \
+         got {status} with {body}"
+    );
 }

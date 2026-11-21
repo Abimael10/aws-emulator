@@ -259,6 +259,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             default_sender_id: None,
             default_message_feedback_enabled: false,
             event_destinations: Vec::new(),
+            // A fresh set is associated with no protect configuration: only
+            // `AssociateProtectConfiguration` records that link.
+            protect_configuration_id: None,
         };
         state.configuration_sets.insert(name.clone(), record);
         if let Some(token) = input.client_token.as_deref() {

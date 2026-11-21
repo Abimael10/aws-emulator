@@ -265,6 +265,18 @@ pub struct ConfigurationSet {
     pub default_sender_id: Option<String>,
     pub default_message_feedback_enabled: bool,
     pub event_destinations: Vec<EventDestination>,
+    /// The `ProtectConfigurationId` of the protect configuration associated with this
+    /// set, while one is associated, and `None` while none is — which is why every
+    /// read of a set reports the member only some of the time.
+    ///
+    /// One id rather than a list: `AssociateProtectConfiguration` documents that a
+    /// configuration set can only be associated with one protect configuration at a
+    /// time and that associating replaces the set's current one, so the link is a single
+    /// optional id held on the set that owns it. The id is a key into
+    /// [`Self::protect_configurations`](ComAmazonawsPinpointsmsvoicev2Pinpointsmsvoicev2State::protect_configurations),
+    /// so the associated configuration's ARN is read from that record rather than stored
+    /// twice.
+    pub protect_configuration_id: Option<String>,
 }
 
 impl ConfigurationSet {
@@ -313,11 +325,13 @@ impl ConfigurationSet {
             "default-message-feedback-enabled" => {
                 Some(vec![self.default_message_feedback_enabled.to_string()])
             }
-            // Modelled, but no implemented operation associates a protect configuration
-            // with a configuration set, so no stored record carries one and this filter
-            // matches nothing. Named explicitly to keep "modelled but unstored" apart
-            // from the catch-all, which a name outside the modelled enum would reach.
-            "protect-configuration-id" => None,
+            // The association `AssociateProtectConfiguration` recorded and
+            // `DisassociateProtectConfiguration` clears. A set with no protect
+            // configuration carries no value for this attribute, so no filter value
+            // selects it.
+            "protect-configuration-id" => {
+                self.protect_configuration_id.clone().map(|id| vec![id])
+            }
             _ => None,
         }
     }
