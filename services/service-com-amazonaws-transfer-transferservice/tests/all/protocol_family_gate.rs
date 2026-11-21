@@ -63,7 +63,11 @@ const API_GATEWAY_IDP: &str = "https://abcdef0123.execute-api.us-east-1.amazonaw
 /// `IdentityProviderType` taken from the request (or, where the request states none, the
 /// value the model documents as that member's default — both read from the crate under
 /// test rather than copied).
-fn family_gate_message(identity_provider_type: &str) -> String {
+///
+/// The one place this crate states that sentence: `refusal_message_rules.rs` reads it
+/// from here too, where the family gate is one of the three server-configuration defects
+/// whose sentences have to differ.
+pub(crate) fn family_gate_message(identity_provider_type: &str) -> String {
     format!(
         "{} and {} protocols unsupported for IdentityProviderType {identity_provider_type}",
         st::PROTOCOL_FTP, st::PROTOCOL_FTPS

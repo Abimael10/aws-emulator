@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Seven of this service's refusal `Message` RULES, each asserted over a TABLE
+//! Eight of this service's refusal `Message` RULES, each asserted over a TABLE
 //! whose rows differ along what the rule generalises over. The sibling suite
 //! `error_message_rules.rs` pins the duplicate, not-found, state-conflict and
-//! `ValidationException` families; these seven are the ones it does not cover.
+//! `ValidationException` families; these eight are the ones it does not cover.
 //!
 //! Every one of them is the same requirement seen from a different operation: a
 //! refusal's `Message` is the text the SERVICE states for that error class — its fixed
@@ -52,14 +52,25 @@
 //!    `IdentityProviderType` value that requires the details, crossed with the other
 //!    members the request carries and with both operations that resolve a server
 //!    configuration.
+//! 8. Rule 7 one level up, over the WHOLE set of refusals one server configuration can
+//!    earn: each condition states its OWN sentence, so the three defects a `CreateServer`
+//!    is refused for (absent identity-provider details, absent VPC endpoint settings, a
+//!    protocol family the requested provider cannot serve) are mutually distinguishable
+//!    by their text alone — they all share one error code — and a refused configuration
+//!    writes nothing, whichever of them it offends.
 //!
 //! Every request goes over the real wire path (`POST /` with
 //! `X-Amz-Target: TransferService.<Op>`) through the shared [`crate::harness`], so what
 //! is asserted is what an SDK sees.
 
+use std::collections::BTreeMap;
+
 use serde_json::{json, Value};
 
-use crate::harness::{member_of, Answer, Emulator, ROLE};
+use service_com_amazonaws_transfer_transferservice::state as st;
+
+use crate::harness::{drain_pages, member_of, Answer, Emulator, ROLE};
+use crate::protocol_family_gate::family_gate_message;
 use crate::web_app_customization_write_guard::{create_web_app, futures_of};
 
 /// Satisfies `DirectoryId`'s modelled `len 12..12`, pattern `^d-[0-9a-f]{10}$`.
@@ -1193,4 +1204,298 @@ async fn a_server_missing_its_identity_provider_details_is_told_what_they_are_re
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 8: one condition, one sentence, over every refusal a server configuration
+// can earn
+// ---------------------------------------------------------------------------
+
+/// Satisfies `EndpointDetails$VpcId`'s modelled form
+/// (`smithy_query(query="shape",shape="EndpointDetails")`): the VPC the rows that DO name
+/// the endpoint settings host their endpoint in.
+const VPC_ID: &str = "vpc-0123456789abcdef0";
+
+/// The whole sentence the service states for a server whose endpoint would be hosted in a
+/// VPC and names no `EndpointDetails`, written out here as the service words it. It is
+/// FIXED for the condition in its entirety — no slot for the member, the `EndpointType` or
+/// anything else the caller sent — so both endpoint types that host in a VPC answer it.
+const ENDPOINT_DETAILS_REQUIRED: &str = "EndpointDetails required for VPC";
+
+/// One row of the table: the condition the request offends (rows sharing a condition must
+/// answer one sentence, and no two conditions may answer the same), the case name, the
+/// request, the whole expected `Message`, and the values the request carried that must not
+/// reach it.
+struct DefectRow {
+    condition: String,
+    case: String,
+    request: Value,
+    expected: String,
+    absent: Vec<String>,
+}
+
+/// RULE: every semantic refusal of a server configuration states the sentence the service
+/// states for THAT condition — its fixed text with only that condition's variable part
+/// filled from the request — so the three defects a `CreateServer` can be refused for are
+/// told apart by their `Message` alone (they share one error code and one status), and a
+/// refused configuration persists nothing.
+///
+/// The rows span the three defects, crossed with what each generalises over: every
+/// `IdentityProviderType` that makes `IdentityProviderDetails` required, both
+/// `EndpointType` values that host the endpoint in a VPC, both members of the FTP family,
+/// and — around each — the other members the request carries (protocols, endpoint
+/// settings, a logging role, tags), including configurations that offend a LATER rule too,
+/// which must still be told the condition they have to clear first.
+#[tokio::test]
+async fn each_refused_server_configuration_states_its_own_condition_and_persists_nothing() {
+    let emulator = Emulator::new();
+    let vpc = json!({"VpcId": VPC_ID});
+    let (tag_key, tag_value) = ("team", "files");
+
+    let mut rows: Vec<DefectRow> = Vec::new();
+
+    // ---- the identity-provider details defect ----
+    for (identity_provider_type, _) in PROVIDERS_REQUIRING_DETAILS {
+        let condition = format!("absent IdentityProviderDetails for {identity_provider_type}");
+        let expected = details_required_for(identity_provider_type);
+        rows.push(DefectRow {
+            condition: condition.clone(),
+            case: format!("{identity_provider_type} serving SFTP on a public endpoint"),
+            request: json!({
+                "IdentityProviderType": identity_provider_type,
+                "Protocols": [st::PROTOCOL_SFTP],
+                "EndpointType": "PUBLIC",
+            }),
+            expected: expected.clone(),
+            absent: vec![],
+        });
+        rows.push(DefectRow {
+            condition: condition.clone(),
+            case: format!("{identity_provider_type} on a VPC endpoint whose settings ARE named"),
+            request: json!({
+                "IdentityProviderType": identity_provider_type,
+                "EndpointType": st::ENDPOINT_TYPE_VPC,
+                "EndpointDetails": vpc.clone(),
+            }),
+            expected: expected.clone(),
+            absent: vec![VPC_ID.to_string()],
+        });
+        rows.push(DefectRow {
+            condition: condition.clone(),
+            case: format!("{identity_provider_type} asking for the FTP family with no certificate"),
+            request: json!({
+                "IdentityProviderType": identity_provider_type,
+                "Protocols": [st::PROTOCOL_FTP, st::PROTOCOL_FTPS],
+                "EndpointType": st::ENDPOINT_TYPE_VPC,
+                "EndpointDetails": vpc.clone(),
+            }),
+            expected: expected.clone(),
+            absent: vec![VPC_ID.to_string()],
+        });
+        rows.push(DefectRow {
+            condition,
+            case: format!("{identity_provider_type} with a logging role and tags"),
+            request: json!({
+                "IdentityProviderType": identity_provider_type,
+                "LoggingRole": ROLE,
+                "Tags": [{"Key": tag_key, "Value": tag_value}],
+            }),
+            expected,
+            absent: vec![ROLE.to_string(), tag_key.to_string(), tag_value.to_string()],
+        });
+    }
+
+    // ---- the VPC endpoint settings defect ----
+    let endpoint_condition = "absent EndpointDetails for an endpoint hosted in a VPC";
+    rows.push(DefectRow {
+        condition: endpoint_condition.to_string(),
+        case: "a VPC-hosted endpoint with no settings".to_string(),
+        request: json!({"EndpointType": st::ENDPOINT_TYPE_VPC}),
+        expected: ENDPOINT_DETAILS_REQUIRED.to_string(),
+        absent: vec![],
+    });
+    rows.push(DefectRow {
+        condition: endpoint_condition.to_string(),
+        case: "the other VPC-hosted endpoint type, with no settings".to_string(),
+        request: json!({
+            "EndpointType": st::ENDPOINT_TYPE_VPC_ENDPOINT,
+            "Protocols": [st::PROTOCOL_SFTP],
+        }),
+        expected: ENDPOINT_DETAILS_REQUIRED.to_string(),
+        absent: vec![st::ENDPOINT_TYPE_VPC_ENDPOINT.to_string()],
+    });
+
+    // ---- the unservable protocol family defect ----
+    // Both rows ask a SERVICE_MANAGED server for the family — one naming that provider,
+    // one taking the documented default — so they are one condition and owe one sentence.
+    // `protocol_family_gate.rs` states that sentence and pins the rule behind it.
+    let family_condition = format!(
+        "a protocol family {} cannot serve",
+        st::IDENTITY_PROVIDER_SERVICE_MANAGED
+    );
+    rows.push(DefectRow {
+        condition: family_condition.clone(),
+        case: "the FTP family under the provider the model defaults to".to_string(),
+        request: json!({"Protocols": [st::PROTOCOL_FTP]}),
+        expected: family_gate_message(st::DEFAULT_IDENTITY_PROVIDER_TYPE),
+        absent: vec![],
+    });
+    rows.push(DefectRow {
+        condition: family_condition,
+        case: "the family's other half beside SFTP, on the endpoint it would need".to_string(),
+        request: json!({
+            "Protocols": [st::PROTOCOL_SFTP, st::PROTOCOL_FTPS],
+            "EndpointType": st::ENDPOINT_TYPE_VPC,
+            "EndpointDetails": vpc.clone(),
+            "IdentityProviderType": st::IDENTITY_PROVIDER_SERVICE_MANAGED,
+        }),
+        expected: family_gate_message(st::IDENTITY_PROVIDER_SERVICE_MANAGED),
+        absent: vec![VPC_ID.to_string()],
+    });
+
+    // What the emulator ANSWERED each row, collected per condition.
+    let mut answered: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    for row in &rows {
+        let answer = emulator.call("CreateServer", row.request.clone()).await;
+        let absent: Vec<&str> = row.absent.iter().map(String::as_str).collect();
+        let actual = assert_message(
+            &row.case,
+            &answer,
+            400,
+            "InvalidRequestException",
+            &row.expected,
+            &absent,
+        );
+        assert!(
+            answer.body.get("ServerId").is_none(),
+            "case {:?}: a refused create must answer no ServerId, got {}",
+            row.case,
+            answer.body
+        );
+        answered
+            .entry(row.condition.clone())
+            .or_default()
+            .push((row.case.clone(), actual));
+    }
+
+    // Nothing in the table was served: a refusal of the configuration leaves no server
+    // behind, whichever condition it reported.
+    let (_, listed) =
+        drain_pages(&emulator, "ListServers", &json!({}), "Servers", "ServerId", None).await;
+    assert!(
+        listed.is_empty(),
+        "case \"the store after every refused create\": expected no server, got {listed:?}"
+    );
+
+    // One condition, one sentence — read off what the emulator answered above, not off
+    // what this suite built: every row of a condition said the same thing whatever else
+    // it configured, and no two conditions said the same, so the Message is what tells a
+    // client WHICH member to repair.
+    let sentences: Vec<(String, String)> = answered
+        .iter()
+        .map(|(condition, said)| {
+            let (first_case, first) = said.first().expect("each condition has rows");
+            for (case, actual) in said {
+                assert_eq!(
+                    actual, first,
+                    "case {case:?} against {first_case:?}: expected one sentence for \
+                     {condition:?}, got {actual:?} and {first:?}"
+                );
+            }
+            (condition.clone(), first.clone())
+        })
+        .collect();
+    for (index, (condition, sentence)) in sentences.iter().enumerate() {
+        for (other_condition, other) in sentences.iter().skip(index + 1) {
+            assert_ne!(
+                sentence, other,
+                "case \"{condition} against {other_condition}\": expected two conditions to \
+                 state two sentences, got {sentence:?} for both"
+            );
+        }
+    }
+
+    // The refusals cost the service nothing: the shared catalog still answers, and the
+    // SAME configuration carrying the details its provider is configured through is
+    // created and reads back with them.
+    let policy = emulator
+        .call(
+            "DescribeSecurityPolicy",
+            json!({"SecurityPolicyName": st::DEFAULT_SECURITY_POLICY_NAME}),
+        )
+        .await;
+    assert_eq!(
+        policy.status, 200,
+        "case \"the catalog after every refused create\": expected 200, got {} with body {}",
+        policy.status, policy.body
+    );
+    assert_eq!(
+        member_of(policy.get("SecurityPolicy"), "SecurityPolicyName").as_str(),
+        Some(st::DEFAULT_SECURITY_POLICY_NAME),
+        "case \"the catalog after every refused create\": expected the policy named, got {}",
+        policy.body
+    );
+
+    for (identity_provider_type, details_member) in PROVIDERS_REQUIRING_DETAILS {
+        let case = format!("{identity_provider_type} carrying its {details_member}");
+        let details = provider_details(details_member);
+        let server_id = emulator
+            .create_server(json!({
+                "IdentityProviderType": identity_provider_type,
+                "IdentityProviderDetails": details.clone(),
+            }))
+            .await;
+        let described = emulator
+            .call("DescribeServer", json!({"ServerId": &server_id}))
+            .await;
+        assert_eq!(
+            described.status, 200,
+            "case {case:?}: expected DescribeServer 200, got {} with body {}",
+            described.status, described.body
+        );
+        let server = described.get("Server");
+        assert_eq!(
+            member_of(server, "IdentityProviderType").as_str(),
+            Some(identity_provider_type),
+            "case {case:?}: expected the provider the create named, got {}",
+            described.body
+        );
+        assert_eq!(
+            member_of(member_of(server, "IdentityProviderDetails"), details_member),
+            &details[details_member],
+            "case {case:?}: expected the details the create carried, got {}",
+            described.body
+        );
+    }
+
+    // The same requirement over the OTHER operation that resolves a server
+    // configuration, where "persists nothing" means "changes nothing": a stored server a
+    // refused update tried to re-type still reports the provider it was created with.
+    let stored = emulator.create_server(json!({})).await;
+    for (identity_provider_type, _) in PROVIDERS_REQUIRING_DETAILS {
+        let answer = emulator
+            .call(
+                "UpdateServer",
+                json!({"ServerId": &stored, "IdentityProviderType": identity_provider_type}),
+            )
+            .await;
+        assert_message(
+            &format!("UpdateServer to {identity_provider_type} with no details"),
+            &answer,
+            400,
+            "InvalidRequestException",
+            &details_required_for(identity_provider_type),
+            &[stored.as_str()],
+        );
+    }
+    let described = emulator
+        .call("DescribeServer", json!({"ServerId": &stored}))
+        .await;
+    assert_eq!(
+        member_of(described.get("Server"), "IdentityProviderType").as_str(),
+        Some(st::DEFAULT_IDENTITY_PROVIDER_TYPE),
+        "case \"the stored server after every refused update\": expected the provider it was \
+         created with, got {}",
+        described.body
+    );
 }
