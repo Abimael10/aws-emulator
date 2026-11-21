@@ -1881,6 +1881,10 @@ pub const READ_SET_UPLOAD_PART_PAGE_TOKEN_TAG: &str = "rsup_";
 /// still distinct from every other, so no token can resume another listing's walk.
 pub const WORKFLOW_VERSION_PAGE_TOKEN_TAG: &str = "wfv_";
 
+/// The same, for `ListMultipartReadSetUploads`. An upload is keyed by its numeric
+/// `uploadId`, so that listing's token names the upload the next page resumes at.
+pub const MULTIPART_READ_SET_UPLOAD_PAGE_TOKEN_TAG: &str = "mrsu_";
+
 /// A page token naming the record the NEXT page of a listing starts at, by that
 /// record's own key.
 ///

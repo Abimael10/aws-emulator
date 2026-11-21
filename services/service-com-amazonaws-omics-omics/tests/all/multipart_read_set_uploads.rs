@@ -21,19 +21,26 @@
 //!     upload every time, and the token is namespaced to the store it was presented to;
 //! * an upload belongs to the store it was initiated against: two stores keep their
 //!   uploads apart;
-//! * a sequence store id no store holds is the modelled 404, however the id is shaped.
+//! * a sequence store id no store holds is the modelled 404, however the id is shaped;
+//! * `ListMultipartReadSetUploads` reports exactly the uploads IN PROGRESS in the one
+//!   store the request names, each member read from that upload's own stored record — so
+//!   a listed upload reports what its create reported — in ascending `uploadId` order,
+//!   paging over them by `maxResults`/`nextToken`; an upload that has been finished is no
+//!   longer in progress and leaves the listing.
 
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_omics_omics::state::{
-    service_state, MultipartReadSetUpload, FIRST_SEQUENCE_STORE_ID, MAX_TAGS, UPLOAD_ID_OFFSET,
+    service_state, MultipartReadSetUpload, FIRST_SEQUENCE_STORE_ID, MAX_TAGS,
+    SEQUENCE_STORE_NOT_FOUND_MESSAGE, UPLOAD_ID_OFFSET,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::private_workflow_runs::{
     assert_absent, assert_members, assert_timestamp, call, error_code, tag_map,
 };
+use crate::read_set_upload_parts::{complete_upload, parts_list, upload_all};
 
 /// Every value the modelled `FileType` enum admits.
 /// Source: the `sourceFileType` member of `CreateMultipartReadSetUploadRequest` ("one of:
@@ -779,4 +786,343 @@ async fn requests_outside_the_published_bounds_are_refused() {
             );
         }
     }
+}
+
+// =============================================================================
+// ListMultipartReadSetUploads
+// =============================================================================
+
+/// `POST /sequencestore/{store}/uploads{query}`, sending `body`.
+///
+/// Every member of this input is an `@httpLabel` or an `@httpQuery`
+/// (`smithy_query(query="operation",operation="ListMultipartReadSetUploads")`), so the
+/// request carries no body members at all — which is why `body` is a row of the table
+/// below rather than fixed here.
+async fn list_uploads(
+    router: &MultiServiceRouter,
+    sequence_store_id: &str,
+    query: &str,
+    body: Option<&Value>,
+) -> (u16, Value) {
+    call(
+        router,
+        "POST",
+        &format!("/sequencestore/{sequence_store_id}/uploads{query}"),
+        body,
+    )
+    .await
+}
+
+/// The `uploads` array of a 200 listing, after asserting the status. The member is always
+/// reported, so a store with nothing in progress answers with an empty array.
+fn uploads_of(case: &str, status: u16, body: &Value) -> Vec<Value> {
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected 200 from ListMultipartReadSetUploads, got {body:?}"
+    );
+    body.get("uploads")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("case {case:?}: expected an uploads array, got {body:?}"))
+        .clone()
+}
+
+/// The `uploadId` of each listed upload, in the order the listing reported them.
+fn listed_ids(case: &str, uploads: &[Value]) -> Vec<String> {
+    uploads
+        .iter()
+        .map(|upload| {
+            upload
+                .get("uploadId")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: a listed upload carried no uploadId, got {upload:?}")
+                })
+                .to_string()
+        })
+        .collect()
+}
+
+/// Initiate `count` uploads in `store`, answering each `uploadId` in creation order.
+async fn initiate_uploads(
+    router: &MultiServiceRouter,
+    store: &str,
+    count: usize,
+) -> Vec<String> {
+    let mut ids = Vec::new();
+    for index in 0..count {
+        let case = format!("upload {index}");
+        let (status, body) = create_upload(
+            router,
+            store,
+            &json!({
+                "name": format!("page member {index}"),
+                "subjectId": format!("subject-{index}"),
+                "sampleId": format!("sample-{index}"),
+                "sourceFileType": FILE_TYPES[index % FILE_TYPES.len()],
+                "referenceArn": REFERENCE_ARN,
+            }),
+        )
+        .await;
+        ids.push(created_upload_id(&case, status, &body));
+    }
+    ids
+}
+
+#[tokio::test]
+async fn the_upload_listing_reports_every_in_progress_upload_from_its_stored_record() {
+    let (router, _engine) = emulator_holding_its_engine();
+    let store = create_store(&router, "the listing destination").await;
+
+    // A store with nothing in progress reports an empty page rather than no member and
+    // rather than a resume token.
+    let (status, body) = list_uploads(&router, &store, "", None).await;
+    let empty = uploads_of("an empty store", status, &body);
+    assert!(
+        empty.is_empty(),
+        "case \"an empty store\": expected no uploads, got {body:?}"
+    );
+    assert!(
+        body.get("nextToken").is_none(),
+        "case \"an empty store\": a single page carries no nextToken, got {body:?}"
+    );
+
+    // The same table the create rows use, so the listing is asserted over the whole class
+    // of uploads — every source format, the members present or absent, tag maps of
+    // several sizes and caller-sized strings at their published bounds.
+    let cases = upload_cases();
+    let mut created = Vec::new();
+    for upload in &cases {
+        let request = request_for(upload);
+        let (status, created_body) = create_upload(&router, &store, &request).await;
+        let upload_id = created_upload_id(upload.case, status, &created_body);
+        created.push((upload.case, upload_id, created_body));
+    }
+
+    let (status, body) = list_uploads(&router, &store, "", None).await;
+    let listed = uploads_of("every upload", status, &body);
+    assert_eq!(
+        listed.len(),
+        created.len(),
+        "case \"every upload\": expected {} uploads, got {body:?}",
+        created.len()
+    );
+
+    for (case, upload_id, created_body) in &created {
+        let item = listed
+            .iter()
+            .find(|item| item.get("uploadId").and_then(Value::as_str) == Some(upload_id.as_str()))
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: upload {upload_id} is missing from {body:?}")
+            });
+        // `MultipartReadSetUploadListItem` and `CreateMultipartReadSetUploadResponse` model
+        // the same members, and both are read from the one stored record, so the listed
+        // item is the create's own report, member for member — including the members an
+        // upload that named neither a reference nor a source leaves out.
+        assert_eq!(
+            item, created_body,
+            "case {case:?}: expected the listed upload to report {created_body:?}, got {item:?}"
+        );
+        assert_timestamp(case, "creationTime", item);
+    }
+
+    // The walk is the store's own key order: ascending `uploadId`, which is creation
+    // order, so two callers reading the same store see the same sequence.
+    let ids = listed_ids("every upload", &listed);
+    let mut ascending = ids.clone();
+    ascending.sort_by_key(|id| id.parse::<u64>().expect("a decimal uploadId"));
+    assert_eq!(
+        ids, ascending,
+        "case \"every upload\": expected ascending uploadId order, got {ids:?}"
+    );
+    assert_eq!(
+        ids,
+        created
+            .iter()
+            .map(|(_, upload_id, _)| upload_id.clone())
+            .collect::<Vec<_>>(),
+        "case \"every upload\": expected creation order, got {ids:?}"
+    );
+
+    // The input binds no body member at all, so what the caller sends as a body cannot
+    // change the page: an empty JSON object and no body are the same request.
+    let (status, with_body) = list_uploads(&router, &store, "", Some(&json!({}))).await;
+    assert_eq!(
+        listed_ids("an empty JSON body", &uploads_of("an empty JSON body", status, &with_body)),
+        ids,
+        "case \"an empty JSON body\": expected the same page, got {with_body:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_upload_listing_pages_over_the_stored_uploads() {
+    let (router, _engine) = emulator_holding_its_engine();
+    let store = create_store(&router, "the paging destination").await;
+    let created = initiate_uploads(&router, &store, 5).await;
+
+    // One row per page size: smaller than, equal to and larger than the collection, so
+    // the rule is asserted over pages that do and do not divide it evenly.
+    for page_size in [1usize, 2, 3, 5, 100] {
+        let case = format!("maxResults={page_size}");
+        let mut seen: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        // Every page is bounded by the collection, so a walk can need no more steps than
+        // there are uploads plus one.
+        for _ in 0..=created.len() {
+            let query = match &token {
+                Some(token) => format!("?maxResults={page_size}&nextToken={token}"),
+                None => format!("?maxResults={page_size}"),
+            };
+            let (status, body) = list_uploads(&router, &store, &query, None).await;
+            let page = uploads_of(&case, status, &body);
+            assert!(
+                page.len() <= page_size,
+                "case {case:?}: a page must hold at most {page_size} uploads, got {body:?}"
+            );
+            seen.extend(listed_ids(&case, &page));
+            token = body
+                .get("nextToken")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if token.is_none() {
+                break;
+            }
+        }
+        assert!(
+            token.is_none(),
+            "case {case:?}: the walk must end without a nextToken, got {token:?}"
+        );
+        assert_eq!(
+            seen, created,
+            "case {case:?}: the pages together must report every upload once, in creation \
+             order"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_upload_page_token_this_listing_did_not_issue_is_refused() {
+    let (router, _engine) = emulator_holding_its_engine();
+    let store = create_store(&router, "the token destination").await;
+    initiate_uploads(&router, &store, 2).await;
+
+    // The rows differ along how the token is unreadable: another listing's tag, a tag this
+    // service never issues, a hex body with no tag, and text that is not hex at all.
+    let tokens = [
+        "rg_31303030303030",
+        "rsup_31",
+        "wfv_6e616d65",
+        "31303030303030",
+        "not-a-token",
+    ];
+    for token in tokens {
+        let (status, body) =
+            list_uploads(&router, &store, &format!("?nextToken={token}"), None).await;
+        assert_eq!(
+            status, 400,
+            "case {token:?}: expected 400 from ListMultipartReadSetUploads, got {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {token:?}: expected ValidationException, got {body:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn listing_the_uploads_of_an_unknown_sequence_store_is_not_found() {
+    let (router, _engine) = emulator_holding_its_engine();
+    // One real store exists, so the 404s below are about the id, not about an empty
+    // registry.
+    let existing = create_store(&router, "the only listed store").await;
+    initiate_uploads(&router, &existing, 1).await;
+
+    // The rule generalises over the id's width and value, across the whole modelled
+    // `SequenceStoreId` length (10..36): a store this emulator does not hold has no
+    // uploads to list, which is "not found" and never an empty page.
+    let (min, max) = SEQUENCE_STORE_ID_WIDTH;
+    let ids = [
+        "0".repeat(min),
+        "9".repeat(min),
+        "1234567890".to_string(),
+        "1".repeat(max),
+        "9".repeat(max),
+    ];
+    for id in &ids {
+        assert_ne!(id, &existing, "the fixture must not collide with the real id");
+        let (status, body) = list_uploads(&router, id, "", None).await;
+        assert_eq!(
+            status, 404,
+            "case {id:?}: expected 404 from ListMultipartReadSetUploads, got {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {id:?}: expected ResourceNotFoundException, got {body:?}"
+        );
+        assert_eq!(
+            body.get("message").and_then(Value::as_str),
+            Some(SEQUENCE_STORE_NOT_FOUND_MESSAGE),
+            "case {id:?}: expected the sequence store refusal message, got {body:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_upload_listing_reports_only_the_uploads_of_the_store_it_names() {
+    let (router, _engine) = emulator_holding_its_engine();
+    let first = create_store(&router, "the first listed store").await;
+    let second = create_store(&router, "the second listed store").await;
+    // The stores differ in how many uploads they hold, so neither listing can be right by
+    // accident.
+    let in_first = initiate_uploads(&router, &first, 3).await;
+    let in_second = initiate_uploads(&router, &second, 1).await;
+
+    for (case, store, expected) in [
+        ("the first store", &first, &in_first),
+        ("the second store", &second, &in_second),
+    ] {
+        let (status, body) = list_uploads(&router, store, "", None).await;
+        let listed = listed_ids(case, &uploads_of(case, status, &body));
+        assert_eq!(
+            &listed, expected,
+            "case {case:?}: expected exactly its own uploads, got {body:?}"
+        );
+        for item in uploads_of(case, status, &body) {
+            assert_eq!(
+                item.get("sequenceStoreId").and_then(Value::as_str),
+                Some(store.as_str()),
+                "case {case:?}: every listed upload must name its own store, got {item:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_upload_that_is_no_longer_in_progress_leaves_the_listing() {
+    let (router, _engine) = emulator_holding_its_engine();
+    let store = create_store(&router, "the finished upload destination").await;
+    let ids = initiate_uploads(&router, &store, 2).await;
+    let (finished, still_open) = (ids[0].clone(), ids[1].clone());
+
+    // The listing reports the uploads IN PROGRESS, so finishing one takes it out of the
+    // page while the other store member stays.
+    let parts: Vec<(&'static str, i32, Vec<u8>)> = vec![("SOURCE1", 1, b"ACGTACGT".to_vec())];
+    let uploaded = upload_all(&router, "a finished upload", &store, &finished, &parts).await;
+    let (status, body) =
+        complete_upload(&router, &store, &finished, &parts_list(&uploaded)).await;
+    assert_eq!(
+        status, 200,
+        "case \"a finished upload\": expected 200 from CompleteMultipartReadSetUpload, got \
+         {body:?}"
+    );
+
+    let (status, body) = list_uploads(&router, &store, "", None).await;
+    let listed = listed_ids("a finished upload", &uploads_of("a finished upload", status, &body));
+    assert_eq!(
+        listed,
+        vec![still_open],
+        "case \"a finished upload\": expected the finished upload {finished} to leave the \
+         listing, got {body:?}"
+    );
 }

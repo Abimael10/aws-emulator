@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMultipartReadSetUploads
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMultipartReadSetUploads`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMultipartReadSetUploads::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -128,6 +119,43 @@ impl From<ListMultipartReadSetUploadsErrorModeled> for ListMultipartReadSetUploa
     }
 }
 
+/// A page token naming the upload the NEXT page starts at. The codec and the page bound
+/// are [`crate::state::encode_page_token`] / [`crate::state::decode_page_token`] and
+/// [`crate::state::MAX_LIST_PAGE_SIZE`], shared with this crate's other listings; this
+/// wrapper only renders an unreadable token as THIS operation's 400 refusal.
+fn decode_page_token(token: &str) -> Result<u64, ListMultipartReadSetUploadsError> {
+    crate::state::decode_page_token(
+        crate::state::MULTIPART_READ_SET_UPLOAD_PAGE_TOKEN_TAG,
+        token,
+    )
+    .ok_or_else(|| {
+        ListMultipartReadSetUploadsErrorModeled::ValidationException(ValidationException {
+            message: "nextToken is not a pagination token issued by ListMultipartReadSetUploads"
+                .to_string(),
+        })
+        .into()
+    })
+}
+
+/// One stored upload as this listing's item: every member `MultipartReadSetUploadListItem`
+/// models, read from that record alone, so an upload reports here exactly what its create
+/// reported and nothing is invented for a member the create left out.
+fn reported(upload: &crate::state::MultipartReadSetUpload) -> MultipartReadSetUploadReported {
+    MultipartReadSetUploadReported {
+        sequence_store_id: upload.sequence_store_id.clone(),
+        upload_id: upload.upload_id.clone(),
+        source_file_type: upload.source_file_type.clone(),
+        subject_id: upload.subject_id.clone(),
+        sample_id: upload.sample_id.clone(),
+        generated_from: upload.generated_from.clone(),
+        reference_arn: upload.reference_arn.clone(),
+        name: Some(upload.name.clone()),
+        description: upload.description.clone(),
+        tags: upload.tags_output(),
+        creation_time: crate::state::timestamp(upload.creation_time_ms),
+    }
+}
+
 /// The `ListMultipartReadSetUploads` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -151,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for ListMultipartReadSetUploads<Eng>
 {
     type Input = ListMultipartReadSetUploadsInput;
-    type Output = ListMultipartReadSetUploadsOutput;
+    type Output = ListMultipartReadSetUploadsResponse;
     type Error = ListMultipartReadSetUploadsError;
 
     const NAME: &'static str = "ListMultipartReadSetUploads";
@@ -164,18 +192,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMultipartReadSetUploads` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMultipartReadSetUploadsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMultipartReadSetUploads"))
+        // Every branch below records the call through `crate::state::audit`. A listing
+        // resolves no single resource, so its records carry
+        // `crate::state::AUDIT_NO_RESOURCE` once the store it reads has resolved.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::StoreUnavailable,
+                None,
+            );
+            ListMultipartReadSetUploadsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the omics sequence store registry is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        let page_size = input
+            .max_results
+            .map_or(crate::state::MAX_LIST_PAGE_SIZE, |requested| {
+                requested.clamp(1, crate::state::MAX_LIST_PAGE_SIZE as i32) as usize
+            });
+        let start = match input.next_token.as_deref().map(decode_page_token) {
+            Some(Err(refusal)) => {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::ValidationRefused,
+                    None,
+                );
+                return Err(refusal);
+            }
+            Some(Ok(start)) => start,
+            None => 0,
+        };
+
+        let now_ms = crate::state::now_epoch_millis();
+        let mut registry = state.lock();
+        registry.settle(now_ms);
+
+        // The uploads of a store are read through that store, so an id no store holds is
+        // "not found" rather than an empty listing. The store's CANONICAL id is what the
+        // walk below narrows on, so the listing is insensitive to the spelling of a
+        // `^[0-9]+$` id in exactly the way every other lookup is.
+        let Some(sequence_store_id) = registry
+            .sequence_store(&input.sequence_store_id)
+            .map(|store| store.id.clone())
+        else {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                Some(&input.sequence_store_id),
+            );
+            return Err(
+                ListMultipartReadSetUploadsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::SEQUENCE_STORE_NOT_FOUND_MESSAGE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut uploads = Vec::new();
+        let mut next_token = None;
+        // In-progress uploads only: an upload that was completed or aborted is no longer
+        // held, which is what this listing excludes. The walk is the store's own key
+        // order — ascending `uploadId`, so creation order — which makes it stable across
+        // calls and lets a token name the upload the next page resumes at.
+        for (key, upload) in registry.multipart_read_set_uploads_for(&sequence_store_id) {
+            if *key < start {
+                continue;
+            }
+            // The first upload that does not fit becomes the next page's start, and only
+            // then is a `nextToken` emitted — the last page carries none.
+            if uploads.len() == page_size {
+                next_token = Some(crate::state::encode_page_token(
+                    crate::state::MULTIPART_READ_SET_UPLOAD_PAGE_TOKEN_TAG,
+                    *key,
+                ));
+                break;
+            }
+            uploads.push(reported(upload));
+        }
+
+        crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::Reported, None);
+
+        Ok(ListMultipartReadSetUploadsResponse {
+            next_token,
+            uploads,
+        })
     }
 }

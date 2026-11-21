@@ -1087,7 +1087,7 @@ async fn listing_an_uploads_parts_pages_and_narrows_over_the_stored_parts() {
 const READ_SET_ID_WIDTH: (usize, usize) = (10, 36);
 
 /// `POST /sequencestore/{store}/upload/{upload}/complete` with `parts` as the list.
-async fn complete_upload(
+pub(crate) async fn complete_upload(
     router: &MultiServiceRouter,
     sequence_store_id: &str,
     upload_id: &str,
@@ -1157,7 +1157,7 @@ fn completed_read_set_id(case: &str, status: u16, body: &Value) -> String {
 
 /// The parts list a completion carries: one entry per uploaded part, with the checksum
 /// `UploadReadSetPart` answered with.
-fn parts_list(parts: &[(&str, i32, String)]) -> Value {
+pub(crate) fn parts_list(parts: &[(&str, i32, String)]) -> Value {
     Value::Array(
         parts
             .iter()
@@ -1174,7 +1174,7 @@ fn parts_list(parts: &[(&str, i32, String)]) -> Value {
 
 /// Upload every part of `parts` and answer the completion list entry for each, in the
 /// order the parts were uploaded.
-async fn upload_all(
+pub(crate) async fn upload_all(
     router: &MultiServiceRouter,
     case: &str,
     sequence_store_id: &str,
