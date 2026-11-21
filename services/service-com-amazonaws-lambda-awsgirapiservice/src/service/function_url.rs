@@ -732,12 +732,14 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
         trace_header: &str,
     ) -> Vec<u8> {
         let req = incoming.req;
-        // The host the handler is told about is the function URL's OWN — the host of the
+        // The host the handler is told about is the function URL's OWN — the HOST of the
         // address this service PUBLISHED for it, which is the address a client was handed
         // and the one `requestContext.domainName` names — rather than the authority the
         // request happened to reach this process at. A handler reconstructs its own URL
         // from that header, enforces a host allow-list with it and signs callbacks from it,
-        // so what it has to name is the endpoint and not the socket in between.
+        // so what it has to name is the endpoint and not the socket in between; and it is
+        // that address's host alone, because a domain name carries no transport port
+        // (`crate::state::function_url`).
         let domain_name = &target.endpoint_host;
         let headers: Vec<(String, String)> = req
             .headers()

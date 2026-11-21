@@ -265,14 +265,15 @@ fn percent_decoded(component: &str) -> String {
 /// The event's `requestContext`: what the format reports about the call itself, every field
 /// of it read off this request or off the resource it addressed.
 ///
-/// `http.sourceIp` is the address of the TCP connection the request arrived on
-/// ([`UrlRequest::source_ip`]), so no header the client wrote can change which address the
-/// call is attributed to, while `http.userAgent` is the client's own declaration and is
-/// reported as sent.
+/// `http.path` is the path the request NAMES ([`decoded_path`]), beside the `rawPath` the
+/// client wrote it as, and `http.sourceIp` is the address of the TCP connection the request
+/// arrived on ([`UrlRequest::source_ip`]), so no header the client wrote can change which
+/// address the call is attributed to, while `http.userAgent` is the client's own declaration
+/// and is reported as sent.
 fn request_context(request: &UrlRequest<'_>) -> Value {
     let mut http = Map::new();
     http.insert("method".to_string(), json!(request.method));
-    http.insert("path".to_string(), json!(request.raw_path));
+    http.insert("path".to_string(), json!(decoded_path(request.raw_path)));
     http.insert("protocol".to_string(), json!(HTTP_PROTOCOL));
     http.insert("sourceIp".to_string(), json!(request.source_ip));
     http.insert(
@@ -309,6 +310,21 @@ fn request_context(request: &UrlRequest<'_>) -> Value {
 
 /// The protocol a function URL request is served over.
 const HTTP_PROTOCOL: &str = "HTTP/1.1";
+
+/// The path `requestContext.http.path` reports: the request path with its percent-escapes
+/// RESOLVED, which is the path the request names.
+///
+/// The format carries the path in two members, a raw one and a resolved one: `rawPath` is the
+/// request target as the client wrote it, escapes and all, and this one is the path those
+/// escapes stand for — the same division the format makes between `rawQueryString` and the
+/// decoded `queryStringParameters` ([`query_parameters`]). A `+` is NOT a space here, because
+/// it is a literal plus in a path and only a form-encoded query writes a space that way,
+/// which is why this is the shared PATH decoding
+/// (`service_common::percent_decode_path_label`) and not the form-encoded reading a query
+/// value gets. A `%` no two hex digits follow is no escape and stands for itself.
+fn decoded_path(raw_path: &str) -> String {
+    ::service_common::percent_decode_path_label(raw_path)
+}
 
 /// The first value of the header `name`, when the request carried it.
 ///

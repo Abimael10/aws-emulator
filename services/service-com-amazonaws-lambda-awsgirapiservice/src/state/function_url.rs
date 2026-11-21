@@ -363,9 +363,10 @@ pub struct FunctionUrlTarget {
     /// The region the ADDRESS named, for the addressings that carry one.
     pub addressed_region: Option<String>,
     /// The HOST of the address this URL was PUBLISHED at ([`announced_function_url`], as
-    /// stored on the configuration), which is the host a client addressed it by — so it is
-    /// the host the handler is told about, in the event's `headers.host` and
-    /// `requestContext.domainName`.
+    /// stored on the configuration), which is the host a client addressed it by, without the
+    /// port that address is served on — so it is the host the handler is told about, in the
+    /// event's `headers.host` and `requestContext.domainName`, both of which name a DOMAIN
+    /// and not a socket ([`announced_host`]).
     pub endpoint_host: String,
 }
 
@@ -457,13 +458,23 @@ fn target_of_record(
     }
 }
 
-/// The HOST of an announced function URL: the authority of the address the configuration
+/// The HOST of an announced function URL: the host NAME of the address the configuration
 /// holds, or — for a stored value carrying none — the documented endpoint host of that url
 /// id, so a handler is never told about an address that is not one.
+///
+/// The host NAME and not the whole authority: what a function URL event reports is the
+/// endpoint's DOMAIN NAME (`requestContext.domainName`, and the `host` the request carried
+/// under it), and a transport port is no part of a domain name — AWS's own announced value
+/// (`<url-id>.lambda-url.<region>.on.aws`) names none, and this emulator announces the same
+/// resource at an address whose port is the socket it could bind rather than anything about
+/// the function URL. So the value a handler is told about is the one every announced form of
+/// this endpoint agrees on ([`::service_common::data_plane_addressing::host_only`], which
+/// also drops any userinfo a `Host` may carry).
 fn announced_host(url: &str, region: &str, url_id: &str) -> String {
     url.split_once("://")
         .map(|(_scheme, rest)| rest.split('/').next().unwrap_or(rest))
-        .filter(|authority| !authority.is_empty())
+        .map(::service_common::data_plane_addressing::host_only)
+        .filter(|host| !host.is_empty())
         .map_or_else(
             || function_url_endpoint_host(region, url_id),
             str::to_string,
@@ -725,6 +736,75 @@ mod tests {
             assert_eq!(
                 read, *expected,
                 "case {host:?}: expected {expected:?}, got {read:?}"
+            );
+        }
+    }
+
+    /// RULE: what the handler is told about the endpoint it was reached at is the HOST of the
+    /// announced address and never the port it is served on — a domain name carries none —
+    /// and a stored value naming no address at all falls back to the documented host of that
+    /// url id, so a handler is never told about something that is no host.
+    ///
+    /// The rows span the address forms an announced value takes: the documented host, a
+    /// loopback literal with a port and a path, a loopback NAME with a port, a bracketed
+    /// IPv6 literal with a port (whose own colons are inside the brackets), a host carrying
+    /// userinfo, an address with no port at all, and the values that name no authority.
+    #[test]
+    fn the_announced_host_is_the_published_addresss_host_without_its_port() {
+        let url_id = "0123456789abcdef0123456789abcdef";
+        let documented = format!("{url_id}.{FUNCTION_URL_LABEL}.{DEFAULT_REGION}.on.aws");
+        // (case, the stored announced value, the host the handler is told about)
+        let rows: &[(&str, String, String)] = &[
+            (
+                "the documented host",
+                function_url(DEFAULT_REGION, url_id),
+                documented.clone(),
+            ),
+            (
+                "a loopback literal with a port, carrying the url id in its path",
+                format!("https://127.0.0.1:9297/_aws/{FUNCTION_URL_LABEL}/{url_id}/"),
+                "127.0.0.1".to_string(),
+            ),
+            (
+                "a loopback NAME with a port",
+                format!("https://localhost:39355/_aws/{FUNCTION_URL_LABEL}/{url_id}/"),
+                "localhost".to_string(),
+            ),
+            (
+                "a bracketed IPv6 literal with a port",
+                format!("https://[::1]:39355/_aws/{FUNCTION_URL_LABEL}/{url_id}/"),
+                "[::1]".to_string(),
+            ),
+            (
+                "an address carrying userinfo",
+                format!("https://user@127.0.0.1:9297/_aws/{FUNCTION_URL_LABEL}/{url_id}/"),
+                "127.0.0.1".to_string(),
+            ),
+            (
+                "an address with no port at all",
+                format!("https://127.0.0.1/_aws/{FUNCTION_URL_LABEL}/{url_id}/"),
+                "127.0.0.1".to_string(),
+            ),
+            (
+                "a stored value naming no authority",
+                "https:///nowhere".to_string(),
+                documented.clone(),
+            ),
+            (
+                "a stored value that is no URL at all",
+                String::new(),
+                documented.clone(),
+            ),
+        ];
+        for (case, announced, expected) in rows {
+            let told = announced_host(announced, DEFAULT_REGION, url_id);
+            assert_eq!(
+                told, *expected,
+                "case {case:?}: expected the handler to be told {expected:?}, got {told:?}"
+            );
+            assert!(
+                !told.contains(':') || told.starts_with('['),
+                "case {case:?}: a domain name carries no port, got {told:?}"
             );
         }
     }

@@ -165,6 +165,18 @@ pub(crate) async fn control(
     uri: &str,
     body: &Value,
 ) -> Answer {
+    control_at(router, SERVICE_HOST, method, uri, body).await
+}
+
+/// The same call, addressed at the endpoint `host` names rather than at this service's own:
+/// the endpoint the client making it is configured with.
+pub(crate) async fn control_at(
+    router: &MultiServiceRouter,
+    host: &str,
+    method: &str,
+    uri: &str,
+    body: &Value,
+) -> Answer {
     let payload = if body.is_null() {
         Vec::new()
     } else {
@@ -173,7 +185,7 @@ pub(crate) async fn control(
     send(
         router,
         method,
-        SERVICE_HOST,
+        host,
         uri,
         &payload,
         &[
@@ -296,13 +308,28 @@ pub(crate) async fn given_configured_url(
     auth_type: &str,
     cors: &Value,
 ) -> Endpoint {
+    given_configured_url_at(router, SERVICE_HOST, function, qualifier, auth_type, cors).await
+}
+
+/// The same create, addressed at the endpoint `host` names — the endpoint the client that
+/// creates the URL is configured with, which is what decides the address the URL is
+/// published at (`crate::state::function_url::announced_function_url`).
+pub(crate) async fn given_configured_url_at(
+    router: &MultiServiceRouter,
+    host: &str,
+    function: &str,
+    qualifier: Option<&str>,
+    auth_type: &str,
+    cors: &Value,
+) -> Endpoint {
     let query = qualifier.map_or_else(String::new, |value| format!("?Qualifier={value}"));
     let mut body = json!({ "AuthType": auth_type });
     if !cors.is_null() {
         body["Cors"] = cors.clone();
     }
-    let created = control(
+    let created = control_at(
         router,
+        host,
         "POST",
         &format!("/2021-10-31/functions/{function}/url{query}"),
         &body,
@@ -320,11 +347,18 @@ pub(crate) async fn given_configured_url(
         .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| panic!("the create must answer a FunctionUrl, got {}", created.text()));
-    let host = url
+    let authority = url
         .strip_prefix("https://")
         .and_then(|rest| rest.split('/').next())
         .expect("the minted URL carries a host")
         .to_string();
+    // The path the announced value carries below that authority, ending in the `/` a function
+    // URL's own root is addressed by: the reserved data-plane path for a URL published on this
+    // emulator's own address, and `/` for the documented host form.
+    let base_path = url
+        .strip_prefix("https://")
+        .and_then(|rest| rest.find('/').map(|at| rest[at..].to_string()))
+        .unwrap_or_else(|| "/".to_string());
     // The url id as the ANNOUNCED address carries it: in the path of the address a function
     // URL is published at (`/_aws/lambda-url/<url-id>/`), and in the first label of the host
     // for the documented form. One reading of the announced value, so a row addressing the
@@ -336,12 +370,17 @@ pub(crate) async fn given_configured_url(
         .filter(|segment| !segment.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| {
-            host.split('.')
+            authority
+                .split('.')
                 .next()
                 .expect("the host carries the url id")
                 .to_string()
         });
-    Endpoint { host, url_id }
+    Endpoint {
+        host: authority,
+        base_path,
+        url_id,
+    }
 }
 
 /// The path segment that names this plane inside an announced local address, as
@@ -350,10 +389,22 @@ const PLANE_LABEL: &str = "lambda-url";
 
 /// The endpoint one function URL publishes.
 pub(crate) struct Endpoint {
-    /// The host the URL is addressed at.
+    /// The authority the URL is addressed at, which is what the announced value carries.
     pub(crate) host: String,
+    /// The path the announced value carries below that authority, ending in `/`.
+    pub(crate) base_path: String,
     /// The url id that host's first label carries.
     pub(crate) url_id: String,
+}
+
+impl Endpoint {
+    /// The HOST of this address, without the port it is served on: what the event reports as
+    /// the request's `host` and as `requestContext.domainName`, both of which name a DOMAIN
+    /// (`crate::state::function_url`). Read through the one reduction this tree has for it,
+    /// which is the one the service answers that member from.
+    pub(crate) fn domain(&self) -> &str {
+        ::service_common::data_plane_addressing::host_only(&self.host)
+    }
 }
 
 /// One request to the function URL, addressed HOST-STYLE the way AWS publishes it.
@@ -651,7 +702,7 @@ async fn the_event_carries_the_request_as_payload_format_two_states_it() {
         ),
         ("the method", "method", json!("GET")),
         ("the account", "accountId", json!(ACCOUNT)),
-        ("the published host", "domainName", json!(endpoint.host)),
+        ("the published host", "domainName", json!(endpoint.domain())),
         (
             "no authorizer on a public endpoint",
             "authorizer",
@@ -684,7 +735,7 @@ async fn the_event_carries_the_request_as_payload_format_two_states_it() {
     );
     assert_eq!(
         headers.get("host"),
-        Some(&json!(endpoint.host)),
+        Some(&json!(endpoint.domain())),
         "case \"the host header\": expected the function URL's own host, got {headers:?}"
     );
 
@@ -714,10 +765,10 @@ async fn the_event_carries_the_request_as_payload_format_two_states_it() {
         let reported = reached.pointer(member).cloned().unwrap_or(Value::Null);
         assert_eq!(
             reported,
-            json!(endpoint.host),
+            json!(endpoint.domain()),
             "case {case:?}: expected the URL's own host {:?} however the endpoint was \
              reached, got {reported}",
-            endpoint.host
+            endpoint.domain()
         );
     }
 
