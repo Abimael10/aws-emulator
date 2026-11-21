@@ -46,3 +46,29 @@ Code: src/ops/list_distribution_tenants.rs:287 projects each stored tenant with 
 3. GET /2020-05-31/distribution-tenant/{Id} and confirm the same ETag is returned.
 4. POST /2020-05-31/distribution-tenants (ListDistributionTenants) with no AssociationFilter and read the DistributionTenantSummary for that tenant id.
 5. Observe the summary's ETag differs from the token steps 2 and 3 returned; AWS reports the identical token. Using the listed token as If-Match on UpdateDistributionTenant/DeleteDistributionTenant therefore does not refer to the tenant's current version.
+
+## Resolution
+
+Cause 1 DECLINED as a per-run value, and the rule behind it pinned by a suite.
+
+- The equality the cause is about already holds in this tree: a distribution tenant's version
+  token is minted by the call that CHANGES the tenant (`state/store.rs`'s
+  `apply_distribution_tenant_update` and `apply_tenant_web_acl`, and the create), stored on the
+  record once, and read back from that one field by every projection that carries an `ETag` —
+  `StoredDistributionTenant::to_summary` (`state.rs`) reads `self.etag` for the summary BOTH
+  listings report through `distribution_tenant_summary`, and `GetDistributionTenant`,
+  `GetDistributionTenantByDomain`, the create, the update and the web ACL association report the
+  same field. Nothing on a read path mints or moves one, the clock-driven `InProgress` ->
+  `Deployed` transition included.
+- What remains is the TEXT of the token, which is a value the service generates per run and no
+  rule derives from the request: the recorded expectation is byte-identical across sweeps
+  (`EJZ50Z92T9DP30` in 20261109, 20261119 and this report) while this emulator's token changed
+  with unrelated changes to its mint (`E89FKDDMX3R403`, then `E1MJV490Q2CKJ1`), so the step
+  compares the recording's literal rather than the token handed out earlier in the same replayed
+  run. Answering it would mean fitting the recording.
+- `tests/all/tenant_version_token_is_minted_by_a_write.rs` pins the half the CLOCK owns — every
+  reader (the tenant's own read, an unfiltered listing, a listing filtered by the distribution and
+  a walk of one-entry pages) reports the token the last write minted, asked twice over while the
+  tenant propagates and again once it is deployed, and the token a deployed tenant's listing hands
+  out is still the only one its `If-Match` accepts. `tests/all/tenant_listing_version_token.rs`
+  pins the half a WRITE owns.
