@@ -34,6 +34,17 @@
 //! opt-in, and additionally dimensioned by `ShardId` for exactly the metrics the stream's
 //! enhanced monitoring names — so the last case mounts CloudWatch beside Kinesis on one engine
 //! and reads those series back where a client reads them.
+//!
+//! A consumer's LAG is the third rule of this suite, and the one the cases at the end of it
+//! are about: every read of a shard publishes how far behind the read left its consumer as the
+//! SAME figure the read itself answers with (`GetRecordsOutput$MillisBehindLatest`, and the
+//! same member of `SubscribeToShardEvent`: "The number of milliseconds the response is from
+//! the tip of the stream, indicating how far behind current time the consumer is. A value of
+//! zero indicates that record processing is caught up") — into the stream-level per-API series
+//! of the reader that took it, with no opt-in, and under `{StreamName, ShardId}` as well for a
+//! stream whose enhanced monitoring names the shard-level spelling of that lag. The figure is
+//! positive while records remain ahead of the reader and zero once it has read to the tip, and
+//! the zero is published too, so a client alarming on the lag evaluates either way.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -774,6 +785,9 @@ struct Reading {
     sum: f64,
     /// The sum of their `SampleCount` statistics: how many calls contributed.
     sample_count: f64,
+    /// The largest figure any one observation in the window carried, or `None` when the
+    /// window reported no datapoint at all.
+    maximum: Option<f64>,
     /// The unit each datapoint carries.
     units: Vec<String>,
 }
@@ -802,7 +816,7 @@ async fn series(monitored: &Monitored, case: &str, metric: &str, dimensions: Val
                 "StartTime": now - 3_600.0,
                 "EndTime": now + 3_600.0,
                 "Period": 60,
-                "Statistics": ["Sum", "SampleCount"],
+                "Statistics": ["Sum", "SampleCount", "Maximum"],
             }),
         )
         .await;
@@ -817,6 +831,10 @@ async fn series(monitored: &Monitored, case: &str, metric: &str, dimensions: Val
             .iter()
             .filter_map(|point| point["SampleCount"].as_f64())
             .sum(),
+        maximum: points
+            .iter()
+            .filter_map(|point| point["Maximum"].as_f64())
+            .reduce(f64::max),
         units: points
             .iter()
             .filter_map(|point| point["Unit"].as_str().map(str::to_string))
@@ -1180,4 +1198,371 @@ async fn a_streams_data_plane_publishes_its_aws_kinesis_series() {
              {reading:?}"
         );
     }
+}
+
+/// The stream-level series the PULL reader publishes its lag into: a per-API family, whose
+/// name carries the operation it is about, which is why the shard-level catalog
+/// ([`EVERY_METRIC`]) does not list this spelling
+/// (<https://docs.aws.amazon.com/streams/latest/dev/monitoring-with-cloudwatch.html>).
+const PULL_LAG: &str = "GetRecords.IteratorAgeMilliseconds";
+
+/// The stream-level series the PUSH reader publishes its lag into: its own per-API family,
+/// named after the member its event reports the same figure in.
+const PUSH_LAG: &str = "SubscribeToShardEvent.MillisBehindLatest";
+
+/// The SHARD-dimensioned spelling of that same lag: the value [`EVERY_METRIC`] carries for it,
+/// i.e. a member of the `MetricsName` catalog enhanced monitoring enables, which is why the
+/// per-shard series of the lag is published under this name rather than under a per-API one.
+const SHARD_LAG: &str = "IteratorAgeMilliseconds";
+
+/// Another metric of that same catalog, for the case that arms a stream with a shard-level
+/// metric which is NOT the lag.
+const SHARD_OUTGOING_RECORDS: &str = "OutgoingRecords";
+
+/// The unit a lag is published in: the `StandardUnit` value for milliseconds.
+const MILLISECONDS: &str = "Milliseconds";
+
+/// A lag in milliseconds as a datapoint carries it. Every lag these cases measure is a few
+/// milliseconds of a test's own run, so the conversion is exact.
+fn millis(lag: i64) -> f64 {
+    f64::from(i32::try_from(lag).expect("a lag of these cases is a few milliseconds"))
+}
+
+/// A `TRIM_HORIZON` iterator over `shard` of `stream`: the position of "the oldest data record
+/// in the shard" (`GetShardIteratorInput$ShardIteratorType`), where a consumer that has read
+/// nothing yet starts.
+async fn horizon_iterator(monitored: &Monitored, case: &str, stream: &str, shard: &str) -> String {
+    monitored
+        .kinesis(
+            case,
+            "GetShardIterator",
+            &json!({
+                "StreamName": stream,
+                "ShardId": shard,
+                "ShardIteratorType": "TRIM_HORIZON",
+            }),
+        )
+        .await["ShardIterator"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case}: GetShardIterator reports an iterator"))
+        .to_string()
+}
+
+/// Read at most `limit` records from the oldest record of `shard`, answering how many records
+/// the page served and the lag it reported.
+async fn read_from_the_horizon(
+    monitored: &Monitored,
+    case: &str,
+    stream: &str,
+    shard: &str,
+    limit: i64,
+) -> (usize, i64) {
+    let iterator = horizon_iterator(monitored, case, stream, shard).await;
+    let page = monitored
+        .kinesis(
+            case,
+            "GetRecords",
+            &json!({ "ShardIterator": iterator, "Limit": limit }),
+        )
+        .await;
+    let served = page["Records"].as_array().map(Vec::len).unwrap_or_default();
+    let lag = page["MillisBehindLatest"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("case {case}: GetRecords reports MillisBehindLatest, got {page}"));
+    (served, lag)
+}
+
+/// The series `metric` must hold `reported` — the figure the read itself answered with — as the
+/// largest lag any of its observations carried, in milliseconds.
+fn carries_the_lag(case: &str, metric: &str, reading: &Reading, reported: i64) {
+    assert!(
+        reading.datapoints >= 1,
+        "case {case}: expected {metric} to carry the lag the read measured, got {reading:?}"
+    );
+    assert!(
+        reading
+            .maximum
+            .is_some_and(|peak| (peak - millis(reported)).abs() < TOLERANCE),
+        "case {case}: expected {metric} to carry the lag the read reported ({reported} ms) as \
+         its largest observation, got {reading:?}"
+    );
+    assert!(
+        reading.units.iter().all(|unit| unit == MILLISECONDS),
+        "case {case}: expected {metric} to be published in {MILLISECONDS}, got {reading:?}"
+    );
+}
+
+/// RULE, for the pull reader: one `GetRecords` publishes the lag it reported — positive while
+/// records remain ahead of the consumer, zero once it has read to the tip — into the
+/// stream-level `GetRecords.IteratorAgeMilliseconds` and, because each row's stream enhances
+/// the lag, into the shard-dimensioned `IteratorAgeMilliseconds` beside it. The two identities
+/// carry the same figure, and neither name exists under the other's dimension set.
+///
+/// The rows differ along what the rule generalises over: how many records the shard holds, how
+/// many of them one page admits, and so whether the read leaves its consumer behind the tip or
+/// caught up with it.
+#[tokio::test]
+async fn a_read_publishes_the_lag_it_reported_into_the_streams_lag_series() {
+    assert!(
+        EVERY_METRIC.contains(&SHARD_LAG),
+        "the shard-level lag is a member of the enhanced-monitoring catalog, which is what a \
+         stream can enable it through"
+    );
+    let shard = shard_id(0);
+    // (the case, the records written, the records one page admits, the records it serves,
+    // whether the read leaves the consumer behind the tip)
+    let rows = [
+        ("one record of four", 4, 1, 1, true),
+        ("three records of four", 4, 3, 3, true),
+        ("every record of four", 4, 10, 4, false),
+        ("the only record there is", 1, 1, 1, false),
+        ("a shard nothing was written to", 0, 10, 0, false),
+    ];
+
+    for (case, written, limit, expect_served, behind) in rows {
+        // One engine per row, so a row's series hold only that row's own observations and the
+        // largest one of them is the lag its last read reported.
+        let monitored = Monitored::new();
+        let stream = "lag-series";
+        active_stream(&monitored, case, stream).await;
+        monitored
+            .kinesis(
+                case,
+                "EnableEnhancedMonitoring",
+                &json!({ "StreamName": stream, "ShardLevelMetrics": [SHARD_LAG] }),
+            )
+            .await;
+        for _ in 0..written {
+            put_one(&monitored, case, stream).await;
+        }
+
+        let reported = if behind {
+            // The data a consumer left behind the tip holds ages with the clock, so the case
+            // LOOKS again until a read reports that age rather than waiting for a duration.
+            // Every look reads the same records from the same position, so the figure it
+            // reports only grows and the last one is the largest the series holds.
+            let lag = std::cell::Cell::new(0_i64);
+            poll_until(
+                case,
+                "a read short of the tip reports a lag of its own",
+                || async {
+                    let (served, reported) =
+                        read_from_the_horizon(&monitored, case, stream, &shard, limit).await;
+                    assert_eq!(
+                        served, expect_served,
+                        "case {case}: expected the page to serve {expect_served} records, got \
+                         {served}"
+                    );
+                    lag.set(reported);
+                    reported > 0
+                },
+            )
+            .await;
+            lag.get()
+        } else {
+            let (served, reported) =
+                read_from_the_horizon(&monitored, case, stream, &shard, limit).await;
+            assert_eq!(
+                served, expect_served,
+                "case {case}: expected the page to serve {expect_served} records, got {served}"
+            );
+            assert_eq!(
+                reported, 0,
+                "case {case}: a reader that has read to the tip is caught up, so its page \
+                 reports no lag"
+            );
+            reported
+        };
+        assert_eq!(
+            reported > 0,
+            behind,
+            "case {case}: expected a read left behind the tip to report a lag and a caught-up \
+             one to report none, got {reported} ms"
+        );
+
+        let at_stream = series(&monitored, case, PULL_LAG, stream_level(stream)).await;
+        carries_the_lag(case, PULL_LAG, &at_stream, reported);
+        let at_shard = series(&monitored, case, SHARD_LAG, shard_level(stream, &shard)).await;
+        carries_the_lag(case, SHARD_LAG, &at_shard, reported);
+
+        // Each identity carries its OWN name: a per-API family is about the call and has no
+        // shard dimension, while the lag the enhanced-monitoring catalog names exists only per
+        // shard.
+        for (metric, dimensions, why) in [
+            (
+                PULL_LAG,
+                shard_level(stream, &shard),
+                "a per-API family carries no shard dimension",
+            ),
+            (
+                SHARD_LAG,
+                stream_level(stream),
+                "the catalog's lag is a shard-level metric",
+            ),
+        ] {
+            let reading = series(&monitored, case, metric, dimensions).await;
+            assert_eq!(
+                reading.datapoints, 0,
+                "case {case}: expected no {metric} under that dimension set, because {why}, got \
+                 {reading:?}"
+            );
+        }
+    }
+}
+
+/// RULE, for the two identities of the lag: the stream-level reading is published for every
+/// stream with no opt-in at all, while the shard-dimensioned one exists only for a stream whose
+/// own enhanced monitoring names THAT metric — the rows being a stream that enhanced the lag, a
+/// stream that enhanced nothing, and a stream that enhanced another metric of the catalog
+/// instead.
+#[tokio::test]
+async fn the_shard_dimensioned_lag_exists_only_where_enhanced_monitoring_names_it() {
+    let monitored = Monitored::new();
+    let shard = shard_id(0);
+    let case = "three streams, one enhanced set each";
+    // (the stream, the shard-level metrics its enhanced monitoring names)
+    let rows: [(&str, &[&str]); 3] = [
+        ("lag-armed", &[SHARD_LAG]),
+        ("lag-bare", &[]),
+        ("lag-other-metric", &[SHARD_OUTGOING_RECORDS]),
+    ];
+
+    for (stream, metrics) in rows {
+        active_stream(&monitored, case, stream).await;
+        if !metrics.is_empty() {
+            monitored
+                .kinesis(
+                    case,
+                    "EnableEnhancedMonitoring",
+                    &json!({ "StreamName": stream, "ShardLevelMetrics": metrics }),
+                )
+                .await;
+        }
+        put_one(&monitored, case, stream).await;
+        put_one(&monitored, case, stream).await;
+        let (served, reported) = read_from_the_horizon(&monitored, case, stream, &shard, 10).await;
+        assert_eq!(
+            served, 2,
+            "case {case}: expected {stream}'s read to serve both records, got {served}"
+        );
+        assert_eq!(
+            reported, 0,
+            "case {case}: expected {stream}'s reader to be caught up after reading to the tip, \
+             got {reported} ms"
+        );
+
+        // The stream-level reading is published whatever the stream enhanced...
+        let at_stream = series(&monitored, case, PULL_LAG, stream_level(stream)).await;
+        carries_the_lag(case, PULL_LAG, &at_stream, reported);
+
+        // ... and the shard-dimensioned one exactly when the set names the lag itself.
+        let at_shard = series(&monitored, case, SHARD_LAG, shard_level(stream, &shard)).await;
+        if metrics.contains(&SHARD_LAG) {
+            carries_the_lag(case, SHARD_LAG, &at_shard, reported);
+        } else {
+            assert_eq!(
+                at_shard.datapoints, 0,
+                "case {case}: {stream} does not enhance {SHARD_LAG}, so it publishes no \
+                 ShardId-dimensioned series of it, got {at_shard:?}"
+            );
+        }
+
+        // A stream that enhanced a DIFFERENT metric still publishes that one per shard, so the
+        // absence above is about which metric the set names and nothing else.
+        let other = series(
+            &monitored,
+            case,
+            SHARD_OUTGOING_RECORDS,
+            shard_level(stream, &shard),
+        )
+        .await;
+        let expected_other = usize::from(metrics.contains(&SHARD_OUTGOING_RECORDS));
+        assert_eq!(
+            other.datapoints.min(1),
+            expected_other,
+            "case {case}: expected the ShardId-dimensioned {SHARD_OUTGOING_RECORDS} of {stream} \
+             to exist only where its set names it, got {other:?}"
+        );
+        if expected_other == 1 {
+            assert!(
+                (other.sum - 2.0).abs() < TOLERANCE,
+                "case {case}: expected {stream}'s per-shard {SHARD_OUTGOING_RECORDS} to count \
+                 the records its read served, got {other:?}"
+            );
+        }
+    }
+}
+
+/// RULE, for the push reader: a `SubscribeToShard` delivery publishes its own lag into ITS
+/// per-API family, and into the shard-dimensioned lag the stream enhanced — a record leaves the
+/// shard the same way whichever reader asked for it — while the pull reader's family counts
+/// only pull reads.
+#[tokio::test]
+async fn a_push_delivery_publishes_its_own_lag_series() {
+    let monitored = Monitored::new();
+    let shard = shard_id(0);
+    let case = "a subscription from the horizon";
+    let stream = "lag-pushed";
+    active_stream(&monitored, case, stream).await;
+    monitored
+        .kinesis(
+            case,
+            "EnableEnhancedMonitoring",
+            &json!({ "StreamName": stream, "ShardLevelMetrics": [SHARD_LAG] }),
+        )
+        .await;
+    put_one(&monitored, case, stream).await;
+    put_one(&monitored, case, stream).await;
+
+    let consumer = monitored
+        .kinesis(
+            case,
+            "RegisterStreamConsumer",
+            &json!({ "StreamARN": stream_arn(REGION, stream), "ConsumerName": "lag-reader" }),
+        )
+        .await["Consumer"]["ConsumerARN"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case}: a registration answers a ConsumerARN"))
+        .to_string();
+    poll_until(case, "the consumer reports ACTIVE", || async {
+        let (status, response) = monitored
+            .call(
+                "kinesis",
+                "Kinesis_20131202.DescribeStreamConsumer",
+                &json!({ "ConsumerARN": consumer }),
+            )
+            .await;
+        status == 200 && response["ConsumerDescription"]["ConsumerStatus"].as_str() == Some("ACTIVE")
+    })
+    .await;
+
+    let (status, _) = monitored
+        .call(
+            "kinesis",
+            "Kinesis_20131202.SubscribeToShard",
+            &json!({
+                "ConsumerARN": consumer,
+                "ShardId": shard,
+                "StartingPosition": { "Type": "TRIM_HORIZON" },
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case}: expected the subscription to be established, got {status}"
+    );
+
+    // The delivery carried everything the shard held, so its consumer is caught up and the lag
+    // it publishes is zero — published, not omitted, under both identities.
+    let at_stream = series(&monitored, case, PUSH_LAG, stream_level(stream)).await;
+    carries_the_lag(case, PUSH_LAG, &at_stream, 0);
+    let at_shard = series(&monitored, case, SHARD_LAG, shard_level(stream, &shard)).await;
+    carries_the_lag(case, SHARD_LAG, &at_shard, 0);
+
+    // The pull reader's family counts pull reads, and this stream has had none.
+    let pull = series(&monitored, case, PULL_LAG, stream_level(stream)).await;
+    assert_eq!(
+        pull.datapoints, 0,
+        "case {case}: expected no {PULL_LAG} where nothing called GetRecords, got {pull:?}"
+    );
 }
