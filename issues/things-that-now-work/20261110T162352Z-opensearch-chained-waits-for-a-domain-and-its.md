@@ -42,3 +42,84 @@ Actual: all six are reported by the suite as [mismatch] with the single detail "
 3. Chain a second readiness wait on the same domain and the budget is gone: (a) AssociatePackages(DomainName=<name>, PackageList=[{PackageID: <a package in AVAILABLE>}]) then poll ListPackagesForDomain/DescribeDomainPackages until DomainPackageStatus=ACTIVE at a 10 s interval; or (b) CreateVpcEndpoint(DomainArn=<arn>, VpcOptions={SubnetIds:[<subnet in the domain's VPC>], SecurityGroupIds:[<sg>]}) then poll until Status=ACTIVE; or (c) poll DescribeDomain until ServiceSoftwareOptions is identical on three consecutive reads 20 s apart.
 4. With a 60 s per-call/per-check deadline the sequence never reaches the operation under test — DissociatePackages/AssociatePackages conflict handling, CreateIndex against analyzers/<PackageID>, UpdateVpcEndpoint with a subnet from a different VPC, or RollbackServiceSoftwareUpdate — and the run ends with no verdict.
 5. Re-replay: opensearch.associate-dissociate-packages-concurrent-race-conflict, opensearch.e2e-package-association-search-flow, opensearch.package-dissociation-blocks-dependent-index-creation-rejected, opensearch.update-index-dependency-failure-on-unavailable-package, opensearch.update-vpc-endpoint-out-of-range-subnet-rejected, opensearch.visibility-timeout-ttl-service-software-rollback-window-accepted.
+
+## Resolution
+
+Cause 1 of 1: DECLINED as to the one thing that is left — the LENGTH of the transient window
+each of these records rests in, a per-run timing value the model states nothing about and
+AWS's own is minutes of. The half of this report that is a requirement — "a read taken after
+the owed work is complete must publish the settled state on THAT read" — is what the emulator
+already does, on every one of the surfaces the report names, and it is now pinned by a test
+that drives the chains these six checks take.
+
+* What the emulator does today, on every surface this report lists: the read itself
+  materialises what the clock owed and then projects it, so the FIRST read taken past the
+  span publishes the settled state and no following poll is needed —
+  `DescribeDomain`/`DescribeDomainConfig` through `store.settled_mut(…)` → `Domain::settle`
+  (`src/state/domains.rs`), which also lands the service software (`ServiceSoftwareOptions`,
+  `src/state/service_software.rs`) and the domain's package associations
+  (`Domain::settle_package_associations`, reached by `ListPackagesForDomain`,
+  `DescribeDomainPackages` and `ListDomainsForPackage` alike), `DescribePackages` through the
+  package's own settle (`src/state/packages.rs`), and `DescribeVpcEndpoints` /
+  `ListVpcEndpoints` / `ListVpcEndpointsForDomain` through `store.settle_vpc_endpoints(now)`
+  (`src/state/vpc_endpoints.rs`).
+* Every operation the report lists as unreachable BEHIND those waits is served, and reached
+  through the wait rather than around it (new test below): the association settling at
+  exactly one `ACTIVE` entry; `CreateIndex` naming a file an associated `TXT-DICTIONARY`
+  package provides served while the package is on the domain and refused with the modelled
+  `ValidationException`, minting nothing, once it is off, then served again after a
+  re-association; `DissociatePackages` left in `DISSOCIATION_FAILED` with the service's
+  in-use error details while a live index's analyzer reads the package, and removing the
+  association once that index is gone; `UpdateVpcEndpoint` served on the endpoint the wait
+  found `ACTIVE` and owed its own span, with the groups it named in place once that span
+  passed; and `RollbackServiceSoftwareUpdate`
+  answering 200 with `RollbackServiceSoftwareOptions$RollbackAvailable` false and the
+  domain's `CurrentVersion` untouched. The parts not restated there are pinned on their
+  own axes by suites that already exist, so no second copy of them was added: the redundant
+  `AssociatePackages` and the concurrent `DissociatePackages` inside the `ASSOCIATING`
+  window both refused HTTP 409 `ConflictException`, by
+  `tests/all/package_associations.rs`, `tests/all/package_dissociation.rs` and
+  `tests/all/package_dependency_lifecycle.rs` (the last over a table of delays taken from
+  inside that span); the cross-VPC subnet refusal of `UpdateVpcEndpoint`
+  by `core/router/tests/all/opensearch_vpc_endpoint_vpc_membership.rs` (it needs EC2 mounted
+  beside this service, so it lives with the router); the agreement of repeated
+  `ServiceSoftwareOptions` reads, by `tests/all/clock_owed_readiness.rs`; and an associated
+  dictionary's content driving both the analyze API and a `match` query by
+  `tests/all/domain_analysis.rs::an_associated_packages_content_drives_the_analyzer_and_the_search`.
+* Why the remaining delta is not a defect: it is the arithmetic of the CHECKS' own poll
+  intervals against the replay harness's 60 s per-check budget. A client that reads
+  immediately after a call, then sleeps `interval_s`, pays ONE interval per wait for ANY
+  non-zero window — the read it takes ~50 ms after the call lands inside a 3 s window and
+  inside a 50 ms one alike. These checks chain two to four such waits at 10–30 s, and one of
+  them additionally needs three agreeing `ServiceSoftwareOptions` reads 20 s apart (40 s on
+  its own), so the budget is spent in the client's `time.sleep` whatever the emulator's
+  windows are; that is exactly where all six are cut off. Removing that cost would need a
+  window shorter than the latency between a call and the client's next read, i.e. effectively
+  zero, which makes the modelled transient state unobservable — `DomainStatus$Processing`
+  ("True if OpenSearch Service is processing configuration changes. False if the
+  configuration is active") with `DomainProcessingStatus` `Creating`,
+  `DomainPackageStatus$ASSOCIATING`/`DISSOCIATING` and `VpcEndpointStatus$CREATING`/`UPDATING`
+  are the values a client is told to wait ON — and contradicts this crate's own pinned
+  contract: `tests/all/clock_owed_readiness.rs` and `tests/all/successive_domain_transitions.rs`
+  (a read taken straight after the call reports the transient status) and
+  `tests/all/domain_activity_gates.rs` and `tests/all/package_dependency_lifecycle.rs` (that
+  in-flight state is what serializes a second writer, which is what two of these very checks
+  grade). AWS's own windows are minutes — far longer than this emulator's — so the same 60 s
+  budget would not complete against the real service either, and the recordings gave these
+  waits caps of 300–1800 s.
+* Replay: all six units still fail, and each on its own key, which is the client's own
+  `time.sleep(interval_s)` inside the wait helper — `_wait_association_gone_or_status`,
+  `_wait_domain_package_status`, `_poll_until`, `_wait_domain_package_dissociation_failed`,
+  `_wait_endpoint_active`, `_wait_service_software_settled` — before the graded call is
+  issued. No other cause diverges on them.
+* Pinned by `tests/all/clock_owed_readiness/chained_client_waits.rs`: the convergence rule
+  over the kinds a chain is built out of (the domain, a package, the association, a VPC
+  endpoint and a change to one, the dissociation that FAILS and the one that REMOVES the
+  association, and the quiescent service-software read), each look judged by an implication
+  rather than a stopwatch — a look taken past the span the service itself records MUST
+  already report the terminal state, a look inside it reports the transient one — so the test
+  states that a client's wait costs one look past the span and holds on a fast host and a
+  loaded one alike. Each wait is then followed by the call it gates, so those calls are
+  asserted as reached through the wait. The looking itself is the crate's own
+  `domain_lifecycle::poll_until`, and what each gated answer IS stays the sibling suites'
+  case, so this file adds one axis rather than a second copy of theirs.

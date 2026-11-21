@@ -61,7 +61,11 @@ pub(crate) async fn update_endpoint(emulator: &Emulator, id: &str, vpc_options: 
 
 /// `DescribeVpcEndpoints` for the read-back of ONE endpoint, through the suite's shared
 /// read: the endpoint it reports, with the call asserted to have been served.
-async fn read_endpoint(emulator: &Emulator, id: &str) -> Value {
+///
+/// `pub(crate)` for the same reason as [`update_endpoint`]: a sibling suite that reads an
+/// endpoint's members back after a change drives THIS read rather than growing a second copy
+/// of it.
+pub(crate) async fn read_endpoint(emulator: &Emulator, id: &str) -> Value {
     let answer = describe_endpoints(emulator, &[id]).await;
     assert_eq!(
         answer.status, 200,

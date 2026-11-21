@@ -37,7 +37,10 @@ use super::domain_lifecycle::{
 };
 
 /// `POST /2021-01-01/opensearch/serviceSoftwareUpdate/rollback`.
-async fn rollback(emulator: &Emulator, name: &str) -> Answer {
+///
+/// `pub(crate)` because a sibling suite that reaches this call through a readiness wait
+/// drives THIS wrapper rather than growing another copy of the path.
+pub(crate) async fn rollback(emulator: &Emulator, name: &str) -> Answer {
     emulator
         .call(
             "POST",

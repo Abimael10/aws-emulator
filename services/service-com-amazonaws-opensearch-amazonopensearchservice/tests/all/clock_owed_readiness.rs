@@ -29,21 +29,37 @@
 //! The control-plane harness comes from [`super::domain_lifecycle`]; this suite adds no
 //! second copy of it.
 
+use std::time::Duration;
+
 use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
     DEPLOYMENT_STATUS_COMPLETED, DOMAIN_PACKAGE_STATUS_ACTIVE, DOMAIN_PACKAGE_STATUS_ASSOCIATING,
-    PACKAGE_STATUS_AVAILABLE, PACKAGE_STATUS_COPYING, PACKAGE_TYPE_TXT_DICTIONARY,
-    PROCESSING_STATUS_ACTIVE, PROCESSING_STATUS_CREATING, VPC_ENDPOINT_STATUS_ACTIVE,
-    VPC_ENDPOINT_STATUS_CREATING,
+    DOMAIN_WORK, PACKAGE_ASSOCIATION_CHANGE, PACKAGE_STATUS_AVAILABLE, PACKAGE_STATUS_COPYING,
+    PACKAGE_TYPE_TXT_DICTIONARY, PROCESSING_STATUS_ACTIVE, PROCESSING_STATUS_CREATING,
+    PROVISIONING, VPC_ENDPOINT_CHANGE, VPC_ENDPOINT_STATUS_ACTIVE, VPC_ENDPOINT_STATUS_CREATING,
 };
 
 use super::domain_lifecycle::{Answer, Emulator, PREFIX, SETTLE_WAIT};
 use super::package_associations::create_package;
 
+/// What a client that CHAINS these waits — one per resource of a sequence — observes, in
+/// its own file beside this one: that each wait of the chain converges on one look past
+/// the span, and that the operations those waits gate are served through them.
+///
+/// The `#[path]` is what points this child at its own directory: this suite is itself
+/// reached through a `#[path]` from `tests/all.rs`, so a bare `mod` would resolve to a
+/// SIBLING suite.
+#[path = "clock_owed_readiness/chained_client_waits.rs"]
+mod chained_client_waits;
+
 /// One resource kind this rule covers: the name a failure reports it by, the status a
 /// create answers for it, and the status the clock owes it.
 struct Kind {
     case: &'static str,
+    /// The ONE span the clock owes a record of this kind before the status its create
+    /// answered with is owed the terminal one — the service's own constant, so a row
+    /// cannot drift from the window the handlers record.
+    span: Duration,
     transient: &'static str,
     terminal: &'static str,
 }
@@ -59,21 +75,25 @@ fn kinds() -> Vec<Kind> {
     vec![
         Kind {
             case: "a domain",
+            span: DOMAIN_WORK,
             transient: PROCESSING_STATUS_CREATING,
             terminal: PROCESSING_STATUS_ACTIVE,
         },
         Kind {
             case: "a package",
+            span: PROVISIONING,
             transient: PACKAGE_STATUS_COPYING,
             terminal: PACKAGE_STATUS_AVAILABLE,
         },
         Kind {
             case: "a domain-package association",
+            span: PACKAGE_ASSOCIATION_CHANGE,
             transient: DOMAIN_PACKAGE_STATUS_ASSOCIATING,
             terminal: DOMAIN_PACKAGE_STATUS_ACTIVE,
         },
         Kind {
             case: "a VPC endpoint",
+            span: VPC_ENDPOINT_CHANGE,
             transient: VPC_ENDPOINT_STATUS_CREATING,
             terminal: VPC_ENDPOINT_STATUS_ACTIVE,
         },
