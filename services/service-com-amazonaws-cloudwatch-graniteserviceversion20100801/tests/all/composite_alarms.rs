@@ -843,11 +843,17 @@ async fn actions_are_suppressed_while_the_suppressor_alarm_is_in_alarm() {
     .await;
 
     wait_for_evaluation();
-    let quiet = composite_alarm(&router, "suppressed").await;
+    let waiting = composite_alarm(&router, "suppressed").await;
+    // " When the value is WaitPeriod, it means that the actions are suppressed because the
+    // composite alarm is waiting for the suppressor alarm to go into into the ALARM state. The
+    // maximum waiting time is as specified in ActionsSuppressorWaitPeriod. "
+    // (`CompositeAlarm$ActionsSuppressedBy`) — this alarm went into ALARM with its suppressor
+    // still outside that state, so the wait is what withholds its actions
+    // (`crate::state::composite_suppression`).
     assert_eq!(
-        quiet.get("ActionsSuppressedBy"),
-        None,
-        "a suppressor outside ALARM suppresses nothing, got {quiet}"
+        text(&waiting, "ActionsSuppressedBy").as_deref(),
+        Some("WaitPeriod"),
+        "an alarm that goes into ALARM before its suppressor does waits for it, got {waiting}"
     );
 
     // "Actions will be suppressed if the suppressor alarm is in the ALARM state."

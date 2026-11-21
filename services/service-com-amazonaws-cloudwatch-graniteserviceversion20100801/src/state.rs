@@ -1457,13 +1457,22 @@ pub struct StoredCompositeAlarm {
     /// evaluation is owed from the write itself, a composite alarm's state being a value
     /// DERIVED from its children's current states rather than a transition a clock owes.
     pub evaluation_due_secs: f64,
-    /// The instant, in epoch seconds, at which the EXTENSION PERIOD this alarm's action
-    /// suppression is in ends; `None` when it is in none.
+    /// The instant, in epoch seconds, at which the timed suppression period this alarm's
+    /// actions are held by ends; `None` when they are held by none.
     ///
-    /// Opened by the evaluation that sees the suppressor alarm leave `ALARM` while it was
-    /// suppressing this alarm's actions, and read by every later evaluation until it passes
-    /// ([`composite_suppression`]).
+    /// Opened by the evaluation that moves this alarm into `ALARM` while its suppressor is not
+    /// in that state (the WAIT period) and by the one that sees the suppressor LEAVE `ALARM`
+    /// while it was suppressing this alarm's actions (the EXTENSION period), and read by every
+    /// later evaluation until it passes ([`composite_suppression`]).
     pub actions_suppressed_until_secs: Option<f64>,
+    /// Whether a transition of this alarm had its configured actions WITHHELD by the
+    /// suppression and has not had them performed yet.
+    ///
+    /// "After this time, the composite alarm performs its actions."
+    /// (`CompositeAlarm$ActionsSuppressorWaitPeriod`) — the actions a suppressed transition did
+    /// not execute are owed once nothing suppresses them any more, so the evaluation that ends
+    /// the suppression performs them, and this is what tells it there are any to perform.
+    pub actions_withheld: bool,
     /// The states of the alarms this one's rule references, as they stood when
     /// `SetAlarmState` last forced this alarm's state; `None` when the alarm's state is its
     /// own evaluated one.

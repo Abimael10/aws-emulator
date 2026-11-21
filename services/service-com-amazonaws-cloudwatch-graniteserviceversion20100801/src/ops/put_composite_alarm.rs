@@ -576,9 +576,11 @@ fn write_composite_alarm(
             evaluation_due_secs: now,
             // The stored state is this write's own, not one `SetAlarmState` forced.
             forced_child_states: None,
-            // No evaluation has seen a suppressor leave `ALARM` for this alarm yet, so no
-            // extension period is in force (`crate::state::composite_suppression`).
+            // No evaluation has opened a suppression period for this alarm yet, so none is in
+            // force and nothing it configured is withheld
+            // (`crate::state::composite_suppression`).
             actions_suppressed_until_secs: None,
+            actions_withheld: false,
         },
     );
     store.record_history(

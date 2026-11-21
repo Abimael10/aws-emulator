@@ -322,6 +322,26 @@ impl AlarmNotification {
     }
 }
 
+/// The action list an alarm fires on moving to `state`: "the actions to execute when this alarm
+/// transitions to the ALARM state from any other state" (`CompositeAlarm$AlarmActions`), and the
+/// same for `OKActions` and `InsufficientDataActions`.
+///
+/// ONE reading of which list belongs to which state, so the dispatch of a transition's actions
+/// and the record of the actions a transition did NOT execute cannot name different ARNs.
+pub(super) fn actions_of_state<'a>(
+    state: &str,
+    ok_actions: Option<&'a [String]>,
+    alarm_actions: Option<&'a [String]>,
+    insufficient_data_actions: Option<&'a [String]>,
+) -> Option<&'a [String]> {
+    match state {
+        super::ALARM_STATE_ALARM => alarm_actions,
+        super::ALARM_STATE_OK => ok_actions,
+        super::ALARM_STATE_INSUFFICIENT_DATA => insufficient_data_actions,
+        _ => None,
+    }
+}
+
 /// One alarm state transition, as a notification is built from it.
 ///
 /// Both kinds of alarm carry the same identity, the same three action lists and the same
@@ -359,12 +379,12 @@ impl Transition<'_> {
         // them, and one that carries no action for the state it moved to has none to fire. The
         // transition itself still happened, and the event it publishes is owed whichever is
         // the case, so it is the ACTION LIST that is empty here rather than the record absent.
-        let actions: Vec<String> = match self.new_state_value {
-            super::ALARM_STATE_ALARM => self.alarm_actions,
-            super::ALARM_STATE_OK => self.ok_actions,
-            super::ALARM_STATE_INSUFFICIENT_DATA => self.insufficient_data_actions,
-            _ => None,
-        }
+        let actions: Vec<String> = actions_of_state(
+            self.new_state_value,
+            self.ok_actions,
+            self.alarm_actions,
+            self.insufficient_data_actions,
+        )
         .filter(|_| self.actions_enabled)
         .unwrap_or_default()
         .to_vec();
