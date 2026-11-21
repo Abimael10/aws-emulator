@@ -327,11 +327,16 @@ async fn given_configured_stage(
     .await;
 }
 
-/// Push `payload` to `connection_id` through the `@connections` management API, which must
-/// answer `200`: an out-of-band message the api sends the client.
+/// Push `payload` to `connection_id` through the `@connections` management API of `stage`,
+/// which must answer `200`: an out-of-band message the api sends the client.
+///
+/// The STAGE is part of the endpoint — these operations are published at
+/// `…/{stage}/@connections/{id}` — so an addressing that names no deployed stage serves
+/// nothing at all and the push would be refused `403` instead.
 pub(crate) async fn pushed(
     emulator: &MultiServiceRouter,
     case: &str,
+    stage: &str,
     connection_id: &str,
     payload: &str,
 ) {
@@ -339,7 +344,7 @@ pub(crate) async fn pushed(
     let addressed = crate::path_label::addressed(connection_id);
     let request = smithy_server_runtime::http::Request::builder()
         .method("POST")
-        .uri(format!("https://{host}/@connections/{addressed}"))
+        .uri(format!("https://{host}/{stage}/@connections/{addressed}"))
         .header("host", &host)
         .header("authorization", authorization("execute-api"))
         .body(bytes::Bytes::from(payload.to_string()))
@@ -591,7 +596,7 @@ async fn each_stage_publishes_the_counters_its_own_traffic_produced() {
         "case {case:?}: a route that produced no reply is answered with the gateway's own \
          frame, got {failed:?}"
     );
-    pushed(&emulator, case, &connection_id, r#"{"pushed":true}"#).await;
+    pushed(&emulator, case, "detailed", &connection_id, r#"{"pushed":true}"#).await;
     let delivered = tokio::time::timeout(
         SERIES_DEADLINE,
         futures_util::StreamExt::next(&mut detailed),

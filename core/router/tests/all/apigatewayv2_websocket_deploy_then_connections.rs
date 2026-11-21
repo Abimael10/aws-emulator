@@ -653,21 +653,20 @@ fn the_two_execute_api_services_route_apart_under_one_signing_name() {
         error_code: Option<&'static str>,
     }
 
-    // This emulator holds NO api, so no stage of one is deployed: a `@connections` row
-    // addressed through an invoke path (a stage, a custom domain's base path) is refused by
-    // the management API as an endpoint that serves nothing (403 `ForbiddenException`),
-    // while one at the MODELLED path addresses no stage and is refused on the
-    // `ConnectionId`'s own shape instead — it could never have been MINTED — with 400
-    // `BadRequestException`. Either way the answer is one only that service can give.
+    // This emulator holds NO api, so no stage of one is deployed: every `@connections` row is
+    // refused by the management API as an endpoint that serves nothing (403
+    // `ForbiddenException`) — whether it is addressed through an invoke path (a stage, a custom
+    // domain's base path) or at the MODELLED path, which carries no stage segment and so names
+    // no stage at all. Either way the answer is one only that service can give.
     const CLAIMS: &[Claim] = &[
         Claim {
-            name: "GetConnection at the modelled path",
+            name: "GetConnection at the modelled path, which names no stage",
             host: "abcdef1234.execute-api.us-east-1.amazonaws.com",
             method: "GET",
             path: "/@connections/no-such-connection",
             body: "",
-            status: Some(400),
-            error_code: Some("BadRequestException"),
+            status: Some(403),
+            error_code: Some("ForbiddenException"),
         },
         Claim {
             name: "GetConnection through a stage invoke path",

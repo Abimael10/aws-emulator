@@ -16,7 +16,8 @@
 //! > **A `@connections` request is served only on an endpoint that resolves to a DEPLOYED
 //! > stage**: these operations are reached through the owning api's own invoke endpoint
 //! > (`…/{stage}/@connections/{id}`, per `Api$ApiEndpoint`), so an addressing whose stage no
-//! > api has deployed is refused with the modelled `ForbiddenException` (HTTP 403) and the
+//! > api has deployed — a stage name nothing deployed, and a path that names no stage at all —
+//! > is refused with the modelled `ForbiddenException` (HTTP 403) and the
 //! > sentence API Gateway words that refusal in, BEFORE the `ConnectionId` is judged and
 //! > before the connection store is consulted.
 //!
@@ -29,8 +30,8 @@
 //!
 //! The rows differ along what each rule generalises over: the operation (all three), the
 //! failure class (the memberless 410 and 403, the 400 that carries a sentence, the modelled
-//! 413), the connection-id form, and the invoke-path prefix (none, a deployed stage, a stage
-//! nothing deployed, a two-segment base path).
+//! 413), the connection-id form, and the invoke-path prefix (a deployed stage, a stage nothing
+//! deployed, a two-segment base path, and a path carrying no stage segment at all).
 
 use std::any::Any;
 use std::sync::Arc;
@@ -49,12 +50,20 @@ use crate::support::{
 /// The `Data` maximum the model declares, read from the crate constant.
 const MAX_DATA_BYTES: usize = mgmt::ops::post_to_connection::MAX_DATA_BYTES;
 
-/// The prefix the installed reading below treats as a deployed stage, and two it does not.
+/// The prefix the installed reading below treats as a deployed stage, and four it does not.
+///
+/// The first segment of an `execute-api` invoke path IS the stage name ("the stage name is
+/// typically appended to this URI to form a complete path to a deployed API stage",
+/// `Api$ApiEndpoint`), so a path carrying NO segment in front of the modelled binding names no
+/// stage at all and the endpoint serves nothing — which is the form a client that never
+/// overrode its SDK's endpoint sends.
 const DEPLOYED_PREFIX: &str = "/dev";
-const UNDEPLOYED_PREFIXES: [(&str, &str); 3] = [
+const UNDEPLOYED_PREFIXES: [(&str, &str); 5] = [
     ("a stage name nothing deployed", "/test"),
     ("a stage whose spelling is nearly the deployed one", "/Dev"),
     ("a two-segment base path nothing maps", "/v1/socket"),
+    ("no stage segment at all", ""),
+    ("no stage segment, with a bare path separator", "/"),
 ];
 
 /// The three operations, by the method each is reached with, and the payload each sends.
@@ -409,6 +418,118 @@ async fn an_addressing_nothing_judges_is_served() {
             "case {case:?}: expected the registry's own answer, got {status} {}",
             rendered(&body)
         );
+    }
+}
+
+/// An invoke path that carries NO stage segment names no stage, so the endpoint it addresses
+/// serves nothing: it is refused 403 `ForbiddenException` exactly as a stage nothing deployed
+/// is, for every operation and for every `ConnectionId` form — the endpoint is resolved from
+/// the addressing alone, in front of the id and in front of the store.
+///
+/// This is the form a client that never overrode its SDK's endpoint sends, and the one that
+/// used to be served as though the modelled path were the api's own deployed invoke endpoint.
+#[tokio::test]
+async fn an_addressing_that_names_no_stage_serves_nothing() {
+    // The two prefixes that carry no stage segment, read out of the table above so the rows
+    // and this case cannot drift apart.
+    let stageless: Vec<(&str, &str)> = UNDEPLOYED_PREFIXES
+        .into_iter()
+        .filter(|(_, prefix)| prefix.trim_matches('/').is_empty())
+        .collect();
+    assert_eq!(
+        stageless.len(),
+        2,
+        "the table must carry the stageless addressings, got {stageless:?}"
+    );
+
+    let malformed = ids_api_gateway_does_not_mint();
+    for (prefix_case, prefix) in stageless {
+        for (method, payload) in OPERATIONS {
+            let engine = engine_with_one_deployed_stage();
+            // A LIVE connection and, below, ids of both other forms: whatever the request
+            // names, the endpoint answers first.
+            let live = MINTED_IDS[0].1;
+            register(&engine, live, "192.0.2.13", "sender/7", connected_at());
+
+            let mut ids: Vec<(String, String)> = vec![
+                ("the live connection's own id".to_string(), live.to_string()),
+                (
+                    "an id of the issued form nothing holds".to_string(),
+                    MINTED_IDS[1].1.to_string(),
+                ),
+            ];
+            ids.extend(
+                malformed
+                    .iter()
+                    .map(|(id_form, id)| (id_form.to_string(), id.clone())),
+            );
+
+            for (id_form, connection_id) in ids {
+                let case =
+                    format!("{method} with {id_form} through {prefix_case} ({prefix:?})");
+                let (status, headers, body) = call_with_headers(
+                    &engine,
+                    HOST,
+                    method,
+                    &path(prefix, &connection_id),
+                    payload.to_vec(),
+                )
+                .await;
+                assert_eq!(
+                    status, 403,
+                    "case {case:?}: an addressing that names no stage must answer the modelled \
+                     HTTP 403, got {status} {}",
+                    rendered(&body)
+                );
+                assert_eq!(
+                    error_code(&headers),
+                    "ForbiddenException",
+                    "case {case:?}: expected ForbiddenException in x-amzn-errortype, got {}",
+                    error_code(&headers)
+                );
+                assert_eq!(
+                    error_message(&body),
+                    "Forbidden",
+                    "case {case:?}: expected the sentence API Gateway refuses an endpoint \
+                     with, got {}",
+                    rendered(&body)
+                );
+            }
+
+            // Nothing about the connection changed: no delivery, no `LastActiveAt` move, and
+            // the DELETE rows did not remove it — which is what "in front of the store" means
+            // on the wire.
+            let stored = mgmt::state::connection(&*engine, live).unwrap_or_else(|| {
+                panic!("case {prefix_case:?}: the connection must still exist")
+            });
+            assert_eq!(
+                stored.delivered_count, 0,
+                "case {prefix_case:?}: a refused call must deliver nothing, got {} deliveries",
+                stored.delivered_count
+            );
+            assert_eq!(
+                stored.last_active_at, stored.connected_at,
+                "case {prefix_case:?}: a refused call must not move LastActiveAt, got {:?}",
+                stored.last_active_at
+            );
+
+            // And the DEPLOYED stage serves the very same call.
+            let (status, _, body) = call_with_headers(
+                &engine,
+                HOST,
+                method,
+                &path(DEPLOYED_PREFIX, live),
+                payload.to_vec(),
+            )
+            .await;
+            let expected = if method == "DELETE" { 204 } else { 200 };
+            assert_eq!(
+                status, expected,
+                "case {prefix_case:?}: the deployed stage must answer {expected}, got {status} \
+                 {}",
+                rendered(&body)
+            );
+        }
     }
 }
 

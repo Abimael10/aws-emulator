@@ -562,6 +562,7 @@ async fn each_message_a_carried_connection_exchanges_raises_the_stage_counters()
             pushed(
                 &emulator,
                 case,
+                stage,
                 &addressed,
                 &format!(r#"{{"pushed":{push}}}"#),
             )

@@ -17,7 +17,9 @@
 //! ([`super::invoke`], [`super::websocket`]): an `execute-api` endpoint serves a stage of an
 //! api it holds whose deployment has been released, and an addressing that resolves to no
 //! such stage is not the caller's to invoke — `403` `Forbidden`
-//! ([`super::data_plane::FORBIDDEN_MESSAGE`]).
+//! ([`super::data_plane::FORBIDDEN_MESSAGE`]). The FIRST segment of an invoke path is the
+//! stage name, so an addressing that carries no segment in front of the `@connections`
+//! binding resolves no stage at all and is one of those.
 
 use std::any::Any;
 
@@ -76,16 +78,12 @@ fn addressed(engine: &dyn Any, host: Option<&str>, prefix: &str) -> Option<Addre
 ///
 /// The VERDICT is the resolution ([`resolved_in`]) read as a yes or no, so the addressing a
 /// request is served on and the resource it is authorized against are one answer: an
-/// addressing that names no stage at all is judged by nobody, one that resolves a deployed
-/// stage is the caller's to invoke, and every other is not.
+/// addressing that resolves a deployed stage is the caller's to invoke, and every other is
+/// not — including one whose invoke path carries NO segment in front of the modelled binding,
+/// since the first segment of an `execute-api` invoke path is the stage name, so a path
+/// without one names no stage and the endpoint serves nothing.
 fn judged_in(store: &ServiceStore, host: Option<&str>, prefix: &str) -> EndpointAuthority {
-    let addressed = addressing(store, host, prefix);
-    if path_segments(addressed.1).is_empty() {
-        // The modelled path itself: the addressing names no stage, so there is nothing here
-        // to judge.
-        return EndpointAuthority::Unjudged;
-    }
-    match resolved(store, host, addressed) {
+    match resolved_in(store, host, prefix) {
         Some(_stage) => EndpointAuthority::Deployed,
         None => EndpointAuthority::Undeployed,
     }

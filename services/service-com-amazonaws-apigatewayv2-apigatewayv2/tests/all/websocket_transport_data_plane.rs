@@ -821,6 +821,11 @@ async fn deleting_the_api_closes_the_socket_it_announced() {
 /// `execute-api`.
 const CONNECTIONS_HOST: &str = "execute-api.eu-west-1.amazonaws.com";
 
+/// The stage the api below deploys, which is the segment its `@connections` callback URL
+/// carries: these operations are published at `…/{stage}/@connections/{id}`, and an endpoint
+/// that names no deployed stage serves nothing at all.
+const CONNECTIONS_STAGE: &str = "prod";
+
 /// A router serving the api's control plane AND the `@connections` management API over ONE
 /// engine, which is how a connection the api's socket carries is the connection that API
 /// addresses.
@@ -848,7 +853,9 @@ async fn connections_call(
 ) -> (u16, Value) {
     let request = http::Request::builder()
         .method(method)
-        .uri(format!("https://{CONNECTIONS_HOST}/@connections/{connection_id}"))
+        .uri(format!(
+            "https://{CONNECTIONS_HOST}/{CONNECTIONS_STAGE}/@connections/{connection_id}"
+        ))
         .header("host", CONNECTIONS_HOST)
         .header(
             "authorization",
@@ -901,9 +908,9 @@ async fn a_carried_connection_is_posted_to_and_then_gone_after_the_client_closes
     )
     .await;
     create_route(&emulator, case, &api.api_id, "$default", &integration, true).await;
-    create_stage(&emulator, case, &api.api_id, "prod", true).await;
+    create_stage(&emulator, case, &api.api_id, CONNECTIONS_STAGE, true).await;
 
-    let mut socket = handshake(case, &api.authority, "prod")
+    let mut socket = handshake(case, &api.authority, CONNECTIONS_STAGE)
         .await
         .unwrap_or_else(|status| panic!("case {case:?}: the handshake must complete, got {status}"));
     let connection_id = exchange(case, &mut socket, r#"{"action":"whoami"}"#)

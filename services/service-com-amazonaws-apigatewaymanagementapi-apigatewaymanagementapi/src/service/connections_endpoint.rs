@@ -13,12 +13,19 @@
 //! sentence API Gateway's `execute-api` endpoint words that refusal in, BEFORE the request is
 //! dispatched and so before the connection store is consulted at all.
 //!
+//! The FIRST segment of such an invoke path is that stage name, so an addressing carrying no
+//! segment in front of the modelled binding names no stage either — the callback URL of a
+//! client that never appended the stage, or never overrode its SDK's own endpoint — and it is
+//! one of the addressings that serve nothing.
+//!
 //! WHY it must be refused rather than answered: `GoneException` (410) is the documented
 //! signal that a peer went away, and a sender prunes its own record of that connection on
 //! it. A client pointed at a stage that was never deployed — a typo, a stale or deleted
-//! stage — would then be told its subscribers had vanished rather than that it may not
-//! invoke the endpoint, so a misconfiguration is indistinguishable from a closed socket and
-//! the per-stage boundary that exists on AWS does not exist here.
+//! stage, a callback URL with no stage at all — would then be told its subscribers had
+//! vanished, or that the id it computed is not an identifier, rather than that it may not
+//! invoke the endpoint; so a misconfigured callback URL is indistinguishable from a closed
+//! socket or a client-side id defect, and the per-stage boundary that exists on AWS does not
+//! exist here.
 //!
 //! WHO decides it: the apis, the stages and the deployment released to each stage are API
 //! Gateway V2's records, which this service cannot read, so that service installs its own
@@ -56,16 +63,21 @@ const FORBIDDEN_MESSAGE: &str = "Forbidden";
 /// request must be refused ([`forbidden`]) instead of dispatched.
 ///
 /// `prefix` is the invoke path in front of the modelled `/@connections/{ConnectionId}`
-/// binding and `host` the endpoint host the request named, when it named one. An empty prefix
-/// is the modelled path itself, which addresses no stage and so is never refused here.
+/// binding and `host` the endpoint host the request named, when it named one. EVERY
+/// addressing is put to the reading, the EMPTY prefix included: the first segment of an
+/// `execute-api` invoke path IS the stage ("the stage name is typically appended to this URI
+/// to form a complete path to a deployed API stage", `Api$ApiEndpoint`), so a path that
+/// carries no segment in front of the modelled binding names no stage at all, which is an
+/// endpoint that serves nothing rather than one to serve from.
+///
+/// Only a reading that answers [`EndpointAuthority::Undeployed`] refuses. An addressing
+/// nothing judges — no owner of stages mounted, so no record says which stages are deployed —
+/// is served as the modelled binding alone decides.
 pub fn addresses_nothing<Eng: Send + Sync + 'static>(
     engine: &Eng,
     host: Option<&str>,
     prefix: &str,
 ) -> bool {
-    if prefix.is_empty() {
-        return false;
-    }
     let Some(cell) = crate::state::connections_endpoint_authority(engine) else {
         return false;
     };
