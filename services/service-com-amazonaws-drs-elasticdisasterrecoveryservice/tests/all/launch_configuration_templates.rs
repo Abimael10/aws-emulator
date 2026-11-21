@@ -51,8 +51,9 @@ const INVALID_REQUEST_BODY: &str = "Invalid request body";
 const NOT_FOUND_CODE: &str = "ResourceNotFoundException";
 
 /// `^lct-[0-9a-zA-Z]{17}$`, the model's `LaunchConfigurationTemplateID` pattern
-/// (length 21..21), checked without pulling in a regex engine.
-fn is_template_id(value: &str) -> bool {
+/// (length 21..21), checked without pulling in a regex engine. `pub(crate)` so a
+/// sibling suite of this target reuses it rather than keeping a second copy.
+pub(crate) fn is_template_id(value: &str) -> bool {
     let Some(suffix) = value.strip_prefix("lct-") else {
         return false;
     };
