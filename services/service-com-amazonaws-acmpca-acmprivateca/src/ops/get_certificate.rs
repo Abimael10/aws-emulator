@@ -175,17 +175,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_arn(crate::state::INVALID_ARN_MESSAGE.to_string()));
         };
 
-        // A certificate ARN carries the ARN of the CA that issued it as its prefix, so one
-        // CA's certificate never resolves against another's: under the CA the request
-        // names, such an ARN is one more certificate that CA holds no record of, so it is
-        // answered with the service's one sentence for an absent certificate rather than
-        // with a sentence of its own built out of the request.
-        if issuing_ca_arn != ca_arn {
-            return Err(not_found(
-                crate::state::CERTIFICATE_NOT_FOUND_MESSAGE.to_string(),
-            ));
-        }
-
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetCertificateErrorModeled::RequestFailedException(
                 RequestFailedException {
@@ -201,13 +190,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found(crate::state::CA_NOT_FOUND_MESSAGE.to_string()));
         };
 
-        // This read is ABOUT the certificate the request names, so that certificate is
-        // what it reports on: an ARN this CA holds no record of is the absence of that
-        // CERTIFICATE, whatever status the authority rests in and whether or not it holds a
-        // certificate of its OWN yet. The authority's readiness is a fact about the
-        // authority, never the reason a certificate could not be resolved — a caller
-        // probing for a certificate, or polling for one it asked to have issued, branches
-        // on the absence of the certificate it asked about.
+        // "You can retrieve the certificate if it is in the ISSUED, EXPIRED, or REVOKED
+        // state" (this operation's docs): a certificate in any of those states is one the
+        // CA signed, so an authority whose key has signed NOTHING yet — it holds no
+        // certificate of its own and has issued none — could not have issued whatever
+        // certificate the request names, and what it owes the caller is the refusal about
+        // the AUTHORITY's state, judged before the certificate ARN is resolved on it. That
+        // is the one condition a caller fixes by finishing the CA's activation rather than
+        // by asking for another certificate, which is why it is not reported as a missing
+        // certificate.
+        if !record.could_have_issued_certificates() {
+            return Err(invalid_state(
+                crate::state::not_in_state_to_have_issued_message(&ca_arn),
+            ));
+        }
+
+        // A certificate ARN carries the ARN of the CA that issued it as its prefix, so one
+        // CA's certificate never resolves against another's: under the CA the request
+        // names, such an ARN is one more certificate that CA holds no record of, so it is
+        // answered with the service's one sentence for an absent certificate rather than
+        // with a sentence of its own built out of the request.
+        if issuing_ca_arn != ca_arn {
+            return Err(not_found(
+                crate::state::CERTIFICATE_NOT_FOUND_MESSAGE.to_string(),
+            ));
+        }
+
+        // Past that gate the CA has signed certificates, so this read is ABOUT the
+        // certificate the request names and that certificate is what it reports on: an ARN
+        // this CA holds no record of is the absence of that CERTIFICATE, whatever status
+        // the authority rests in and whether or not it holds a certificate of its OWN yet.
         //
         // `RequestInProgressException` is kept for the one thing it says — a certificate
         // this CA really is minting, which a caller may retry for (below).
@@ -247,6 +259,14 @@ fn invalid_arn(message: String) -> GetCertificateError {
 /// cannot be found."
 fn not_found(message: String) -> GetCertificateError {
     GetCertificateErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// "The state of the private CA does not allow this action to occur."
+fn invalid_state(message: String) -> GetCertificateError {
+    GetCertificateErrorModeled::InvalidStateException(InvalidStateException {
         message: Some(message),
     })
     .into()

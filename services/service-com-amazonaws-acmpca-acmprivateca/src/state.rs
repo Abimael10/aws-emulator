@@ -1376,6 +1376,23 @@ impl CertificateAuthorityRecord {
         })
     }
 
+    /// Whether this CA's private key has signed a certificate yet, so that a certificate
+    /// read on it is about a certificate it could be holding at all.
+    ///
+    /// A CA signs with its own key, so a certificate exists under it only once that key has
+    /// been used: either the CA holds a certificate of its own (it was activated, so it can
+    /// sign for others) or it has already issued one, which before activation is the ONE
+    /// certificate a root signs for itself ([`signs_its_own_root_certificate`]). An
+    /// authority that has done neither — one still being created, or still waiting for its
+    /// certificate and not yet asked to sign anything — has no issuance history at all, and
+    /// the refusal it owes a request about one of its certificates is the one about the
+    /// AUTHORITY's state ([`not_in_state_to_have_issued_message`]).
+    ///
+    /// [`signs_its_own_root_certificate`]: Self::signs_its_own_root_certificate
+    pub fn could_have_issued_certificates(&self) -> bool {
+        self.ca_certificate_pem.is_some() || !self.certificates.is_empty()
+    }
+
     /// Whether this CA is being asked for the one certificate it can sign before it holds
     /// a certificate of its own: its SELF-SIGNED ROOT certificate.
     ///
