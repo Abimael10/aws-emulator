@@ -57,7 +57,7 @@ const DEADLINE: Duration = Duration::from_secs(60);
 
 /// A cluster that has finished provisioning, with the kubeconfig members a client
 /// builds its connection from, and a handle on the engine behind the emulator.
-async fn published_cluster(
+pub(crate) async fn published_cluster(
     name: &str,
 ) -> (
     MultiServiceRouter,

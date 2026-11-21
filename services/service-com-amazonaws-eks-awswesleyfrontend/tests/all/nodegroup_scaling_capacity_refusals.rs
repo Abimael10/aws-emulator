@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! `UpdateNodegroupConfig` words a `scalingConfig` refusal the way Amazon EKS does:
-//! it names the BOUND the desired size falls outside of, with the capacities the
-//! change would leave the node group with.
+//! it names the CAPACITY the change asked the node group to run at and the bound it
+//! falls outside of, with the capacities the change would leave the node group with.
 //!
 //! The RULE under test: "the Cluster Autoscaler doesn't scale a managed node group
 //! lower than `minSize` or higher than `maxSize`"
@@ -10,7 +10,7 @@
 //! outside either bound is refused `InvalidParameterException` (400) — as
 //! `Minimum capacity <minSize> can't be greater than desired size <desiredSize>`
 //! when it is below the lower bound, and as
-//! `Maximum capacity <maxSize> can't be less than desired size <desiredSize>` when
+//! `desired capacity <desiredSize> can't be greater than max size <maxSize>` when
 //! it is above the upper one. The two numbers in each sentence are the capacities
 //! the node group would carry after the change, which is the merged triple:
 //! "when updating a node group, you can specify any or none of the properties"
@@ -26,9 +26,8 @@
 //! in `tests/all/wire.rs`; the cluster and node group setup is
 //! `nodegroup_lifecycle`'s, so this suite grows no second copy of either.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use service_com_amazonaws_eks_awswesleyfrontend::state::NODEGROUP_ACTIVATION_DELAY;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cluster_lifecycle::REGION;
@@ -76,6 +75,15 @@ async fn describe_nodegroup(router: &MultiServiceRouter, cluster: &str, name: &s
     .await
 }
 
+/// How long a polled read is given before the setup is declared broken. Generous
+/// on purpose: the span a node group settles over is one the service chose in
+/// milliseconds, so a deadline in seconds leaves a loaded host all the room it
+/// needs without ever being the thing a case measures.
+const DEADLINE: Duration = Duration::from_secs(60);
+
+/// How often that read is repeated: the loop ends on the first read that holds.
+const INTERVAL: Duration = Duration::from_millis(25);
+
 /// Stand up one `ACTIVE` node group named `ng` on a cluster of its own, carrying
 /// the capacities above.
 async fn active_nodegroup(router: &MultiServiceRouter, cluster: &str) {
@@ -91,7 +99,21 @@ async fn active_nodegroup(router: &MultiServiceRouter, cluster: &str) {
         created.status, 200,
         "setup: expected 200 from CreateNodegroup on {cluster:?}, got {created:?}"
     );
-    tokio::time::sleep(NODEGROUP_ACTIVATION_DELAY + Duration::from_millis(250)).await;
+    // Waited out by polling for the CONDITION the rows need — an `ACTIVE` node
+    // group — rather than for a span.
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let described = describe_nodegroup(router, cluster, "ng").await;
+        if described.body["nodegroup"]["status"] == serde_json::json!("ACTIVE") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "setup: the node group on {cluster:?} never reached ACTIVE; the last answer was \
+             {described:?}"
+        );
+        tokio::time::sleep(INTERVAL).await;
+    }
 }
 
 /// One row: the `scalingConfig` a change carries, and the sentence it earns —
@@ -112,7 +134,7 @@ fn rows() -> Vec<Case> {
         Case {
             case: "all three capacities, the desired size above the maximum",
             scaling: serde_json::json!({ "minSize": 1, "maxSize": 3, "desiredSize": 9 }),
-            refusal: Some("Maximum capacity 3 can't be less than desired size 9".to_string()),
+            refusal: Some("desired capacity 9 can't be greater than max size 3".to_string()),
         },
         Case {
             case: "a minimum alone, judged against the stored desired size",
@@ -125,14 +147,14 @@ fn rows() -> Vec<Case> {
             case: "a maximum alone, judged against the stored desired size",
             scaling: serde_json::json!({ "maxSize": 1 }),
             refusal: Some(format!(
-                "Maximum capacity 1 can't be less than desired size {STORED_DESIRED}"
+                "desired capacity {STORED_DESIRED} can't be greater than max size 1"
             )),
         },
         Case {
             case: "a desired size alone, above the stored maximum",
             scaling: serde_json::json!({ "desiredSize": 9 }),
             refusal: Some(format!(
-                "Maximum capacity {STORED_MAX} can't be less than desired size 9"
+                "desired capacity 9 can't be greater than max size {STORED_MAX}"
             )),
         },
         Case {
@@ -147,6 +169,13 @@ fn rows() -> Vec<Case> {
             scaling: serde_json::json!({ "minSize": 250, "maxSize": 400, "desiredSize": 100 }),
             refusal: Some(
                 "Minimum capacity 250 can't be greater than desired size 100".to_string(),
+            ),
+        },
+        Case {
+            case: "three-digit capacities, the desired size above the maximum",
+            scaling: serde_json::json!({ "minSize": 10, "maxSize": 120, "desiredSize": 300 }),
+            refusal: Some(
+                "desired capacity 300 can't be greater than max size 120".to_string(),
             ),
         },
         Case {
@@ -168,9 +197,9 @@ fn rows() -> Vec<Case> {
 }
 
 // ---------------------------------------------------------------------------
-// RULE: the refusal names the bound the desired size falls outside of, and the
-// two capacities of that relation — nothing else, and nothing from the emulator's
-// own restatement of the constraint.
+// RULE: the refusal names the capacity the change asked for and the bound it falls
+// outside of, and the two capacities of that relation — nothing else, and nothing
+// from the emulator's own restatement of the constraint.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

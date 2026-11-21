@@ -20,6 +20,12 @@
 //! holds a pod to ([`MAX_CONTAINERS_PER_POD`]), because every container of an
 //! admitted pod is one more image its node's kubelet pulls
 //! ([`super::kubernetes_image_pull`]).
+//!
+//! `PodSpec.restartPolicy` is the other member the API server decides here: it is
+//! defaulted the way Kubernetes defaults it, so a client reads back the policy its
+//! pod was admitted under, and refused when it names a policy Kubernetes does not
+//! have — it is the member that says whether a pod's containers are started again
+//! once they exit, so a value nothing defines is not stored.
 
 use super::kubernetes_objects::ApiRefusal;
 
@@ -34,6 +40,23 @@ use super::kubernetes_objects::ApiRefusal;
 /// past it is refused with the validation `Status` apimachinery refuses a list past
 /// its limit with rather than stored in part.
 pub const MAX_CONTAINERS_PER_POD: usize = 64;
+
+/// The `PodSpec.restartPolicy` values Kubernetes accepts: "restart policy for all
+/// containers within the pod. One of Always, OnFailure, Never. ... Default to
+/// Always." The policy is what says whether a pod's containers are started again
+/// once they exit, so a manifest naming a value outside this set is refused rather
+/// than stored as a pod whose lifecycle nothing defines.
+pub const POD_RESTART_POLICY_ALWAYS: &str = "Always";
+/// See [`POD_RESTART_POLICY_ALWAYS`].
+pub const POD_RESTART_POLICY_ON_FAILURE: &str = "OnFailure";
+/// See [`POD_RESTART_POLICY_ALWAYS`].
+pub const POD_RESTART_POLICY_NEVER: &str = "Never";
+/// The three of them, in the order the API server's own validation lists them.
+pub const POD_RESTART_POLICIES: [&str; 3] = [
+    POD_RESTART_POLICY_ALWAYS,
+    POD_RESTART_POLICY_ON_FAILURE,
+    POD_RESTART_POLICY_NEVER,
+];
 
 /// The `spec` the Pod `name` is ADMITTED with: the submitted one, validated,
 /// carrying the service account the API server resolved for it.
@@ -62,9 +85,43 @@ pub fn admitted_pod_spec(
         }
     };
     validate_containers(name, spec.get("containers"))?;
+    let restart_policy = admitted_restart_policy(name, &spec)?;
+    spec["restartPolicy"] = ::serde_json::json!(restart_policy);
     spec["serviceAccountName"] = ::serde_json::json!(service_account_name);
     spec["serviceAccount"] = ::serde_json::json!(service_account_name);
     Ok(spec)
+}
+
+/// The `restartPolicy` the pod is admitted with: the one the manifest named, or
+/// the Kubernetes default for a manifest that named none ("default to Always").
+///
+/// A value outside [`POD_RESTART_POLICIES`] is refused with the validation
+/// `Status` apimachinery refuses an unsupported enumerated value with, listing the
+/// values it does support — the policy decides the pod's whole lifecycle, so a
+/// value nothing defines is not stored.
+fn admitted_restart_policy(
+    name: &str,
+    spec: &::serde_json::Value,
+) -> Result<&'static str, ApiRefusal> {
+    let Some(named) = spec
+        .get("restartPolicy")
+        .and_then(::serde_json::Value::as_str)
+        .filter(|policy| !policy.is_empty())
+    else {
+        return Ok(POD_RESTART_POLICY_ALWAYS);
+    };
+    POD_RESTART_POLICIES
+        .into_iter()
+        .find(|policy| *policy == named)
+        .ok_or_else(|| {
+            let supported = POD_RESTART_POLICIES
+                .map(|policy| format!("\"{policy}\""))
+                .join(", ");
+            ApiRefusal::invalid(format!(
+                "Pod \"{name}\" is invalid: spec.restartPolicy: Unsupported value: \"{named}\": \
+                 supported values: {supported}"
+            ))
+        })
 }
 
 /// Refuse a container list no Pod can run: one the manifest did not carry, an

@@ -395,9 +395,16 @@ pub fn scaling_relation_violation(
 /// are not ones it can scale between, or `None` when they are.
 ///
 /// The relation is [`violated_scaling_relation`]'s answer — the same ordering the
-/// create path is judged by — and the refusal names the BOUND the desired size falls
-/// outside of, with the capacities themselves, the way Amazon EKS words each one for
-/// a change.
+/// create path is judged by — and the refusal names the CAPACITY the request asked
+/// the node group to run at and the bound it falls outside of, with the two
+/// capacities themselves, the way Amazon EKS words each one for a change.
+///
+/// The desired size is the subject of the sentence, not the bound: a change is
+/// refused because the capacity asked for does not fit between the bounds the node
+/// group would then carry, so the sentence states the asked-for capacity first and
+/// the bound it broke second. The upper bound reads `desired capacity <desiredSize>
+/// can't be greater than max size <maxSize>` and the lower one `Minimum capacity
+/// <minSize> can't be greater than desired size <desiredSize>`.
 pub fn scaling_capacity_violation(
     min_size: i32,
     max_size: i32,
@@ -409,7 +416,7 @@ pub fn scaling_capacity_violation(
                 "Minimum capacity {min_size} can't be greater than desired size {desired_size}"
             ),
             ScalingRelation::DesiredAboveMaximum => format!(
-                "Maximum capacity {max_size} can't be less than desired size {desired_size}"
+                "desired capacity {desired_size} can't be greater than max size {max_size}"
             ),
         },
     )
