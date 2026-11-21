@@ -552,12 +552,14 @@ fn served_message(
             // A token presented for a connection is decided by the mode that issued it, by
             // the same rule the API's GraphQL endpoint applies to a call
             // ([`super::user_pool`]): a Cognito user pool token has to be one the pool the
-            // API configured signed, inside its own window.
-            let refused_token = matches!(
-                token_decision(context, connection_auth),
-                super::user_pool::Decided::Refused(_)
-            );
-            if !authorized || refused_token {
+            // API configured signed, inside its own window, and a refusal carries the
+            // sentence that decision states.
+            let refused_token = match token_decision(context, connection_auth) {
+                super::user_pool::Decided::Refused(refused) => Some(refused),
+                super::user_pool::Decided::Admitted(_)
+                | super::user_pool::Decided::NotApplicable => None,
+            };
+            if !authorized || refused_token.is_some() {
                 // A connect this endpoint turned away on the client's own account is what
                 // `ConnectClientError` counts, and the connection ends with the refusal:
                 // nothing more is served over it.
@@ -565,7 +567,9 @@ fn served_message(
                 *closed = true;
                 return vec![connection_error_frame(
                     event_api::UNAUTHORIZED_ERROR_TYPE,
-                    event_api::UNAUTHORIZED_MESSAGE,
+                    refused_token
+                        .as_ref()
+                        .map_or(event_api::UNAUTHORIZED_MESSAGE, |refused| refused.message),
                 )];
             }
             // Idempotent: a second `connection_init` on one connection is acked again and
@@ -639,16 +643,16 @@ fn started(
     // the store is locked, because that decision reads this store and the user-pool
     // service's.
     let admitted_groups = match token_decision(context, &auth) {
-        super::user_pool::Decided::Refused(reason) => {
+        super::user_pool::Decided::Refused(refused) => {
             ::tracing::info!(
                 api_id = %context.api_id,
-                %reason,
+                reason = %refused.reason,
                 "the token this subscription presented authorizes no call on this API"
             );
             return error_frame(
                 subscription_id,
                 event_api::UNAUTHORIZED_ERROR_TYPE,
-                event_api::UNAUTHORIZED_MESSAGE,
+                refused.message,
             );
         }
         super::user_pool::Decided::Admitted(admitted) => Some(admitted.groups),

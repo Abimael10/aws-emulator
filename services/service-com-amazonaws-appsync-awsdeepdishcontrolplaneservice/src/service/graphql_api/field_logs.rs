@@ -51,10 +51,13 @@
 //! readers. The stream is named by the REQUEST, so a client holding the `x-amzn-RequestId`
 //! of an answer can reach what was logged about that answer directly.
 //!
-//! The group itself is there from the moment logging is CONFIGURED ([`provisioned`]), not
-//! only from the first request: `cloudWatchLogsRoleArn` is "The service role that AppSync
-//! assumes to publish to CloudWatch logs in your account", so an API that configures logging
-//! is an API whose group a client can already ask CloudWatch Logs for.
+//! The group itself comes into existence with the FIRST record written into it, not when
+//! logging is configured: `logConfig` states the role "that AppSync assumes to publish to
+//! CloudWatch logs in your account" and the level the API's fields are captured at, and
+//! neither of them is a group of the account's. So an API that has logged nothing is an API
+//! CloudWatch Logs holds no group for, and whoever creates a group under that name — a
+//! client, or a template that owns it so a metric filter can attach to it — is creating a
+//! group the account does not hold yet.
 //!
 //! Delivery is BEST EFFORT, as every vended-logs delivery is: a write CloudWatch Logs
 //! refuses, or an emulator assembled without it, loses the records and never fails the
@@ -63,7 +66,6 @@
 use ::std::time::{Duration, SystemTime};
 
 use ::serde_json::{json, Map as JsonMap, Value as Json};
-use ::service_com_amazonaws_cloudwatchlogs_logs_20140328::state as logs;
 
 use super::execution::{Answer, FieldTrace, GeneratedStep};
 use super::PlaneContext;
@@ -74,39 +76,6 @@ use crate::state::ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState as Serv
 #[must_use]
 pub fn log_group(api_id: &str) -> String {
     format!("/aws/appsync/apis/{api_id}")
-}
-
-/// Provision the log group `api_id`'s own logs go to, which is what configuring logging asks
-/// for.
-///
-/// The group is created in the CloudWatch Logs service's OWN store on the SAME shared engine,
-/// through that service's own record constructor ([`logs::LogGroupRecord::new`]) and under
-/// its own ceiling ([`logs::MAX_LOG_GROUPS`]), so the group this service provisioned is the
-/// one that service's readers report. A group the account ALREADY holds is left exactly as it
-/// is — its retention, its tags and the events in it belong to the account — and an engine
-/// carrying no CloudWatch Logs store has nowhere to provision one, so nothing is created.
-///
-/// Call it with NO store of this service locked: it takes the destination's guard only.
-pub fn provisioned<Eng: Send + Sync + 'static>(engine: &Eng, region: &str, api_id: &str) {
-    let Some(state) = logs::service_state(engine) else {
-        return;
-    };
-    let group = log_group(api_id);
-    let mut store = state.lock();
-    if store.log_groups.contains_key(&group) {
-        return;
-    }
-    if store.log_groups.len() >= logs::MAX_LOG_GROUPS {
-        ::tracing::warn!(
-            log_group = %group,
-            "the CloudWatch Logs store is at capacity, so this API's log group was not created"
-        );
-        return;
-    }
-    let at = logs::now_ms();
-    store
-        .log_groups
-        .insert(group.clone(), logs::LogGroupRecord::new(region, &group, at));
 }
 
 /// The `logType` of each record, which is what a reader selects one kind of record by.

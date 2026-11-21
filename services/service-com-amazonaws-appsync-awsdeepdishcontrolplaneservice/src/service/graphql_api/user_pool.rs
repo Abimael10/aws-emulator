@@ -31,8 +31,10 @@
 //!    matches it — `aud` on an identity token and `client_id` on an access token, which is
 //!    the shared audience reading ([`::service_common::jwt::CompactJws::audiences`]).
 //!
-//! A token that fails any of those authorizes nobody, and the call is refused with the one
-//! refusal every unauthorized call on this data plane earns. A token that passes them all is
+//! A token that fails any of those authorizes nobody, and the call is refused ([`Refusal`]
+//! states which sentence the caller is told: a value that is no readable token at all is
+//! reported as one that could not be parsed, and a token read and not admitted earns the one
+//! refusal every unauthorized call on this data plane earns). A token that passes them all is
 //! WHO the call speaks for: its claim set is what a resolver reads as `$context.identity`
 //! ([`Admitted::identity`]), and the groups it claims are what the group guards a schema
 //! writes on its fields are judged against ([`refused_fields`]) — on a QUERY or MUTATION
@@ -93,13 +95,51 @@ pub enum Decided {
     /// presented nothing in the field this mode reads, or it presented material of another
     /// provider this API also configured.
     NotApplicable,
-    /// The call authorizes nobody and reaches no field of the API. The reason is LOGGED,
-    /// never answered: what a caller is told about a token it presented is the refusal's own
-    /// sentence and nothing about the token.
-    Refused(String),
+    /// The call authorizes nobody and reaches no field of the API ([`Refusal`]).
+    Refused(Refusal),
     /// The call is served, under what the token says about the caller.
     Admitted(Admitted),
 }
+
+/// A refused call: what its caller is TOLD, and which check the token failed.
+///
+/// The two are deliberately separate. The reason is LOGGED and never answered, because
+/// nothing about the token a caller presented is reported back to it; what the caller is told
+/// is one of exactly two sentences, and which one says how far the decision got: a value this
+/// mode could not READ as a JSON Web Token at all is reported as a token that could not be
+/// parsed ([`UNREADABLE_TOKEN_MESSAGE`]) — nothing about it can be judged until it has been —
+/// and a token that WAS read and then not admitted earns the one refusal every unauthorized
+/// call on this data plane earns, whichever of the later checks it failed.
+#[derive(Debug, Clone)]
+pub struct Refusal {
+    /// The sentence the refusal carries.
+    pub message: &'static str,
+    /// Which check the token failed, for this emulator's own log.
+    pub reason: String,
+}
+
+impl Refusal {
+    /// A value this mode could not read as a JSON Web Token.
+    fn unreadable(reason: String) -> Self {
+        Self {
+            message: UNREADABLE_TOKEN_MESSAGE,
+            reason,
+        }
+    }
+
+    /// A token that was read and not admitted.
+    fn unauthorized(reason: String) -> Self {
+        Self {
+            message: crate::service::event_api::UNAUTHORIZED_MESSAGE,
+            reason,
+        }
+    }
+}
+
+/// What a caller presenting a value this mode cannot READ as a JSON Web Token is told: the
+/// token has to be parsed before anything about it — its issuer, its signature, its window —
+/// can be judged, so the refusal states exactly that and nothing about the value itself.
+pub const UNREADABLE_TOKEN_MESSAGE: &str = "Unable to parse JWT token.";
 
 /// What an admitted token says about the caller.
 #[derive(Debug, Clone)]
@@ -149,21 +189,27 @@ pub fn decided(
     // Whether a value this mode cannot place is REFUSED here or left to another mode: an API
     // that also set up a mode reading the same field has a second reader for it, and an API
     // that did not has none, so such a value authorizes nobody.
-    let unplaced = |reason: String| match defers_to_another_token_mode(context) {
+    let unplaced = |refusal: Refusal| match defers_to_another_token_mode(context) {
         true => Decided::NotApplicable,
-        false => Decided::Refused(reason),
+        false => Decided::Refused(refusal),
     };
     let read = match jwt::read(token) {
         Ok(read) => read,
-        Err(defect) => return unplaced(format!("the presented value is not a token: {defect}")),
+        Err(defect) => {
+            return unplaced(Refusal::unreadable(format!(
+                "the presented value is not a token: {defect}"
+            )))
+        }
     };
     let Some(issuer) = read.claim_str(jwt::ISSUER_CLAIM) else {
-        return unplaced("the presented token names no issuer".to_string());
+        return unplaced(Refusal::unauthorized(
+            "the presented token names no issuer".to_string(),
+        ));
     };
     let Some((pool, key_set)) = issuing_pool(context, &configured, issuer) else {
-        return unplaced(
+        return unplaced(Refusal::unauthorized(
             "the presented token's issuer is no user pool this API configured".to_string(),
-        );
+        ));
     };
     // The signature over the token's OWN encoded bytes, against the key its header names in
     // the set the pool publishes: a token minted by one pool does not verify against
@@ -173,16 +219,18 @@ pub fn decided(
     let verified = match jwt::verify(token, &key_set) {
         Ok(verified) => verified,
         Err(defect) => {
-            return Decided::Refused(format!(
+            return Decided::Refused(Refusal::unauthorized(format!(
                 "the presented token is not one its user pool signed: {defect}"
-            ))
+            )))
         }
     };
     if let Some(defect) = verified.outside_window(now) {
-        return Decided::Refused(format!("the presented token is outside its window: {defect}"));
+        return Decided::Refused(Refusal::unauthorized(format!(
+            "the presented token is outside its window: {defect}"
+        )));
     }
     if let Some(unmatched) = audience_unmatched(&pool, &verified) {
-        return Decided::Refused(unmatched);
+        return Decided::Refused(Refusal::unauthorized(unmatched));
     }
     let groups = claimed_groups(&verified);
     Decided::Admitted(Admitted {

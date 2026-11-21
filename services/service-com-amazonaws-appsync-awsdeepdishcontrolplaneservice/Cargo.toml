@@ -121,11 +121,6 @@ aws-sdk-rds = { version = "1", default-features = false, features = ["rt-tokio",
 # database's schema holds, with the same maintained SQL parser (and PostgreSQL dialect) the
 # Data API itself parses statements with, rather than by scanning the text here.
 sqlparser = { version = "0.59", default-features = false, features = ["std"] }
-# The store an API's own CloudWatch Logs records land in: a GraphQL API that configures
-# logging has its log group `/aws/appsync/apis/<apiId>` (`src/service/graphql_api/field_logs.rs`),
-# which is created in that service's own store on this same engine through its own record
-# constructor, so what this service provisioned is what its readers report.
-service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # The WAFv2 service, for the web ACL in front of a GraphQL API: `AssociateWebACL` binds one
 # to "an AppSync GraphQL API" by the API's own ARN, so the API's `GRAPHQL` endpoint asks THAT
 # service what its web ACL decides about each request it is handed
@@ -182,13 +177,16 @@ rand = "0.9"
 # (with the KMS the secret is sealed under) the login comes from — mounted beside this
 # service in the introspection suite, so what the introspection reports is the schema of a
 # real database of this emulator, created through those services' own operations.
-# The store an API's own CloudWatch Logs records land in: the field-logging suite reads them
-# back through that service's own reader, so a record that did not reach it cannot pass.
-# (The crate itself is one of this service's own dependencies, above.)
 service-com-amazonaws-rdsdata-rdsdataservice = { workspace = true }
 service-com-amazonaws-rds-amazonrdsv19 = { workspace = true }
 service-com-amazonaws-secretsmanager-secretsmanager = { workspace = true }
 service-com-amazonaws-kms-trentservice = { workspace = true }
+# The store an API's own CloudWatch Logs records land in: a GraphQL API that configures
+# logging publishes what it logs about each request into `/aws/appsync/apis/<apiId>`
+# (`src/service/graphql_api/field_logs.rs`) through the tree's one vended-logs write, so the
+# field-logging suite mounts that service beside this one and reads the records back through
+# its own reader — a record that did not reach it cannot pass.
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # The client Secrets Manager is driven through in that suite (it speaks restJson1), so a
 # case creates its secret with the SDK rather than by hand-rolling that wire form; the RDS
 # control plane a case creates its cluster through is already this crate's own dependency.

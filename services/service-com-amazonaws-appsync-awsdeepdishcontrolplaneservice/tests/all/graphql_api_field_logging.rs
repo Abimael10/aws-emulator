@@ -16,8 +16,11 @@
 //! > request/response functions that got resolved" — for EVERY field at `ALL`, for only "the
 //! > fields that are in error" at `ERROR`, and for none at `NONE`.
 //! > `excludeVerboseContent` excludes the sections carrying the context and the evaluated
-//! > templates "regardless of logging level". An API carrying no `logConfig` logs nothing,
-//! > and the account then holds no such group at all.
+//! > templates "regardless of logging level". The group itself comes into existence with the
+//! > FIRST record the API writes into it — configuring logging names the role AppSync
+//! > publishes under, not a group of the account's — so an API that has logged nothing, and
+//! > an API carrying no `logConfig` at all, leave the account holding no such group, and
+//! > whoever creates one under that name creates it themselves.
 //!
 //! Every assertion reads the outcome back through CloudWatch Logs' own reader
 //! (`FilterLogEvents`), so a record that did not reach that store cannot pass; the rows differ
@@ -329,10 +332,12 @@ async fn excluding_verbose_content_leaves_the_context_and_the_templates_out() {
 }
 
 #[tokio::test]
-async fn an_api_that_configures_logging_has_its_log_group() {
-    for (case, level, expected) in [
+async fn the_api_s_log_group_appears_with_the_first_record_it_logs() {
+    for (case, level, logs_anything) in [
         ("an API logging every field", Some("ALL"), true),
         ("an API logging the fields in error", Some("ERROR"), true),
+        // `NONE` captures no FIELD, and the request-level records of the request as a whole
+        // are written whenever a `logConfig` is configured at all.
         ("an API logging no field", Some("NONE"), true),
         ("an API that configures no logging", None, false),
     ] {
@@ -343,34 +348,120 @@ async fn an_api_that_configures_logging_has_its_log_group() {
             level.map(|level| log_config(level, false)),
         )
         .await;
-        // The group is there BEFORE any request is served, because configuring logging is
-        // what asks for it.
-        let (status, described) = logs(
-            &router,
-            "DescribeLogGroups",
-            json!({"logGroupNamePrefix": format!("/aws/appsync/apis/{}", api.api_id)}),
+        // Configuring logging creates nothing: the group appears with the first record the
+        // API writes into it, so an API that has logged nothing is an API CloudWatch Logs
+        // holds no group for.
+        assert!(
+            !holds_the_api_s_group(&router, &api).await,
+            "case {case:?}: an API that has logged nothing must leave the account holding no \
+             group of its own"
+        );
+
+        let (status, _, document) = post_graphql_answer(
+            case,
+            &api,
+            &json!({"query": "query { probe(msg: \"hello\") }"}),
+            &[("x-api-key", api.api_key.as_str())],
         )
         .await;
         assert_eq!(
             status, 200,
-            "case {case:?}: DescribeLogGroups must answer 200, got {described}"
+            "case {case:?}: the query is answered, got {status} and {document}"
         );
-        let held: Vec<&str> = described["logGroups"]
-            .as_array()
-            .map(|groups| {
-                groups
-                    .iter()
-                    .filter_map(|group| group["logGroupName"].as_str())
-                    .collect()
-            })
-            .unwrap_or_default();
-        let group = format!("/aws/appsync/apis/{}", api.api_id);
         assert_eq!(
-            held.contains(&group.as_str()),
-            expected,
-            "case {case:?}: expected the group to be held={expected}, got {held:?}"
+            holds_the_api_s_group(&router, &api).await,
+            logs_anything,
+            "case {case:?}: expected the group to be held after one request={logs_anything}"
         );
     }
+}
+
+#[tokio::test]
+async fn the_api_s_log_group_may_be_created_by_whoever_owns_it() {
+    // What a template that owns the API's request log group does — the only way a metric
+    // filter can attach to it at deploy time: create the API with its `logConfig`, then
+    // create the group under the name that API publishes under.
+    let case = "a client creating the group of an API that has logged nothing";
+    let router = emulator();
+    let api = create_api(&router, "owned-group", Some(log_config("ALL", false))).await;
+    let group = format!("/aws/appsync/apis/{}", api.api_id);
+
+    let (status, created) = logs(&router, "CreateLogGroup", json!({"logGroupName": group})).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: CreateLogGroup must create a group the account does not hold, got \
+         {status} and {created}"
+    );
+    let (status, retained) = logs(
+        &router,
+        "PutRetentionPolicy",
+        json!({"logGroupName": group, "retentionInDays": 1}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the owner's retention must be accepted, got {status} and {retained}"
+    );
+
+    // And what the API logs goes into that very group, whose owner's retention is untouched.
+    let (status, _, document) = post_graphql_answer(
+        case,
+        &api,
+        &json!({"query": "query { probe(msg: \"hello\") }"}),
+        &[("x-api-key", api.api_key.as_str())],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the query is answered, got {status} and {document}"
+    );
+    let records = delivered(&router, &api).await;
+    assert!(
+        records
+            .iter()
+            .any(|record| record["logType"].as_str() == Some(REQUEST_SUMMARY)),
+        "case {case:?}: the API's records must land in the group its owner created, got {} \
+         records",
+        records.len()
+    );
+    let (status, described) = logs(
+        &router,
+        "DescribeLogGroups",
+        json!({"logGroupNamePrefix": group}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: DescribeLogGroups must answer 200, got {described}"
+    );
+    assert_eq!(
+        described["logGroups"][0]["retentionInDays"].as_i64(),
+        Some(1),
+        "case {case:?}: the retention its owner set must survive a delivery, got {described}"
+    );
+}
+
+/// Whether CloudWatch Logs holds the log group `api` publishes its own records under, read
+/// through that service's own reader.
+async fn holds_the_api_s_group(router: &MultiServiceRouter, api: &GraphqlApi) -> bool {
+    let group = format!("/aws/appsync/apis/{}", api.api_id);
+    let (status, described) = logs(
+        router,
+        "DescribeLogGroups",
+        json!({"logGroupNamePrefix": group}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "DescribeLogGroups must answer 200, got {status} and {described}"
+    );
+    described["logGroups"]
+        .as_array()
+        .is_some_and(|groups| {
+            groups
+                .iter()
+                .any(|held| held["logGroupName"].as_str() == Some(group.as_str()))
+        })
 }
 
 #[tokio::test]

@@ -62,6 +62,11 @@ const GRAPHQL_PATH: &str = "/graphql";
 /// `service::event_api::UNAUTHORIZED_ERROR_TYPE` and `…_MESSAGE`.
 const UNAUTHORIZED_STATUS: u16 = 401;
 const UNAUTHORIZED_ERROR_TYPE: &str = "UnauthorizedException";
+const UNAUTHORIZED_MESSAGE: &str = "You are not authorized to make this call.";
+
+/// What a caller presenting a value this mode cannot READ as a token is told instead; the
+/// service's own copy is `service::graphql_api::user_pool::UNREADABLE_TOKEN_MESSAGE`.
+const UNREADABLE_TOKEN_MESSAGE: &str = "Unable to parse JWT token.";
 
 /// The error AppSync reports for a field the caller may not access; the service's own copies
 /// are `service::graphql_api::execution::UNAUTHORIZED_FIELD_ERROR_TYPE` and
@@ -693,6 +698,189 @@ async fn a_cognito_authorized_api_serves_only_the_tokens_its_user_pool_signed() 
             ),
         }
     }
+}
+
+/// RULE: a refusal of a value presented in the `authorization` field states HOW FAR the
+/// decision got, and nothing about the value itself. A value the mode could not READ as a
+/// JSON Web Token is refused as a token that could not be parsed — nothing about it can be
+/// judged until it has been read — and a token that WAS read and then not admitted, whichever
+/// of the later checks it failed, earns the one refusal every unauthorized call on this data
+/// plane earns. Both are `UnauthorizedException` with the status that refusal carries, and
+/// neither reaches a resolver.
+///
+/// The rows span what the rule generalises over: WHICH form rule a value breaks (the segment
+/// count, the header, the `alg` it names, the claim segment, the unsecured form nothing
+/// signed), whether the bearer scheme is in front of it, and — on the other side — which
+/// later check a readable token fails (its issuer, its signature, its window, its app client).
+#[tokio::test]
+async fn a_refusal_states_whether_the_presented_value_could_be_read_as_a_token() {
+    let (router, engine) = emulator();
+    let (pool_id, client_id) = pool_with_client(&router, "refusal-pool").await;
+    user_in_groups(&router, &pool_id, "alice", &[ADMINS]).await;
+    let (other_pool_id, other_pool_client_id) = pool_with_client(&router, "refusal-other").await;
+    user_in_groups(&router, &other_pool_id, "carol", &[]).await;
+    let alice = sign_in(&router, &pool_id, &client_id, "alice").await;
+    let carol = sign_in(&router, &other_pool_id, &other_pool_client_id, "carol").await;
+    let api = create_api(&router, "refusals", &pool_id, None).await;
+
+    let minted = id_token(&alice);
+    // A token the pool itself signed whose window has already elapsed, and one that names no
+    // issuer at all: both are READ, so both are refused by a later check.
+    let mut elapsed_claims = claims_of(&minted);
+    elapsed_claims["exp"] = json!(seconds_ago(Duration::from_secs(600)));
+    let elapsed = pool_signed_token(&engine, &pool_id, &elapsed_claims);
+    let mut issuerless_claims = claims_of(&minted);
+    if let Some(claims) = issuerless_claims.as_object_mut() {
+        claims.remove("iss");
+    }
+    let issuerless = pool_signed_token(&engine, &pool_id, &issuerless_claims);
+
+    /// One row: what it presents, and the sentence the refusal has to carry.
+    struct Row {
+        case: String,
+        presented: String,
+        message: &'static str,
+    }
+    let unreadable = |case: &str, presented: String| Row {
+        case: case.to_string(),
+        presented,
+        message: UNREADABLE_TOKEN_MESSAGE,
+    };
+    let unauthorized = |case: &str, presented: String| Row {
+        case: case.to_string(),
+        presented,
+        message: UNAUTHORIZED_MESSAGE,
+    };
+    let rows = vec![
+        unreadable(
+            "a value that is no token at all",
+            "not-a-token-at-all".to_string(),
+        ),
+        unreadable(
+            "a value of two segments only",
+            segments_of(&minted)[..2].join("."),
+        ),
+        unreadable(
+            "a value of four segments",
+            format!("{minted}.extra"),
+        ),
+        unreadable(
+            "a token whose header segment is not base64url",
+            with_segment(&minted, 0, "!!!not-base64!!!"),
+        ),
+        unreadable(
+            "a token whose header names no algorithm",
+            with_segment(
+                &minted,
+                0,
+                &service_common::jwt::encode_base64url(b"{\"kid\":\"k\"}"),
+            ),
+        ),
+        unreadable(
+            "a token whose claim segment is not base64url",
+            with_segment(&minted, 1, "!!!not-base64!!!"),
+        ),
+        unreadable(
+            "a token whose claim segment is no JSON object",
+            with_segment(
+                &minted,
+                1,
+                &service_common::jwt::encode_base64url(b"[\"not\",\"a\",\"claim\",\"set\"]"),
+            ),
+        ),
+        unreadable(
+            "the unsecured form, which nothing signed",
+            format!(
+                "{}.{}.",
+                service_common::jwt::encode_base64url(b"{\"alg\":\"none\"}"),
+                segments_of(&minted)[1]
+            ),
+        ),
+        unreadable(
+            "the bearer scheme in front of a value that is no token",
+            "Bearer not-a-token-at-all".to_string(),
+        ),
+        unauthorized(
+            "a readable token minted by another user pool",
+            id_token(&carol),
+        ),
+        unauthorized(
+            "a readable token with its signature rewritten",
+            with_rewritten_signature(&minted),
+        ),
+        unauthorized(
+            "a readable token whose claim set was rewritten after signing",
+            with_rewritten_claims(&minted, |claims| {
+                claims["sub"] = json!("somebody-else");
+            }),
+        ),
+        unauthorized(
+            "a token the pool signed whose window has elapsed",
+            elapsed.clone(),
+        ),
+        unauthorized(
+            "a token the pool signed that names no issuer",
+            issuerless.clone(),
+        ),
+    ];
+
+    for row in &rows {
+        let case = &row.case;
+        let (status, answered) =
+            post_graphql(case, &api, "query { open }", Some(&row.presented)).await;
+        assert_eq!(
+            (
+                status,
+                answered["errors"][0]["errorType"].as_str(),
+                answered["errors"][0]["message"].as_str()
+            ),
+            (
+                UNAUTHORIZED_STATUS,
+                Some(UNAUTHORIZED_ERROR_TYPE),
+                Some(row.message)
+            ),
+            "case {case:?}: expected ({UNAUTHORIZED_STATUS}, {UNAUTHORIZED_ERROR_TYPE:?}, {:?}), \
+             got {status} and {answered}",
+            row.message
+        );
+        assert_eq!(
+            answered["errors"].as_array().map(Vec::len),
+            Some(1),
+            "case {case:?}: a refusal reports exactly one error, got {answered}"
+        );
+        assert!(
+            answered.get("data").is_none() || answered["data"].is_null(),
+            "case {case:?}: a refused call must reach no resolver, got {answered}"
+        );
+    }
+
+    // And the token the pool minted for the same API is served, so the rows above fail on
+    // what they present rather than on the API.
+    let (status, answered) = post_graphql(
+        "the pool's own identity token",
+        &api,
+        "query { open }",
+        Some(&minted),
+    )
+    .await;
+    assert_eq!(
+        (status, answered["data"]["open"].as_str()),
+        (200, Some(OPEN_VALUE)),
+        "the pool's own token must still be served, got {status} and {answered}"
+    );
+}
+
+/// The three segments of a compact JWS, as the rows above take one apart.
+fn segments_of(token: &str) -> Vec<String> {
+    token.split('.').map(str::to_string).collect()
+}
+
+/// `token` with the segment `at` replaced by `replacement` — how a row breaks ONE form rule
+/// and leaves the rest of the value as the pool minted it.
+fn with_segment(token: &str, at: usize, replacement: &str) -> String {
+    let mut segments = segments_of(token);
+    segments[at] = replacement.to_string();
+    segments.join(".")
 }
 
 #[tokio::test]

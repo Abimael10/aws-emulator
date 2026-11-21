@@ -279,23 +279,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ListGraphqlApis` answer with afterwards — minus the API's `dns` records,
         // which this reply does not carry (`crate::state::GraphqlApiRecord::to_updated_graphql_api`).
         let graphql_api = record.to_updated_graphql_api();
-        // The API's OWN id, which is what the log group is provisioned under whichever
-        // form the request addressed the API in.
-        let api_id = record.api_id.clone();
-        let logs_configured = graphql_api.log_config.is_some();
         drop(guard);
 
-        // An update that configures logging provisions the API's log group, as the create
-        // does ([`crate::service::graphql_api::field_logs`]), so an API whose logging was
-        // turned on afterwards has the group its records go to as well. Taken with this
-        // service's own store released, so the destination's guard is the only one held.
-        if logs_configured {
-            crate::service::graphql_api::field_logs::provisioned(
-                &*self.engine,
-                &crate::state::request_region(ctx),
-                &api_id,
-            );
-        }
+        // Turning logging on brings no log group into existence: the group an API's records
+        // go to is created by the FIRST request this API logs
+        // ([`crate::service::graphql_api::field_logs`]), so until then CloudWatch Logs holds
+        // nothing under that name.
 
         Ok(UpdateGraphqlApiOutput {
             graphql_api: Some(graphql_api),

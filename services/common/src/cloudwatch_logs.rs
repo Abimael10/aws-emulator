@@ -361,12 +361,13 @@ const MAX_BATCH_SPAN_MS: i64 = 24 * 60 * 60 * 1_000;
 /// Bring the log group a delivering service publishes under its OWN name into existence,
 /// with no record delivered into it.
 ///
-/// A group of the delivering service's own is one it PUBLISHES, so it exists from the moment
-/// the configuration that turns its log on is accepted rather than from the first record
-/// written into it: a client reads such a group to confirm the log is on, and attaches a
-/// retention policy or a subscription filter to it, before anything has been logged. The
-/// records themselves go in through [`delivered`], which creates the group too, so a group
-/// provisioned here and one created by the first delivery are the same group.
+/// For a service whose OWN recorded behaviour is that the group is there once the
+/// configuration turning its log on is accepted — one whose clients read that group back to
+/// confirm the log is on, or attach a retention policy or a subscription filter to it, before
+/// anything has been logged. WHEN a group appears is each service's own fact, not a rule of
+/// this module: a service whose group appears only with the first record written into it does
+/// not call this at all and lets [`delivered`] create it. Either way it is the same group,
+/// because the records go in through [`delivered`], which creates it too.
 ///
 /// `true` once CloudWatch Logs holds the group — including a group it already held, which is
 /// the group this service has been writing to — and `false` when it could not be created.

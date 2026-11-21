@@ -375,24 +375,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .graphql_apis
             .get(&api_id)
             .map(crate::state::GraphqlApiRecord::to_graphql_api);
-        let logs_configured = graphql_api
-            .as_ref()
-            .is_some_and(|api| api.log_config.is_some());
         drop(guard);
 
-        // An API that configures logging HAS its log group: `logConfig` names "The service
-        // role that AppSync assumes to publish to CloudWatch logs in your account", so the
-        // group this API's records go to is provisioned with the API rather than only when
-        // the first request is logged ([`crate::service::graphql_api::field_logs`]). Taken
-        // with this service's own store released, so the destination's guard is the only one
-        // held.
-        if logs_configured {
-            crate::service::graphql_api::field_logs::provisioned(
-                &*self.engine,
-                &region,
-                &api_id,
-            );
-        }
+        // Configuring logging brings no log group into existence: `logConfig` names "The
+        // service role that AppSync assumes to publish to CloudWatch logs in your account",
+        // so the group this API's records go to is created by the first request the API LOGS
+        // ([`crate::service::graphql_api::field_logs`]) — until then the account holds no
+        // group under that name, and whoever creates one under it creates it themselves.
 
         Ok(CreateGraphqlApiOutput { graphql_api })
     }

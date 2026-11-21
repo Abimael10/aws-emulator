@@ -325,10 +325,10 @@ async fn served_request(
         started,
     ) {
         user_pool::Decided::NotApplicable => {}
-        user_pool::Decided::Refused(reason) => {
+        user_pool::Decided::Refused(refused) => {
             ::tracing::info!(
                 api_id = %context.api_id,
-                %reason,
+                reason = %refused.reason,
                 "the token this call presented authorizes no call on this API"
             );
             return refusal_logged(
@@ -338,7 +338,7 @@ async fn served_request(
                 clock,
                 UNAUTHORIZED_STATUS,
                 event_api::UNAUTHORIZED_ERROR_TYPE,
-                event_api::UNAUTHORIZED_MESSAGE,
+                refused.message,
             )
             .await;
         }
