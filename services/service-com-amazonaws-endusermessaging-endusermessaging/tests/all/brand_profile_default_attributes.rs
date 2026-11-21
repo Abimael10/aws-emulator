@@ -25,7 +25,13 @@
 //!   `ResourceNotFoundException`, and refuses a `nextToken` it never issued with
 //!   `ValidationException`;
 //! * each profile holds its own copy of the template, so one profile's list never
-//!   reports another's.
+//!   reports another's;
+//! * the list reports the attributes the profile HOLDS, so an attribute a write
+//!   added is paged back as it was stored, one a delete removed is gone, and one
+//!   re-created under the same name is reported again with the value the request
+//!   supplied;
+//! * `maxResults` outside its modelled range is refused, and paging the list — by
+//!   any page size, to exhaustion — changes nothing a later caller sees.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -226,6 +232,53 @@ impl Emulator {
         }
         panic!("case {case}: the list never ran out of pages within {MAX_PAGES} pages");
     }
+
+    /// `CreateBrandProfileAttributes`, over the same route the list reads back.
+    async fn create_attributes(&self, id_or_arn: &str, entries: Vec<Value>) -> Reply {
+        self.call(
+            "POST",
+            &format!(
+                "/v1/brand-profiles/{}/attributes",
+                path_label(id_or_arn)
+            ),
+            Some(json!({ "attributes": entries })),
+        )
+        .await
+    }
+
+    /// `DeleteBrandProfileAttribute` for one attribute of a profile.
+    async fn delete_attribute(&self, id_or_arn: &str, name: &str) -> Reply {
+        self.call(
+            "DELETE",
+            &format!(
+                "/v1/brand-profiles/{}/attributes/{}",
+                path_label(id_or_arn),
+                attribute_segment(name)
+            ),
+            None,
+        )
+        .await
+    }
+
+    /// `GetBrandProfileAttribute` for one attribute of a profile.
+    async fn get_attribute(&self, id_or_arn: &str, name: &str) -> Reply {
+        self.call(
+            "GET",
+            &format!(
+                "/v1/brand-profiles/{}/attributes/{}",
+                path_label(id_or_arn),
+                attribute_segment(name)
+            ),
+            None,
+        )
+        .await
+    }
+}
+
+/// `name` as one path segment of a request URI: `BrandProfileAttributeName`'s
+/// modelled pattern admits an interior space, which a URI does not carry literally.
+fn attribute_segment(name: &str) -> String {
+    name.replace(' ', "%20")
 }
 
 /// The names in this table are the classes `BrandProfileName`'s modelled
@@ -544,4 +597,293 @@ async fn a_token_this_service_never_issued_is_refused() {
             refused.error
         );
     }
+}
+
+#[tokio::test]
+async fn the_attribute_list_refuses_a_max_results_outside_the_modelled_range() {
+    let em = Emulator::new();
+    let created = em.create_named("page-size-bounds").await;
+    let id = created.string("brandProfileId");
+
+    // `maxResults` targets `MaxResults`, modelled `@range(1..100)`
+    // (`smithy_query(query="shape", shape="MaxResults")`): each published bound is
+    // accepted, as is an interior value.
+    for accepted in [1, 2, 99, 100] {
+        let case = format!("maxResults={accepted}");
+        let page = em
+            .list_attributes(&id, &format!("?maxResults={accepted}"))
+            .await;
+        assert_eq!(
+            page.status, 200,
+            "case {case}: a published bound must be accepted, got {} / {:?}",
+            page.status, page.body
+        );
+        assert!(
+            page.attributes().len() <= accepted,
+            "case {case}: a page holds at most maxResults attributes, got {}",
+            page.attributes().len()
+        );
+    }
+
+    // One past each published bound, and far past the upper one.
+    for refused_size in ["0", "-1", "101", "1000"] {
+        let case = format!("maxResults={refused_size}");
+        let refused = em
+            .list_attributes(&id, &format!("?maxResults={refused_size}"))
+            .await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case}: expected 400, got {} / {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error.as_deref(),
+            Some("ValidationException"),
+            "case {case}: unexpected error code, got {:?}",
+            refused.error
+        );
+        let expected = "1 validation error detected. Value at '/maxResults' failed to \
+                        satisfy constraint: Member must be between 1 and 100, inclusive";
+        assert_eq!(
+            refused.string("message"),
+            expected,
+            "case {case}: expected message {expected:?}, got {:?}",
+            refused.body
+        );
+    }
+}
+
+/// The attributes to add on top of the seeded template: one call's worth, since
+/// `CreateBrandProfileAttributes`' own `attributes` list is `@length(1..10)`.
+///
+/// The rows span what `BrandProfileAttributeName`'s modelled `@length(1..256)` and
+/// `^[A-Za-z0-9_ -]*[A-Za-z0-9_-][A-Za-z0-9_ -]*$` pattern admit — a single
+/// character, a digit, each punctuation the pattern names, an interior space and
+/// exactly the maximum length — every value of the modelled
+/// `BrandProfileAttributeType` enum, and the optional members a summary projects,
+/// present and absent. Source: `smithy_query(query="shape",
+/// shape="BrandProfileAttributeInput,BrandProfileAttributeSummary")`.
+fn added_attributes() -> Vec<Value> {
+    vec![
+        json!({ "attributeName": "z", "attributeType": "TEXT", "attributeValue": "one character" }),
+        json!({ "attributeName": "0", "attributeType": "TEXT", "attributeValue": "" }),
+        json!({
+            "attributeName": "added_text",
+            "attributeType": "TEXT",
+            "attributeValue": "stored",
+            "description": "the described one",
+            "category": "BUSINESS_IDENTITY",
+        }),
+        json!({ "attributeName": "added-text-2", "attributeType": "TEXT" }),
+        json!({
+            "attributeName": "Added Text Three",
+            "attributeType": "TEXT",
+            "attributeValue": "spaced",
+            "category": "BUSINESS_ADDRESS",
+        }),
+        json!({ "attributeName": "A".repeat(256), "attributeType": "TEXT", "attributeValue": "the longest name" }),
+        json!({ "attributeName": "added-image", "attributeType": "IMAGE", "description": "no media yet" }),
+        json!({ "attributeName": "added-document", "attributeType": "DOCUMENT" }),
+    ]
+}
+
+/// The `attributeName` each entry of a request or a list page carries, in order.
+fn requested_names(entries: &[Value]) -> Vec<String> {
+    entries
+        .iter()
+        .map(|entry| {
+            entry["attributeName"]
+                .as_str()
+                .unwrap_or_else(|| panic!("attributeName is not a string in {entry:?}"))
+                .to_string()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn the_attribute_list_reports_the_attributes_the_writes_stored() {
+    let em = Emulator::new();
+    let created = em.create_named("grown-template").await;
+    let id = created.string("brandProfileId");
+    let seeded = requested_names(&em.all_attributes("seeded", &id, None).await);
+
+    let added = added_attributes();
+    let create = em.create_attributes(&id, added.clone()).await;
+    assert_eq!(
+        create.status, 200,
+        "the batch must be created, got {} / {:?}",
+        create.status, create.body
+    );
+
+    // Every name the profile now holds, seeded and added, reported exactly once.
+    let listed = em.all_attributes("grown", &id, None).await;
+    let listed_names = requested_names(&listed);
+    let mut expected: BTreeSet<String> = seeded.iter().cloned().collect();
+    for name in requested_names(&added) {
+        assert!(
+            expected.insert(name.clone()),
+            "the added {name:?} collides with the seeded template {seeded:?}"
+        );
+    }
+    assert_eq!(
+        listed_names.iter().cloned().collect::<BTreeSet<String>>(),
+        expected,
+        "the list reports the attributes the profile holds, got {listed_names:?}"
+    );
+    assert_eq!(
+        listed_names.len(),
+        expected.len(),
+        "each attribute is reported once, got {listed_names:?}"
+    );
+
+    // Each added attribute is paged back as the request stored it, including the
+    // optional members a summary projects and the ones the request left out.
+    for entry in &added {
+        let name = entry["attributeName"].as_str().expect("a requested name");
+        let case = format!("attributeName={name:?}");
+        let summary = listed
+            .iter()
+            .find(|item| item["attributeName"] == entry["attributeName"])
+            .unwrap_or_else(|| panic!("case {case}: not reported in {listed_names:?}"));
+        for member in ["attributeType", "description", "category"] {
+            assert_eq!(
+                summary[member],
+                entry[member],
+                "case {case}: {member} must be what was stored, got {summary:?}"
+            );
+        }
+        assert_eq!(
+            summary["updatedAt"],
+            summary["createdAt"],
+            "case {case}: a never-updated attribute has updatedAt == createdAt, got {summary:?}"
+        );
+    }
+
+    // The grown set is more than one page, so paging it spans several: one at a
+    // time, an interior size, each side of the set's own size, and `maxResults`'
+    // modelled maximum.
+    let total = listed_names.len();
+    let sizes: Vec<usize> = vec![1, 3, total - 1, total, total + 1, 100];
+    for size in sizes {
+        let case = format!("maxResults={size}");
+        let paged = requested_names(&em.all_attributes(&case, &id, Some(size)).await);
+        assert_eq!(
+            paged, listed_names,
+            "case {case}: paging must report every attribute exactly once, in the same \
+             order as the unpaged list, got {paged:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_listed_attribute_can_be_deleted_and_recreated_with_a_value() {
+    let em = Emulator::new();
+    let created = em.create_named("delete-and-recreate").await;
+    let id = created.string("brandProfileId");
+    let before = requested_names(&em.all_attributes("before", &id, None).await);
+
+    // Each row is one name the list reports: a seeded one, and one a write added.
+    let added = vec![json!({
+        "attributeName": "added-text",
+        "attributeType": "TEXT",
+        "attributeValue": "first value",
+    })];
+    assert_eq!(
+        em.create_attributes(&id, added.clone()).await.status,
+        200,
+        "the added attribute must be created"
+    );
+    let seeded_name = before.first().expect("a seeded template").clone();
+    let rows = vec![seeded_name, "added-text".to_string()];
+
+    for name in rows {
+        let case = format!("attributeName={name:?}");
+        let held = requested_names(&em.all_attributes(&case, &id, None).await);
+        assert!(
+            held.contains(&name),
+            "case {case}: the list must report it before the delete, got {held:?}"
+        );
+
+        assert_eq!(
+            em.delete_attribute(&id, &name).await.status,
+            200,
+            "case {case}: the delete must succeed"
+        );
+        let after_delete = requested_names(&em.all_attributes(&case, &id, None).await);
+        assert!(
+            !after_delete.contains(&name),
+            "case {case}: a deleted attribute is not listed, got {after_delete:?}"
+        );
+        let survivors: Vec<String> = held.iter().filter(|n| **n != name).cloned().collect();
+        assert_eq!(
+            after_delete, survivors,
+            "case {case}: the delete leaves every other attribute listed, got {after_delete:?}"
+        );
+        assert_eq!(
+            em.get_attribute(&id, &name).await.status,
+            404,
+            "case {case}: the reader of a deleted attribute answers not found"
+        );
+
+        // Re-created under the same name, with a value the request supplies.
+        let recreated = em
+            .create_attributes(
+                &id,
+                vec![json!({
+                    "attributeName": name,
+                    "attributeType": "TEXT",
+                    "attributeValue": "recreated value",
+                    "category": "OTHER",
+                })],
+            )
+            .await;
+        assert_eq!(
+            recreated.status, 200,
+            "case {case}: the name is free again, got {} / {:?}",
+            recreated.status, recreated.body
+        );
+        let after_create = requested_names(&em.all_attributes(&case, &id, None).await);
+        assert_eq!(
+            after_create, held,
+            "case {case}: the re-created attribute is listed again, got {after_create:?}"
+        );
+        let read = em.get_attribute(&id, &name).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case}: the re-created attribute reads back, got {} / {:?}",
+            read.status, read.body
+        );
+        assert_eq!(
+            read.string("attributeValue"),
+            "recreated value",
+            "case {case}: the stored value is the one supplied, got {:?}",
+            read.body
+        );
+        assert_eq!(
+            read.string("attributeType"),
+            "TEXT",
+            "case {case}: the stored type is the one supplied, got {:?}",
+            read.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn paging_the_attribute_list_changes_nothing_a_later_caller_sees() {
+    let em = Emulator::new();
+    let created = em.create_named("read-only-list").await;
+    let id = created.string("brandProfileId");
+    let before = em.list_attributes(&id, "").await.attributes();
+
+    // Every way a client walks the list: whole, and page by page to exhaustion.
+    for page_size in [None, Some(1), Some(2), Some(100)] {
+        let case = format!("maxResults={page_size:?}");
+        em.all_attributes(&case, &id, page_size).await;
+    }
+
+    let after = em.list_attributes(&id, "").await.attributes();
+    assert_eq!(
+        after, before,
+        "a read leaves the stored attributes alone, got {after:?} vs {before:?}"
+    );
 }
