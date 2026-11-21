@@ -9,7 +9,9 @@
 //! states is recovered by re-reading the request, which is what
 //! `service_common::validation` collects the submitted echo for. A member the walk
 //! withheld is not a member the request left out, and the two are not stated the same way:
-//! an ABSENT member keeps the `Value null at '<member>'` it earns.
+//! an ABSENT member keeps the `Value null at '<member>'` it earns, and a member submitted
+//! EMPTY has no text to quote, so its clause states no value at all
+//! (`empty_value_constraint_clause.rs`).
 //!
 //! The rows span what the rule generalises over: the constraint class (a pattern, a length
 //! maximum, a length minimum), where the member sits (a top-level member and a member
@@ -61,6 +63,12 @@ fn clause(value: &str, path: &str, requirement: &str) -> String {
 /// The clause an ABSENT member earns: there was no value to quote.
 fn absent_clause(path: &str, requirement: &str) -> String {
     format!("Value null at '{path}' failed to satisfy constraint: {requirement}")
+}
+
+/// The clause a member submitted EMPTY earns: no value half at all, there being no text to
+/// quote.
+fn valueless_clause(path: &str, requirement: &str) -> String {
+    format!("Value at '{path}' failed to satisfy constraint: {requirement}")
 }
 
 /// One row: the request body a member's own constraint refuses, and the message the
@@ -129,19 +137,19 @@ async fn a_clause_quotes_the_value_the_request_carried_at_a_sensitive_member() {
             )),
         },
         Row {
-            case: "an empty username, under its length minimum and outside its pattern",
+            case: "an empty username, which has no text to quote",
             body: json!({
                 "ClientId": WELL_FORMED_CLIENT_ID,
                 "Username": "",
             }),
             // The empty string breaks both of the member's constraints, so the refusal
-            // states a clause for each, both quoting the value the request carried — the
-            // expression the value has to match ahead of the bound on it, which is the
-            // order this endpoint states a member's clauses in
-            // (`clause_order_states_the_expression_first.rs`).
+            // states a clause for each — the floor the value with no text falls short of
+            // ahead of the expression it does not match, and neither quoting a value, as
+            // the recorded refusal of an empty username states it
+            // (`empty_value_constraint_clause.rs`).
             expected_message: validation_errors(&[
-                clause("", "username", username_pattern),
-                clause("", "username", at_least_1),
+                valueless_clause("username", at_least_1),
+                valueless_clause("username", username_pattern),
             ]),
         },
         Row {

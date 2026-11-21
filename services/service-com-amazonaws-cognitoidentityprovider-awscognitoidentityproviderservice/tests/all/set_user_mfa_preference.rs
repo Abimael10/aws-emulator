@@ -677,14 +677,11 @@ async fn set_user_mfa_preference_stores_the_factors_the_user_can_receive() {
                     "case {case:?}: expected InvalidParameterException, got {code:?} with {payload}"
                 );
                 let message = error_message(&payload);
-                // What the user is MISSING: the registration of the
-                // authenticator the software token is read from, and the
-                // delivery configuration a message factor is sent with.
-                let wanted = if setting == "SOFTWARE_TOKEN_MFA" {
-                    "User has not verified software token mfa".to_string()
-                } else {
-                    format!("User does not have delivery config set to turn on {setting}")
-                };
+                // The delivery configuration the factor would reach the user
+                // through, naming the factor the request asked for: one
+                // sentence for every factor, the software token's registered
+                // authenticator included.
+                let wanted = format!("User does not have delivery config set to turn on {setting}");
                 assert_eq!(
                     message, wanted,
                     "case {case:?}: expected the refusal to report {wanted:?}, got {message:?}"

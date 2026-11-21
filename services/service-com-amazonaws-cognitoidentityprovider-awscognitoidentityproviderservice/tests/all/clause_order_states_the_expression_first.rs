@@ -9,13 +9,16 @@
 //! measurements of it. Which clauses are stated, which member each names, which value each
 //! quotes and how each requirement is worded are unchanged: only the order is this rule's.
 //!
+//! The rows carry a value with TEXT. A member the request submitted EMPTY is stated the
+//! other way round, and with no value at all, which is its own recorded refusal and its own
+//! suite (`empty_value_constraint_clause.rs`).
+//!
 //! The rows span what the rule generalises over: the member and the shape it targets
 //! (`UserPoolId` -> `UserPoolIdType`, `ClientId` -> `ClientIdType`, `Username` ->
 //! `UsernameType`, `GroupName` -> `GroupNameType`, from
 //! `smithy_query(query="shape",shape="UserPoolIdType,ClientIdType,UsernameType,GroupNameType")`),
-//! which bound the value breaks beside the expression (a length MAXIMUM, a length
-//! MINIMUM), the operation carrying the member, and where the member sits in the request
-//! (the member the request is addressed by, and a member beside a well-formed pool id).
+//! the operation carrying the member, and where the member sits in the request (the member
+//! the request is addressed by, and a member beside a well-formed pool id).
 //!
 //! The boundary table is the other half: a refusal carrying ONE clause is stated exactly as
 //! it was, and a request breaking two DIFFERENT members' rules still carries a clause for
@@ -65,11 +68,6 @@ fn must_match(expression: &str) -> String {
 /// The requirement half of a length MAXIMUM clause.
 fn at_most(bound: usize) -> String {
     format!("Member must have length less than or equal to {bound}")
-}
-
-/// The requirement half of a length MINIMUM clause.
-fn at_least(bound: usize) -> String {
-    format!("Member must have length greater than or equal to {bound}")
 }
 
 /// One row: a request whose refusal carries two clauses about one member, and the two
@@ -131,15 +129,6 @@ async fn a_members_expression_clause_precedes_the_bound_it_also_broke() {
             bound: at_most(55),
         },
         Row {
-            case: "an empty pool id, under its minimum, on a listing",
-            operation: "ListUserPoolClients",
-            body: json!({ "UserPoolId": "" }),
-            path: "userPoolId",
-            value: String::new(),
-            expression: pool_id_expression,
-            bound: at_least(1),
-        },
-        Row {
             case: "an over-long client id beside a well-formed pool id",
             operation: "DescribeUserPoolClient",
             body: json!({
@@ -150,15 +139,6 @@ async fn a_members_expression_clause_precedes_the_bound_it_also_broke() {
             value: over_long_client_id.clone(),
             expression: client_id_expression,
             bound: at_most(128),
-        },
-        Row {
-            case: "an empty client id beside a well-formed pool id",
-            operation: "DescribeUserPoolClient",
-            body: json!({ "UserPoolId": WELL_FORMED_POOL_ID, "ClientId": "" }),
-            path: "clientId",
-            value: String::new(),
-            expression: client_id_expression,
-            bound: at_least(1),
         },
         Row {
             case: "an over-long username on an administrative read",

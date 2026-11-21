@@ -612,10 +612,11 @@ async fn a_challenge_response_without_the_new_password_names_the_key_it_belongs_
     let fixture = pool_with_client(&router, "missing-new-password-pool", false).await;
 
     // The rows differ along what the response DOES carry beside the missing
-    // entry: nothing, the username alone, an attribute value, and a key that is
-    // not the one the password travels under.
+    // entry: the username alone, an attribute value, and a key that is not the
+    // one the password travels under. Every row names the user, because a
+    // response that names none is refused for THAT entry first
+    // (`challenge_response_required_entries.rs`).
     let rows: &[(&str, &[(&str, &str)])] = &[
-        ("an empty response map", &[]),
         ("the username alone", &[("USERNAME", "{username}")]),
         (
             "an attribute value beside the username",

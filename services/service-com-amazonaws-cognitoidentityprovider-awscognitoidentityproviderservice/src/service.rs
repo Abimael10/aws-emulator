@@ -91,7 +91,7 @@
 //! the body stay as the renderer wrote them.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
-use aws_smithy_schema_server::constraints::{self, Violation, ViolationKind};
+use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
 use aws_smithy_schema_server::ProtocolError;
 // The shared naming of the two documents every OIDC issuer this emulator serves publishes,
 // which this service's own well-known routes answer with.
@@ -101,8 +101,8 @@ use service_common::validation::{
     refusing_violations_with_declared_echoes_quoting_up_to, unanchored, SubmittedEcho,
 };
 use service_common::validation_message::{
-    in_hashed_enum_order, in_pattern_first_order, quoting_the_submitted_collection,
-    quoting_the_whole_submitted_value,
+    envelope_over, in_hashed_enum_order, in_pattern_first_order, quoting_the_submitted_collection,
+    quoting_the_whole_submitted_value, valueless_clause,
 };
 use smithy_server_runtime::{
     http, BoxFuture, DeserializableStruct, ErasedOperation, ErasedServiceDefinition, Operation,
@@ -343,8 +343,9 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for BehindWebAcl<Eng> {
 ///
 /// Nothing else is re-implemented, and no check is repeated with different words: the
 /// violations come from the framework's own machinery (the protocol's deserializer and
-/// `constraints::validate` over the built input), the sentence from the framework's own
-/// `constraints::envelope`, and the status from the framework's refusal channel. A request
+/// `constraints::validate` over the built input), the envelope the sentence is stated in
+/// from the framework's own `constraints::envelope` ([`stated_report`]), and the status from
+/// the framework's refusal channel. A request
 /// this wrapper does not refuse is handed to the generated [`ErasedOperation::run`], which
 /// owns deserialize -> validate -> handle -> serialize, telemetry and every modelled
 /// error. The cost is DELIBERATE: a valid request's body is read twice, once here and once
@@ -438,7 +439,8 @@ fn requirement_as_stated(violation: &Violation) -> Violation {
 
 /// The clauses of one refusal in the order this endpoint states them: the members in the
 /// order the validating walk found them, and within ONE member the EXPRESSION its value has
-/// to match ahead of that member's other requirements.
+/// to match ahead of that member's other requirements — except for the floor an EMPTY value
+/// falls short of, which is stated ahead of that expression.
 ///
 /// Amazon Cognito reports the form of a value before any bound on it — a pool id that is
 /// both outside `UserPoolIdType`'s `@pattern` and past its `@length` maximum is reported as
@@ -447,15 +449,92 @@ fn requirement_as_stated(violation: &Violation) -> Violation {
 /// order is [`in_pattern_first_order`], the tree's one statement of it; only the owned
 /// vector the renderers take is rebuilt here.
 ///
+/// A member the request submitted EMPTY is the one exception, and the recorded refusal of an
+/// empty `Username` is where it comes from: a value with no text at all is reported as
+/// missing the `@length` floor FIRST and as outside the expression second — the value that
+/// is not there before the form it does not have — which is also the clause pair that states
+/// no value at all ([`stated_clause`]). The lift is over that one clause of that one member,
+/// so every other member and every other requirement keep the order above.
+///
 /// Nothing but the order changes: each clause, its member path, the value it quotes and its
 /// requirement stay the ones [`requirement_as_stated`] and the framework's own walk wrote,
 /// and the set of clauses is the same one, so a request is never refused for more or fewer
 /// rules than it broke.
 fn in_stated_clause_order(violations: &[Violation]) -> Vec<Violation> {
-    in_pattern_first_order(violations)
+    let expression_first = in_pattern_first_order(violations);
+    // Each member's clauses sit together in that order already, so remembering where each
+    // member was first stated is enough to lift one clause WITHIN its own member: the sort
+    // is stable, so every clause this key cannot separate keeps the place the order above
+    // gave it.
+    let mut first_stated_at: ::std::collections::HashMap<&str, usize> =
+        ::std::collections::HashMap::with_capacity(expression_first.len());
+    let mut keyed: Vec<((usize, bool), &Violation)> = expression_first
+        .iter()
+        .enumerate()
+        .map(|(position, violation)| {
+            let member = *first_stated_at
+                .entry(violation.path.as_str())
+                .or_insert(position);
+            ((member, !states_an_empty_value_floor(violation)), *violation)
+        })
+        .collect();
+    keyed.sort_by_key(|(key, _)| *key);
+    keyed
         .into_iter()
-        .cloned()
+        .map(|(_, violation)| violation.clone())
         .collect()
+}
+
+/// Whether `violation` is the `@length` FLOOR clause an EMPTY submitted value earns, which
+/// is the one clause [`in_stated_clause_order`] lifts ahead of its member's expression.
+///
+/// Decided from the violation itself — the constraint it broke and the value it was found
+/// on — so no member, operation or request shape is named here.
+fn states_an_empty_value_floor(violation: &Violation) -> bool {
+    matches!(violation.kind, ViolationKind::MinLength(_)) && submitted_nothing(violation)
+}
+
+/// Whether the value `violation` was found on is one with no text at all.
+///
+/// A member the request left out is NOT one: the walk hands such a violation over with no
+/// value, which the clause states as the `null` it was, and this is about a member that WAS
+/// submitted, carrying the empty string.
+fn submitted_nothing(violation: &Violation) -> bool {
+    violation.value.as_deref().is_some_and(str::is_empty)
+}
+
+/// The report this endpoint states over `violations`: the framework's own envelope
+/// ([`envelope_over`]) over the clause each violation is stated as ([`stated_clause`]).
+///
+/// The one place both of this service's refusal paths render their message, so a request
+/// refused before a handler ran and one refused by the walk behind this file's own wrapper
+/// cannot be worded two ways.
+fn stated_report(violations: &[Violation]) -> Option<String> {
+    let clauses: Vec<String> = violations.iter().map(stated_clause).collect();
+    envelope_over(&clauses)
+}
+
+/// The clause `violation` is stated as: the framework's own, with the VALUE half dropped
+/// where the request submitted no text to quote.
+///
+/// Amazon Cognito's clause quotes the value a request carried at the refused member, and a
+/// member submitted EMPTY has none to quote: the recorded refusal of an empty `Username`
+/// states `Value at '<member>' failed to satisfy constraint: <requirement>`, with no `''`
+/// between them. The drop is [`valueless_clause`], which takes that half off the
+/// framework's own clause rather than spelling one here, so the requirement, the member path
+/// and the punctuation stay single-homed; a clause whose value half it cannot find keeps the
+/// framework's text rather than losing the clause.
+///
+/// Every other clause is untouched: a value with text is quoted as this service quotes one
+/// ([`quoting_the_submitted_value`]), and an ABSENT member keeps the `Value null at …` the
+/// framework states an absence with.
+fn stated_clause(violation: &Violation) -> String {
+    if submitted_nothing(violation) {
+        if let Some(stated) = valueless_clause(violation) {
+            return stated;
+        }
+    }
+    violation.message()
 }
 
 /// The members of this model whose clause quotes the modelled `@pattern` CHARACTER FOR
@@ -752,7 +831,7 @@ where
                     .map(|(violation, echo)| quoting_the_submitted_value(violation, echo))
                     .collect::<Vec<Violation>>(),
             );
-            if let Some(message) = prose.or_else(|| constraints::envelope(&refused)) {
+            if let Some(message) = prose.or_else(|| stated_report(&refused)) {
                 // The framework renders the refusal in this service's own envelope; the
                 // one thing it does not state on an awsJson error is the error shape in
                 // `x-amzn-errortype`, which this service answers on EVERY error, so the
@@ -914,8 +993,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                             .map(requirement_as_stated)
                             .collect::<Vec<Violation>>(),
                     );
-                    ::aws_smithy_schema_server::constraints::envelope(&violations)
-                        .unwrap_or_else(|| "invalid request".to_string())
+                    stated_report(&violations).unwrap_or_else(|| "invalid request".to_string())
                 });
                 Some(Refused {
                     code: INVALID_PARAMETER_EXCEPTION.to_string(),
@@ -1275,6 +1353,7 @@ mod tests {
     //! One more thing a wire test cannot see lives here: that the hand-maintained
     //! `wrap_operations!` list is the WHOLE surface.
 
+    use aws_smithy_schema_server::constraints;
     use super::{
         hosted_logo_route, logo_media_type, routes_to_signing_name, unsigned_target_names_shape,
         well_known_route, EmulatedService, ErasedServiceDefinition, WellKnownDocument,
@@ -1709,7 +1788,7 @@ mod tests {
                 .filter(|shape| shape["type"] == "structure")
                 .filter_map(|shape| shape["members"].as_object())
                 .flat_map(|members| members.iter())
-                .filter(|(name, _)| super::constraints::path::member(name) == *member)
+                .filter(|(name, _)| constraints::path::member(name) == *member)
                 .filter_map(|(_, declaration)| {
                     declared_pattern(shapes, declaration["target"].as_str()?)
                 })
@@ -1778,11 +1857,11 @@ mod tests {
             super::USER_POOL_ID_MEMBER
         );
         assert_eq!(
-            super::constraints::path::member(super::USER_POOL_ID_MEMBER),
+            constraints::path::member(super::USER_POOL_ID_MEMBER),
             super::USER_POOL_ID_MEMBER_PATH,
             "the path the sentence keys on must be the one the framework spells {:?} as, got {:?}",
             super::USER_POOL_ID_MEMBER,
-            super::constraints::path::member(super::USER_POOL_ID_MEMBER)
+            constraints::path::member(super::USER_POOL_ID_MEMBER)
         );
     }
 }

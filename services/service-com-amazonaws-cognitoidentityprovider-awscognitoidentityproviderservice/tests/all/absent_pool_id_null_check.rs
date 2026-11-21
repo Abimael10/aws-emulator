@@ -268,15 +268,15 @@ async fn a_pool_id_the_request_supplied_keeps_the_constraint_report() {
 }
 
 #[tokio::test]
-async fn an_empty_pool_id_is_a_value_the_report_quotes_rather_than_an_absence() {
+async fn an_empty_pool_id_is_a_value_the_report_states_rather_than_an_absence() {
     let router = router();
 
     // The empty string is a value a request DID carry, so it is reported as one: it breaks
     // both of the member's constraints (`UserPoolIdType` is `@length` 1..55 and
-    // `^[\w-]+_[0-9a-zA-Z]+$`), and the report quotes the value in a clause for each. WHICH
-    // ORDER those two clauses are stated in is not asserted here: that is the subject of its
-    // own recorded refusal, and this test is about the empty string not being read as an
-    // absence.
+    // `^[\w-]+_[0-9a-zA-Z]+$`), and the report states a clause for each — with no value
+    // between the two halves, there being no text to quote
+    // (`empty_value_constraint_clause.rs` is where that rule's rows live). What this test
+    // is about is that the empty string is not read as an absence.
     let (status, payload) = call(&router, "GetCSVHeader", &json!({ "UserPoolId": "" })).await;
     let message = error_message(&payload);
     assert_eq!(
@@ -292,7 +292,8 @@ async fn an_empty_pool_id_is_a_value_the_report_quotes_rather_than_an_absence() 
         "Member must have length greater than or equal to 1",
         &format!("Member must satisfy regular expression pattern: {POOL_ID_PATTERN}"),
     ] {
-        let stated = clause("", "userPoolId", requirement);
+        let stated =
+            format!("Value at 'userPoolId' failed to satisfy constraint: {requirement}");
         assert!(
             message.contains(&stated),
             "case {requirement:?}: the report must state {stated:?}, got {message:?}"

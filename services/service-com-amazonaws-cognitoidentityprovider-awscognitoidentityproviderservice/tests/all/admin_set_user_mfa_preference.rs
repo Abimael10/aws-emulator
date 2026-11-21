@@ -601,14 +601,11 @@ const CASES: &[Case] = &[
     },
 ];
 
-/// The refusal an unreceivable activation reports: what the user is MISSING —
-/// the registration of the authenticator the software token is read from, and
-/// the delivery configuration a message factor is sent with, naming that
-/// factor.
+/// The refusal an unreceivable activation reports: the delivery configuration the factor
+/// would reach the user through, naming the factor the request asked for — one sentence for
+/// every factor, the software token's registered authenticator included
+/// (`mfa_activation_delivery_config.rs` spans the three settings on its own).
 fn no_delivery_config_message(setting: &str) -> String {
-    if setting == "SOFTWARE_TOKEN_MFA" {
-        return "User has not verified software token mfa".to_string();
-    }
     format!("User does not have delivery config set to turn on {setting}")
 }
 

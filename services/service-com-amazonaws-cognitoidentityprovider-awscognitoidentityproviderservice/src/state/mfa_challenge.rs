@@ -98,6 +98,30 @@ pub fn mfa_setting_chosen(answer: &str) -> Option<&'static str> {
 /// (see [`mfa_setting_chosen`]).
 const EMAIL_MFA_ANSWER: &str = "EMAIL_MFA";
 
+/// The `ChallengeResponses` entry an `MFA_SETUP` response names the SETUP it completes in:
+/// "the session ID from `VerifySoftwareToken`" (`ChallengeResponses` in this service's
+/// model), which is the one entry that challenge asks for beside the `USERNAME` every
+/// challenge requires.
+pub const SETUP_SESSION_RESPONSE: &str = "SESSION";
+
+/// Whether a response to an `MFA_SETUP` challenge CARRIES the setup it completes: the
+/// session a `VerifySoftwareToken` handed out, which "satisfies an `MFA_SETUP` challenge"
+/// (`VerifySoftwareToken.Session` in this service's model).
+///
+/// Two ways a response carries it, both the model's: the request's own `Session` IS that
+/// session — the one the verification handed out, which `presented` is — or the response
+/// names it in its [`SETUP_SESSION_RESPONSE`] entry (`named`). A response that carries
+/// neither names no setup at all, which is a parameter it did not supply rather than
+/// anything about the user's stored factors.
+///
+/// Decided from the SESSION and the response map alone, so it can be answered before any
+/// user or factor is read.
+#[must_use]
+pub fn mfa_setup_session_presented(presented: &AuthSession, named: Option<&String>) -> bool {
+    presented.issued_by == SessionIssuer::SoftwareTokenVerification
+        || named.is_some_and(|session| !session.is_empty())
+}
+
 /// The `ChallengeResponses` entry the response to the MFA challenge
 /// `challenge_name` carries the presented code in, or `None` for a challenge
 /// that is answered with something other than a code.

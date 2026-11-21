@@ -718,24 +718,20 @@ impl MfaPreferenceRejection {
     /// be set as preferred" (`SetUserMFAPreference` in this service's model), so
     /// what is refused is the pair of preferences rather than either factor.
     ///
-    /// An activation the user cannot receive reports what the user is missing:
-    /// the software token is received through an authenticator the user has to
-    /// REGISTER first — "users must register a TOTP authenticator before they
-    /// set this as their preferred MFA method"
-    /// (`SetUserMFAPreference.SoftwareTokenMfaSettings` in this service's
-    /// model) — so its refusal reports that registration, while a message
-    /// factor's reports the delivery configuration its message would be sent
-    /// with, naming the factor it asked for. A preference over a factor the
-    /// request leaves off reports that alone and names NO factor, a factor that
-    /// is off not being one a user prefers, so the refusal is about the
-    /// preference rather than about any one factor. Nothing stored is disclosed
-    /// by any of them.
+    /// An activation the user cannot receive reports the delivery configuration
+    /// the factor would reach the user through, naming the factor the request
+    /// asked for — the same sentence for EVERY factor, the recorded refusal of a
+    /// `SOFTWARE_TOKEN_MFA` activation included: what the user is missing is the
+    /// configuration that factor is turned on with, whether that is a message
+    /// medium or a registered authenticator, and the only part taken from the
+    /// request is the `UserMFASettingList` setting it named. A preference over a
+    /// factor the request leaves off reports that alone and names NO factor, a
+    /// factor that is off not being one a user prefers, so the refusal is about
+    /// the preference rather than about any one factor. Nothing stored is
+    /// disclosed by any of them.
     pub fn message(&self) -> String {
         match self {
             Self::TwoPreferred => TWO_PREFERRED_MFA_TYPES_MESSAGE.to_string(),
-            Self::NoDeliveryConfig(setting) if setting == SOFTWARE_TOKEN_MFA_SETTING => {
-                "User has not verified software token mfa".to_string()
-            }
             Self::NoDeliveryConfig(setting) => {
                 format!("User does not have delivery config set to turn on {setting}")
             }

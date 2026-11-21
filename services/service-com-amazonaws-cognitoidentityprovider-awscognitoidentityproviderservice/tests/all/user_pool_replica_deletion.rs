@@ -597,10 +597,17 @@ async fn an_update_names_a_status_the_model_declares() {
         // Cognito constraint clause quotes the value the request carried, which
         // `input_validation_refusal_wording.rs` asserts over the class of such
         // values. Bounded all the same, by the ceiling this service states from
-        // its own model rather than by the framework's own 256-byte elision.
+        // its own model rather than by the framework's own 256-byte elision. A
+        // value submitted EMPTY has no text to quote, so its clause states none
+        // (`empty_value_constraint_clause.rs`).
+        let stated = if status.is_empty() {
+            "Value at 'status'".to_string()
+        } else {
+            format!("Value '{status}' at 'status'")
+        };
         assert!(
-            message.contains(&format!("Value '{status}' at 'status'")),
-            "case {status:?}: the submitted value is quoted whole, got {payload}"
+            message.contains(&stated),
+            "case {status:?}: the refusal must state {stated:?}, got {payload}"
         );
         assert_eq!(
             status_of(&router, &user_pool_id, REPLICA_REGION).await,

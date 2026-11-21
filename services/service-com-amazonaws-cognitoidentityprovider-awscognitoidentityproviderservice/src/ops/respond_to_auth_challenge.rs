@@ -460,6 +460,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RespondToAuthChal
             .clone()
             .ok_or_else(|| missing_parameter("Session"))?;
         let responses = input.challenge_responses.clone().unwrap_or_default();
+        // Every challenge response names the user it answers for: "all of the following
+        // challenges require USERNAME and, when the app client has a client secret,
+        // SECRET_HASH in the parameters" (`ChallengeName` in this service's model), so a
+        // response that names none answers no challenge whichever one is outstanding — and
+        // an entry carrying no text names nobody, so it is the same missing parameter as
+        // an entry that is not there. The presence of the entries a response has to carry
+        // is decided on the REQUEST, ahead of the stored session, the user it was started
+        // for and that user's own state — so a malformed request is reported as one rather
+        // than as something missing from the user it never named.
+        if !responses.contains_key(USERNAME) {
+            return Err(missing_parameter(USERNAME));
+        }
         let caller =
             crate::state::lambda_triggers::Caller::of(ctx.parts(), Some(&input.client_id));
 
@@ -626,6 +638,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RespondToAuthChal
                 };
             }
             if session.challenge_name == crate::state::MFA_SETUP_CHALLENGE {
+                // The setup challenge is answered with the setup itself: "the session ID
+                // from `VerifySoftwareToken`" (`ChallengeResponses` in this service's
+                // model), which the response either presents as the request's own
+                // `Session` or names in its `SESSION` entry
+                // ([`crate::state::mfa_setup_session_presented`]). A response carrying
+                // neither answers no setup, so it is refused as a session that is not this
+                // request's — the refusal every call of the software-token flow gives a
+                // session another call handed out — before anything about the user's own
+                // factors is read.
+                if !crate::state::mfa_setup_session_presented(
+                    &session,
+                    responses.get(crate::state::SETUP_SESSION_RESPONSE),
+                ) {
+                    return Err(invalid_session());
+                }
                 let username = usable_session_user(guard, &session)?;
                 match guard.complete_mfa_setup(&session, now) {
                     crate::state::MfaSetupCompletion::Activated(_) => {}

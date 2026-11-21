@@ -222,18 +222,9 @@ async fn a_terms_members_clause_quotes_the_modelled_expression_as_written() {
             value: "xx-terms-of-use-yy",
             expression: TERMS_NAME_PATTERN.to_string(),
         },
-        Row {
-            case: "an empty terms name",
-            operation: "DescribeTermsByClient",
-            body: json!({
-                "UserPoolId": user_pool_id,
-                "ClientId": client_id,
-                "TermsName": "",
-            }),
-            member: "termsName",
-            value: "",
-            expression: TERMS_NAME_PATTERN.to_string(),
-        },
+        // A terms name submitted EMPTY states the same expression with no value half at
+        // all, there being no text to quote; that row lives with the rest of that rule
+        // (`empty_value_constraint_clause.rs`).
     ];
 
     assert_rows(&router, rows).await;
