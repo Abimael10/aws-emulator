@@ -23,7 +23,7 @@ use service_com_amazonaws_batch_awsbatchv20160810::state;
 
 use crate::job_lifecycle::{
     arn, compute_environment, container_properties, error_code, error_message, job_definition,
-    until_status, Batch,
+    until_status, Batch, REGION,
 };
 
 /// Which scheduling policy a row attaches to its job queue.
@@ -432,9 +432,10 @@ async fn the_snapshot_lists_at_most_the_published_hundred_runnable_jobs() {
     );
 }
 
-/// RULE: a queue the service holds nothing for is refused with the modelled
-/// `ClientException` (HTTP 400) worded from the reference the request gave, while a queue
-/// it does hold answers the 200 — with an empty front of queue when nothing rests in it.
+/// RULE: a job-queue identifier that names no queue this service holds is refused with the
+/// modelled `ClientException` (HTTP 400) stating the ARN the identifier resolves to and
+/// that it does not exist, while a queue it does hold answers the 200 — with an empty front
+/// of queue when nothing rests in it.
 #[tokio::test]
 async fn a_queue_the_service_holds_nothing_for_is_refused() {
     let fixture = fixture().await;
@@ -468,11 +469,15 @@ async fn a_queue_the_service_holds_nothing_for_is_refused() {
             "ClientException",
             "case {reference:?}: expected the modelled ClientException, got {body}"
         );
+        // The resolver names the ARN the identifier resolves to — an ARN stays itself, a
+        // name is minted into this region's and account's queue ARN — and nothing else.
+        let expected = state::does_not_exist_sentence(&state::resolved_arn(reference, |queue| {
+            state::job_queue_arn(REGION, queue)
+        }));
         assert_eq!(
             error_message(&body),
-            format!("JobQueue {reference} not found."),
-            "case {reference:?}: expected the refusal worded from the reference given, got \
-             {body}"
+            expected,
+            "case {reference:?}: expected {expected:?}, got {body}"
         );
     }
 }

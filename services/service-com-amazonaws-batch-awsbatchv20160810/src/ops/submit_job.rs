@@ -409,6 +409,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
 
             let job_id = state.new_uuid();
+            let submitted_place = state.next_submission_sequence();
             let arn = batch::job_arn(&region, &job_id);
             let job = batch::Job {
                 job_id: job_id.clone(),
@@ -419,6 +420,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 status: batch::JOB_SUBMITTED.to_string(),
                 status_reason: None,
                 created_at: now,
+                // Where this submit sits in the order this store took its jobs in, which is
+                // what orders two jobs the clock timed at the same millisecond when the
+                // scheduler evaluates them (`state::compute_capacity`).
+                submission_sequence: submitted_place,
                 status_since: now,
                 started_at: None,
                 stopped_at: None,

@@ -176,9 +176,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state.materialize_due(now);
 
             // `jobQueue`: "The job queue’s name or full queue Amazon Resource Name (ARN)".
+            // The resolver's refusal names the ARN the identifier resolves to and nothing
+            // else, terminated the way the resolvers that close the sentence do
+            // ([`batch::does_not_exist_sentence`]) — the same wording `UpdateJobQueue`
+            // answers for a queue identifier that names nothing.
             let Some(queue) = state.job_queue(&input.job_queue) else {
                 return Err(GetJobQueueSnapshotErrorModeled::ClientException(
-                    batch::client_exception(format!("JobQueue {} not found.", input.job_queue)),
+                    batch::client_exception(batch::does_not_exist_sentence(&batch::resolved_arn(
+                        &input.job_queue,
+                        |queue| batch::job_queue_arn(&batch::request_region(ctx), queue),
+                    ))),
                 )
                 .into());
             };

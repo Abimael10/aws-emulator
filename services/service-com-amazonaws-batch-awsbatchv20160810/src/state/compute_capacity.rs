@@ -63,9 +63,10 @@ use super::*;
 /// Lowest first, member by member: the queue's `priority` (negated, so the higher priority is
 /// evaluated first), what the job's share has cost it in its queue's ordering, the job's own
 /// `schedulingPriority` (negated by the rank that answers it), the instant its submit was
-/// recorded, its place in its queue's submission order — so two jobs submitted inside one
-/// millisecond are still evaluated in the order they were submitted — and finally its id, so
-/// one instant answers one order.
+/// recorded, the place that submit has in the store's submission order — so two jobs submitted
+/// inside one millisecond are still evaluated in the order they were submitted, whichever
+/// queues they went to — its place in its queue's submission order, which is what separates the
+/// children of one array submit, and finally its id, so one instant answers one order.
 ///
 /// The share cost is compared only AFTER the queue's priority, so the two costs being weighed
 /// against each other are normally one queue's — which is the queue whose own policy produced
@@ -79,6 +80,7 @@ struct DispatchKey<'job> {
     share_cost: f64,
     scheduling_priority: i32,
     created_at: i64,
+    submission_sequence: u64,
     queue_position: usize,
     job_id: &'job str,
 }
@@ -91,6 +93,7 @@ impl DispatchKey<'_> {
             .then(self.share_cost.total_cmp(&other.share_cost))
             .then(self.scheduling_priority.cmp(&other.scheduling_priority))
             .then(self.created_at.cmp(&other.created_at))
+            .then(self.submission_sequence.cmp(&other.submission_sequence))
             .then(self.queue_position.cmp(&other.queue_position))
             .then(self.job_id.cmp(other.job_id))
     }
@@ -373,6 +376,7 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             share_cost: self.share_cost_of_usage(job, used),
             scheduling_priority: self.scheduling_priority_key(job),
             created_at: job.created_at,
+            submission_sequence: job.submission_sequence,
             queue_position: position_of
                 .get(job.job_id.as_str())
                 .copied()

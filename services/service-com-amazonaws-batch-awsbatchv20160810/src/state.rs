@@ -1386,6 +1386,15 @@ pub struct Job {
     pub status: String,
     pub status_reason: Option<String>,
     pub created_at: i64,
+    /// Where this job sits in the order the store took its jobs in
+    /// ([`ComAmazonawsBatchAwsbatchv20160810State::next_submission_sequence`]): internal
+    /// bookkeeping, not a modelled member.
+    ///
+    /// `createdAt` is reported in milliseconds, so two jobs submitted inside one of them
+    /// carry the same instant; this is what still orders those two by the order they were
+    /// submitted when the scheduler evaluates them (`compute_capacity`'s dispatch key). The
+    /// children of an array job share their parent's place, as they share its submit.
+    pub submission_sequence: u64,
     /// `startedAt`: "when the job transitioned from the `STARTING` state to the `RUNNING`
     /// state" (`JobDetail$startedAt`). Written when the container's own program STARTS
     /// ([`container_run`]), and `None` for a job whose program nothing performed — the
@@ -2407,6 +2416,10 @@ pub struct ComAmazonawsBatchAwsbatchv20160810State {
     /// How many identifiers this store has minted, so two ids are distinct even when the
     /// clock reports the same nanosecond (see [`new_uuid`]).
     minted_ids: u64,
+    /// How many jobs this store has taken in, so the order they were SUBMITTED in is
+    /// recorded on each of them ([`Job::submission_sequence`]) however coarse the clock
+    /// that timed them is.
+    submissions: u64,
     /// The job state changes this store has recorded and nothing has published to
     /// EventBridge yet, oldest first.
     ///
@@ -2448,6 +2461,17 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
     pub fn new_uuid(&mut self) -> String {
         self.minted_ids = self.minted_ids.wrapping_add(1);
         new_uuid(self.minted_ids)
+    }
+
+    /// The place in this store's submission order the job it is about to take in has: a
+    /// counter that only grows, recorded on the job ([`Job::submission_sequence`]).
+    ///
+    /// It is what orders two jobs the clock timed at the SAME millisecond, so the order they
+    /// were submitted in decides between them instead of their ids — which are minted, so an
+    /// order read off them is no order at all.
+    pub fn next_submission_sequence(&mut self) -> u64 {
+        self.submissions = self.submissions.saturating_add(1);
+        self.submissions
     }
     /// The compute environment `name_or_arn` names, resolved by name or by ARN.
     pub fn compute_environment(&self, name_or_arn: &str) -> Option<&ComputeEnvironment> {
@@ -3947,8 +3971,23 @@ pub fn job_definition_reference_name(reference: &str) -> &str {
     short.rsplit_once(':').map_or(short, |(name, _)| name)
 }
 
+/// How AWS Batch words the refusal of a `JobStateTimeLimitAction$maxTimeSeconds` outside
+/// the member's documented bounds: one fixed sentence that states the wait time is invalid
+/// and the closed range it had to fall in, written `[<min>..<max>]`.
+///
+/// The bounds are the MODEL's ([`MIN_JOB_STATE_TIME_LIMIT_SECONDS`],
+/// [`MAX_JOB_STATE_TIME_LIMIT_SECONDS`]), not values the request carried, and the offending
+/// value is not echoed — the same sentence answers a value below the minimum and one above
+/// the maximum, so a client matching the refusal by its text recognises both.
+pub fn job_action_wait_time_detail() -> String {
+    format!(
+        "Invalid job action wait time. Value must be in range: [{MIN_JOB_STATE_TIME_LIMIT_SECONDS}..{MAX_JOB_STATE_TIME_LIMIT_SECONDS}]"
+    )
+}
+
 /// Refuse a `jobStateTimeLimitActions` list that names a `maxTimeSeconds` outside the
-/// documented bounds; answers the refusal detail of the first offending entry.
+/// documented bounds; answers the refusal detail of the first offending entry
+/// ([`job_action_wait_time_detail`]).
 ///
 /// Shared by every operation that accepts the list (`CreateJobQueue`, `UpdateJobQueue`),
 /// so one rule covers all of them.
@@ -3959,10 +3998,7 @@ pub fn validate_job_state_time_limit_actions(
         if !(MIN_JOB_STATE_TIME_LIMIT_SECONDS..=MAX_JOB_STATE_TIME_LIMIT_SECONDS)
             .contains(&action.max_time_seconds)
         {
-            return Err(format!(
-                "jobStateTimeLimitActions maxTimeSeconds must be between {MIN_JOB_STATE_TIME_LIMIT_SECONDS} and {MAX_JOB_STATE_TIME_LIMIT_SECONDS}, got {}",
-                action.max_time_seconds
-            ));
+            return Err(job_action_wait_time_detail());
         }
     }
     Ok(())
