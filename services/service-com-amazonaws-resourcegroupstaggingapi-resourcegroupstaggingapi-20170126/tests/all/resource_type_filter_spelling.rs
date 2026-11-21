@@ -18,7 +18,9 @@
 //! * the resource-type half is NOT validated: it selects within a supported
 //!   service, so a type that names nothing is an empty page rather than an error;
 //! * `ResourceARNList` combined with any filtering or pagination member is
-//!   refused with the service's one fixed sentence, which names no member;
+//!   refused with the service's one fixed sentence, which names no member —
+//!   whichever of those members, and however many of them, the request carries,
+//!   and whatever the resource list holds;
 //! * a `TagFilters` element carrying no `Key` is refused by the field it left out.
 //!
 //! The tables span what each rule generalises over: which spelling mistake the
@@ -406,6 +408,169 @@ async fn a_tag_filter_element_without_a_key_is_refused_by_the_field_it_left_out(
             "case {case}: expected the missing-field sentence, got {body}"
         );
     }
+}
+
+/// The ONE sentence that answers every prohibited combination of an explicit
+/// resource list with a filtering or pagination member.
+///
+/// Source: the request-level refusal the API serves for the prohibition
+/// `GetResourcesInput.ResourceARNList` documents against `ResourceTypeFilters`,
+/// `TagFilters` and the pagination members. It is entirely fixed text — it names
+/// no member, value, ARN or limit — so the same bytes, trailing period included,
+/// answer every one of those combinations.
+const ONE_SENTENCE: &str = "Filters is not allowed when providing a resource list.";
+
+/// Every prohibited combination is refused by that one sentence, whatever the
+/// resource list holds and however many of the excluded members the request
+/// carries.
+///
+/// The table spans both axes the rule generalises over:
+///
+/// * which excluded members the request carries — each of the five on its own,
+///   the two filter members together, the two page sizes together, and all five
+///   at once — and which value each carries, including a page size at a
+///   published bound;
+/// * the shape of the resource list — one ARN, several ARNs of different
+///   services (one of them an ARN with no Region or account), and a list filled
+///   to `ResourceARNListForGet`'s modelled maximum of 100 entries.
+///
+/// Every case must answer the SAME bytes: the refusal is not templated, so no
+/// member name, ARN or filter value may appear in it.
+#[tokio::test]
+async fn a_resource_list_with_any_excluded_member_is_refused_by_the_same_sentence() {
+    let router = emulator();
+
+    let single = vec![format!(
+        "arn:aws:lambda:{REGION}:{ACCOUNT_ID}:function:excluded-fn"
+    )];
+    let mixed = vec![
+        // An S3 bucket ARN carries neither Region nor account.
+        "arn:aws:s3:::excluded-bucket".to_string(),
+        format!("arn:aws:dynamodb:{REGION}:{ACCOUNT_ID}:table/excluded-table"),
+    ];
+    // `ResourceARNListForGet` is `@length(1, 100)`, so 100 distinct ARNs is the
+    // longest list the member accepts.
+    let full: Vec<String> = (0..100)
+        .map(|index| format!("arn:aws:rds:{REGION}:{ACCOUNT_ID}:db:excluded-db-{index}"))
+        .collect();
+    let lists: &[(&str, &Vec<String>)] = &[
+        ("one ARN", &single),
+        ("ARNs of two services", &mixed),
+        ("the modelled maximum of 100 ARNs", &full),
+    ];
+
+    let combinations: &[(&str, Value)] = &[
+        (
+            "TagFilters",
+            json!({ "TagFilters": [{ "Key": "Env", "Values": ["prod"] }] }),
+        ),
+        (
+            "TagFilters carrying a key alone",
+            json!({ "TagFilters": [{ "Key": "Env" }] }),
+        ),
+        (
+            "ResourceTypeFilters",
+            json!({ "ResourceTypeFilters": ["lambda:function"] }),
+        ),
+        (
+            "ResourcesPerPage at its documented maximum",
+            json!({ "ResourcesPerPage": 100 }),
+        ),
+        (
+            "TagsPerPage at its documented minimum",
+            json!({ "TagsPerPage": 100 }),
+        ),
+        (
+            "a PaginationToken this service never minted",
+            json!({ "PaginationToken": "ZGVhZGJlZWY=" }),
+        ),
+        (
+            "both filter members",
+            json!({ "TagFilters": [{ "Key": "Env" }], "ResourceTypeFilters": ["s3"] }),
+        ),
+        (
+            "both page sizes",
+            json!({ "ResourcesPerPage": 1, "TagsPerPage": 500 }),
+        ),
+        (
+            "all five excluded members at once",
+            json!({
+                "TagFilters": [{ "Key": "Env", "Values": ["prod"] }],
+                "ResourceTypeFilters": ["lambda"],
+                "ResourcesPerPage": 50,
+                "TagsPerPage": 200,
+                "PaginationToken": "ZGVhZGJlZWY=",
+            }),
+        ),
+    ];
+
+    for (list_case, arns) in lists {
+        for (combination_case, members) in combinations {
+            let case = format!("{list_case} + {combination_case}");
+            let mut request = json!({ "ResourceARNList": arns });
+            for (member, value) in members
+                .as_object()
+                .expect("every combination of the table is an object")
+            {
+                request[member.as_str()] = value.clone();
+            }
+            let (status, body) = tagging(&router, "GetResources", request).await;
+            assert_eq!(
+                status, 400,
+                "case {case}: expected HTTP 400, got {status} with {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "InvalidParameterException",
+                "case {case}: got {body}"
+            );
+            let message = error_message(&body);
+            assert_eq!(
+                message, ONE_SENTENCE,
+                "case {case}: expected the one fixed sentence, got {message:?} in {body}"
+            );
+            assert!(
+                !message.contains("ResourceARNList")
+                    && !message.contains("arn:aws:")
+                    && !message.contains("Env")
+                    && !message.contains("Page"),
+                "case {case}: the sentence is fixed text, so it names no member or value, \
+                 got {message:?}"
+            );
+        }
+    }
+
+    // The controls: neither half of a prohibited combination is refused on its
+    // own, so the refusal above is the COMBINATION's and not the list's or the
+    // filters'.
+    for (list_case, arns) in lists {
+        let (status, body) = tagging(
+            &router,
+            "GetResources",
+            json!({ "ResourceARNList": arns }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {list_case} alone: expected HTTP 200, got {status} with {body}"
+        );
+    }
+    let (status, body) = tagging(
+        &router,
+        "GetResources",
+        json!({
+            "TagFilters": [{ "Key": "Env", "Values": ["prod"] }],
+            "ResourceTypeFilters": ["lambda:function"],
+            "ResourcesPerPage": 100,
+            "TagsPerPage": 100,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case the filters and page sizes with no resource list: expected HTTP 200, \
+         got {status} with {body}"
+    );
 }
 
 /// The token a paginated answer hands out is OPAQUE: one unstructured run of
