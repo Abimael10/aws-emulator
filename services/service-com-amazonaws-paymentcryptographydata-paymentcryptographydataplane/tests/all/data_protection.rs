@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The symmetric data-protection loop of the Payment Cryptography data plane, end to
-//! end over the wire: `EncryptData`, `DecryptData`, `GenerateMac`, `VerifyMac`,
-//! `GenerateCardValidationData`, `VerifyCardValidationData`,
+//! The data-protection loop of the Payment Cryptography data plane, end to
+//! end over the wire: `EncryptData`, `DecryptData`, `ReEncryptData`, `GenerateMac`,
+//! `VerifyMac`, `GenerateCardValidationData`, `VerifyCardValidationData`,
 //! `GenerateAuthRequestCryptogram`, `VerifyAuthRequestCryptogram`, `GeneratePinData`,
 //! `VerifyPinData`.
 //!
@@ -24,6 +24,14 @@
 //! `MajorKeyDerivationMode` options, every modelled `PinBlockFormatForPinData` value
 //! and every member of `PinGenerationAttributes` and `PinVerificationAttributes` —
 //! rather than the single row the issue named.
+//!
+//! For the operations that take a data-encryption attribute set the rule has a second
+//! half: WHICH KEY the cipher runs under is what the attribute set names — the named key
+//! itself for `Symmetric` and `Asymmetric`, and for `Dukpt` and `Emv` the key the
+//! published derivation produces from it — so every member of
+//! `EncryptionDecryptionAttributes` and of `ReEncryptionAttributes` is served, and the
+//! tables below span every modelled `DukptDerivationType`, `DukptKeyVariant`,
+//! `DukptEncryptionMode`, `EmvEncryptionMode` and `PaddingType` as well.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -33,8 +41,10 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_paymentcryptographydata_paymentcryptographydataplane::ops::types::{
-    ENCRYPTION_MODE_VALUES, MAC_ALGORITHM_VALUES, MAJOR_KEY_DERIVATION_MODE_VALUES,
-    PIN_BLOCK_FORMAT_FOR_PIN_DATA_VALUES, VERIFICATION_FAILED_REASON_VALUES,
+    DUKPT_DERIVATION_TYPE_VALUES, DUKPT_ENCRYPTION_MODE_VALUES, DUKPT_KEY_VARIANT_VALUES,
+    EMV_ENCRYPTION_MODE_VALUES, ENCRYPTION_MODE_VALUES, MAC_ALGORITHM_VALUES,
+    MAJOR_KEY_DERIVATION_MODE_VALUES, PADDING_TYPE_VALUES, PIN_BLOCK_FORMAT_FOR_PIN_DATA_VALUES,
+    VERIFICATION_FAILED_REASON_VALUES,
 };
 use service_com_amazonaws_paymentcryptographydata_paymentcryptographydataplane::EmulatedService as DataPlane;
 use service_com_amazonaws_paymentcryptography_paymentcryptographycontrolplane::EmulatedService as ControlPlane;
@@ -170,10 +180,26 @@ async fn create_key(
     key_usage: &str,
     modes: Value,
 ) -> Key {
+    create_key_of_class(router, "SYMMETRIC_KEY", key_algorithm, key_usage, modes).await
+}
+
+/// Mint a key of one `KeyClass` through the control plane's own `CreateKey` and read its
+/// ARN and check value back out of the response.
+///
+/// The class is a parameter because an asymmetric key is a whole key pair
+/// (`ASYMMETRIC_KEY_PAIR`) where a symmetric one is a single secret, and the data plane's
+/// `Asymmetric` attribute sets run under the former.
+async fn create_key_of_class(
+    router: &MultiServiceRouter,
+    key_class: &str,
+    key_algorithm: &str,
+    key_usage: &str,
+    modes: Value,
+) -> Key {
     let body = json!({
         "KeyAttributes": {
             "KeyUsage": key_usage,
-            "KeyClass": "SYMMETRIC_KEY",
+            "KeyClass": key_class,
             "KeyAlgorithm": key_algorithm,
             "KeyModesOfUse": modes,
         },
@@ -3032,5 +3058,1000 @@ async fn the_pin_length_a_request_names_must_be_the_pin_it_works_with() {
                 "case {case:?}: expected a failed verification, got {status} {parsed}"
             );
         }
+    }
+}
+
+/// The `KeyUsage` a DUKPT base derivation key carries, from the control plane's modelled
+/// `KeyUsage`: the BDK "To encrypt using DUKPT, you must already have a BDK (Base
+/// Derivation Key) key in your account with KeyModesOfUse set to DeriveKey"
+/// (`EncryptData`'s own documentation) names.
+const USAGE_BASE_DERIVATION: &str = "TR31_B0_BASE_DERIVATION_KEY";
+
+/// The `KeyUsage` an EMV issuer master key for data confidentiality carries, from the
+/// same shape: the issuer master key an EMV data encryption derives its session key from.
+const USAGE_EMV_CONFIDENTIALITY: &str = "TR31_E1_EMV_MKEY_CONFIDENTIALITY";
+
+/// The `KeyUsage` an asymmetric data encryption key pair carries, from the same shape.
+const USAGE_ASYMMETRIC_DATA_ENCRYPTION: &str = "TR31_D1_ASYMMETRIC_KEY_FOR_DATA_ENCRYPTION";
+
+/// The `KeyClass` an asymmetric key is: a whole key pair.
+const CLASS_ASYMMETRIC_PAIR: &str = "ASYMMETRIC_KEY_PAIR";
+
+/// `POST /keys/{IncomingKeyIdentifier}/reencrypt`, the URI the model binds
+/// `ReEncryptData` to.
+fn reencrypt_uri(identifier: &str) -> String {
+    format!("/keys/{}/reencrypt", encoded(identifier))
+}
+
+/// The `message` a refusal states.
+fn error_message(body: &Value) -> &str {
+    body.get("message")
+        .or_else(|| body.get("Message"))
+        .and_then(Value::as_str)
+        .unwrap_or("<no message>")
+}
+
+/// `value` as an object with the members that are present, so an attribute set carries
+/// only the members a case names and defaults the rest.
+fn attributes(members: &[(&str, Option<Value>)]) -> Value {
+    let mut object = serde_json::Map::new();
+    for (member, value) in members {
+        if let Some(value) = value {
+            object.insert((*member).to_string(), value.clone());
+        }
+    }
+    Value::Object(object)
+}
+
+/// One row of the DUKPT table: the base derivation key it derives from, the serial
+/// number of the transaction, the attributes the request names, and the block length in
+/// BYTES of the key that derivation produces — which is what the data length has to be a
+/// multiple of.
+struct DukptRow {
+    case: &'static str,
+    key_algorithm: &'static str,
+    key_serial_number: &'static str,
+    derivation_type: Option<&'static str>,
+    key_variant: Option<&'static str>,
+    mode: Option<&'static str>,
+    initialization_vector: Option<&'static str>,
+    derived_block_len: usize,
+}
+
+/// The DUKPT cases: both schemes the service supports — the Triple DES scheme of a
+/// `TDES_2KEY` base derivation key with its 20-character serial number, and the AES
+/// scheme of an AES one with its 24-character serial number — across every modelled
+/// `DukptDerivationType`, `DukptKeyVariant` and `DukptEncryptionMode`, with and without
+/// an initialization vector, and with the attributes the model makes optional left out
+/// so the defaults are exercised too.
+fn dukpt_table() -> Vec<DukptRow> {
+    vec![
+        DukptRow {
+            case: "a Triple DES base derivation key, every optional attribute defaulted",
+            key_algorithm: "TDES_2KEY",
+            key_serial_number: "FFFF9876543210E00001",
+            derivation_type: None,
+            key_variant: None,
+            mode: None,
+            initialization_vector: None,
+            derived_block_len: 8,
+        },
+        DukptRow {
+            case: "a Triple DES base derivation key, ECB and the request variant",
+            key_algorithm: "TDES_2KEY",
+            key_serial_number: "FFFF9876543210E00002",
+            derivation_type: Some("TDES_2KEY"),
+            key_variant: Some("REQUEST"),
+            mode: Some("ECB"),
+            initialization_vector: None,
+            derived_block_len: 8,
+        },
+        DukptRow {
+            case: "a Triple DES base derivation key, CBC from an initialization vector",
+            key_algorithm: "TDES_2KEY",
+            key_serial_number: "FFFF9876543210E0000F",
+            derivation_type: None,
+            key_variant: Some("RESPONSE"),
+            mode: Some("CBC"),
+            initialization_vector: Some("0123456789ABCDEF"),
+            derived_block_len: 8,
+        },
+        DukptRow {
+            case: "an AES-128 base derivation key, every optional attribute defaulted",
+            key_algorithm: "AES_128",
+            key_serial_number: "123456789012345600000001",
+            derivation_type: None,
+            key_variant: None,
+            mode: None,
+            initialization_vector: None,
+            derived_block_len: 16,
+        },
+        DukptRow {
+            case: "an AES-192 base derivation key deriving an AES-128 working key",
+            key_algorithm: "AES_192",
+            key_serial_number: "123456789012345600000002",
+            derivation_type: Some("AES_128"),
+            key_variant: Some("REQUEST"),
+            mode: Some("CBC"),
+            initialization_vector: Some("000102030405060708090A0B0C0D0E0F"),
+            derived_block_len: 16,
+        },
+        DukptRow {
+            case: "an AES-256 base derivation key deriving an AES-192 working key",
+            key_algorithm: "AES_256",
+            key_serial_number: "1234567890123456000000FF",
+            derivation_type: Some("AES_192"),
+            key_variant: Some("BIDIRECTIONAL"),
+            mode: Some("ECB"),
+            initialization_vector: None,
+            derived_block_len: 16,
+        },
+        DukptRow {
+            case: "an AES-256 base derivation key deriving an AES-256 working key",
+            key_algorithm: "AES_256",
+            key_serial_number: "123456789012345600001000",
+            derivation_type: Some("AES_256"),
+            key_variant: Some("RESPONSE"),
+            mode: Some("CBC"),
+            initialization_vector: None,
+            derived_block_len: 16,
+        },
+        DukptRow {
+            case: "an AES-256 base derivation key deriving a Triple DES working key",
+            key_algorithm: "AES_256",
+            key_serial_number: "123456789012345600001001",
+            derivation_type: Some("TDES_2KEY"),
+            key_variant: Some("REQUEST"),
+            mode: Some("ECB"),
+            initialization_vector: None,
+            derived_block_len: 8,
+        },
+        DukptRow {
+            case: "an AES-256 base derivation key deriving a triple-length Triple DES key",
+            key_algorithm: "AES_256",
+            key_serial_number: "123456789012345600001002",
+            derivation_type: Some("TDES_3KEY"),
+            key_variant: None,
+            mode: Some("CBC"),
+            initialization_vector: None,
+            derived_block_len: 8,
+        },
+    ]
+}
+
+/// The `EncryptData` or `DecryptData` body of one DUKPT case, with `key_serial_number`
+/// naming the transaction (which a case varies to show the key is per transaction).
+fn dukpt_body(
+    data_member: &str,
+    value: &str,
+    attributes_member: &str,
+    row: &DukptRow,
+    key_serial_number: &str,
+) -> Value {
+    let set = attributes(&[
+        ("KeySerialNumber", Some(json!(key_serial_number))),
+        ("Mode", row.mode.map(|mode| json!(mode))),
+        (
+            "DukptKeyDerivationType",
+            row.derivation_type.map(|named| json!(named)),
+        ),
+        (
+            "DukptKeyVariant",
+            row.key_variant.map(|variant| json!(variant)),
+        ),
+        (
+            "InitializationVector",
+            row.initialization_vector.map(|iv| json!(iv)),
+        ),
+    ]);
+    json!({data_member: value, attributes_member: {"Dukpt": set}})
+}
+
+#[tokio::test]
+async fn dukpt_encryption_round_trips_under_every_derived_key_type() {
+    let router = emulator();
+    let rows = dukpt_table();
+
+    // The table spans the modelled catalogs the rule generalises over: a value any of
+    // them gains later fails these assertions rather than going untested.
+    let variants: BTreeSet<&str> = rows
+        .iter()
+        .map(|row| row.key_variant.unwrap_or("BIDIRECTIONAL"))
+        .collect();
+    assert_eq!(
+        variants,
+        DUKPT_KEY_VARIANT_VALUES.iter().copied().collect(),
+        "the table must span the modelled DukptKeyVariant catalog"
+    );
+    let modes: BTreeSet<&str> = rows.iter().map(|row| row.mode.unwrap_or("CBC")).collect();
+    assert_eq!(
+        modes,
+        DUKPT_ENCRYPTION_MODE_VALUES.iter().copied().collect(),
+        "the table must span the modelled DukptEncryptionMode catalog"
+    );
+    let derived: BTreeSet<&str> = rows
+        .iter()
+        .map(|row| row.derivation_type.unwrap_or(row.key_algorithm))
+        .collect();
+    assert_eq!(
+        derived,
+        DUKPT_DERIVATION_TYPE_VALUES.iter().copied().collect(),
+        "the table must span the modelled DukptDerivationType catalog"
+    );
+
+    for row in &rows {
+        let bdk = create_key(
+            &router,
+            row.key_algorithm,
+            USAGE_BASE_DERIVATION,
+            derive_key(),
+        )
+        .await;
+        // Two whole blocks of the key the derivation produces: "When you use TDES or
+        // TDES DUKPT, the plaintext data length must be a multiple of 8 bytes. For AES
+        // or AES DUKPT, the plaintext data length must be a multiple of 16 bytes"
+        // (`EncryptData`'s own documentation).
+        let plain_text = hex_data(row.derived_block_len * 2);
+        let case = row.case;
+        let (status, parsed) = data(
+            &router,
+            &encrypt_uri(&bdk.arn),
+            &dukpt_body(
+                "PlainText",
+                &plain_text,
+                "EncryptionAttributes",
+                row,
+                row.key_serial_number,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status} {parsed}"
+        );
+        let cipher_text = string(&parsed, "CipherText").to_string();
+        assert_eq!(
+            string(&parsed, "KeyArn"),
+            bdk.arn,
+            "case {case:?}: the answer must carry the base derivation key's canonical ARN, \
+             got {parsed}"
+        );
+        assert_eq!(
+            string(&parsed, "KeyCheckValue"),
+            bdk.key_check_value,
+            "case {case:?}: the answer must carry that key's own check value, got {parsed}"
+        );
+        assert!(
+            cipher_text.len() == plain_text.len()
+                && cipher_text.chars().all(|c| c.is_ascii_hexdigit()),
+            "case {case:?}: CipherText {cipher_text} must be {} hex characters",
+            plain_text.len()
+        );
+        assert_ne!(
+            cipher_text, plain_text,
+            "case {case:?}: the ciphertext must not be the plaintext echoed back"
+        );
+
+        // The same serial number and the same attributes derive the same key, so the
+        // decrypt inverts the encrypt.
+        let decrypted = ok_data(
+            &router,
+            &decrypt_uri(&bdk.arn),
+            &dukpt_body(
+                "CipherText",
+                &cipher_text,
+                "DecryptionAttributes",
+                row,
+                row.key_serial_number,
+            ),
+        )
+        .await;
+        assert_eq!(
+            string(&decrypted, "PlainText"),
+            plain_text,
+            "case {case:?}: the DUKPT decrypt must recover the plaintext"
+        );
+
+        // A DIFFERENT transaction counter is a different key, so the same ciphertext read
+        // under it is not the plaintext: that is what "unique key per transaction" means.
+        let other_transaction = another_transaction(row.key_serial_number);
+        let elsewhere = ok_data(
+            &router,
+            &decrypt_uri(&bdk.arn),
+            &dukpt_body(
+                "CipherText",
+                &cipher_text,
+                "DecryptionAttributes",
+                row,
+                &other_transaction,
+            ),
+        )
+        .await;
+        assert_ne!(
+            string(&elsewhere, "PlainText"),
+            plain_text,
+            "case {case:?}: the key of transaction {other_transaction} must not read the \
+             ciphertext of transaction {}",
+            row.key_serial_number
+        );
+    }
+}
+
+/// `key_serial_number` with its transaction counter stepped on: the same device, another
+/// transaction.
+fn another_transaction(key_serial_number: &str) -> String {
+    let mut stepped = key_serial_number.to_string();
+    stepped.pop();
+    let last = key_serial_number.chars().next_back().unwrap_or('0');
+    stepped.push(if last == '7' { '9' } else { '7' });
+    stepped
+}
+
+/// One row of the EMV table: the issuer master key, the card, and the attributes the
+/// request names.
+struct EmvRow {
+    case: &'static str,
+    key_algorithm: &'static str,
+    major_key_derivation_mode: &'static str,
+    primary_account_number: &'static str,
+    pan_sequence_number: &'static str,
+    session_derivation_data: &'static str,
+    mode: Option<&'static str>,
+    initialization_vector: Option<&'static str>,
+}
+
+/// The EMV cases: both modelled `MajorKeyDerivationMode` options, both modelled
+/// `EmvEncryptionMode` values and the default, both published bounds of
+/// `PrimaryAccountNumber` (12 and 19 digits), under both Triple DES issuer master key
+/// algorithms.
+fn emv_table() -> Vec<EmvRow> {
+    vec![
+        EmvRow {
+            case: "EMV option A, every optional attribute defaulted",
+            key_algorithm: "TDES_2KEY",
+            major_key_derivation_mode: "EMV_OPTION_A",
+            primary_account_number: "123456789012",
+            pan_sequence_number: "00",
+            session_derivation_data: "0000000000000001",
+            mode: None,
+            initialization_vector: None,
+        },
+        EmvRow {
+            case: "EMV option B, ECB, the longest account number",
+            key_algorithm: "TDES_2KEY",
+            major_key_derivation_mode: "EMV_OPTION_B",
+            primary_account_number: "1234567890123456789",
+            pan_sequence_number: "01",
+            session_derivation_data: "00000000000000FF",
+            mode: Some("ECB"),
+            initialization_vector: None,
+        },
+        EmvRow {
+            case: "EMV option A under a triple-length issuer master key, CBC from an \
+                   initialization vector",
+            key_algorithm: "TDES_3KEY",
+            major_key_derivation_mode: "EMV_OPTION_A",
+            primary_account_number: "4111111111111111",
+            pan_sequence_number: "02",
+            session_derivation_data: "ABCDEF0123456789",
+            mode: Some("CBC"),
+            initialization_vector: Some("FEDCBA9876543210"),
+        },
+    ]
+}
+
+/// The `EncryptData` or `DecryptData` body of one EMV case, with the session derivation
+/// data a case can vary to show the key is per session.
+fn emv_body(
+    data_member: &str,
+    value: &str,
+    attributes_member: &str,
+    row: &EmvRow,
+    session_derivation_data: &str,
+) -> Value {
+    let set = attributes(&[
+        (
+            "MajorKeyDerivationMode",
+            Some(json!(row.major_key_derivation_mode)),
+        ),
+        (
+            "PrimaryAccountNumber",
+            Some(json!(row.primary_account_number)),
+        ),
+        ("PanSequenceNumber", Some(json!(row.pan_sequence_number))),
+        (
+            "SessionDerivationData",
+            Some(json!(session_derivation_data)),
+        ),
+        ("Mode", row.mode.map(|mode| json!(mode))),
+        (
+            "InitializationVector",
+            row.initialization_vector.map(|iv| json!(iv)),
+        ),
+    ]);
+    json!({data_member: value, attributes_member: {"Emv": set}})
+}
+
+#[tokio::test]
+async fn emv_encryption_round_trips_under_the_session_key_the_card_derives() {
+    let router = emulator();
+    let rows = emv_table();
+    let covered: BTreeSet<&str> = rows
+        .iter()
+        .map(|row| row.major_key_derivation_mode)
+        .collect();
+    assert_eq!(
+        covered,
+        MAJOR_KEY_DERIVATION_MODE_VALUES.iter().copied().collect(),
+        "the table must span the modelled MajorKeyDerivationMode catalog"
+    );
+    let modes: BTreeSet<&str> = rows.iter().map(|row| row.mode.unwrap_or("CBC")).collect();
+    assert_eq!(
+        modes,
+        EMV_ENCRYPTION_MODE_VALUES.iter().copied().collect(),
+        "the table must span the modelled EmvEncryptionMode catalog"
+    );
+
+    for row in &rows {
+        let imk = create_key(
+            &router,
+            row.key_algorithm,
+            USAGE_EMV_CONFIDENTIALITY,
+            derive_key(),
+        )
+        .await;
+        // The EMV derivations produce a double-length Triple DES key, which chains an
+        // 8-byte block: "For EMV encryption, Amazon Web Services Payment Cryptography
+        // supports TDES algorithms" (`EncryptData`'s own documentation).
+        let plain_text = hex_data(16);
+        let case = row.case;
+        let (status, parsed) = data(
+            &router,
+            &encrypt_uri(&imk.arn),
+            &emv_body(
+                "PlainText",
+                &plain_text,
+                "EncryptionAttributes",
+                row,
+                row.session_derivation_data,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status} {parsed}"
+        );
+        let cipher_text = string(&parsed, "CipherText").to_string();
+        assert_eq!(
+            (
+                string(&parsed, "KeyArn"),
+                string(&parsed, "KeyCheckValue")
+            ),
+            (imk.arn.as_str(), imk.key_check_value.as_str()),
+            "case {case:?}: the answer must carry the issuer master key's own ARN and \
+             check value, got {parsed}"
+        );
+        assert_ne!(
+            cipher_text, plain_text,
+            "case {case:?}: the ciphertext must not be the plaintext echoed back"
+        );
+
+        let decrypted = ok_data(
+            &router,
+            &decrypt_uri(&imk.arn),
+            &emv_body(
+                "CipherText",
+                &cipher_text,
+                "DecryptionAttributes",
+                row,
+                row.session_derivation_data,
+            ),
+        )
+        .await;
+        assert_eq!(
+            string(&decrypted, "PlainText"),
+            plain_text,
+            "case {case:?}: the EMV decrypt must recover the plaintext"
+        );
+
+        // Another session of the same card is another key.
+        let other_session = "1111111111111111";
+        let elsewhere = ok_data(
+            &router,
+            &decrypt_uri(&imk.arn),
+            &emv_body(
+                "CipherText",
+                &cipher_text,
+                "DecryptionAttributes",
+                row,
+                other_session,
+            ),
+        )
+        .await;
+        assert_ne!(
+            string(&elsewhere, "PlainText"),
+            plain_text,
+            "case {case:?}: the session key of {other_session} must not read the \
+             ciphertext of session {}",
+            row.session_derivation_data
+        );
+    }
+}
+
+#[tokio::test]
+async fn asymmetric_encryption_round_trips_under_every_modelled_padding() {
+    let router = emulator();
+    let pair = create_key_of_class(
+        &router,
+        CLASS_ASYMMETRIC_PAIR,
+        "RSA_2048",
+        USAGE_ASYMMETRIC_DATA_ENCRYPTION,
+        encrypt_decrypt(),
+    )
+    .await;
+    // One modulus of ciphertext, whatever the padding: an RSA ciphertext is exactly as
+    // wide as the key.
+    const MODULUS_BYTES: usize = 256;
+    let plain_text = hex_data(16);
+    for padding_type in PADDING_TYPE_VALUES {
+        let body = json!({
+            "PlainText": plain_text,
+            "EncryptionAttributes": {"Asymmetric": {"PaddingType": padding_type}},
+        });
+        let (status, parsed) = data(&router, &encrypt_uri(&pair.arn), &body).await;
+        assert_eq!(
+            status, 200,
+            "case {padding_type}: expected 200, got {status} {parsed}"
+        );
+        let cipher_text = string(&parsed, "CipherText").to_string();
+        assert_eq!(
+            cipher_text.len(),
+            MODULUS_BYTES * 2,
+            "case {padding_type}: an RSA_2048 ciphertext is one modulus wide, got \
+             {cipher_text}"
+        );
+        assert_eq!(
+            string(&parsed, "KeyArn"),
+            pair.arn,
+            "case {padding_type}: the answer must carry the key pair's canonical ARN"
+        );
+        let decrypted = ok_data(
+            &router,
+            &decrypt_uri(&pair.arn),
+            &json!({
+                "CipherText": cipher_text,
+                "DecryptionAttributes": {"Asymmetric": {"PaddingType": padding_type}},
+            }),
+        )
+        .await;
+        assert_eq!(
+            string(&decrypted, "PlainText"),
+            plain_text,
+            "case {padding_type}: the private half must recover the plaintext"
+        );
+
+        // The padding is part of what produced the ciphertext, so reading it under an
+        // OAEP scheme that did not produce it is refused rather than answered.
+        let other = if *padding_type == "OAEP_SHA256" {
+            "OAEP_SHA512"
+        } else {
+            "OAEP_SHA256"
+        };
+        let (status, parsed) = data(
+            &router,
+            &decrypt_uri(&pair.arn),
+            &json!({
+                "CipherText": cipher_text,
+                "DecryptionAttributes": {"Asymmetric": {"PaddingType": other}},
+            }),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&parsed).as_str()),
+            (400, "ValidationException"),
+            "case {padding_type}: a ciphertext read under {other} must be refused, got \
+             {status} {parsed}"
+        );
+    }
+
+    // Each scheme's own ceiling over this modulus (RFC 8017): a plaintext past it is
+    // refused, naming the limit, rather than truncated or padded.
+    // (the padding, the longest plaintext it admits in BYTES)
+    let ceilings: &[(&str, usize)] = &[
+        ("PKCS1", MODULUS_BYTES - 11),
+        ("OAEP_SHA1", MODULUS_BYTES - 2 * 20 - 2),
+        ("OAEP_SHA256", MODULUS_BYTES - 2 * 32 - 2),
+        ("OAEP_SHA512", MODULUS_BYTES - 2 * 64 - 2),
+    ];
+    for (padding_type, longest) in ceilings {
+        for (case, bytes, served) in [("at the ceiling", *longest, true), ("past it", longest + 1, false)] {
+            let (status, parsed) = data(
+                &router,
+                &encrypt_uri(&pair.arn),
+                &json!({
+                    "PlainText": hex_data(bytes),
+                    "EncryptionAttributes": {"Asymmetric": {"PaddingType": padding_type}},
+                }),
+            )
+            .await;
+            if served {
+                assert_eq!(
+                    status, 200,
+                    "case {padding_type} {case}: {bytes} bytes must be served, got \
+                     {status} {parsed}"
+                );
+            } else {
+                assert_eq!(
+                    (status, error_code(&parsed).as_str()),
+                    (400, "ValidationException"),
+                    "case {padding_type} {case}: {bytes} bytes must be refused, got \
+                     {status} {parsed}"
+                );
+                assert!(
+                    error_message(&parsed).contains(&(longest * 2).to_string()),
+                    "case {padding_type} {case}: the refusal must name the {} hexadecimal \
+                     characters it admits, got {parsed}",
+                    longest * 2
+                );
+            }
+        }
+    }
+
+    // "You must specify a PaddingType" (`ReEncryptionAttributes$Asymmetric`): there is
+    // no scheme to default to, so a set naming none is refused.
+    let (status, parsed) = data(
+        &router,
+        &encrypt_uri(&pair.arn),
+        &json!({"PlainText": plain_text, "EncryptionAttributes": {"Asymmetric": {}}}),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&parsed).as_str()),
+        (400, "ValidationException"),
+        "an asymmetric request naming no PaddingType must be refused, got {status} {parsed}"
+    );
+}
+
+/// One row of the `ReEncryptData` table: the two keys, the attribute sets of the two
+/// legs, and how long a plaintext both legs' ciphers admit.
+struct ReEncryptRow {
+    case: &'static str,
+    incoming: String,
+    incoming_attributes: Value,
+    outgoing: Key,
+    outgoing_attributes: Value,
+    plain_text_bytes: usize,
+}
+
+#[tokio::test]
+async fn re_encrypt_data_moves_a_ciphertext_from_one_key_to_another() {
+    let router = emulator();
+    let bdk = create_key(&router, "TDES_2KEY", USAGE_BASE_DERIVATION, derive_key()).await;
+    let aes_bdk = create_key(&router, "AES_256", USAGE_BASE_DERIVATION, derive_key()).await;
+    let network = create_key(
+        &router,
+        "TDES_2KEY",
+        USAGE_DATA_ENCRYPTION,
+        encrypt_decrypt(),
+    )
+    .await;
+    let acquirer = create_key(&router, "AES_256", USAGE_DATA_ENCRYPTION, encrypt_decrypt()).await;
+    let pair = create_key_of_class(
+        &router,
+        CLASS_ASYMMETRIC_PAIR,
+        "RSA_2048",
+        USAGE_ASYMMETRIC_DATA_ENCRYPTION,
+        encrypt_decrypt(),
+    )
+    .await;
+
+    let dukpt_tdes = json!({"Dukpt": {"KeySerialNumber": "FFFF9876543210E00001", "Mode": "ECB"}});
+    let dukpt_aes = json!({
+        "Dukpt": {"KeySerialNumber": "123456789012345600000003", "DukptKeyVariant": "REQUEST"},
+    });
+    let symmetric_tdes = json!({"Symmetric": {"Mode": "CBC"}});
+    let symmetric_aes = json!({"Symmetric": {"Mode": "ECB"}});
+    let asymmetric = json!({"Asymmetric": {"PaddingType": "OAEP_SHA256"}});
+
+    // Every member of `ReEncryptionAttributes` on either leg, and both the symmetric and
+    // the derived key schemes on both sides of the move.
+    let rows = vec![
+        ReEncryptRow {
+            case: "a terminal's DUKPT ciphertext onto the network's own key",
+            incoming: bdk.arn.clone(),
+            incoming_attributes: dukpt_tdes.clone(),
+            outgoing: network.clone(),
+            outgoing_attributes: symmetric_tdes.clone(),
+            plain_text_bytes: 16,
+        },
+        ReEncryptRow {
+            case: "the network's ciphertext onto a terminal's DUKPT key",
+            incoming: network.arn.clone(),
+            incoming_attributes: symmetric_tdes.clone(),
+            outgoing: bdk.clone(),
+            outgoing_attributes: dukpt_tdes.clone(),
+            plain_text_bytes: 16,
+        },
+        ReEncryptRow {
+            case: "one symmetric key onto another of a different cipher",
+            incoming: network.arn.clone(),
+            incoming_attributes: symmetric_tdes.clone(),
+            outgoing: acquirer.clone(),
+            outgoing_attributes: symmetric_aes.clone(),
+            plain_text_bytes: 16,
+        },
+        ReEncryptRow {
+            case: "an asymmetric ciphertext onto a symmetric key",
+            incoming: pair.arn.clone(),
+            incoming_attributes: asymmetric.clone(),
+            outgoing: network.clone(),
+            outgoing_attributes: symmetric_tdes.clone(),
+            plain_text_bytes: 16,
+        },
+        ReEncryptRow {
+            case: "a symmetric ciphertext onto an asymmetric key pair",
+            incoming: network.arn.clone(),
+            incoming_attributes: symmetric_tdes.clone(),
+            outgoing: pair.clone(),
+            outgoing_attributes: asymmetric.clone(),
+            plain_text_bytes: 16,
+        },
+        ReEncryptRow {
+            case: "one DUKPT scheme onto the other",
+            incoming: bdk.arn.clone(),
+            incoming_attributes: dukpt_tdes.clone(),
+            outgoing: aes_bdk.clone(),
+            outgoing_attributes: dukpt_aes.clone(),
+            plain_text_bytes: 16,
+        },
+    ];
+
+    for row in &rows {
+        let case = row.case;
+        let plain_text = hex_data(row.plain_text_bytes);
+        // The incoming ciphertext is one the incoming key itself produced, which is the
+        // position a caller of this operation is in.
+        let encrypted = ok_data(
+            &router,
+            &encrypt_uri(&row.incoming),
+            &json!({
+                "PlainText": plain_text,
+                "EncryptionAttributes": row.incoming_attributes,
+            }),
+        )
+        .await;
+        let incoming_cipher_text = string(&encrypted, "CipherText").to_string();
+
+        let (status, parsed) = data(
+            &router,
+            &reencrypt_uri(&row.incoming),
+            &json!({
+                "OutgoingKeyIdentifier": row.outgoing.arn,
+                "CipherText": incoming_cipher_text,
+                "IncomingEncryptionAttributes": row.incoming_attributes,
+                "OutgoingEncryptionAttributes": row.outgoing_attributes,
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status} {parsed}"
+        );
+        let cipher_text = string(&parsed, "CipherText").to_string();
+        assert_eq!(
+            (
+                string(&parsed, "KeyArn"),
+                string(&parsed, "KeyCheckValue")
+            ),
+            (
+                row.outgoing.arn.as_str(),
+                row.outgoing.key_check_value.as_str()
+            ),
+            "case {case:?}: the answer must carry the OUTGOING key's ARN and check value, \
+             got {parsed}"
+        );
+        assert_ne!(
+            cipher_text, incoming_cipher_text,
+            "case {case:?}: the ciphertext answered is the outgoing key's, not the one \
+             that came in"
+        );
+        assert_ne!(
+            cipher_text, plain_text,
+            "case {case:?}: the plaintext must not be answered"
+        );
+
+        // What the move preserves is the plaintext: the outgoing key and the outgoing
+        // attributes read exactly what the incoming ones carried.
+        let decrypted = ok_data(
+            &router,
+            &decrypt_uri(&row.outgoing.arn),
+            &json!({
+                "CipherText": cipher_text,
+                "DecryptionAttributes": row.outgoing_attributes,
+            }),
+        )
+        .await;
+        assert_eq!(
+            string(&decrypted, "PlainText"),
+            plain_text,
+            "case {case:?}: a decrypt under the outgoing key must recover the plaintext"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_derived_key_request_the_scheme_does_not_admit_is_refused_as_invalid() {
+    let router = emulator();
+    let bdk = create_key(&router, "TDES_2KEY", USAGE_BASE_DERIVATION, derive_key()).await;
+    let triple = create_key(&router, "TDES_3KEY", USAGE_BASE_DERIVATION, derive_key()).await;
+    let no_derive = create_key(
+        &router,
+        "TDES_2KEY",
+        USAGE_BASE_DERIVATION,
+        encrypt_decrypt(),
+    )
+    .await;
+    let data_key = create_key(
+        &router,
+        "TDES_2KEY",
+        USAGE_DATA_ENCRYPTION,
+        json!({"Decrypt": true}),
+    )
+    .await;
+    let pair = create_key_of_class(
+        &router,
+        CLASS_ASYMMETRIC_PAIR,
+        "RSA_2048",
+        USAGE_ASYMMETRIC_DATA_ENCRYPTION,
+        encrypt_decrypt(),
+    )
+    .await;
+
+    let dukpt = |ksn: &str| json!({"Dukpt": {"KeySerialNumber": ksn, "Mode": "ECB"}});
+    let emv = json!({"Emv": {
+        "MajorKeyDerivationMode": "EMV_OPTION_A",
+        "PrimaryAccountNumber": "4111111111111111",
+        "PanSequenceNumber": "00",
+        "SessionDerivationData": "0000000000000001",
+    }});
+    // (case, the key, the attributes, the sentence the refusal has to state)
+    let rows: Vec<(&str, &str, Value, String)> = vec![
+        (
+            "a base derivation key whose modes of use do not derive",
+            no_derive.arn.as_str(),
+            dukpt("FFFF9876543210E00001"),
+            format!(
+                "The KeyModesOfUse of key {} do not include DeriveKey.",
+                no_derive.arn
+            ),
+        ),
+        (
+            "an EMV derivation under a key whose modes of use do not derive",
+            no_derive.arn.as_str(),
+            emv.clone(),
+            format!(
+                "The KeyModesOfUse of key {} do not include DeriveKey.",
+                no_derive.arn
+            ),
+        ),
+        (
+            "a symmetric encrypt under a key whose modes of use do not encrypt",
+            data_key.arn.as_str(),
+            json!({"Symmetric": {"Mode": "CBC"}}),
+            format!(
+                "The KeyModesOfUse of key {} do not include Encrypt.",
+                data_key.arn
+            ),
+        ),
+        (
+            "a key serial number of the other scheme's length",
+            bdk.arn.as_str(),
+            dukpt("123456789012345600000001"),
+            "KeySerialNumber must be 20 hexadecimal characters for KeyAlgorithm TDES_2KEY."
+                .to_string(),
+        ),
+        (
+            "a triple-length Triple DES base derivation key, which X9.24-1 derives \
+             nothing under",
+            triple.arn.as_str(),
+            dukpt("FFFF9876543210E00001"),
+            "KeyAlgorithm TDES_3KEY is not valid for DUKPT key derivation.".to_string(),
+        ),
+        (
+            "a derived key type the base derivation key's own scheme does not derive",
+            bdk.arn.as_str(),
+            json!({"Dukpt": {
+                "KeySerialNumber": "FFFF9876543210E00001",
+                "DukptKeyDerivationType": "AES_128",
+            }}),
+            "DukptKeyDerivationType AES_128 is not valid for KeyAlgorithm TDES_2KEY."
+                .to_string(),
+        ),
+        (
+            "an asymmetric set naming a symmetric key",
+            bdk.arn.as_str(),
+            json!({"Asymmetric": {"PaddingType": "PKCS1"}}),
+            "KeyAlgorithm TDES_2KEY is not valid for asymmetric encryption.".to_string(),
+        ),
+    ];
+    for (case, identifier, attributes, expected) in rows {
+        let (status, parsed) = data(
+            &router,
+            &encrypt_uri(identifier),
+            &json!({"PlainText": hex_data(16), "EncryptionAttributes": attributes}),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&parsed).as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: expected a 400 ValidationException, got {status} {parsed}"
+        );
+        assert_eq!(
+            error_message(&parsed),
+            expected,
+            "case {case:?}: expected the refusal to state the rule it broke, got {parsed}"
+        );
+    }
+
+    // The data length rule is the DERIVED key's: a plaintext that is not a whole number
+    // of its blocks is refused naming the length, in the hex characters the caller sent.
+    let (status, parsed) = data(
+        &router,
+        &encrypt_uri(&bdk.arn),
+        &json!({
+            "PlainText": hex_data(12),
+            "EncryptionAttributes": dukpt("FFFF9876543210E00001"),
+        }),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&parsed).as_str()),
+        (400, "ValidationException"),
+        "a plaintext that is not a whole number of the derived key's blocks must be \
+         refused, got {status} {parsed}"
+    );
+    assert_eq!(
+        error_message(&parsed),
+        "Invalid data provided. Please provide data of length multiple of 16.",
+        "the refusal must state the derived cipher's block length in hex characters, got \
+         {parsed}"
+    );
+
+    // The one form of these operations that is still a scaffold: a key the request
+    // carries with it, rather than one of the attribute sets.
+    let wrapped = json!({
+        "WrappedKeyMaterial": {"Tr31KeyBlock": "B0096B1TX00S0100KS1800604B120F9292800000A1B2C3D4"},
+    });
+    // (case, the URI, the body)
+    let scaffolded: Vec<(&str, String, Value)> = vec![
+        (
+            "EncryptData with a WrappedKey",
+            encrypt_uri(&pair.arn),
+            json!({
+                "PlainText": hex_data(16),
+                "EncryptionAttributes": {"Symmetric": {"Mode": "CBC"}},
+                "WrappedKey": wrapped,
+            }),
+        ),
+        (
+            "ReEncryptData with a WrappedKey",
+            reencrypt_uri(&bdk.arn),
+            json!({
+                "OutgoingKeyIdentifier": data_key.arn,
+                "CipherText": hex_data(16),
+                "IncomingEncryptionAttributes": dukpt("FFFF9876543210E00001"),
+                "OutgoingEncryptionAttributes": {"Symmetric": {"Mode": "CBC"}},
+                "IncomingWrappedKey": wrapped,
+            }),
+        ),
+    ];
+    for (case, uri, body) in scaffolded {
+        let (status, parsed) = data(&router, &uri, &body).await;
+        assert_eq!(
+            (status, error_code(&parsed).as_str()),
+            (501, "NotImplemented"),
+            "case {case:?}: a dynamic key nothing here establishes must say so, got \
+             {status} {parsed}"
+        );
     }
 }

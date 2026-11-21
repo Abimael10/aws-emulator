@@ -11,12 +11,19 @@
 //! The key itself lives in the Payment Cryptography control plane's store, where
 //! `CreateKey` minted it; [`crate::state::resolve_key`] is what reads it, so the
 //! `KeyArn` answered is the canonical one and `KeyCheckValue` is the value that store
-//! computed from the key's own secret.
+//! computed from the key's own secret — the key the REQUEST named, even where the
+//! attributes derived the key the cipher ran under from it.
 //!
-//! This slice serves the `Symmetric` encryption attributes. The asymmetric (RSA),
-//! DUKPT and EMV attribute sets, and the dynamic `WrappedKey` form, each need key
-//! derivation or a key form nothing here establishes yet, so they answer 501 rather
-//! than a ciphertext no documented algorithm produced.
+//! This slice serves every `EncryptionAttributes` the model admits: the `Symmetric` set
+//! runs the named key's own cipher, and the `Dukpt`, `Emv` and `Asymmetric` sets each
+//! name the key the ciphertext is computed under instead — all four read by
+//! [`crate::state::data_encryption`], which `DecryptData` and `ReEncryptData` read
+//! theirs through as well.
+//!
+//! The dynamic `WrappedKey` form is a different thing from an attribute set: it carries
+//! a key of its own, established for the one call out of a TR-31 key block or an ECDH
+//! agreement, and nothing here establishes such a key yet — so that member alone answers
+//! 501 rather than a ciphertext under a key no caller sent.
 //!
 //! ## Shape of an operation
 //!
@@ -224,53 +231,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "EncryptData with a WrappedKey",
             ));
         }
-        let EncryptionDecryptionAttributes::Symmetric(attributes) = &input.encryption_attributes
-        else {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "EncryptData with Asymmetric, Dukpt or Emv encryption attributes",
-            ));
-        };
-
-        let key =
-            crate::state::resolve_key(&*self.engine, &input.key_identifier).map_err(refused)?;
-        // "For this operation, the key must have KeyModesOfUse set to Encrypt" (this
-        // operation's own documentation).
-        if !key.modes.encrypt() {
-            return Err(invalid(format!(
-                "The KeyModesOfUse of key {} do not include Encrypt.",
-                key.key_arn
-            )));
-        }
 
         let Ok(plain_text) = hex::decode(&input.plain_text) else {
             return Err(invalid("PlainText must be hexadecimal.".to_string()));
         };
-        let initialization_vector = match attributes.initialization_vector.as_deref() {
-            None => None,
-            Some(iv) => match hex::decode(iv) {
-                Ok(iv) => Some(iv),
-                Err(_) => {
-                    return Err(invalid(
-                        "InitializationVector must be hexadecimal.".to_string(),
-                    ))
-                }
-            },
-        };
-        let cipher_text = crate::state::crypto::symmetric_encrypt(
-            &crate::state::crypto::SymmetricRequest {
-                key_algorithm: &key.key_algorithm,
-                material: key.material(),
-                mode: &attributes.mode,
-                initialization_vector: initialization_vector.as_deref(),
-                data: &plain_text,
-            },
+        let encrypted = crate::state::data_encryption::transform(
+            &*self.engine,
+            &input.key_identifier,
+            (&input.encryption_attributes).into(),
+            crate::state::data_encryption::Direction::Encrypt,
+            &plain_text,
         )
-        .map_err(invalid)?;
+        .map_err(refused)?;
 
         Ok(EncryptDataOutput {
-            key_arn: key.key_arn,
-            key_check_value: Some(key.key_check_value),
-            cipher_text: hex::encode_upper(cipher_text),
+            key_arn: encrypted.key_arn,
+            key_check_value: Some(encrypted.key_check_value),
+            cipher_text: hex::encode_upper(encrypted.data),
         })
     }
 }

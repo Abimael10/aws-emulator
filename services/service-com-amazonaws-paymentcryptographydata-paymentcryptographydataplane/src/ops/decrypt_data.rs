@@ -12,8 +12,10 @@
 //! which key a ciphertext was encrypted under; what it can guarantee, and does, is
 //! that no key returns another key's plaintext.
 //!
-//! This slice serves the `Symmetric` decryption attributes; the asymmetric, DUKPT and
-//! EMV attribute sets and the dynamic `WrappedKey` form answer 501, as on
+//! This slice serves every `DecryptionAttributes` the model admits — `Symmetric`,
+//! `Asymmetric`, `Dukpt` and `Emv`, each naming the key the plaintext is recovered
+//! under, read by [`crate::state::data_encryption`] exactly as `EncryptData` reads them.
+//! The dynamic `WrappedKey` form carries a key of its own and answers 501, as on
 //! `EncryptData`.
 //!
 //! ## Shape of an operation
@@ -213,53 +215,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "DecryptData with a WrappedKey",
             ));
         }
-        let EncryptionDecryptionAttributes::Symmetric(attributes) = &input.decryption_attributes
-        else {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "DecryptData with Asymmetric, Dukpt or Emv decryption attributes",
-            ));
-        };
-
-        let key =
-            crate::state::resolve_key(&*self.engine, &input.key_identifier).map_err(refused)?;
-        // "For this operation, the key must have KeyModesOfUse set to Decrypt" (this
-        // operation's own documentation).
-        if !key.modes.decrypt() {
-            return Err(invalid(format!(
-                "The KeyModesOfUse of key {} do not include Decrypt.",
-                key.key_arn
-            )));
-        }
 
         let Ok(cipher_text) = hex::decode(&input.cipher_text) else {
             return Err(invalid("CipherText must be hexadecimal.".to_string()));
         };
-        let initialization_vector = match attributes.initialization_vector.as_deref() {
-            None => None,
-            Some(iv) => match hex::decode(iv) {
-                Ok(iv) => Some(iv),
-                Err(_) => {
-                    return Err(invalid(
-                        "InitializationVector must be hexadecimal.".to_string(),
-                    ))
-                }
-            },
-        };
-        let plain_text = crate::state::crypto::symmetric_decrypt(
-            &crate::state::crypto::SymmetricRequest {
-                key_algorithm: &key.key_algorithm,
-                material: key.material(),
-                mode: &attributes.mode,
-                initialization_vector: initialization_vector.as_deref(),
-                data: &cipher_text,
-            },
+        let decrypted = crate::state::data_encryption::transform(
+            &*self.engine,
+            &input.key_identifier,
+            (&input.decryption_attributes).into(),
+            crate::state::data_encryption::Direction::Decrypt,
+            &cipher_text,
         )
-        .map_err(invalid)?;
+        .map_err(refused)?;
 
         Ok(DecryptDataOutput {
-            key_arn: key.key_arn,
-            key_check_value: key.key_check_value,
-            plain_text: hex::encode_upper(plain_text),
+            key_arn: decrypted.key_arn,
+            key_check_value: decrypted.key_check_value,
+            plain_text: hex::encode_upper(decrypted.data),
         })
     }
 }

@@ -147,6 +147,41 @@ pub fn session_key(
     Ok(halves)
 }
 
+/// The session key an EMV DATA ENCRYPTION runs under: the issuer master key `material`
+/// diversified for the card, then for the session by the derivation data the request
+/// carries.
+///
+/// The same two-step chain [`session_key`] walks for a cryptogram, with the session step
+/// diversified by `session_derivation_data` — "the derivation value used to derive the
+/// ICC session key ... typically the application transaction counter value padded with
+/// zeros or previous ARQC value padded with zeros as per EMV version 4.3"
+/// (`EmvEncryptionAttributes$SessionDerivationData`), which is one derivation block —
+/// rather than by a transaction counter the cryptogram schemes carry. The result is the
+/// double-length Triple DES key the data is then encrypted under.
+pub fn encryption_session_key(
+    major_key_derivation_mode: &str,
+    key_algorithm: &str,
+    material: &[u8],
+    primary_account_number: &str,
+    pan_sequence_number: &str,
+    session_derivation_data: &str,
+) -> Result<Vec<u8>, CryptogramRefusal> {
+    let master = card_master_key(
+        major_key_derivation_mode,
+        key_algorithm,
+        material,
+        primary_account_number,
+        pan_sequence_number,
+    )?;
+    let value = decoded_exact(
+        "SessionDerivationData",
+        session_derivation_data,
+        DERIVATION_BLOCK_BYTES,
+    )?;
+    let cipher = derived_cipher(&master)?;
+    Ok(common_session_key(&cipher, &value))
+}
+
 /// The Authorization Request Cryptogram of `transaction_data` under `session_key`: the
 /// EMV MAC, eight bytes, which is what the modelled `AuthRequestCryptogramType`
 /// carries as sixteen hexadecimal characters.

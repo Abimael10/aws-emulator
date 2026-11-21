@@ -23,6 +23,9 @@ use std::collections::BTreeMap;
 use ::service_com_amazonaws_paymentcryptography_paymentcryptographycontrolplane::state as key_store;
 
 pub mod crypto;
+/// The one reading of a data-encryption attribute set: the key each attribute set
+/// computes under, and the cipher it runs.
+pub mod data_encryption;
 
 /// Per-service state for com-amazonaws-paymentcryptographydata-paymentcryptographydataplane. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -175,6 +178,30 @@ pub enum KeyRefusal {
     Unavailable(String),
 }
 
+/// How this service states that a key cannot be used because of the modes of use it
+/// carries: the mode the operation needs, and the key it asked for it on.
+///
+/// One sentence for every operation here, so the refusal a caller reads does not depend
+/// on which operation — or which attribute set — asked for the mode.
+#[must_use]
+pub fn missing_mode(key_arn: &str, mode: &str) -> String {
+    format!("The KeyModesOfUse of key {key_arn} do not include {mode}.")
+}
+
+/// The name of the mode of use an operation that ENCRYPTS data needs, as the control
+/// plane's `KeyModesOfUse` spells it.
+pub const MODE_ENCRYPT: &str = "Encrypt";
+
+/// The name of the mode an operation that DECRYPTS data needs.
+pub const MODE_DECRYPT: &str = "Decrypt";
+
+/// The name of the mode a key whose material is DERIVED FROM needs: "To encrypt using
+/// DUKPT, you must already have a BDK (Base Derivation Key) key in your account with
+/// KeyModesOfUse set to DeriveKey" and "To encrypt using EMV, you must already have an
+/// IMK (Issuer Master Key) key in your account with KeyModesOfUse set to DeriveKey"
+/// (`EncryptData`'s own documentation).
+pub const MODE_DERIVE_KEY: &str = "DeriveKey";
+
 /// The key `identifier` names, with the working material its computations run under.
 ///
 /// `identifier` is anything the modelled `KeyArnOrKeyAliasType` admits, and it is
@@ -218,6 +245,42 @@ fn key_facts<Eng: Send + Sync + 'static>(
     engine: &Eng,
     identifier: &str,
 ) -> Result<KeyFacts, KeyRefusal> {
+    with_key(engine, identifier, |key| {
+        Ok(KeyFacts {
+            key_arn: key.key_arn.clone(),
+            key_check_value: key.key_check_value.clone(),
+            key_algorithm: key.key_attributes.key_algorithm.clone(),
+            key_usage: key.key_attributes.key_usage.clone(),
+            modes: key_modes(key),
+        })
+    })
+}
+
+/// The modes of use `key` carries, as the operations here judge them.
+fn key_modes(key: &key_store::StoredKey) -> KeyModes {
+    let modes = &key.key_attributes.key_modes_of_use;
+    KeyModes {
+        encrypt: modes.encrypt,
+        decrypt: modes.decrypt,
+        generate: modes.generate,
+        verify: modes.verify,
+        derive_key: modes.derive_key,
+        no_restrictions: modes.no_restrictions,
+    }
+}
+
+/// What `read` makes of the control plane's record of the key `identifier` names, with
+/// the checks every operation here makes of a key before it uses one already applied.
+///
+/// The one reader of that store in this service, so a key that does not exist, one whose
+/// deletion has completed, one in a state no cryptographic operation runs under and one
+/// that is disabled are each refused the same way whatever asked — and the store's guard
+/// is held for the one read and dropped with it.
+fn with_key<Eng: Send + Sync + 'static, T>(
+    engine: &Eng,
+    identifier: &str,
+    read: impl FnOnce(&key_store::StoredKey) -> Result<T, KeyRefusal>,
+) -> Result<T, KeyRefusal> {
     let Some(keys) = key_store::service_state(engine) else {
         return Err(KeyRefusal::Unavailable(
             "The Payment Cryptography key store is unavailable.".to_string(),
@@ -244,21 +307,7 @@ fn key_facts<Eng: Send + Sync + 'static>(
             key.key_arn
         )));
     }
-    let modes = &key.key_attributes.key_modes_of_use;
-    Ok(KeyFacts {
-        key_arn: key.key_arn.clone(),
-        key_check_value: key.key_check_value.clone(),
-        key_algorithm: key.key_attributes.key_algorithm.clone(),
-        key_usage: key.key_attributes.key_usage.clone(),
-        modes: KeyModes {
-            encrypt: modes.encrypt,
-            decrypt: modes.decrypt,
-            generate: modes.generate,
-            verify: modes.verify,
-            derive_key: modes.derive_key,
-            no_restrictions: modes.no_restrictions,
-        },
-    })
+    read(key)
 }
 
 /// The `KeyUsage` a card verification key carries, from the control plane's modelled

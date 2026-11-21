@@ -41,6 +41,14 @@ impl AsymmetricKeyPair {
     pub fn public_key_spki(&self) -> &[u8] {
         &self.public_key_spki
     }
+
+    /// The private half, PKCS#8 DER, for the computations defined in terms of it — the
+    /// signature over a certificate signing request, and the public-key decryption in
+    /// [`super::asymmetric_encryption`]. Visible to this store alone: it is never
+    /// returned, never logged, and the wrapper it is held in redacts every formatter.
+    pub(super) fn private_key_pkcs8(&self) -> &[u8] {
+        &self.private_key_pkcs8.0
+    }
 }
 
 /// Why no certificate signing request could be made for a key.

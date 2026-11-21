@@ -67,6 +67,9 @@ mod resource_policy;
 /// The asymmetric key pair an asymmetric key is, and the certificate signing request
 /// made from it.
 mod key_pair;
+/// Public-key encryption under an asymmetric key: the one place either half of a key
+/// pair encrypts or decrypts.
+mod asymmetric_encryption;
 /// The public key certificate this service hands out for an asymmetric key, and the
 /// authority that signs it.
 mod public_key_certificate;
@@ -78,6 +81,11 @@ pub use resource_policy::{
 };
 
 pub use key_pair::{AsymmetricKeyPair, CertificateRequestRejection};
+pub use asymmetric_encryption::{RsaEncryptionScheme, RsaRefusal};
+/// The initial DUKPT key a base derivation key and a key serial number derive, which
+/// both planes of this service compute: `ExportKey` hands one to a caller, and the data
+/// plane's DUKPT operations walk their transaction keys forward from it.
+pub use dukpt::{initial_key as dukpt_initial_key, InitialKey as DukptInitialKey};
 pub use public_key_certificate::{
     mint_public_key_certificate_authority, IssuedPublicKeyCertificate,
     PublicKeyCertificateAuthority, PublicKeyCertificateRejection,

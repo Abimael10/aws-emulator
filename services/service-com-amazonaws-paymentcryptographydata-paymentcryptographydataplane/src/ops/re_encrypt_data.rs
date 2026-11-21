@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ReEncryptData
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ReEncryptData`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ReEncryptData::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Moves `CipherText` from one key to another without answering the plaintext: it is
+//! decrypted under `IncomingKeyIdentifier` as `IncomingEncryptionAttributes` names it,
+//! then encrypted under `OutgoingKeyIdentifier` as `OutgoingEncryptionAttributes` names
+//! it, and what comes back is the OUTGOING key's ciphertext, its `KeyArn` and its key
+//! check value. So a `DecryptData` under that key and those attributes recovers exactly
+//! the plaintext whoever produced the incoming ciphertext encrypted.
+//!
+//! Both legs are read by [`crate::state::data_encryption`], the one reading of a
+//! data-encryption attribute set in this service, so every member of
+//! `ReEncryptionAttributes` the model admits — `Symmetric`, `Asymmetric` and `Dukpt`,
+//! each naming the key its own leg runs under — is served here and on `EncryptData` and
+//! `DecryptData` alike, and the two legs may name different members.
+//!
+//! The dynamic `WrappedKey` form of either leg carries a key established for the one
+//! call, out of a TR-31 key block or an ECDH agreement, and nothing here establishes
+//! such a key yet — so that member alone answers 501.
 //!
 //! ## Shape of an operation
 //!
@@ -196,18 +204,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ReEncryptData` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ReEncryptDataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ReEncryptData"))
+        // IAM decides ahead of the service, and this operation names TWO keys: a caller
+        // whose policies do not cover both learns nothing about either.
+        for identifier in [&input.incoming_key_identifier, &input.outgoing_key_identifier] {
+            crate::service::authorization::authorize(&*self.engine, ctx, Self::NAME, identifier)
+                .map_err(denied)?;
+        }
+        // "This operation also supports dynamic keys, allowing you to pass a dynamic
+        // encryption key as a TR-31 WrappedKeyBlock" (this operation's own
+        // documentation): a key form nothing here establishes yet, on either leg.
+        if input.incoming_wrapped_key.is_some() || input.outgoing_wrapped_key.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ReEncryptData with a WrappedKey",
+            ));
+        }
+
+        let Ok(cipher_text) = hex::decode(&input.cipher_text) else {
+            return Err(invalid("CipherText must be hexadecimal.".to_string()));
+        };
+        // The plaintext exists only between these two calls: it is never answered, and
+        // the ciphertext the caller gets back is the outgoing key's own.
+        let decrypted = crate::state::data_encryption::transform(
+            &*self.engine,
+            &input.incoming_key_identifier,
+            (&input.incoming_encryption_attributes).into(),
+            crate::state::data_encryption::Direction::Decrypt,
+            &cipher_text,
+        )
+        .map_err(refused)?;
+        let encrypted = crate::state::data_encryption::transform(
+            &*self.engine,
+            &input.outgoing_key_identifier,
+            (&input.outgoing_encryption_attributes).into(),
+            crate::state::data_encryption::Direction::Encrypt,
+            &decrypted.data,
+        )
+        .map_err(refused)?;
+
+        // "The keyARN (Amazon Resource Name) of the encryption key that Amazon Web
+        // Services Payment Cryptography uses for plaintext encryption"
+        // (`ReEncryptData$KeyArn`): the OUTGOING key, which is the one the answered
+        // ciphertext is readable under.
+        Ok(ReEncryptDataOutput {
+            key_arn: encrypted.key_arn,
+            key_check_value: encrypted.key_check_value,
+            cipher_text: hex::encode_upper(encrypted.data),
+        })
+    }
+}
+
+/// A request the calling principal's IAM policies do not allow: the modelled
+/// `AccessDeniedException` (HTTP 403), worded by [`crate::service::authorization`].
+fn denied(exception: AccessDeniedException) -> ReEncryptDataError {
+    ReEncryptDataErrorModeled::AccessDeniedException(exception).into()
+}
+
+/// A request this operation cannot serve as asked: the modelled `ValidationException`.
+fn invalid(message: String) -> ReEncryptDataError {
+    ReEncryptDataErrorModeled::ValidationException(ValidationException {
+        message,
+        field_list: None,
+    })
+    .into()
+}
+
+/// The refusal [`crate::state::data_encryption::transform`] answered for one of this
+/// operation's two legs, in this operation's own error channel.
+fn refused(refusal: crate::state::KeyRefusal) -> ReEncryptDataError {
+    match refusal {
+        crate::state::KeyRefusal::NotFound(identifier) => {
+            ReEncryptDataErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                resource_id: Some(identifier),
+            })
+            .into()
+        }
+        crate::state::KeyRefusal::NotUsable(message) => invalid(message),
+        crate::state::KeyRefusal::Unavailable(message) => {
+            ReEncryptDataErrorModeled::InternalServerException(InternalServerException {
+                message: Some(message),
+            })
+            .into()
+        }
     }
 }

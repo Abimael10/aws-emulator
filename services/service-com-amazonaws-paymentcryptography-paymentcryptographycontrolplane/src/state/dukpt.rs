@@ -55,7 +55,12 @@ const AES_DERIVE_USAGE: [u8; 2] = [0x80, 0x01];
 
 /// One derived initial key: its material and the `KeyAlgorithm` that material is a key
 /// of, which is what the exported key block's header and check value are built from.
-pub(super) struct InitialKey {
+///
+/// Public because the DATA plane of this service derives from the same two inputs — the
+/// base derivation key's material and a key serial number — for the DUKPT data
+/// operations, and calls [`initial_key`] rather than carrying a second copy of this
+/// derivation.
+pub struct InitialKey {
     pub material: Vec<u8>,
     pub key_algorithm: &'static str,
 }
@@ -66,7 +71,7 @@ pub(super) struct InitialKey {
 /// Every refusal names the rule it breaks: the key serial number's length belongs to
 /// one DUKPT family, and the base derivation key's algorithm has to be of that same
 /// family.
-pub(super) fn initial_key(
+pub fn initial_key(
     bdk_algorithm: &str,
     bdk: &[u8],
     key_serial_number: &str,

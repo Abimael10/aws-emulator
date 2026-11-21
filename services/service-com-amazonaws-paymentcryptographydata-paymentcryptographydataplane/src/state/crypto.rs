@@ -41,6 +41,7 @@ use des::{Des, TdesEde2, TdesEde3};
 use hmac::Hmac;
 use sha2::{Sha224, Sha256, Sha384, Sha512};
 
+pub mod dukpt;
 pub mod emv;
 pub mod pin;
 
@@ -50,7 +51,7 @@ pub mod pin;
 /// `PlainTextType`, `CipherTextType`, `MessageDataType` and the rest), so a length a
 /// caller counts in its own value is twice the length counted in bytes — which is the
 /// unit a refusal of such a value states.
-const HEX_CHARACTERS_PER_BYTE: usize = 2;
+pub(crate) const HEX_CHARACTERS_PER_BYTE: usize = 2;
 
 /// The modelled `KeyAlgorithm` values this service can run a symmetric computation
 /// under, each with the number of key bytes it takes.
