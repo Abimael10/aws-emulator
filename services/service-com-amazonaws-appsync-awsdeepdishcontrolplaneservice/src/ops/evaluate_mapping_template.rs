@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EvaluateMappingTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EvaluateMappingTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EvaluateMappingTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: RENDERS the request's Velocity template over the context it carries, through
+//! the ONE reader of that language this crate holds
+//! ([`crate::service::graphql_api::mapping_template`], which also evaluates the
+//! `requestMappingTemplate` / `responseMappingTemplate` of a resolver), and answers with the
+//! text it rendered, the stash it left and the errors it appended; a template that RAISES is
+//! a served call reporting that error, and one that cannot be evaluated at all is refused
+//! `BadRequestException`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -91,6 +89,15 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The language this operation evaluates is read by the crate's ONE reader of it, the same
+// one a resolver's `requestMappingTemplate` / `responseMappingTemplate` is evaluated by, so
+// one template renders one way wherever it is submitted.
+use crate::service::graphql_api::mapping_template::{self, Evaluation, Fault, Raised};
+
+// The member of a context that carries the stash, as the other half of this sandbox spells
+// it (`crate::ops::evaluate_code::appsync_js`).
+use crate::ops::evaluate_code::appsync_js::STASH_MEMBER;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -161,18 +168,157 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EvaluateMappingTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EvaluateMappingTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EvaluateMappingTemplate"))
+        // "Evaluates a given template and returns the response": the whole answer is that one
+        // render, and no resource is created, read or changed by it — so this handler holds no
+        // store guard, and a later caller sees exactly what it saw before.
+        let _ = (ctx, &self.engine);
+
+        // "The map that holds all of the contextual information for your resolver
+        // invocation": a context that is not a map carries no member a reference could walk
+        // into, so it is refused before anything is rendered.
+        let context = match ::serde_json::from_str::<::serde_json::Value>(&input.context) {
+            Ok(context) if context.is_object() => context,
+            _ => return Err(invalid_member(CONTEXT_MEMBER)),
+        };
+
+        answer(rendered(input.template, context).await)
     }
 }
+
+/// The member a context this operation cannot render over is reported against.
+const CONTEXT_MEMBER: &str = "context";
+
+/// How long one render may take, whatever it spends its steps on. The evaluator caps a budget
+/// at its own ceiling, so this is the longest a caller's template runs; the same bound the
+/// resolvers of this service hold a template to
+/// (`crate::service::graphql_api::execution`), for the same reason.
+const MAX_EVALUATION: ::std::time::Duration = ::std::time::Duration::from_secs(2);
+
+/// How long this call waits for a render to come back. The render is synchronous host work
+/// with no await point of its own, so it is run on the blocking pool and the WAIT is bounded
+/// out here: one the host has given up on is reported as a run that did not finish rather
+/// than held open.
+const CALLER_WAIT_CEILING: ::std::time::Duration = ::std::time::Duration::from_secs(5);
+
+/// How long the text a render produced may be: `EvaluationResult` is `@length 0..65536`
+/// (`smithy_query(query="shape",shape="EvaluationResult")`), so a template rendering more
+/// than that renders no result this operation can report.
+const MAX_RESULT_BYTES: usize = 65_536;
+
+/// What one render came to, as this operation answers it.
+enum Answered {
+    /// The template RENDERED: the text it produced, the context as it left it and the errors
+    /// it appended.
+    Rendered(Evaluation),
+    /// The template RAISED — `$util.error` or `$util.unauthorized` — which is how a template
+    /// refuses what it renders for. The call itself was served.
+    Raised(String),
+    /// The template could not be evaluated at all: it does not parse, it names something this
+    /// reader does not implement, or it ran past one of its bounds.
+    Unevaluable(String),
+    /// The render did not finish, or did not come back at all.
+    DidNotFinish(String),
+}
+
+/// Render `template` over `context` on the blocking pool, and report what the run came to.
+async fn rendered(template: String, context: ::serde_json::Value) -> Answered {
+    let running = ::tokio::task::spawn_blocking(move || {
+        mapping_template::evaluate(&template, &context, MAX_EVALUATION)
+    });
+    match ::tokio::time::timeout(CALLER_WAIT_CEILING, running).await {
+        Ok(Ok(Ok(evaluation))) => Answered::Rendered(evaluation),
+        // A template that RAISED refused what it renders for, which is an answer about the
+        // template rather than about the request; one that could not be evaluated at all —
+        // it does not parse, it names something this reader does not implement, or it ran
+        // past one of its bounds — makes the REQUEST the malformed one.
+        Ok(Ok(Err(Fault::Raised(raised)))) => Answered::Raised(raised.message),
+        Ok(Ok(Err(Fault::Fault(reason)))) => Answered::Unevaluable(reason),
+        // The run did not finish, or did not come back at all: nothing was rendered, and the
+        // request was not what was wrong with it.
+        Ok(Err(_)) | Err(_) => Answered::DidNotFinish(format!(
+            "{GIVEN_UP} {} seconds.",
+            CALLER_WAIT_CEILING.as_secs()
+        )),
+    }
+}
+
+/// The response one render is reported as.
+fn answer(
+    answered: Answered,
+) -> Result<EvaluateMappingTemplateOutput, EvaluateMappingTemplateError> {
+    match answered {
+        Answered::Rendered(evaluation) => {
+            if evaluation.text.len() > MAX_RESULT_BYTES {
+                return Err(bad_request(format!(
+                    "{TOO_MUCH_RESULT} {MAX_RESULT_BYTES} bytes."
+                )));
+            }
+            Ok(EvaluateMappingTemplateOutput {
+                evaluation_result: Some(evaluation.text),
+                stash: stash(&evaluation.context),
+                out_errors: out_errors(&evaluation.appended),
+                // "A list of logs that were generated by calls to util.log.info and
+                // util.log.error in the evaluated code": this reader publishes no logging
+                // helper, so a render writes no lines and the list it reports is empty.
+                logs: Some(Vec::new()),
+                error: None,
+            })
+        }
+        // The call itself was SERVED — the template is what refused — so the error it raised
+        // is the payload of a 200, as the other half of this sandbox reports a raise too.
+        Answered::Raised(message) => Ok(EvaluateMappingTemplateOutput {
+            error: Some(ErrorDetail {
+                message: Some(message),
+            }),
+            logs: Some(Vec::new()),
+            ..Default::default()
+        }),
+        Answered::Unevaluable(reason) => Err(bad_request(reason)),
+        Answered::DidNotFinish(reason) => Err(EvaluateMappingTemplateErrorModeled::
+            InternalFailureException(InternalFailureException {
+                message: Some(reason),
+            })
+            .into()),
+    }
+}
+
+/// The `$ctx.stash` as the render left it, as JSON text: "a single stash object lives through
+/// a single resolver run … you can use the stash to pass arbitrary data across request and
+/// response handlers", so what the response reports is the object this run ends holding. A
+/// context that carries none, and a template that writes none, leave nothing to report.
+fn stash(context: &::serde_json::Value) -> Option<String> {
+    context
+        .get(STASH_MEMBER)
+        .map(::serde_json::Value::to_string)
+}
+
+/// The errors `$util.appendError` appended, as the JSON text of a list, or `None` where the
+/// render appended none — each entry projected the one way this service projects an appended
+/// error (`Raised::detail`).
+fn out_errors(appended: &[Raised]) -> Option<String> {
+    if appended.is_empty() {
+        return None;
+    }
+    let entries: Vec<::serde_json::Value> = appended.iter().map(Raised::detail).collect();
+    Some(::serde_json::Value::Array(entries).to_string())
+}
+
+/// AppSync's own refusal for a member this operation cannot render with: the service's
+/// `BadRequestException` (400), naming the member the way every other refusal of this service
+/// names one (`crate::service`'s "Invalid <member> given.").
+fn invalid_member(member: &str) -> EvaluateMappingTemplateError {
+    bad_request(format!("Invalid {member} given."))
+}
+
+/// The operation's modelled `BadRequestException` (400) carrying `message`.
+fn bad_request(message: String) -> EvaluateMappingTemplateError {
+    EvaluateMappingTemplateErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The sentences this operation's own refusals state.
+const TOO_MUCH_RESULT: &str = "This template rendered more text than this operation reports:";
+const GIVEN_UP: &str = "This template was given up on after";

@@ -57,6 +57,29 @@ pub struct Raised {
 }
 
 impl Raised {
+    /// The error as one entry of an `outErrors` list: every member the helper takes, each
+    /// one the raise named none of carried as `null`.
+    ///
+    /// This is the projection a SANDBOX evaluation reports an appended error by
+    /// (`crate::ops::evaluate_mapping_template`), the same one the APPSYNC_JS runtime of the
+    /// same sandbox writes (`crate::ops::evaluate_code::appsync_js`), so one appended error
+    /// reads the same whichever language appended it. The entry of a GraphQL result
+    /// ([`Self::document`]) is the other projection: it names the field's path and leaves
+    /// out what the raise did not name.
+    #[must_use]
+    pub fn detail(&self) -> Json {
+        let member = |value: Option<Json>| value.unwrap_or(Json::Null);
+        let mut entry = JsonMap::new();
+        entry.insert("message".to_string(), Json::String(self.message.clone()));
+        entry.insert(
+            "errorType".to_string(),
+            member(self.error_type.clone().map(Json::String)),
+        );
+        entry.insert("data".to_string(), member(self.data.clone()));
+        entry.insert("errorInfo".to_string(), member(self.error_info.clone()));
+        Json::Object(entry)
+    }
+
     /// The error as one entry of a GraphQL result's `errors`.
     #[must_use]
     pub fn document(&self, path: &[Json]) -> Json {
