@@ -203,8 +203,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stream) = cluster.streams.get(&input.stream_identifier) else {
             return Err(GetStreamErrorModeled::ResourceNotFoundException(
                 crate::state::stream_not_found(
-                    &region,
-                    &input.cluster_identifier,
+                    // The ARN this refusal names is the one a stream of THIS
+                    // stored cluster would have carried, and a stream is nested
+                    // UNDER its cluster (`cluster/{cluster}/stream/{stream}`), so
+                    // its Region is the Region the cluster lives in — the Region
+                    // that cluster's own ARN was minted in
+                    // (`crate::state::resource_region`) — and not the Region this
+                    // request happens to be signed for.
+                    &crate::state::resource_region(&cluster.arn, &region),
+                    &cluster.identifier,
                     &input.stream_identifier,
                 ),
             )

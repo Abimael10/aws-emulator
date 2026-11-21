@@ -15,14 +15,9 @@
 use serde_json::{json, Value};
 
 use crate::harness::{
-    absent_identifier, expected_arn, is_cluster_id, wait_for_the_clock, Dsql, TAG_MAP_MAX,
+    absent_identifier, arn_not_found_message, expected_arn, is_cluster_id, wait_for_the_clock, Dsql,
+    TAG_MAP_MAX,
 };
-
-/// The sentence AWS answers a missing resource with. The ARN is the request's
-/// own: it is how the caller learns WHICH resource was missing.
-fn arn_not_found_message(arn: &str) -> String {
-    format!("The resource with ARN {arn} doesn't exist. Verify the ARN and try again.")
-}
 
 /// `TagMap`'s modelled maximum entry count, from the one place the suites spell
 /// the modelled tag bounds ([`crate::harness::TAG_MAP_MAX`]).

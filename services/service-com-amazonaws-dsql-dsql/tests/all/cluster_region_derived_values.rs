@@ -17,14 +17,17 @@
 //! The tables span the class the rule generalises over: both directions of a
 //! region pair and region ids of different shapes, every form `kmsEncryptionKey`
 //! admits (a bare key id, an alias, a full ARN that already names its own region,
-//! and the reserved value that names no key at all), and the two derived values
-//! this service builds for a persisted cluster.
+//! and the reserved value that names no key at all), the two derived values this
+//! service builds for a persisted cluster, and the refusals that name a derived
+//! value — the ARN a stream of a stored cluster would have carried.
 
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::harness::{expected_stream_arn, wait_for_the_clock, Answer, Dsql};
+use crate::harness::{
+    absent_identifier, arn_not_found_message, expected_stream_arn, wait_for_the_clock, Answer, Dsql,
+};
 use crate::stream_lifecycle::kinesis_target;
 
 /// The region pairs the rule is exercised over: the cluster's home region and the
@@ -272,5 +275,120 @@ async fn a_streams_arn_carries_its_clusters_region() {
                 );
             }
         }
+    }
+}
+
+/// The stream identifiers a cluster does NOT hold, spanning the forms a client can
+/// address: one never issued, the lowest value of the form, the cluster's own id
+/// used as a stream id, and the id of a stream that lives on ANOTHER cluster.
+fn absent_stream_identifiers(
+    cluster: &str,
+    on_another_cluster: &str,
+) -> Vec<(&'static str, String)> {
+    vec![
+        ("a stream id never issued", absent_identifier()),
+        (
+            "the lowest stream id of the form",
+            "00000000000000000000000000".to_string(),
+        ),
+        (
+            "the cluster's own id used as a stream id",
+            cluster.to_string(),
+        ),
+        (
+            "the id of a stream of another cluster",
+            on_another_cluster.to_string(),
+        ),
+    ]
+}
+
+/// RULE applied to the refusals that name a stream of a STORED cluster: the ARN
+/// `GetStream`'s and `DeleteStream`'s 404 names is the ARN a stream of that cluster
+/// would have carried, so its region segment is the CLUSTER's — whichever region
+/// the refused request is signed for. A refusal is region-independent: both views
+/// of the one store report the identical sentence.
+#[tokio::test]
+async fn the_missing_stream_refusal_names_the_clusters_region() {
+    for (home, away) in REGION_PAIRS {
+        let (at_home, elsewhere) = two_views(home, away);
+        let clusters = at_home.create_settled_many(2).await;
+        let (cluster, other_cluster) = (&clusters[0], &clusters[1]);
+
+        // A stream that really exists, but on the OTHER cluster: its id is absent
+        // from `cluster` just as much as an id never issued.
+        let created = at_home
+            .create_stream(
+                other_cluster,
+                json!({
+                    "format": "JSON",
+                    "ordering": "UNORDERED",
+                    "targetDefinition": kinesis_target(home, "changes", "dsql-cdc"),
+                }),
+            )
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {home}->{away}: CreateStream must answer 200, got {} {:?}",
+            created.status, created.body
+        );
+        let on_another_cluster = created.str("streamIdentifier");
+
+        for (form, stream) in absent_stream_identifiers(cluster, &on_another_cluster) {
+            let want_arn = expected_stream_arn(home, cluster, &stream);
+            let want_message = arn_not_found_message(&want_arn);
+
+            for (operation, signed_for, view) in [
+                ("GetStream", home, &at_home),
+                ("GetStream", away, &elsewhere),
+                ("DeleteStream", home, &at_home),
+                ("DeleteStream", away, &elsewhere),
+            ] {
+                let case =
+                    format!("{home}->{away} {form:?} via {operation} signed for {signed_for}");
+                let answer = if operation == "GetStream" {
+                    view.get_stream(cluster, &stream).await
+                } else {
+                    view.delete_stream(cluster, &stream, "").await
+                };
+                assert_eq!(
+                    answer.status, 404,
+                    "case {case}: a stream the cluster does not hold must answer 404, \
+                     got {} {:?}",
+                    answer.status, answer.body
+                );
+                assert_eq!(
+                    answer.error.as_deref(),
+                    Some("ResourceNotFoundException"),
+                    "case {case}: the 404 must be a ResourceNotFoundException, got {:?}",
+                    answer.error
+                );
+                assert_eq!(
+                    answer.message(),
+                    want_message,
+                    "case {case}: the refusal must name {want_arn:?}, got {:?}",
+                    answer.message()
+                );
+                assert!(
+                    !answer.message().contains(&format!(":dsql:{away}:")),
+                    "case {case}: the refusal must not name the signing region {away}, got {:?}",
+                    answer.message()
+                );
+            }
+        }
+
+        // The cluster and the stream that do exist are untouched by the refusals.
+        assert_eq!(
+            at_home.get(cluster).await.status,
+            200,
+            "case {home}->{away}: the addressed cluster must still be readable"
+        );
+        assert_eq!(
+            at_home
+                .get_stream(other_cluster, &on_another_cluster)
+                .await
+                .status,
+            200,
+            "case {home}->{away}: the stream must still be readable on its own cluster"
+        );
     }
 }

@@ -474,6 +474,14 @@ pub fn expected_stream_arn(region: &str, cluster: &str, stream: &str) -> String 
     )
 }
 
+/// The sentence AWS answers a missing ARN-named resource with
+/// (`state::resource_not_found`). The ARN is the one the call addressed: it is how
+/// the caller learns WHICH resource was missing, so every suite that asserts this
+/// refusal words it from here.
+pub fn arn_not_found_message(arn: &str) -> String {
+    format!("The resource with ARN {arn} doesn't exist. Verify the ARN and try again.")
+}
+
 /// The account segment of an ARN this service minted
 /// (`arn:{partition}:dsql:{region}:{account}:{resource}`) — how a suite reads the
 /// account id a refusal about a per-account collection reports, from an ARN the

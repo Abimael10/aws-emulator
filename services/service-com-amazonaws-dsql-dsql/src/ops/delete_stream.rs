@@ -264,11 +264,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reported only once the stream this call names has been found, so an
         // unknown stream is still a 404 rather than a conflict.
         let cluster_conflict = cluster.mutation_conflict("have a stream deleted");
+        // The Region a stream of this cluster lives in: a stream is nested UNDER
+        // its cluster (`cluster/{cluster}/stream/{stream}`), so the Region of its
+        // ARN is the Region the stored cluster's own ARN was minted in
+        // (`crate::state::resource_region`) and not the Region this request happens
+        // to be signed for. Read here, beside the status gate, because the cluster
+        // record is borrowed for the stream lookup below.
+        let cluster_region = crate::state::resource_region(&cluster.arn, &region);
+        // The cluster the refusal names is the STORED one this call resolved, read
+        // here for the same reason as the Region above.
+        let cluster_identifier = cluster.identifier.clone();
         let Some(stream) = cluster.streams.get_mut(&input.stream_identifier) else {
             return Err(DeleteStreamErrorModeled::ResourceNotFoundException(
                 crate::state::stream_not_found(
-                    &region,
-                    &input.cluster_identifier,
+                    &cluster_region,
+                    &cluster_identifier,
                     &input.stream_identifier,
                 ),
             )

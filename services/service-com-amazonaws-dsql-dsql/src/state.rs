@@ -3440,14 +3440,24 @@ pub fn cluster_not_found(region: &str, identifier: &str) -> ResourceNotFoundExce
     )
 }
 
-/// The modelled `ResourceNotFoundException` for a stream a cluster does not hold.
+/// The modelled `ResourceNotFoundException` for a stream a cluster does not hold:
+/// [`resource_not_found`] over the ARN a stream of that identifier would have had
+/// under THAT cluster.
+///
+/// `cluster_region` is the region the cluster this call resolved LIVES in
+/// ([`resource_region`]), never the region the request happens to be signed for: a
+/// stream ARN nests under its cluster's (`cluster/{cluster}/stream/{stream}`), so
+/// the only region a stream of a stored cluster could ever have carried is that
+/// cluster's. The absent-cluster sibling ([`cluster_not_found`]) is the one case
+/// that takes the request's region, because there is no stored resource to read one
+/// from.
 pub fn stream_not_found(
-    region: &str,
+    cluster_region: &str,
     cluster_identifier: &str,
     stream_identifier: &str,
 ) -> ResourceNotFoundException {
     resource_not_found(
-        &stream_arn(region, cluster_identifier, stream_identifier),
+        &stream_arn(cluster_region, cluster_identifier, stream_identifier),
         stream_identifier,
         RESOURCE_TYPE_STREAM,
     )
