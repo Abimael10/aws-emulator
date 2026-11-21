@@ -45,12 +45,12 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::appconfig_workflow::{
-    create_application, create_environment, create_profile, json_call, send, Answer,
+    create_application, create_environment, create_profile, json_call, send,
 };
 use crate::configuration_profile_validators::{activate_functions, lambda};
 use crate::extension_action_points::{
     associate, create_version, drain, get_deployment, given_growing_strategy,
-    given_growing_strategy_of_type, given_queue, given_strategy, start_deployment,
+    given_growing_strategy_of_type, given_queue, given_strategy, start_deployment, stop_deployment,
 };
 use crate::extensions::create_extension;
 use crate::resource_tags::arn;
@@ -92,7 +92,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// AppConfig, Lambda and Amazon SQS on ONE engine: the steering target and the observation
 /// target of an extension action both live in another service, and the invocation is
 /// asserted where a client sees it.
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+///
+/// `pub(crate)` because more than one suite of this target binds an extension action to a
+/// FUNCTION it runs and observes the event on a QUEUE, which is these three services.
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -209,6 +212,17 @@ async fn given_tick_extension(
         .unwrap_or_else(|| panic!("case {case:?}: CreateExtension answered no Id"))
 }
 
+/// One `AT_DEPLOYMENT_TICK` event the observation queue delivered, with the position the
+/// last read taken BEFORE it could have been dispatched reported.
+struct ObservedTick {
+    /// The event as the action's target received it.
+    event: Value,
+    /// The lower bound of where the rollout stood when the tick was dispatched, and `None`
+    /// when that read found a deployment that was no longer rolling out — the position of a
+    /// deployment a rollback has withdrawn from its targets bounds nothing.
+    at_least: Option<f64>,
+}
+
 /// Read the deployment until it reaches a state it can no longer leave, and answer the
 /// document it was last reported with together with every `AT_DEPLOYMENT_TICK` event the
 /// ticks of this deployment delivered to the observation queue.
@@ -216,9 +230,17 @@ async fn given_tick_extension(
 /// The wait is on the CONDITION: the loop looks again until the state is terminal or
 /// [`SETTLED_BY`] has passed, so nothing here depends on how fast the host runs. Reading
 /// the deployment is also what runs the ticks the clock has made due, so the events a read
-/// produced are drained right after it — which is what lets each tick's reported position
-/// be checked against the position that same read reported for the deployment, while it is
-/// still rolling out.
+/// produced are drained right after it.
+///
+/// Each tick's reported position is checked against the rollout the deployment's own reads
+/// report, BRACKETED rather than compared with one of them: a tick is dispatched at an
+/// instant of the service's own — AppConfig paces them, and the actions bound at the point
+/// are invoked one after another — so the position it reports is the position the rollout
+/// stood at somewhere between the read before it and the read after it. A rollout only ever
+/// grows while it stands, which makes those two reads its bounds; demanding that it equal
+/// one single read's position would instead be asking whether a growth interval elapsed
+/// between two independently timed observations, which is a statement about how fast the
+/// host runs rather than about the rule.
 async fn settled(
     router: &MultiServiceRouter,
     case: &str,
@@ -229,6 +251,13 @@ async fn settled(
 ) -> (Value, Vec<Value>) {
     let deadline = Instant::now() + SETTLED_BY;
     let mut ticks: Vec<Value> = Vec::new();
+    // The ticks drained since the previous read, each waiting for the read that bounds it
+    // from above: every one of them was dispatched before this drain, so the next read of
+    // the deployment is the first one taken after it.
+    let mut observed: Vec<ObservedTick> = Vec::new();
+    // The position the previous read reported, which no tick drained after it can be
+    // behind. A deployment nothing has rolled out yet stands at none of its targets.
+    let mut previously_reported: Option<f64> = Some(0.0);
     loop {
         let read = get_deployment(router, application, environment, number).await;
         assert_eq!(
@@ -241,29 +270,40 @@ async fn settled(
         let body = read.json();
         let state = body["State"].as_str().unwrap_or_default().to_string();
         let reported = body["PercentageComplete"].as_f64().unwrap_or_default();
+        let rolling_out = IN_FLIGHT_STATES.contains(&state.as_str());
+        for tick in observed.drain(..) {
+            let position = tick.event["PercentageComplete"].as_f64().unwrap_or_default();
+            // Only while the rollout stands at both ends of the bracket: a tick that asked
+            // for the abort is answered by withdrawing the configuration from every
+            // target, so the position a read reports afterwards is the one the ROLLBACK
+            // left, not one the rollout passed through.
+            if let (true, Some(at_least)) = (rolling_out, tick.at_least) {
+                assert!(
+                    position >= at_least && position <= reported,
+                    "case {case:?}: a tick reports the position the deployment stood at \
+                     when it was dispatched, got {position} where the reads around it \
+                     reported {at_least} and {reported}"
+                );
+            }
+            ticks.push(tick.event);
+        }
         for event in drain(router, queue_url).await {
             if event["Type"] != json!("AtDeploymentTick") {
                 continue;
             }
-            let position = event["PercentageComplete"].as_f64().unwrap_or_else(|| {
-                panic!(
-                    "case {case:?}: a tick must report the rollout position it is asking \
-                     about, got {event}"
-                )
+            assert!(
+                event["PercentageComplete"].as_f64().is_some(),
+                "case {case:?}: a tick must report the rollout position it is asking \
+                 about, got {event}"
+            );
+            observed.push(ObservedTick {
+                event,
+                at_least: previously_reported,
             });
-            // Only while the rollout stands: a tick that asked for the abort is answered
-            // by withdrawing the configuration from every target, so the position the read
-            // reports afterwards is the one the ROLLBACK left, not the one the tick saw.
-            if IN_FLIGHT_STATES.contains(&state.as_str()) {
-                assert_eq!(
-                    position, reported,
-                    "case {case:?}: a tick reports the position the deployment stands at, \
-                     got {position} where the same read reported {reported}"
-                );
-            }
-            ticks.push(event);
         }
+        previously_reported = rolling_out.then_some(reported);
         if TERMINAL_STATES.contains(&state.as_str()) {
+            ticks.extend(observed.into_iter().map(|tick| tick.event));
             return (body, ticks);
         }
         assert!(
@@ -325,22 +365,6 @@ async fn served(
         String::from_utf8_lossy(&read.body)
     );
     (read.body.to_vec(), read.header("Configuration-Version"))
-}
-
-/// `StopDeployment` of one deployment, with no `AllowRevert`.
-async fn stop_deployment(
-    router: &MultiServiceRouter,
-    application: &str,
-    environment: &str,
-    number: i32,
-) -> Answer {
-    json_call(
-        router,
-        "DELETE",
-        &format!("/applications/{application}/environments/{environment}/deployments/{number}"),
-        &Value::Null,
-    )
-    .await
 }
 
 /// What one row's tick target answers and what that makes of the rollout.
@@ -528,8 +552,8 @@ async fn an_at_deployment_tick_directive_steers_the_deployment_it_is_invoked_for
 
         // The action point FIRED: the observation target was handed the tick events of this
         // deployment, each naming the deployment, the environment under rollout and the
-        // rollout position the tick is asking about — which `settled` already checked
-        // against the position the deployment itself reported.
+        // rollout position the tick is asking about — which `settled` already bracketed
+        // between the positions the reads around each tick reported.
         let tick = ticks.first().unwrap_or_else(|| {
             panic!(
                 "case {case:?}: the AT_DEPLOYMENT_TICK action point must be invoked while \

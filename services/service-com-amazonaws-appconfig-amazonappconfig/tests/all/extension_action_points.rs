@@ -387,6 +387,25 @@ pub(crate) async fn get_deployment(
     .await
 }
 
+/// `StopDeployment` of one deployment, with no `AllowRevert`.
+///
+/// `pub(crate)` and beside the other deployment calls of this module, because more than one
+/// suite of this target stops a deployment through the same front door.
+pub(crate) async fn stop_deployment(
+    router: &MultiServiceRouter,
+    application: &str,
+    environment: &str,
+    number: i32,
+) -> Answer {
+    json_call(
+        router,
+        "DELETE",
+        &format!("/applications/{application}/environments/{environment}/deployments/{number}"),
+        &Value::Null,
+    )
+    .await
+}
+
 /// The event's `Content` member, decoded: the standard base64 the member carries, read
 /// back through the `base64` crate rather than through the service's own encoder.
 fn decoded(text: &str) -> Vec<u8> {

@@ -907,8 +907,15 @@ callback_client!(eventbridge_client, aws_sdk_eventbridge, "events");
 struct OwedPoint {
     /// The targets bound at the point, already marked as invoked in the store.
     targets: Vec<ActionTarget>,
-    /// The event they are handed.
-    event: ActionEvent,
+    /// The event the targets are handed, built when the point was dispatched — and `None`
+    /// for a tick, whose event is built again for each invocation it is handed to
+    /// ([`current_tick_event`]), because the position a tick asks about is the one the
+    /// rollout stands at when that invocation is made.
+    event: Option<ActionEvent>,
+    /// What triggered the point, which the event carries as `TriggeredBy`: kept beside the
+    /// event because a tick's event is built per invocation and every one of them is
+    /// attributed to the same trigger.
+    triggered_by: String,
     /// Where the deployment's event log records the invocations: the index of the event
     /// the action point belongs to, and `None` for a tick, which logs nothing of its own.
     event_index: Option<usize>,
@@ -956,7 +963,35 @@ pub async fn drive_deployment<Eng: Send + Sync + 'static>(
         let mut records: Vec<ActionInvocation> = Vec::new();
         let mut rollback: Option<Option<String>> = None;
         for target in &owed.targets {
-            let answer = invoke(callback, target, &owed.event.document(target), region).await;
+            // A tick's event is built for THIS invocation, at the instant it is made: a
+            // tick asks its target to rule on the position the rollout stands at, and the
+            // actions bound at one point are invoked one after another, so an action that
+            // took longer than a growth interval to answer would otherwise leave the next
+            // one asking about a position the clock has already moved past. A lifecycle
+            // point reports the stage it belongs to, which is over and does not change
+            // while its actions run, so it keeps the event its dispatch built.
+            let event = match &owed.event {
+                Some(event) => event.clone(),
+                None => {
+                    let refreshed = {
+                        let mut store = state.lock();
+                        current_tick_event(
+                            &mut store,
+                            application_id,
+                            environment_id,
+                            deployment_number,
+                            &owed.triggered_by,
+                            SystemTime::now(),
+                        )
+                    };
+                    // The deployment is no longer there to ask about, or the clock has
+                    // finished with it while an earlier action of this same dispatch held
+                    // it, so the rest of this point's actions are not invoked for it.
+                    let Some(refreshed) = refreshed else { break };
+                    refreshed
+                }
+            };
+            let answer = invoke(callback, target, &event.document(target), region).await;
             match answer {
                 Ok(answered) => {
                     records.push(target.invocation_record(None));
@@ -1033,6 +1068,57 @@ fn apply_roll_back(
     true
 }
 
+/// The event one `AT_DEPLOYMENT_TICK` invocation is handed, as of `now`: the deployment
+/// brought up to what the clock already owes it at that instant, and then described.
+///
+/// The materialisation is the deployment's own ([`super::Environment::materialize`], the
+/// same call every read of a deployment makes), so this states what was already true at
+/// `now` whether or not any action point was dispatched — and it is what keeps the position
+/// an event reports from being one the clock has moved past.
+///
+/// `None` when the store no longer holds the deployment, and when the deployment is no
+/// longer in FLIGHT: a tick asks its target to rule on a rollout that still stands, so a
+/// deployment the clock has finished with — including one it finished while an earlier
+/// action of the same dispatch held it — is not ticked.
+fn current_tick_event(
+    store: &mut ServiceStore,
+    application_id: &str,
+    environment_id: &str,
+    deployment_number: i32,
+    triggered_by: &str,
+    now: SystemTime,
+) -> Option<ActionEvent> {
+    materialize_environment(store, application_id, environment_id, now);
+    let in_flight = store
+        .application(application_id)?
+        .environments
+        .get(environment_id)?
+        .deployments
+        .get(&deployment_number)?
+        .is_in_flight();
+    if !in_flight {
+        return None;
+    }
+    let event = deployment_event(store, application_id, environment_id, deployment_number)?;
+    Some(event.triggered_by(triggered_by))
+}
+
+/// Bring the environment a deployment under dispatch belongs to up to what the clock
+/// already owes it at `now`, when the store still holds it.
+fn materialize_environment(
+    store: &mut ServiceStore,
+    application_id: &str,
+    environment_id: &str,
+    now: SystemTime,
+) {
+    if let Some(environment) = store
+        .application_mut(application_id)
+        .and_then(|application| application.environments.get_mut(environment_id))
+    {
+        environment.materialize(now);
+    }
+}
+
 /// The next action point this deployment owes the invocation of, marked as invoked so the
 /// same one is not dispatched twice, or `None` when it owes none.
 fn next_owed_point(
@@ -1043,6 +1129,10 @@ fn next_owed_point(
     region: &str,
     now: SystemTime,
 ) -> Option<OwedPoint> {
+    // What is owed is decided against the deployment as of `now`: a stage the clock made
+    // due since the record was last brought forward owes its point from this instant on,
+    // and the event the dispatch builds states the deployment as of the same instant.
+    materialize_environment(store, application_id, environment_id, now);
     let environment = store
         .application(application_id)?
         .environments
@@ -1057,8 +1147,16 @@ fn next_owed_point(
         .and_then(|index| deployment.event_log.get(index))
         .and_then(|event| event.triggered_by.clone())
         .unwrap_or_else(|| super::TRIGGERED_BY_APPCONFIG.to_string());
-    let event = deployment_event(store, application_id, environment_id, deployment_number)?
-        .triggered_by(&triggered_by);
+    // A tick's event is built again for each invocation ([`current_tick_event`]), so the
+    // dispatch builds one only for a point whose event is the stage it belongs to.
+    let event = if action_point == AT_DEPLOYMENT_TICK {
+        None
+    } else {
+        Some(
+            deployment_event(store, application_id, environment_id, deployment_number)?
+                .triggered_by(&triggered_by),
+        )
+    };
     // Marked BEFORE the invocation: an action point whose target does not answer has
     // still been reached, and the deployment's stage happened once however its actions
     // went.
@@ -1093,6 +1191,7 @@ fn next_owed_point(
     Some(OwedPoint {
         targets,
         event,
+        triggered_by,
         event_index,
     })
 }
