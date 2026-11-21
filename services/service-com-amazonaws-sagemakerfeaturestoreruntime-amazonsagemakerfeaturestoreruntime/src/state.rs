@@ -36,6 +36,11 @@ use aws_smithy_types::date_time::{DateTime, Format};
 /// its own slice lives beside this one.
 pub mod offline_store;
 
+/// Where a `ListRecords` page resumes, and the bounded token that cursor travels as: the
+/// one concern that has to reconcile an identifier the model bounds at 358 400 characters
+/// with a page token it bounds at 8 192, so it lives beside the ordered store it walks.
+pub mod page_cursor;
+
 /// The most feature groups one emulator keeps an OnlineStore for.
 ///
 /// A capacity bound, not an AWS quota: the store is per-process memory that grows with

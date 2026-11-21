@@ -4,7 +4,9 @@
 //! IMPLEMENTED: this operation enumerates the record identifiers the feature group's
 //! OnlineStore holds in [`crate::state`], one page at a time: soft-deleted records are
 //! excluded unless the caller asks for them, the page is truncated to `MaxResults`, and
-//! `NextToken` names the identifier the next page resumes at. The `FeatureGroupName` is
+//! `NextToken` carries the cursor the next page resumes at, encoded by
+//! [`crate::state::page_cursor`] inside the maximum the model declares for that member
+//! however long the identifier it resumes at. The `FeatureGroupName` is
 //! resolved against the feature groups the SageMaker control plane holds
 //! ([`crate::state::resolve_group`]) and a name that resolves to none is refused with the
 //! modelled `ValidationError` (400), the same classification every operation of this data
@@ -88,6 +90,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::page_cursor::PageCursor;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -167,12 +170,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        // The page cursor: an opaque token whose only content is the identifier the
-        // page resumes at, so a page boundary survives records being added or removed
-        // between calls (a positional index would not).
-        let resume_at = match input.next_token.as_deref() {
+        // The page cursor: an opaque token naming the record the page resumes at, so a
+        // page boundary survives records being added or removed between calls (a
+        // positional index would not).
+        let cursor = match input.next_token.as_deref() {
             None => None,
-            Some(token) => Some(decode_next_token(token).ok_or_else(|| {
+            Some(token) => Some(PageCursor::decode(token).ok_or_else(|| {
                 validation("NextToken is not a ListRecords pagination token")
             })?),
         };
@@ -215,74 +218,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
 
         let mut store = state.lock();
-        // `records_from` RESUMES the ordered store (a `BTreeMap`) at the cursor rather
+        // `page_identifiers` RESUMES the ordered store (a `BTreeMap`) at the cursor rather
         // than walking it from its first identifier, which is what makes the cursor a
-        // resume point and not just a filter: the walk begins at the identifier the token
-        // names and the token the page emits is the first identifier it did not return.
-        // Only the identifiers this page returns (plus that one) are copied, so no work
-        // here is linear in the records ordered before the cursor. A feature group that
-        // resolves but has taken no record yet has no online store here, and lists
-        // nothing.
-        let (record_identifiers, next_identifier) = store
+        // resume point and not just a filter: the walk begins at the record the token
+        // names and the cursor the page emits is the first record it did not return. Only
+        // the identifiers this page returns (plus that one) are copied, so no work here is
+        // linear in the records ordered before the cursor. A feature group that resolves
+        // but has taken no record yet has no online store here, and lists nothing.
+        let (record_identifiers, next_cursor) = store
             .group_mut(&input.feature_group_name)
-            .map(|group| {
-                let mut remaining = group
-                    .records_from(resume_at.as_deref())
-                    .filter(|record| include_soft_deleted || !record.soft_deleted);
-                let page: Vec<String> = remaining
-                    .by_ref()
-                    .take(page_size)
-                    .map(|record| record.identifier.clone())
-                    .collect();
-                let next = remaining.next().map(|record| record.identifier.clone());
-                (page, next)
-            })
+            .map(|group| group.page_identifiers(cursor.as_ref(), include_soft_deleted, page_size))
             .unwrap_or_default();
         drop(store);
-        let next_token = next_identifier
-            .map(|identifier| encode_next_token(&identifier));
+        let next_token = next_cursor.map(|cursor| cursor.encode());
 
         Ok(ListRecordsOutput {
             record_identifiers,
             next_token,
         })
     }
-}
-
-/// The per-process key every page token this operation issues carries.
-///
-/// Derived once at first use from `RandomState`, which the standard library seeds
-/// randomly per process, so a caller cannot mint a cursor: only a token this emulator
-/// issued decodes. It is only a cursor — no authorization decision rides on it — so a
-/// 64-bit marker is enough, and it deliberately does not survive a restart, exactly as
-/// a page token should not.
-fn page_token_key() -> u64 {
-    static KEY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *KEY.get_or_init(|| {
-        use std::hash::{BuildHasher, Hasher};
-        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-        hasher.write(b"ListRecords page token");
-        hasher.finish()
-    })
-}
-
-/// The page token for the identifier the next page resumes at.
-///
-/// Hex of this process's token key plus the identifier: opaque to a caller (the
-/// modelled `NextToken` promises nothing about its content), stable across calls, and
-/// carrying no server state, so a token handed out by one page resumes exactly where
-/// that page stopped.
-fn encode_next_token(identifier: &str) -> String {
-    hex::encode(format!("{:016x}:{identifier}", page_token_key()).as_bytes())
-}
-
-/// The identifier a page token resumes at, or `None` when the token is not one this
-/// operation handed out.
-fn decode_next_token(token: &str) -> Option<String> {
-    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
-    decoded
-        .strip_prefix(&format!("{:016x}:", page_token_key()))
-        .map(str::to_owned)
 }
 
 /// The modelled `ValidationError` (HTTP 400) for a request this operation refuses.

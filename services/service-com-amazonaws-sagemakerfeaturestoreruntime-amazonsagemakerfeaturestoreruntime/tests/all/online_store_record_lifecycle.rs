@@ -1730,3 +1730,234 @@ async fn every_operation_of_this_slice_answers_from_the_store() {
          with body {body:?}"
     );
 }
+
+/// The modelled maximum length of a `ListRecords` page token: `ListRecordsNextToken` is
+/// `@length 1..8192` on the response member a token is written to and on the request
+/// member it comes back on alike
+/// (`smithy_query(query="shape", shape="ListRecordsNextToken")`).
+const MAX_NEXT_TOKEN_LENGTH: usize = 8192;
+
+/// The modelled maximum length of a record identifier: a `RecordIdentifierValueAsString`
+/// targets `ValueAsString`, `@length 0..358400`
+/// (`smithy_query(query="shape", shape="ValueAsString")`).
+const MAX_IDENTIFIER_LENGTH: usize = 358_400;
+
+/// `count` distinct record identifiers of exactly `length` characters that share every
+/// character but their last three — so identifiers past the length a token has room for
+/// share the whole leading part of themselves with each other.
+fn identifiers_sharing_a_prefix(length: usize, count: usize) -> Vec<String> {
+    (1..=count)
+        .map(|index| format!("{}{index:03}", "c".repeat(length - 3)))
+        .collect()
+}
+
+/// `count` distinct record identifiers of exactly `length` characters that differ in their
+/// FIRST three characters, so no two of them share a leading part at all.
+fn identifiers_with_distinct_prefixes(length: usize, count: usize) -> Vec<String> {
+    (1..=count)
+        .map(|index| format!("{index:03}{}", "c".repeat(length - 3)))
+        .collect()
+}
+
+/// Page through a whole listing one identifier at a time, asserting of EVERY token it
+/// hands back that it is inside the modelled `ListRecordsNextToken` length — and, because
+/// [`list_one_page`] requires HTTP 200, that the service itself accepts the token it just
+/// minted — and return the identifiers the pages carried.
+async fn page_through_asserting_bounded_tokens(
+    emulator: &Emulator,
+    group: &str,
+    case: &str,
+) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    // A bound on the number of requests, not on time: each page carries one identifier.
+    for _ in 0..64 {
+        let (page, next) = list_one_page(emulator, group, Some(1), token.as_deref(), case).await;
+        seen.extend(page);
+        let Some(next) = next else { return seen };
+        assert!(
+            (1..=MAX_NEXT_TOKEN_LENGTH).contains(&next.len()),
+            "case {case:?}: expected a NextToken inside the modelled length \
+             1..{MAX_NEXT_TOKEN_LENGTH}, got one of {} characters",
+            next.len()
+        );
+        token = Some(next);
+    }
+    panic!("case {case:?}: pagination did not terminate");
+}
+
+#[tokio::test]
+async fn every_page_token_is_inside_the_modelled_bound_whatever_identifier_it_resumes_at() {
+    // A token this operation hands back comes STRAIGHT BACK as the next request's
+    // `NextToken`, where the same modelled maximum is enforced before any handler runs, so
+    // a token outside it dead-ends the listing. The rows differ along what the rule
+    // generalises over: the SIZE of the identifier the cursor resumes at — from the
+    // shortest to the longest the model admits, across the length at which a token
+    // carrying its identifier whole crosses the token's own maximum (a token is hex, so
+    // half of it) — and whether the identifiers share their leading characters or differ
+    // in them.
+    let half_the_token_maximum = MAX_NEXT_TOKEN_LENGTH / 2;
+    let cases: Vec<(&str, Vec<String>)> = vec![
+        ("three characters", identifiers_sharing_a_prefix(3, 3)),
+        ("sixty-four characters", identifiers_sharing_a_prefix(64, 3)),
+        (
+            "just inside half the token maximum",
+            identifiers_sharing_a_prefix(half_the_token_maximum - 64, 3),
+        ),
+        (
+            "half the token maximum",
+            identifiers_sharing_a_prefix(half_the_token_maximum, 3),
+        ),
+        (
+            "one character past half the token maximum",
+            identifiers_sharing_a_prefix(half_the_token_maximum + 1, 3),
+        ),
+        (
+            "past the whole token maximum",
+            identifiers_sharing_a_prefix(MAX_NEXT_TOKEN_LENGTH + 1, 3),
+        ),
+        (
+            "the modelled identifier maximum",
+            identifiers_sharing_a_prefix(MAX_IDENTIFIER_LENGTH, 3),
+        ),
+        (
+            "long, differing in their leading characters",
+            identifiers_with_distinct_prefixes(5_000, 3),
+        ),
+    ];
+
+    for (index, (case, written)) in cases.iter().enumerate() {
+        let emulator = Emulator::new();
+        let group = format!("tokenbound{index}");
+        emulator.create_feature_group(&group, "customer_id", "event_time", true);
+        for identifier in written {
+            let (status, body) = emulator
+                .put_record(
+                    &group,
+                    json!({ "Record": [
+                        feature("customer_id", identifier),
+                        feature("event_time", "2024-01-01T00:00:00Z")
+                    ] }),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected PutRecord 200 for a {}-character identifier, got \
+                 {status} with {body}",
+                identifier.len()
+            );
+        }
+        let mut ascending = written.clone();
+        ascending.sort();
+
+        let seen = page_through_asserting_bounded_tokens(&emulator, &group, case).await;
+        assert_eq!(
+            seen.len(),
+            ascending.len(),
+            "case {case:?}: expected {} identifiers across the pages, got {}",
+            ascending.len(),
+            seen.len()
+        );
+        assert!(
+            seen == ascending,
+            "case {case:?}: expected every identifier in ascending order exactly once, got \
+             {} identifiers whose lengths are {:?}",
+            seen.len(),
+            seen.iter().map(String::len).collect::<Vec<usize>>()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_cursor_at_an_identifier_too_long_for_a_token_still_names_its_record() {
+    // Identifiers that share every character a token has room for, so the cursor cannot
+    // carry the identifier it resumes at and names the record another way. The rows differ
+    // along what has happened to the store by the time the next page is asked for: a
+    // cursor names a RECORD, not a position, so removing a record that sorts BEFORE the
+    // cursor must not move the resume point, and removing the cursor's own record resumes
+    // at the records above it.
+    let written = identifiers_sharing_a_prefix(5_000, 4);
+    let cases: Vec<(&str, Option<usize>, Vec<usize>)> = vec![
+        ("nothing deleted", None, vec![1, 2, 3]),
+        (
+            "the record before the cursor hard-deleted",
+            Some(0),
+            vec![1, 2, 3],
+        ),
+        (
+            "the cursor's own record hard-deleted",
+            Some(1),
+            vec![2, 3],
+        ),
+        (
+            "the record after the cursor hard-deleted",
+            Some(2),
+            vec![1, 3],
+        ),
+    ];
+
+    for (index, (case, deleted, expected)) in cases.iter().enumerate() {
+        let emulator = Emulator::new();
+        let group = format!("longcursor{index}");
+        emulator.create_feature_group(&group, "customer_id", "event_time", true);
+        for identifier in &written {
+            let (status, body) = emulator
+                .put_record(
+                    &group,
+                    json!({ "Record": [
+                        feature("customer_id", identifier),
+                        feature("event_time", "2024-01-01T00:00:00Z")
+                    ] }),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected PutRecord 200, got {status} with {body}"
+            );
+        }
+
+        let (page, token) = list_one_page(&emulator, &group, Some(1), None, case).await;
+        assert!(
+            page == written[..1],
+            "case {case:?}: expected the first identifier alone, got {} of them",
+            page.len()
+        );
+        let token = token.unwrap_or_else(|| {
+            panic!("case {case:?}: a truncated page must hand back a NextToken")
+        });
+
+        if let Some(deleted) = *deleted {
+            let (status, body) = emulator
+                .delete_record(
+                    &group,
+                    &format!(
+                        "RecordIdentifierValueAsString={}&EventTime=2024-01-02T00:00:00Z\
+                         &DeletionMode=HardDelete",
+                        written[deleted]
+                    ),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected DeleteRecord 200, got {status} with {body}"
+            );
+        }
+
+        let rest = page_through(&emulator, &group, Some(1), Some(token), case).await;
+        let expected: Vec<String> = expected.iter().map(|at| written[*at].clone()).collect();
+        assert!(
+            rest == expected,
+            "case {case:?}: expected the {} identifiers ending {:?}, got {} ending {:?}",
+            expected.len(),
+            expected
+                .iter()
+                .map(|identifier| identifier[identifier.len() - 3..].to_owned())
+                .collect::<Vec<String>>(),
+            rest.len(),
+            rest.iter()
+                .map(|identifier| identifier[identifier.len() - 3..].to_owned())
+                .collect::<Vec<String>>()
+        );
+    }
+}
+

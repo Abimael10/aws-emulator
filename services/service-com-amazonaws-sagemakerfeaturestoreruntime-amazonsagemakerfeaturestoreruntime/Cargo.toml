@@ -25,6 +25,9 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Encodes/decodes the opaque ListRecords pagination token.
 hex = { workspace = true }
+# The digest that names one whole record identifier inside a page token too short to carry
+# it, from the maintained implementation rather than a hand-rolled hash.
+sha2 = { workspace = true }
 # The AWS SDK for Amazon S3, driven over the emulator's in-process callback: a record
 # ingested into a feature group that has an OfflineStore is replicated into the configured
 # Amazon S3 location, and the one object store in this emulator is that service's. Only the
@@ -39,7 +42,6 @@ parquet = { version = "60", default-features = false, features = ["snap"] }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
 # The SageMaker CONTROL plane, mounted beside this data plane on one shared engine by the
 # offline-store suite: a feature group with an `OfflineStoreConfig` is created through its
 # own `CreateFeatureGroup` and its `OfflineStoreStatus` read back through its
