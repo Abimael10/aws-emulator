@@ -47,10 +47,13 @@ const SERVED_ORIGIN: &str = HOST;
 const SERVED_PATH: &str = "/2020-05-31/distribution";
 
 /// `X-Cache` for an answer the origin produced for this request.
-const MISS: &str = "Miss from cloudfront";
+///
+/// `pub(crate)` so a sibling suite over another origin reports the same two values rather than
+/// restating them.
+pub(crate) const MISS: &str = "Miss from cloudfront";
 
 /// `X-Cache` for an answer the edge cache held.
-const HIT: &str = "Hit from cloudfront";
+pub(crate) const HIT: &str = "Hit from cloudfront";
 
 /// The `MaxItems` a `ListDistributions` that was asked for none reports — the service's own
 /// page ceiling (`crate::state::MAX_ITEMS`), which is what the origin's answer carries when
@@ -59,18 +62,21 @@ const DEFAULT_MAX_ITEMS: &str = "100";
 
 /// What the edge answered one viewer request with: the status, the headers a viewer reads the
 /// edge's decisions from, and the BYTES, which a compressed answer is only decodable from.
-struct Viewed {
-    status: u16,
-    x_cache: String,
-    content_encoding: Option<String>,
-    content_type: Option<String>,
-    body: Bytes,
+///
+/// `pub(crate)` so a sibling suite whose origin is a Lambda function URL
+/// ([`crate::edge_lambda_url_origin_shaping`]) reads one answer the same way, decoding included.
+pub(crate) struct Viewed {
+    pub(crate) status: u16,
+    pub(crate) x_cache: String,
+    pub(crate) content_encoding: Option<String>,
+    pub(crate) content_type: Option<String>,
+    pub(crate) body: Bytes,
 }
 
 impl Viewed {
     /// The answer's bytes as text, decoded under the coding it says they are in — which is
     /// what proves the bytes really are that coding's rather than mislabelled.
-    fn decoded(&self, case: &str) -> String {
+    pub(crate) fn decoded(&self, case: &str) -> String {
         let bytes: Vec<u8> = match self.content_encoding.as_deref() {
             None => self.body.to_vec(),
             Some("br") => {
@@ -97,7 +103,10 @@ impl Viewed {
 
 /// Send one VIEWER request to `host`: no AWS credential, carrying `headers` beside the
 /// `Host` — exactly as a browser reaches a distribution.
-async fn view(
+///
+/// `pub(crate)` so every suite that reaches a distribution through the router sends that
+/// request the same way.
+pub(crate) async fn view(
     router: &MultiServiceRouter,
     host: &str,
     path_and_query: &str,

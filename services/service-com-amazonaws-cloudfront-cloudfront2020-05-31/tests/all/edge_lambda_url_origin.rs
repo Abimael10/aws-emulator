@@ -152,9 +152,14 @@ def lambda_handler(event, context):
     }
 "#;
 
-/// A .zip deployment package holding [`HANDLER_SOURCE`] as `index.py`, written in memory the
-/// way a caller uploads one.
-fn package() -> Vec<u8> {
+/// A .zip deployment package holding `source` as `index.py`, written in memory the way a
+/// caller uploads one.
+///
+/// The handler is a PARAMETER so a sibling suite over the same topology stages a function that
+/// reports what IT needs out of the request it was handed — the query string and the cookies
+/// that reached the origin ([`crate::edge_lambda_url_origin_shaping`]) — through this one
+/// packaging step rather than a copy of it.
+fn package_of(source: &str) -> Vec<u8> {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
         let mut writer = ::zip::ZipWriter::new(&mut buffer);
@@ -162,7 +167,7 @@ fn package() -> Vec<u8> {
             .start_file("index.py", ::zip::write::SimpleFileOptions::default())
             .expect("the entry starts");
         writer
-            .write_all(HANDLER_SOURCE.as_bytes())
+            .write_all(source.as_bytes())
             .expect("the entry's bytes are written");
         writer.finish().expect("a finished archive");
     }
@@ -339,8 +344,25 @@ impl Topology {
     /// The HOST of a PUBLIC function URL over [`HANDLER_SOURCE`]: `AuthType=NONE` and the
     /// resource-policy grant that admits the anonymous caller an unsigned origin fetch is.
     pub(crate) async fn public_function_url_host(&self, case: &str, function: &str) -> String {
+        self.public_function_url_host_running(case, function, HANDLER_SOURCE)
+            .await
+    }
+
+    /// [`Self::public_function_url_host`] over the handler `source`, for a sibling suite whose
+    /// rows are about what the origin RECEIVED and so need a handler that reports it.
+    pub(crate) async fn public_function_url_host_running(
+        &self,
+        case: &str,
+        function: &str,
+        source: &str,
+    ) -> String {
         let host = self
-            .function_url_host(case, function, aws_sdk_lambda::types::FunctionUrlAuthType::None)
+            .function_url_host_running(
+                case,
+                function,
+                aws_sdk_lambda::types::FunctionUrlAuthType::None,
+                source,
+            )
             .await;
         // `AuthType=NONE` leaves IAM out of it; the function's own resource policy is what
         // admits the anonymous caller the edge's unsigned origin fetch is.
@@ -365,6 +387,18 @@ impl Topology {
         function: &str,
         auth_type: aws_sdk_lambda::types::FunctionUrlAuthType,
     ) -> String {
+        self.function_url_host_running(case, function, auth_type, HANDLER_SOURCE)
+            .await
+    }
+
+    /// [`Self::function_url_host`] over the handler `source` rather than this suite's own.
+    pub(crate) async fn function_url_host_running(
+        &self,
+        case: &str,
+        function: &str,
+        auth_type: aws_sdk_lambda::types::FunctionUrlAuthType,
+        source: &str,
+    ) -> String {
         let trust = json!({
             "Version": "2012-10-17",
             "Statement": [{
@@ -388,7 +422,7 @@ impl Topology {
             .filter(|arn| !arn.is_empty())
             .unwrap_or_else(|| panic!("setup {case}: the created execution role has no ARN"));
         let code = aws_sdk_lambda::types::FunctionCode::builder()
-            .zip_file(::aws_smithy_types::Blob::new(package()))
+            .zip_file(::aws_smithy_types::Blob::new(package_of(source)))
             .build();
         self.lambda()
             .create_function()
