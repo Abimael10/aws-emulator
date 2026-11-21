@@ -297,13 +297,29 @@ fn unhealthy_check_due(
 /// Whether the group's health check acts on `instance` at `now`: a check has recorded it
 /// unhealthy, the clock has made that check due, and the instance is one the group still
 /// performs health checks on (see the module docs).
-///
-/// "On its way out of the group" is the crate's own reading of it
-/// ([`StoredInstance::is_leaving_group`]), which covers an instance waiting at a termination
-/// hook as well as one terminating outright: either way it is leaving already, so the check
-/// has nothing to take out.
 fn acts_now(instance: &StoredInstance, now: SystemTime) -> bool {
-    instance.health_check_due.is_some_and(|debt| debt.due <= now)
-        && !instance.is_leaving_group()
-        && !instance.is_in_standby()
+    health_check_due_at(instance).is_some_and(|due| due <= now)
+}
+
+/// WHEN the group's health check acts on `instance` — the instant the clock waits for on its
+/// behalf — and `None` when no such instant is owed.
+///
+/// `None` for a member no failed check has recorded, and also for one the check is owed for
+/// and DECLINES to act on: an instance parked in `Standby`, which the group performs no health
+/// check on while it is parked, and one already on its way out of the group
+/// ([`StoredInstance::is_leaving_group`], which covers an instance waiting at a termination
+/// hook as well as one terminating outright) — either way it is leaving already, so the check
+/// has nothing to take out. The debt itself STAYS on the instance, so the replacement falls
+/// due again once the instance is back in service (see the module docs); what is not owed is
+/// an instant at which anything happens.
+///
+/// THE ONE reading of that instant, for the acting pass ([`acts_now`]) and for the clock that
+/// waits on what this store owes ([`AutoScalingState::next_clock_due_at`]) alike: a clock
+/// waiting on an instant no pass acts at would wake, retire nothing and wait again, with
+/// nothing for it to do and nothing to end it.
+pub(crate) fn health_check_due_at(instance: &StoredInstance) -> Option<SystemTime> {
+    if instance.is_leaving_group() || instance.is_in_standby() {
+        return None;
+    }
+    instance.health_check_due.map(|debt| debt.due)
 }
