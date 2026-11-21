@@ -261,7 +261,10 @@ const FLUSH_CACHE_SEGMENT: &str = "FlushCache";
 ///
 /// Two of them: an API's environment-variable SET, and its CACHE — which is configuration
 /// of the API rather than a resource of this service anything addresses by an ARN, so the
-/// only spelling that identifies what such a call acts on is the call's own URI.
+/// only spelling that identifies what such a call acts on is the call's own URI. A space
+/// whose MEMBERS are what carry no spelling is read from the path instead
+/// ([`member_path`]), because there the member rather than the space is what a call acts
+/// on.
 const UNSPELLED_CHILD_SEGMENTS: &[&str] = &[
     ENVIRONMENT_VARIABLES_SEGMENT,
     API_CACHES_SEGMENT,
@@ -389,6 +392,19 @@ fn addressed(
                 let version = segment(0).unwrap_or_default();
                 return Addressed::Path(format!("/{version}/apis/{api_id}/{child}"));
             }
+            // A FUNCTION and a RESOLVER are each addressed by a MEMBER of a space no ARN
+            // spelling of this service covers — the resource types IAM publishes for
+            // AppSync name an API, a data source, a type and a field of one, and neither a
+            // function nor a resolver is among them — so the call is judged by its own URI
+            // path, down to the member it addresses, which is the only spelling that
+            // identifies what it acts on. That path is the resource IAM names in the
+            // refusal, and the one a policy has to state to lift it; the ARN each of these
+            // resources is REPORTED under (`functionArn`, `resolverArn`) is a different
+            // spelling, of the object rather than of the call.
+            if let Some(member) = member_path(&segment) {
+                let version = segment(0).unwrap_or_default();
+                return Addressed::Path(format!("/{version}/apis/{api_id}/{member}"));
+            }
             Addressed::Resource(match (segment(3).as_deref(), segment(4)) {
                 (Some("channelNamespaces"), Some(name)) => {
                     crate::state::channel_namespace_resource(&api_id, &name)
@@ -396,15 +412,7 @@ fn addressed(
                 (Some("datasources"), Some(name)) => {
                     crate::state::data_source_resource(&api_id, &name)
                 }
-                (Some("functions"), Some(function_id)) => {
-                    crate::state::function_resource(&api_id, &function_id)
-                }
-                (Some("types"), Some(type_name)) => match (segment(5).as_deref(), segment(6)) {
-                    (Some("resolvers"), Some(field_name)) => {
-                        crate::state::resolver_resource(&api_id, &type_name, &field_name)
-                    }
-                    _ => crate::state::type_resource(&api_id, &type_name),
-                },
+                (Some("types"), Some(type_name)) => crate::state::type_resource(&api_id, &type_name),
                 // Every other child space — the API keys, the schema, the source-API
                 // associations — is addressed under the API itself, which is the resource
                 // those calls name.
@@ -426,6 +434,26 @@ fn addressed(
             None => Addressed::Account,
         },
         _ => Addressed::Account,
+    }
+}
+
+/// The path, under an API, of the member of a space no ARN spelling of this service covers
+/// — `functions/{functionId}` and `types/{typeName}/resolvers/{fieldName}` — or `None` when
+/// the request addresses neither.
+///
+/// Only a request that names the MEMBER is one: a call on the collection above it
+/// (`functions`, `types/{typeName}/resolvers`) names the space it collects under, which is
+/// judged the way every other child collection is.
+fn member_path(segment: &impl Fn(usize) -> Option<String>) -> Option<String> {
+    match (segment(3).as_deref(), segment(4)) {
+        (Some("functions"), Some(function_id)) => Some(format!("functions/{function_id}")),
+        (Some("types"), Some(type_name)) => match (segment(5).as_deref(), segment(6)) {
+            (Some("resolvers"), Some(field_name)) => {
+                Some(format!("types/{type_name}/resolvers/{field_name}"))
+            }
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -1014,12 +1042,18 @@ mod tests {
                 ),
             ),
             (
-                "a function of a GraphQL API",
+                "a function of a GraphQL API, which no ARN spelling covers",
                 "/v1/apis/abcdefghijklmnopqrstuvwxyz/functions/fn-1",
                 None,
-                Addressed::Resource(
-                    "apis/abcdefghijklmnopqrstuvwxyz/functions/fn-1".to_string(),
+                Addressed::Path(
+                    "/v1/apis/abcdefghijklmnopqrstuvwxyz/functions/fn-1".to_string(),
                 ),
+            ),
+            (
+                "the function collection, which names the API it collects under",
+                "/v1/apis/abcdefghijklmnopqrstuvwxyz/functions",
+                None,
+                Addressed::Resource("apis/abcdefghijklmnopqrstuvwxyz".to_string()),
             ),
             (
                 "a type of a GraphQL API",
@@ -1028,11 +1062,12 @@ mod tests {
                 Addressed::Resource("apis/abcdefghijklmnopqrstuvwxyz/types/Query".to_string()),
             ),
             (
-                "a resolver on a field of a type",
+                "a resolver on a field of a type, which no ARN spelling covers either",
                 "/v1/apis/abcdefghijklmnopqrstuvwxyz/types/Query/resolvers/orders",
                 None,
-                Addressed::Resource(
-                    "apis/abcdefghijklmnopqrstuvwxyz/types/Query/resolvers/orders".to_string(),
+                Addressed::Path(
+                    "/v1/apis/abcdefghijklmnopqrstuvwxyz/types/Query/resolvers/orders"
+                        .to_string(),
                 ),
             ),
             (

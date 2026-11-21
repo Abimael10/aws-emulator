@@ -18,10 +18,10 @@
 //!    run left it, and `outErrors` reports the errors the run appended without ending it;
 //! 4. code that RAISES is a served call whose `error` carries the error's own message, and
 //!    no `evaluationResult`;
-//! 5. code that defines nothing the call could run — it does not compile, it exports no
-//!    function of the requested name, or it imports a module the runtime does not provide —
-//!    is a 400 `BadRequestException` whose `reason` is `CODE_ERROR` and whose `detail`
-//!    carries one `CodeError` per fault;
+//! 5. code that defines nothing the call could run — it does not compile, it imports a
+//!    module the runtime does not provide, or it does not export a function for BOTH of the
+//!    mappings APPSYNC_JS code defines — is SERVED: HTTP 200 whose `error` carries one
+//!    `CodeError` per fault and no `evaluationResult`;
 //! 6. a member this operation cannot run with (`runtimeVersion` other than the one allowed
 //!    version, a `function` outside the two valid values, a `context` that is not a map) is
 //!    a 400 `BadRequestException` naming that member;
@@ -67,8 +67,44 @@ fn body(code: &str, context: &str, function: Option<&str>) -> Value {
     request
 }
 
-/// Evaluate `code` over `context` and return what the emulator answered.
+/// `code` as a whole APPSYNC_JS mapping: the module the row states, plus a pass-through
+/// export for the counterpart function it leaves out.
+///
+/// "For APPSYNC_JS runtimes, the code defines the request and response functions"
+/// (`EvaluateCode`), which rule 5 holds the service to: a module that exports a function
+/// for only one of them defines no mapping. Every other rule's rows are each about ONE of
+/// the two functions, so the counterpart they leave out is supplied here instead of being
+/// repeated in all of them.
+pub fn mapping(code: &str) -> String {
+    let mut module = code.to_string();
+    for (name, pass_through) in [
+        ("request", "export function request(ctx) { return {} }\n"),
+        ("response", "export function response(ctx) { return ctx.result }\n"),
+    ] {
+        if !module.contains(&format!("export function {name}"))
+            && !module.contains(&format!("export const {name}"))
+        {
+            module.push('\n');
+            module.push_str(pass_through);
+        }
+    }
+    module
+}
+
+/// Evaluate `code` over `context` and return what the emulator answered, the module
+/// completed the way [`mapping`] completes one.
 async fn evaluate(
+    router: &MultiServiceRouter,
+    code: &str,
+    context: &str,
+    function: Option<&str>,
+) -> Answer {
+    evaluate_module(router, &mapping(code), context, function).await
+}
+
+/// Evaluate `code` VERBATIM, whatever it exports: the call rule 5's rows are made through,
+/// because what they state about the module is the point.
+async fn evaluate_module(
     router: &MultiServiceRouter,
     code: &str,
     context: &str,
@@ -449,95 +485,126 @@ async fn code_that_raises_is_reported_as_the_response_error() {
     }
 }
 
-/// Rule 5: code that defines nothing the call could run is a bad request carrying the
-/// `CODE_ERROR` detail.
+/// Rule 5: code that defines nothing the call could run is SERVED, with the faults in the
+/// `error` payload and no `evaluationResult`.
 #[tokio::test]
-async fn code_that_defines_nothing_runnable_is_a_code_error_bad_request() {
+async fn code_that_defines_no_mapping_is_served_as_the_error_payload() {
     let router = router();
 
-    // The rows differ along the kind of fault and the `errorType` it is reported under.
-    let cases: &[(&str, String, Option<&str>, &str, &str)] = &[
-        (
-            "code that does not compile",
-            "export function request(ctx) { return (((( }".to_string(),
-            Some("request"),
-            "PARSER_ERROR",
-            "",
-        ),
-        (
-            "code that is not a module at all",
-            "this is not javascript at all".to_string(),
-            Some("request"),
-            "PARSER_ERROR",
-            "",
-        ),
-        (
-            "code that exports no function of the requested name",
-            "export function request(ctx) { return {} }".to_string(),
-            Some("response"),
-            "LINT_ERROR",
-            "response",
-        ),
-        (
-            "code whose only export is not a function",
-            "export const request = 42;".to_string(),
-            Some("request"),
-            "LINT_ERROR",
-            "request",
-        ),
-        (
-            "code that imports a module the runtime does not provide",
-            "import fs from 'node:fs';\nexport function request(ctx) { return {} }\n".to_string(),
-            Some("request"),
-            "PARSER_ERROR",
-            "node:fs",
-        ),
+    // The rows differ along the kind of fault, the `errorType` it is reported under and how
+    // many faults one module carries.
+    struct Case {
+        label: &'static str,
+        code: &'static str,
+        function: Option<&'static str>,
+        error_type: &'static str,
+        named: &'static str,
+        faults: usize,
+    }
+    let cases: &[Case] = &[
+        Case {
+            label: "code that does not compile",
+            code: "export function request(ctx) { return (((( }",
+            function: Some("request"),
+            error_type: "PARSE_ERROR",
+            named: "",
+            faults: 1,
+        },
+        Case {
+            label: "code that is not a module at all",
+            code: "this is not javascript at all",
+            function: Some("request"),
+            error_type: "PARSE_ERROR",
+            named: "",
+            faults: 1,
+        },
+        Case {
+            label: "code that imports a module the runtime does not provide",
+            code: "import fs from 'node:fs';\nexport function request(ctx) { return {} }\n",
+            function: Some("request"),
+            error_type: "PARSE_ERROR",
+            named: "node:fs",
+            faults: 1,
+        },
+        Case {
+            label: "a module exporting only the request function",
+            code: "export function request(ctx) { return {} }",
+            function: Some("request"),
+            error_type: "MISSING_MAPPING_EXPORT",
+            named: "response",
+            faults: 1,
+        },
+        Case {
+            label: "a module exporting only the response function",
+            code: "export function response(ctx) { return ctx.result }",
+            function: Some("response"),
+            error_type: "MISSING_MAPPING_EXPORT",
+            named: "request",
+            faults: 1,
+        },
+        Case {
+            label: "a module exporting the name as something that is not a function",
+            code: "export const request = 42;\nexport function response(ctx) { return {} }\n",
+            function: Some("request"),
+            error_type: "MISSING_MAPPING_EXPORT",
+            named: "request",
+            faults: 1,
+        },
+        Case {
+            label: "a module exporting neither function",
+            code: "export const unrelated = 1;",
+            function: None,
+            error_type: "MISSING_MAPPING_EXPORT",
+            named: "request",
+            faults: 2,
+        },
     ];
 
-    for (case, code, function, error_type, named) in cases {
-        let answer = evaluate(&router, code, "{}", *function).await;
+    for case in cases {
+        let label = case.label;
+        let answer = evaluate_module(&router, case.code, "{}", case.function).await;
         assert_eq!(
-            answer.status, 400,
-            "case {case:?}: expected status 400, got {answer:?}"
+            answer.status, 200,
+            "case {label:?}: expected the call itself to be served, got {answer:?}"
+        );
+        assert!(
+            answer.body.get("evaluationResult").is_none(),
+            "case {label:?}: expected no evaluation result, got {answer:?}"
         );
         assert_eq!(
-            answer.error_type, "BadRequestException",
-            "case {case:?}: expected error type BadRequestException, got {answer:?}"
+            answer.body["error"]["message"].as_str(),
+            Some("The code contains one or more errors."),
+            "case {label:?}: expected AppSync's own sentence for faulty code, got {answer:?}"
         );
-        assert_eq!(
-            answer.message, "Invalid code given.",
-            "case {case:?}: expected the refusal to name the code member, got {answer:?}"
-        );
-        assert_eq!(
-            answer.body["reason"].as_str(),
-            Some("CODE_ERROR"),
-            "case {case:?}: expected the CODE_ERROR reason, got {answer:?}"
-        );
-        let faults = answer.body["detail"]["codeErrors"]
+        let faults = answer.body["error"]["codeErrors"]
             .as_array()
             .cloned()
             .unwrap_or_default();
         assert_eq!(
             faults.len(),
-            1,
-            "case {case:?}: expected one code error, got {answer:?}"
+            case.faults,
+            "case {label:?}: expected {} code error(s), got {answer:?}",
+            case.faults
         );
         assert_eq!(
             faults[0]["errorType"].as_str(),
-            Some(*error_type),
-            "case {case:?}: expected the {error_type} type, got {answer:?}"
+            Some(case.error_type),
+            "case {label:?}: expected the {} type, got {answer:?}",
+            case.error_type
         );
         let value = faults[0]["value"].as_str().unwrap_or_default();
         assert!(
-            !value.is_empty() && value.contains(named),
-            "case {case:?}: expected a presentable error naming {named:?}, got {answer:?}"
+            !value.is_empty() && value.contains(case.named),
+            "case {label:?}: expected a presentable error naming {:?}, got {answer:?}",
+            case.named
         );
-        // "The line number in the code. Defaults to 0 if unknown"; "The span/length of the
-        // error. Defaults to -1 if unknown" (`CodeErrorLocation`).
-        assert_eq!(
-            faults[0]["location"],
-            json!({"line": 0, "column": 0, "span": -1}),
-            "case {case:?}: expected the documented unknown location, got {answer:?}"
+        // The position the fault sits at is stated from the code itself, so a client can
+        // place it: both are counted from one.
+        let location = &faults[0]["location"];
+        assert!(
+            location["line"].as_i64().unwrap_or_default() >= 1
+                && location["column"].as_i64().unwrap_or_default() >= 1,
+            "case {label:?}: expected a line and a column counted from one, got {answer:?}"
         );
     }
 }
@@ -720,9 +787,12 @@ async fn code_that_does_not_end_is_stopped_and_reported_as_stopped() {
             "case {case:?}: expected no evaluation result, got {answer:?}"
         );
         if *stopped {
+            // The run's OWN breach, not the host giving up on it: the engine raises the
+            // stop at every check it makes once a bound is spent, so code that catches one
+            // is stopped at the next and the answer names the bound rather than the wait.
             assert!(
-                message.contains("stopped"),
-                "case {case:?}: expected the run to be reported as stopped, got {answer:?}"
+                message.starts_with("the code was stopped after"),
+                "case {case:?}: expected the run's own bound to end it, got {answer:?}"
             );
         }
     }

@@ -309,6 +309,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A resolver resolves against a data source OF the API it is attached to, so a
+        // `dataSourceName` that API does not hold — one held only by another API among
+        // them — names nothing this resolver could ever call: the create is refused and no
+        // resolver is attached, so a later listing of the API reports no field bound to a
+        // data source it does not own.
+        if let Some(name) = input
+            .data_source_name
+            .as_deref()
+            .filter(|name| !api.data_sources.contains_key(*name))
+        {
+            return Err(CreateResolverErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::no_data_source_named_message(name)),
+            })
+            .into());
+        }
+
         // Conflict detection and resolution work on the item versions a data source
         // keeps, so a resolver that configures them has to resolve against a data source
         // configured for versioned items: `syncConfig` is "The SyncConfig for a resolver

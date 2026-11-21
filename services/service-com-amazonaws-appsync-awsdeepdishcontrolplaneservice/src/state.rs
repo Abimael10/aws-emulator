@@ -896,15 +896,27 @@ pub fn function_resource(api_id: &str, function_id: &str) -> String {
 }
 
 /// The text a `NotFoundException` (HTTP 404) carries for a function the named API does
-/// not hold: AppSync's own wording, a fixed template whose only variable part is the
-/// `functionId` the request asked for, which is what the caller has to act on.
+/// not hold, where the answer the call was going to give IS that function: AppSync's own
+/// wording, a fixed template whose only variable part is the `functionId` the request asked
+/// for, which is the function it could not report.
 ///
-/// Shared by every operation that addresses a function by id (`GetFunction`,
-/// `UpdateFunction`, `DeleteFunction`), so the three cannot disagree about how a
-/// missing function is reported.
+/// Shared by the operations whose answer carries the function — `GetFunction` and
+/// `UpdateFunction` — so the two cannot disagree about how a missing function is reported.
+/// An operation whose answer carries something else states the absence without naming the
+/// id ([`FUNCTION_NOT_FOUND_MESSAGE`]).
 pub fn function_not_found_message(function_id: &str) -> String {
     format!("function id {function_id} not found")
 }
+
+/// AppSync's fixed, request-independent text for a function the named API does not hold,
+/// carried by `NotFoundException` (HTTP 404) where the answer the call was going to give is
+/// NOT the function itself — `DeleteFunction`, whose answer carries no members at all, and
+/// `ListResolversByFunction`, whose answer is a page of the resolvers that invoke it.
+///
+/// The sentence has no variable part, so the requested id is not echoed back: there was no
+/// function to report it on. An operation that would have REPORTED the function names the id
+/// ([`function_not_found_message`]).
+pub const FUNCTION_NOT_FOUND_MESSAGE: &str = "Function not found.";
 
 /// The refusal text for a function definition AppSync could not run, or `None` when
 /// the request describes one it could.

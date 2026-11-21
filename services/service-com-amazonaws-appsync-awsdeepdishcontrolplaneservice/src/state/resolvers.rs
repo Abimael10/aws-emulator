@@ -159,6 +159,19 @@ pub fn resolver_resource(api_id: &str, type_name: &str, field_name: &str) -> Str
     format!("apis/{api_id}/types/{type_name}/resolvers/{field_name}")
 }
 
+/// The text a `NotFoundException` (HTTP 404) carries for a `dataSourceName` the resolver's
+/// own API does not hold: AppSync's sentence for an unresolvable data source REFERENCE,
+/// whose one variable part is the name the request asked for.
+///
+/// A resolver "run[s] a GraphQL query against a single data source" (`Resolver$kind`) of
+/// the API the request addresses (`/v1/apis/{apiId}/types/{typeName}/resolvers`), so a name
+/// that API does not hold names no data source the resolver could resolve against — a name
+/// held only by ANOTHER API among them, which is why the lookup is scoped to the API in the
+/// request.
+pub fn no_data_source_named_message(name: &str) -> String {
+    format!("No data source found named {name}")
+}
+
 /// The text a `NotFoundException` (HTTP 404) carries for a field that carries no
 /// resolver: AppSync's fixed sentence, which names nothing of the request that asked for
 /// it. Shared by every operation that addresses a resolver by its type and field, so

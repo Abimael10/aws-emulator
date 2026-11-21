@@ -180,12 +180,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The listing is scoped to ONE function of that API, so a `functionId` the API
+        // does not hold names no function whose references could be reported: the request
+        // is refused rather than answered with the empty page, which is what a function
+        // that EXISTS and no resolver invokes is reported as.
+        if !api.functions.contains_key(&input.function_id) {
+            return Err(ListResolversByFunctionErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::FUNCTION_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
         // The resolvers of that API which invoke the function, in the creation order
         // each record keeps — one total order every page is cut from, so two walks
         // report the same resolvers in the same order however the caller pages. A
         // function no resolver invokes is reported by no resolver, which is the empty
-        // page: this operation lists what references the function rather than resolving
-        // the function itself.
+        // page.
         let ordered = api.resolvers_using_function(&input.function_id);
 
         // The cursor is the first resolver of the NEXT page, keyed by the type/field

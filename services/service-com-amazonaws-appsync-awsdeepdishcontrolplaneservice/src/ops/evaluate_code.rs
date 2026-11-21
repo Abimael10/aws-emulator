@@ -3,9 +3,10 @@
 //! @op EvaluateCode
 //! Implemented: RUNS the request's APPSYNC_JS code in the engine this process embeds
 //! ([`appsync_js`]) and answers with what the evaluated function returned, the lines it
-//! logged, the stash it left and the errors it appended; code the engine cannot compile, or
-//! that defines no function the request named, is refused `BadRequestException` with the
-//! `CODE_ERROR` detail. This is the ONLY file to touch for this operation.
+//! logged, the stash it left and the errors it appended; code the engine cannot read, or
+//! that does not export both of the functions a mapping is defined by, is answered with the
+//! `error` payload carrying one `CodeError` per fault. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -208,7 +209,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             _ => return Err(invalid_member("context")),
         };
 
-        answer(appsync_js::evaluate(input.code, function, context).await)
+        answer(
+            appsync_js::evaluate(input.code.clone(), function, context).await,
+            &input.code,
+        )
     }
 }
 
@@ -245,12 +249,18 @@ fn resolver_context(mut context: ::serde_json::Value) -> ::serde_json::Value {
 
 /// The response one evaluation is reported as.
 ///
-/// A run that RETURNED answers with its `evaluationResult`; a run that raised, or that a
-/// bound stopped, answers 200 with the `error` payload instead, because the call itself was
-/// served — the code is what failed. Code the engine could not compile at all, or that
-/// defines no function the request named, is a malformed REQUEST
-/// ([`code_faults_refusal`]).
-fn answer(evaluation: Evaluation) -> Result<EvaluateCodeOutput, EvaluateCodeError> {
+/// The call itself is served whatever the code did — "Evaluates the given code and returns
+/// the response", whose `error` member is "the payload of the response error" — so every
+/// outcome is one 200 answer:
+///
+/// * a run that RETURNED answers with its `evaluationResult`;
+/// * a run that raised, or that a bound stopped, answers with the `error` payload instead,
+///   because the code is what failed;
+/// * code that defines no mapping at all — code the engine could not read, or a module that
+///   does not export both of the functions a mapping is defined by — answers with the
+///   `error` payload carrying one `CodeError` per fault ([`code_faults_error`]) and no
+///   result, because nothing ran.
+fn answer(evaluation: Evaluation, code: &str) -> Result<EvaluateCodeOutput, EvaluateCodeError> {
     let Evaluation {
         outcome,
         logs,
@@ -276,13 +286,30 @@ fn answer(evaluation: Evaluation) -> Result<EvaluateCodeOutput, EvaluateCodeErro
                 code_errors: None,
             });
         }
-        Outcome::Faults(faults) => return Err(code_faults_refusal(&faults)),
+        Outcome::Faults(faults) => output.error = Some(code_faults_error(&faults, code)),
     }
     Ok(output)
 }
 
-/// The member a code fault is reported against.
-const CODE_MEMBER: &str = "code";
+/// The `error` payload for code that defines nothing this call could run: AppSync's own
+/// sentence for code carrying faults, and one `CodeError` per fault so a client can place
+/// each one in the code it sent.
+///
+/// The sentence, the per-fault projection and the position each fault is stated at are the
+/// shared ones (`crate::state`), so this evaluation and the create or update of a definition
+/// report one fault the same way — only the member that carries them differs, because an
+/// evaluation is SERVED (the faults are the answer) where a definition is REFUSED (the
+/// faults are the refusal's detail).
+fn code_faults_error(faults: &[CodeFault], code: &str) -> EvaluateCodeErrorDetail {
+    let stated: Vec<CodeFault> = faults
+        .iter()
+        .map(|fault| crate::state::stated_code_fault(fault, code))
+        .collect();
+    EvaluateCodeErrorDetail {
+        message: Some(crate::state::CODE_ERRORS_MESSAGE.to_string()),
+        code_errors: Some(crate::state::code_errors(&stated)),
+    }
+}
 
 /// The refusal text a `function` outside the two valid values takes: AppSync names the
 /// member and lists the values it accepts, so the sentence is built from that value set
@@ -307,22 +334,6 @@ fn bad_request(message: String) -> EvaluateCodeError {
     EvaluateCodeErrorModeled::BadRequestException(BadRequestException {
         message: Some(message),
         ..Default::default()
-    })
-    .into()
-}
-
-/// The refusal for code that defines nothing this call could run: the same
-/// `BadRequestException`, with the `CODE_ERROR` reason and one `CodeError` per fault the
-/// engine reported, so a client can place each one in the code it sent.
-///
-/// The reason and the per-fault projection are the shared ones
-/// (`crate::state::code_errors_detail`), so this pre-flight evaluation and the create or
-/// update of a definition report one fault the same way.
-fn code_faults_refusal(faults: &[CodeFault]) -> EvaluateCodeError {
-    EvaluateCodeErrorModeled::BadRequestException(BadRequestException {
-        message: Some(format!("Invalid {CODE_MEMBER} given.")),
-        reason: Some(crate::state::CODE_ERROR_REASON.to_string()),
-        detail: Some(crate::state::code_errors_detail(faults)),
     })
     .into()
 }

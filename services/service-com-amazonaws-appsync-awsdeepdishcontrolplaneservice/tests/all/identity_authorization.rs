@@ -554,6 +554,29 @@ fn gated_requests(fixture: &Fixture, suffix: &str) -> Vec<Gated> {
             served_status: 204,
         },
         Gated {
+            case: "a read of one function, which no ARN spelling of this service covers",
+            method: "GET",
+            path: format!("/v1/apis/{}/functions/fn_absent", fixture.api_id),
+            body: None,
+            operation: "GetFunction",
+            // The refusal names the call's own URI path: neither this service's ARN
+            // builders nor the resource types IAM publishes for AppSync spell a function.
+            resource: arn(&format!("/v1/apis/{}/functions/fn_absent", fixture.api_id)),
+            served_status: 404,
+        },
+        Gated {
+            case: "a read of one resolver, which no ARN spelling covers either",
+            method: "GET",
+            path: format!("/v1/apis/{}/types/Query/resolvers/absent", fixture.api_id),
+            body: None,
+            operation: "GetResolver",
+            resource: arn(&format!(
+                "/v1/apis/{}/types/Query/resolvers/absent",
+                fixture.api_id
+            )),
+            served_status: 404,
+        },
+        Gated {
             case: "a code evaluation, which addresses no resource of its own",
             method: "POST",
             path: "/v1/dataplane-evaluatecode".to_string(),

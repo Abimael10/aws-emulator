@@ -307,6 +307,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The same scope the create enforces, over the same member: a resolver resolves
+        // against a data source OF its own API, so an update naming one that API does not
+        // hold is refused and the stored resolver is left exactly as it was.
+        if let Some(name) = input
+            .data_source_name
+            .as_deref()
+            .filter(|name| !api.data_sources.contains_key(*name))
+        {
+            return Err(UpdateResolverErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::no_data_source_named_message(name)),
+            })
+            .into());
+        }
+
         // The same pairing the create enforces: conflict detection and resolution work on
         // the item versions a data source keeps, so an update that would configure them
         // against a data source that keeps none is refused and the stored resolver is left

@@ -1197,8 +1197,26 @@ async fn a_listing_by_function_reports_the_resolvers_that_invoke_it() {
         }
     }
 
-    // A function no resolver of this API invokes is reported by none: an id of the right
-    // shape nothing holds, and a function created under ANOTHER API.
+    // The empty page is what a function that EXISTS and no resolver invokes is reported
+    // as: a third function of this API, named by no resolver's pipeline.
+    let created = create_function(&router, &api_id, DATA_SOURCE, &function_rows()[2]).await;
+    assert_eq!(
+        created.status, 200,
+        "case the unreferenced function: expected CreateFunction 200, got {created:?}"
+    );
+    let unreferenced = created.body["functionConfiguration"]["functionId"]
+        .as_str()
+        .expect("the third function carries a minted functionId")
+        .to_string();
+    let listed = walk(&router, &api_id, Listing::ByFunction(&unreferenced), None, 0).await;
+    assert!(
+        listed.is_empty(),
+        "case the listing by a function no resolver invokes: expected no entries, got {listed:?}"
+    );
+
+    // A `functionId` the API does NOT hold names no function whose references could be
+    // reported, so the listing is refused rather than answered with that empty page: an id
+    // of the right shape nothing holds, and a function created under ANOTHER API.
     let (other_api, foreign_function) =
         api_with_dependencies(&router, "Api_resolvers_by_function_other").await;
     create_resolver_body(
@@ -1209,10 +1227,24 @@ async fn a_listing_by_function_reports_the_resolvers_that_invoke_it() {
     )
     .await;
     for function_id in ["z".repeat(state::API_ID_LEN).as_str(), &foreign_function] {
-        let listed = walk(&router, &api_id, Listing::ByFunction(function_id), None, 0).await;
-        assert!(
-            listed.is_empty(),
-            "case the listing by {function_id:?}: expected no entries, got {listed:?}"
+        let answer = list_page(
+            &router,
+            &api_id,
+            Listing::ByFunction(function_id),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            (
+                answer.status,
+                answer.error_type.as_str(),
+                answer.message.as_str()
+            ),
+            (404, "NotFoundException", state::FUNCTION_NOT_FOUND_MESSAGE),
+            "case the listing by {function_id:?}: expected 404 NotFoundException {:?}, \
+             got {answer:?}",
+            state::FUNCTION_NOT_FOUND_MESSAGE
         );
     }
 

@@ -34,6 +34,10 @@ const PATH: &str = "/v1/dataplane-evaluatecode";
 const RUNTIME: (&str, &str) = ("APPSYNC_JS", "1.0.0");
 
 /// Evaluate `function` of `code` over `context`.
+///
+/// The module is completed the way [`super::evaluate_code::mapping`] completes one — a
+/// mapping is defined by both exports — so each row below states only the function it is
+/// about.
 async fn evaluate(
     router: &MultiServiceRouter,
     code: &str,
@@ -42,7 +46,7 @@ async fn evaluate(
 ) -> Answer {
     let body = json!({
         "runtime": {"name": RUNTIME.0, "runtimeVersion": RUNTIME.1},
-        "code": code,
+        "code": super::evaluate_code::mapping(code),
         "context": context,
         "function": function,
     });

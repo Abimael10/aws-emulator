@@ -195,6 +195,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A UNIT resolver of this API resolves against the data source its own
+        // `dataSourceName` names, which is the other live reference to a data source, so a
+        // delete that would leave a resolver resolving against nothing is refused the same
+        // way — naming the type and the field that address the resolver still using it —
+        // and the data source is left exactly as it was.
+        if let Some(message) = api.data_source_resolver_refusal(&input.name) {
+            return Err(DeleteDataSourceErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+            .into());
+        }
+
         // Removing the record is what makes the resource gone: every reader of that API
         // (`GetDataSource`, `ListDataSources`) answers without it afterwards, and the
         // room it took in the per-API quota is free again.

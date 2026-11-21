@@ -171,10 +171,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A function is addressed by the id its create minted, within its API, so an id
         // the API does not hold names no resource to delete — including one held by a
-        // DIFFERENT API, and one an earlier delete already removed.
+        // DIFFERENT API, and one an earlier delete already removed. This answer carries no
+        // members at all, so the absence is stated without naming the id
+        // (`crate::state::FUNCTION_NOT_FOUND_MESSAGE`).
         if !api.functions.contains_key(&input.function_id) {
             return Err(DeleteFunctionErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::function_not_found_message(&input.function_id)),
+                message: Some(crate::state::FUNCTION_NOT_FOUND_MESSAGE.to_string()),
             })
             .into());
         }

@@ -78,8 +78,10 @@ const BAD_REQUEST_CODE: &str = "BadRequestException";
 ///
 /// It is kept for ONE class of refusal: a value outside an enumerated type's value set,
 /// which the corpus records this service answering under this code
-/// ([`without_rejected_enum_values`]). Every other constraint class answers under the
-/// service's own [`BAD_REQUEST_CODE`].
+/// ([`without_rejected_enum_values`]) — except for the two enumerated members it records
+/// under its own code, the `format` a report is asked in ([`format_refusal`]) and the
+/// `runtime.name` a request names its code's runtime by ([`runtime_name_refusal`]). Every
+/// other constraint class answers under the service's own [`BAD_REQUEST_CODE`].
 const FRAMEWORK_REFUSAL_CODE: &str = "ValidationException";
 
 /// Every member this service's model constrains with `@range`, with the bounds the
@@ -354,6 +356,38 @@ fn recited_value_set(allowed: &[String]) -> Option<&'static [&'static str]> {
             && recited
                 .iter()
                 .all(|value| allowed.iter().any(|held| held == value))
+    })
+}
+
+/// The member path a request names the RUNTIME of the code it carries by: `AppSyncRuntime`
+/// is reached as the `runtime` member of every operation that takes code
+/// (`smithy_query(query="shape", shape="AppSyncRuntime")`), and its `name` targets the
+/// enumerated `RuntimeName`.
+const RUNTIME_NAME_PATH: &str = "runtime.name";
+
+/// AppSync's own refusal for a `runtime.name` outside the enumerated set `RuntimeName`
+/// declares: its `BadRequestException`, carrying the same aggregated constraint report the
+/// framework states — the member path and the permitted values, the rejected value withheld
+/// ([`without_rejected_enum_values`]) — under the code the operations that take a runtime
+/// model for a request that is not well formed.
+///
+/// The DECISION and the sentence are the framework's; only the CODE is restated, because
+/// `ValidationException` is a shape no operation of this service models, so a client's
+/// typed-error dispatch over the runtime it named would never fire.
+///
+/// `None` when no violation is that member's value set, which leaves every other
+/// enumerated member to the framework's own code ([`without_rejected_enum_values`]).
+fn runtime_name_refusal(violations: &[Violation]) -> Option<Refused> {
+    let names_the_runtime = violations.iter().any(|violation| {
+        violation.path == RUNTIME_NAME_PATH && matches!(violation.kind, ViolationKind::EnumValue(_))
+    });
+    if !names_the_runtime {
+        return None;
+    }
+    let stated = without_rejected_enum_values(violations)?;
+    Some(Refused {
+        code: BAD_REQUEST_CODE.to_string(),
+        ..stated
     })
 }
 
@@ -714,7 +748,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         //   the permitted values WITHOUT echoing the rejected value
         //   (`without_rejected_enum_values`), under the framework's own code — except
         //   for the `format` a report is asked in, which the service refuses by naming
-        //   the member and the rejected value (`format_refusal`);
+        //   the member and the rejected value (`format_refusal`), and the `runtime.name`
+        //   a request names its code's runtime by, which keeps that sentence under the
+        //   service's own `BadRequestException` (`runtime_name_refusal`);
         // * a tag whose VALUE carries a character tags may not hold is its own
         //   `BadRequestException` stating the tag grammar (`tag_value_refusal`), the way the
         //   service states the grammar of a tag key;
@@ -728,6 +764,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             Refusal::Invalid(violations) => resource_arn_refusal(violations)
                 .or_else(|| member_refusal(violations))
                 .or_else(|| format_refusal(violations))
+                .or_else(|| runtime_name_refusal(violations))
                 .or_else(|| without_rejected_enum_values(violations))
                 .or_else(|| tag_value_refusal(violations))
                 .or_else(|| declared_form_refusal(violations)),

@@ -3,17 +3,18 @@
 //! What inside one GraphQL API still USES one of its resources, and how a delete that
 //! would break that use is refused.
 //!
-//! The resources of an API point at each other by name and by id: a function "resolves
-//! against" the data source its `dataSourceName` names, and a pipeline resolver invokes
-//! the functions its `pipelineConfig.functions` lists. A delete of the resource at the
+//! The resources of an API point at each other by name and by id: a function and a UNIT
+//! resolver each "resolve against" the data source their own `dataSourceName` names, and a
+//! pipeline resolver invokes the functions its `pipelineConfig.functions` lists. A delete
+//! of the resource at the
 //! far end of such a reference would leave the referring resource pointing at something
 //! that no longer exists, so AppSync refuses it with its `BadRequestException` (HTTP
 //! 400) naming what still uses the resource, and the resource is left in place — the
 //! caller deletes the referring resource first.
 //!
-//! The lookups and the two sentences live together here because they are one rule read
-//! from both ends: the delete that refuses and the create that established the
-//! reference name the same members.
+//! The lookups and the sentences live together here because they are one rule read from
+//! both ends: the delete that refuses and the create that established the reference name
+//! the same members.
 
 use super::{FunctionRecord, GraphqlApiRecord, ResolverRecord};
 
@@ -50,6 +51,39 @@ impl GraphqlApiRecord {
         (!function_ids.is_empty()).then(|| data_source_in_use_message(&function_ids))
     }
 
+    /// Every resolver of this API that resolves against the data source `name`, in the
+    /// order they were created.
+    ///
+    /// `dataSourceName` is "The resolver data source name" (`Resolver$dataSourceName`) —
+    /// the data source a UNIT resolver "run[s] a GraphQL query against" (`Resolver$kind`)
+    /// — so a resolver names at most one, and the creation order each record keeps is the
+    /// one total order a report of them is stated in.
+    pub fn resolvers_using_data_source(&self, name: &str) -> Vec<&ResolverRecord> {
+        let mut resolvers: Vec<&ResolverRecord> = self
+            .resolvers
+            .values()
+            .filter(|resolver| resolver.data_source_name.as_deref() == Some(name))
+            .collect();
+        resolvers.sort_by_key(|resolver| resolver.seq);
+        resolvers
+    }
+
+    /// The refusal text for deleting the data source `name` while a resolver of this API
+    /// still resolves against it, or `None` when no resolver does.
+    ///
+    /// The sentence names ONE resolver — the first of the API's resolvers that resolves
+    /// against the data source, in creation order — because that is what AppSync's own
+    /// sentence has room for: a resolver is addressed by the type and the field it is
+    /// attached to ([`ResolverRecord::cursor`]), which is what the message carries.
+    pub fn data_source_resolver_refusal(&self, name: &str) -> Option<String> {
+        let resolvers = self.resolvers_using_data_source(name);
+        let resolver: &ResolverRecord = resolvers.first()?;
+        Some(resolver_data_source_in_use_message(
+            &resolver.type_name,
+            &resolver.field_name,
+        ))
+    }
+
     /// The refusal text for deleting the function `function_id` while a resolver of this
     /// API still invokes it, or `None` when no resolver does.
     ///
@@ -78,6 +112,17 @@ pub fn data_source_in_use_message(function_ids: &[&str]) -> String {
         "Data source is still in use by functions: [{}]",
         function_ids.join(", ")
     )
+}
+
+/// The text a `BadRequestException` (HTTP 400) carries for a data source a RESOLVER still
+/// resolves against: the fixed sentence plus the type and the field that address the
+/// referring resolver, read from state.
+///
+/// A resolver and a function are each stated in the vocabulary of what refers to the data
+/// source: a function is named by its id ([`data_source_in_use_message`]) and a resolver by
+/// the type and the field it is attached to, which is how every operation addresses one.
+pub fn resolver_data_source_in_use_message(type_name: &str, field_name: &str) -> String {
+    format!("Resolver for type {type_name} and field {field_name} associated with data source")
 }
 
 /// The text a `BadRequestException` (HTTP 400) carries for a function a resolver still

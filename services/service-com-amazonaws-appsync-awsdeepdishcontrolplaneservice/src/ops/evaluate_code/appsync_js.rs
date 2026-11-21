@@ -41,16 +41,24 @@
 //!   evaluation may produce, so one call cannot make an unbounded answer;
 //! * a CALLER WAIT ceiling ([`CALLER_WAIT_CEILING`]) held outside the engine, so the
 //!   request is answered even where a stretch of engine-internal work outlasts the run's
-//!   own clock — the engine can only be stopped at a check it makes.
+//!   own clock — the engine can only be stopped at a check it makes;
+//! * a count of the engines this process runs AT ONCE ([`MAX_SANDBOX_ENGINES`]), so the
+//!   threads and the memory this operation can hold are bounded however many requests
+//!   arrive: each run takes one slot for the life of the thread that owns its engine, and a
+//!   run the host has already answered costs that one slot and nothing else — in particular
+//!   no thread of the executor serving other requests ([`in_sandbox`]).
 //!
 //! Which bound was breached is LATCHED in host state ([`Bounds`]) rather than read back out
 //! of the engine, so code that catches the exception the engine raises in it cannot make
-//! the run report a result: once the latch is set, the run's answer is the stop. The bounds
+//! the run report a result: once the latch is set, the run's answer is the stop. The engine
+//! raises that stop at every check it makes from then on, so a run that swallows one is
+//! stopped at the next — which is why a stopped run reports the BOUND it breached rather
+//! than the host giving up on it (`tests/all/evaluate_code.rs` holds it to that). The bounds
 //! are this sandbox's own rather than the event-handler path's, because what they bound is
 //! one API call the caller waits on, and the breach is reported TO that caller.
 //!
-//! The run happens on a blocking thread ([`evaluate`]), never on the async executor serving
-//! the request.
+//! The run happens on a thread of the sandbox's own ([`in_sandbox`]), never on the async
+//! executor serving the request.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -118,22 +126,18 @@ pub const EVALUATED_FUNCTIONS: &[&str] = &["request", "response"];
 /// defines, which is the one a resolver runs first.
 pub const DEFAULT_FUNCTION: &str = "request";
 
-/// The `errorType` of a [`CodeFault`] for code the engine could not compile. "Examples
-/// include, but aren't limited to: `LINT_ERROR`, `PARSER_ERROR`" (`CodeError$errorType`).
-pub const PARSER_ERROR: &str = "PARSER_ERROR";
+/// The `errorType` of a [`CodeFault`] for a module that does not export a FUNCTION the
+/// runtime would call: "the code defines the request and response functions"
+/// (`EvaluateCode`), so a module exporting a function for only one of them — or exporting
+/// the name as something that is not a function — defines no mapping the runtime could run.
+pub const MISSING_MAPPING_EXPORT: &str = "MISSING_MAPPING_EXPORT";
 
-/// The `errorType` of a [`CodeFault`] for code that compiles but does not define the
-/// function the request asked to evaluate.
-pub const LINT_ERROR: &str = "LINT_ERROR";
-
-/// The `errorType` of a [`CodeFault`] found by the compile a create or an update of a
-/// resolver or a function runs over the `code` it would store ([`compile_faults`]).
+/// The `errorType` of a [`CodeFault`] for code the engine could not READ, whether it was
+/// read to be run ([`run`]) or read to be stored ([`compile_faults`]).
 ///
-/// A written definition is compiled rather than evaluated, so the only fault that path can
-/// report is code the engine could not read, and recorded behaviour names that one
-/// `PARSE_ERROR` — the `errorType` member is free text ("Examples include, but aren't
-/// limited to: `LINT_ERROR`, `PARSER_ERROR`", `CodeError$errorType`), so each path reports
-/// the type its own compiler names.
+/// The `errorType` member is free text ("Examples include, but aren't limited to:
+/// `LINT_ERROR`, `PARSER_ERROR`", `CodeError$errorType`), and recorded behaviour names a
+/// code fault the compiler could not get past this one.
 pub const PARSE_ERROR: &str = "PARSE_ERROR";
 
 /// The `span` a fault carries when the engine does not report one: "The span/length of the
@@ -162,7 +166,7 @@ pub const ARGUMENTS_SHORT_MEMBER: &str = "args";
 /// One fault found in the code itself, as a `CodeError` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodeFault {
-    /// The kind of fault: [`PARSER_ERROR`] or [`LINT_ERROR`].
+    /// The kind of fault: [`PARSE_ERROR`] or [`MISSING_MAPPING_EXPORT`].
     pub error_type: &'static str,
     /// The user-presentable error, as the engine worded it.
     pub value: String,
@@ -205,7 +209,7 @@ pub enum Outcome {
     /// A bound of this module stopped the run. The text says which.
     Stopped(String),
     /// The code defines nothing this call could run: it does not compile, or it does not
-    /// export the function the request named.
+    /// export both of the functions a mapping is defined by.
     Faults(Vec<CodeFault>),
 }
 
@@ -224,20 +228,84 @@ pub struct Evaluation {
     pub out_errors: Option<String>,
 }
 
-/// Evaluate `function` of `code` over `context`, on a blocking thread.
+/// Evaluate `function` of `code` over `context`, on a thread of its own.
 ///
 /// The engine, the bounds and the whole run live inside that thread, so nothing of the
-/// engine crosses onto the executor serving the request. The CALLER's wait is bounded
-/// separately ([`CALLER_WAIT_CEILING`]): a run the engine has not come back from by then is
-/// given up on, so the request is answered whatever the engine is doing — the given-up run
-/// has already spent its own clock, so it ends at the next check the engine makes and takes
-/// nothing else with it.
+/// engine crosses onto the executor serving the request, and the thread is the sandbox's own
+/// rather than one of the executor's ([`in_sandbox`], which also bounds how many engines this
+/// process runs at once). The CALLER's wait is bounded separately ([`CALLER_WAIT_CEILING`]):
+/// a run the engine has not come back from by then is given up on, so the request is answered
+/// whatever the engine is doing, and the given-up run costs one sandbox slot until it ends.
 pub async fn evaluate(code: String, function: String, context: Json) -> Evaluation {
-    let running = ::tokio::task::spawn_blocking(move || run(&code, &function, &context));
-    match ::tokio::time::timeout(CALLER_WAIT_CEILING, running).await {
-        Ok(Ok(evaluation)) => evaluation,
-        Ok(Err(error)) => stopped(format!("the code could not be run: {error}")),
-        Err(_) => stopped(format!(
+    match in_sandbox(move || run(&code, &function, &context)).await {
+        Entered::Answered(evaluation) => evaluation,
+        Entered::GaveUp(reason) => stopped(reason),
+    }
+}
+
+/// How many sandbox engines this process runs at ONE time.
+///
+/// The bound that makes the cost of this operation finite however many requests arrive: each
+/// run takes a slot for the life of the thread that owns its engine, so the engines in flight
+/// — and with them the memory they may each take ([`RUN_MEMORY_BYTES`]) and the threads they
+/// run on — can never exceed this count, and a run that outlasts the caller's wait costs that
+/// one slot and nothing else. Chosen well above the number of evaluations a caller can have
+/// in flight in practice, so an ordinary request never queues behind another.
+const MAX_SANDBOX_ENGINES: usize = 16;
+
+/// The slots the sandbox's engines take, one per engine ([`MAX_SANDBOX_ENGINES`]).
+static SANDBOX_SLOTS: ::tokio::sync::Semaphore =
+    ::tokio::sync::Semaphore::const_new(MAX_SANDBOX_ENGINES);
+
+/// The name the sandbox's own threads carry, so one is recognisable in a thread dump.
+const SANDBOX_THREAD_NAME: &str = "appsync-js-sandbox";
+
+/// What asking the sandbox to run one engine came to.
+enum Entered<T> {
+    /// The engine ran and this is what it produced.
+    Answered(T),
+    /// Nothing was learned: the host did not wait for it, or could not start it. The text
+    /// says which.
+    GaveUp(String),
+}
+
+/// Run `work` — one engine's whole life — on a thread of its own, under the sandbox's slot
+/// bound, and answer what it produced or why the host stopped waiting for it.
+///
+/// Two bounds, both of the HOST's and neither reachable from the evaluated code:
+///
+/// * the SLOT ([`SANDBOX_SLOTS`]), held by the thread that owns the engine and released when
+///   that thread ends, so the engines in flight are bounded whatever the code does — a run
+///   that swallowed everything the engine raised in it could cost at most its own slot, and
+///   never a thread of the executor serving other requests;
+/// * the caller's WAIT ([`CALLER_WAIT_CEILING`]), both for entering the sandbox and for the
+///   answer, so the request is answered even where every slot is taken.
+async fn in_sandbox<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Entered<T> {
+    let Ok(Ok(slot)) =
+        ::tokio::time::timeout(CALLER_WAIT_CEILING, SANDBOX_SLOTS.acquire()).await
+    else {
+        return Entered::GaveUp(format!(
+            "the sandbox was busy for {} seconds",
+            CALLER_WAIT_CEILING.as_secs()
+        ));
+    };
+    let (answer, answered) = ::tokio::sync::oneshot::channel();
+    let started = ::std::thread::Builder::new()
+        .name(SANDBOX_THREAD_NAME.to_string())
+        .spawn(move || {
+            let produced = work();
+            // The engine is gone with `work`; the slot goes with the thread, so what the
+            // next run finds free is a slot nothing holds any more.
+            let _ = answer.send(produced);
+            drop(slot);
+        });
+    if started.is_err() {
+        return Entered::GaveUp("the sandbox could not be started".to_string());
+    }
+    match ::tokio::time::timeout(CALLER_WAIT_CEILING, answered).await {
+        Ok(Ok(produced)) => Entered::Answered(produced),
+        Ok(Err(_)) => Entered::GaveUp("the code could not be run".to_string()),
+        Err(_) => Entered::GaveUp(format!(
             "the code was given up on after {} seconds",
             CALLER_WAIT_CEILING.as_secs()
         )),
@@ -271,14 +339,9 @@ pub enum Compiled {
 /// clean one: the caller then answers the server fault its model declares instead of
 /// storing a definition nothing could read.
 pub async fn compile_faults(code: String) -> Compiled {
-    let compiling = ::tokio::task::spawn_blocking(move || compile(&code));
-    match ::tokio::time::timeout(CALLER_WAIT_CEILING, compiling).await {
-        Ok(Ok(compiled)) => compiled,
-        Ok(Err(error)) => Compiled::Unknown(format!("the code could not be compiled: {error}")),
-        Err(_) => Compiled::Unknown(format!(
-            "the compile was given up on after {} seconds",
-            CALLER_WAIT_CEILING.as_secs()
-        )),
+    match in_sandbox(move || compile(&code)).await {
+        Entered::Answered(compiled) => compiled,
+        Entered::GaveUp(reason) => Compiled::Unknown(reason),
     }
 }
 
@@ -516,11 +579,11 @@ fn evaluate_in(
         Ok(declared) => declared,
         // The engine resolves every `import` as it compiles, so a module this sandbox
         // serves none for is reported here beside code that does not parse.
-        Err(caught) => return (Outcome::Faults(vec![parser_fault(&caught)]), None),
+        Err(caught) => return (Outcome::Faults(vec![parse_fault(&caught)]), None),
     };
     let (evaluated, settled) = match declared.eval().catch(ctx) {
         Ok(evaluated) => evaluated,
-        Err(caught) => return (Outcome::Faults(vec![parser_fault(&caught)]), None),
+        Err(caught) => return (Outcome::Faults(vec![parse_fault(&caught)]), None),
     };
     // The module's body is evaluated through a promise, and nothing of this run drives a
     // job queue, so a body that RAISED is read off that promise here — otherwise its
@@ -538,15 +601,21 @@ fn evaluate_in(
             );
         }
     }
+    // "For APPSYNC_JS runtimes, the code defines the request and response functions"
+    // (`EvaluateCode`), so a module is a mapping only once it exports a function for BOTH
+    // of them ([`EVALUATED_FUNCTIONS`]): each name it does not is reported as a fault of
+    // the code and nothing is run, whichever of them the call asked to evaluate.
+    let missing: Vec<CodeFault> = EVALUATED_FUNCTIONS
+        .iter()
+        .filter(|name| evaluated.get::<_, Function<'_>>(**name).is_err())
+        .map(|name| missing_export_fault(name))
+        .collect();
+    if !missing.is_empty() {
+        return (Outcome::Faults(missing), None);
+    }
     let Ok(handler) = evaluated.get::<_, Function<'_>>(function) else {
         return (
-            Outcome::Faults(vec![CodeFault {
-                error_type: LINT_ERROR,
-                value: format!("The code does not export a {function} function."),
-                line: 0,
-                column: 0,
-                span: UNKNOWN_SPAN,
-            }]),
+            Outcome::Faults(vec![missing_export_fault(function)]),
             None,
         );
     };
@@ -659,14 +728,15 @@ fn pending(caught: &::rquickjs::CaughtError<'_>) -> bool {
     )
 }
 
-/// The fault code the engine could not compile takes.
+/// The fault code the engine could not READ takes.
 ///
 /// The engine reports the failure as one message, which names where in the code it stopped;
 /// it hands back no line or column of its own, so the location takes the values
 /// `CodeErrorLocation` documents for an unknown one (0 for the line and the column,
 /// [`UNKNOWN_SPAN`] for the span) and the message is reported verbatim as the user
-/// presentable error.
-fn parser_fault(caught: &::rquickjs::CaughtError<'_>) -> CodeFault {
+/// presentable error. Where the fault is REPORTED decides whether the position is stated
+/// from the code itself instead (`crate::state::stated_code_fault`).
+fn parse_fault(caught: &::rquickjs::CaughtError<'_>) -> CodeFault {
     let value = match caught {
         ::rquickjs::CaughtError::Exception(exception) => exception
             .message()
@@ -675,8 +745,24 @@ fn parser_fault(caught: &::rquickjs::CaughtError<'_>) -> CodeFault {
         other => other.to_string(),
     };
     CodeFault {
-        error_type: PARSER_ERROR,
+        error_type: PARSE_ERROR,
         value,
+        line: 0,
+        column: 0,
+        span: UNKNOWN_SPAN,
+    }
+}
+
+/// The fault a module that does not export `name` as a function takes: the mapping the
+/// runtime would have called is not there, stated as the export it looked for.
+///
+/// The module itself compiled, so the engine reports no position for it; the location takes
+/// the values `CodeErrorLocation` documents for an unknown one, and the reader of the fault
+/// states the position from the code (`crate::state::stated_code_fault`).
+fn missing_export_fault(name: &str) -> CodeFault {
+    CodeFault {
+        error_type: MISSING_MAPPING_EXPORT,
+        value: format!("The code does not export a {name} function."),
         line: 0,
         column: 0,
         span: UNKNOWN_SPAN,

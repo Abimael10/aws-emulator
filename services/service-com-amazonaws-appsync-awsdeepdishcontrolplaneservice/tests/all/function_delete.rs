@@ -85,9 +85,11 @@ fn assert_empty_success(case: &str, answer: &Answer) {
     );
 }
 
-/// The text a `NotFoundException` carries for a function the addressed API does not
-/// hold: AppSync's own wording, a fixed template whose only variable part is the
-/// requested id.
+/// The text a `NotFoundException` carries for a function the addressed API does not hold,
+/// where the answer the call was going to give IS the function (`GetFunction`,
+/// `UpdateFunction`): AppSync's own wording, a fixed template whose only variable part is
+/// the requested id. The delete, whose answer carries no members, states the absence
+/// without naming the id (`state::FUNCTION_NOT_FOUND_MESSAGE`).
 fn not_found_message(function_id: &str) -> String {
     format!("function id {function_id} not found")
 }
@@ -325,8 +327,8 @@ async fn a_delete_that_addresses_nothing_is_refused_and_removes_nothing() {
         );
         assert_eq!(
             answer.message,
-            not_found_message(&unheld),
-            "case delete {case}: expected the refusal to name the id, got {answer:?}"
+            state::FUNCTION_NOT_FOUND_MESSAGE,
+            "case delete {case}: expected the fixed no-function sentence, got {answer:?}"
         );
     }
 

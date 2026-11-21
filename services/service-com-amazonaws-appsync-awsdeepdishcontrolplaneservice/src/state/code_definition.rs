@@ -27,6 +27,14 @@
 //! takes `code` (`CreateFunction`, `UpdateFunction`, `CreateResolver`, `UpdateResolver`)
 //! refuses the same definitions; a request that carries no `code` defines nothing to
 //! compile.
+//!
+//! What this compile does NOT judge is which functions the module EXPORTS. A written
+//! definition is refused only for code the engine could not read, because that is what the
+//! corpus records this plane refusing: `EvaluateCode` is the call recorded reporting a module
+//! that exports no `request`/`response` pair as faulty (`crate::ops::evaluate_code`), and it
+//! reports that as the evaluation's own `error` rather than as a refusal of the request. A
+//! create or an update of a definition is left exactly as recorded until a recording says
+//! otherwise.
 
 use crate::ops::evaluate_code::appsync_js::{compile_faults, CodeFault, Compiled, CODE_UNIT};
 use crate::ops::types::{BadRequestDetail, BadRequestException, CodeError, CodeErrorLocation};
@@ -54,8 +62,15 @@ pub const CODE_ERRORS_MESSAGE: &str = "The code contains one or more errors.";
 /// how one fault is reported.
 pub fn code_errors_detail(faults: &[CodeFault]) -> BadRequestDetail {
     BadRequestDetail {
-        code_errors: Some(faults.iter().map(code_error).collect()),
+        code_errors: Some(code_errors(faults)),
     }
+}
+
+/// The faults `code` carries as the modelled `CodeError` list, which both the member that
+/// reports them in a REFUSAL ([`code_errors_detail`]) and the one that reports them in an
+/// evaluation's own `error` (`EvaluateCodeErrorDetail$codeErrors`) carry.
+pub fn code_errors(faults: &[CodeFault]) -> Vec<CodeError> {
+    faults.iter().map(code_error).collect()
 }
 
 /// One fault as the modelled `CodeError` reports it: its type, the user-presentable error
@@ -104,7 +119,10 @@ pub async fn code_definition(code: Option<&str>) -> CodeDefinition {
     if faults.is_empty() {
         return CodeDefinition::Compiled;
     }
-    let stated: Vec<CodeFault> = faults.iter().map(|fault| diagnosed(fault, code)).collect();
+    let stated: Vec<CodeFault> = faults
+        .iter()
+        .map(|fault| stated_code_fault(fault, code))
+        .collect();
     CodeDefinition::Refused(BadRequestException {
         message: Some(CODE_ERRORS_MESSAGE.to_string()),
         reason: Some(CODE_ERROR_REASON.to_string()),
@@ -123,7 +141,11 @@ pub async fn code_definition(code: Option<&str>) -> CodeDefinition {
 /// position is the one the engine stated, or, for a fault the engine states none for,
 /// where the code ITSELF ends ([`end_of_input`]), which is as far as a compile that could
 /// not read the code got.
-fn diagnosed(fault: &CodeFault, code: &str) -> CodeFault {
+///
+/// Shared by every reader of the code — the compile a WRITTEN definition runs and the
+/// evaluation of code a caller submits — so one fault is stated one way wherever the code
+/// was read.
+pub fn stated_code_fault(fault: &CodeFault, code: &str) -> CodeFault {
     let (line, column) = if fault.line > 0 {
         (fault.line, fault.column)
     } else {

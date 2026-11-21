@@ -10,8 +10,9 @@
 //! 1. a data source a FUNCTION of its API still resolves against cannot be deleted: the
 //!    call is a 400 `BadRequestException` listing the ids of every function that names
 //!    it, in creation order, and the data source is left in place — whatever the number
-//!    of referring functions, while a data source no function names is deletable even
-//!    when a resolver resolves against it;
+//!    of referring functions; a data source a RESOLVER of its API resolves against is
+//!    blocked the same way, in the vocabulary of what refers to it (the type and the field
+//!    that address the resolver), and a data source nothing names at all is deletable;
 //! 2. a function a RESOLVER of its API still invokes (a step of its `pipelineConfig`)
 //!    cannot be deleted: the call is a 400 `BadRequestException` naming the type and the
 //!    field that address the referring resolver, and the function is left in place —
@@ -230,25 +231,26 @@ async fn a_data_source_a_function_resolves_against_is_not_deleted() {
     }
 }
 
-/// Rule 1, the other side: what blocks a delete is a FUNCTION naming the data source,
-/// so a data source only a resolver resolves against is deletable, and a function naming
-/// one data source does not block the delete of another.
+/// Rule 1, the other side: a RESOLVER resolving against the data source blocks the delete
+/// too, stated in the vocabulary of what refers to it — the type and field that address the
+/// resolver — and a reference to one data source does not block the delete of another.
 #[tokio::test]
-async fn only_a_function_reference_blocks_a_data_source_delete() {
+async fn a_resolver_reference_blocks_a_data_source_delete_in_its_own_words() {
     let router = router();
     let api_id = create_api(&router, "deps-ds-scope").await;
     create_data_source(&router, &api_id, DATA_SOURCE).await;
     create_data_source(&router, &api_id, OTHER_DATA_SOURCE).await;
     create_functions(&router, &api_id, DATA_SOURCE, 1).await;
 
-    // A UNIT resolver resolving against the second data source: a resolver reference is
-    // not what AppSync's refusal names, and the data source is deleted.
+    // A UNIT resolver "run[s] a GraphQL query against a single data source", which is the
+    // other live reference to one.
+    let field = "unitField";
     let answer = create_resolver(
         &router,
         &api_id,
         TYPES[0],
         json!({
-            "fieldName": "unitField",
+            "fieldName": field,
             "kind": state::UNIT_KIND,
             "dataSourceName": OTHER_DATA_SOURCE,
             "requestMappingTemplate": "{\"version\": \"2018-05-29\"}",
@@ -260,15 +262,48 @@ async fn only_a_function_reference_blocks_a_data_source_delete() {
         "case attach a UNIT resolver to the second data source: expected 200, got {answer:?}"
     );
 
+    let expected = state::resolver_data_source_in_use_message(TYPES[0], field);
     let answer = delete_data_source(&router, &api_id, OTHER_DATA_SOURCE).await;
-    assert_empty_ok("a data source only a resolver resolves against", &answer);
+    assert_eq!(
+        (
+            answer.status,
+            answer.error_type.as_str(),
+            answer.message.as_str()
+        ),
+        (400, "BadRequestException", expected.as_str()),
+        "case a data source a resolver resolves against: expected 400 BadRequestException \
+         {expected:?}, got {answer:?}"
+    );
 
-    // The first data source is still blocked, so the rule is about the reference and not
-    // about the API holding any function at all.
+    // The refusal left it in place, and taking the resolver away frees it.
+    let read = call(
+        &router,
+        "GET",
+        &format!("/v1/apis/{api_id}/datasources/{OTHER_DATA_SOURCE}"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        (read.status, read.body["dataSource"]["name"].as_str()),
+        (200, Some(OTHER_DATA_SOURCE)),
+        "case a data source a resolver resolves against: expected it still readable, got {read:?}"
+    );
+    let detached = delete_resolver(&router, &api_id, TYPES[0], field).await;
+    assert_empty_ok("detach the resolver that blocked the delete", &detached);
+    let answer = delete_data_source(&router, &api_id, OTHER_DATA_SOURCE).await;
+    assert_empty_ok("a data source nothing resolves against any more", &answer);
+
+    // The first data source is still blocked by its FUNCTION, so each reference is stated
+    // in its own words: the delete is refused for the one named and not for the other.
     let answer = delete_data_source(&router, &api_id, DATA_SOURCE).await;
     assert_eq!(
         answer.status, 400,
         "case the data source its function names: expected 400, got {answer:?}"
+    );
+    assert!(
+        answer.message.starts_with("Data source is still in use by functions:"),
+        "case the data source its function names: expected the sentence naming the functions, \
+         got {answer:?}"
     );
 }
 
