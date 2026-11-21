@@ -6,7 +6,7 @@
 //! them, the execution role is the one IAM holds, and what reached the handler is read off
 //! the queue the handler forwarded it to.
 //!
-//! Two rules decide that, and this suite pins one each. `FilterCriteria` is "an object that
+//! Two rules decide that, and this suite pins them. `FilterCriteria` is "an object that
 //! defines the filter criteria that determine whether Lambda should process an event", and
 //! `Filters` is "a list of filters", so of the records one poll takes off the source exactly
 //! those matching AT LEAST ONE of the mapping's patterns are handed to the function; a record
@@ -31,6 +31,14 @@
 //! member absent, the infinite default, the smallest age AWS publishes, the largest the
 //! member's own range admits, and a finite age the records have already passed) and whether
 //! the records are older than it when the mapping starts reading.
+//!
+//! The age is decided per RECORD, so the last suite is the shape that mixes the two: a
+//! backlog that has already passed the age with ONE record written after the mapping existed
+//! behind it. Each record of such a read is decided by its own age, and a record the age
+//! discarded is accounted for by the poller itself — so the position advances past it and the
+//! younger record behind it is still handed over. Its rows differ along the age stated (two
+//! finite spans and the infinite default) and how many aged records sit ahead of the younger
+//! one.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -40,8 +48,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::dynamodb_stream_event_source_delivery::{
-    given_table, results_until, write_item, Write, BUDGET, KEY, LOOK_AGAIN, NEW_AND_OLD_IMAGES,
-    RESULT_OK, TRIM_HORIZON,
+    dynamodb, given_table, results_until, write_item, Write, BUDGET, KEY, LOOK_AGAIN,
+    NEW_AND_OLD_IMAGES, RESULT_OK, TRIM_HORIZON,
 };
 use crate::event_source_mapping_role_access::{allow, given_role, DYNAMODB_READS};
 use crate::event_source_mappings::{call, call_sqs, create_mapping, create_queue, get_mapping};
@@ -726,6 +734,236 @@ async fn the_record_age_a_mapping_states_decides_which_stream_records_reach_the_
             );
             stop_mapping(&router, case, &control_uuid).await;
         }
+
+        stop_mapping(&router, case, &uuid).await;
+    }
+}
+
+/// The shortest finite age any boundary row states, in the seconds the member states them in.
+///
+/// An EMULATOR choice of a value inside `@range(min: -1, max: 604800)`, not an AWS number:
+/// short enough that a row waits its backlog past it in seconds, and long enough that the one
+/// record written while the mapping reads is read well inside it even on a loaded machine —
+/// so the only span a row is tight about is the age of the backlog it wrote, never how fast
+/// the host delivers the record behind it.
+const BOUNDARY_RECORD_AGE: i64 = 5;
+
+/// A second, LONGER finite age the boundary rows state, so the suite reads the member as the
+/// span it states rather than as one value it was tried with. Longer than
+/// [`BOUNDARY_RECORD_AGE`], because the headroom that one leaves the delivery is the least any
+/// row may leave it.
+const LONGER_BOUNDARY_RECORD_AGE: i64 = 8;
+
+/// The keys of the backlog a boundary row writes BEFORE its mapping exists, in the order they
+/// are written; a row takes as many of them as it states.
+const BACKLOG_KEYS: [&str; 3] = ["backlog-1", "backlog-2", "backlog-3"];
+
+/// The key of the one record a boundary row writes once its mapping is already reading: the
+/// record that is younger than the age whatever that age is.
+const FRESH_KEY: &str = "fresh";
+
+/// One row of the boundary suite: the age the mapping states, how many aged records sit ahead
+/// of the record written after it existed, and whether those aged records reach the handler.
+struct BoundaryRow {
+    case: &'static str,
+    /// `MaximumRecordAgeInSeconds` as the create states it; `None` leaves the member out of
+    /// the request, which is the infinite default.
+    maximum_record_age: Option<i64>,
+    /// How many of [`BACKLOG_KEYS`] the row writes before its mapping exists.
+    backlog: usize,
+    /// Whether the handler must be handed the backlog's records. The record written after the
+    /// mapping existed must reach it in every row.
+    delivers_the_backlog: bool,
+}
+
+impl BoundaryRow {
+    /// The span this row waits its backlog past before creating its mapping: the age the
+    /// mapping states where that is finite, and otherwise the longest age this suite states —
+    /// so a row carrying the infinite age meets a backlog at least as aged as the finite rows'.
+    fn waits_past(&self) -> Duration {
+        let seconds = self
+            .maximum_record_age
+            .and_then(|age| u64::try_from(age).ok())
+            .unwrap_or_else(|| {
+                u64::try_from(LONGER_BOUNDARY_RECORD_AGE)
+                    .expect("the suite's age is a positive span")
+            });
+        Duration::from_secs(seconds)
+    }
+}
+
+/// The boundary rows: the recorded shape and the two it generalises over.
+fn boundary_rows() -> Vec<BoundaryRow> {
+    vec![
+        // The recorded shape: a whole backlog past the age, with one record written after the
+        // mapping existed behind it.
+        BoundaryRow {
+            case: "a-backlog-past-the-age-then-a-younger-record",
+            maximum_record_age: Some(BOUNDARY_RECORD_AGE),
+            backlog: BACKLOG_KEYS.len(),
+            delivers_the_backlog: false,
+        },
+        // Another age over a backlog of ONE: the age is read as the span the member states,
+        // and the position advances past a single discarded record as past a run of them.
+        BoundaryRow {
+            case: "one-aged-record-ahead-of-the-younger-one",
+            maximum_record_age: Some(LONGER_BOUNDARY_RECORD_AGE),
+            backlog: 1,
+            delivers_the_backlog: false,
+        },
+        // The control the withholding is read against: the same backlog, as old, read by a
+        // mapping carrying the infinite default, which ages nothing out.
+        BoundaryRow {
+            case: "the-infinite-age-keeps-the-same-backlog",
+            maximum_record_age: Some(INFINITE_RECORD_AGE),
+            backlog: BACKLOG_KEYS.len(),
+            delivers_the_backlog: true,
+        },
+    ]
+}
+
+/// Every item `keys` names is still in `table`, read with the strongest read a client has:
+/// the age is a CONSUMER-side bound, so what it discarded is no change to the table the
+/// records came from.
+async fn items_are_still_in_the_table(
+    router: &MultiServiceRouter,
+    case: &str,
+    table: &str,
+    keys: &[String],
+) {
+    for key in keys {
+        let (status, read) = dynamodb(
+            router,
+            "GetItem",
+            &json!({
+                "TableName": table,
+                "Key": { KEY: { "S": key } },
+                "ConsistentRead": true,
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: GetItem {key:?} answered {status} {read}"
+        );
+        assert_eq!(
+            read["Item"][KEY],
+            json!({ "S": key }),
+            "case {case:?}: the item {key:?} must still be in {table:?} whatever the mapping \
+             discarded, got {read}"
+        );
+    }
+}
+
+/// RULE: the age a stream mapping states decides each record it reads on that record's OWN
+/// age, and a record the age discarded is accounted for by the poller — so a mapping stating
+/// a finite age hands its function none of a backlog that has passed that age while still
+/// handing over the younger record behind it, and keeps reading as an `Enabled` mapping that
+/// came to no problem.
+#[tokio::test]
+async fn an_aged_out_backlog_is_discarded_while_the_record_behind_it_is_delivered() {
+    for row in boundary_rows() {
+        let case = row.case;
+        let router = emulator();
+        let table = format!("boundary-{case}");
+        let function = format!("boundary-fn-{case}");
+        let (queue_url, queue_arn) =
+            create_queue(&router, case, &format!("boundary-out-{case}"), &json!({})).await;
+        let stream_arn = given_table(&router, case, &table, Some(NEW_AND_OLD_IMAGES)).await;
+        let role_arn = given_role(
+            &router,
+            case,
+            &format!("boundary-role-{case}"),
+            Some(json!([
+                allow("dynamodb", &DYNAMODB_READS, &stream_arn),
+                allow("sqs", &SEND_MESSAGE, &queue_arn),
+            ])),
+        )
+        .await;
+        given_function(&router, case, &function, &role_arn, &queue_url).await;
+
+        // The backlog, written before any mapping exists and waited out past the age the row
+        // states, so the mapping meets records that have already passed it.
+        let backlog = &BACKLOG_KEYS[..row.backlog];
+        for key in backlog {
+            write_item(&router, case, &table, key, Write::Insert).await;
+        }
+        aged_past(row.waits_past(), SystemTime::now()).await;
+
+        let uuid =
+            given_aged_mapping(&router, case, &function, &stream_arn, row.maximum_record_age).await;
+        // And the one record written once that mapping is already reading: younger than the
+        // age, and behind every record of the backlog in the shard.
+        write_item(&router, case, &table, FRESH_KEY, Write::Insert).await;
+
+        // The deadlines are GENEROUS: the only tight span a row is about is the age it
+        // states, so a loaded machine must not turn a slow delivery into a verdict.
+        let deadline = Instant::now() + BUDGET + BUDGET;
+        let fresh = marker(INSERT, FRESH_KEY);
+        let mut seen = markers_until(
+            &router,
+            case,
+            &queue_url,
+            std::slice::from_ref(&fresh),
+            deadline,
+        )
+        .await;
+        assert!(
+            seen.contains(&fresh),
+            "case {case:?}: the record written while the mapping read is younger than the \
+             {:?} second(s) it allows, so its handler must be handed it, it forwarded {seen:?}",
+            row.maximum_record_age
+        );
+        // A shard is read IN ORDER, so once the younger record's message is on the queue the
+        // backlog ahead of it has been read past: what the handler did not forward for it is
+        // a verdict rather than a race.
+        seen.extend(take_markers(&router, case, &queue_url).await);
+        for key in backlog {
+            let aged = marker(INSERT, key);
+            assert_eq!(
+                seen.contains(&aged),
+                row.delivers_the_backlog,
+                "case {case:?}: a mapping stating {:?} must {} the record of {key:?}, which \
+                 had passed {:?} before the mapping existed; the handler forwarded {seen:?}",
+                row.maximum_record_age,
+                if row.delivers_the_backlog {
+                    "hand over"
+                } else {
+                    "discard"
+                },
+                row.waits_past()
+            );
+        }
+
+        // Discarding is not failing: the mapping comes to no problem at all with the records
+        // it shed, keeps the age it was created with, and stays Enabled.
+        let results = results_until(&router, case, &uuid, RESULT_OK, deadline).await;
+        assert_eq!(
+            results.last().map(String::as_str),
+            Some(RESULT_OK),
+            "case {case:?}: an aged-out record is discarded rather than failed, saw {results:?}"
+        );
+        let read = get_mapping(&router, &uuid).await;
+        assert_eq!(
+            read.string("State").as_deref(),
+            Some(STATE_ENABLED),
+            "case {case:?}: a mapping that shed records keeps reading, so it must still \
+             report {STATE_ENABLED}, got {}",
+            read.text()
+        );
+        assert_eq!(
+            read.json()["MaximumRecordAgeInSeconds"],
+            json!(row.maximum_record_age.unwrap_or(INFINITE_RECORD_AGE)),
+            "case {case:?}: the mapping must still carry the age it was created with, got {}",
+            read.text()
+        );
+        // And the table itself is untouched by what the consumer shed.
+        let keys: Vec<String> = backlog
+            .iter()
+            .chain(std::iter::once(&FRESH_KEY))
+            .map(|key| (*key).to_string())
+            .collect();
+        items_are_still_in_the_table(&router, case, &table, &keys).await;
 
         stop_mapping(&router, case, &uuid).await;
     }
