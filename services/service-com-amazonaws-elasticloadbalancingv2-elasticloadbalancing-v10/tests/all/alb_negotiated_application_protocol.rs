@@ -153,7 +153,14 @@ async fn modify_attribute(router: &MultiServiceRouter, lb_arn: &str, key: &str, 
 
 /// Create an internet-facing NETWORK load balancer, whose TLS listener carries an ALPN
 /// policy of its own, and answer its ARN and published address.
-async fn create_network_load_balancer(router: &MultiServiceRouter, name: &str) -> (String, String) {
+///
+/// `pub(crate)` because `all/listener_alpn_policy_member.rs` needs the same load balancer —
+/// a TLS listener is a Network Load Balancer's — so ONE builder serves both suites and they
+/// cannot drift on how such a load balancer is created.
+pub(crate) async fn create_network_load_balancer(
+    router: &MultiServiceRouter,
+    name: &str,
+) -> (String, String) {
     let mut form = action("CreateLoadBalancer");
     form.push(p("Name", name));
     form.push(p("Type", "network"));
@@ -175,7 +182,10 @@ async fn create_network_load_balancer(router: &MultiServiceRouter, name: &str) -
 }
 
 /// Create the TCP target group such a listener forwards to, and answer its ARN.
-async fn create_tcp_target_group(router: &MultiServiceRouter, name: &str) -> String {
+///
+/// `pub(crate)` for the same reason as the load balancer above: a Network Load Balancer's
+/// listener may forward only to a target group carrying the traffic it serves.
+pub(crate) async fn create_tcp_target_group(router: &MultiServiceRouter, name: &str) -> String {
     let mut form = action("CreateTargetGroup");
     form.push(p("Name", name));
     form.push(p("Protocol", "TCP"));
