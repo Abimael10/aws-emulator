@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: writes the request's tags onto the resource its `resourceArn` names,
+//! overwriting the value of a key that resource already carries and leaving its other
+//! keys alone.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What a request may ask to write, and what a write does to the stored list, are
+//! [`crate::state`]'s ([`crate::state::requested_tags`],
+//! [`crate::state::ComAmazonawsEndusermessagingEndusermessagingState::write_tags`]):
+//! every operation of this service that takes a `TagList` judges it the same way, and
+//! the tags this one writes are the ones `ListTagsForResource` then reports.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +150,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::NO_STORE.to_string(),
+                },
+            )
+            .into());
+        };
+        // The request's own content is judged before any lookup: a tag set no request
+        // may carry is refused whatever resource its ARN names, so the answer to such a
+        // request does not depend on the store. `crate::state::requested_tags` owns
+        // which sets those are, for this write and for every create that takes tags.
+        let requested = crate::state::requested_tags(&input.tags)
+            .map_err(TagResourceErrorModeled::ValidationException)?;
+        // `ctx` is read for the Region the request was made in, which is the only
+        // Region a `resourceArn` may name a resource in.
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        let resource = store
+            .resolve_tagged_resource(&input.resource_arn, &region)
+            .map_err(|unreachable| match unreachable {
+                crate::state::UnreachableResource::Invalid(invalid) => {
+                    TagResourceErrorModeled::ValidationException(invalid)
+                }
+                crate::state::UnreachableResource::NotFound(missing) => {
+                    TagResourceErrorModeled::ResourceNotFoundException(missing)
+                }
+            })?;
+        // The resolution and the write share one lock, so the record the ARN resolved
+        // to is still here; a state that disagreed is reported rather than passed off
+        // as a write that landed.
+        store
+            .write_tags(&resource, &requested)
+            .map_err(|refused| match refused {
+                crate::state::TagWriteRefused::Vanished => {
+                    TagResourceErrorModeled::InternalServerException(InternalServerException {
+                        message: crate::state::RESOLVED_RESOURCE_VANISHED.to_string(),
+                    })
+                }
+                crate::state::TagWriteRefused::Quota { would_hold } => {
+                    TagResourceErrorModeled::ServiceQuotaExceededException(
+                        crate::state::tag_quota_exceeded(would_hold),
+                    )
+                }
+            })?;
+        // The operation models no output members: the tags it wrote are what
+        // `ListTagsForResource` reports from the record they were written to.
+        Ok(TagResourceOutput {})
     }
 }

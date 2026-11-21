@@ -183,17 +183,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `clientToken` is compared against. Both parameter structures are kept exactly
         // as supplied: no value is applied for a member the request omits, and the
         // passcode defaults are applied when a code is sent rather than at create time.
+        // The tag set is judged by the same rules a tag write's is
+        // (`crate::state::requested_tags`), so a key inside the reserved namespace, or
+        // one this request names twice, is refused and nothing is created.
+        let tags = crate::state::requested_tags(input.tags.as_deref().unwrap_or_default())
+            .map_err(CreateNotifyCodeConfigurationErrorModeled::ValidationException)?;
         let requested = crate::state::NotifyCodeConfigurationCreate {
             name: input.notify_code_configuration_name,
             code_configuration_parameters: input.code_configuration_parameters,
             channel_parameters: input.channel_parameters,
             deletion_protection_enabled: input.deletion_protection_enabled.unwrap_or(false),
-            tags: input
-                .tags
-                .unwrap_or_default()
-                .into_iter()
-                .map(|tag| (tag.key, tag.value))
-                .collect(),
+            tags,
         };
 
         // `clientToken` is `@idempotencyToken`: a repeat of a request already served

@@ -186,16 +186,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The parameters this request asks for, which is what a repeat of its
-        // `clientToken` is compared against.
+        // `clientToken` is compared against. The tag set is judged by the same rules a
+        // tag write's is (`crate::state::requested_tags`), so a key inside the reserved
+        // namespace, or one this request names twice, is refused and nothing is created.
+        let tags = crate::state::requested_tags(input.tags.as_deref().unwrap_or_default())
+            .map_err(CreateBrandProfileErrorModeled::ValidationException)?;
         let requested = crate::state::BrandProfileCreate {
             name: input.brand_profile_name,
             deletion_protection_enabled: input.deletion_protection_enabled.unwrap_or(false),
-            tags: input
-                .tags
-                .unwrap_or_default()
-                .into_iter()
-                .map(|tag| (tag.key, tag.value))
-                .collect(),
+            tags,
         };
 
         // `clientToken` is `@idempotencyToken`: a repeat of a request already served

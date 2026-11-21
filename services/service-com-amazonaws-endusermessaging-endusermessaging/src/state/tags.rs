@@ -8,6 +8,12 @@
 //! a tag read and a tag write cannot disagree about which resource an ARN names, or
 //! about how a value that names none is refused.
 //!
+//! What a request may ASK to write lives here for the same reason: a `TagList` arrives
+//! on a tag write and on every create that takes tags, and the rules a tag set has to
+//! satisfy — the reserved key namespace, one value per key, the per-resource ceiling —
+//! are the same wherever it arrived, so they are stated once ([`requested_tags`],
+//! [`ComAmazonawsEndusermessagingEndusermessagingState::write_tags`]).
+//!
 //! The ARN itself is read by the workspace's one ARN parse,
 //! [`::service_common::arn`], so this service does not decide for itself what an ARN
 //! is: the fields, the resource type and the id of a resource of that type all come
@@ -174,6 +180,184 @@ impl ComAmazonawsEndusermessagingEndusermessagingState {
                 .get(id)
                 .map(|record| record.tags.as_slice()),
         }
+    }
+
+    /// The tags stored on `resource`, to write, or `None` for a resource this state no
+    /// longer holds.
+    ///
+    /// The one place a tag write reaches, so every stored tag list is the one its own
+    /// resource record carries rather than a second copy beside it.
+    fn tags_of_mut(&mut self, resource: &TaggedResource) -> Option<&mut Vec<(String, String)>> {
+        match resource {
+            TaggedResource::BrandProfile(id) => {
+                self.brand_profiles.get_mut(id).map(|profile| &mut profile.tags)
+            }
+            TaggedResource::NotifyCodeConfiguration(id) => self
+                .notify_code_configurations
+                .get_mut(id)
+                .map(|record| &mut record.tags),
+        }
+    }
+
+    /// Write `requested` onto `resource`, overwriting the value of a key the resource
+    /// already carries and leaving every other key alone.
+    ///
+    /// A tag key is unique per resource (`TagKey`'s own documentation), so a key the
+    /// resource already carries is one pair whose value this write replaces — in the
+    /// place it already occupies, since the list's order is the order its keys were
+    /// first written — and a key it does not carry is appended. Refused, writing
+    /// nothing, when the merge would leave the resource carrying more than
+    /// [`MAX_TAGS_PER_RESOURCE`] tags.
+    pub fn write_tags(
+        &mut self,
+        resource: &TaggedResource,
+        requested: &[(String, String)],
+    ) -> Result<(), TagWriteRefused> {
+        let Some(stored) = self.tags_of_mut(resource) else {
+            return Err(TagWriteRefused::Vanished);
+        };
+        // What the resource would carry once the merge is applied: its own keys, plus
+        // the requested keys it does not carry yet.
+        let would_hold = stored.len()
+            + requested
+                .iter()
+                .filter(|(key, _)| !stored.iter().any(|(held, _)| held == key))
+                .count();
+        if would_hold > MAX_TAGS_PER_RESOURCE {
+            return Err(TagWriteRefused::Quota { would_hold });
+        }
+        for (key, value) in requested {
+            match stored.iter_mut().find(|(held, _)| held == key) {
+                Some(pair) => pair.1 = value.clone(),
+                None => stored.push((key.clone(), value.clone())),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Why a tag write a request asked for was not applied.
+#[derive(Debug)]
+pub enum TagWriteRefused {
+    /// The resource was resolved but holds no record, which the lock the resolution
+    /// and the write share makes impossible. `InternalServerException`, HTTP 500.
+    Vanished,
+    /// The merge would leave the resource carrying more than [`MAX_TAGS_PER_RESOURCE`]
+    /// tags. `ServiceQuotaExceededException`, HTTP 400.
+    Quota {
+        /// How many tags the resource would have carried had the write been applied.
+        would_hold: usize,
+    },
+}
+
+/// The most tags one resource of this service carries.
+///
+/// AWS's per-resource tag quota is 50 keys, which the modelled `TagList`'s
+/// `@length(max: 50)` states for ONE request — a tag write MERGES its keys into the
+/// tags already stored on the resource, so the ceiling has to be on the stored list,
+/// not on a request. A write that would take a resource past it is refused with
+/// `ServiceQuotaExceededException`, the error `TagResource` models for a request that
+/// would exceed a quota, rather than growing the list.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// `ServiceQuotaExceededException` for a tag write that would leave a resource
+/// carrying more than [`MAX_TAGS_PER_RESOURCE`] tags.
+///
+/// The fixed text names the quota; the variable parts are the number of tags the
+/// resource would have carried and the ceiling itself, so the caller is told how far
+/// past it the request reached.
+pub fn tag_quota_exceeded(would_hold: usize) -> crate::ops::types::ServiceQuotaExceededException {
+    crate::ops::types::ServiceQuotaExceededException {
+        message: format!(
+            "The request would leave the resource carrying {would_hold} tags, more than the \
+             maximum of {MAX_TAGS_PER_RESOURCE} tags a resource may carry."
+        ),
+    }
+}
+
+/// The tag-key namespace AWS keeps for the tags it creates itself.
+///
+/// A key inside it is not a caller's to assign: AWS's own tagging rules reserve this
+/// prefix, so a request naming such a key is refused rather than written. The
+/// namespace is AWS's however the prefix is cased, so it is matched
+/// case-insensitively ([`is_reserved_tag_key`]).
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` lies inside the namespace [`RESERVED_TAG_KEY_PREFIX`] keeps, compared
+/// without regard to case.
+///
+/// Only a key that BEGINS with the prefix is reserved: one carrying it anywhere else,
+/// or carrying `aws` without the colon, is an ordinary key.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// The key/value pairs a request's `tags` asks to write, as the store keeps them, or
+/// the refusal of a tag set no request may carry.
+///
+/// Every operation of this service that takes a `TagList` reads it through here, so a
+/// tag set is judged the same whichever member it arrived on: a key inside the
+/// reserved namespace is not a caller's to assign, and a key repeated inside one list
+/// asks for two values for one key, which `TagKey` — "case-sensitive and must be
+/// unique per resource" — leaves no room for. The elements are judged in the order the
+/// request gave them, so one request is always refused for the same element, and
+/// nothing is written for a request that carries either.
+pub fn requested_tags(
+    tags: &[crate::ops::types::Tag],
+) -> Result<Vec<(String, String)>, crate::ops::types::ValidationException> {
+    let mut pairs: Vec<(String, String)> = Vec::with_capacity(tags.len());
+    for (index, tag) in tags.iter().enumerate() {
+        if is_reserved_tag_key(&tag.key) {
+            return Err(reserved_tag_key(index, &tag.key));
+        }
+        if pairs.iter().any(|(key, _)| key == &tag.key) {
+            return Err(duplicate_tag_key(index, &tag.key));
+        }
+        pairs.push((tag.key.clone(), tag.value.clone()));
+    }
+    Ok(pairs)
+}
+
+/// The JSON pointer naming the `key` of the tag at `index` of a request's `tags`, as
+/// `ValidationExceptionField$path` documents the member a refusal names.
+fn tag_key_pointer(index: usize) -> String {
+    format!("/tags/{index}/key")
+}
+
+/// `ValidationException` for a tag key inside the namespace
+/// [`RESERVED_TAG_KEY_PREFIX`] keeps.
+///
+/// Worded as a sentence, the way this API words a refusal its model does not express
+/// (an unissued pagination token, an update carrying nothing to update). The fixed
+/// text is this refusal's and names the rule; the only variable parts are the prefix
+/// itself and the key the request gave, which the sentence closes with.
+fn reserved_tag_key(index: usize, key: &str) -> crate::ops::types::ValidationException {
+    crate::ops::types::ValidationException {
+        message: format!("Tag key cannot start with '{RESERVED_TAG_KEY_PREFIX}': {key}"),
+        field_list: Some(vec![crate::ops::types::ValidationExceptionField {
+            path: tag_key_pointer(index),
+            message: format!(
+                "The tag key must not begin with the reserved prefix {RESERVED_TAG_KEY_PREFIX}"
+            ),
+        }]),
+    }
+}
+
+/// `ValidationException` for a tag key a request names more than once.
+///
+/// The fixed text is this refusal's; the only variable part is the key the request
+/// repeated. The element the `fieldList` names is the one that repeated it — the
+/// second, since that is the element the request could drop.
+fn duplicate_tag_key(index: usize, key: &str) -> crate::ops::types::ValidationException {
+    crate::ops::types::ValidationException {
+        message: format!("Duplicate tag key: '{key}'"),
+        field_list: Some(vec![crate::ops::types::ValidationExceptionField {
+            path: tag_key_pointer(index),
+            message: "Each tag key must be named at most once in one request; tag keys are \
+                      case-sensitive"
+                .to_string(),
+        }]),
     }
 }
 

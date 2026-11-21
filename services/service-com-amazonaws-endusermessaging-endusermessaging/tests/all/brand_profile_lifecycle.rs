@@ -43,6 +43,15 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_endusermessaging_endusermessaging::EmulatedService;
 
+/// The tag WRITE half of the same tagging contract, driven over the same wire:
+/// `TagResource`, and the tag sets no request may carry. A child module of this suite,
+/// in `tests/all/brand_profile_lifecycle/`. This crate's one test target declares each
+/// suite DIRECTLY under `tests/all/` from `tests/all.rs`; a child module of an
+/// already-declared suite is declared by its parent, here. The `#[path]` is relative to
+/// this file's own directory, as it is in `all.rs`.
+#[path = "brand_profile_lifecycle/tag_writes.rs"]
+mod tag_writes;
+
 /// This service's sigv4 signing name, from the model (`OPERATIONS.md`, "Wire protocol").
 const SIGNING_NAME: &str = "end-user-messaging";
 
