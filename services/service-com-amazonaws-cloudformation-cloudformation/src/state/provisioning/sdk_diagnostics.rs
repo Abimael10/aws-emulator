@@ -40,7 +40,9 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
     // parenthesis). This signing name is SHARED with API Gateway v2, whose own surface is
     // bound under a URI prefix of its own and is therefore named by its own SDK rather than
     // by this entry ([`SDK_SHARED_NAME_PREFIXES`]); this one answers for the REST control
-    // plane's types ([`provisioning::apigateway_rest_api`]).
+    // plane's types ([`provisioning::apigateway_rest_api`]). The provider of the api ITSELF
+    // words the ATTEMPT-counting shape, which is recorded per provider
+    // ([`SDK_PROVIDER_SHAPES`]).
     (
         crate::state::provisioner::API_GATEWAY_SIGNING_NAME,
         "ApiGateway",
@@ -507,6 +509,27 @@ fn uri_is_under(uri: &str, prefix: &str) -> bool {
 /// the rows below say which reason that was, so a later recording of another of those calls can
 /// correct them.
 const SDK_PROVIDER_SHAPES: &[(&str, &str, SdkDiagnostic)] = &[
+    // The `AWS::ApiGateway::RestApi` type's provider — the api ITSELF
+    // ([`provisioning::apigateway_rest_api`]) — words the ATTEMPT-counting shape, where that
+    // service's entry above carries the bare envelope its DEPLOYMENT provider words. Read from
+    // the recorded `ResourceStatusReason` of an `AWS::ApiGateway::RestApi` whose declared
+    // `ApiKeySourceType` is outside that service's value set (in the behavioral corpus
+    // `simparity-behavioral-aws-v1`, check `apigateway__cloudformation.deploy-cfn-apigateway-\
+    // restapi-invalid-apikeysourcetype-rejected`, whose reason reads `Resource handler returned
+    // message: "<the service's sentence> (Service: ApiGateway, Status Code: 400, Request ID: …)
+    // (SDK Attempt Count: …)" (RequestToken: …, HandlerErrorCode: GeneralServiceException)`).
+    // The two rows are the calls that provider makes whose operation this crate states; a call
+    // of its that names none takes its service's own shape.
+    (
+        crate::state::provisioner::API_GATEWAY_SIGNING_NAME,
+        "CreateRestApi",
+        SdkDiagnostic::Attempts,
+    ),
+    (
+        crate::state::provisioner::API_GATEWAY_SIGNING_NAME,
+        "UpdateRestApi",
+        SdkDiagnostic::Attempts,
+    ),
     // AWS Elemental MediaConvert's three TRANSCODING types — the queue a stack's jobs run in,
     // the job template they are created from and the preset an output is written with
     // ([`provisioning::mediaconvert_resources`]) — are provisioned by a provider that words the

@@ -182,10 +182,11 @@ async fn update_rest_api(
     if !patches.is_empty() {
         let mut request = Map::new();
         request.insert("patchOperations".to_string(), Value::Array(patches));
-        call_rest_json(
+        call_rest_json_named(
             ctx,
             API_GATEWAY_SIGNING_NAME,
             region,
+            UPDATE_REST_API,
             "PATCH",
             &rest_api_uri(&api_id),
             Some(&Value::Object(request)),

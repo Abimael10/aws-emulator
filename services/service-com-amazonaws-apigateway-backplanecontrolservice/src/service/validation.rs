@@ -103,7 +103,7 @@ const SELF_VALIDATED_MEMBERS: [(&str, &str, &str); 1] = [(
 /// request, and is recorded as such: a value set is rendered in the service's declared
 /// order, which for every other enum of this service is the order the public model
 /// preserves.
-const DECLARED_VALUE_SETS: [&[&str]; 4] = [
+const DECLARED_VALUE_SETS: [&[&str]; 5] = [
     &["add", "remove", "move", "test", "replace", "copy"],
     &["overwrite", "merge"],
     &["HTTP", "MOCK", "AWS_PROXY", "HTTP_PROXY", "AWS"],
@@ -113,6 +113,16 @@ const DECLARED_VALUE_SETS: [&[&str]; 4] = [
     // recorded refusals of an out-of-enum `types` element on `CreateRestApi` list it as
     // below.
     &["PRIVATE", "EDGE", "REGIONAL"],
+    // `CreateRestApi$apiKeySource`'s shape, `com.amazonaws.apigateway#ApiKeySourceType`, which
+    // the public model declares `[HEADER, AUTHORIZER]`
+    // (`smithy_query(query="shape", shape="com.amazonaws.apigateway#ApiKeySourceType")`); the
+    // recorded refusal of an out-of-enum `apiKeySource` lists it as below — read from the
+    // `ResourceStatusReason` a CloudFormation stack's `AWS::ApiGateway::RestApi` carries when
+    // its declared `ApiKeySourceType` is outside the set, which quotes this service's own
+    // sentence (in the behavioral corpus `simparity-behavioral-aws-v1`, check
+    // `apigateway__cloudformation.deploy-cfn-apigateway-restapi-invalid-apikeysourcetype-\
+    // rejected`).
+    &["AUTHORIZER", "HEADER"],
 ];
 
 /// This service's wording for the violations the framework found on `operation`'s
@@ -503,14 +513,15 @@ mod tests {
     const OP_VALUE_SET: &[&str] = DECLARED_VALUE_SETS[0];
     const PUT_MODE_VALUE_SET: &[&str] = DECLARED_VALUE_SETS[1];
     const INTEGRATION_TYPE_VALUE_SET: &[&str] = DECLARED_VALUE_SETS[2];
+    const API_KEY_SOURCE_VALUE_SET: &[&str] = DECLARED_VALUE_SETS[4];
 
     /// A value set is listed in the service's declared order: the recorded order for
-    /// `Op`, for `PutMode` and for `IntegrationType`, the model's own order for every
-    /// other enum.
+    /// `Op`, for `PutMode`, for `IntegrationType` and for `ApiKeySourceType`, the model's own
+    /// order for every other enum.
     #[test]
     fn an_enum_value_set_is_listed_in_the_services_declared_order() {
         // (case, the set as the model declares it, the set as the service lists it)
-        let rows: [(&str, &[&str], &[&str]); 8] = [
+        let rows: [(&str, &[&str], &[&str]); 9] = [
             (
                 "Op, in the model's declaration order",
                 &["add", "remove", "replace", "move", "copy", "test"],
@@ -530,11 +541,17 @@ mod tests {
                 PUT_MODE_VALUE_SET,
             ),
             // Source: `smithy_query(query="shape",
-            // shape="com.amazonaws.apigateway#ApiKeySourceType")`.
+            // shape="com.amazonaws.apigateway#ApiKeySourceType")` declares
+            // `[HEADER, AUTHORIZER]`.
             (
-                "ApiKeySourceType",
+                "ApiKeySourceType, in the model's declaration order",
                 &["HEADER", "AUTHORIZER"],
-                &["HEADER", "AUTHORIZER"],
+                API_KEY_SOURCE_VALUE_SET,
+            ),
+            (
+                "ApiKeySourceType, already in the service's order",
+                API_KEY_SOURCE_VALUE_SET,
+                API_KEY_SOURCE_VALUE_SET,
             ),
             // A set that merely overlaps `Op` keeps its own order and its own members.
             (

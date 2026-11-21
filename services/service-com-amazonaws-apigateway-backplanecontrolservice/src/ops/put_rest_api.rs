@@ -206,8 +206,30 @@ const MODE_OVERWRITE: &str = "overwrite";
 /// The `authorizationType` an imported method is created with. API Gateway imports an
 /// operation that declares no security requirement as an open method, and this emulator
 /// models no authorizers yet (`CreateAuthorizer` writes no record), so every imported
-/// method is open.
+/// method is open — except one whose requirement names a SigV4 scheme, whose authorization
+/// is the CALLER's own credential and so needs no authorizer at all
+/// ([`IMPORTED_SIGV4_AUTHORIZATION_TYPE`]).
 const IMPORTED_AUTHORIZATION_TYPE: &str = "NONE";
+
+/// The `authorizationType` an imported operation whose security requirement names a SigV4
+/// security scheme is created with: "`AWS_IAM` for using AWS IAM permissions"
+/// (`Method$authorizationType`).
+///
+/// That requirement is satisfied by the credential the CALLER signs the request with, so
+/// there is nothing for the import to create for it: the scheme IS the authorization, and a
+/// method that requires it is imported under it rather than open.
+const IMPORTED_SIGV4_AUTHORIZATION_TYPE: &str = "AWS_IAM";
+
+/// The document key that says which kind of authorization a security scheme stands for, and
+/// the value of it that names the caller's own SigV4 credential.
+///
+/// `pub` because the EXPORT side of a definition (`super::get_export`) renders the same key
+/// with the same value, so an api's methods keep their authorization through an export and an
+/// import of the document.
+pub const AUTHTYPE_EXTENSION: &str = "x-amazon-apigateway-authtype";
+
+/// See [`AUTHTYPE_EXTENSION`].
+pub const AUTHTYPE_SIGV4: &str = "awsSigv4";
 
 /// The document key API Gateway's OpenAPI extensions use for an API's binary media
 /// types — the `binaryMediaTypes` member's counterpart in an imported definition.
@@ -1031,6 +1053,7 @@ fn read_definition(document: &Node, scope: &ImportScope) -> Result<ImportedDefin
     // `Authorizer` only for the scheme types its authorizers cover, and reports a type it
     // cannot. `securityDefinitions` is Swagger 2.0's spelling of the set, replaced by
     // `components.securitySchemes` from OpenAPI 3 on.
+    let mut sigv4_schemes: BTreeSet<String> = BTreeSet::new();
     for (name, scheme) in declared_security_schemes(document) {
         let kind = scheme.string_member("type").unwrap_or_default();
         if !IMPORTABLE_SECURITY_SCHEME_TYPES.contains(&kind.as_str()) {
@@ -1039,14 +1062,19 @@ fn read_definition(document: &Node, scope: &ImportScope) -> Result<ImportedDefin
                 format!("Unsupported security definition type '{kind}' for '{name}'. Ignoring."),
             );
         }
+        // ...and which of them stand for the CALLER's own SigV4 credential, which is the
+        // authorization an import carries over without creating anything for it: the scheme's
+        // own authentication type is what says so. Held as a SET, so a requirement naming a
+        // scheme is answered by one lookup rather than by a scan of every declared scheme.
+        if scheme.string_member(AUTHTYPE_EXTENSION).as_deref() == Some(AUTHTYPE_SIGV4) {
+            sigv4_schemes.insert(name);
+        }
     }
 
-    // The security requirement the document declares across its API, which every
-    // operation that declares none of its own is imported under.
-    let document_security = document
-        .member("security")
-        .and_then(Node::items)
-        .is_some_and(|requirements| !requirements.is_empty());
+    // What the DOCUMENT says about security, answered ONCE: every operation that declares no
+    // requirement of its own is imported under it, so the document's own list is read here
+    // rather than per operation ([`DocumentSecurity`]).
+    let document_security = DocumentSecurity::of(document, &sigv4_schemes);
 
     // `paths` is optional from OpenAPI 3.1 on, and a document without it describes an
     // API with no resources rather than a malformed definition.
@@ -1076,7 +1104,7 @@ fn read_definition(document: &Node, scope: &ImportScope) -> Result<ImportedDefin
                     verb,
                     declared,
                     path,
-                    document_security,
+                    &document_security,
                     scope,
                     &mut definition.warnings,
                 ));
@@ -1487,11 +1515,15 @@ const REQUEST_PARAMETER_SECTIONS: &[(&str, &str)] = &[
 /// `responses` it declares as method responses, and API Gateway's own integration
 /// extension as the method's integration. What the import cannot carry over is reported
 /// in `warnings`.
+///
+/// `security` is what the DOCUMENT says about the authorization of its operations, read once
+/// for the whole document ([`DocumentSecurity`]), which an operation that states no
+/// requirement of its own is imported under.
 pub fn imported_method(
     verb: &str,
     operation: &Node,
     path: &str,
-    document_security: bool,
+    security: &DocumentSecurity,
     scope: &ImportScope,
     warnings: &mut Vec<String>,
 ) -> MethodEntry {
@@ -1520,11 +1552,22 @@ pub fn imported_method(
     // A security requirement is the DOCUMENT's unless the operation declares one of its
     // own: an OpenAPI document's `security` applies across the API, and an operation
     // overrides it — with an EMPTY list where it means no security at all.
-    let specifies_security = match operation.member("security") {
-        Some(Node::Sequence(requirements)) => !requirements.is_empty(),
-        _ => document_security,
+    //
+    // The one authorization that needs NO authorizer is the caller's own SigV4 credential:
+    // the scheme IS the authorization, so a requirement naming such a scheme is carried over
+    // to the method, which is then imported under it rather than open. Each operation's OWN
+    // requirement is read once here and the document's was read once for the document, so
+    // this costs one pass over the definition however the two are sized.
+    let (states_a_requirement, requires_sigv4) = match required_schemes(operation) {
+        Some(requirement) => (
+            !requirement.is_empty(),
+            security.names_a_sigv4_scheme(requirement),
+        ),
+        None => (security.states_a_requirement, security.requires_sigv4),
     };
-    if specifies_security && operation.member(AUTHORIZER_EXTENSION).is_none() {
+    if requires_sigv4 {
+        method.authorization_type = IMPORTED_SIGV4_AUTHORIZATION_TYPE.to_string();
+    } else if states_a_requirement && operation.member(AUTHORIZER_EXTENSION).is_none() {
         warn(
             warnings,
             format!(
@@ -1799,6 +1842,68 @@ fn declared_security_schemes(document: &Node) -> Vec<(String, &Node)> {
         .iter()
         .map(|(name, scheme)| (name.clone(), scheme))
         .collect()
+}
+
+/// What the DOCUMENT says about the authorization of its operations, read ONCE for the whole
+/// document.
+///
+/// An OpenAPI document's own `security` applies across the api, so every operation that
+/// states no requirement of its own is imported under it. Answering that per operation would
+/// walk the document's list once for each of them — a product of two caller-sized parts of one
+/// body — so the two questions an operation asks of it are decided here, when the document is
+/// read, and the set of schemes a requirement is resolved against is a SET, so a name is
+/// answered by one lookup.
+pub struct DocumentSecurity {
+    /// Whether the document states a requirement that names anything at all.
+    states_a_requirement: bool,
+    /// Whether that requirement names a scheme standing for the caller's own SigV4
+    /// credential.
+    requires_sigv4: bool,
+    /// The schemes that stand for that credential ([`AUTHTYPE_SIGV4`]).
+    sigv4_schemes: BTreeSet<String>,
+}
+
+impl DocumentSecurity {
+    /// What `document` says about its operations' authorization, against the `sigv4_schemes`
+    /// its own scheme set declared.
+    fn of(document: &Node, sigv4_schemes: &BTreeSet<String>) -> Self {
+        let required = required_schemes(document);
+        Self {
+            states_a_requirement: required.is_some_and(|requirement| !requirement.is_empty()),
+            requires_sigv4: required
+                .is_some_and(|requirement| names_a_scheme_of(requirement, sigv4_schemes)),
+            sigv4_schemes: sigv4_schemes.clone(),
+        }
+    }
+
+    /// Whether `requirement` — one operation's own — names a scheme standing for the caller's
+    /// own SigV4 credential.
+    fn names_a_sigv4_scheme(&self, requirement: &[Node]) -> bool {
+        names_a_scheme_of(requirement, &self.sigv4_schemes)
+    }
+}
+
+/// The `security` requirement `node` states, as the list the document wrote, or `None` where
+/// the node states no requirement at all.
+///
+/// An OpenAPI security requirement is a LIST of objects whose keys name the schemes the
+/// document declares. A requirement list that is EMPTY names none, which is how an operation
+/// says it needs no security where the document requires some — so an empty list and an absent
+/// member are deliberately different answers.
+fn required_schemes(node: &Node) -> Option<&[Node]> {
+    node.member("security")?.items()
+}
+
+/// Whether one security `requirement` names any of `schemes`: the keys of its entries are the
+/// scheme names, each answered by a lookup in the set.
+fn names_a_scheme_of(requirement: &[Node], schemes: &BTreeSet<String>) -> bool {
+    requirement.iter().any(|entry| {
+        entry
+            .entries()
+            .unwrap_or_default()
+            .iter()
+            .any(|(name, _)| schemes.contains(name))
+    })
 }
 
 /// The most references one definition's walk RESOLVES against the document.

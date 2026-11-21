@@ -31,10 +31,11 @@
 //! Only the rules whose violation the macro cannot expand PAST are judged: a `Policies` entry
 //! that is none of the three things the property accepts, a `Zip` function with no runtime or
 //! no handler to run, an `Events` entry naming no event source type (on the two types that
-//! take one), and a `SimpleTable` whose stated primary key says nothing about its type.
-//! Everything else a declaration carries is expanded as written and judged where it lands —
-//! by the service that owns the resource the expansion produced, which is where the real macro
-//! leaves it too.
+//! take one), a `SimpleTable` whose stated primary key says nothing about its type, and an
+//! API whose `Auth` states an authorizer that could never authorize a request or a default
+//! authorizer the api does not declare. Everything else a declaration carries is expanded as
+//! written and judged where it lands — by the service that owns the resource the expansion
+//! produced, which is where the real macro leaves it too.
 //!
 //! At most ONE fault per declaration, which is how the validator reports them: the first thing
 //! it finds wrong with a resource is what that resource is invalid for, so the count is the
@@ -186,6 +187,11 @@ fn fault_in(declaration: &Value, globals: &Value) -> Option<String> {
             declaration.get("Properties"),
             0,
         )),
+        API => api_fault(&merged(
+            globals.get("Api"),
+            declaration.get("Properties"),
+            0,
+        )),
         SIMPLE_TABLE => table_fault(&merged(
             globals.get("SimpleTable"),
             declaration.get("Properties"),
@@ -316,6 +322,94 @@ fn events_fault(properties: &Value) -> Option<String> {
                  for key Type. Event Type is: {stated}."
             )
         })
+}
+
+/// What one `AWS::Serverless::Api` declaration is invalid for.
+///
+/// The order is the validator's own: the api's AUTHORIZERS are built before the default
+/// authorizer is set over them, so an authorizer that could never authorize a request is
+/// reported before a default that names an authorizer the api does not declare.
+fn api_fault(properties: &Value) -> Option<String> {
+    let auth = object(properties.get(auth::AUTH_PROPERTY));
+    let authorizers = object(auth.get(auth::AUTHORIZERS));
+    if let Some(fault) = authorizers
+        .iter()
+        .find_map(|(name, declaration)| authorizer_fault(name, declaration))
+    {
+        return Some(fault);
+    }
+    let default = auth.get(auth::DEFAULT_AUTHORIZER).and_then(Value::as_str)?;
+    if matches!(default, auth::AWS_IAM | auth::NO_AUTHORIZER) || authorizers.contains_key(default) {
+        return None;
+    }
+    Some(format!(
+        "Unable to set DefaultAuthorizer because '{default}' was not defined in \
+         '{}'",
+        auth::AUTHORIZERS
+    ))
+}
+
+/// `Some(detail)` for one declared authorizer that could never authorize a request: a Lambda
+/// authorizer called with the WHOLE request that names no part of the request to authorize
+/// on.
+///
+/// The rule is API Gateway's own, stated over the authorizer that service would create:
+/// "`identitySource` … For the `REQUEST` authorizer, this is required when authorization
+/// caching is enabled", and caching is enabled exactly while the result TTL is above zero —
+/// which an authorizer that states no `ReauthorizeEvery` has, since that service picks its
+/// own default TTL for a create that sets none. So an authorizer that caches its results has
+/// to say what to cache them BY, and one with caching switched off may authorize on the
+/// request alone.
+///
+/// A `TOKEN` authorizer reads its token from a header, and one that names none reads the
+/// `Authorization` header, so there is no such thing as a token authorizer with no identity;
+/// a user-pool authorizer is in the same position.
+fn authorizer_fault(name: &str, declaration: &Value) -> Option<String> {
+    if declaration.get(auth::USER_POOL_ARN).is_some() {
+        return None;
+    }
+    declaration.get(auth::FUNCTION_ARN)?;
+    if declaration
+        .get(auth::FUNCTION_PAYLOAD_TYPE)
+        .and_then(Value::as_str)
+        != Some(auth::PAYLOAD_TYPE_REQUEST)
+    {
+        return None;
+    }
+    let identity = declaration.get(auth::IDENTITY);
+    if identity
+        .and_then(|identity| identity.get(auth::IDENTITY_REAUTHORIZE_EVERY))
+        .and_then(Value::as_i64)
+        == Some(CACHING_DISABLED)
+    {
+        return None;
+    }
+    if !auth::request_identity_sources(identity).is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{name} Authorizer must specify Identity with at least one of {}.",
+        identity_sources_as_listed()
+    ))
+}
+
+/// The value an authorizer's `Identity` switches result caching OFF with: "if it equals 0,
+/// authorization caching is disabled" (`Authorizer$authorizerResultTtlInSeconds`, which the
+/// member the declaration states it under becomes — [`auth::IDENTITY_REAUTHORIZE_EVERY`]).
+const CACHING_DISABLED: i64 = 0;
+
+/// The identity sources the sentence above lists, in the order the property publishes them
+/// ([`auth::REQUEST_IDENTITY_SOURCES`]), with the last joined by `or` as the validator words
+/// it.
+fn identity_sources_as_listed() -> String {
+    let names: Vec<&str> = auth::REQUEST_IDENTITY_SOURCES
+        .iter()
+        .map(|(property, _)| *property)
+        .collect();
+    match names.split_last() {
+        Some((last, before)) => format!("{}, or {last}", before.join(", ")),
+        None => String::new(),
+    }
 }
 
 /// `Some(detail)` for one `AWS::Serverless::SimpleTable` whose stated `PrimaryKey` says
@@ -472,6 +566,40 @@ mod tests {
                 ),
             ),
             (
+                "a REQUEST authorizer that names no part of the request to authorize on",
+                json!({
+                    "Transform": TRANSFORM,
+                    "Resources": {"Web": {"Type": API, "Properties": {
+                        "StageName": "live",
+                        "Auth": {"Authorizers": {"Gate": {
+                            "FunctionArn": {"Fn::GetAtt": ["Guard", "Arn"]},
+                            "FunctionPayloadType": "REQUEST",
+                        }}},
+                    }}},
+                }),
+                wrapped(
+                    1,
+                    &["Resource with id [Web] is invalid. Gate Authorizer must specify \
+                       Identity with at least one of Headers, QueryStrings, StageVariables, \
+                       or Context."],
+                ),
+            ),
+            (
+                "a default authorizer the api does not declare",
+                json!({
+                    "Transform": TRANSFORM,
+                    "Resources": {"Web": {"Type": API, "Properties": {
+                        "StageName": "live",
+                        "Auth": {"DefaultAuthorizer": "Missing"},
+                    }}},
+                }),
+                wrapped(
+                    1,
+                    &["Resource with id [Web] is invalid. Unable to set DefaultAuthorizer \
+                       because 'Missing' was not defined in 'Authorizers'"],
+                ),
+            ),
+            (
                 "a type the macro does not define",
                 json!({
                     "Transform": TRANSFORM,
@@ -535,6 +663,112 @@ mod tests {
                 "a document that declares the transform nowhere",
                 json!({
                     "Resources": {"Fn": {"Type": FUNCTION, "Properties": {}}},
+                }),
+            ),
+        ];
+
+        for (case, document) in rows {
+            let answered = failure(&document);
+            assert_eq!(
+                answered, None,
+                "case {case:?}: expected no failure, got {answered:?}"
+            );
+        }
+    }
+
+    /// RULE: an api whose `Auth` states an authorizer that CAN authorize a request, and a
+    /// default the api declares, is a document the macro processes.
+    ///
+    /// The rows differ along what the rule generalises over: which kind of authorizer the
+    /// declaration states (a Lambda authorizer called with the whole request, one called with
+    /// a token, a user-pool authorizer), where a `REQUEST` authorizer's identity comes from
+    /// (a request part it names, or caching switched off so it needs none) and what the
+    /// default authorizer is (a declared authorizer, or the caller's own credential, which the
+    /// api declares nothing for).
+    #[test]
+    fn an_api_whose_auth_can_authorize_a_request_is_not_a_fault() {
+        // (case, the document)
+        let rows: Vec<(&str, Value)> = vec![
+            (
+                "a REQUEST authorizer naming a header to authorize on",
+                json!({
+                    "Transform": TRANSFORM,
+                    "Resources": {"Web": {"Type": API, "Properties": {
+                        "StageName": "live",
+                        "Auth": {"Authorizers": {"Gate": {
+                            "FunctionArn": {"Fn::GetAtt": ["Guard", "Arn"]},
+                            "FunctionPayloadType": "REQUEST",
+                            "Identity": {"Headers": ["Authorization"]},
+                        }}},
+                    }}},
+                }),
+            ),
+            (
+                "a REQUEST authorizer naming a context value to authorize on",
+                json!({
+                    "Transform": TRANSFORM,
+                    "Resources": {"Web": {"Type": API, "Properties": {
+                        "Auth": {"Authorizers": {"Gate": {
+                            "FunctionArn": {"Fn::GetAtt": ["Guard", "Arn"]},
+                            "FunctionPayloadType": "REQUEST",
+                            "Identity": {"Context": ["tenant"]},
+                        }}},
+                    }}},
+                }),
+            ),
+            (
+                "a REQUEST authorizer with caching switched off, which needs no identity",
+                json!({
+                    "Transform": TRANSFORM,
+                    "Resources": {"Web": {"Type": API, "Properties": {
+                        "Auth": {"Authorizers": {"Gate": {
+                            "FunctionArn": {"Fn::GetAtt": ["Guard", "Arn"]},
+                            "FunctionPayloadType": "REQUEST",
+                            "Identity": {"ReauthorizeEvery": 0},
+                        }}},
+                    }}},
+                }),
+            ),
+            (
+                "a TOKEN authorizer, which reads its token from a header either way",
+                json!({
+                    "Transform": TRANSFORM,
+                    "Resources": {"Web": {"Type": API, "Properties": {
+                        "Auth": {
+                            "DefaultAuthorizer": "Gate",
+                            "Authorizers": {"Gate": {
+                                "FunctionArn": {"Fn::GetAtt": ["Guard", "Arn"]},
+                            }},
+                        },
+                    }}},
+                }),
+            ),
+            (
+                "a user-pool authorizer set as the default",
+                json!({
+                    "Transform": TRANSFORM,
+                    "Resources": {"Web": {"Type": API, "Properties": {
+                        "Auth": {
+                            "DefaultAuthorizer": "Pool",
+                            "Authorizers": {"Pool": {"UserPoolArn": {"Fn::GetAtt": ["Users", "Arn"]}}},
+                        },
+                    }}},
+                }),
+            ),
+            (
+                "the caller's own credential as the default authorizer",
+                json!({
+                    "Transform": TRANSFORM,
+                    "Resources": {"Web": {"Type": API, "Properties": {
+                        "Auth": {"DefaultAuthorizer": "AWS_IAM"},
+                    }}},
+                }),
+            ),
+            (
+                "an api that states no authorization at all",
+                json!({
+                    "Transform": TRANSFORM,
+                    "Resources": {"Web": {"Type": API, "Properties": {"StageName": "live"}}},
                 }),
             ),
         ];

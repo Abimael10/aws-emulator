@@ -254,11 +254,13 @@ use super::put_rest_api::GATEWAY_RESPONSES_EXTENSION;
 /// own OpenAPI extension for the member `RestApi$securityPolicy` reports.
 const SECURITY_POLICY_EXTENSION: &str = "x-amazon-apigateway-security-policy";
 
-/// The document key that says which kind of authorization a security scheme stands for.
-const AUTHTYPE_EXTENSION: &str = "x-amazon-apigateway-authtype";
+/// The document key that says which kind of authorization a security scheme stands for,
+/// named once beside the IMPORT that reads it back ([`super::put_rest_api`]).
+const AUTHTYPE_EXTENSION: &str = super::put_rest_api::AUTHTYPE_EXTENSION;
 
-/// The `x-amazon-apigateway-authtype` of a method signed with SigV4.
-const AUTHTYPE_SIGV4: &str = "awsSigv4";
+/// The `x-amazon-apigateway-authtype` of a method signed with SigV4, named once beside the
+/// import for the same reason.
+const AUTHTYPE_SIGV4: &str = super::put_rest_api::AUTHTYPE_SIGV4;
 
 /// The `x-amazon-apigateway-authtype` of a method authorized by a `TOKEN`/`REQUEST`
 /// authorizer of the API — the same label the authorizer's own `authType` carries, which is

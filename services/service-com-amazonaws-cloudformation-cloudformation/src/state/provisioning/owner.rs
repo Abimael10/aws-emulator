@@ -1767,11 +1767,33 @@ impl Owner {
             Self::ElasticLoadBalancing(_) if code.contains(PRIORITY_IN_USE) => {
                 super::HANDLER_ERROR_ALREADY_EXISTS
             }
+            // API Gateway's providers map that service's own MODELLED errors — a bad request,
+            // a resource it does not hold — and nothing else: a call its CONSTRAINT layer
+            // refused carries that layer's own class ([`API_GATEWAY_VALIDATION`]), which is no
+            // error API Gateway's model declares, so the plugin has no mapping for the
+            // exception it was handed and reports it under its class for a service that failed
+            // (as the recorded `ResourceStatusReason` of an `AWS::ApiGateway::RestApi` whose
+            // declared `ApiKeySourceType` is outside that service's value set carries, in the
+            // behavioral corpus `simparity-behavioral-aws-v1`, check `apigateway__\
+            // cloudformation.deploy-cfn-apigateway-restapi-invalid-apikeysourcetype-rejected`,
+            // whose reason closes `HandlerErrorCode: GeneralServiceException`). Its refusals
+            // of a modelled error keep the class their own codes fall in.
+            Self::ApiGatewayRestApi(_) if code == API_GATEWAY_VALIDATION => {
+                super::HANDLER_ERROR_SERVICE_FAILED
+            }
             // Every other provider here reports the class the error code itself falls in.
             _ => classified,
         }
     }
 }
+
+/// The error code API Gateway's CONSTRAINT layer refuses a value outside a member's modelled
+/// constraint with: the class of the layer in FRONT of every operation of that service, which
+/// is no error its model declares for any of them
+/// (`smithy_query(query="operation",operation="CreateRestApi")` declares
+/// `BadRequestException`, `ConflictException`, `LimitExceededException`,
+/// `NotFoundException`, `TooManyRequestsException` and `UnauthorizedException`).
+const API_GATEWAY_VALIDATION: &str = "ValidationException";
 
 /// The error code Elastic Load Balancing refuses a rule asking for a priority its listener
 /// already evaluates a rule at with: the `awsQueryError` code of `CreateRule`'s own

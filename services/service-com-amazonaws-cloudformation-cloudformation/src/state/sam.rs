@@ -111,6 +111,10 @@ mod validation;
 /// written into the BUCKET it names rather than becoming a resource of its own.
 mod object_events;
 
+/// The AUTHORIZATION an `AWS::Serverless::Api` declares, written into the OpenAPI definition
+/// of the api the transform expands it into.
+mod auth;
+
 /// `Some(reason)` for a template body whose declared Serverless transform cannot be applied
 /// to it, worded as the failure the operation that submitted it records; `None` for a body
 /// this macro processes, and for one that does not declare it at all.
@@ -1503,6 +1507,9 @@ fn expand_rest_api(
                 .cloned()
                 .unwrap_or_else(rest_definition);
             merge_definition_paths(&mut body, paths);
+            // ...and what the declaration says about the AUTHORIZATION of the api's methods,
+            // which is part of the document an api is imported from ([`auth`]).
+            auth::apply(&mut body, properties);
             api.insert("Body".to_string(), body);
         }
     }

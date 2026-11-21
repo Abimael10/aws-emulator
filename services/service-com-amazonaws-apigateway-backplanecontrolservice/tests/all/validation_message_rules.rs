@@ -59,9 +59,12 @@ const NOT_FOUND_EXCEPTION: &str = "NotFoundException";
 /// different order: `smithy_query(query="shape", shape="com.amazonaws.apigateway#Op")`.)
 const OP_VALUES: [&str; 6] = ["add", "remove", "move", "test", "replace", "copy"];
 
-/// The `ApiKeySourceType` value set, in the order the model declares it. Source:
-/// `smithy_query(query="shape", shape="com.amazonaws.apigateway#ApiKeySourceType")`.
-const API_KEY_SOURCE_VALUES: [&str; 2] = ["HEADER", "AUTHORIZER"];
+/// The `ApiKeySourceType` value set as API Gateway lists it. Source: the recorded
+/// `ResourceStatusReason` of a CloudFormation `AWS::ApiGateway::RestApi` whose declared
+/// `ApiKeySourceType` is outside the set, which quotes this service's own refusal of
+/// `apiKeySource`. (The public model declares the same two values in the other order:
+/// `smithy_query(query="shape", shape="com.amazonaws.apigateway#ApiKeySourceType")`.)
+const API_KEY_SOURCE_VALUES: [&str; 2] = ["AUTHORIZER", "HEADER"];
 
 /// The `GatewayResponseType` value set, in the order the model declares it. Source:
 /// `smithy_query(query="shape", shape="com.amazonaws.apigateway#GatewayResponseType")`.

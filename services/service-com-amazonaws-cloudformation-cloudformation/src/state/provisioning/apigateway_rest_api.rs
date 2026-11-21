@@ -73,8 +73,8 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value};
 
 use super::{
-    applicable_tags, call_rest_json, call_rest_payload, percent_encoded, Created, Readiness,
-    Refusal,
+    applicable_tags, call_rest_json, call_rest_json_named, call_rest_payload, percent_encoded,
+    Created, Readiness, Refusal,
 };
 use crate::state::provisioner::{
     api_gateway_answered, api_gateway_deleted, attribute_text, lower_camel_members, tags_as_map,
@@ -295,6 +295,15 @@ pub(super) async fn update(
 /// asks for — which is also what deleting the API that held it leaves behind, since an api
 /// owns its resources, methods, deployments and stages. The delete itself is the one both
 /// API Gateway control planes share ([`api_gateway_deleted`]).
+///
+/// A DEPLOYMENT takes the stage its own create made with it: a declaration that states a
+/// `StageName` makes `CreateDeployment` create that stage ("the name of the Stage resource
+/// for the Deployment resource to create"), so the stage is part of what this resource put
+/// there — and API Gateway will not let a deployment go while a stage still points at it
+/// ("deleting a deployment will only succeed if there are no Stage resources associated with
+/// it"). The stage is taken down only while it still SERVES this deployment
+/// ([`serves_deployment`]): one that has been re-pointed at another deployment is no longer
+/// this resource's, and it is the association that this delete has to clear.
 pub(super) async fn delete(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -309,11 +318,20 @@ pub(super) async fn delete(
             percent_encoded(&resource.physical_resource_id)
         ),
         Kind::Method => method_uri(resource)?,
-        Kind::Deployment => format!(
-            "{}/deployments/{}",
-            rest_api_uri(&required(resource, REST_API_ID)?),
-            percent_encoded(&resource.physical_resource_id)
-        ),
+        Kind::Deployment => {
+            let api_id = required(resource, REST_API_ID)?;
+            if let Some(stage_name) = stated(resource, STAGE_NAME).map(attribute_text) {
+                let stage = stage_uri(&api_id, &stage_name);
+                if serves_deployment(ctx, region, &stage, &resource.physical_resource_id).await? {
+                    api_gateway_deleted(ctx, region, &stage).await?;
+                }
+            }
+            format!(
+                "{}/deployments/{}",
+                rest_api_uri(&api_id),
+                percent_encoded(&resource.physical_resource_id)
+            )
+        }
         Kind::Stage => stage_uri(
             &required(resource, REST_API_ID)?,
             &resource.physical_resource_id,
@@ -331,6 +349,28 @@ pub(super) async fn delete(
         }
     };
     api_gateway_deleted(ctx, region, &uri).await
+}
+
+/// Whether the stage at `uri` still SERVES the deployment `deployment_id`: the association
+/// API Gateway requires cleared before it will delete that deployment, read off the stage's
+/// own `deploymentId` rather than assumed from the declaration.
+///
+/// A stage that service no longer holds serves nothing, so a stage already gone — and an api
+/// already gone with it — is not something a delete has to clear.
+async fn serves_deployment(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    uri: &str,
+    deployment_id: &str,
+) -> Result<bool, Refusal> {
+    match call_rest_json(ctx, API_GATEWAY_SIGNING_NAME, region, "GET", uri, None).await {
+        Ok(stage) => Ok(stage
+            .get("deploymentId")
+            .and_then(Value::as_str)
+            .is_some_and(|served| served == deployment_id)),
+        Err(refusal) if refusal.code == API_GATEWAY_NOT_FOUND => Ok(false),
+        Err(refusal) => Err(refusal),
+    }
 }
 
 /// The configuration one of these resources has as API Gateway reports it, for drift
@@ -460,6 +500,13 @@ const STAGE_REPORTED: &[(&str, &str)] = &[
 // ---------------------------------------------------------------------------
 // AWS::ApiGateway::RestApi
 // ---------------------------------------------------------------------------
+
+/// The operations the `AWS::ApiGateway::RestApi` provider CALLS on the api itself, stated
+/// with the call: the name is what says which of this service's providers made it, and so
+/// which diagnostic shape the exception its SDK raised carries
+/// ([`super::sdk_diagnostics::SDK_PROVIDER_SHAPES`]).
+const CREATE_REST_API: &str = "CreateRestApi";
+const UPDATE_REST_API: &str = "UpdateRestApi";
 
 /// Every property `AWS::ApiGateway::RestApi` publishes. A declared property this list does
 /// not carry is refused rather than dropped.
@@ -618,16 +665,20 @@ async fn create_rest_api(
     if !tags.is_empty() {
         request.insert("tags".to_string(), Value::Object(tags));
     }
-    let answered = call_rest_json(
+    // The call NAMES the operation: that is what says which of this service's resource
+    // providers made it, and so which diagnostic shape the exception its SDK raised carries
+    // ([`super::sdk_diagnostics::SDK_PROVIDER_SHAPES`]).
+    let answered = call_rest_json_named(
         ctx,
         API_GATEWAY_SIGNING_NAME,
         region,
+        CREATE_REST_API,
         "POST",
         REST_APIS_URI,
         Some(&Value::Object(request)),
     )
     .await?;
-    rest_api_created(&answered, "CreateRestApi")
+    rest_api_created(&answered, CREATE_REST_API)
 }
 
 /// Import the api an `AWS::ApiGateway::RestApi` declares a DEFINITION for, so a client that
@@ -698,10 +749,11 @@ async fn import_rest_api(
     if !patches.is_empty() {
         let mut request = Map::new();
         request.insert("patchOperations".to_string(), Value::Array(patches));
-        call_rest_json(
+        call_rest_json_named(
             ctx,
             API_GATEWAY_SIGNING_NAME,
             region,
+            UPDATE_REST_API,
             "PATCH",
             &rest_api_uri(&api_id),
             Some(&Value::Object(request)),
