@@ -905,12 +905,17 @@ pub const SERVICE_PRINCIPAL: &str = "events.amazonaws.com";
 /// assume-role step, before any target API call was attempted.
 pub const FAILED_TO_ASSUME_ROLE: &str = "FAILED_TO_ASSUME_ROLE";
 
-/// The condition EventBridge reports for an event whose target invocation was
-/// refused for want of a permission: every document in force over that invocation
-/// was read and none of them authorizes it. That is the role's policies where the
+/// The condition EventBridge reports for an event whose target invocation that
+/// target's service answered with an AUTHORIZATION refusal: the resource is there
+/// and it would not let the call be made. That is the role's policies where the
 /// target names a role, and the TARGET's own resource policy where it names none —
-/// a queue, a topic, a function or a log group this service may not call — because
-/// what both say is that the resource is there and the call was not allowed on it.
+/// a topic, a function or a log group this service may not call — plus the key an
+/// encrypted target's payload is encrypted under.
+///
+/// Which class a refusal lands in follows the ANSWER rather than the document that
+/// decided it ([`queue_access_refusal`]): a service that will not disclose the
+/// resource to a caller whose call it withholds answers its NOT-FOUND class
+/// instead, and such a delivery is [`NO_RESOURCE`].
 pub const NO_PERMISSIONS: &str = "NO_PERMISSIONS";
 
 /// The condition EventBridge reports for a delivery that failed for a reason its

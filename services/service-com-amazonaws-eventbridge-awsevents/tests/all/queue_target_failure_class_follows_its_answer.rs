@@ -78,6 +78,12 @@ const ACCESS_DENIED: &str = "AccessDenied";
 /// `awsQueryError` code.
 const QUEUE_DOES_NOT_EXIST: &str = "AWS.SimpleQueueService.NonExistentQueue";
 
+/// The fixed sentence that answer carries, which states both of the reasons it covers
+/// — stated here rather than read from the implementation's own constant, so a wrong
+/// sentence there cannot make this suite pass.
+const QUEUE_DOES_NOT_EXIST_MESSAGE: &str =
+    "The specified queue does not exist or you do not have access to it.";
+
 /// The status that refusal is answered with, which the reported answer states beside
 /// the code.
 const QUEUE_DOES_NOT_EXIST_STATUS: u16 = 400;
@@ -409,9 +415,8 @@ async fn the_withheld_send_answer_states_one_call_and_names_nothing_of_the_deliv
         "case {case:?}: expected one dead letter per refused delivery, got {parked:?}"
     );
     let head = format!(
-        "The specified queue does not exist or you do not have access to it. (Service: \
-         AmazonSQS; Status Code: {QUEUE_DOES_NOT_EXIST_STATUS}; Error Code: \
-         {QUEUE_DOES_NOT_EXIST}; Request ID: "
+        "{QUEUE_DOES_NOT_EXIST_MESSAGE} (Service: AmazonSQS; Status Code: \
+         {QUEUE_DOES_NOT_EXIST_STATUS}; Error Code: {QUEUE_DOES_NOT_EXIST}; Request ID: "
     );
     let mut ids = Vec::new();
     for message in &parked {
@@ -439,6 +444,16 @@ async fn the_withheld_send_answer_states_one_call_and_names_nothing_of_the_deliv
             vec![8, 4, 4, 4, 12],
             "case {case:?}: expected a request id in the 8-4-4-4-12 form, got {id:?}"
         );
+        // That answer is the one a queue nobody may write to gives: it names
+        // neither the caller nor the queue, which is what keeps it from telling an
+        // unauthorized caller the queue is there.
+        for withheld in [target_arn.as_str(), SERVICE_PRINCIPAL, SEND_MESSAGE] {
+            assert!(
+                !reported.contains(withheld),
+                "case {case:?}: expected nothing of the refused send in that answer, got \
+                 {withheld:?} in {reported:?}"
+            );
+        }
         ids.push(id);
     }
     assert_ne!(

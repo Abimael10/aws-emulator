@@ -40,13 +40,13 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{
-    rule_arn, InvocationOutcome, DEFAULT_EVENT_BUS_NAME, NO_RESOURCE, SERVICE_PRINCIPAL,
-    UNKNOWN_CONDITION,
+    rule_arn, InvocationOutcome, DEFAULT_EVENT_BUS_NAME, NO_PERMISSIONS, NO_RESOURCE,
+    SERVICE_PRINCIPAL, UNKNOWN_CONDITION,
 };
 
 use crate::target_dispatch::{
-    drain, emulator, given_queue, given_queue_with_policy, given_role, given_rule, granting_events,
-    invocations, publish, sqs, Emulator, REGION,
+    drain, emulator, given_queue, given_queue_with_policy, given_role, given_rule,
+    given_state_machine, granting_events, invocations, publish, sqs, Emulator, REGION,
 };
 
 /// The rule every row publishes through.
@@ -111,6 +111,10 @@ enum Target {
     FifoQueueWithoutContentDeduplication,
     /// A state-machine ARN of this account that no state machine exists for.
     StateMachineNeverCreated,
+    /// A state machine that IS there, named by a target whose role can be assumed
+    /// but whose policies allow the invocation's own API call nowhere — a target
+    /// service that really does answer an authorization refusal.
+    StateMachineWhoseRoleWithholdsTheCall,
 }
 
 /// One row: the case, the target the rule names and the condition the dead letter
@@ -233,6 +237,21 @@ async fn given_target(
                 Some(role),
             )
         }
+        Target::StateMachineWhoseRoleWithholdsTheCall => {
+            // The role can be assumed and allows nothing, so what the row's
+            // delivery fails at is the permission for the call it would make.
+            let role = given_role(
+                emulator,
+                &format!("classified-role-{index}"),
+                SERVICE_PRINCIPAL,
+                None,
+            )
+            .await;
+            (
+                given_state_machine(emulator, &format!("classified-{index}")).await,
+                Some(role),
+            )
+        }
     }
 }
 
@@ -270,6 +289,11 @@ async fn the_dead_letter_condition_classifies_the_targets_own_answer() {
             case: "a state-machine ARN no state machine was created for",
             target: Target::StateMachineNeverCreated,
             condition: Some(NO_RESOURCE),
+        },
+        Row {
+            case: "a state machine whose target role withholds the invocation's call",
+            target: Target::StateMachineWhoseRoleWithholdsTheCall,
+            condition: Some(NO_PERMISSIONS),
         },
         Row {
             case: "a FIFO queue whose send has no deduplication id and derives none",

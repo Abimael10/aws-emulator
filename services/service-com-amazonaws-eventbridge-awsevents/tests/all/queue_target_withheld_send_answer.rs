@@ -192,8 +192,8 @@ enum Setup {
 enum Answer {
     /// The answer for a queue that is there and did not authorize the send.
     Withheld,
-    /// The answer for a queue that is not there, which is the other class with a
-    /// sentence of its own.
+    /// The answer for a queue that is not there, which that service answers under
+    /// the SAME code: it tells the two apart for nobody.
     Absent,
 }
 
@@ -358,6 +358,15 @@ async fn a_withheld_queue_delivery_reports_the_answer_that_service_gave() {
                     "case {case:?}: expected a request id in the 8-4-4-4-12 form, got \
                      {request_id:?}"
                 );
+                // That answer discloses nothing about the queue or the caller: it is
+                // the same sentence a queue that is not there earns.
+                for withheld in [target_arn.as_str(), SERVICE_PRINCIPAL, SEND_MESSAGE] {
+                    assert!(
+                        !reported.contains(withheld),
+                        "case {case:?}: that service names nothing of the refused send, so \
+                         {withheld:?} must not appear in {reported:?}"
+                    );
+                }
             }
             Answer::Absent => {
                 assert!(
