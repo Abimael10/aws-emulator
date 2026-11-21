@@ -37,6 +37,12 @@ pub use launch_configuration_templates::*;
 mod replication_configuration_templates;
 pub use replication_configuration_templates::*;
 
+/// The ACCOUNT INITIALIZATION concern: what `InitializeService` establishes in the
+/// account's IAM before it records the account as initialized, and how an attempt that
+/// could not establish it is worded. Re-exported like every other part of this state.
+mod account_initialization;
+pub use account_initialization::*;
+
 use crate::ops::types::{
     ApplicationAggregatedStatus, CidrMapping, ConflictException, ConnectorSsmCommandConfig,
     CreateApplicationOutput, CreateConnectorOutput, CreateNetworkMigrationDefinitionOutput,
@@ -308,6 +314,22 @@ impl ComAmazonawsMgnApplicationmigrationserviceState {
     pub fn can_initialize(&self, account_id: &str) -> bool {
         self.initialized_accounts.contains(account_id)
             || self.initialized_accounts.len() < ACCOUNT_QUOTA
+    }
+
+    /// Record `account_id` as initialized, and answer whether the store now holds it.
+    ///
+    /// The check and the write under ONE borrow of the store, so the bound holds however
+    /// many initializations are in flight: a caller that checks
+    /// [`Self::can_initialize`] before doing the work an initialization needs still
+    /// records the account through this, and the keyspace cannot be grown past
+    /// [`ACCOUNT_QUOTA`] by two calls that both passed that earlier check. Recording an
+    /// account already in the set changes nothing and answers `true`.
+    pub fn initialize_account(&mut self, account_id: &str) -> bool {
+        if !self.can_initialize(account_id) {
+            return false;
+        }
+        self.initialized_accounts.insert(account_id.to_string());
+        true
     }
 
     /// Store a newly created application, remembering its place in creation order.
@@ -1447,7 +1469,10 @@ pub fn account_quota_exceeded() -> ValidationException {
             "This emulator tracks at most {ACCOUNT_QUOTA} initialized accounts."
         )),
         code: None,
-        reason: None,
+        // The request carries no member at all, so no field is at fault: the classified
+        // reason is [`VALIDATION_OTHER`], as it is for every refusal of this service that
+        // is not about a value the caller submitted.
+        reason: Some(VALIDATION_OTHER.to_string()),
         field_list: None,
     }
 }
@@ -1610,6 +1635,13 @@ pub fn cidr_mappings_need_existing_vpcs() -> ValidationException {
 /// model stops declaring it. The ONE definition of this value for the service — every
 /// handler that words a field validation reaches it here.
 pub const VALIDATION_FIELD_FAILED: &str = validation_exception_reason("fieldValidationFailed");
+
+/// The `ValidationExceptionReason` for a request this service cannot serve for a reason
+/// that is NOT about a member of it: the operation is known, the body parsed, and no
+/// field is at fault, so the remaining value the model declares is the one that classifies
+/// it. Taken from the model's own generated value list exactly as
+/// [`VALIDATION_FIELD_FAILED`] is, and the ONE definition of this value for the service.
+pub const VALIDATION_OTHER: &str = validation_exception_reason("other");
 
 /// The `ValidationExceptionReason` value the model spells `wanted`, resolved at compile
 /// time against `ops::types::VALIDATION_EXCEPTION_REASON_VALUES` (generated from the

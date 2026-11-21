@@ -317,7 +317,9 @@ pub fn replication_configuration_template_store_full(account_id: &str) -> Valida
              {REPLICATION_CONFIGURATION_TEMPLATE_QUOTA} replication configuration templates."
         )),
         code: None,
-        reason: None,
+        // The store being full is not a member of the request being at fault, so the
+        // classified reason is `other` rather than a field validation.
+        reason: Some(VALIDATION_OTHER.to_string()),
         field_list: None,
     }
 }

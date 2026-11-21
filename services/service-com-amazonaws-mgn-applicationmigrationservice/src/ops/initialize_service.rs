@@ -1,10 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op InitializeService
-//! Initializes Application Migration Service for the account the request acts on: it
+//! Initializes Application Migration Service for the account the request acts on:
+//! "Initialize Application Migration Service" is the creation of the IAM resources the
+//! service's own machinery runs under — its service-linked role and the instance profiles
+//! its replication and conversion servers run under — so the handler ESTABLISHES those in
+//! the account's IAM (`crate::state::establish_account_initialization`) and only then
 //! flips the account's persisted `initialized` flag, after which that account's other
-//! operations stop answering `UninitializedAccountException`. Idempotent — the flag is
-//! a set membership, so a second call changes nothing and still answers 204.
+//! operations stop answering `UninitializedAccountException`. An attempt IAM refuses
+//! records nothing and is answered with the modelled `ValidationException` (HTTP 400,
+//! `reason` `other`) naming which resources could not be created. Idempotent — the
+//! resources an earlier call established are reported as established and the flag is a set
+//! membership, so a second call changes nothing and still answers 204.
 //!
 //! The operation models NO `accountID` member, so it initializes the caller's own
 //! account and nothing else. A request to another operation that names a different
@@ -145,11 +152,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             InitializeServiceErrorModeled::InternalServerException(crate::state::state_unavailable())
         })?;
 
-        // Idempotent: the flag is set membership, so a repeat changes nothing.
         let account = crate::state::account_key(None);
-        let mut store = state.lock();
-        // The account keyspace is bounded: see `crate::state::ACCOUNT_QUOTA`.
-        if !store.can_initialize(&account) {
+        // The account keyspace is bounded: see `crate::state::ACCOUNT_QUOTA`. Checked
+        // first, and with the store held for no longer than the check: nothing is
+        // established for an account this store could not record.
+        if !state.lock().can_initialize(&account) {
             crate::state::audit(
                 ctx.parts(),
                 Self::NAME,
@@ -162,8 +169,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        store.initialized_accounts.insert(account.clone());
-        drop(store);
+
+        // Initializing the account is establishing what an initialized account holds —
+        // the service-linked role and the server instance profiles, in the account's IAM —
+        // so the attempt is made BEFORE anything is recorded, and an attempt that
+        // concluded in failure records nothing. Idempotent: the resources an earlier call
+        // established are reported as established, so a repeat changes nothing and still
+        // answers 204.
+        let region = crate::state::request_region(ctx.parts());
+        let failure = crate::state::establish_account_initialization(ctx, &region).await;
+        if let Some(refusal) = failure.refusal() {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &account,
+                &account,
+                "refused: ValidationException",
+            );
+            return Err(InitializeServiceErrorModeled::ValidationException(refusal).into());
+        }
+
+        // The flag is set membership, so recording an account already in it changes
+        // nothing. The bound is re-checked with the write under one borrow of the store,
+        // so the keyspace cannot be grown past it by two initializations that both
+        // cleared the check above.
+        if !state.lock().initialize_account(&account) {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &account,
+                &account,
+                "refused: ValidationException",
+            );
+            return Err(InitializeServiceErrorModeled::ValidationException(
+                crate::state::account_quota_exceeded(),
+            )
+            .into());
+        }
         crate::state::audit(ctx.parts(), Self::NAME, &account, &account, "initialized");
 
         Ok(InitializeServiceOutput {})

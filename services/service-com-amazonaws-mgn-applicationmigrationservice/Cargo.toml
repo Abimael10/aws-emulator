@@ -21,6 +21,18 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The AWS SDK for IAM, driven over the in-process callback
+# (`OperationContext::callback`): `InitializeService` establishes the account's
+# service-linked role and the server instance profiles an initialized account holds in
+# IAM, which owns them (`src/state/account_initialization.rs`). Only the generated client
+# is needed — the emulator supplies the transport.
+aws-sdk-iam = { version = "1", default-features = false }
+# The tree's shared in-process IAM client and Region-label reading.
+service-common = { path = "../common" }
+# IAM's OWN spelling of a service-linked role's path and of the policy language version,
+# so the role this service asks IAM to file and the role IAM files are one record rather
+# than two spellings of one.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -175,7 +175,9 @@ pub fn connector_quota_exceeded(account_id: &str) -> ValidationException {
             "Account {account_id} already holds the maximum of {CONNECTOR_QUOTA} connectors."
         )),
         code: None,
-        reason: None,
+        // A quota the account reached is not a member of the request being at fault, so
+        // the classified reason is `other` rather than a field validation.
+        reason: Some(VALIDATION_OTHER.to_string()),
         field_list: None,
     }
 }
