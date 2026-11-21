@@ -32,7 +32,10 @@ use crate::wire::{call, emulator, Answer};
 /// A connector role ARN of the form the rule accepts: an IAM role in the single
 /// account this emulator serves (`engine::emulator_account_id`, which every ARN
 /// it mints carries).
-const PASSABLE_ROLE: &str = "arn:aws:iam::000000000000:role/AmazonEKSConnectorRole";
+///
+/// `pub(crate)` with the two builders below: every suite that drives a registration
+/// sends the request THIS suite sends, so a second copy cannot drift from it.
+pub(crate) const PASSABLE_ROLE: &str = "arn:aws:iam::000000000000:role/AmazonEKSConnectorRole";
 
 /// The emulator and the engine behind it, so a test can reach the very store the
 /// handlers read and write.
@@ -51,7 +54,9 @@ fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     (router, engine)
 }
 
-async fn register(router: &MultiServiceRouter, body: &serde_json::Value) -> Answer {
+/// `POST /cluster-registrations` — `RegisterCluster`. See [`PASSABLE_ROLE`] for why
+/// this is shared.
+pub(crate) async fn register(router: &MultiServiceRouter, body: &serde_json::Value) -> Answer {
     call(
         router,
         REGION,
@@ -63,8 +68,9 @@ async fn register(router: &MultiServiceRouter, body: &serde_json::Value) -> Answ
 }
 
 /// The smallest request `RegisterCluster` accepts: the name and the connector
-/// configuration, which are its only required members.
-fn minimal_registration(name: &str, provider: &str) -> serde_json::Value {
+/// configuration, which are its only required members. See [`PASSABLE_ROLE`] for why
+/// this is shared.
+pub(crate) fn minimal_registration(name: &str, provider: &str) -> serde_json::Value {
     serde_json::json!({
         "name": name,
         "connectorConfig": { "roleArn": PASSABLE_ROLE, "provider": provider },
@@ -392,13 +398,45 @@ async fn the_connector_role_must_be_a_role_this_caller_can_pass() {
 
 // ---------------------------------------------------------------------------
 // RULE: `connectorConfig.provider` names a member of the modelled
-// `ConnectorConfigProvider` enum; any other value is refused.
+// `ConnectorConfigProvider` enum; any other value is refused with the sentence
+// this API states for a member judged by an enum's value set — naming the member
+// by its PATH from the request root and the values the model declares for it, in
+// the order it declares them.
 // ---------------------------------------------------------------------------
+
+/// The accepted set in the order the model DECLARES it, which is the order the sentence
+/// states (source: `ConnectorConfigProvider`'s member list,
+/// `smithy_query(query="shape", shape="ConnectorConfigProvider")`). The generated
+/// `CONNECTOR_CONFIG_PROVIDER_VALUES` holds the same members SORTED, so the two are
+/// cross-checked as sets below: a model that grows a provider fails this suite rather
+/// than passing quietly.
+const DECLARED_PROVIDERS: &[&str] = &[
+    "EKS_ANYWHERE",
+    "ANTHOS",
+    "GKE",
+    "AKS",
+    "OPENSHIFT",
+    "TANZU",
+    "RANCHER",
+    "EC2",
+    "OTHER",
+];
 
 #[tokio::test]
 async fn the_provider_must_be_a_modelled_member() {
     let router = emulator();
-
+    let mut declared: Vec<&str> = DECLARED_PROVIDERS.to_vec();
+    declared.sort_unstable();
+    assert_eq!(
+        declared,
+        CONNECTOR_CONFIG_PROVIDER_VALUES.to_vec(),
+        "the providers written out here must be the set the model declares, got {:?}",
+        CONNECTOR_CONFIG_PROVIDER_VALUES
+    );
+    let expected_message = format!(
+        "The value of connectorConfig.provider must be one of [{}]",
+        DECLARED_PROVIDERS.join(", ")
+    );
     // Every member of the enum, straight from the model — so a model that grows a
     // provider is covered without editing this test.
     for provider in CONNECTOR_CONFIG_PROVIDER_VALUES {
@@ -433,6 +471,20 @@ async fn the_provider_must_be_a_modelled_member() {
             answer.error_type.as_deref(),
             Some("InvalidParameterException"),
             "case {case:?}: expected InvalidParameterException, got {answer:?}"
+        );
+        // The sentence names the member by its path from the request root, and the
+        // values it accepts in the model's own order.
+        assert_eq!(
+            answer.message(),
+            expected_message,
+            "case {case:?}: expected the value-set sentence, got {:?}",
+            answer.message()
+        );
+        // The complaint is about the member it names, so it reports no cluster.
+        assert_eq!(
+            answer.body["clusterName"].as_str(),
+            None,
+            "case {case:?}: expected the refusal to name no cluster, got {answer:?}"
         );
         assert_eq!(
             describe(&router, &name).await.status,

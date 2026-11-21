@@ -304,9 +304,9 @@ fn invalid_parameter(message: &str) -> DescribeClusterVersionsError {
 }
 
 /// Refuse a `versionStatus` whose token the modelled enum does not declare, naming
-/// the member and the members that member accepts — the sentence this service states
+/// the member and the values that member accepts — the sentence this service states
 /// for a member judged by an enum's value set
-/// ([`state::member_must_be_one_of_message`]).
+/// ([`state::value_must_be_one_of_message`]).
 ///
 /// The DEPRECATED `status` spelling of the same filter states a refusal of its own
 /// ([`state::cluster_version_status_message`]) rather than this one.
@@ -315,7 +315,7 @@ fn unknown_version_status() -> DescribeClusterVersionsError {
         .iter()
         .map(|status| status.version_status().to_string())
         .collect();
-    invalid_parameter(&state::member_must_be_one_of_message(
+    invalid_parameter(&state::value_must_be_one_of_message(
         "versionStatus",
         &accepted,
     ))

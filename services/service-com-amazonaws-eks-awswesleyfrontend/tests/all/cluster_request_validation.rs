@@ -824,12 +824,14 @@ async fn a_value_outside_an_enum_member_is_refused_in_the_services_own_sentence(
         (
             "an authenticationMode in the wrong case",
             serde_json::json!({ "accessConfig": { "authenticationMode": "api" } }),
-            "authenticationMode must be one of [API, API_AND_CONFIG_MAP, CONFIG_MAP]",
+            "The value of accessConfig.authenticationMode must be one of \
+             [API, API_AND_CONFIG_MAP, CONFIG_MAP]",
         ),
         (
             "an authenticationMode nothing declares",
             serde_json::json!({ "accessConfig": { "authenticationMode": "NONE" } }),
-            "authenticationMode must be one of [API, API_AND_CONFIG_MAP, CONFIG_MAP]",
+            "The value of accessConfig.authenticationMode must be one of \
+             [API, API_AND_CONFIG_MAP, CONFIG_MAP]",
         ),
         (
             "a log type in the wrong case",

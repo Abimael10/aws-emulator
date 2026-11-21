@@ -84,14 +84,15 @@ use crate::ops::types::{
     CreateAddonInput, CreateCapabilityInput, CreateClusterInput, CreateFargateProfileInput,
     CreateNodegroupInput, CreatePodIdentityAssociationInput, DeleteAddonInput, DescribeAddonInput,
     InvalidParameterException, ListAddonsInput, ListCapabilitiesInput, ListFargateProfilesInput,
-    ListNodegroupsInput, ListUpdatesInput, ResourceNotFoundException, UpdateAddonInput,
-    UpdateClusterConfigInput,
+    ListNodegroupsInput, ListUpdatesInput, RegisterClusterInput, ResourceNotFoundException,
+    UpdateAddonInput, UpdateClusterConfigInput,
     ASSOCIATE_IDENTITY_PROVIDER_CONFIG_INPUT_SCHEMA, CREATE_ACCESS_ENTRY_INPUT_SCHEMA,
     CREATE_ADDON_INPUT_SCHEMA, CREATE_CAPABILITY_INPUT_SCHEMA, CREATE_CLUSTER_INPUT_SCHEMA,
     CREATE_FARGATE_PROFILE_INPUT_SCHEMA, CREATE_NODEGROUP_INPUT_SCHEMA,
     CREATE_POD_IDENTITY_ASSOCIATION_INPUT_SCHEMA, DELETE_ADDON_INPUT_SCHEMA,
     DESCRIBE_ADDON_INPUT_SCHEMA, LIST_ADDONS_INPUT_SCHEMA, LIST_CAPABILITIES_INPUT_SCHEMA,
     LIST_FARGATE_PROFILES_INPUT_SCHEMA, LIST_NODEGROUPS_INPUT_SCHEMA, LIST_UPDATES_INPUT_SCHEMA,
+    REGISTER_CLUSTER_INPUT_SCHEMA,
     SCHEMA_ACCESS_DENIED_EXCEPTION,
     SCHEMA_INVALID_PARAMETER_EXCEPTION, SCHEMA_RESOURCE_NOT_FOUND_EXCEPTION,
     UPDATE_ADDON_INPUT_SCHEMA, UPDATE_CLUSTER_CONFIG_INPUT_SCHEMA,
@@ -509,10 +510,31 @@ fn addressed_by_input(
                     .flatten()
                     .collect(),
                 )
-                .with_parameter_refusal(super::parameter_contract::create_cluster_refusal(
-                    violations,
-                    &input.name,
-                ))
+                .with_parameter_refusal(
+                    super::parameter_contract::cluster_name_parameter_refusal(
+                        violations,
+                        &input.name,
+                    ),
+                )
+            },
+        ),
+        // The other operation that mints a cluster record under a `name` member of its
+        // body: a registration connects an external cluster, so there is no cluster to
+        // resolve and no role it hands a control plane (its connector role is a
+        // parameter of the registration, judged by the handler in this operation's own
+        // class) — but the refusal of that `name` carries the `clusterName` the request
+        // asked for, exactly as the create's does, so it is worded here.
+        "RegisterCluster" => addressed_with(
+            protocol,
+            REGISTER_CLUSTER_INPUT_SCHEMA,
+            req,
+            |input: &RegisterClusterInput, violations| {
+                Addressed::default().with_parameter_refusal(
+                    super::parameter_contract::cluster_name_parameter_refusal(
+                        violations,
+                        &input.name,
+                    ),
+                )
             },
         ),
         "CreateNodegroup" => addressed_with(

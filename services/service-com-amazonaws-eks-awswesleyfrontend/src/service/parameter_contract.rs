@@ -18,9 +18,9 @@
 //!
 //! * [`crate::service::EmulatedService::override_refusal`], which the walk calls with
 //!   the violations it found, for the MESSAGE; and
-//! * [`super::precedence`], for a `CreateCluster` whose refusal also carries the
-//!   `clusterName` the request asked for — a member of the refusal payload, which the
-//!   per-service message seam cannot reach.
+//! * [`super::precedence`], for a request that NAMES its cluster in the body, whose
+//!   refusal also carries that `clusterName` — a member of the refusal payload, which
+//!   the per-service message seam cannot reach.
 //!
 //! The sentences themselves are not here: they belong to the parameters, so they live
 //! beside the rules each one obeys, in [`crate::state`]. What lives here is the map
@@ -98,8 +98,10 @@ pub fn refusal_message(violations: &[Violation]) -> Option<String> {
     }
     let member = member_of(&violation.path)?;
     match &violation.kind {
-        // "The parameter <member> is required." — the sentence for a member this API
-        // requires and the request omitted, whichever member it is.
+        // The sentence for a member this API requires and the request omitted,
+        // whichever member it is: the general one ("The parameter <member> is
+        // required.") or that member's own, where Amazon EKS publishes one
+        // ([`state::parameter_required_message`]).
         ViolationKind::MissingRequiredMember => Some(state::parameter_required_message(member)),
         // A member bound to the cluster-name grammar: the violated pattern IS that
         // grammar, so this words every member of this service the model binds to it
@@ -129,16 +131,16 @@ pub fn refusal_message(violations: &[Violation]) -> Option<String> {
             Some(state::max_results_range_message())
         }
         // Every member judged by an enum's value set that this API states no sentence
-        // of its own for: the sentence names the member and the values it accepts,
-        // read off the violation so they are the set the model declares, in the order
-        // it declares them.
+        // of its own for: the sentence names the member by its PATH from the request
+        // root and the values it accepts, both read off the violation, so they are the
+        // set the model declares, in the order it declares them.
         //
         // The two members whose sentence is their operation's own — a capability
         // `type` and an add-on `resolveConflicts` — never reach this seam: both are
         // answered before dispatch, in the sentence that operation states (see
         // [`super::off_enum_member_contract`]).
-        ViolationKind::EnumValue(declared) => Some(state::member_must_be_one_of_message(
-            member,
+        ViolationKind::EnumValue(declared) => Some(state::value_must_be_one_of_message(
+            &violation.path,
             declared,
         )),
         _ => None,
@@ -173,9 +175,11 @@ pub fn page_size_refusal(violations: &[Violation]) -> Option<InvalidParameterExc
     })
 }
 
-/// The refusal `CreateCluster` answers a parameter the walk refused with: Amazon EKS's
-/// own sentence for the rule it broke, and — for the rules whose refusal names it —
-/// the `clusterName` the request asked for.
+/// The refusal an operation that names the cluster it acts on in its BODY —
+/// `CreateCluster` and `RegisterCluster`, the two that mint a cluster record under a
+/// `name` member — answers a parameter the walk refused with: Amazon EKS's own sentence
+/// for the rule it broke, and — for the rules whose refusal names it — the
+/// `clusterName` the request asked for.
 ///
 /// `None` when this API states no sentence for that rule, which leaves the request to
 /// the modelled operation and the framework's own report — the answer it has always
@@ -184,10 +188,10 @@ pub fn page_size_refusal(violations: &[Violation]) -> Option<InvalidParameterExc
 /// WHICH refusals name the cluster is recorded behaviour: the ones stated in the
 /// parameter family of sentences ("The parameter … is required.", the grammar's and
 /// the length maximum's) carry the `clusterName` the request supplied, while the
-/// value-set sentence ([`state::member_must_be_one_of_message`]) names only the member
+/// value-set sentence ([`state::value_must_be_one_of_message`]) names only the member
 /// it is about. A request that supplied no name — the omitted `name` this same
 /// function words the refusal of — names no cluster in its refusal either.
-pub fn create_cluster_refusal(
+pub fn cluster_name_parameter_refusal(
     violations: &[Violation],
     requested_name: &str,
 ) -> Option<InvalidParameterException> {
@@ -359,8 +363,26 @@ mod tests {
                 Some("api"),
             )])
             .as_deref(),
-            Some("authenticationMode must be one of [API, API_AND_CONFIG_MAP, CONFIG_MAP]"),
+            Some("The value of authenticationMode must be one of [API, API_AND_CONFIG_MAP, CONFIG_MAP]"),
             "another enum member earns the sentence naming it and the values it accepts"
+        );
+
+        // And a member NESTED in a structure is named by its path from the request
+        // root, which is how the request spells it.
+        assert_eq!(
+            refusal_message(&[violation(
+                "connectorConfig.provider",
+                ViolationKind::EnumValue(
+                    ["EKS_ANYWHERE", "OTHER"]
+                        .iter()
+                        .map(|value| (*value).to_string())
+                        .collect()
+                ),
+                Some("eks_anywhere"),
+            )])
+            .as_deref(),
+            Some("The value of connectorConfig.provider must be one of [EKS_ANYWHERE, OTHER]"),
+            "a nested enum member is named by its path from the request root"
         );
 
         // A value INSIDE a collection, judged against an enum this API states no
@@ -377,8 +399,8 @@ mod tests {
         );
     }
 
-    /// RULE: a `CreateCluster` refusal carries the cluster name the request asked for
-    /// beside the sentence — and names none when the request named none.
+    /// RULE: the refusal of a request that names its cluster in the body carries that
+    /// name beside the sentence — and names none when the request named none.
     #[test]
     fn a_create_refusal_names_the_requested_cluster() {
         let violations = vec![violation(
@@ -386,7 +408,7 @@ mod tests {
             ViolationKind::Pattern(state::CLUSTER_NAME_PATTERN.to_string()),
             Some("probe cluster"),
         )];
-        let refusal = create_cluster_refusal(&violations, "probe cluster")
+        let refusal = cluster_name_parameter_refusal(&violations, "probe cluster")
             .expect("a pattern violation is worded");
         assert_eq!(
             refusal.cluster_name.as_deref(),
@@ -407,7 +429,7 @@ mod tests {
             None,
         )];
         let refusal =
-            create_cluster_refusal(&omitted, "").expect("an omitted required member is worded");
+            cluster_name_parameter_refusal(&omitted, "").expect("an omitted required member is worded");
         assert_eq!(
             refusal.cluster_name, None,
             "a request that named no cluster names none in its refusal, got {:?}",
@@ -421,7 +443,7 @@ mod tests {
         );
 
         assert!(
-            create_cluster_refusal(
+            cluster_name_parameter_refusal(
                 &[violation(
                     "tags",
                     ViolationKind::MaxLength(50),
@@ -434,7 +456,7 @@ mod tests {
         );
 
         // The value-set sentence names the member it is about and no cluster.
-        let value_set = create_cluster_refusal(
+        let value_set = cluster_name_parameter_refusal(
             &[violation(
                 "authenticationMode",
                 ViolationKind::EnumValue(vec!["API".to_string()]),
