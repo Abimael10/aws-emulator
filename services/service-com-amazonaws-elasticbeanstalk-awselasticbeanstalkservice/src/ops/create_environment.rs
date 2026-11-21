@@ -10,7 +10,11 @@
 //! label can carry and must not already be held by a live environment — the same rule
 //! `CheckDNSAvailability` reports on. A request that names no `EnvironmentName` takes it
 //! from the environment manifest (`env.yaml`) in the source bundle of the version it
-//! deploys, completed by `GroupName`. This is the ONLY file to touch for this operation.
+//! deploys, completed by `GroupName`. The launch is provisioned only if IAM lets this
+//! caller pass the IAM instance profile the configuration gives the environment's
+//! instances: one it will not reaches `Terminated` with that refusal in its event stream
+//! rather than `Ready` (`crate::state::environment_launch_failure`). This is the ONLY file
+//! to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -253,7 +257,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // awaits anything again: what the launch owes CloudWatch Logs is delivered
         // afterwards, and that delivery calls another service and RUNS the
         // deployed application, so the guard cannot be held across it.
-        let launched = self.launch(&input, &region, &plane_authority)?;
+        let launched = self.launch(&input, &region, &plane_authority, ctx)?;
         if let Some(streaming) = launched.streaming {
             let started = match launched.deployed {
                 Some(deployed) => deployed.startup_output().await,
@@ -281,11 +285,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateEnvironment
     /// LAUNCH the environment the request asks for: everything this operation
     /// decides and stores, which is all of it that happens under this service's
     /// store.
+    /// `ctx` is the request's own context, which the launch takes ONE decision
+    /// from: whether IAM lets this caller pass the IAM instance profile the
+    /// configuration gives the environment's instances.
     fn launch(
         &self,
         input: &CreateEnvironmentInput,
         region: &str,
         plane_authority: &str,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Launched, CreateEnvironmentError> {
         let region = region.to_string();
         let plane_authority = plane_authority.to_string();
@@ -562,6 +570,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateEnvironment
         ) {
             return Err(CreateEnvironmentError::configuration_validation(message));
         }
+        // "IamInstanceProfile: instance profile that gives the environment's
+        // instances the permissions they need": the instances this launch runs
+        // are handed that role, and handing a role over is the CALLER's act —
+        // so IAM decides whether this caller may pass it, and a launch nothing
+        // may pass it for cannot be provisioned. The decision reads the IAM
+        // store alone; nothing of this service's state goes into it.
+        let pass_instance_profile_refusal =
+            crate::service::authorization::pass_instance_profile_refusal(
+                &*self.engine,
+                ctx,
+                &crate::state::launch_instance_profile(&option_settings),
+            );
         // The record itself is the one every launch of this service produces
         // ([`crate::state::EnvironmentLaunch`]), built from what this request
         // resolved: the status and health a new environment starts in, the
@@ -605,6 +625,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateEnvironment
         // The launch has STARTED here; the event for its completion is recorded
         // when the clock makes that completion due.
         store.store_launched_environment(environment, &request_id, "createEnvironment");
+        // A launch the caller may not pass the instance profile for carries
+        // that refusal as an event and ends in its terminal status instead of
+        // reaching `Ready`; see `crate::state::environment_launch_failure`.
+        let refused = pass_instance_profile_refusal.is_some();
+        if let Some(diagnosis) = pass_instance_profile_refusal {
+            store.fail_environment_launch(&environment_id, diagnosis, &request_id);
+        }
 
         // "StreamLogs: whether to create groups in CloudWatch Logs for proxy and
         // deployment logs, and stream logs from each instance in your
@@ -613,7 +640,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateEnvironment
         // retention it states on each of them — and the output the deployed
         // application wrote while STARTING is delivered into the group of the
         // file it goes to on the instance.
-        let streaming = store.instance_log_streaming(&region, &environment_id);
+        //
+        // A launch that could not be provisioned runs no instance, so it has no
+        // instance log to stream and no application that started: it publishes
+        // nothing and delivers nothing.
+        let streaming = (!refused)
+            .then(|| store.instance_log_streaming(&region, &environment_id))
+            .flatten();
         let deployed = streaming
             .as_ref()
             .and_then(|_| store.deployed_application(&environment_id));

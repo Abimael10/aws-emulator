@@ -13,8 +13,11 @@
 //! `GroupName` when the manifest's name ends in `+`), its solution stack, its
 //! tier, its configuration and its links to the other environments of the group
 //! — is read out of that version's own manifest. Each composed environment is a
-//! launch like any other: it starts `Launching` and reaches `Ready`. A label
-//! that describes no environment composes none.
+//! launch like any other: it starts `Launching` and reaches `Ready`, provided
+//! its manifest associates an IAM instance profile with the environment's
+//! instances — which no launch can be provisioned without, the rule
+//! `environment_launch_authorization.rs` owns — so every manifest below
+//! supplies one. A label that describes no environment composes none.
 //!
 //! A manifest is what a version's PRE-PROCESSING reads and validates, so only a
 //! version that "was successfully pre-processed and validated" can be composed
@@ -89,6 +92,23 @@ const UPDATED_PROPERTY_VALUE: &str = "hello again";
 /// beside `EnvironmentTier$Name` `Worker`.
 const WORKER_TIER_TYPE: &str = "SQS/HTTP";
 
+/// The namespace and the option that name the IAM instance profile an
+/// environment's instances are given, as Elastic Beanstalk's published
+/// configuration-option reference spells them
+/// (`aws:autoscaling:launchconfiguration` / `IamInstanceProfile`), and the
+/// profile every manifest here associates with its environment.
+///
+/// A composed environment is configured by its manifest alone, so a manifest
+/// that associates no instance profile composes a launch that cannot be
+/// provisioned. That rule is `environment_launch_authorization.rs`'s subject;
+/// every manifest below supplies a profile, so what decides each case here is
+/// the rule the case is about.
+const LAUNCH_CONFIGURATION: &str = "aws:autoscaling:launchconfiguration";
+/// See [`LAUNCH_CONFIGURATION`].
+const IAM_INSTANCE_PROFILE: &str = "IamInstanceProfile";
+/// See [`LAUNCH_CONFIGURATION`].
+const INSTANCE_PROFILE: &str = "eb-ec2-role";
+
 /// The second published solution stack, so one group's two manifests name two
 /// different platforms and each environment is asserted to have taken its OWN
 /// manifest's.
@@ -103,6 +123,10 @@ fn other_solution_stack() -> String {
 /// reference lays `env.yaml` out: the configuration-template version, the
 /// environment's name, the solution stack to use, the tier, the option settings
 /// by namespace and the links to the other environments of the group.
+///
+/// Every manifest associates [`INSTANCE_PROFILE`] with its environment's
+/// instances, ahead of the case's own settings, since a launch with no instance
+/// profile is one this service cannot provision.
 ///
 /// Built here rather than held as a constant because the solution stack a
 /// manifest names is read off the service's own published catalogue.
@@ -123,13 +147,14 @@ fn manifest(
             "EnvironmentTier:\n  Name: {name}\n  Type: {kind}\n"
         ));
     }
-    if !settings.is_empty() {
-        text.push_str("OptionSettings:\n");
-        for (namespace, option_name, value) in settings {
-            text.push_str(&format!(
-                "  {namespace}:\n    {option_name}: '{value}'\n"
-            ));
-        }
+    text.push_str("OptionSettings:\n");
+    text.push_str(&format!(
+        "  {LAUNCH_CONFIGURATION}:\n    {IAM_INSTANCE_PROFILE}: '{INSTANCE_PROFILE}'\n"
+    ));
+    for (namespace, option_name, value) in settings {
+        text.push_str(&format!(
+            "  {namespace}:\n    {option_name}: '{value}'\n"
+        ));
     }
     if !links.is_empty() {
         text.push_str("EnvironmentLinks:\n");

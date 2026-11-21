@@ -57,6 +57,9 @@ pub mod configuration_setting_validation;
 pub mod deployed_application;
 pub mod environment_health;
 pub mod environment_launch;
+/// Why a launch this service ACCEPTED can still fail, and what the environment
+/// then reports.
+pub mod environment_launch_failure;
 pub mod environment_plane_endpoint;
 pub mod event_notifications;
 pub mod instance_log_streaming;
@@ -83,6 +86,7 @@ pub use configuration_setting_validation::*;
 pub use deployed_application::*;
 pub use environment_health::*;
 pub use environment_launch::*;
+pub use environment_launch_failure::*;
 pub use environment_plane_endpoint::*;
 pub use event_notifications::*;
 pub use instance_log_streaming::*;
@@ -521,11 +525,17 @@ pub fn unsupported_environment_tier_message(
 /// higher", so this order is what "higher" means.
 pub const EVENT_SEVERITY_LADDER: &[&str] = &["TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL"];
 
-/// The severity every event this service records carries: each one reports a
-/// lifecycle call that succeeded, which is informational. Nothing here runs a
-/// deployment, a health check or a managed action, so there is no failure or
-/// degradation to report at a higher severity and none is invented.
+/// The severity a lifecycle call that SUCCEEDED is recorded at: the event
+/// reports what the call did, which is informational.
 pub const SEVERITY_INFO: &str = "INFO";
+
+/// The severity a failure is recorded at — the event class a launch this
+/// service accepted but could not provision carries, whose diagnosis and whose
+/// outcome a client reads out of the environment's event stream rather than out
+/// of a response (see [`environment_launch_failure`]). Both values are members
+/// of [`EVENT_SEVERITY_LADDER`], so `DescribeEvents$Severity` — "only those with
+/// the specified severity or higher" — tells the two apart.
+pub const SEVERITY_ERROR: &str = "ERROR";
 
 /// How far back `DescribeEvents` reports: "Returns list of event descriptions
 /// matching criteria **up to the last 6 weeks**" (the model's `DescribeEvents`
@@ -1702,6 +1712,10 @@ pub struct PendingStatus {
     pub request_id: String,
     /// The message of the event recorded when the move is materialised.
     pub completion_message: String,
+    /// The severity that event carries: a change that completes the work the
+    /// call asked for is informational ([`SEVERITY_INFO`]), and one that reports
+    /// work this service could not carry out is a failure ([`SEVERITY_ERROR`]).
+    pub completion_severity: &'static str,
 }
 
 impl PendingStatus {
@@ -1724,6 +1738,7 @@ impl PendingStatus {
             abortable_operation_in_progress: false,
             request_id: request_id.to_string(),
             completion_message: completion_message.into(),
+            completion_severity: SEVERITY_INFO,
         }
     }
 
@@ -2325,6 +2340,7 @@ impl Environment {
             abortable_operation_in_progress: false,
             request_id: request_id.to_string(),
             completion_message: "terminateEnvironment completed successfully.".to_string(),
+            completion_severity: SEVERITY_INFO,
         });
     }
 
@@ -2376,6 +2392,7 @@ impl Environment {
             abortable_operation_in_progress: self.abortable_operation_in_progress,
             request_id: request_id.to_string(),
             completion_message: "restartAppServer completed successfully.".to_string(),
+            completion_severity: SEVERITY_INFO,
         };
         self.status = STATUS_UPDATING.to_string();
         self.health = HEALTH_GREY.to_string();
@@ -2540,6 +2557,7 @@ impl Environment {
         Some(CompletedTransition {
             request_id: pending.request_id,
             message: pending.completion_message,
+            severity: pending.completion_severity,
             at: pending.due_date,
             subject: self.event_subject(),
         })
@@ -2651,6 +2669,9 @@ impl EnvironmentInfoCompilation {
 struct CompletedTransition {
     request_id: String,
     message: String,
+    /// The severity the event carries, from the change's own
+    /// [`PendingStatus::completion_severity`].
+    severity: &'static str,
     at: ::aws_smithy_types::DateTime,
     subject: EventSubject,
 }
@@ -3598,7 +3619,7 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
         for transition in completed {
             self.record_event_at(
                 &transition.request_id,
-                SEVERITY_INFO,
+                transition.severity,
                 transition.message,
                 transition.subject,
                 transition.at,

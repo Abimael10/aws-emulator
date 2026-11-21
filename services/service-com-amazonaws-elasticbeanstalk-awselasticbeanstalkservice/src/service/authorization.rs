@@ -93,6 +93,34 @@ pub fn permits<Eng: Send + Sync + 'static>(
     decision(engine, ctx, action, resource).is_none()
 }
 
+/// The IAM action a service needs to hand an IAM role to a resource it creates for the
+/// caller ("to pass a role to a service, a user must have permission to pass the role",
+/// IAM's `iam:PassRole`): handing the role is the CALLER's act, so IAM decides it against
+/// the caller's own policies.
+pub const ACTION_PASS_ROLE: &str = "iam:PassRole";
+
+/// The refusal this caller earns for passing the IAM instance profile
+/// `instance_profile` to the instances of an environment it launches, or `None` when the
+/// policies in force let it ([`ACTION_PASS_ROLE`] on the role that profile names, see
+/// [`crate::state::instance_profile_role_arn`]).
+///
+/// The MESSAGE is answered, not just the verdict: a launch nothing may pass the profile
+/// for reports why in the environment's event stream, which is where a client reads the
+/// progress of a launch.
+#[must_use]
+pub fn pass_instance_profile_refusal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    instance_profile: &str,
+) -> Option<String> {
+    decision(
+        engine,
+        ctx,
+        ACTION_PASS_ROLE,
+        &crate::state::instance_profile_role_arn(instance_profile),
+    )
+}
+
 /// The refusal `action` on `resource` earns from the policies in force on this request's
 /// caller, or `None` when they permit it.
 fn decision<Eng: Send + Sync + 'static>(

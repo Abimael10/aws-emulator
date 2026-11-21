@@ -159,6 +159,13 @@ pub struct ComposedEnvironment<'a> {
     /// The links this environment reports, with every target already resolved
     /// to the name the group completed for it.
     pub environment_links: Vec<EnvironmentLink>,
+    /// Why this launch cannot be provisioned, where it cannot: the manifest
+    /// associates no IAM instance profile with the environment's instances, or
+    /// IAM will not let this call's caller pass the one it does — the diagnosis
+    /// the launch then fails with, see
+    /// [`super::environment_launch_failure`]. `None` where the launch can be
+    /// provisioned.
+    pub launch_refusal: Option<String>,
     pub request_id: &'a str,
 }
 
@@ -178,6 +185,7 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
             environment_name,
             manifest,
             environment_links,
+            launch_refusal,
             request_id,
         } = composed;
         if let Some(updated) = self.recompose_environment(
@@ -226,6 +234,15 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
         });
         let launched = environment.clone();
         self.store_launched_environment(environment, request_id, COMPOSE_OPERATION_NAME);
+        // The instances this launch would run are configured by the manifest
+        // alone, and are given the IAM instance profile it associates with them
+        // — which only a caller allowed to pass that role may hand over. A
+        // launch with no profile to hand them, or none this caller may pass,
+        // cannot be provisioned: it carries the refusal as an event and ends in
+        // its terminal status rather than reaching `Ready`.
+        if let Some(diagnosis) = launch_refusal {
+            self.fail_environment_launch(&launched.environment_id, diagnosis, request_id);
+        }
         launched
     }
 

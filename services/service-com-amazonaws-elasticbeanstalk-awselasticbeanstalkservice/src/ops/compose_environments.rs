@@ -8,7 +8,11 @@
 //! operation "creates or updates a group of environments". Each composed environment
 //! carries the manifest's name (completed by `GroupName`), solution stack, tier, option
 //! settings and links to the other environments of the group, starts `Launching` and
-//! reaches `Ready` the way every other launch does, and is answered as an
+//! reaches `Ready` the way every other launch does — unless the manifest associates no IAM
+//! instance profile with the environment's instances, or IAM will not let this caller pass
+//! the one it does, which no launch can be provisioned without: such an environment
+//! carries that refusal as an error event and the clock takes it to `Terminated` instead
+//! (`crate::state::environment_launch_failure`). Either way it is answered as an
 //! `EnvironmentDescription`. A request none of whose labels names a version of the
 //! application resolves no version at all, so it is refused with the service's
 //! `MissingParameter` and its fixed sentence for that class; a version that IS the
@@ -386,6 +390,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )),
                 })
                 .collect();
+            // "The name of each environment and other required information
+            // must be included in the source bundles in an environment
+            // manifest named env.yaml": the manifest is the whole of what
+            // configures a composed environment, so the IAM instance profile
+            // its instances are given — "instance profile that gives the
+            // environment's instances the permissions they need" — is the one
+            // the manifest associates with them, and a manifest that
+            // associates none leaves the launch without one. Handing that role
+            // over is the CALLER's act, so IAM decides whether this caller may
+            // pass the profile the manifest does name. Either way the launch
+            // cannot be provisioned, and the refusal is reported on the
+            // environment rather than as this call's answer. The decision
+            // reads the IAM store alone; nothing of this service's state goes
+            // into it.
+            let launch_refusal = match crate::state::associated_instance_profile(
+                &composed.manifest.option_settings,
+            ) {
+                None => Some(crate::state::missing_instance_profile_diagnosis()),
+                Some(instance_profile) => {
+                    crate::service::authorization::pass_instance_profile_refusal(
+                        &*self.engine,
+                        ctx,
+                        &instance_profile,
+                    )
+                }
+            };
             let environment = store.compose_environment(crate::state::ComposedEnvironment {
                 region: &region,
                 plane_authority: &plane_authority,
@@ -394,6 +424,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 environment_name: &composed.environment_name,
                 manifest: &composed.manifest,
                 environment_links,
+                launch_refusal,
                 request_id: &request_id,
             });
             environments.push(crate::state::environment_description!(

@@ -106,7 +106,11 @@ const NOT_A_NUMBER_REQUIREMENT: &str = "Value is not a number";
 /// launches are given — "an instance profile enables Amazon EC2 instances to
 /// access other Amazon Web Services resources" — in the launch-configuration
 /// namespace every platform version this service publishes defines.
-const OPTION_IAM_INSTANCE_PROFILE: &str = "IamInstanceProfile";
+///
+/// Stated once here and read by [`super::environment_launch_failure`] too, so
+/// the option this validation advises about and the one a launch passes a role
+/// for cannot be spelled two ways.
+pub(super) const OPTION_IAM_INSTANCE_PROFILE: &str = "IamInstanceProfile";
 
 /// The advisory a configuration that associates no IAM instance profile with its
 /// instances is reported with. FIXED text: it names nothing from the request or

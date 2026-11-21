@@ -300,9 +300,9 @@ pub const GENERAL_CONFIGURATION_OPTIONS: &[ConfigurationOption] = &[
     .with_max_length(255),
     ConfigurationOption::new(
         NAMESPACE_LAUNCH_CONFIGURATION,
-        "IamInstanceProfile",
+        OPTION_IAM_INSTANCE_PROFILE,
         CHANGE_SEVERITY_RESTART_ENVIRONMENT,
-        "aws-elasticbeanstalk-ec2-role",
+        DEFAULT_INSTANCE_PROFILE,
     )
     .with_max_length(500),
     // The single-valued form of the instance type an environment runs, which
