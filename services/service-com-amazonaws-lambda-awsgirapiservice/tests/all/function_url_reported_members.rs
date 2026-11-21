@@ -489,7 +489,11 @@ async fn an_unconfigured_invoke_mode_is_absent_from_a_write_and_default_on_a_rea
 /// Assert `value` is an instant of the form this service renders: a date, a `T`, a time, a
 /// three-digit millisecond field and the NUMERIC UTC offset — the form the model's own
 /// instant example spells (`2018-11-27T15:10:45.123+0000`).
-fn assert_offset_instant(case: &str, member: &str, value: &Value) {
+///
+/// `pub(crate)` so a sibling suite asserting the same form over ANOTHER member set (the
+/// instants of a layer and of its listings, `layer_version_payload_members.rs`) checks it
+/// against this one reading of the form rather than a second copy of it.
+pub(crate) fn assert_offset_instant(case: &str, member: &str, value: &Value) {
     let rendered = value.as_str().unwrap_or_else(|| {
         panic!("case {case:?}: expected the string member {member} in {value:?}")
     });

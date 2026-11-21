@@ -232,7 +232,10 @@ pub(crate) async fn publish_layer_version(
 }
 
 /// `ListLayerVersions` on a layer name.
-async fn list_layer_versions(router: &MultiServiceRouter, name: &str) -> Answer {
+///
+/// `pub(crate)` so a sibling suite listing a layer's versions over this harness addresses it
+/// through this one spelling of the call rather than a second copy of it.
+pub(crate) async fn list_layer_versions(router: &MultiServiceRouter, name: &str) -> Answer {
     let uri = format!("/2018-10-31/layers/{name}/versions");
     json_call(router, "GET", &uri, &Value::Null).await
 }

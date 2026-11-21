@@ -144,7 +144,10 @@ async fn get_layer_version(router: &MultiServiceRouter, name: &str, version: i64
 
 /// `GetLayerVersionByArn`, whose `Arn` member is bound to the `Arn` query parameter of
 /// `GET /2018-10-31/layers?find=LayerVersion`.
-async fn get_layer_version_by_arn(router: &MultiServiceRouter, arn: &str) -> Answer {
+///
+/// `pub(crate)` so a sibling suite reading the same operation over this harness addresses it
+/// through this one spelling of the call rather than a second copy of it.
+pub(crate) async fn get_layer_version_by_arn(router: &MultiServiceRouter, arn: &str) -> Answer {
     let encoded = arn.replace(':', "%3A");
     let uri = format!("/2018-10-31/layers?find=LayerVersion&Arn={encoded}");
     json_call(router, "GET", &uri, &Value::Null).await
