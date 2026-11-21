@@ -50,7 +50,9 @@ use crate::resource_tags::error_code;
 
 /// The sentence Amazon EMR refuses the session surface of a cluster without sessions with:
 /// fixed text apart from the cluster id the request sent, quoted.
-fn not_enabled_sentence(cluster_id: &str) -> String {
+///
+/// `pub(crate)` for the reason [`SPARK_RELEASE`] is.
+pub(crate) fn not_enabled_sentence(cluster_id: &str) -> String {
     format!(
         "Sessions are not enabled on cluster '{cluster_id}'. Set SessionEnabled to true \
          when creating the cluster to enable sessions."
@@ -59,10 +61,14 @@ fn not_enabled_sentence(cluster_id: &str) -> String {
 
 /// The Amazon EMR Spark release the session surface is documented for: "this operation is
 /// supported in Amazon EMR Spark 8.0.0 and later" (`StartSession` doc, Smithy model).
-const SPARK_RELEASE: &str = "emr-spark-8.0.0";
+///
+/// `pub(crate)` here and below so the sibling suite that drives a session's END states its
+/// launch, waits for its cluster and polls its session through these helpers rather than
+/// its own copies.
+pub(crate) const SPARK_RELEASE: &str = "emr-spark-8.0.0";
 
 /// A launch whose `SessionEnabled` is `enabled` when the row states one at all.
-fn launch_request(name: &str, enabled: Option<bool>) -> Value {
+pub(crate) fn launch_request(name: &str, enabled: Option<bool>) -> Value {
     let mut request = json!({
         "Name": name,
         "ReleaseLabel": SPARK_RELEASE,
@@ -100,7 +106,7 @@ const SESSION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// The wait is on the CONDITION — the harness's own poll-until helper, whose deadline is far
 /// above every span this service owes a cluster — so a slow or loaded host delays a case
 /// rather than failing it.
-async fn ready_cluster(emr: &Emr, case: &str, request: Value) -> String {
+pub(crate) async fn ready_cluster(emr: &Emr, case: &str, request: Value) -> String {
     let cluster_id = emr.run_job_flow(request).await;
     await_cluster_where(
         emr,
@@ -121,7 +127,7 @@ async fn ready_cluster(emr: &Emr, case: &str, request: Value) -> String {
 ///
 /// Waits for the CONDITION rather than for a span: the deadline is far above every span a
 /// session's start takes, so a slow host delays this rather than failing it.
-async fn await_session_state(
+pub(crate) async fn await_session_state(
     emr: &Emr,
     cluster_id: &str,
     session_id: &str,

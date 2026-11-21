@@ -45,6 +45,40 @@ pub mod session_state {
     /// The session has started: "the date and time that the session entered the
     /// `STARTED` state" is what `Session$StartedAt` reports.
     pub const STARTED: &str = "STARTED";
+    /// The session is up and running no work: "the date and time that the session last
+    /// entered the `IDLE` state" is what `Session$IdleSince` reports.
+    pub const IDLE: &str = "IDLE";
+    /// The session is up and running work.
+    pub const BUSY: &str = "BUSY";
+    /// "After you call this operation, the session enters the TERMINATING state and then
+    /// transitions to TERMINATED." (`TerminateSession` doc, Smithy model.)
+    pub const TERMINATING: &str = "TERMINATING";
+    /// The session has ended: "the date and time that the session was terminated or
+    /// failed" is what `Session$EndedAt` reports.
+    pub const TERMINATED: &str = "TERMINATED";
+    /// The session ended because it failed; the other end `Session$EndedAt` reports.
+    pub const FAILED: &str = "FAILED";
+}
+
+/// Whether a session in `state` is READY — up, and able to accept a client.
+///
+/// The states `Session$State` names for a session that has started and not ended: it has
+/// entered `STARTED` and is then either running no work (`IDLE`) or running some (`BUSY`).
+/// This is the one reading of "the session can be connected to", so the operation that
+/// reports a session's endpoint and the operation that ends it judge the same question the
+/// same way.
+pub fn is_ready_session_state(state: &str) -> bool {
+    matches!(
+        state,
+        session_state::STARTED | session_state::IDLE | session_state::BUSY
+    )
+}
+
+/// Whether a session in `state` has ENDED: a state it never leaves, which is what
+/// `Session$EndedAt` — "the date and time that the session was terminated or failed" —
+/// is reported for.
+pub fn is_terminal_session_state(state: &str) -> bool {
+    matches!(state, session_state::TERMINATED | session_state::FAILED)
 }
 
 /// The states a session passes through, in order, from the request that created it to the
@@ -202,6 +236,12 @@ impl SessionRecord {
             if pending.state == session_state::STARTED {
                 self.session.started_at = Some(timestamp(pending.due));
             }
+            // "The date and time that the session was terminated or failed"
+            // (`Session$EndedAt` doc): the instant the end was owed at, so a session that
+            // ended reports when it ended rather than when somebody noticed.
+            if is_terminal_session_state(&pending.state) {
+                self.session.ended_at = Some(timestamp(pending.due));
+            }
             if let Some(next) = next_session_state(&pending.state) {
                 self.pending_state = Some(PendingSessionState {
                     due: pending.due + SESSION_PHASE_SPAN,
@@ -209,6 +249,43 @@ impl SessionRecord {
                 });
             }
         }
+    }
+}
+
+impl SessionRecord {
+    /// Begin the termination `TerminateSession` asked for.
+    ///
+    /// "After you call this operation, the session enters the TERMINATING state and then
+    /// transitions to TERMINATED" (`TerminateSession` doc, Smithy model): the state the
+    /// call ANSWERS is recorded here and the end is owed to the clock one phase span later
+    /// ([`SESSION_PHASE_SPAN`]), so a caller that reads the session straight afterwards
+    /// sees it terminating rather than already gone. A session the clock still owed a
+    /// start to is terminating from here on instead: the request to end it replaces what
+    /// was owed.
+    pub fn terminate_at(&mut self, now: SystemTime) {
+        self.session.state = session_state::TERMINATING.to_string();
+        self.session.updated_at = Some(timestamp(now));
+        self.pending_state = Some(PendingSessionState {
+            due: now + SESSION_PHASE_SPAN,
+            state: session_state::TERMINATED.to_string(),
+        });
+    }
+
+    /// End this session because the CLUSTER it runs on has terminated, at the instant
+    /// `due` the cluster ended at.
+    ///
+    /// A session is "a Spark Connect session on the specified cluster" (`StartSession`
+    /// doc, Smithy model) — it is hosted by that cluster, so it does not outlive it: once
+    /// the cluster is gone, nothing the session ran on remains and the session has ended.
+    /// A session that had already ended keeps the end it reported.
+    pub fn end_with_cluster(&mut self, due: SystemTime) {
+        if is_terminal_session_state(&self.session.state) {
+            return;
+        }
+        self.pending_state = None;
+        self.session.state = session_state::TERMINATED.to_string();
+        self.session.updated_at = Some(timestamp(due));
+        self.session.ended_at = Some(timestamp(due));
     }
 }
 
@@ -246,6 +323,31 @@ impl ClusterRecord {
         self.sessions
             .iter_mut()
             .find(|record| record.session.id == session_id)
+    }
+
+    /// Begin terminating the session `session_id` of this cluster, and answer it — `None`
+    /// for a session this cluster does not carry, which changes nothing.
+    ///
+    /// The one write `TerminateSession` performs: the named session enters `TERMINATING`
+    /// and the clock owes it the end ([`SessionRecord::terminate_at`]). Every other
+    /// session of the cluster is untouched.
+    ///
+    /// A session that is already on its way out — one an earlier request put into
+    /// `TERMINATING`, and one that has ended — keeps the end that request owed it rather
+    /// than having a fresh one armed, so asking twice settles the session at the instant
+    /// the FIRST ask made due.
+    pub fn terminate_session(
+        &mut self,
+        session_id: &str,
+        now: SystemTime,
+    ) -> Option<&SessionRecord> {
+        let record = self.session_mut(session_id)?;
+        let ending = record.session.state == session_state::TERMINATING
+            || is_terminal_session_state(&record.session.state);
+        if !ending {
+            record.terminate_at(now);
+        }
+        Some(record)
     }
 
     /// The session this cluster already started for the client request token `token`, if

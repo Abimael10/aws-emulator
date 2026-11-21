@@ -220,6 +220,11 @@ pub use step_events::*;
 mod sessions;
 pub use sessions::*;
 
+/// How a client REACHES one of those sessions — the endpoint `GetSessionEndpoint` reports
+/// and the time-limited token it mints — split out and re-exported the same way.
+mod session_endpoint;
+pub use session_endpoint::*;
+
 /// The bootstrap actions a cluster was launched with — what `ListBootstrapActions`
 /// reports, and the page token it pages on — split out and re-exported the same way.
 mod bootstrap_actions;
@@ -2998,6 +3003,12 @@ impl ClusterRecord {
                     // of this cluster ended at that same instant.
                     for instance in &mut self.ec2_instances {
                         instance.end_at(due);
+                    }
+                    // Nor does a session it was hosting: a session is started "on the
+                    // specified cluster" (`StartSession` doc), so a cluster that is gone
+                    // leaves none of its sessions live ([`SessionRecord::end_with_cluster`]).
+                    for session in &mut self.sessions {
+                        session.end_with_cluster(due);
                     }
                 }
             }

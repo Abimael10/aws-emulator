@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSessionEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSessionEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports how a client REACHES one Spark Connect session of a cluster of the shared
+//! engine: the endpoint it dials — the address this emulator is served at, with the
+//! session's own path under it ([`crate::state::session_endpoint_url`]) — and a
+//! time-limited authentication token minted for this call alone, with the instant it
+//! expires at.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSessionEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What it refuses, with the `InvalidRequestException` it models: a cluster id this account
+//! holds no cluster under, a cluster launched WITHOUT the session surface
+//! ([`crate::state::sessions_not_enabled`]), a session the named cluster does not carry,
+//! and a session that has not reached a ready state — a client connects to a session that
+//! is UP, so one that is still starting, terminating or ended has no endpoint to connect to
+//! ([`crate::state::session_not_ready_for_endpoint`]).
+//!
+//! The session's `Credentials` are reported by nothing here: that pair authenticates a
+//! client "connecting directly over VPC peering" to the Spark Connect server a session's
+//! `Session$ServerUrl` names, and no Spark Connect server is run for a session of this
+//! emulator, so no session reports either member.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +158,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSessionEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSessionEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSessionEndpoint"))
+        let now = ::std::time::SystemTime::now();
+
+        // The SHAPE of both ids is settled BEFORE any resource is resolved, in the same
+        // order and through the same channel the rest of the session surface settles a
+        // session reference in: a value no id of that resource is ever drawn from names
+        // nothing the service could hold, so it is a bad REQUEST rather than a bad target.
+        if !crate::state::is_cluster_id_shaped(&input.cluster_id) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::malformed_cluster_id_message(&input.cluster_id),
+            ));
+        }
+        if !crate::state::is_session_id_shaped(&input.session_id) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::malformed_session_id_message(&input.cluster_id, &input.session_id),
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetSessionEndpointErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the EMR cluster store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // Reporting only: `cluster_mut` materialises the transitions the clock already made
+        // due, which were owed at this instant whether or not anybody asked for an
+        // endpoint, so the state judged below is the one the session has actually reached.
+        let Some(cluster) = store.cluster_mut(&input.cluster_id, now) else {
+            return Err(GetSessionEndpointErrorModeled::InvalidRequestException(
+                crate::state::unknown_cluster(&input.cluster_id),
+            )
+            .into());
+        };
+
+        if !cluster.sessions_enabled() {
+            return Err(GetSessionEndpointErrorModeled::InvalidRequestException(
+                crate::state::sessions_not_enabled(&input.cluster_id),
+            )
+            .into());
+        }
+
+        let Some(session) = cluster.session(&input.session_id) else {
+            return Err(GetSessionEndpointErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    error_code: None,
+                    message: Some(crate::state::unknown_session_message(&input.session_id)),
+                },
+            )
+            .into());
+        };
+
+        // "Use the endpoint and token to connect a PySpark client to the session": a
+        // session that is not up accepts no client, so it has no endpoint to connect to —
+        // and the state the refusal names is the session's own, read off the record.
+        if !crate::state::is_ready_session_state(&session.session.state) {
+            let refusal = crate::state::session_not_ready_for_endpoint(
+                &session.session.id,
+                &session.session.state,
+            );
+            return Err(GetSessionEndpointErrorModeled::InvalidRequestException(refusal).into());
+        }
+
+        // Every id the endpoint names is the STORED session's own, never the request's.
+        let cluster_id = session.session.cluster_id.clone();
+        let session_id = session.session.id.clone();
+        drop(store);
+
+        // A fresh token per call, which is what "call this operation again when the token
+        // expires to obtain a new one" asks of a client. Nothing in a service constructs a
+        // secret itself: the emulator's credential store mints it.
+        let Some(auth_token) = crate::state::mint_session_auth_token(ctx.credential_store())
+        else {
+            return Err(GetSessionEndpointErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "no authentication token could be minted for the session".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetSessionEndpointOutput {
+            // The address this emulator is REACHED at, with the session's own path under
+            // it: a client takes this value and connects to it, so it leads back here
+            // rather than to a host AWS publishes its own endpoints at.
+            endpoint: crate::state::session_endpoint_url(
+                ctx.endpoint().as_str(),
+                &cluster_id,
+                &session_id,
+            ),
+            auth_token: Some(auth_token),
+            auth_token_expiration_time: Some(crate::state::timestamp(
+                now + crate::state::SESSION_AUTH_TOKEN_VALIDITY,
+            )),
+            // See the module docs: the pair belongs to a direct connection no session of
+            // this emulator offers, so it is reported by none.
+            credentials: None,
+        })
     }
 }

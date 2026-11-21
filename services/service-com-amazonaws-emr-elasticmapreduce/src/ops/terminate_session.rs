@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TerminateSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TerminateSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Ends one Spark Connect session of a cluster of the shared engine: the named session
+//! enters `TERMINATING` and the clock settles it in `TERMINATED` a phase span later, which
+//! is what this call answers and what a later `GetSession` and `ListSessions` report. The
+//! session stays readable after it has ended.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TerminateSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What it refuses, with the `InvalidRequestException` it models: a cluster id this account
+//! holds no cluster under and a cluster launched WITHOUT the session surface
+//! ([`crate::state::sessions_not_enabled`]). A `SessionId` the cluster carries no session
+//! for — one of a form no session is ever minted in, and one that simply names none — is
+//! refused as a bad REQUEST naming the session's qualified path, before and instead of any
+//! session being moved.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +148,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TerminateSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TerminateSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        // The SHAPE of both ids is settled BEFORE any resource is resolved: a value
+        // carrying characters no id of that resource is drawn from names nothing the
+        // service could hold, so it is refused as a bad REQUEST — naming the member the
+        // caller has to fix — rather than looked up. This is the same division, in the
+        // same order, that `GetSession` holds a session reference to.
+        if !crate::state::is_cluster_id_shaped(&input.cluster_id) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::malformed_cluster_id_message(&input.cluster_id),
+            ));
+        }
+        if !crate::state::is_session_id_shaped(&input.session_id) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::malformed_session_id_message(&input.cluster_id, &input.session_id),
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TerminateSessionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the EMR cluster store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // Ending a session changes the cluster's state, so every transition the clock
+        // already made due is materialised first; `cluster_mut` does that for the cluster
+        // and the sessions it carries, so the state this call moves is the one the clock
+        // has actually reached.
+        let Some(cluster) = store.cluster_mut(&input.cluster_id, now) else {
+            return Err(TerminateSessionErrorModeled::InvalidRequestException(
+                crate::state::unknown_cluster(&input.cluster_id),
+            )
+            .into());
+        };
+
+        // Sessions are enabled by the LAUNCH, so a cluster that carries no session surface
+        // at all has no session to end — the same gate, with the same sentence, that the
+        // rest of this surface holds a cluster to.
+        if !cluster.sessions_enabled() {
+            return Err(TerminateSessionErrorModeled::InvalidRequestException(
+                crate::state::sessions_not_enabled(&input.cluster_id),
+            )
+            .into());
+        }
+
+        // "After you call this operation, the session enters the TERMINATING state and then
+        // transitions to TERMINATED." (`TerminateSession` doc, Smithy model.) The state
+        // reported is read off the RECORD this call just moved, so it is the state a later
+        // `GetSession` reports rather than one this handler names itself.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TerminateSession"))
+        // A `SessionId` the named cluster carries no session for is refused the way
+        // recorded behavior words it for this operation: the request-validation envelope
+        // (HTTP 400, `ValidationException`) naming the session's QUALIFIED path — the same
+        // sentence a value that could name no session at all is refused with — because
+        // either way the request names no session there is anything to terminate. Nothing
+        // is moved.
+        let Some(session) = cluster.terminate_session(&input.session_id, now) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::malformed_session_id_message(&input.cluster_id, &input.session_id),
+            ));
+        };
+
+        Ok(TerminateSessionOutput {
+            cluster_id: session.session.cluster_id.clone(),
+            session_id: session.session.id.clone(),
+            state: session.session.state.clone(),
+        })
     }
 }
