@@ -41,28 +41,27 @@ use crate::access_point_lifecycle::{
 
 use service_com_amazonaws_s3control_awss3controlservicev20180820::state::ACCESS_POINT_NAME_LEN;
 
-/// The keys `GetAccessPoint$Endpoints` reports, and the host each one names in
-/// Region `region`: the Regional S3 access point endpoints, over plain IPv4 and
-/// over the FIPS and dual-stack variants of the same service.
+/// The keys `GetAccessPoint$Endpoints` reports, and the address each one names:
+/// the endpoint variants S3 publishes for an access point, every one of them at
+/// the `host[:port]` THIS emulator serves its data plane at — a client reads this
+/// map to learn where to send its object requests, and this emulator runs one
+/// data plane.
 ///
-/// Written out here, rather than read from the emulator, so the test states the
-/// hosts a client resolves independently of the code that builds them.
-fn expected_endpoints(region: &str) -> BTreeMap<String, String> {
-    [
-        ("ipv4", format!("s3-accesspoint.{region}.amazonaws.com")),
-        ("fips", format!("s3-accesspoint-fips.{region}.amazonaws.com")),
-        (
-            "fips_dualstack",
-            format!("s3-accesspoint-fips.dualstack.{region}.amazonaws.com"),
-        ),
-        (
-            "dualstack",
-            format!("s3-accesspoint.dualstack.{region}.amazonaws.com"),
-        ),
-    ]
-    .into_iter()
-    .map(|(key, host)| (key.to_string(), host))
-    .collect()
+/// This suite's router is served on no port, so that address is the host of the
+/// base the core reports for one
+/// ([`::smithy_server_runtime::UNSERVED_URL_BASE`]). The sibling suite
+/// `access_point_endpoint_order` drives the published address over every address
+/// this process can be served at, pins the ENTRY ORDER of the map, and dials a
+/// published entry to prove it reaches the access point.
+fn expected_endpoints() -> BTreeMap<String, String> {
+    let authority = ::smithy_server_runtime::UNSERVED_URL_BASE
+        .rsplit("://")
+        .next()
+        .expect("the unserved base names a host");
+    ["ipv4", "fips", "fips_dualstack", "dualstack"]
+        .into_iter()
+        .map(|key| (key.to_string(), authority.to_string()))
+        .collect()
 }
 
 /// The type an access point over a general-purpose bucket reports, which is the
@@ -233,7 +232,7 @@ async fn a_read_reports_the_bucket_owner_the_type_and_the_regional_endpoints() {
             );
             assert_eq!(
                 endpoints_of(&read),
-                expected_endpoints(region),
+                expected_endpoints(),
                 "case {:?} in {region}: expected the Regional access point endpoints, got \
                  body {}",
                 case.case,
@@ -250,9 +249,10 @@ async fn a_read_reports_the_bucket_owner_the_type_and_the_regional_endpoints() {
                 "",
             )
             .await;
-            // Compared member by member rather than byte for byte: the
-            // `Endpoints` map's ENTRY ORDER is not part of the contract, and
-            // the codec writes the entries in the order the map holds them.
+            // Compared member by member here, with the `Endpoints` map read as
+            // a set of pairs; the sibling suite `access_point_endpoint_order`
+            // pins the ENTRY ORDER of that map and that two reads of one
+            // unchanged access point answer the same bytes.
             for member in [
                 "Name",
                 "Bucket",

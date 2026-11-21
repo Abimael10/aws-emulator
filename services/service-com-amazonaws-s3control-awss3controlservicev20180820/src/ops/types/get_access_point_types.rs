@@ -37,7 +37,10 @@ pub struct GetAccessPointOutput {
     pub creation_date: Option<::aws_smithy_types::DateTime>,
     pub alias: Option<String>,
     pub access_point_arn: Option<String>,
-    pub endpoints: Option<std::collections::HashMap<String, String>>,
+    /// Held in an ORDER-PRESERVING map: the codec writes a map member's
+    /// entries in the order the map holds them, and the entry order of this one
+    /// is part of what a read reports (`crate::state::access_point_endpoints`).
+    pub endpoints: Option<::indexmap::IndexMap<String, String>>,
     pub bucket_account_id: Option<String>,
     pub data_source_id: Option<String>,
     pub data_source_type: Option<String>,

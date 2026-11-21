@@ -171,7 +171,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::state::state_unavailable());
         };
@@ -193,10 +192,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creation_date: Some(record.creation_date),
             alias: Some(record.alias.clone()),
             access_point_arn: Some(record.arn.clone()),
-            // The access point's data-plane hosts, derived from the Region it
-            // lives in: a client resolves them from here rather than building
-            // one.
-            endpoints: Some(crate::state::access_point_endpoints(&record.region)),
+            // The addresses the access point's data plane is reached at: the
+            // endpoint THIS emulator serves, which is what a client dials its
+            // object requests at.
+            endpoints: Some(crate::state::access_point_endpoints::announced_endpoints(
+                ctx,
+            )),
             bucket_account_id: Some(record.bucket_account_id.clone()),
             // Set only for an access point attached to a data source (FSx), which
             // `CreateAccessPoint` here never does.

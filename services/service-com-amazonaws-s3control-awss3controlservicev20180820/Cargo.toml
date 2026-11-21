@@ -66,6 +66,10 @@ csv = "1.3"
 # RFC 3986 percent-encoding for the `x-amz-copy-source` of a copy task, whose
 # value "must be URL-encoded".
 percent-encoding = "2"
+# An order-preserving map: a map member of a response body is written entry by
+# entry in the order the map holds, so the maps this service reports are held in
+# one that keeps the order they were populated in rather than a hashed one.
+indexmap = "2.14"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -111,7 +111,14 @@ pub struct JobOperation {
 pub struct LambdaInvokeOperation {
     pub function_arn: Option<String>,
     pub invocation_schema_version: Option<String>,
-    pub user_arguments: Option<std::collections::HashMap<String, String>>,
+    /// Order-preserving, like every map member this service writes back: a read
+    /// of the job echoes these pairs, and the codec writes them in the order the
+    /// map holds, so a `BTreeMap` is what makes two reads of one unchanged job
+    /// answer the same document. (A map member whose entry order AWS fixes is
+    /// held in an `indexmap::IndexMap` instead — see
+    /// `GetAccessPointOutput::endpoints` — which the derive that builds this
+    /// shape's codec does not admit as a map type.)
+    pub user_arguments: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.s3control#S3CopyObjectOperation")]
@@ -162,7 +169,11 @@ pub struct S3ObjectMetadata {
     pub content_disposition: Option<String>,
     pub content_encoding: Option<String>,
     pub content_language: Option<String>,
-    pub user_metadata: Option<std::collections::HashMap<String, String>>,
+    /// Order-preserving, for the same reason as
+    /// [`LambdaInvokeOperation::user_arguments`]: a read of the job echoes
+    /// these pairs, so the order they are written in is one order rather than a
+    /// hash order that changes per response.
+    pub user_metadata: Option<std::collections::BTreeMap<String, String>>,
     pub content_length: Option<i64>,
     pub content_md5: Option<String>,
     pub content_type: Option<String>,

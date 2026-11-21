@@ -106,6 +106,9 @@ macro_rules! s3c_write_member {
     };
     ($s:ident, $m:expr, $v:expr, map_of_string) => {
         $s.write_map($m, &|__sm| {
+            // Entry by entry, in the order the map holds them: a map written
+            // here is an order-preserving one, so the entry order of a response
+            // is the order the map was populated in.
             for (__k, __mv) in $v.iter() {
                 __sm.write_string($m, __k.as_str())?;
                 __sm.write_string($m, __mv.as_str())?;
@@ -120,6 +123,11 @@ macro_rules! s3c_write_member {
 
 /// Read one member, as the vendored codegen's `codegen::emit_read` does for
 /// that kind.
+///
+/// A map is read into an ORDER-PRESERVING map, so the entries keep the order
+/// the document listed them in and a structure that is read and then written
+/// again — a caller-supplied map a read echoes back — carries them in that same
+/// order every time rather than in a hash order that changes per response.
 ///
 /// Entry COUNTS are bounded by the request body the server reads with a cap,
 /// and nesting DEPTH by the codec itself, which refuses a document nesting
@@ -138,8 +146,8 @@ macro_rules! s3c_read_member {
         $d.read_timestamp($m)?
     };
     ($d:ident, $m:expr, map_of_string) => {{
-        let mut __out: ::std::collections::HashMap<::std::string::String, ::std::string::String> =
-            ::std::collections::HashMap::new();
+        let mut __out: ::indexmap::IndexMap<::std::string::String, ::std::string::String> =
+            ::indexmap::IndexMap::new();
         $d.read_map($m, &mut |__k, __dm| {
             __out.insert(__k, __dm.read_string($m)?);
             Ok(())

@@ -33,6 +33,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub mod access_point_policy_actions;
 /// Publishing an access point's DATA PATH into the object store that serves it.
 pub mod access_point_routes;
+/// WHICH hosts an access point's data plane is reached at, as
+/// `GetAccessPoint$Endpoints` reports them.
+pub mod access_point_endpoints;
 /// The ACCOUNT-level `PublicAccessBlock` configuration, held in the object store
 /// that enforces it.
 pub mod account_public_access_block;
@@ -77,8 +80,7 @@ pub struct AccessPointRecord {
     pub bucket_account_id: String,
     pub arn: String,
     /// The Region the access point lives in — the one the create request was
-    /// signed for. Recorded because the access point's data-plane endpoints are
-    /// Regional ([`access_point_endpoints`]) and its ARN names the same Region.
+    /// signed for. Recorded because the access point's ARN names that Region.
     pub region: String,
     pub alias: String,
     /// What this access point fronts, as `AccessPointType` reports it: one of
@@ -2830,48 +2832,6 @@ const DEFAULT_REGION: &str = "us-east-1";
 /// never puts another account id in an ARN it emits.
 pub fn access_point_arn(region: &str, name: &str) -> String {
     ::emulator_server::emulator_arn("s3", region, &format!("accesspoint/{name}"))
-}
-
-/// The host an access point's data plane is reached at, in `region`, over
-/// `variant` — the Regional S3 access point endpoints, whose host is built from
-/// the `s3-accesspoint` service name, the FIPS and dual-stack markers the
-/// variant carries, the Region and the partition's DNS suffix.
-fn access_point_endpoint(region: &str, fips: bool, dualstack: bool) -> String {
-    let service = if fips {
-        "s3-accesspoint-fips"
-    } else {
-        "s3-accesspoint"
-    };
-    let stack = if dualstack { "dualstack." } else { "" };
-    format!("{service}.{stack}{region}.{DNS_SUFFIX}")
-}
-
-/// The DNS suffix of the partition this emulator answers for.
-const DNS_SUFFIX: &str = "amazonaws.com";
-
-/// The endpoints an access point is reachable at, keyed by the IP stack and
-/// FIPS mode each one serves — what `GetAccessPoint$Endpoints` reports.
-///
-/// A client resolves the access point's DATA-PLANE host from this map rather
-/// than building one, so all four Regional variants are reported: plain IPv4,
-/// FIPS, dual-stack, and FIPS over dual-stack. Every host is DERIVED from the
-/// Region the access point lives in, so an access point in another Region
-/// reports another four.
-pub fn access_point_endpoints(region: &str) -> ::std::collections::HashMap<String, String> {
-    [
-        ("ipv4", false, false),
-        ("fips", true, false),
-        ("fips_dualstack", true, true),
-        ("dualstack", false, true),
-    ]
-    .into_iter()
-    .map(|(variant, fips, dualstack)| {
-        (
-            variant.to_string(),
-            access_point_endpoint(region, fips, dualstack),
-        )
-    })
-    .collect()
 }
 
 /// The bounds Amazon S3 states for the LENGTH of an access point name: "Must be
