@@ -198,6 +198,7 @@ pub mod ec2_security_groups;
 pub mod ec2_subnets;
 mod event_notifications;
 pub mod kms_key;
+pub mod log_delivery;
 pub mod s3_export;
 mod store;
 mod parameters;
@@ -224,6 +225,7 @@ pub use rbac_engine_versions::*;
 pub use replication_groups::*;
 pub use shard_configuration::*;
 pub use cache_clusters::*;
+pub use log_delivery::*;
 pub use cache_data_plane::*;
 pub use reserved_nodes::*;
 pub use parameters::*;
@@ -976,12 +978,6 @@ pub const SECURITY_GROUP_STATUS: &str = "active";
 pub const NOTIFICATION_STATUS_ACTIVE: &str = "active";
 /// See [`NOTIFICATION_STATUS_ACTIVE`].
 pub const NOTIFICATION_STATUS_INACTIVE: &str = "inactive";
-
-/// The `LogDeliveryConfiguration$Status` of a log delivery this emulator holds,
-/// from `LogDeliveryConfigurationStatus` (`active | enabling | modifying |
-/// disabling | error`): a stored configuration is the settled one, and the
-/// emulator delivers no logs for it to error on.
-pub const LOG_DELIVERY_STATUS: &str = "active";
 
 /// What `CacheCluster$PreferredAvailabilityZone` reports for a cluster whose
 /// nodes are not all in one zone: "the name of the Availability Zone in which

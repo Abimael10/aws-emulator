@@ -484,9 +484,14 @@ fn slow_log_policy(
 }
 
 /// Where the slow log of the node `cluster` is delivered, from the log-delivery
-/// configurations `configurations` — `None` when none of them is an active `slow-log`
-/// configuration whose destination is a CloudWatch Logs log group, which is every cache that
-/// asked for no slow-log delivery.
+/// configurations `configurations` — `None` when none of them is a `slow-log` configuration
+/// whose destination is a CloudWatch Logs log group, which is every cache that asked for no
+/// slow-log delivery.
+///
+/// A configuration that settled in the ERROR state carries nowhere: it names a destination
+/// that was not there when the configuration was resolved
+/// ([`super::log_delivery::settle_log_delivery`]), and a delivery that is reported as having
+/// failed must not start carrying records because the destination appeared later.
 fn slow_log_delivery(
     cluster: &super::CacheClusterRecord,
     configurations: &[super::LogDeliveryRecord],
@@ -500,6 +505,7 @@ fn slow_log_delivery(
                 .destination_type
                 .as_deref()
                 .is_some_and(|destination| destination == slow_log::CLOUDWATCH_LOGS_DESTINATION)
+            && record.status != super::LOG_DELIVERY_STATUS_ERROR
     })?;
     let log_group = configured
         .destination_details

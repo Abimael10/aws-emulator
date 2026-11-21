@@ -1229,11 +1229,6 @@ async fn every_stored_cluster_setting_is_reported_back() {
             "CloudWatchLogsDetails/LogGroup",
             "/aws/elasticache/slow",
         ),
-        (
-            "LogDeliveryConfigurations",
-            "LogDeliveryConfiguration/Status",
-            "active",
-        ),
     ] {
         assert_eq!(
             described.text(element),
@@ -1242,6 +1237,38 @@ async fn every_stored_cluster_setting_is_reported_back() {
             described.text(element)
         );
     }
+    // The log delivery this cluster asked for is not settled by the call that
+    // asked for it: the clock owes it a status, and reaching one means resolving
+    // the destination. No CloudWatch Logs group of that name exists on this
+    // engine, so the delivery settles in the state that says so, naming the
+    // group it could not find.
+    let settled = poll_until(
+        &emulator,
+        REGION,
+        "configured",
+        "the log delivery leaving its transient status",
+        "DescribeCacheClusters",
+        &params(&[("CacheClusterId", "configured")]),
+        |reply| {
+            reply
+                .text("LogDeliveryConfiguration/Status")
+                .is_some_and(|status| status == "active" || status == "error")
+        },
+    )
+    .await;
+    assert_eq!(
+        (
+            settled.text("LogDeliveryConfiguration/Status"),
+            settled.text("LogDeliveryConfiguration/Message"),
+        ),
+        (
+            Some("error"),
+            Some("Destination log group /aws/elasticache/slow does not exist."),
+        ),
+        "case LogDeliveryConfigurations: a delivery naming a log group that does not exist \
+         settles in error and names it, got {}",
+        settled.body
+    );
     // The auth token is a secret: only the fact that one was set is reported,
     // and the token itself appears nowhere in the answer.
     assert!(

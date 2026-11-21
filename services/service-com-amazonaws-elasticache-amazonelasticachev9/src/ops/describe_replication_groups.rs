@@ -201,6 +201,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // waits for one, and never advances one: the span a transition is owed
         // after is the CALL that started the work, so this read answers with the
         // state the clock owed whether or not anybody had called.
+        //
+        // The settled status of a LOG-DELIVERY configuration is owed by the same
+        // clock, and reaching it means resolving the destination where the service
+        // that OWNS it answers, so that pass runs with no store of this service
+        // locked.
+        crate::state::log_delivery::settle_log_delivery(&*self.engine);
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         store.settle_all(now);

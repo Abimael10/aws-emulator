@@ -1046,7 +1046,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
             if let Some(requests) = input.log_delivery_configurations.clone() {
-                crate::state::apply_log_delivery(&mut pending.log_delivery_configurations, requests);
+                crate::state::apply_log_delivery(
+                    &mut pending.log_delivery_configurations,
+                    requests,
+                    now,
+                );
             }
             if let Some(enabled) = input.transit_encryption_enabled {
                 pending.transit_encryption_enabled = Some(enabled);
@@ -1095,7 +1099,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 group.automatic_failover = setting(enabled).to_string();
             }
             if let Some(requests) = input.log_delivery_configurations.clone() {
-                crate::state::apply_log_delivery(&mut group.log_delivery_configurations, requests);
+                crate::state::apply_log_delivery(
+                    &mut group.log_delivery_configurations,
+                    requests,
+                    now,
+                );
             }
             if let Some(enabled) = input.transit_encryption_enabled {
                 group.transit_encryption_enabled = enabled;
@@ -1244,7 +1252,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
             if let Some(requests) = member_log_delivery.clone() {
-                crate::state::apply_log_delivery(&mut cluster.log_delivery_configurations, requests);
+                crate::state::apply_log_delivery(
+                    &mut cluster.log_delivery_configurations,
+                    requests,
+                    now,
+                );
                 cluster.replication_group_log_delivery_enabled =
                     Some(!cluster.log_delivery_configurations.is_empty());
             }

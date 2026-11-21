@@ -2,55 +2,6 @@
 
 use super::*;
 
-/// One log-delivery configuration of a cluster, as this emulator persists it.
-///
-/// `LogDeliveryConfigurationRequest` carries an `Enabled` flag; a disabled
-/// request removes the configuration rather than storing one, so a stored record
-/// is always an enabled one and needs no flag of its own.
-#[derive(Debug, Clone)]
-pub struct LogDeliveryRecord {
-    pub log_type: Option<String>,
-    pub destination_type: Option<String>,
-    pub destination_details: Option<DestinationDetails>,
-    pub log_format: Option<String>,
-}
-
-impl LogDeliveryRecord {
-    /// This record as the modelled `LogDeliveryConfiguration`.
-    pub fn to_modeled(&self) -> LogDeliveryConfiguration {
-        LogDeliveryConfiguration {
-            log_type: self.log_type.clone(),
-            destination_type: self.destination_type.clone(),
-            destination_details: self.destination_details.clone(),
-            log_format: self.log_format.clone(),
-            status: Some(LOG_DELIVERY_STATUS.to_string()),
-            // `message` carries the reason a log delivery is in an error state,
-            // and a stored configuration is settled.
-            message: None,
-        }
-    }
-}
-
-/// Apply `requests` to the log-delivery configurations `stored`: a request
-/// replaces the configuration for its log type, and `Enabled: false` removes it.
-pub fn apply_log_delivery(
-    stored: &mut Vec<LogDeliveryRecord>,
-    requests: Vec<LogDeliveryConfigurationRequest>,
-) {
-    for request in requests {
-        stored.retain(|existing| existing.log_type != request.log_type);
-        if request.enabled == Some(false) {
-            continue;
-        }
-        stored.push(LogDeliveryRecord {
-            log_type: request.log_type,
-            destination_type: request.destination_type,
-            destination_details: request.destination_details,
-            log_format: request.log_format,
-        });
-    }
-}
-
 /// One cache node of a cluster, as this emulator persists it.
 #[derive(Debug, Clone)]
 pub struct CacheNodeRecord {

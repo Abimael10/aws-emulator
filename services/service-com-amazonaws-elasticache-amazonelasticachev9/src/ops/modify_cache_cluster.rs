@@ -833,7 +833,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_deref()
             .is_some_and(|requests| !requests.is_empty());
         if let Some(requests) = input.log_delivery_configurations {
-            crate::state::apply_log_delivery(&mut cluster.log_delivery_configurations, requests);
+            crate::state::apply_log_delivery(
+                &mut cluster.log_delivery_configurations,
+                requests,
+                now,
+            );
         }
 
         // Whether this request changes a member the modelled

@@ -1012,6 +1012,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::apply_log_delivery(
                     &mut stored,
                     input.log_delivery_configurations.unwrap_or_default(),
+                    now,
                 );
                 stored
             },
