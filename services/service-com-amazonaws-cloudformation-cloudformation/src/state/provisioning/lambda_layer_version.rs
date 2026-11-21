@@ -36,7 +36,13 @@ use super::{call_rest_json, percent_encoded, Created, Refusal};
 use crate::state::StoredResource;
 
 /// The resource type this module provisions.
-pub(super) const LAMBDA_LAYER_VERSION: &str = "AWS::Lambda::LayerVersion";
+///
+/// Reached from outside this module by the two catalogues the type's IDENTITY is keyed in:
+/// the one that says the identifier in force is the one AWS Lambda minted
+/// ([`crate::state::template::identity_is_service_assigned`]) and the one that says which of
+/// its properties a published version cannot take a new value for
+/// ([`CREATE_ONLY_PROPERTIES`]).
+pub(in crate::state) const LAMBDA_LAYER_VERSION: &str = "AWS::Lambda::LayerVersion";
 
 /// The SigV4 signing name of the service that owns it, which is what routes the in-process
 /// call to AWS Lambda's own handlers.
@@ -69,6 +75,16 @@ const LAYER_PROPERTIES: &[&str] = &[
     "LayerName",
     "LicenseInfo",
 ];
+
+/// The properties of the type a published version cannot take a NEW VALUE for while it goes on
+/// existing, so a declaration stating one of them differently asks for a DIFFERENT version —
+/// which CloudFormation replaces by publishing one
+/// ([`crate::state::template::replacement_properties`]).
+///
+/// Which is EVERY property the type publishes: a layer version cannot be changed at all, as
+/// this module's own header records — AWS Lambda publishes no call that edits one, and "each
+/// time you call PublishLayerVersion with the same layer name, a new version is created".
+pub(in crate::state) const CREATE_ONLY_PROPERTIES: &[&str] = LAYER_PROPERTIES;
 
 /// The properties that ARE `PublishLayerVersion`'s own body members under the same name, so
 /// the declared value travels into the request as written.

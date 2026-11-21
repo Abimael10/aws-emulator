@@ -304,9 +304,16 @@ pub(super) mod iot_provisioning_resources;
 pub(super) mod iot_topic_rule;
 mod lambda_alias;
 mod lambda_event_invoke_config;
-mod lambda_event_source_mapping;
+/// `AWS::Lambda::EventSourceMapping`: the mapping a stack declares, created in AWS Lambda
+/// itself. Visible to the rest of this service's state because the type's NAME and the
+/// properties a mapping cannot take a new value for live here, beside the arm that
+/// provisions it ([`lambda_event_source_mapping`]).
+pub(super) mod lambda_event_source_mapping;
 mod lambda_function;
-mod lambda_layer_version;
+/// `AWS::Lambda::LayerVersion`: the layer version a stack declares, published in AWS Lambda
+/// itself. Visible for the reason [`lambda_event_source_mapping`] is
+/// ([`lambda_layer_version`]).
+pub(super) mod lambda_layer_version;
 mod lambda_permission;
 /// The member catalogue every `AWS::Lambda::*` arm reads its declaration through, so a
 /// quoted number or boolean reaches AWS Lambda as the type that service models it as

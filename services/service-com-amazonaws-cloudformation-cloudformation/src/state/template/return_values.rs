@@ -787,6 +787,23 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // function version" embeds and which every call on the version takes as its
         // qualifier.
         || resource_type == LAMBDA_VERSION
+        // A LAYER VERSION is one more, for the reason [`lambda_layer_version`] records: "Ref
+        // returns the ARN of the layer version", and that ARN carries the VERSION NUMBER
+        // Lambda allocated ("each time you call PublishLayerVersion with the same layer name,
+        // a new version is created") — a template declares the layer's name and its content,
+        // never that number, and `GetLayerVersion`, `DeleteLayerVersion` and a function's own
+        // `Layers` each take the ARN carrying it.
+        || resource_type
+            == crate::state::provisioning::lambda_layer_version::LAMBDA_LAYER_VERSION
+        // An EVENT SOURCE MAPPING is one more, for the reason
+        // [`lambda_event_source_mapping`] records: `CreateEventSourceMapping` takes no
+        // identifier for the mapping — a declaration states the event source and the function
+        // it wires together — and answers the `UUID` Lambda assigned, which is what "Ref
+        // returns the event source mapping's ID" publishes and what `GetEventSourceMapping`,
+        // `UpdateEventSourceMapping` and `DeleteEventSourceMapping` each take. The type
+        // declares no name at all, so nothing else could say which mapping a re-deploy means.
+        || resource_type
+            == crate::state::provisioning::lambda_event_source_mapping::LAMBDA_EVENT_SOURCE_MAPPING
         // An AWS Step Functions state machine VERSION is the same case:
         // `PublishStateMachineVersion` takes no identifier for the version — the declaration
         // states the machine it is published from — and answers the ARN that service minted,

@@ -366,6 +366,29 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         crate::state::provisioning::ssm_patch_baseline::SSM_PATCH_BASELINE => {
             &["OperatingSystem"]
         }
+        // The event source an AWS Lambda EVENT SOURCE MAPPING reads, and how it reads it, are
+        // fixed when Lambda makes the mapping: each is a member of
+        // `CreateEventSourceMapping` and of no member of `UpdateEventSourceMapping`, and that
+        // service publishes no call that re-points a mapping at another source — so a
+        // declaration restating one of them asks for a DIFFERENT mapping, which
+        // CloudFormation replaces rather than updates. Every other property of the type is a
+        // member of that update, so stating one differently is a change to the mapping the
+        // stack already has
+        // ([`crate::state::provisioning::lambda_event_source_mapping::update`]). The type
+        // declares no name, so [`name_is_create_only`] has nothing to catch here.
+        crate::state::provisioning::lambda_event_source_mapping::LAMBDA_EVENT_SOURCE_MAPPING => {
+            crate::state::provisioning::lambda_event_source_mapping::CREATE_ONLY_PROPERTIES
+        }
+        // A LAYER VERSION cannot be changed at all: AWS Lambda publishes no call that edits
+        // one, and "each time you call PublishLayerVersion with the same layer name, a new
+        // version is created" — so every property of the type is create-only and a declaration
+        // restating any of them asks for a DIFFERENT version, which CloudFormation replaces by
+        // publishing one ([`crate::state::provisioning::lambda_layer_version`]). Its
+        // `LayerName` is among them for the same reason: the version is published UNDER that
+        // layer, and no call moves one to another layer.
+        crate::state::provisioning::lambda_layer_version::LAMBDA_LAYER_VERSION => {
+            crate::state::provisioning::lambda_layer_version::CREATE_ONLY_PROPERTIES
+        }
         // An event bus is created FOR a partner source or for nothing, and EventBridge
         // publishes no call that re-points one: `EventSourceName` is a member of
         // `CreateEventBus` and of no member of `UpdateEventBus`, so a declaration restating it

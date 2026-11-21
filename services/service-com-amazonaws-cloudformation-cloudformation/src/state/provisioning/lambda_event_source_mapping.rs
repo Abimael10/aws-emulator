@@ -40,7 +40,12 @@ use super::{
 use crate::state::StoredResource;
 
 /// The resource type this module provisions.
-pub(super) const LAMBDA_EVENT_SOURCE_MAPPING: &str = "AWS::Lambda::EventSourceMapping";
+///
+/// Reached from outside this module by the two catalogues the type's IDENTITY is keyed in:
+/// the one that says the identifier in force is the one AWS Lambda minted
+/// ([`crate::state::template::identity_is_service_assigned`]) and the one that says which of
+/// its properties a mapping cannot take a new value for ([`CREATE_ONLY_PROPERTIES`]).
+pub(in crate::state) const LAMBDA_EVENT_SOURCE_MAPPING: &str = "AWS::Lambda::EventSourceMapping";
 
 /// The SigV4 signing name of the service that owns it, which is what routes the in-process
 /// call to AWS Lambda's own handlers.
@@ -184,6 +189,31 @@ const UPDATE_MEMBERS: &[&str] = &[
     "ScalingConfig",
     "SourceAccessConfigurations",
     "TumblingWindowInSeconds",
+];
+
+/// The properties of the type a mapping cannot take a NEW VALUE for while it goes on
+/// existing, so a declaration stating one of them differently asks for a DIFFERENT mapping —
+/// which CloudFormation replaces rather than edits
+/// ([`crate::state::template::replacement_properties`]).
+///
+/// They are [`MAPPING_PROPERTIES`] less the ones `UpdateEventSourceMapping` takes a member for
+/// ([`UPDATE_MEMBERS`] and the `KmsKeyArn` that call spells `KMSKeyArn`), which this module's
+/// own test pins to those two lists so the published set cannot drift from the call it is read
+/// off. [`create_only_change`] is the one reader of it.
+///
+/// `Tags` is not among them: that call carries no tags member either, but Lambda's own
+/// `TagResource` and `UntagResource` take a mapping's tags, so a declaration restating them
+/// asks for no new mapping. No arm here calls them yet, so [`update`] still reports a
+/// tags-only revision as a change it did NOT apply rather than applying it in place — refused
+/// honestly rather than passed off as done. A tag arm is what settles that.
+pub(in crate::state) const CREATE_ONLY_PROPERTIES: &[&str] = &[
+    "EventSourceArn",
+    "Queues",
+    "SelfManagedEventSource",
+    "SelfManagedKafkaEventSourceConfig",
+    "StartingPosition",
+    "StartingPositionTimestamp",
+    "Topics",
 ];
 
 /// Create the mapping an `AWS::Lambda::EventSourceMapping` declares, in AWS Lambda itself —
@@ -485,14 +515,13 @@ async fn await_settled(
 const TRANSITIONAL_STATES: &[&str] = &["Creating", "Updating"];
 
 /// Whether this deployment changes a property that can only be set when the mapping is
-/// CREATED: a property `UpdateEventSourceMapping` takes no member for, which is why AWS
+/// CREATED ([`CREATE_ONLY_PROPERTIES`]), or the `Tags` no arm here applies to a mapping that
+/// already exists: a property `UpdateEventSourceMapping` takes no member for, which is why AWS
 /// replaces the mapping for such a change rather than editing it.
 fn create_only_change(existing: &Value, declared: &Value) -> bool {
-    MAPPING_PROPERTIES
+    CREATE_ONLY_PROPERTIES
         .iter()
-        .filter(|property| {
-            !UPDATE_MEMBERS.contains(*property) && **property != KMS_KEY_PROPERTY
-        })
+        .chain(::std::iter::once(&TAGS_PROPERTY))
         .any(|property| declared_in(declared, property) != declared_in(existing, property))
 }
 
@@ -585,6 +614,28 @@ mod tests {
                  {LAMBDA_EVENT_SOURCE_MAPPING}, got none"
             );
         }
+    }
+
+    /// The create-only properties the type publishes to CloudFormation are exactly the ones
+    /// [`create_only_change`] reads as create-only, tags apart — so the list a replacement is
+    /// judged by and the list the update arm applies cannot drift.
+    #[test]
+    fn the_create_only_properties_are_the_ones_the_update_call_cannot_take() {
+        let derived: Vec<&str> = MAPPING_PROPERTIES
+            .iter()
+            .filter(|property| {
+                !UPDATE_MEMBERS.contains(*property)
+                    && **property != KMS_KEY_PROPERTY
+                    && **property != TAGS_PROPERTY
+            })
+            .copied()
+            .collect();
+        assert_eq!(
+            CREATE_ONLY_PROPERTIES, derived,
+            "expected the published create-only properties to be the ones \
+             UpdateEventSourceMapping takes no member for, got {CREATE_ONLY_PROPERTIES:?} \
+             against {derived:?}"
+        );
     }
 
     /// A change to a property the update call takes is applied in place; a change to one it
