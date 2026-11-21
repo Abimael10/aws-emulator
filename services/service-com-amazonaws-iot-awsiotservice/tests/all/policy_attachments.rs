@@ -350,8 +350,9 @@ impl Emulator {
 }
 
 /// A target as ONE URI path segment: the `:` and `/` of an ARN travel as `%3A` and
-/// `%2F`, or the request addresses a different route.
-fn as_path_segment(target: &str) -> String {
+/// `%2F`, or the request addresses a different route. Shared with the principal-policy
+/// suites, which address the same listing route with the same targets.
+pub(crate) fn as_path_segment(target: &str) -> String {
     target.replace('%', "%25").replace(':', "%3A").replace('/', "%2F")
 }
 

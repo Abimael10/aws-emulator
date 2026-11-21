@@ -144,9 +144,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let _ = ctx;
 
-        // Every version the policy holds, oldest-first — the order the records are kept
-        // in — so a listing never reports more versions than the cap the create enforces.
-        // A name the account holds no policy under is the modelled
+        // Every version the policy holds, NEWEST-first — the order a reader of the
+        // listing takes `policyVersions[0]` as the policy's newest version in
+        // ([`crate::state::RegisteredPolicy::version_summaries`]) — so a listing never
+        // reports more versions than the cap the create enforces, nor one the policy no
+        // longer holds. A name the account holds no policy under is the modelled
         // `ResourceNotFoundException` (HTTP 404), never an empty list.
         let summaries = state
             .lock()

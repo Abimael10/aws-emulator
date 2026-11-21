@@ -2156,8 +2156,10 @@ pub struct RegisteredPolicy {
     pub policy_name: String,
     /// `arn:aws:iot:<region>:<account>:policy/<policyName>`, minted on create.
     pub policy_arn: String,
-    /// Every version that exists, keyed by its numeric `policyVersionId`. Ordered,
-    /// so `ListPolicyVersions` reads them oldest-first without sorting.
+    /// Every version that exists, keyed by its numeric `policyVersionId`. Ordered, so
+    /// the ids ascend and a reader walks them in either direction without sorting —
+    /// `ListPolicyVersions` reports them newest-first
+    /// ([`RegisteredPolicy::version_summaries`]).
     pub versions: BTreeMap<u32, PolicyVersion>,
     /// Which version is in effect — the `defaultVersionId` a reader reports and the
     /// version whose document `GetPolicy` hands back.

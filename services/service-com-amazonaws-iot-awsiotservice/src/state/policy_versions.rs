@@ -240,11 +240,17 @@ impl super::RegisteredPolicy {
             .is_ok_and(|version_id| version_id == self.default_version_id)
     }
 
-    /// Every version as `ListPolicyVersions` reports them, oldest-first — the order
-    /// the records are kept in, so a reader does not sort.
+    /// Every version as `ListPolicyVersions` reports them, NEWEST-first: the version a
+    /// caller just created, or is about to point the policy at, is the one it reads at the
+    /// head of the list, and the oldest version it still holds is at the tail.
+    ///
+    /// The records are kept oldest-first (the ids ascend, [`RegisteredPolicy::versions`]),
+    /// so the reporting order is that order walked backwards; a version the policy no
+    /// longer holds is in neither.
     pub fn version_summaries(&self) -> Vec<ModeledPolicyVersion> {
         self.versions
             .iter()
+            .rev()
             .map(|(version_id, version)| ModeledPolicyVersion {
                 version_id: Some(version_id.to_string()),
                 is_default_version: *version_id == self.default_version_id,

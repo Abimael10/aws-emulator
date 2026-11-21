@@ -124,6 +124,9 @@ ipnet = "2"
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs` from `tests/all/main.rs`, so a new
+# integration-test suite is a new file and nothing lists it.
+automod = { workspace = true }
 # `tokio::time` drives the tests' wait past a stream's activation transition.
 tokio = { workspace = true, features = ["time"] }# The rules-engine tests observe a rule's action where a client observes it, so the
 # services a `kinesis` action reaches are mounted beside IoT on one engine: the data plane

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DetachPrincipalPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DetachPrincipalPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DetachPrincipalPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The deprecated twin of `DetachPolicy`: "Removes the specified policy from the
+//! specified certificate … Use DetachPolicy instead". It is the SAME removal from the
+//! one policy-attachment relation this service's state keeps
+//! (`crate::state::policy_attachments`) that `AttachPrincipalPolicy` records into and
+//! both attachment listings read, so a pair recorded under either name is removed under
+//! either name.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +169,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DetachPrincipalPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DetachPrincipalPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DetachPrincipalPolicy"))
+        // Every principal this removal names was minted when its resource was created,
+        // so the write needs no request metadata of its own.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DetachPrincipalPolicyErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+
+        // The principal is resolved against this account's state, the way the attach
+        // under this same name resolves it: a principal of no supported form names no
+        // resource at all, so there is nothing it could be detached from — the modelled
+        // `InvalidRequestException` (HTTP 400) — and a well-formed one naming a resource
+        // this account does not hold is the modelled `ResourceNotFoundException`
+        // (HTTP 404), the miss this deprecated operation models and its modern twin does
+        // not.
+        let resolved = match store.resolve_policy_target(&input.principal) {
+            Ok(resolved) => resolved,
+            Err(crate::state::PolicyTargetRefusal::Invalid(message)) => {
+                return Err(DetachPrincipalPolicyErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+            Err(crate::state::PolicyTargetRefusal::NotFound(message)) => {
+                return Err(DetachPrincipalPolicyErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // Whether the pair was recorded is not reported: the removal is IDEMPOTENT, so a
+        // detach of a pair the relation does not hold leaves it unchanged and still
+        // answers 200 — the state the caller asked for (this policy is not attached to
+        // this principal) is the state that holds afterwards. That is also why a policy
+        // name the account holds no policy under is not resolved here: nothing is
+        // attached under it either way.
+        store
+            .policy_attachments
+            .detach(&resolved.key, &input.policy_name);
+
+        // The operation's output shape is `Unit`: the removal is the whole effect, and
+        // the next `ListAttachedPolicies` / `ListTargetsForPolicy` no longer reports the
+        // pair — so the principal this was the last policy of, and the policy no target
+        // names any more, are deletable again.
+        Ok(DetachPrincipalPolicyOutput)
     }
 }

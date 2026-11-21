@@ -278,11 +278,12 @@ async fn versions_accumulate_up_to_the_cap_and_no_further() {
         .map(|version| version["versionId"].as_str().unwrap_or_default().to_string())
         .collect();
     let expected_ids: Vec<String> = (1..=MAX_POLICY_VERSIONS)
+        .rev()
         .map(|index| index.to_string())
         .collect();
     assert_eq!(
         ids, expected_ids,
-        "case the listing: expected the versions oldest-first, got {ids:?}"
+        "case the listing: expected the versions newest-first, got {ids:?}"
     );
     let defaults: Vec<&Value> = versions
         .iter()
@@ -642,6 +643,7 @@ async fn version_ids_are_never_reused_and_the_cap_counts_versions_held() {
         })
         .collect();
     let expected_ids: Vec<String> = (1..=MAX_POLICY_VERSIONS + 1)
+        .rev()
         .filter(|index| *index != 2)
         .map(|index| index.to_string())
         .collect();
