@@ -368,8 +368,24 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 # socket tests open on this emulator's own core: its protocol handler reads and writes the
 # connection the core hands it. `test-util` for the PAUSED clock a unit test over the poll
 # loop's own wait runs on, so the case that lets the loop's interval run out advances virtual
-# time instead of sleeping (`state::sqs_poller`).
-tokio = { workspace = true, features = ["io-util", "test-util", "time"] }
+# time instead of sleeping (`state::sqs_poller`). `net` for the socket a client of a
+# WEBSOCKET api's data plane dials, which is a TCP connection to this emulator's own listener.
+tokio = { workspace = true, features = ["io-util", "net", "test-util", "time"] }
+# API Gateway V2, mounted beside lambda on ONE engine: a function fronting the routes of a
+# WEBSOCKET api is invoked by that api's data plane, and the reply it pushes back travels
+# through the `@connections` surface that api publishes, so the backend-response lifecycle is
+# driven against the service that owns the socket.
+service-com-amazonaws-apigatewayv2-apigatewayv2 = { workspace = true }
+# And the `@connections` management API beside it (signing name `execute-api`): the reply a
+# WEBSOCKET backend pushes back to its caller is a call of THAT service, which the handler's own
+# SDK makes over the in-process seam, so it has to be mounted for the push to reach anything.
+service-com-amazonaws-apigatewaymanagementapi-apigatewaymanagementapi = { workspace = true }
+# The RFC 6455 WebSocket protocol, CLIENT side: that data plane is a socket, so the client
+# half of the conversation — the opening handshake, the masking of every frame, the accept
+# value it verifies and the closing handshake — is this maintained implementation rather than
+# anything hand-written. The same version, and the same `client_async` seam, the API Gateway
+# V2 crate's own socket suites drive. `handshake` only.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 # The services a mapping's event source and its own metrics live in are mounted beside
 # lambda on ONE engine in the data-plane tests, because a delivery is asserted where a
 # client sees it: on the stream the records were put to, and in the series CloudWatch
