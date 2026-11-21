@@ -419,13 +419,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteCluster<Eng
         // The configuration a final snapshot captures is the cluster as it stood
         // when this call arrived, admin credentials included: a restore from
         // that snapshot rebuilds exactly this cluster. Cloned before the record
-        // is marked `deleting` and its password dropped.
-        let source = final_identifier.as_ref().map(|_| removed.clone());
+        // is marked `deleting` and its password dropped — and WITHOUT the
+        // cluster's open endpoint, which dies with the cluster: a snapshot is a
+        // copy of a cluster's configuration and data, never a holder of the
+        // socket it was served on, and the credentials issued against that
+        // cluster expire with it.
+        let source = final_identifier.as_ref().map(|_| {
+            let mut source = removed.clone();
+            source.endpoint_plane = None;
+            source.issued_credentials = Vec::new();
+            source
+        });
         removed.cluster.cluster_status = Some(st::STATUS_DELETING.to_string());
         removed.cluster.cluster_availability_status =
             Some(st::availability_status(st::STATUS_DELETING).to_string());
         // The stored password dies with the record.
         removed.master_user_password = None;
+        // So does the listener the cluster's database was served on: the record
+        // this call reports is the one that is going away, and the port closes
+        // with it.
+        removed.endpoint_plane = None;
+        removed.issued_credentials = Vec::new();
 
         if let Some(identifier) = final_identifier {
             let snapshot = st::snapshot_of(

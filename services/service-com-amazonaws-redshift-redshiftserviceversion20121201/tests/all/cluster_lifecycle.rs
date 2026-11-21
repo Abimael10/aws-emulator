@@ -1191,15 +1191,24 @@ async fn the_cluster_lifecycle_is_consistent_across_calls() {
     let address = described
         .text("Address")
         .expect("case describe demo-cluster: an available cluster publishes its endpoint");
-    assert!(
-        address.starts_with("demo-cluster.") && address.ends_with(".redshift.amazonaws.com"),
-        "case describe demo-cluster: expected a Redshift endpoint host for the identifier, got {address:?}"
-    );
     assert_eq!(
-        described.text("Port").as_deref(),
-        Some("5439"),
-        "case describe demo-cluster: expected the default port 5439, got {:?}",
-        described.text("Port")
+        address, "127.0.0.1",
+        "case describe demo-cluster: expected the address this emulator serves the cluster's \
+         database on, got {address:?}"
+    );
+    let port = described
+        .text("Port")
+        .and_then(|port| port.parse::<u16>().ok())
+        .unwrap_or_else(|| {
+            panic!(
+                "case describe demo-cluster: expected the endpoint port, got body {}",
+                described.body
+            )
+        });
+    assert!(
+        port != 0,
+        "case describe demo-cluster: expected the port the cluster's listener is bound to, got \
+         {port}"
     );
 
     // MODIFY — the mutation persists and a later describe shows it.
@@ -1256,7 +1265,10 @@ async fn the_cluster_lifecycle_is_consistent_across_calls() {
         ("NodeType", "ra3.xlplus"),
         ("MasterUsername", "admin"),
         ("DBName", "dev"),
-        ("Port", "5439"),
+        // `Snapshot$Port` is "the port that the cluster is listening on", so it
+        // is the port the source cluster's endpoint publishes — the one its
+        // listener is bound to, read off the cluster above rather than assumed.
+        ("Port", port.to_string().as_str()),
     ] {
         assert_eq!(
             snapshot.text(member).as_deref(),
@@ -2301,9 +2313,9 @@ async fn a_rename_re_keys_the_cluster_and_keeps_its_namespace() {
     let namespace = created
         .text("ClusterNamespaceArn")
         .expect("case create: the cluster reports a namespace ARN");
-    // The endpoint is published once the cluster is serving, so the hostname a
-    // rename moves is read past the provisioning span — crossed by advancing
-    // this emulator's own clock rather than by waiting for it.
+    // The endpoint is published once the cluster is serving, so the address a
+    // rename leaves in place is read past the provisioning span — crossed by
+    // advancing this emulator's own clock rather than by waiting for it.
     emulator.advance_clock(state::PROVISIONING_SPAN);
     let serving = emulator
         .call("DescribeClusters", &[("ClusterIdentifier", "rename-me")])
@@ -2311,6 +2323,9 @@ async fn a_rename_re_keys_the_cluster_and_keeps_its_namespace() {
     let original_address = serving
         .text("Address")
         .expect("case create: an available cluster reports an endpoint address");
+    let original_port = serving
+        .text("Port")
+        .expect("case create: an available cluster reports an endpoint port");
 
     let taken = emulator.create_minimal("already-there").await;
     assert_eq!(taken.status, 200, "case create collision target: {}", taken.body);
@@ -2363,18 +2378,19 @@ async fn a_rename_re_keys_the_cluster_and_keeps_its_namespace() {
         "case rename: the namespace ARN identifies the cluster and must survive, got {:?}",
         now.text("ClusterNamespaceArn")
     );
+    // The cluster is SERVED on the socket its listener was opened on, which a
+    // rename does not move and a `Port` cannot rebind: the endpoint a client
+    // dials stays exactly where it is, so its sessions survive the rename.
     assert_eq!(
-        now.text("Port").as_deref(),
-        Some("5555"),
-        "case rename: the new port must persist, got {:?}",
+        (now.text("Address"), now.text("Port")),
+        (
+            Some(original_address.clone()),
+            Some(original_port.clone())
+        ),
+        "case rename: expected the endpoint the cluster is served on to stay \
+         {original_address}:{original_port}, got {:?}:{:?}",
+        now.text("Address"),
         now.text("Port")
-    );
-    let new_address = now
-        .text("Address")
-        .expect("case rename: the renamed cluster reports an endpoint address");
-    assert!(
-        new_address.starts_with("renamed.") && new_address != original_address,
-        "case rename: the endpoint hostname carries the new name, got {new_address:?} (was {original_address:?})"
     );
 
     let unknown = emulator

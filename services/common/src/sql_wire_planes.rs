@@ -13,7 +13,9 @@
 //! the connection caps), the address and port the resource publishes are that
 //! listener's own, and the connections accepted on it are served by the server
 //! half of the engine's wire ([`mysql_wire`], [`pg_wire`]) over the database's
-//! own engine ([`sql_engine`]).
+//! own engine ([`sql_engine`]). A credential the control plane MINTED for that
+//! database logs on to it too ([`IssuedCredential`]), for as long as the
+//! service reports it as valid.
 //!
 //! Both wires negotiate encryption IN BAND — a MySQL server sends its greeting
 //! in the clear and upgrades on the client's `CLIENT_SSL` answer, and
@@ -164,6 +166,50 @@ pub trait ServedDatabase: Send + Sync + 'static {
     /// that has been deleted serves no session, and the client is told the
     /// server is going away rather than served from a record nobody holds.
     fn facts(&self) -> Option<DatabaseFacts>;
+
+    /// The credentials the owning service has ISSUED for this database beside
+    /// its master user's and that are still valid, read per login like
+    /// [`ServedDatabase::facts`].
+    ///
+    /// A service whose control plane mints temporary database credentials
+    /// answers them here; one that authenticates only its master user leaves
+    /// this as it stands and nothing else is admitted.
+    fn issued_credentials(&self) -> Vec<IssuedCredential> {
+        Vec::new()
+    }
+}
+
+/// One credential the OWNING SERVICE issued for a database beside its master
+/// user's, and that its engine therefore authenticates.
+///
+/// A control plane that mints temporary database credentials promises a LOGIN:
+/// the user name and password it answered log on to that database until they
+/// expire. So the service holds what it issued and reports the ones still valid
+/// through [`ServedDatabase::issued_credentials`] — one whose lifetime has run
+/// out is simply not reported, which is what keeps the admission decision below
+/// free of a clock of its own.
+#[derive(Clone)]
+pub struct IssuedCredential {
+    /// The database user this credential logs on as, exactly as the control
+    /// plane answered it.
+    pub user: String,
+    /// The secret that proves it.
+    pub password: String,
+    /// The database it was issued for, and `None` for one scoped to no
+    /// database, which may log on to any database the engine holds.
+    pub database: Option<String>,
+}
+
+/// Written by hand rather than derived: the issued secret is a secret and no
+/// formatter writes it.
+impl std::fmt::Debug for IssuedCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IssuedCredential")
+            .field("user", &self.user)
+            .field("database", &self.database)
+            .finish_non_exhaustive()
+    }
 }
 
 /// What one session on a database's endpoint is served from.
@@ -206,6 +252,13 @@ impl SessionContext {
     #[must_use]
     pub fn facts(&self) -> Option<DatabaseFacts> {
         self.served.facts()
+    }
+
+    /// The credentials the owning service has issued for this database and that
+    /// are still valid ([`ServedDatabase::issued_credentials`]).
+    #[must_use]
+    pub fn issued_credentials(&self) -> Vec<IssuedCredential> {
+        self.served.issued_credentials()
     }
 }
 
@@ -305,24 +358,74 @@ pub fn admit(
     database: Option<&str>,
     proof: &PasswordProof<'_>,
 ) -> Result<String, LoginRefusal> {
+    admit_issued(facts, &[], user, database, proof)
+}
+
+/// Admit one login against the stored resource AND the credentials its owning
+/// service has issued for it, answering the database the session is on.
+///
+/// [`admit`] widened by the second way a database authenticates a session: a
+/// credential the control plane MINTED for it ([`IssuedCredential`]). The rules
+/// are otherwise the one decision both wires make — the engine has to be
+/// running, the credential presented has to be the resource's master user with
+/// its current password or one of the issued credentials still valid for the
+/// database asked for, and the database asked for has to be the one the engine
+/// holds, with a login that names none served the master database.
+pub fn admit_issued(
+    facts: &DatabaseFacts,
+    issued: &[IssuedCredential],
+    user: &str,
+    database: Option<&str>,
+    proof: &PasswordProof<'_>,
+) -> Result<String, LoginRefusal> {
     if !facts.is_serving() {
         return Err(LoginRefusal::NotServing {
             serving: facts.serving,
         });
     }
-    if user != facts.master_username || !proof.proves(&facts.master_user_password) {
-        return Err(LoginRefusal::AuthenticationFailed {
-            user: user.to_string(),
-            password_given: proof.carries_a_password(),
+    let named = database.filter(|named| !named.is_empty());
+    let authentication_failed = || LoginRefusal::AuthenticationFailed {
+        user: user.to_string(),
+        password_given: proof.carries_a_password(),
+    };
+    // Which database the session lands on when it names none: the master
+    // database for the master user, and for an issued credential the database
+    // it was issued for — one issued for none leaves the master database, which
+    // is the database the create made inside the engine.
+    //
+    // A resource whose master password this service does not HOLD (one whose
+    // control plane keeps it elsewhere) authenticates no master login at all,
+    // rather than admitting the empty password as that user's.
+    let default_database = if !facts.master_user_password.is_empty()
+        && user == facts.master_username
+        && proof.proves(&facts.master_user_password)
+    {
+        facts.master_database_name.clone()
+    } else {
+        issued
+            .iter()
+            // A credential issued FOR a database authenticates a session on
+            // that database and on no other.
+            .filter(|credential| {
+                credential.user == user
+                    && match (credential.database.as_deref(), named) {
+                        (Some(scope), Some(named)) => scope == named,
+                        _ => true,
+                    }
+            })
+            .find(|credential| proof.proves(&credential.password))
+            .ok_or_else(authentication_failed)?
+            .database
+            .clone()
+            .unwrap_or_else(|| facts.master_database_name.clone())
+    };
+    let session_database = named.map_or(default_database, str::to_string);
+    if session_database != facts.master_database_name {
+        return Err(LoginRefusal::UnknownDatabase {
+            database: session_database,
         });
     }
-    match database {
-        None | Some("") => Ok(facts.master_database_name.clone()),
-        Some(named) if named == facts.master_database_name => Ok(named.to_string()),
-        Some(named) => Err(LoginRefusal::UnknownDatabase {
-            database: named.to_string(),
-        }),
-    }
+    Ok(session_database)
 }
 
 /// One database's open data plane: where it answers, what answers there, and
@@ -603,6 +706,163 @@ mod tests {
                 answer,
                 Err(LoginRefusal::NotServing { serving }),
                 "case {serving:?}: expected the refusal to carry the state, got {answer:?}"
+            );
+        }
+    }
+
+    /// The credentials an owning service has issued for the database
+    /// [`serving_facts`] describes: one scoped to the database the engine holds,
+    /// and one scoped to no database at all.
+    fn issued_credentials() -> Vec<IssuedCredential> {
+        vec![
+            IssuedCredential {
+                user: "IAMA:analyst".to_string(),
+                password: "temporary-pw-scoped".to_string(),
+                database: Some("appdb".to_string()),
+            },
+            IssuedCredential {
+                user: "IAM:auditor".to_string(),
+                password: "temporary-pw-unscoped".to_string(),
+                database: None,
+            },
+        ]
+    }
+
+    /// One issued-credential case: the user, the secret it presents, the
+    /// database it asks for, and what the decision answers.
+    type IssuedCase<'a> = (
+        &'a str,
+        &'a str,
+        &'a str,
+        Option<&'a str>,
+        Result<&'a str, LoginRefusal>,
+    );
+
+    /// RULE: a credential the owning service ISSUED for a database is admitted
+    /// on it beside the master user's, on the database it was issued for and no
+    /// other — and a resource whose master password this service does not hold
+    /// authenticates no master login at all.
+    ///
+    /// The rows span what the decision generalises over: an issued credential
+    /// with and without a database of its own, each on the database it names and
+    /// on another, a user no credential was issued for, an issued user with the
+    /// wrong secret, and the empty stored master password with the empty proof.
+    #[test]
+    fn an_issued_credential_is_admitted_on_the_database_it_was_issued_for() {
+        let facts = serving_facts();
+        let issued = issued_credentials();
+        // (case, the user, the secret, the database asked for, what is admitted)
+        let rows: Vec<IssuedCase<'_>> = vec![
+            (
+                "an issued credential on the database it was issued for",
+                "IAMA:analyst",
+                "temporary-pw-scoped",
+                Some("appdb"),
+                Ok("appdb"),
+            ),
+            (
+                "an issued credential naming no database, served the one it was issued for",
+                "IAMA:analyst",
+                "temporary-pw-scoped",
+                None,
+                Ok("appdb"),
+            ),
+            (
+                "an issued credential scoped to no database, served the master database",
+                "IAM:auditor",
+                "temporary-pw-unscoped",
+                None,
+                Ok("appdb"),
+            ),
+            (
+                "an issued credential on another database",
+                "IAMA:analyst",
+                "temporary-pw-scoped",
+                Some("other"),
+                Err(LoginRefusal::AuthenticationFailed {
+                    user: "IAMA:analyst".to_string(),
+                    password_given: true,
+                }),
+            ),
+            (
+                "an unscoped credential on a database the engine does not hold",
+                "IAM:auditor",
+                "temporary-pw-unscoped",
+                Some("other"),
+                Err(LoginRefusal::UnknownDatabase {
+                    database: "other".to_string(),
+                }),
+            ),
+            (
+                "an issued credential with the wrong secret",
+                "IAMA:analyst",
+                "not-it",
+                Some("appdb"),
+                Err(LoginRefusal::AuthenticationFailed {
+                    user: "IAMA:analyst".to_string(),
+                    password_given: true,
+                }),
+            ),
+            (
+                "a user no credential was issued for, with an issued secret",
+                "IAM:someone",
+                "temporary-pw-scoped",
+                Some("appdb"),
+                Err(LoginRefusal::AuthenticationFailed {
+                    user: "IAM:someone".to_string(),
+                    password_given: true,
+                }),
+            ),
+            (
+                "the master user, still admitted beside what was issued",
+                "dbadmin",
+                "Pw9#xZq!shared",
+                Some("appdb"),
+                Ok("appdb"),
+            ),
+        ];
+        for (case, user, password, database, want) in rows {
+            let answer = admit_issued(
+                &facts,
+                &issued,
+                user,
+                database,
+                &PasswordProof::Cleartext(password),
+            );
+            let want = want.map(str::to_string);
+            assert_eq!(
+                answer, want,
+                "case {case:?}: expected {want:?}, got {answer:?}"
+            );
+        }
+    }
+
+    /// RULE: a resource whose master password this service does not HOLD
+    /// authenticates no master login, however the login presents itself — the
+    /// empty password is not that user's.
+    #[test]
+    fn a_resource_whose_master_password_is_not_held_admits_no_master_login() {
+        let facts = DatabaseFacts {
+            master_user_password: String::new(),
+            ..serving_facts()
+        };
+        for (case, password) in [
+            ("the empty password", ""),
+            ("any password at all", "anything"),
+        ] {
+            let answer = admit(
+                &facts,
+                &facts.master_username,
+                Some(&facts.master_database_name),
+                &PasswordProof::Cleartext(password),
+            );
+            assert_eq!(
+                answer,
+                Err(LoginRefusal::AuthenticationFailed {
+                    user: facts.master_username.clone(),
+                    password_given: !password.is_empty(),
+                }),
+                "case {case:?}: expected the login to be refused, got {answer:?}"
             );
         }
     }

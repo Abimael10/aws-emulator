@@ -214,6 +214,25 @@ async fn describe(emulator: &Emulator, identifier: &str) -> Answer {
         .await
 }
 
+/// The cluster `identifier` as `DescribeClusters` reports it once it is
+/// `available`.
+///
+/// The wait is on the CONDITION a client has to see before it connects, looked
+/// for again through the harness's own poll loop until it holds or a deadline
+/// far longer than the span this service owes the transition in has passed — so
+/// a slow or loaded host only costs it more polls.
+async fn describe_when_available(emulator: &Emulator, identifier: &str) -> Answer {
+    let (answer, _polls) = emulator
+        .poll_until(
+            identifier,
+            "DescribeClusters",
+            &[("ClusterIdentifier", identifier)],
+            |answer| answer.text("ClusterStatus").as_deref() == Some(state::STATUS_AVAILABLE),
+        )
+        .await;
+    answer
+}
+
 #[tokio::test]
 async fn a_restore_rebuilds_the_captured_configuration_under_the_new_identifier() {
     let (emulator, _) = seeded_emulator().await;
@@ -341,8 +360,7 @@ async fn a_restore_rebuilds_the_captured_configuration_under_the_new_identifier(
 
     // The clock owes the restored cluster its `available` state, and the restore
     // is complete exactly when the cluster is.
-    tokio::time::sleep(state::PROVISIONING_SPAN + Duration::from_millis(250)).await;
-    let settled = describe(&emulator, target).await;
+    let settled = describe_when_available(&emulator, target).await;
     assert_eq!(
         settled.text("ClusterStatus").as_deref(),
         Some(state::STATUS_AVAILABLE),
@@ -356,19 +374,28 @@ async fn a_restore_rebuilds_the_captured_configuration_under_the_new_identifier(
         all_text(&settled.body, "Status")
     );
     // Serving at last, so the restored cluster publishes its endpoint: the
-    // hostname of the NEW identifier, on the port the snapshot captured
-    // ("Default: The same port as the original cluster").
+    // address and port its OWN database is served on, which this emulator
+    // answers at.
     assert_eq!(
         settled.text("Address").as_deref(),
-        Some(state::endpoint_address(target, REGION).as_str()),
-        "case settled {target}: expected the endpoint host of the new identifier, got {:?}",
+        Some("127.0.0.1"),
+        "case settled {target}: expected the address this emulator serves the restored cluster \
+         on, got {:?}",
         settled.text("Address")
     );
-    assert_eq!(
-        settled.text("Port").as_deref(),
-        Some("8191"),
-        "case settled {target}: expected the captured port once serving, got {:?}",
-        settled.text("Port")
+    let port = settled
+        .text("Port")
+        .and_then(|port| port.parse::<u16>().ok())
+        .unwrap_or_else(|| {
+            panic!(
+                "case settled {target}: expected the endpoint port, got body {}",
+                settled.body
+            )
+        });
+    assert!(
+        port != 0,
+        "case settled {target}: expected the port the restored cluster's listener is bound to, \
+         got {port}"
     );
 }
 
@@ -518,9 +545,10 @@ async fn a_request_member_overrides_the_captured_value() {
         }
     }
 
-    // The PORT a request overrides is part of the connection endpoint, which a
-    // cluster still being restored publishes none of — so the override is
-    // observed once the restored cluster is serving.
+    // The connection endpoint a restored cluster publishes is the socket this
+    // emulator SERVES its database on, so a `Port` the request names binds
+    // nothing: what the cluster announces, once it is serving, is the address
+    // and port its own listener answers at.
     let ported = restore(&emulator, "restored-port", &[("Port", "5455")]).await;
     assert_eq!(
         ported.status, 200,
@@ -533,18 +561,24 @@ async fn a_request_member_overrides_the_captured_value() {
         "case port: expected no endpoint port while restoring, got {:?}",
         ported.text("Port")
     );
-    tokio::time::sleep(state::PROVISIONING_SPAN + Duration::from_millis(250)).await;
-    let serving = describe(&emulator, "restored-port").await;
-    assert_eq!(
-        serving.text("Port").as_deref(),
-        Some("5455"),
-        "case port: expected the overriding port once the cluster is serving, got {:?}",
-        serving.text("Port")
+    let serving = describe_when_available(&emulator, "restored-port").await;
+    let port = serving
+        .text("Port")
+        .and_then(|port| port.parse::<u16>().ok())
+        .unwrap_or_else(|| {
+            panic!(
+                "case port: expected an endpoint port once the cluster is serving, got body {}",
+                serving.body
+            )
+        });
+    assert!(
+        port != 0,
+        "case port: expected the port the restored cluster's listener is bound to, got {port}"
     );
     assert_eq!(
         serving.text("Address").as_deref(),
-        Some(state::endpoint_address("restored-port", REGION).as_str()),
-        "case port: expected the endpoint host of the new identifier, got {:?}",
+        Some("127.0.0.1"),
+        "case port: expected the address this emulator serves the cluster on, got {:?}",
         serving.text("Address")
     );
 }

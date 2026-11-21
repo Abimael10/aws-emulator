@@ -345,9 +345,10 @@ async fn a_reported_cluster_carries_every_member_derived_from_its_configuration(
     }
 
     // Once every row's cluster is serving it publishes its connection endpoint:
-    // the hostname that carries its own name, the port it listens on and the VPC
-    // interface endpoint it is reached through, whose network interface is in the
-    // cluster's own Availability Zone.
+    // the address and port its database is SERVED on — this emulator's own
+    // loopback interface and the port the core assigned that cluster's listener
+    // — and the VPC interface endpoint it is reached through, whose network
+    // interface is in the cluster's own Availability Zone.
     emulator.advance_clock(state::PROVISIONING_SPAN);
     for (index, case) in cases.iter().enumerate() {
         let name = case.case;
@@ -358,16 +359,18 @@ async fn a_reported_cluster_carries_every_member_derived_from_its_configuration(
         let address = serving
             .text("Address")
             .unwrap_or_else(|| panic!("case {name}: expected an endpoint address once serving, got {}", serving.body));
-        assert!(
-            address.starts_with(&format!("{identifier}."))
-                && address.ends_with(".redshift.amazonaws.com"),
-            "case {name}: expected a Redshift endpoint host for the identifier, got {address:?}"
-        );
         assert_eq!(
-            serving.text("Port").as_deref(),
-            Some(state::DEFAULT_PORT.to_string().as_str()),
-            "case {name}: expected the default port, got {:?}",
-            serving.text("Port")
+            address, "127.0.0.1",
+            "case {name}: expected the address this emulator serves the cluster on, got \
+             {address:?}"
+        );
+        let port = serving
+            .text("Port")
+            .and_then(|port| port.parse::<u16>().ok())
+            .unwrap_or_else(|| panic!("case {name}: expected an endpoint port, got {}", serving.body));
+        assert!(
+            port != 0,
+            "case {name}: expected the port the cluster's listener is bound to, got {port}"
         );
         let endpoint_id = serving
             .text("VpcEndpointId")

@@ -284,7 +284,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateClusterSnap
         let mut store = state.lock();
         store.settle(started);
 
-        let Some(stored_cluster) = store.cluster(&input.cluster_identifier).cloned() else {
+        // The cluster as it stands now, WITHOUT the socket its database is
+        // served on: a snapshot is a copy of a cluster's configuration and data,
+        // never a holder of that cluster's listener or of the temporary
+        // credentials issued against it.
+        let Some(stored_cluster) = store
+            .cluster(&input.cluster_identifier)
+            .cloned()
+            .map(|mut stored| {
+                stored.endpoint_plane = None;
+                stored.issued_credentials = Vec::new();
+                stored
+            })
+        else {
             return Err(CreateClusterSnapshotErrorModeled::ClusterNotFoundFault(
                 ClusterNotFoundFault {
                     message: Some(st::cluster_not_found_message(

@@ -19043,6 +19043,7 @@ dependencies = [
  "cron",
  "hex",
  "http",
+ "rustls",
  "serde_json",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
  "service-com-amazonaws-dynamodb-dynamodb-20120810",
@@ -19058,6 +19059,7 @@ dependencies = [
  "service-common",
  "sha2 0.10.9",
  "tokio",
+ "tokio-rustls",
  "tracing",
 ]
 

@@ -73,14 +73,14 @@ impl Clock {
 /// touches nothing else, so it is safe to read while another store's guard is held.
 #[must_use]
 pub fn now<Eng: Send + Sync + 'static>(engine: &Eng) -> Instant {
-    clock(engine).map_or_else(Instant::now, |clock| clock.lock().now())
+    clock_store(engine).map_or_else(Instant::now, |clock| clock.lock().now())
 }
 
 /// Stop this emulator's clock where it stands, so no transition it owes falls due until
 /// [`advance`] brings it there; answers the instant the clock now stands at, and `None` on an
 /// engine that holds no store to stop.
 pub fn stop<Eng: Send + Sync + 'static>(engine: &Eng) -> Option<Instant> {
-    clock(engine).map(|clock| clock.lock().stop())
+    clock_store(engine).map(|clock| clock.lock().stop())
 }
 
 /// Move this emulator's clock on by `span`, stopping it first if it is still running — which
@@ -90,12 +90,19 @@ pub fn stop<Eng: Send + Sync + 'static>(engine: &Eng) -> Option<Instant> {
 /// recorded, an advance by a whole span always crosses a due instant an earlier call
 /// recorded, whatever the host was doing in between.
 pub fn advance<Eng: Send + Sync + 'static>(engine: &Eng, span: Duration) -> Option<Instant> {
-    clock(engine).map(|clock| clock.lock().advance(span))
+    clock_store(engine).map(|clock| clock.lock().advance(span))
 }
 
 /// This emulator's clock store, or `None` when `engine` is not the shared in-memory engine
 /// (which only a test harness of this workspace can arrange).
-fn clock<Eng: Send + Sync + 'static>(engine: &Eng) -> Option<::engine::ServiceState<Clock>> {
+///
+/// The one place the engine is resolved to the clock: a holder that reads time WITHOUT a
+/// request of its own — a data plane's session, a background task — keeps this handle rather
+/// than writing the downcast again, and reads [`Clock::now`] through it.
+#[must_use]
+pub fn clock_store<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<Clock>> {
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<Clock>)

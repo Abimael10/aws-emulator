@@ -6,7 +6,7 @@
 //! A stock client (PyMySQL, libmysqlclient, a JDBC driver) connects to the
 //! published address and port and speaks this. What it gets is this emulator's
 //! own state: the greeting names the engine version the resource publishes, the
-//! login is admitted against the stored resource ([`super::admit`]), and every
+//! login is admitted against the stored resource ([`super::admit_issued`]), and every
 //! statement is run by that database's own SQL engine
 //! ([`super::sql_engine`]).
 //!
@@ -34,7 +34,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::session::Session;
 use super::sql_engine::{Cell, Column, EngineError, EngineErrorKind, ResultSet};
 use super::{
-    admit, client_host, DatabaseFacts, EngineWire, LoginRefusal, PasswordProof, ServingState,
+    admit_issued, client_host, DatabaseFacts, EngineWire, LoginRefusal, PasswordProof, ServingState,
     SessionContext,
 };
 
@@ -216,7 +216,13 @@ async fn serve_login(
         nonce,
         response: &login.auth_response,
     };
-    let database = match admit(&facts, &login.user, login.database.as_deref(), &proof) {
+    let database = match admit_issued(
+        &facts,
+        &context.issued_credentials(),
+        &login.user,
+        login.database.as_deref(),
+        &proof,
+    ) {
         Ok(database) => database,
         Err(refusal) => {
             let (number, state, message) = refusal_sentence(&refusal);

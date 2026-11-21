@@ -253,9 +253,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // sleeps for it.
         stored.cluster.cluster_status = Some(st::STATUS_MODIFYING.to_string());
         stored.available_at = started + st::PROVISIONING_SPAN;
-        // The connection endpoint's ADDRESS does not move — it is the cluster's
-        // own ([`st::endpoint_address`]) and a client keeps using it across a
-        // failover, which is what deploying the cluster in two zones is for — but
+        // The connection endpoint's ADDRESS does not move — it is the socket the
+        // cluster is served on ([`st::attach_cluster_endpoint`]) and a client
+        // keeps using it across a failover, which is what deploying the cluster
+        // in two zones is for — but
         // the interface the cluster is reached through is in the zone the cluster
         // now serves from, so the VPC endpoint is re-derived there through the one
         // rule every cluster's VPC endpoints come from.

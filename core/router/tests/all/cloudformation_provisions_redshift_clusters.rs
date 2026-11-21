@@ -214,7 +214,11 @@ const ROWS: &[Row] = &[
             ("NodeType", "ra3.xlplus"),
             ("AutomatedSnapshotRetentionPeriod", "7"),
             ("PreferredMaintenanceWindow", "wed:04:00-wed:04:30"),
-            ("Port", "5555"),
+            // The declared `Port` is deliberately NOT in this list: the port a
+            // cluster publishes is the one its own database engine is listening
+            // on, which Amazon Redshift's listener was assigned — not a value a
+            // template can pick. `crate::cloudformation_redshift_stack_outputs`
+            // pins what the stack then publishes for it.
         ],
     },
 ];

@@ -19,6 +19,10 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         // next week whether or not anybody called.
         let wall = ::aws_smithy_types::DateTime::from(SystemTime::now());
         for stored in &mut self.clusters {
+            // A temporary database credential this service issued for the
+            // cluster's database stops authenticating a login at its
+            // `Expiration`, which passed whether or not anybody called.
+            stored.expire_database_credentials(now);
             // A cluster the service is still working on — bringing it up,
             // applying a change to it, restarting it, or rotating its encryption
             // keys — is available again once that work's span has passed, whether

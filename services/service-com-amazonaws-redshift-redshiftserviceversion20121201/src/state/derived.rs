@@ -50,16 +50,6 @@ pub(super) fn digest_byte(seed: &str) -> u8 {
     Sha256::digest(seed.as_bytes())[0]
 }
 
-/// The DNS address of a cluster's connection endpoint, in Redshift's
-/// `<cluster>.<id>.<region>.redshift.amazonaws.com` form.
-///
-/// Derived from the cluster identifier and region, so renaming a cluster moves
-/// its endpoint exactly as the real hostname does.
-pub fn endpoint_address(cluster_identifier: &str, region: &str) -> String {
-    let token = short_digest(&format!("endpoint/{cluster_identifier}/{region}"), 12);
-    format!("{cluster_identifier}.{token}.{region}.redshift.amazonaws.com")
-}
-
 /// The namespace ARN of a cluster: `arn:aws:redshift:<region>:<account>:namespace:<uuid>`.
 ///
 /// Computed ONCE, when the cluster is created, and then persisted on the stored
@@ -158,12 +148,15 @@ pub fn master_password_secret_arn(cluster_identifier: &str, region: &str) -> Str
 /// listens on and the VPC interface endpoint it is reached through.
 ///
 /// The ONE rule for the whole `Endpoint` structure, so the create, the modify
-/// and the restore paths cannot build one differently. The endpoint is a
-/// property of the cluster's own configuration — its identifier, its Region, the
-/// port it was asked for, and the VPC and Availability Zone its subnet group put
-/// it in — so it is DECIDED when the cluster is allocated and
-/// [`StoredCluster::endpoint`] holds it from then on, whether or not the cluster
-/// is serving yet (see [`StoredCluster::publish_endpoint`]).
+/// and the restore paths cannot build one differently.
+///
+/// The ADDRESS and PORT are not derived here and not derivable: they are the
+/// socket this emulator SERVES the cluster's database on, which the core assigns
+/// when the endpoint is opened ([`attach_cluster_endpoint`]) — so this builds
+/// the structure around them and that call fills them in. Until it has, the
+/// cluster publishes no endpoint at all
+/// ([`StoredCluster::publish_endpoint`]), which is what a cluster that is still
+/// being provisioned reports.
 ///
 /// `vpc_id` is the VPC the cluster's subnet group placed it in, as that group's
 /// stored record reports it — `None` where no subnet group placed the cluster in
@@ -172,14 +165,12 @@ pub fn master_password_secret_arn(cluster_identifier: &str, region: &str) -> Str
 /// (`smithy_query(query="doc", shape="Endpoint", member="VpcEndpoints")`).
 pub fn cluster_endpoint(
     cluster_identifier: &str,
-    region: &str,
-    port: i32,
     vpc_id: Option<&str>,
     availability_zone: &str,
 ) -> Endpoint {
     Endpoint {
-        address: Some(endpoint_address(cluster_identifier, region)),
-        port: Some(port),
+        address: None,
+        port: None,
         vpc_endpoints: vpc_id
             .map(|vpc_id| cluster_vpc_endpoints(cluster_identifier, vpc_id, availability_zone)),
     }

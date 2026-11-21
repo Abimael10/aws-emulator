@@ -6,8 +6,9 @@
 //!
 //! A stock client (psql, libpq, psycopg, a JDBC driver) connects to the
 //! published address and port and speaks this. What it gets is this emulator's
-//! own state: the login is admitted against the stored resource
-//! ([`super::admit`]), the parameters the backend reports carry the engine
+//! own state: the login is admitted against the stored resource and the
+//! credentials its control plane issued for it ([`super::admit_issued`]), the
+//! parameters the backend reports carry the engine
 //! version the resource publishes, and every statement is run by that
 //! database's own SQL engine ([`super::sql_engine`]).
 //!
@@ -18,7 +19,8 @@
 //!    handshake, after which the startup arrives over the upgraded stream;
 //! 2. the `StartupMessage` names the user and the database; the server asks for
 //!    the password (`AuthenticationCleartextPassword`), checks it against the
-//!    stored master password and answers `AuthenticationOk`, the backend
+//!    stored master password and the credentials the control plane issued, and
+//!    answers `AuthenticationOk`, the backend
 //!    parameters, `BackendKeyData` and `ReadyForQuery` — or one
 //!    `ErrorResponse` carrying the SQLSTATE of the refusal, and closes;
 //! 3. the simple query protocol: `Query` is run and answered with
@@ -36,7 +38,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::session::{Answer, Session};
 use super::sql_engine::{Cell, Column, EngineError, EngineErrorKind};
 use super::{
-    admit, EngineWire, LoginRefusal, PasswordProof, ServingState, SessionContext,
+    admit_issued, EngineWire, LoginRefusal, PasswordProof, ServingState, SessionContext,
 };
 
 /// The protocol version this server speaks, as a startup message declares it
@@ -179,8 +181,9 @@ async fn serve_session(
             .await
         }
     };
-    let database = match admit(
+    let database = match admit_issued(
         &facts,
+        &context.issued_credentials(),
         &user,
         database.as_deref(),
         &PasswordProof::Cleartext(&password),

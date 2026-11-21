@@ -400,6 +400,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // into another service and must not run under it.
         let (output, identifier) = self.create(input, ctx)?;
 
+        // The cluster's own CONNECTION ENDPOINT, opened with the store's lock
+        // released: binding is asynchronous and the core owns the socket, the
+        // bind interface and the port. From here on the address and port this
+        // cluster publishes are that listener's own, so the endpoint a client
+        // reads once the cluster is available is one this emulator answers at.
+        // A cluster whose endpoint could not be opened is removed again rather
+        // than left announcing an address nothing serves.
+        if let Err(failure) =
+            crate::state::attach_cluster_endpoint(&*self.engine, &identifier).await
+        {
+            if let Some(state) = crate::state::service_state(&*self.engine) {
+                let mut store = state.lock();
+                if let Some(position) = store.cluster_position(&identifier) {
+                    store.clusters.remove(position);
+                }
+            }
+            return Err(CreateClusterErrorModeled::DependentServiceUnavailableFault(
+                DependentServiceUnavailableFault {
+                    message: Some(format!(
+                        "The cluster's connection endpoint could not be opened: {failure}"
+                    )),
+                },
+            )
+            .into());
+        }
+
         // The cluster is being brought up, and from the moment it is available the
         // service publishes its health every minute — so this write starts the
         // clock that publishes that series (`crate::state::cluster_metrics`).
@@ -663,18 +689,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateCluster<Eng
         let vpc_id = subnet_group
             .as_ref()
             .and_then(|group| group.vpc_id.clone());
-        // The endpoint the cluster will serve on once it is up. A cluster
-        // reported `creating` publishes NONE — its address and port appear only
+        // The endpoint the cluster will serve on once it is up: its VPC
+        // interface endpoint here, and the address and port the core assigns
+        // when this call opens the cluster's listener
+        // (`crate::state::attach_cluster_endpoint`). A cluster reported
+        // `creating` publishes NONE of it — its address and port appear only
         // when it becomes available — so the record below carries no endpoint
         // and the store keeps this one until the provisioning transition
         // publishes it.
-        let endpoint = st::cluster_endpoint(
-            &identifier,
-            &region,
-            input.port.unwrap_or(st::DEFAULT_PORT),
-            vpc_id.as_deref(),
-            &availability_zone,
-        );
+        let endpoint = st::cluster_endpoint(&identifier, vpc_id.as_deref(), &availability_zone);
         let mut cluster = Cluster {
             cluster_identifier: Some(identifier.clone()),
             node_type: Some(input.node_type.clone()),
@@ -844,6 +867,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateCluster<Eng
             // associates no Identity Center application with its lakehouse
             // configuration.
             settles_to: None,
+            // The endpoint is opened once this write has released the store's
+            // lock (`crate::state::attach_cluster_endpoint`), because binding a
+            // listener is asynchronous; until then the cluster publishes none,
+            // as a cluster that is `creating` does.
+            endpoint_plane: None,
+            // No credentials have been minted for a cluster that has just been
+            // created.
+            issued_credentials: Vec::new(),
             lakehouse_idc_application_arn: None,
         });
 

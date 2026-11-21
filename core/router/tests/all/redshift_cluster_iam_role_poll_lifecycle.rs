@@ -164,6 +164,10 @@ fn a_cluster_and_its_iam_role_associations_settle_for_a_polling_client() {
 
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_time()
+                // The create of a cluster opens the listener its database
+                // endpoint is served on, so this runtime drives a socket as
+                // well as the clock.
+                .enable_io()
                 .build()
                 .expect("a current-thread runtime");
 

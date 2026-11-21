@@ -244,6 +244,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let expiration = ::aws_smithy_types::DateTime::from(issued_at + duration);
+        // Held against the cluster, exactly as `GetClusterCredentials` holds
+        // what it issued: the endpoint that cluster publishes authenticates this
+        // pair until it expires, which is the authorization to log on this
+        // operation answers with. `Expiration` renders the lifetime on the wall
+        // clock and the deadline the wire holds it to is the same lifetime on
+        // the emulator's own clock, as it is there.
+        if let Some(stored) = store.clusters.get_mut(position) {
+            stored.issue_database_credential(st::IssuedDatabaseCredential {
+                db_user: db_user.clone(),
+                db_password: db_password.clone(),
+                db_name: input.db_name.clone(),
+                expires_at: ::service_common::clock::now(&*self.engine) + duration,
+            });
+        }
         // Issuing a database credential is the security-relevant event of this
         // operation, so it is attributable in the emulator's log, exactly as
         // `GetClusterCredentials` makes its own issuance attributable: which

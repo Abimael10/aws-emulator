@@ -303,6 +303,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let expiration = ::aws_smithy_types::DateTime::from(issued_at + duration);
+        // The credential is HELD against the cluster, so the endpoint that
+        // cluster publishes authenticates the pair this call answers until it
+        // expires — which is what "temporary authorization to log on to an
+        // Amazon Redshift database" until `Expiration` means. The password is
+        // held for that and reported by no read of the store.
+        //
+        // ONE lifetime, reported and enforced: `Expiration` renders it on the
+        // wall clock, because that is what the member carries, and the deadline
+        // the wire holds the credential to is the same lifetime on the
+        // emulator's own clock ([`::service_common::clock`]) — which is what
+        // every other instant this service owes is measured against, and the
+        // only clock an operator can hold still or move. Both are taken from
+        // this one call, so they name the same moment for a client of a running
+        // emulator.
+        let reported_db_user = st::credential_db_user(&input.db_user, auto_create);
+        if let Some(stored) = store.clusters.get_mut(position) {
+            stored.issue_database_credential(st::IssuedDatabaseCredential {
+                db_user: reported_db_user.clone(),
+                db_password: db_password.clone(),
+                db_name: input.db_name.clone(),
+                expires_at: ::service_common::clock::now(&*self.engine) + duration,
+            });
+        }
         // Issuing a database credential is the security-relevant event of this
         // operation, so it is attributable in the emulator's log: which
         // operation, the access key id the request presented, which cluster and
@@ -328,7 +351,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "A database user name that is authorized to log on to the database
             // DbName", reported with the prefix the operation documents for this
             // request's `AutoCreate`.
-            db_user: Some(st::credential_db_user(&input.db_user, auto_create)),
+            db_user: Some(reported_db_user),
             db_password: Some(db_password),
             // "The date and time the password in DbPassword expires": this call's
             // instant plus the lifetime it asked for.

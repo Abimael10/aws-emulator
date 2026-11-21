@@ -14,11 +14,11 @@
 //! lives here.
 //!
 //! The rows differ along what the rule generalises over: whether the template states the
-//! cluster's port or leaves the documented default (`CreateCluster$Port`: "Default: 5439"),
-//! whether it declares a cluster parameter group beside the cluster and whether it NAMES that
-//! group or leaves CloudFormation to generate the name, which published family the group
-//! belongs to, and how the outputs read the published values — a `Ref`, an `Fn::GetAtt` of
-//! each endpoint member, and an `Fn::Sub` composing both.
+//! cluster's port or leaves it unstated (the cluster publishes the port its own database
+//! engine is listening on either way), whether it declares a cluster parameter group beside
+//! the cluster and whether it NAMES that group or leaves CloudFormation to generate the name,
+//! which published family the group belongs to, and how the outputs read the published
+//! values — a `Ref`, an `Fn::GetAtt` of each endpoint member, and an `Fn::Sub` composing both.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,11 +41,6 @@ const LOOK_AGAIN_AFTER: Duration = Duration::from_millis(100);
 
 /// The admin password every row declares. It must never be echoed by either service.
 const PASSWORD: &str = "Cfn-Redsh1ft-Out";
-
-/// The port Amazon Redshift gives a cluster whose create states none
-/// (`smithy_query(query="doc", shape="CreateClusterMessage", member="Port")`: "Default:
-/// 5439").
-const DEFAULT_PORT: &str = "5439";
 
 /// The emulator with the two services this suite exercises, mounted on ONE engine exactly as
 /// `core/router/src/lib.rs` mounts them.
@@ -196,8 +191,9 @@ struct Row {
     /// The `ClusterIdentifier` the template states.
     cluster_identifier: &'static str,
     node_type: &'static str,
-    /// The `Port` the template states, or `""` for a template that states none — the cluster
-    /// then serves on the documented default.
+    /// The `Port` the template states, or `""` for a template that states none. Either way
+    /// the cluster publishes the port its own database engine is listening on, which is what
+    /// the stack's outputs carry.
     port: &'static str,
     /// The `ParameterGroupFamily` the row's group declares, or `""` for a row that declares no
     /// parameter group at all.
@@ -394,25 +390,28 @@ async fn every_output_of_a_completed_redshift_stack_carries_the_value_redshift_r
             opt_element(endpoint, "Address").as_deref(),
             "case {case:?}: expected the published address to be Redshift's own, got {endpoint}"
         );
-        let expected_port = if row.port.is_empty() {
-            DEFAULT_PORT
-        } else {
-            row.port
-        };
+        let served_port = opt_element(endpoint, "Port").unwrap_or_else(|| {
+            panic!("case {case:?}: no Port on the cluster's endpoint in {reported}")
+        });
+        // The port a cluster publishes is the one its database engine is
+        // listening on — the port Amazon Redshift's own listener was assigned —
+        // so what the stack publishes is read off the cluster rather than
+        // assumed from the template, and a `Port` the template declares binds
+        // no socket.
         assert_eq!(
-            (
-                outputs["EndpointPort"].as_str(),
-                opt_element(endpoint, "Port").as_deref()
-            ),
-            (expected_port, Some(expected_port)),
+            outputs["EndpointPort"], served_port,
             "case {case:?}: expected the published port to be the one the cluster serves on, \
              got {endpoint}"
+        );
+        assert!(
+            served_port.parse::<u16>().is_ok_and(|port| port != 0),
+            "case {case:?}: expected a port a client can dial, got {served_port:?}"
         );
         // The output COMPOSED from both members is the pair, which is what a connection
         // string a consumer builds out of a stack's outputs is.
         assert_eq!(
             outputs["Connection"],
-            format!("{}:{expected_port}", outputs["EndpointAddress"]),
+            format!("{}:{served_port}", outputs["EndpointAddress"]),
             "case {case:?}: expected the composed output to carry both members, got {outputs:?}"
         );
         assert!(

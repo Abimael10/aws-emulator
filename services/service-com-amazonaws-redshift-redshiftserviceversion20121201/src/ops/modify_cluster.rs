@@ -737,20 +737,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ModifyCluster<Eng
             stored.available_at = now + st::PROVISIONING_SPAN;
             stored.master_user_password = Some(password);
         }
-        // A port change moves the endpoint the caller connects to.
-        if let Some(port) = input.port {
-            stored.endpoint.port = Some(port);
-        }
-        // Renaming re-keys the record and moves the endpoint hostname, which
-        // carries the cluster name. The namespace ARN is the cluster's identity
-        // and is left exactly as it was minted.
+        // Neither a new port nor a new name moves the socket the cluster is
+        // SERVED on: the address and port it publishes are its listener's own
+        // ([`st::attach_cluster_endpoint`]), which the core opened when the
+        // cluster was allocated and which answers for as long as the cluster
+        // exists. So a `Port` this call carries configures nothing a client
+        // could dial, and a rename leaves the cluster's sessions and its
+        // endpoint exactly where they are.
         if let Some(new_identifier) = input.new_cluster_identifier.clone() {
-            stored.cluster.cluster_identifier = Some(new_identifier.clone());
-            stored.endpoint.address = Some(st::endpoint_address(&new_identifier, &region));
+            // The namespace ARN is the cluster's identity and is left exactly as
+            // it was minted — which is also what the cluster's own data plane
+            // reads it back by.
+            stored.cluster.cluster_identifier = Some(new_identifier);
         }
-        // Either change moves the endpoint the cluster SERVES on; a cluster that
-        // publishes one reports the moved value, and one still coming up still
-        // publishes none.
+        // A cluster that publishes an endpoint keeps reporting the one it is
+        // served on; one still coming up still publishes none.
         stored.refresh_endpoint();
 
         // Re-derive every member the service computes from the configuration

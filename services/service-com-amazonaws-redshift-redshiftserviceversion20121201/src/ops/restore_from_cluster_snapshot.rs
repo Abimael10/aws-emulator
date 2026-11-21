@@ -403,6 +403,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // into another service and must not run under it.
         let (output, identifier, restored_from, data) = self.restore(&input, ctx)?;
 
+        // The restored cluster's own CONNECTION ENDPOINT, opened with the
+        // store's lock released and for the same reasons `CreateCluster` opens
+        // one there: the address and port it publishes are that listener's own,
+        // so a client that dials them reaches this emulator. A cluster whose
+        // endpoint could not be opened is removed again, leaving the store as
+        // the call found it.
+        if let Err(failure) =
+            crate::state::attach_cluster_endpoint(&*self.engine, &identifier).await
+        {
+            if let Some(state) = crate::state::service_state(&*self.engine) {
+                let mut store = state.lock();
+                if let Some(position) = store.cluster_position(&identifier) {
+                    store.clusters.remove(position);
+                }
+            }
+            return Err(
+                RestoreFromClusterSnapshotErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(format!(
+                            "The cluster's connection endpoint could not be opened: {failure}"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // Phase 2, with no store lock held: the snapshot's DATABASES into the
         // cluster this call created, so "creates a new cluster from a snapshot"
         // means a cluster that serves the snapshot's tables and rows. Copying
@@ -893,18 +920,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RestoreFromCluste
         let vpc_id = subnet_group
             .as_ref()
             .and_then(|group| group.vpc_id.clone());
-        // The endpoint the restored cluster will serve on once it is up, at its
-        // OWN hostname rather than the source's and, by default, on "the same
-        // port as the original cluster". A cluster still being restored
-        // publishes none, so the store keeps this one until the provisioning
-        // transition publishes it.
-        let endpoint = st::cluster_endpoint(
-            &identifier,
-            &region,
-            input.port.or(snapshot.port).unwrap_or(st::DEFAULT_PORT),
-            vpc_id.as_deref(),
-            &availability_zone,
-        );
+        // The endpoint the restored cluster will serve on once it is up: its VPC
+        // interface endpoint here, and the address and port the core assigns
+        // when this call opens the cluster's own listener
+        // (`crate::state::attach_cluster_endpoint`) — the restored cluster is
+        // served on a socket of its own rather than the source's. A cluster
+        // still being restored publishes none of it, so the store keeps this one
+        // until the provisioning transition publishes it.
+        let endpoint = st::cluster_endpoint(&identifier, vpc_id.as_deref(), &availability_zone);
 
         let mut cluster = Cluster {
             cluster_identifier: Some(identifier.clone()),
@@ -1150,6 +1173,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RestoreFromCluste
             // associates no Identity Center application with its lakehouse
             // configuration.
             settles_to: None,
+            // Opened once this write has released the store's lock
+            // (`crate::state::attach_cluster_endpoint`), exactly as
+            // `CreateCluster` opens the endpoint of the cluster it allocates.
+            endpoint_plane: None,
+            // No credentials have been minted for a cluster this call has just
+            // built.
+            issued_credentials: Vec::new(),
             lakehouse_idc_application_arn: None,
         });
 

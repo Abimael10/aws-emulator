@@ -221,11 +221,12 @@ fn seed_ds2(emulator: &Emulator, cluster_identifier: &str) -> String {
         // Already past, so the record needs no clock-owed transition.
         available_at: std::time::Instant::now(),
         // A seeded cluster serves on the endpoint the service would have given
-        // it, built by the one rule every cluster's endpoint comes from.
+        // it, built by the one rule every cluster's endpoint comes from. Its
+        // address and port are the listener's, which only an allocating
+        // operation opens, so this record publishes none: a reserved-node
+        // exchange reads nothing of it.
         endpoint: state::cluster_endpoint(
             cluster_identifier,
-            REGION,
-            state::DEFAULT_PORT,
             Some("vpc-seeded"),
             &format!("{REGION}a"),
         ),
@@ -237,6 +238,10 @@ fn seed_ds2(emulator: &Emulator, cluster_identifier: &str) -> String {
         // It is already serving, and no lakehouse configuration was written on
         // it.
         settles_to: None,
+        // No listener was opened for a seeded record, and no credentials have
+        // been minted against it.
+        endpoint_plane: None,
+        issued_credentials: Vec::new(),
         lakehouse_idc_application_arn: None,
     });
     store.reserved_nodes.push(state::StoredReservedNode {

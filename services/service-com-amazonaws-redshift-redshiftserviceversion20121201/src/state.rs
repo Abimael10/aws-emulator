@@ -38,7 +38,8 @@
 //! from a cluster's own configuration (one rule, [`populate_derived_members`],
 //! so the create, modify and read paths cannot report different member sets),
 //! the connection endpoint a cluster serves on (one rule, [`cluster_endpoint`],
-//! reported only once the cluster is serving),
+//! on a listener this emulator opens for the cluster's PostgreSQL wire and
+//! reported only once the cluster is serving, see [`attach_cluster_endpoint`]),
 //! and the clock-owed `creating` -> `available` transitions (see
 //! [`PROVISIONING_SPAN`]) and the faster in-place `modifying` -> `available` one
 //! an IAM role change owes (see [`IAM_ROLE_APPLY_SPAN`]), every one of them
@@ -140,6 +141,9 @@ mod lakehouse;
 /// A cluster's DATA, which lives in the SQL engine the Redshift Data API runs
 /// statements on: what a snapshot of a cluster copies and a restore writes back.
 mod cluster_data;
+/// The connection endpoint a cluster publishes, the PostgreSQL wire served
+/// there, and the temporary credentials that log on to it.
+mod endpoint_plane;
 /// The table restores a `RestoreTableFromClusterSnapshot` asked for, and the
 /// status a read reports for each.
 mod table_restores;
@@ -159,6 +163,7 @@ pub use cluster_metrics::*;
 pub use caller_identity::*;
 pub use clock::*;
 pub use cluster_data::*;
+pub use endpoint_plane::*;
 pub use clusters::*;
 pub use data_shares::*;
 pub use table_restores::*;
@@ -359,7 +364,20 @@ pub fn orderable_cluster_types(node_type: &str) -> Vec<&'static str> {
         .collect()
 }
 
-/// The port the Redshift database engine listens on when the request names none.
+/// The port Amazon Redshift documents a cluster's database engine as listening
+/// on when the request names none
+/// (`smithy_query(query="doc", shape="CreateClusterMessage", member="Port")` —
+/// "Default: 5439").
+///
+/// NOT the port a cluster of this emulator PUBLISHES: `Endpoint$Port` is "the
+/// port that the database engine is listening on", and the engine behind a
+/// cluster here is served on a listener the CORE opens and assigns a port to
+/// ([`attach_cluster_endpoint`]) — so what a cluster publishes is that
+/// listener's own port, and a `Port` a `CreateCluster`, a
+/// `RestoreFromClusterSnapshot` or a `ModifyCluster` names binds no socket. The
+/// documented default is kept here because it is what a caller reading the
+/// model expects of this member, and because this service's published node
+/// configurations quote the ranges around it.
 pub const DEFAULT_PORT: i32 = 5439;
 
 /// The cluster parameter group family an engine version belongs to.
@@ -2600,6 +2618,27 @@ pub struct StoredCluster {
     /// assumed by
     /// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::settle`].
     pub settles_to: Option<String>,
+    /// The cluster's OPEN data plane: the listener its `Endpoint` publishes, the
+    /// PostgreSQL wire served on it and the SQL engine behind it
+    /// ([`attach_cluster_endpoint`]).
+    ///
+    /// `None` only for a cluster whose endpoint has not been opened — which no
+    /// allocating operation leaves behind, because one that could not open a
+    /// listener creates no cluster at all. Held here, beside the record it
+    /// belongs to, so the port stays open for exactly as long as the cluster
+    /// does: dropping this record (a `DeleteCluster`) drops the listener and the
+    /// engine with it.
+    pub endpoint_plane: Option<::std::sync::Arc<ClusterEndpointPlane>>,
+    /// The temporary database credentials this service has ISSUED for this
+    /// cluster's database and that have not expired yet, which is what the
+    /// cluster's endpoint authenticates beside its admin user (see
+    /// [`IssuedDatabaseCredential`]).
+    ///
+    /// Written by `GetClusterCredentials` and `GetClusterCredentialsWithIAM` —
+    /// the operations whose contract is that the pair they answer logs on until
+    /// `Expiration` — and pruned by the clock-owed settle, so a credential past
+    /// its lifetime is held nowhere.
+    pub issued_credentials: Vec<IssuedDatabaseCredential>,
     /// The IAM Identity Center application whose trusted identity propagation
     /// this cluster's lakehouse configuration is associated with, and `None` for
     /// a cluster no `ModifyLakehouseConfiguration` associated one with.
@@ -2617,10 +2656,18 @@ impl StoredCluster {
     ///
     /// Called by the transition that finishes provisioning
     /// ([`ComAmazonawsRedshiftRedshiftserviceversion20121201State::settle`]) and
-    /// by nothing else: a cluster reported `creating` has no endpoint, which is
+    /// by the call that opens the endpoint ([`attach_cluster_endpoint`]), and by
+    /// nothing else: a cluster reported `creating` has no endpoint, which is
     /// what stops a client that polls for one from dialling a cluster that is
     /// not serving yet.
+    ///
+    /// A cluster whose endpoint is not OPEN yet publishes none either: the
+    /// address a cluster announces is the one its listener answers at, so there
+    /// is nothing to announce until that listener exists.
     pub fn publish_endpoint(&mut self) {
+        if self.endpoint_plane.is_none() {
+            return;
+        }
         self.cluster.endpoint = Some(self.endpoint.clone());
     }
 
@@ -2669,7 +2716,54 @@ impl StoredCluster {
         self.database_users.insert(db_user.to_string(), joined);
         DatabaseUserCreation::Created
     }
+
+    /// Hold the temporary database credential `db_user`/`db_password`, valid
+    /// until `expires_at`, so the cluster's endpoint authenticates it until
+    /// then.
+    ///
+    /// The one place a minted credential is recorded, for both operations that
+    /// mint one (`GetClusterCredentials`, `GetClusterCredentialsWithIAM`): what
+    /// those operations promise is a LOGIN, and this is what makes the promise
+    /// real on the wire the cluster serves (see [`IssuedDatabaseCredential`]).
+    /// Bounded by [`ISSUED_CREDENTIALS_PER_CLUSTER`]: the oldest-expiring record
+    /// is dropped when a cluster would hold more, so a client that mints
+    /// credentials in a loop cannot grow this store without end.
+    pub fn issue_database_credential(&mut self, issued: IssuedDatabaseCredential) {
+        self.issued_credentials.push(issued);
+        if self.issued_credentials.len() > ISSUED_CREDENTIALS_PER_CLUSTER {
+            // The record closest to expiring is the one with the least left to
+            // promise, so it is the one that goes.
+            if let Some(position) = self
+                .issued_credentials
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, held)| held.expires_at)
+                .map(|(position, _)| position)
+            {
+                self.issued_credentials.remove(position);
+            }
+        }
+    }
+
+    /// Drop every temporary database credential of this cluster whose lifetime
+    /// has run out at `now`.
+    ///
+    /// Clock-owed: a credential's `Expiration` passed whether or not anybody
+    /// called, and a login presenting it is refused from that instant on.
+    pub fn expire_database_credentials(&mut self, now: Instant) {
+        self.issued_credentials
+            .retain(|issued| issued.expires_at > now);
+    }
 }
+
+/// How many unexpired temporary database credentials one cluster holds.
+///
+/// The emulator's OWN bound, like [`DATABASE_USERS_PER_CLUSTER_QUOTA`]: neither
+/// the model nor the docs state a number, and a credential is held only for the
+/// lifetime it was issued with ([`CREDENTIAL_DURATION_MAX_SECONDS`] at the
+/// most), so this is what stops the list growing inside one such lifetime. It is
+/// far above any workflow an emulator serves.
+pub const ISSUED_CREDENTIALS_PER_CLUSTER: usize = 256;
 
 /// What [`StoredCluster::create_database_user`] did with the name it was given.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4034,10 +4128,12 @@ pub const ENDPOINT_AUTHORIZATIONS_PER_CLUSTER_QUOTA: usize = 1_000;
 /// The DNS address a Redshift-managed VPC endpoint is reached at.
 ///
 /// Source: `smithy_query(query="doc", shape="EndpointAccess", member="Address")`
-/// — "The DNS address of the endpoint". Built in the same Redshift hostname form
-/// as a cluster's own endpoint ([`endpoint_address`]) and derived from the
-/// endpoint's own name and Region, so the same endpoint always reports the same
-/// address and nothing here is drawn per run.
+/// — "The DNS address of the endpoint". Derived from the endpoint's own name and
+/// Region, so the same endpoint always reports the same address and nothing here
+/// is drawn per run. Unlike a CLUSTER's connection endpoint — which is the
+/// socket this emulator serves that cluster's database on
+/// ([`attach_cluster_endpoint`]) — a managed VPC endpoint has no listener of its
+/// own here yet; that is its own open issue.
 pub fn endpoint_access_address(endpoint_name: &str, region: &str) -> String {
     let token = short_digest(&format!("endpoint-access/{endpoint_name}/{region}"), 12);
     format!("{endpoint_name}.{token}.{region}.redshift.amazonaws.com")
