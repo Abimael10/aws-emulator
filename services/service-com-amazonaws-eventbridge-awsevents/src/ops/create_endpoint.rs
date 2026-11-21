@@ -262,6 +262,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(reason));
         }
 
+        // The failover policy WATCHES a Route 53 health check — "you also create
+        // a Amazon Route 53 health check that will tell EventBridge to route
+        // events to the secondary Region when an 'unhealthy' state is
+        // encountered" — so an endpoint whose policy names one that does not
+        // exist describes a failover nothing could ever trigger. The health
+        // check is resolved in Route 53's own store, BEFORE this service's store
+        // is locked and before anything is written, so a refusal leaves no
+        // endpoint behind (`crate::state::endpoint_health_check`).
+        if let Some(reason) =
+            crate::state::endpoint_health_check::missing_health_check(ctx, Some(&input.routing_config))
+                .await
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(reason));
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // An endpoint whose clock has already moved it on is settled first, so

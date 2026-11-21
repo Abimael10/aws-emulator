@@ -10,8 +10,9 @@
 //! EndpointId is `abcde.veo`" (`Endpoint$EndpointId`) — so every endpoint a
 //! create stores carries an `EndpointId` no other endpoint of the same account
 //! carries, in the modelled form (length 1..50, two dot-separated segments of
-//! `[A-Za-z0-9\-]`), it is the subdomain of the endpoint's own `EndpointUrl`,
-//! and a read reports it unchanged.
+//! `[A-Za-z0-9\-]`), and a read reports it unchanged. The URL events reach the
+//! endpoint at is the address THIS emulator answers on, which is one address for
+//! the whole process rather than a subdomain per endpoint.
 //!
 //! A URL is how events reach an endpoint, so two endpoints sharing one makes the
 //! pair unroutable: the ids have to differ whatever else about the two requests
@@ -31,6 +32,12 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region every request below is signed for.
 const REGION: &str = "eu-central-1";
+
+/// The `EndpointUrl` a read of an endpoint must report here: the address this
+/// emulator answers on, which for a service driven in process (served on no port
+/// of its own) is the loopback zone — never the domain AWS publishes its own
+/// global endpoints under.
+const ANNOUNCED_ENDPOINT_URL: &str = "https://localhost";
 
 /// One `awsJson1_1` call to EventBridge over the router.
 async fn events(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
@@ -225,11 +232,9 @@ async fn every_created_endpoint_is_published_at_its_own_subdomain() {
         );
         assert_eq!(
             read["EndpointUrl"],
-            json!(format!(
-                "https://{endpoint_id}.{}",
-                state::ENDPOINT_URL_DOMAIN
-            )),
-            "case {case:?}: the URL is the EndpointId under the published domain, got {read}"
+            json!(ANNOUNCED_ENDPOINT_URL),
+            "case {case:?}: expected the URL this emulator answers on \
+             ({ANNOUNCED_ENDPOINT_URL:?}), got {read}"
         );
         // `CreateEndpointResponse` models no `EndpointId` member (its members are
         // Name, Arn, RoutingConfig, ReplicationConfig, EventBuses, RoleArn and

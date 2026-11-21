@@ -57,6 +57,16 @@ const REGION: &str = "eu-central-1";
 /// selects the endpoint rather than being ignored.
 const OTHER_REGION: &str = "us-east-1";
 
+/// The `EndpointUrl` a read of an endpoint must report here.
+///
+/// A global endpoint's URL is an address a client DIALS to publish its events, so
+/// it has to lead back to the emulator answering the read — never to the domain
+/// AWS publishes its own global endpoints under. These tests drive the service in
+/// process, so the emulator is served on no port of its own and the address left
+/// that leads back here is the loopback zone, which is the interface the core
+/// binds its listeners on.
+const ANNOUNCED_ENDPOINT_URL: &str = "https://localhost";
+
 /// How long a test waits before reading a resource whose next state the clock
 /// owes it: the span itself plus enough slack that a loaded machine does not make
 /// the wait the flaky part of the assertion.
@@ -334,9 +344,10 @@ async fn a_created_endpoint_is_read_back_and_settles_into_active() {
             "case {case:?}: expected a LastModifiedTime on a read, got {settled}"
         );
 
-        // The subdomain and the URL built from it are ONE fact: "if the URL for
-        // Endpoint is https://abcde.veo.endpoints.event.amazonaws.com, then the
-        // EndpointId is abcde.veo" (`Endpoint$EndpointId`).
+        // The subdomain an endpoint is published under is its own
+        // (`Endpoint$EndpointId`), and the URL events reach it at is the address
+        // THIS emulator answers on — never a host AWS publishes its own global
+        // endpoints at.
         let endpoint_id = settled["EndpointId"].as_str().unwrap_or_default();
         let (subdomain, suffix) = endpoint_id.split_once('.').unwrap_or_default();
         assert!(
@@ -353,11 +364,9 @@ async fn a_created_endpoint_is_read_back_and_settles_into_active() {
         );
         assert_eq!(
             settled["EndpointUrl"],
-            json!(format!(
-                "https://{endpoint_id}.{}",
-                state::ENDPOINT_URL_DOMAIN
-            )),
-            "case {case:?}: the URL is the EndpointId under the published domain, got {settled}"
+            json!(ANNOUNCED_ENDPOINT_URL),
+            "case {case:?}: expected the URL this emulator answers on \
+             ({ANNOUNCED_ENDPOINT_URL:?}), got {settled}"
         );
 
         // Nothing about the endpoint moves because it was read.

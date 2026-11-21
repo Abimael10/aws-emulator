@@ -2115,15 +2115,6 @@ pub const DEFAULT_REPLICATION_STATE: &str = REPLICATION_STATE_ENABLED;
 /// once here, for both writers of an endpoint's replication configuration.
 pub const REPLICATION_NEEDS_A_ROLE: &str = "When replication is enabled, role cannot be empty.";
 
-/// The domain a global endpoint's URL is published under.
-///
-/// "The URL subdomain of the endpoint. For example, if the URL for Endpoint is
-/// `https://abcde.veo.endpoints.event.amazonaws.com`, then the EndpointId is
-/// `abcde.veo`" (`Endpoint$EndpointId`): the URL is the endpoint's own id
-/// followed by this domain, which is why [`endpoint_url`] builds one from the
-/// other instead of storing both independently.
-pub const ENDPOINT_URL_DOMAIN: &str = "endpoints.event.amazonaws.com";
-
 /// `arn:aws:events:<region>:<account>:endpoint/<name>`.
 ///
 /// `EndpointArn`'s modelled pattern is
@@ -2138,14 +2129,13 @@ pub fn endpoint_arn(region: &str, name: &str) -> String {
 /// mint ([`ComAmazonawsEventbridgeAwseventsState::next_unique_id`]).
 ///
 /// `EndpointId` is modelled `pattern ^[A-Za-z0-9\-]+[\.][A-Za-z0-9\-]+$` and
-/// documented with the example `abcde.veo` — two dot-separated segments — while
-/// the URL built from it ([`endpoint_url`]) is modelled
-/// `^(https://)?[\.\-a-z0-9]+$`, so both segments are lowercase. The id is the
-/// subdomain EventBridge publishes the endpoint at, so it is minted per
-/// endpoint and never derived from the endpoint's name: two endpoints of one run
-/// cannot share a subdomain.
+/// documented with the example `abcde.veo` — two dot-separated segments, both
+/// lowercase. The id is the subdomain EventBridge publishes the endpoint at, so
+/// it is minted per endpoint and never derived from the endpoint's name: two
+/// endpoints of one run cannot share a subdomain. WHERE this emulator publishes
+/// an endpoint is its own question ([`endpoint_addressing`]).
 ///
-/// The URL is how events reach the endpoint, so a subdomain two endpoints shared
+/// The subdomain is how events reach the endpoint, so one two endpoints shared
 /// would make both unroutable. The id is therefore built from BOTH ends of the
 /// minted value: the first segment from its leading field, which the creation
 /// instant supplies, so ids of separate runs differ; the second from its
@@ -2182,12 +2172,6 @@ pub fn endpoint_id(unique: &str) -> String {
     let trimmed = counter.trim_start_matches('0');
     let suffix = format!("{trimmed:0>COUNTER_WIDTH$}");
     format!("{subdomain}.{suffix}")
-}
-
-/// The URL a global endpoint is reached at: its own [`endpoint_id`] under
-/// [`ENDPOINT_URL_DOMAIN`].
-pub fn endpoint_url(endpoint_id: &str) -> String {
-    format!("https://{endpoint_id}.{ENDPOINT_URL_DOMAIN}")
 }
 
 /// What any operation addressing a name that names no global endpoint reports:
@@ -2358,17 +2342,17 @@ impl EndpointRecord {
         }
     }
 
-    /// "The URL of the endpoint" (`DescribeEndpoint$EndpointUrl`), built from
-    /// the stored subdomain so the URL and the `EndpointId` cannot disagree.
-    pub fn url(&self) -> String {
-        endpoint_url(&self.endpoint_id)
-    }
-
     /// Every member a listing reports for this endpoint
     /// ([`crate::ops::types::Endpoint`]), read back from the same stored record
     /// the single-endpoint read reports, so a listing and a read cannot
     /// disagree.
-    pub fn to_summary(&self) -> EndpointSummary {
+    ///
+    /// `endpoint_url` is the address this emulator publishes its global
+    /// endpoints at ([`endpoint_addressing::announced_endpoint_url`]), passed in
+    /// by the handler rather than held on the record: where this process answers
+    /// is a property of the process and not of the create that stored the
+    /// endpoint.
+    pub fn to_summary(&self, endpoint_url: &str) -> EndpointSummary {
         EndpointSummary {
             name: Some(self.name.clone()),
             description: self.description.clone(),
@@ -2378,7 +2362,7 @@ impl EndpointRecord {
             event_buses: Some(self.event_buses.clone()),
             role_arn: self.role_arn.clone(),
             endpoint_id: Some(self.endpoint_id.clone()),
-            endpoint_url: Some(self.url()),
+            endpoint_url: Some(endpoint_url.to_string()),
             state: Some(self.state.clone()),
             state_reason: self.state_reason.clone(),
             creation_time: Some(to_wire_timestamp(self.created)),
@@ -2387,8 +2371,10 @@ impl EndpointRecord {
     }
 
     /// Every member `UpdateEndpoint` reports, read back from the stored record,
-    /// so the write's answer and a later read cannot disagree.
-    pub fn to_update_output(&self) -> UpdateEndpointOutput {
+    /// so the write's answer and a later read cannot disagree. `endpoint_url` is
+    /// the address this emulator publishes its global endpoints at, as
+    /// [`Self::to_summary`] takes it.
+    pub fn to_update_output(&self, endpoint_url: &str) -> UpdateEndpointOutput {
         UpdateEndpointOutput {
             name: Some(self.name.clone()),
             arn: Some(self.arn.clone()),
@@ -2397,14 +2383,16 @@ impl EndpointRecord {
             event_buses: Some(self.event_buses.clone()),
             role_arn: self.role_arn.clone(),
             endpoint_id: Some(self.endpoint_id.clone()),
-            endpoint_url: Some(self.url()),
+            endpoint_url: Some(endpoint_url.to_string()),
             state: Some(self.state.clone()),
         }
     }
 
     /// Every member `DescribeEndpoint` reports, read back from the stored
     /// record, so a read and what the create did cannot disagree.
-    pub fn to_describe_output(&self) -> DescribeEndpointOutput {
+    /// `endpoint_url` is the address this emulator publishes its global
+    /// endpoints at, as [`Self::to_summary`] takes it.
+    pub fn to_describe_output(&self, endpoint_url: &str) -> DescribeEndpointOutput {
         DescribeEndpointOutput {
             name: Some(self.name.clone()),
             description: self.description.clone(),
@@ -2414,7 +2402,7 @@ impl EndpointRecord {
             event_buses: Some(self.event_buses.clone()),
             role_arn: self.role_arn.clone(),
             endpoint_id: Some(self.endpoint_id.clone()),
-            endpoint_url: Some(self.url()),
+            endpoint_url: Some(endpoint_url.to_string()),
             state: Some(self.state.clone()),
             state_reason: self.state_reason.clone(),
             creation_time: Some(to_wire_timestamp(self.created)),
@@ -4959,6 +4947,14 @@ pub mod archive_encryption;
 /// The order this service lists an enumerated type's admissible values in when a HANDLER
 /// refuses a value outside that type, beside the other refusal wording above.
 pub mod enum_value_set;
+
+/// WHERE this emulator publishes a global endpoint — the one address every read of an
+/// endpoint reports as its `EndpointUrl`.
+pub mod endpoint_addressing;
+
+/// The Amazon Route 53 health check a global endpoint's failover policy watches, and the
+/// refusal a policy naming one that does not exist earns.
+pub mod endpoint_health_check;
 
 mod replays;
 pub use replays::*;

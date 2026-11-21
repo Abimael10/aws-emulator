@@ -144,7 +144,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListEndpointsErrorModeled::InternalException(InternalException {
@@ -170,6 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
 
+        let announced_url = crate::state::endpoint_addressing::announced_endpoint_url(ctx);
         let mut store = state.lock();
         // The one write a listing makes: finish the transitions the clock already
         // owed, so the states reported are the ones the endpoints are in at the
@@ -212,9 +213,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let has_more = matched.len() > page_len;
 
         Ok(ListEndpointsOutput {
+            // The URL each entry reports is the address THIS emulator answers
+            // the endpoint's publications at, never a host AWS publishes its own
+            // global endpoints at (`crate::state::endpoint_addressing`), and the
+            // same address the single-endpoint read reports.
             endpoints: Some(
                 page.iter()
-                    .map(|endpoint| crate::state::EndpointRecord::to_summary(endpoint))
+                    .map(|endpoint| endpoint.to_summary(&announced_url))
                     .collect(),
             ),
             // A token only when there IS a next page: "if there are no more

@@ -191,6 +191,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        Ok(stored.to_describe_output())
+        // The URL reported is the address THIS emulator answers the endpoint's
+        // publications at, never a host AWS publishes its own global endpoints
+        // at (`crate::state::endpoint_addressing`).
+        Ok(stored.to_describe_output(
+            &crate::state::endpoint_addressing::announced_endpoint_url(ctx),
+        ))
     }
 }

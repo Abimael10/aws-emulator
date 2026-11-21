@@ -240,13 +240,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // An update changes an endpoint that EXISTS; it never brings one into
+        // being, so the endpoint is looked up BEFORE anything else about the
+        // write is judged — a caller naming an endpoint that is not there reads
+        // that, rather than a complaint about a member of a write that could
+        // never have been applied. The guard is taken and released here, so the
+        // resolution below reaches Route 53 with no store of this service held.
+        {
+            let mut store = state.lock();
+            // An endpoint whose clock has already moved it on is settled first,
+            // so the lookup and the write below see one state.
+            store.settle_endpoints(now);
+            if store.endpoint(&input.name).is_none() {
+                return Err(UpdateEndpointErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::no_such_endpoint(&input.name, &region)),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A failover policy this write names WATCHES a Route 53 health check,
+        // and one that does not exist describes a failover nothing could ever
+        // trigger — so the health check is resolved in Route 53's own store,
+        // before this service's store is locked and before anything is written
+        // (`crate::state::endpoint_health_check`). A write naming no policy
+        // references nothing new.
+        if let Some(reason) = crate::state::endpoint_health_check::missing_health_check(
+            ctx,
+            input.routing_config.as_ref(),
+        )
+        .await
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(reason));
+        }
+
+        let announced_url = crate::state::endpoint_addressing::announced_endpoint_url(ctx);
         let mut store = state.lock();
         // An endpoint whose clock has already moved it on is settled first, so
         // the write is applied to, and answered from, one state.
         store.settle_endpoints(now);
 
-        // An update changes an endpoint that EXISTS; it never brings one into
-        // being. One lookup serves both the merge decision and the write.
+        // The endpoint was there a moment ago; it is looked up again because
+        // nothing holds a guard across the resolution above, and a delete that
+        // landed in between leaves nothing to update.
         let Some(endpoint) = store.endpoint_mut(&input.name) else {
             return Err(UpdateEndpointErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
@@ -313,7 +351,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         endpoint.active_due = Some(now + crate::state::ENDPOINT_TRANSITION);
 
         // Reported from the STORED record rather than from the request, so this
-        // response and `DescribeEndpoint`'s cannot disagree.
-        Ok(endpoint.to_update_output())
+        // response and `DescribeEndpoint`'s cannot disagree. The URL is the
+        // address THIS emulator answers the endpoint's publications at
+        // (`crate::state::endpoint_addressing`).
+        Ok(endpoint.to_update_output(&announced_url))
     }
 }

@@ -111,6 +111,13 @@ service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # model — so the delivery writes the very store `GetWorkflowRuns` reads, exactly
 # as this service's own metrics are written into CloudWatch's.
 service-com-amazonaws-glue-awsglue = { workspace = true }
+# A global endpoint's failover policy WATCHES an Amazon Route 53 health check,
+# which is Route 53's resource: `CreateEndpoint`/`UpdateEndpoint` resolve it
+# through that service's own `GetHealthCheck` over the in-process callback
+# (`state::endpoint_health_check`) instead of keeping a second opinion about
+# which health checks exist. Only the generated client is needed — the emulator
+# supplies the transport.
+aws-sdk-route53 = { version = "1", default-features = false }
 # `uuid`: a state-machine target's execution is named `<event id>_<uuid>`, whose
 # suffix is a fresh v4 UUID per invocation (`ops::put_events`).
 uuid = { version = "1", features = ["v4"] }
@@ -167,6 +174,10 @@ service-com-amazonaws-ecs-amazonec2containerservicev20141113 = { workspace = tru
 service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 # The deployment package that suite uploads is a .zip archive it writes in memory.
 zip = { version = "9", default-features = false, features = ["deflate"] }
+# The Route 53 health check a global endpoint's failover policy watches, mounted beside
+# EventBridge on one engine: the endpoint suites create the health check through that
+# service's own CreateHealthCheck, which is where the existence check reads it.
+service-com-amazonaws-route53-awsdnsv20130401 = { workspace = true }
 
 [lints]
 workspace = true
