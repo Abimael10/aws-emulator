@@ -54,43 +54,43 @@ const ACCOUNT: &str = "000000000000";
 /// Lambda-task counters, the run span and the execution counters. Written as literals here
 /// rather than read from the Step Functions crate, so a series published under a name no AWS
 /// reader would ask for fails here.
-const STATES_NAMESPACE: &str = "AWS/States";
+pub(crate) const STATES_NAMESPACE: &str = "AWS/States";
 /// See [`STATES_NAMESPACE`].
-const LAMBDA_FUNCTION_ARN_DIMENSION: &str = "LambdaFunctionArn";
+pub(crate) const LAMBDA_FUNCTION_ARN_DIMENSION: &str = "LambdaFunctionArn";
 /// See [`STATES_NAMESPACE`].
-const STATE_MACHINE_ARN_DIMENSION: &str = "StateMachineArn";
+pub(crate) const STATE_MACHINE_ARN_DIMENSION: &str = "StateMachineArn";
 /// See [`STATES_NAMESPACE`].
-const LAMBDA_FUNCTIONS_SCHEDULED: &str = "LambdaFunctionsScheduled";
+pub(crate) const LAMBDA_FUNCTIONS_SCHEDULED: &str = "LambdaFunctionsScheduled";
 /// See [`STATES_NAMESPACE`].
-const LAMBDA_FUNCTIONS_STARTED: &str = "LambdaFunctionsStarted";
+pub(crate) const LAMBDA_FUNCTIONS_STARTED: &str = "LambdaFunctionsStarted";
 /// See [`STATES_NAMESPACE`].
-const LAMBDA_FUNCTIONS_SUCCEEDED: &str = "LambdaFunctionsSucceeded";
+pub(crate) const LAMBDA_FUNCTIONS_SUCCEEDED: &str = "LambdaFunctionsSucceeded";
 /// See [`STATES_NAMESPACE`].
-const LAMBDA_FUNCTIONS_FAILED: &str = "LambdaFunctionsFailed";
+pub(crate) const LAMBDA_FUNCTIONS_FAILED: &str = "LambdaFunctionsFailed";
 /// See [`STATES_NAMESPACE`].
-const LAMBDA_FUNCTION_RUN_TIME: &str = "LambdaFunctionRunTime";
+pub(crate) const LAMBDA_FUNCTION_RUN_TIME: &str = "LambdaFunctionRunTime";
 /// See [`STATES_NAMESPACE`].
 const EXECUTIONS_STARTED: &str = "ExecutionsStarted";
 /// See [`STATES_NAMESPACE`].
-const EXECUTIONS_SUCCEEDED: &str = "ExecutionsSucceeded";
+pub(crate) const EXECUTIONS_SUCCEEDED: &str = "ExecutionsSucceeded";
 /// See [`STATES_NAMESPACE`].
-const EXECUTIONS_FAILED: &str = "ExecutionsFailed";
+pub(crate) const EXECUTIONS_FAILED: &str = "ExecutionsFailed";
 
 /// The namespace Lambda publishes its own series to, the dimension they are reported per,
 /// and the two the AWS Lambda metric reference names for an invocation and for a run that
 /// came to a function error. Literals, for the same reason as above.
-const LAMBDA_NAMESPACE: &str = "AWS/Lambda";
+pub(crate) const LAMBDA_NAMESPACE: &str = "AWS/Lambda";
 /// See [`LAMBDA_NAMESPACE`].
-const FUNCTION_NAME_DIMENSION: &str = "FunctionName";
+pub(crate) const FUNCTION_NAME_DIMENSION: &str = "FunctionName";
 /// See [`LAMBDA_NAMESPACE`].
-const INVOCATIONS: &str = "Invocations";
+pub(crate) const INVOCATIONS: &str = "Invocations";
 /// See [`LAMBDA_NAMESPACE`].
-const ERRORS: &str = "Errors";
+pub(crate) const ERRORS: &str = "Errors";
 
 /// The unit a counter carries, and the unit a span of time carries.
-const COUNT_UNIT: &str = "Count";
+pub(crate) const COUNT_UNIT: &str = "Count";
 /// See [`COUNT_UNIT`].
-const MILLISECONDS_UNIT: &str = "Milliseconds";
+pub(crate) const MILLISECONDS_UNIT: &str = "Milliseconds";
 
 /// The `Period`, in seconds, every read below asks for: the one-minute granularity these
 /// series are stored at.
@@ -109,9 +109,9 @@ const FUNCTION_ACTIVE: &str = "Active";
 const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
 
 /// The terminal statuses an execution reaches, and the one it sits in while its task runs.
-const SUCCEEDED: &str = "SUCCEEDED";
+pub(crate) const SUCCEEDED: &str = "SUCCEEDED";
 /// See [`SUCCEEDED`].
-const FAILED: &str = "FAILED";
+pub(crate) const FAILED: &str = "FAILED";
 /// See [`SUCCEEDED`].
 const RUNNING: &str = "RUNNING";
 
@@ -137,21 +137,21 @@ const AMPLE_TIMEOUT_SECS: u64 = 300;
 
 /// The class Python's own `ValueError` reports, which is the `errorType` of the document a
 /// raising run answers and so the name the failed task and the failed execution carry.
-const RAISED_CLASS: &str = "ValueError";
+pub(crate) const RAISED_CLASS: &str = "ValueError";
 
 /// The IAM action an invocation is subject to, which is the one Lambda PUBLISHES for
 /// `Invoke` rather than the operation's own name.
-const INVOKE_ACTION: &str = "lambda:InvokeFunction";
+pub(crate) const INVOKE_ACTION: &str = "lambda:InvokeFunction";
 
 /// An action a function's own role carries, so the row's documents say something about both
 /// roles rather than leaving either without one.
-const LOG_ACTION: &str = "logs:PutLogEvents";
+pub(crate) const LOG_ACTION: &str = "logs:PutLogEvents";
 
 /// The service a state machine's execution role is assumed by, and the one a function's own
 /// execution role is.
-const STATES_PRINCIPAL: &str = "states.amazonaws.com";
+pub(crate) const STATES_PRINCIPAL: &str = "states.amazonaws.com";
 /// See [`STATES_PRINCIPAL`].
-const LAMBDA_PRINCIPAL: &str = "lambda.amazonaws.com";
+pub(crate) const LAMBDA_PRINCIPAL: &str = "lambda.amazonaws.com";
 
 /// How often to look while waiting for work the clock owes — a deployed function reaching
 /// [`FUNCTION_ACTIVE`], an execution leaving [`RUNNING`] — and how many looks to take. The
@@ -164,7 +164,7 @@ const LOOKS: usize = 2_400;
 /// The emulator as it is ASSEMBLED, on one engine, so the invocation a task makes, the
 /// documents it is judged against and every series published for it are all served by the
 /// same mounted services a client reaches.
-fn build_router() -> MultiServiceRouter {
+pub(crate) fn build_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = aws_emulator_router::build_router(engine);
     // The signature is never checked here, as in every other suite of this crate; the
@@ -221,7 +221,7 @@ async fn sfn(router: &MultiServiceRouter, case: &str, operation: &str, body: &Va
 }
 
 /// One CloudWatch call, requiring a 200.
-async fn cloudwatch(
+pub(crate) async fn cloudwatch(
     router: &MultiServiceRouter,
     case: &str,
     operation: &str,
@@ -346,7 +346,7 @@ async fn cloudformation(
 }
 
 /// The text a member of a response carries.
-fn string(body: &Value, name: &str) -> String {
+pub(crate) fn string(body: &Value, name: &str) -> String {
     body.get(name)
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("expected a {name} in {body}"))
@@ -354,7 +354,7 @@ fn string(body: &Value, name: &str) -> String {
 }
 
 /// Now, in epoch seconds, which is how CloudWatch's `awsJson` wire form carries an instant.
-fn now_secs() -> f64 {
+pub(crate) fn now_secs() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -367,7 +367,7 @@ fn now_secs() -> f64 {
 /// A state machine's execution role is trusted by Step Functions and a function's own
 /// execution role by Lambda — which `CreateFunction` checks — so the trusted service is the
 /// caller's.
-async fn given_role(
+pub(crate) async fn given_role(
     router: &MultiServiceRouter,
     name: &str,
     service: &str,
@@ -412,7 +412,7 @@ async fn given_role(
 /// Deploy the row's function as a stack's inline source — which is what archives the handler
 /// into a deployment package — wait until Lambda reports it [`FUNCTION_ACTIVE`], and answer
 /// its ARN.
-async fn given_function(
+pub(crate) async fn given_function(
     router: &MultiServiceRouter,
     case: &str,
     stack: &str,
@@ -473,7 +473,7 @@ async fn given_function(
 
 /// A state machine whose one `Task` state's `Resource` is `function_arn` — the BARE function
 /// ARN, which names the function itself — under `role_arn`; answers its ARN.
-async fn given_machine(
+pub(crate) async fn given_machine(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
@@ -499,7 +499,7 @@ async fn given_machine(
 }
 
 /// Start one execution named `name` with `input` and report it once it has left [`RUNNING`].
-async fn ran(
+pub(crate) async fn ran(
     router: &MultiServiceRouter,
     case: &str,
     machine_arn: &str,
@@ -536,34 +536,50 @@ async fn ran(
 }
 
 /// Every datapoint `GetMetricStatistics` answers with for one series, over a window the whole
-/// run falls inside. A series nothing was accounted in answers with none, which is what "that
-/// family is absent under this dimension" reads as.
-async fn datapoints(
+/// run falls inside, read the way `unit` says: `Some(u)` selects the observations published
+/// with `u`, and `None` names no unit at all, which selects every one of them ("If you omit
+/// Unit, all data that was collected with any unit is returned",
+/// `GetMetricStatisticsInput$Unit`). A series nothing was accounted in answers with none, which
+/// is what "that family is absent under this dimension" reads as.
+pub(crate) async fn datapoints(
     router: &MultiServiceRouter,
     case: &str,
     namespace: &str,
     metric: &str,
-    unit: &str,
+    unit: Option<&str>,
     dimensions: &Value,
 ) -> Vec<Value> {
     let now = now_secs();
-    let stats = cloudwatch(
-        router,
-        case,
-        "GetMetricStatistics",
-        &json!({
-            "Namespace": namespace,
-            "MetricName": metric,
-            "Dimensions": dimensions,
-            "StartTime": now - WINDOW_SECS,
-            "EndTime": now + WINDOW_SECS,
-            "Period": PERIOD_SECS,
-            "Statistics": ["Sum", "SampleCount"],
-            "Unit": unit,
-        }),
-    )
-    .await;
+    let mut request = json!({
+        "Namespace": namespace,
+        "MetricName": metric,
+        "Dimensions": dimensions,
+        "StartTime": now - WINDOW_SECS,
+        "EndTime": now + WINDOW_SECS,
+        "Period": PERIOD_SECS,
+        "Statistics": ["Sum", "SampleCount"],
+    });
+    if let Some(unit) = unit {
+        request["Unit"] = json!(unit);
+    }
+    let stats = cloudwatch(router, case, "GetMetricStatistics", &request).await;
     stats["Datapoints"].as_array().cloned().unwrap_or_default()
+}
+
+/// The statistic a counter's magnitude is read as, and the one a span's observation count is
+/// read as (`Statistic`).
+pub(crate) const SUM_STATISTIC: &str = "Sum";
+/// See [`SUM_STATISTIC`].
+pub(crate) const SAMPLE_COUNT_STATISTIC: &str = "SampleCount";
+
+/// One `statistic` summed over every datapoint a read answered with — the magnitude a client
+/// charts, alarms or polls on. A series with no datapoint sums to zero, and a datapoint that
+/// does not carry the statistic contributes nothing.
+pub(crate) fn sum_of(points: &[Value], statistic: &str) -> f64 {
+    points
+        .iter()
+        .filter_map(|point| point[statistic].as_f64())
+        .sum()
 }
 
 /// The `Sum` of a counter's series over the window: the magnitude a client charts or alarms
@@ -575,51 +591,50 @@ async fn counted(
     metric: &str,
     dimensions: &Value,
 ) -> f64 {
-    datapoints(router, case, namespace, metric, COUNT_UNIT, dimensions)
-        .await
-        .iter()
-        .filter_map(|point| point["Sum"].as_f64())
-        .sum()
+    sum_of(
+        &datapoints(router, case, namespace, metric, Some(COUNT_UNIT), dimensions).await,
+        SUM_STATISTIC,
+    )
 }
 
 /// How many SAMPLES a span's series holds over the window: one per observation published,
 /// which for a run span is one per invocation that closed.
 async fn sampled(router: &MultiServiceRouter, case: &str, metric: &str, dimensions: &Value) -> f64 {
-    datapoints(
-        router,
-        case,
-        STATES_NAMESPACE,
-        metric,
-        MILLISECONDS_UNIT,
-        dimensions,
+    sum_of(
+        &datapoints(
+            router,
+            case,
+            STATES_NAMESPACE,
+            metric,
+            Some(MILLISECONDS_UNIT),
+            dimensions,
+        )
+        .await,
+        SAMPLE_COUNT_STATISTIC,
     )
-    .await
-    .iter()
-    .filter_map(|point| point["SampleCount"].as_f64())
-    .sum()
 }
 
 /// The dimension set the per-function `AWS/States` series are reported under: the function's
 /// ARN alone.
-fn function_arn_dimensions(function_arn: &str) -> Value {
+pub(crate) fn function_arn_dimensions(function_arn: &str) -> Value {
     json!([{ "Name": LAMBDA_FUNCTION_ARN_DIMENSION, "Value": function_arn }])
 }
 
 /// The dimension set the per-execution `AWS/States` series are reported under: the state
 /// machine's ARN alone.
-fn state_machine_dimensions(machine_arn: &str) -> Value {
+pub(crate) fn state_machine_dimensions(machine_arn: &str) -> Value {
     json!([{ "Name": STATE_MACHINE_ARN_DIMENSION, "Value": machine_arn }])
 }
 
 /// The dimension set Lambda's own series are reported under.
-fn function_name_dimensions(name: &str) -> Value {
+pub(crate) fn function_name_dimensions(name: &str) -> Value {
     json!([{ "Name": FUNCTION_NAME_DIMENSION, "Value": name }])
 }
 
 /// The mode that makes the handler return, and the one that makes it raise.
-const OK: &str = "ok";
+pub(crate) const OK: &str = "ok";
 /// See [`OK`].
-const BOOM: &str = "boom";
+pub(crate) const BOOM: &str = "boom";
 
 /// One row: how many invocations one state machine takes, and how each of them closes. Every
 /// counter the rule names is a FUNCTION of this list, so no row states one twice.
@@ -799,7 +814,7 @@ async fn a_function_arn_task_is_accounted_per_function_and_per_state_machine() {
                 case,
                 STATES_NAMESPACE,
                 metric,
-                COUNT_UNIT,
+                Some(COUNT_UNIT),
                 &per_machine,
             )
             .await;
@@ -814,7 +829,7 @@ async fn a_function_arn_task_is_accounted_per_function_and_per_state_machine() {
             case,
             STATES_NAMESPACE,
             LAMBDA_FUNCTION_RUN_TIME,
-            MILLISECONDS_UNIT,
+            Some(MILLISECONDS_UNIT),
             &per_machine,
         )
         .await;
@@ -830,7 +845,7 @@ async fn a_function_arn_task_is_accounted_per_function_and_per_state_machine() {
                 case,
                 STATES_NAMESPACE,
                 metric,
-                COUNT_UNIT,
+                Some(COUNT_UNIT),
                 &per_function,
             )
             .await;
