@@ -47,41 +47,20 @@
 
 use super::json_media_type::{announced_media_type, with_json_media_type};
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
+// The header a restJson1 client resolves the error shape from, and the SHARED reader of the
+// shape a value names in it: the shape's own name, with neither the namespace that may
+// precede it (`com.amazonaws.docdbelastic#ResourceNotFoundException`) nor a locator appended
+// after it. Reading a shape out of every form a value can arrive in is what every service of
+// this wire family needs, so this service takes that reader rather than keeping a copy.
+use ::service_common::error_type_locator::{header_shape_named, ERROR_TYPE_HEADER};
 use smithy_server_runtime::{
     BoxFuture, ErasedOperation, ErasedServiceDefinition, OperationContext, OperationRoutingTable,
     Refused, Service, ServerHttpProtocol, ServiceIdentity,
 };
 
-/// The header a restJson1 client resolves the error shape from.
-const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
-
-/// What separates the namespace that declares a shape from the shape's own name, in a
-/// value that arrives written as an absolute shape id.
-const NAMESPACE_SEPARATOR: char = '#';
-
-/// What separates a shape's name from anything appended after it — a locator for the shape
-/// inside a serving stack, which this wire does not carry.
-const APPENDED_SEPARATOR: char = ':';
-
 /// The lowest HTTP status that is a failure, and so the lowest one that names an error
 /// shape at all.
 const FIRST_FAILURE_STATUS: u16 = 400;
-
-/// The error SHAPE a header value names: the shape's own name, with neither the namespace
-/// that may precede it nor anything that may follow it.
-///
-/// A renderer writes the bare name, which is already the answer; a value that arrived
-/// namespaced (`com.amazonaws.docdbelastic#ResourceNotFoundException`) or with something
-/// appended after a separator names the same shape, and neither part is the shape's name.
-fn shape_named(raw: &str) -> &str {
-    let raw = raw.trim();
-    let after_namespace = raw.rsplit(NAMESPACE_SEPARATOR).next().unwrap_or(raw);
-    after_namespace
-        .split(APPENDED_SEPARATOR)
-        .next()
-        .unwrap_or(after_namespace)
-        .trim()
-}
 
 /// `resp` as this service answers it: a failure names its error shape in
 /// [`ERROR_TYPE_HEADER`] by that shape's name alone.
@@ -100,7 +79,7 @@ pub fn with_error_type_shape_name(mut resp: RtResponse) -> RtResponse {
     let Some(named) = resp.headers().get(ERROR_TYPE_HEADER) else {
         return resp;
     };
-    let shape = shape_named(named);
+    let shape = header_shape_named(named);
     if shape.is_empty() || shape == named {
         return resp;
     }

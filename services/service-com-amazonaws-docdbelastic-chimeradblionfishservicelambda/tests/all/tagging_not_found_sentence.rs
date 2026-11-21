@@ -28,6 +28,26 @@
 //! the model declares it under, with nothing appended beside it. It holds for a modelled
 //! refusal an operation answered and for one the framework raised before any handler ran,
 //! and a success names no shape at all.
+//!
+//! The third rule is the one the two HEADERS of such a refusal carry together, which is
+//! what a client classifies the answer by before it parses a byte of the body: **a refusal
+//! of the ARN-addressed tagging surface announces its JSON payload as the generic
+//! `application/json`, whatever media type the request named for its own payload, and names
+//! the modelled error shape in `x-amzn-errortype` with that shape's name as the value's
+//! LEADING token** — so a client that dispatches on the media type, and one that resolves
+//! the error shape from the header, both read what AWS answers. The rule is about the
+//! surface and not about one status or one caller, so the last table spans all three tagging
+//! operations, every JSON media type a request can name (including naming none and naming
+//! one that is not JSON at all), both resource classes an ARN of this service can name, and
+//! a success of the same surface beside the refusals; a route OUTSIDE that surface is the
+//! contrast row, which keeps announcing this service's own media type.
+//!
+//! Each of those two headers has a suite of its own for the WHOLE service —
+//! `tests/all/response_media_type.rs` for the media type every operation announces, and
+//! `tests/all/error_type_header_form.rs` for the form every failure names its shape in. What
+//! the table below adds is the two of them, and the body, asserted on ONE response of this
+//! surface: that is the envelope a client of a tag-op refusal reads, and it is the pair that
+//! diverged on it.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -104,42 +124,20 @@ fn encode(value: &str) -> String {
         .collect()
 }
 
-/// Send one request and return its status, the `x-amzn-errortype` header the response
-/// names its error shape in, and its parsed JSON body (`Value::Null` when the body is
-/// empty).
+/// Send one request naming the generic JSON media type for its own payload — the way an
+/// SDK sends a call of this wire — and return its status, the `x-amzn-errortype` header the
+/// response names its error shape in, and its parsed JSON body.
+///
+/// One request builder serves this file ([`announced`]): a second copy of it could drift
+/// from the first and have two suites of the same file disagree about what was sent.
 async fn answer(
     router: &MultiServiceRouter,
     method: &str,
     path: &str,
     body: Option<Value>,
 ) -> (u16, Option<String>, Value) {
-    let payload = body.map(|b| b.to_string()).unwrap_or_default();
-    let request = http::Request::builder()
-        .method(method)
-        .uri(format!("https://docdb-elastic.{REGION}.amazonaws.com{path}"))
-        .header("host", format!("docdb-elastic.{REGION}.amazonaws.com"))
-        .header("authorization", authorization())
-        .header("content-type", "application/json")
-        .body(bytes::Bytes::from(payload))
-        .expect("a well-formed request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let error_type = response
-        .headers()
-        .get(ERROR_TYPE_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let bytes = response.into_body();
-    let parsed = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-            panic!(
-                "{method} {path}: body is not JSON ({e}): {}",
-                String::from_utf8_lossy(&bytes)
-            )
-        })
-    };
+    let (status, _, error_type, parsed) =
+        announced(router, method, path, body, Some(GENERIC_JSON_MEDIA_TYPE)).await;
     (status, error_type, parsed)
 }
 
@@ -152,6 +150,94 @@ async fn call(
 ) -> (u16, Value) {
     let (status, _, parsed) = answer(router, method, path, body).await;
     (status, parsed)
+}
+
+/// The media type every response of the ARN-addressed tagging surface announces its JSON
+/// payload with: the generic one of this service's `restJson1` wire
+/// (`smithy_query(query="service_info")`: protocols [restJson1]), whatever the request
+/// named for its own payload.
+const GENERIC_JSON_MEDIA_TYPE: &str = "application/json";
+
+/// The media type a route OUTSIDE that surface announces when the request named none —
+/// recorded behavior of this service's own resource operations, and so the contrast that
+/// keeps the rule above scoped to the tagging surface.
+const SERVICE_JSON_MEDIA_TYPE: &str = "application/x-amz-json-1.1";
+
+/// Send one request, naming `content_type` for its own payload only when it names one at
+/// all, and return the status, the media type the answer announced, the error shape it
+/// named, and its parsed JSON body.
+async fn announced(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+    content_type: Option<&str>,
+) -> (u16, Option<String>, Option<String>, Value) {
+    let payload = body.map(|b| b.to_string()).unwrap_or_default();
+    let mut request = http::Request::builder()
+        .method(method)
+        .uri(format!("https://docdb-elastic.{REGION}.amazonaws.com{path}"))
+        .header("host", format!("docdb-elastic.{REGION}.amazonaws.com"))
+        .header("authorization", authorization());
+    if let Some(content_type) = content_type {
+        request = request.header("content-type", content_type);
+    }
+    let response = router
+        .dispatch(
+            request
+                .body(bytes::Bytes::from(payload))
+                .expect("a well-formed request"),
+        )
+        .await;
+    let status = response.status().as_u16();
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+    };
+    let media_type = header("content-type");
+    let error_type = header(ERROR_TYPE_HEADER);
+    let bytes = response.into_body();
+    let parsed = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            panic!(
+                "{method} {path}: body is not JSON ({e}): {}",
+                String::from_utf8_lossy(&bytes)
+            )
+        })
+    };
+    (status, media_type, error_type, parsed)
+}
+
+/// One SUCCESS of the tagging surface: the call, and the media type its request names for
+/// its own payload (`None` for a request carrying none).
+struct Success {
+    case: &'static str,
+    method: &'static str,
+    path: String,
+    body: Option<Value>,
+    named: Option<&'static str>,
+}
+
+/// The LEADING token of an `x-amzn-errortype` value: the error shape a client resolves from
+/// it, which is the text before any locator a serving stack appends and after any namespace
+/// that declares the shape.
+///
+/// Spelled out here on purpose, rather than taken from
+/// `service_common::error_type_locator::header_shape_named`: that reader is what the service
+/// under test uses to write the header, so this suite keeps its own INDEPENDENT oracle for
+/// reading it back. It is not a third parsing rule of the wire.
+fn leading_token(named: &str) -> &str {
+    let before_locator = named.split(':').next().unwrap_or(named).trim();
+    before_locator
+        .rsplit('#')
+        .next()
+        .unwrap_or(before_locator)
+        .trim()
 }
 
 /// The wire error code of an error response (`__type`, bare or namespaced).
@@ -627,4 +713,196 @@ async fn an_arn_this_service_does_hold_is_still_tagged_and_read_back() {
         body["tags"].get("Project").is_none(),
         "case \"reading after untag\": the removed key must be gone, got {body}"
     );
+}
+
+#[tokio::test]
+async fn a_tagging_refusal_announces_the_generic_media_type_and_leads_with_its_error_code() {
+    // The two headers a client classifies this refusal by, asserted on ONE response: the
+    // media type it announces its JSON payload with, and the error shape it names. The rows
+    // span all three tagging operations, every JSON media type a request can name for its
+    // own payload (naming none and naming one that is not JSON included), and both resource
+    // classes an ARN of this service can name — the recorded cases, a tag read and a tag
+    // delete of an ARN no resource carries, are rows of it.
+    let router = emulator();
+
+    // The media types a request can name for its own payload. A request naming none at all
+    // is the `None` row: that is how a read and a delete arrive.
+    let named_media_types = [
+        ("no media type", None),
+        ("the generic JSON media type", Some(GENERIC_JSON_MEDIA_TYPE)),
+        ("this service's own", Some(SERVICE_JSON_MEDIA_TYPE)),
+        ("another AWS JSON version", Some("application/x-amz-json-1.0")),
+        ("a parameterised media type", Some("application/json; charset=utf-8")),
+        ("a media type that is not JSON", Some("application/xml")),
+    ];
+
+    for tag_call in tag_calls() {
+        for identifier in identifiers() {
+            for (named_case, named) in named_media_types {
+                let case = format!(
+                    "{} / {} / {named_case}",
+                    tag_call.operation, identifier.case
+                );
+                let (status, media_type, error_type, body) = announced(
+                    &router,
+                    tag_call.method,
+                    &(tag_call.path)(&identifier.value),
+                    (tag_call.body)(),
+                    named,
+                )
+                .await;
+
+                assert_eq!(
+                    status, 404,
+                    "case {case:?}: an ARN holding no resource is HTTP 404, got {status} \
+                     with {body}"
+                );
+                assert_eq!(
+                    media_type.as_deref(),
+                    Some(GENERIC_JSON_MEDIA_TYPE),
+                    "case {case:?}: expected the payload announced as \
+                     {GENERIC_JSON_MEDIA_TYPE:?}, got {media_type:?}"
+                );
+                let named_shape = error_type.clone().unwrap_or_else(|| {
+                    panic!("case {case:?}: a refusal must name its error shape in {ERROR_TYPE_HEADER}")
+                });
+                assert_eq!(
+                    leading_token(&named_shape),
+                    NOT_FOUND_SHAPE,
+                    "case {case:?}: expected {NOT_FOUND_SHAPE:?} to lead \
+                     {ERROR_TYPE_HEADER}, got {named_shape:?}"
+                );
+                // No Amazon-internal locator rides along: a client reading the whole value
+                // sees nothing a real answer does not carry.
+                assert!(
+                    !named_shape.contains("internal.amazon.com"),
+                    "case {case:?}: {ERROR_TYPE_HEADER} must carry no internal locator, got \
+                     {named_shape:?}"
+                );
+                // The envelope the two headers announce is the one the body carries.
+                assert_eq!(
+                    error_code(&body),
+                    NOT_FOUND_SHAPE,
+                    "case {case:?}: the body must name the same shape, got {body}"
+                );
+                assert_eq!(
+                    message(&body),
+                    TAGGED_RESOURCE_SENTENCE,
+                    "case {case:?}: expected {TAGGED_RESOURCE_SENTENCE:?}, got {:?}",
+                    message(&body)
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_tagging_surface_announces_one_media_type_whatever_the_status() {
+    // The rule belongs to the SURFACE, not to a status: a success of the same three
+    // operations is announced with the same media type and names no error shape. The
+    // contrast row is a route outside that surface, which keeps announcing this service's
+    // own media type for a request that named none — so the rule does not leak into the
+    // rest of the service.
+    let router = emulator();
+    let (status, created) = call(
+        &router,
+        "POST",
+        "/cluster",
+        Some(minimal_create("announced-cluster")),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the fixture cluster must be created, got {status} with {created}"
+    );
+    let arn = created["cluster"]["clusterArn"]
+        .as_str()
+        .expect("the created cluster carries its ARN")
+        .to_string();
+
+    let successes = vec![
+        Success {
+            case: "TagResource on a held ARN",
+            method: "POST",
+            path: format!("/tags/{}", encode(&arn)),
+            body: Some(json!({"tags": {"Project": "lionfish"}})),
+            named: Some(GENERIC_JSON_MEDIA_TYPE),
+        },
+        Success {
+            case: "ListTagsForResource on a held ARN, naming no media type",
+            method: "GET",
+            path: format!("/tags/{}", encode(&arn)),
+            body: None,
+            named: None,
+        },
+        Success {
+            case: "ListTagsForResource on a held ARN, naming this service's own",
+            method: "GET",
+            path: format!("/tags/{}", encode(&arn)),
+            body: None,
+            named: Some(SERVICE_JSON_MEDIA_TYPE),
+        },
+        Success {
+            case: "UntagResource on a held ARN",
+            method: "DELETE",
+            path: format!("/tags/{}?tagKeys=Project", encode(&arn)),
+            body: None,
+            named: Some(SERVICE_JSON_MEDIA_TYPE),
+        },
+    ];
+
+    for Success {
+        case,
+        method,
+        path,
+        body,
+        named,
+    } in successes
+    {
+        let (status, media_type, error_type, answered) =
+            announced(&router, method, &path, body, named).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with {answered}"
+        );
+        assert_eq!(
+            media_type.as_deref(),
+            Some(GENERIC_JSON_MEDIA_TYPE),
+            "case {case:?}: expected {GENERIC_JSON_MEDIA_TYPE:?}, got {media_type:?}"
+        );
+        assert_eq!(
+            error_type, None,
+            "case {case:?}: a success names no error shape, got {error_type:?}"
+        );
+    }
+
+    // The contrast: a cluster's own reader is not the ARN-addressed surface. Each row names
+    // the status its own ARN must answer, so a row that stops exercising its route fails.
+    let unheld = format!(
+        "arn:aws:docdb-elastic:{REGION}:{ACCOUNT}:{CLUSTER_SEGMENT}/00000000-0000-0000-0000-000000000000"
+    );
+    for (case, path, expected) in [
+        (
+            "GetCluster of a held ARN",
+            format!("/cluster/{}", encode(&arn)),
+            200,
+        ),
+        (
+            "GetCluster of an ARN no cluster carries",
+            format!("/cluster/{}", encode(&unheld)),
+            404,
+        ),
+    ] {
+        let (status, media_type, _, body) = announced(&router, "GET", &path, None, None).await;
+        assert_eq!(
+            status, expected,
+            "case {case:?}: expected HTTP {expected}, got {status} with {body}"
+        );
+        assert_eq!(
+            media_type.as_deref(),
+            Some(SERVICE_JSON_MEDIA_TYPE),
+            "case {case:?}: a route outside the tagging surface announces \
+             {SERVICE_JSON_MEDIA_TYPE:?} for a request naming none, got {media_type:?}"
+        );
+    }
 }
