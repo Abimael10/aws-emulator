@@ -100,6 +100,17 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         // session's identifier and its metadata alone), so a declaration naming another key
         // asks for a different session.
         BEDROCK_SESSION => &["EncryptionKeyArn"],
+        // A trigger keeps the TYPE it fires on, the WORKFLOW it belongs to and whether its
+        // create started it: all three are members of `CreateTrigger` and of no member of
+        // `TriggerUpdate` — which takes a trigger's description, schedule, actions, predicate
+        // and event batching condition and nothing else
+        // (`smithy_query(query="shape",shape="TriggerUpdate")`) — so a declaration restating
+        // one of them asks for a DIFFERENT trigger, which CloudFormation replaces. (Its NAME
+        // is in that position through [`name_is_create_only`], and every other property of the
+        // type is a member of that update.)
+        crate::state::provisioner::glue_triggers::GLUE_TRIGGER => {
+            crate::state::provisioner::glue_triggers::GLUE_TRIGGER_CREATE_ONLY_PROPERTIES
+        }
         // A spending limit is a cost control ABOUT one device: `UpdateSpendingLimit` takes
         // the limit's amount and its period and no device at all, so a declaration naming
         // another device asks for a different limit.

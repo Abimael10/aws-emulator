@@ -214,6 +214,14 @@ impl Provisioner {
             Self::GlueJob => update_glue_job(ctx, region, resource, declared)
                 .await
                 .map(Some),
+            // `UpdateTrigger` takes the `TriggerUpdate` that "updates the previous trigger
+            // definition by overwriting it completely", so a changed declaration is applied
+            // to the trigger the stack created rather than replacing it — less the three
+            // properties that shape carries no member for, which a change replaces the
+            // trigger over ([`glue_triggers::GLUE_TRIGGER_CREATE_ONLY_PROPERTIES`]).
+            Self::GlueTrigger => update_glue_trigger(ctx, region, resource, declared)
+                .await
+                .map(Some),
             // `UpdateDatabase` "updates an existing database definition" and takes the same
             // `DatabaseInput` the create did, so a changed declaration is applied to the
             // database the stack created rather than replacing it; `UpdateTable` is the same

@@ -7,7 +7,9 @@
 //! catalog's `EncryptionAtRest` names a KMS key is encrypted under THAT key, and every
 //! later read of that object answers it only after KMS has opened its data key again —
 //! while the key cannot be used, the read is refused with HTTP 400
-//! `GlueEncryptionException` carrying KMS's own refusal, and once the key can be used
+//! `GlueEncryptionException` carrying KMS's own refusal, relayed as the whole ANSWER it came
+//! in (that service's sentence, then the envelope naming the service, the status, the error
+//! code and that answer's own request id), and once the key can be used
 //! again the very same metadata is answered. The key belongs to each WRITE, because the
 //! configuration "is applied to every catalog write thereafter"
 //! (`PutDataCatalogEncryptionSettings`): an object written before the key was configured,
@@ -111,16 +113,79 @@ fn kms_message(body: &Value) -> String {
         .to_string()
 }
 
+/// What KMS itself ANSWERED when asked to use a key for a cryptographic operation right
+/// now: the sentence it worded, the code it answered under and the status it answered with
+/// — the three parts a Glue refusal relaying it has to carry, taken from KMS rather than
+/// written out here.
+#[derive(Debug)]
+struct KmsRefusal {
+    sentence: String,
+    code: String,
+    status: u16,
+}
+
 /// What KMS itself answers when asked to use `key_id` for a cryptographic operation right
 /// now: the refusal the catalog has to relay, taken from KMS rather than written out here.
-async fn kms_refusal_for(router: &MultiServiceRouter, key_id: &str) -> String {
+async fn kms_refusal_for(router: &MultiServiceRouter, key_id: &str) -> KmsRefusal {
     let (status, body) = kms(router, "GenerateDataKey", &json!({ "KeyId": key_id })).await;
     assert_eq!(
         status, 400,
         "a key that cannot be used must have KMS refuse a cryptographic operation on it, \
          got {status} with {body}"
     );
-    kms_message(&body)
+    KmsRefusal {
+        sentence: kms_message(&body),
+        code: kms_error_code(&body),
+        status,
+    }
+}
+
+/// The error code a KMS failure body answers under (`__type`), without the namespace an
+/// awsJson discriminator may carry — the code the relayed envelope names.
+fn kms_error_code(body: &Value) -> String {
+    let tagged = body
+        .get("__type")
+        .and_then(Value::as_str)
+        .unwrap_or("<no __type>");
+    tagged
+        .rsplit('#')
+        .next()
+        .unwrap_or(tagged)
+        .to_string()
+}
+
+/// Hold one Glue refusal's `Message` to the whole KMS ANSWER it relays: that service's own
+/// sentence, then the envelope naming the call it came from.
+///
+/// The envelope's fixed text is the form an SDK renders a caught service exception in; every
+/// variable part comes from the answer KMS gave ([`kms_refusal_for`]) rather than from this
+/// suite, and the request id — which belongs to that one answer — is only held to being an
+/// identifier the envelope states rather than to any particular value.
+fn assert_relays_kms_answer(case: &str, operation: &str, message: &str, refused: &KmsRefusal) {
+    let head = format!(
+        "{} (Service: AWSKMS; Status Code: {}; Error Code: {}; Request ID: ",
+        refused.sentence, refused.status, refused.code
+    );
+    let tail = "; Proxy: null)";
+    assert!(
+        message.starts_with(&head),
+        "case {case}: {operation} must relay KMS's own answer; expected it to start {head:?}, \
+         got {message:?}"
+    );
+    assert!(
+        message.ends_with(tail),
+        "case {case}: {operation} must relay KMS's own answer; expected it to end {tail:?}, \
+         got {message:?}"
+    );
+    let request_id = message
+        .strip_prefix(&head)
+        .and_then(|rest| rest.strip_suffix(tail))
+        .unwrap_or_default();
+    assert!(
+        !request_id.is_empty() && !request_id.contains(' '),
+        "case {case}: {operation} must state the relayed answer's own request id, got \
+         {request_id:?}"
+    );
 }
 
 /// How a key is taken out of use and put back — the two ways KMS's own key states reach a
@@ -372,10 +437,11 @@ async fn a_catalog_read_depends_on_the_key_its_write_was_encrypted_under() {
         }
 
         row.outage.begin(&router, &key_id).await;
-        // The refusal the catalog must relay, as KMS words it for this key right now.
+        // The refusal the catalog must relay, as KMS words and codes it for this key right
+        // now.
         let relayed = kms_refusal_for(&router, &key_id).await;
         assert!(
-            relayed.contains(&key_arn),
+            relayed.sentence.contains(&key_arn),
             "case {}: KMS's own refusal names the key it is about, got {relayed:?}",
             row.case
         );
@@ -393,13 +459,7 @@ async fn a_catalog_read_depends_on_the_key_its_write_was_encrypted_under() {
                 "case {}: {operation} must be refused as GlueEncryptionException, got {body}",
                 row.case
             );
-            assert_eq!(
-                error_message(&body),
-                relayed,
-                "case {}: {operation} must relay KMS's own refusal, got {:?}",
-                row.case,
-                error_message(&body)
-            );
+            assert_relays_kms_answer(row.case, operation, &error_message(&body), &relayed);
         }
 
         row.outage.end(&router, &key_id).await;
@@ -491,13 +551,7 @@ async fn a_catalog_write_is_refused_while_the_catalogs_key_cannot_be_used() {
                 "case {}: {operation} must be refused as GlueEncryptionException, got {body}",
                 row.case
             );
-            assert_eq!(
-                error_message(&body),
-                relayed,
-                "case {}: {operation} must relay KMS's own refusal, got {:?}",
-                row.case,
-                error_message(&body)
-            );
+            assert_relays_kms_answer(row.case, operation, &error_message(&body), &relayed);
         }
 
         // Nothing the refused writes named was stored, and nothing they would have

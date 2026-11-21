@@ -219,6 +219,9 @@ impl Provisioner {
                 describe_web_acl_association(ctx, region, resource).await
             }
             Self::GlueJob => describe_glue_job(ctx, region, physical_resource_id).await,
+            Self::GlueTrigger => {
+                describe_glue_trigger(ctx, region, physical_resource_id).await
+            }
             // Read back by the same handles the deletes address the two catalog entities by,
             // and reported as the type's own properties: a database's definition is the
             // `DatabaseInput` property, a table's the `TableInput` one.

@@ -179,6 +179,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
+        // A firing of a SCHEDULED trigger that the clock has already made due BEGINS a run of
+        // the job its actions name, and it was owed at the instant its schedule named whether
+        // or not anybody called — so it is materialised here, before the runs this job owes
+        // their executions are performed, and the run it began is part of this history.
+        state
+            .lock()
+            .settle_due_scheduled_trigger_firings(&region, now);
         // A run of this job that is still owed its script's ONE execution — one a trigger's
         // firing or an event delivery began — is performed here, with no store guard held,
         // before the history is read: the execution was owed the instant the run began, so

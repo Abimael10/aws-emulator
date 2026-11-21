@@ -23,6 +23,14 @@
 //!   one this caller may not use — is the catalog read's refusal too, relayed under the
 //!   modelled `GlueEncryptionException`.
 //!
+//! A relayed refusal carries the whole ANSWER and not just its sentence: KMS's own sentence
+//! followed by the envelope the SDK layer that made the call states around a failed one — the
+//! service that answered, the HTTP status it answered with, the error code it answered under
+//! and that answer's own request id ([`judge`]). Which KMS failure broke the catalog call is
+//! then readable from the message alone, with no second call to KMS, and the envelope is
+//! rendered by the workspace's one renderer of that form
+//! ([`::service_common::relayed_refusal::caught_exception_message`]) rather than built here.
+//!
 //! KMS is reached the way this service already reaches another service: the AWS SDK driven
 //! over the emulator's OWN in-process transport, through the operation callback
 //! ([`smithy_server_runtime::OperationContext::callback`]), so no socket is opened and
@@ -35,8 +43,14 @@
 
 use ::aws_sdk_kms::error::ProvideErrorMetadata;
 use ::aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+use ::service_common::relayed_refusal::{answered_request_id, caught_exception_message, CaughtCall};
 
 use super::ComAmazonawsGlueAwsglueState;
+
+/// The name the relayed envelope names the called service by: the name the SDK layer that
+/// relays a Key Management Service call reports it under, which is neither that service's
+/// signing name (`kms`) nor the casing of its `sdkId`.
+const KMS_SDK_SERVICE_NAME: &str = "AWSKMS";
 
 /// The `CatalogEncryptionMode` values under which a catalog write is encrypted with a KMS
 /// key named by `EncryptionAtRest$SseAwsKmsKeyId`.
@@ -91,9 +105,9 @@ pub fn write_key(store: &ComAmazonawsGlueAwsglueState, catalog_id: &str) -> Opti
 /// the `key` the catalog's settings named.
 ///
 /// `Ok(None)` is an object that depends on no key — the catalog encrypts its writes under
-/// none, or KMS answered nothing about the one it names. `Err` carries KMS's OWN refusal
-/// message, for the caller to answer `GlueEncryptionException` with: a catalog whose key
-/// cannot be used cannot take the write either.
+/// none, or KMS answered nothing about the one it names. `Err` carries KMS's OWN refusal as
+/// the answer it came in ([`judge`]), for the caller to answer `GlueEncryptionException`
+/// with: a catalog whose key cannot be used cannot take the write either.
 pub async fn seal(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -148,8 +162,9 @@ pub async fn seal(
 /// read has to do before it can answer the object.
 ///
 /// `Ok(())` is a read that may be answered — the object was written under no key, or KMS
-/// opened its data key, or KMS answered nothing about it. `Err` carries KMS's own refusal
-/// message, for the caller to answer `GlueEncryptionException` with.
+/// opened its data key, or KMS answered nothing about it. `Err` carries KMS's own refusal as
+/// the answer it came in ([`judge`]), for the caller to answer `GlueEncryptionException`
+/// with.
 pub async fn unseal(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -216,7 +231,8 @@ pub async fn unseal_all(
 /// Resolve the `SseAwsKmsKeyId` a `PutDataCatalogEncryptionSettings` names, so a catalog
 /// is not configured to encrypt its writes under a key that does not exist.
 ///
-/// `Err` carries KMS's own refusal message for the caller's `InvalidInputException`. Only
+/// `Err` carries KMS's own refusal, as the answer it came in ([`judge`]), for the caller's
+/// `InvalidInputException`. Only
 /// a KMS answer about whether the key can be RESOLVED is a refusal
 /// ([`EXISTENCE_NEGATIVE_KMS_ERROR_CODES`]): the state a key is in is read at each write
 /// and read of an object, so a key that resolves may be configured whatever state it is
@@ -251,7 +267,8 @@ pub async fn resolvable_key(
 
 /// What KMS answered about a key, once the failure has been read.
 enum KmsAnswer {
-    /// KMS refused, and the refusal is about the KEY. Carries KMS's own message.
+    /// KMS refused, and the refusal is about the KEY. Carries KMS's own answer, relayed
+    /// whole ([`judge`]).
     Refused(String),
     /// KMS said nothing about the key. Carries why, for the operator-visible log line.
     Silent(String),
@@ -259,26 +276,46 @@ enum KmsAnswer {
 
 /// Read a KMS failure: a client-status answer carrying one of `negative` is a statement
 /// about the key, anything else says nothing about it.
+///
+/// A statement about the key is relayed as the whole ANSWER it came in: KMS's own sentence,
+/// then the envelope naming the call it came from — the service that answered, the status it
+/// answered with, the code it answered under and the id of that answer. Every part comes from
+/// the response being read, so the message cannot state a code or a status the answer did not
+/// carry, and the id is the one that answer reported (or, where it reported none, one minted
+/// for that answer — never derived from the request).
 fn judge<E: ProvideErrorMetadata + ::std::error::Error + 'static>(
     error: &::aws_sdk_kms::error::SdkError<E, HttpResponse>,
     negative: &[&str],
 ) -> KmsAnswer {
     let reason = ::aws_smithy_types::error::display::DisplayErrorContext(error).to_string();
-    // The status KMS answered with, when it answered at all: a 5xx is about KMS, not
-    // about the key, whatever code travels with it.
-    let client_error = error
-        .raw_response()
-        .is_some_and(|response| response.status().is_client_error());
+    // The answer KMS gave, when it gave one at all: a failure that carries no response is
+    // evidence of nothing about the key, and neither is a 5xx — that is about KMS — whatever
+    // code travels with it.
+    let Some(response) = error.raw_response() else {
+        return KmsAnswer::Silent(reason);
+    };
     let code = ProvideErrorMetadata::code(error).unwrap_or_default();
-    if client_error && negative.iter().any(|known| known.eq_ignore_ascii_case(code)) {
-        // KMS's own wording for the refusal, which is what the catalog relays; a coded
-        // answer that carries no message at all leaves the rendered failure as the next
-        // best account of it.
-        let message = ProvideErrorMetadata::message(error)
-            .map_or_else(|| reason.clone(), str::to_string);
-        return KmsAnswer::Refused(message);
+    if !response.status().is_client_error()
+        || !negative.iter().any(|known| known.eq_ignore_ascii_case(code))
+    {
+        return KmsAnswer::Silent(reason);
     }
-    KmsAnswer::Silent(reason)
+    // KMS's own wording for the refusal, which is what the catalog relays; a coded
+    // answer that carries no message at all leaves the rendered failure as the next
+    // best account of it.
+    let sentence =
+        ProvideErrorMetadata::message(error).map_or_else(|| reason.clone(), str::to_string);
+    KmsAnswer::Refused(caught_exception_message(
+        "",
+        "",
+        &sentence,
+        CaughtCall {
+            service: KMS_SDK_SERVICE_NAME,
+            status: response.status().as_u16(),
+            code,
+            request_id: &answered_request_id(response.headers()),
+        },
+    ))
 }
 
 /// The KMS error codes that say the key cannot be USED for a cryptographic operation

@@ -289,6 +289,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // read, so this write lands on the record that read reported.
             if let Some(trigger) = store.trigger_mut(&region, &input.name) {
                 trigger.start();
+                // A start that ARMED a scheduled trigger puts it on its schedule: the first
+                // firing it is owed is the first instant its own expression names after this
+                // start ([`crate::state::TriggerEntry::arm_schedule`]).
+                trigger.arm_schedule(now);
             }
             ::tracing::info!(
                 operation = "StartTrigger",
@@ -319,6 +323,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|begun| begun.job_name.clone())
             .collect();
         crate::state::perform_owed_job_runs(&*self.engine, ctx, &region, &started_jobs).await;
+        // A trigger this start armed is owed its firings by the CLOCK, so the store's pump is
+        // started for it: the firings then happen with no request waiting on any of them.
+        crate::state::drive_clock(ctx.callback(), &state);
 
         Ok(StartTriggerOutput {
             // "The name of the trigger that was started."

@@ -192,6 +192,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &mut trigger.state,
             crate::state::TRIGGER_STATE_DEACTIVATED.to_string(),
         );
+        // A stopped trigger fires on nothing, so a stopped SCHEDULED trigger is on no
+        // schedule either: the firing the clock owed it is taken away with the arming, and a
+        // later start arms the schedule afresh
+        // ([`crate::state::TriggerEntry::arm_schedule`]).
+        trigger.arm_schedule(::std::time::SystemTime::now());
         ::tracing::info!(
             operation = "StopTrigger",
             trigger = %input.name,

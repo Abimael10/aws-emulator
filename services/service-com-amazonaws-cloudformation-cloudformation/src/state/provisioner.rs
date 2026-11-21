@@ -886,6 +886,11 @@ pub(super) enum Provisioner {
     /// makes and `DisassociateWebACL` removes.
     Wafv2WebAclAssociation,
     GlueJob,
+    /// `AWS::Glue::Trigger`: a trigger of AWS Glue — what STARTS the jobs and crawlers of a
+    /// deployment, on a schedule, on a predicate, on an event or on a caller — which
+    /// `CreateTrigger` creates under the name the declaration states, `UpdateTrigger`
+    /// overwrites the definition of and `DeleteTrigger` deletes.
+    GlueTrigger,
     /// `AWS::Glue::Database`: a database of the AWS Glue Data Catalog, which
     /// `CreateDatabase` creates under the name its `DatabaseInput` states and
     /// `DeleteDatabase` deletes.
@@ -1518,6 +1523,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         WAFV2_REGEX_PATTERN_SET => Some(Provisioner::Wafv2RegexPatternSet),
         WAFV2_WEB_ACL_ASSOCIATION => Some(Provisioner::Wafv2WebAclAssociation),
         GLUE_JOB => Some(Provisioner::GlueJob),
+        GLUE_TRIGGER => Some(Provisioner::GlueTrigger),
         GLUE_DATABASE => Some(Provisioner::GlueDatabase),
         GLUE_TABLE => Some(Provisioner::GlueTable),
         GLUE_CRAWLER => Some(Provisioner::GlueCrawler),
@@ -1980,6 +1986,10 @@ impl Provisioner {
             // (the job's name) set on the way out and the tag MAP that call takes merged
             // from the declaration's own and the stack's.
             Self::GlueJob => create_glue_job(ctx, region, resource, propagated).await,
+            // A trigger IS taggable: its `Tags` property is the tag MAP `CreateTrigger`'s own
+            // `Tags` member takes, so it carries the stack's tags beside its own, and every
+            // other property of the type is a member of that same call.
+            Self::GlueTrigger => create_glue_trigger(ctx, region, resource, propagated).await,
             // The two catalog types publish no `Tags` property at all — neither is a
             // taggable resource, AWS Glue holding tags on the catalog entities its own
             // tagging calls name — so no tags are propagated to one, and the declared
@@ -3091,6 +3101,7 @@ impl Provisioner {
             // carries.
             Self::Wafv2WebAclAssociation => disassociate_web_acl(ctx, region, resource).await,
             Self::GlueJob => delete_glue_job(ctx, region, physical_resource_id).await,
+            Self::GlueTrigger => delete_glue_trigger(ctx, region, physical_resource_id).await,
             // A database is addressed by its name in the catalog its declaration names, and
             // a table by that catalog, the database that holds it and its own name — so both
             // deletes take the whole record rather than the id.
@@ -3771,6 +3782,11 @@ mod neptune_graphs;
 /// on one of the Data Catalog tables [`platform_services`] creates, which that service keys
 /// by the catalog, the database, the table and the optimizer's own type together.
 mod glue_table_optimizers;
+/// The AWS Glue TRIGGER arms: the trigger an `AWS::Glue::Trigger` declares, which is what
+/// starts the jobs [`platform_services`] creates. Visible to the rest of this service's state
+/// because the type's own NAME lives here, beside the arms that provision it, and the table of
+/// properties a change REPLACES the resource over keys its entry by it.
+pub(in crate::state) mod glue_triggers;
 /// The AWS Elemental MediaConvert CERTIFICATE ASSOCIATION arm: the trust an
 /// `AWS::MediaConvert::CertificateAssociation` declares between an AWS Certificate Manager
 /// certificate and the account's MediaConvert service, made in the service that owns it so
@@ -3968,6 +3984,7 @@ use rbin_rules::*;
 use network_security_manager::*;
 use neptune_graphs::*;
 use glue_table_optimizers::*;
+use glue_triggers::*;
 use mediaconvert_certificates::*;
 use lake_formation_permissions::*;
 use iam_identities::*;

@@ -349,10 +349,13 @@ pub(super) fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // built from is printable — but may be longer than.
         "AWS::Glue::Job" => rules(255, Characters::AsGenerated),
         // The same `NameString` bound AWS Glue holds every entity of its own to:
-        // `CreateDatabase.DatabaseInput$Name`, `CreateTable.TableInput$Name` and
-        // `CreateCrawler.Name` are all `@length(min: 1, max: 255)` with that same printable
-        // pattern (AWS Glue's own Smithy model).
+        // `CreateDatabase.DatabaseInput$Name`, `CreateTable.TableInput$Name`,
+        // `CreateCrawler.Name` and `CreateTrigger.Name` are all `@length(min: 1, max: 255)`
+        // with that same printable pattern (AWS Glue's own Smithy model).
         GLUE_DATABASE | GLUE_TABLE | GLUE_CRAWLER => rules(255, Characters::AsGenerated),
+        crate::state::provisioner::glue_triggers::GLUE_TRIGGER => {
+            rules(255, Characters::AsGenerated)
+        }
         // Amazon EventBridge `PutRule.Name`: `RuleName`, `@length(min: 1, max: 64)` with
         // pattern `^[\.\-_A-Za-z0-9]+$` (EventBridge's own Smithy model), which a
         // generated name is already inside but may be longer than.

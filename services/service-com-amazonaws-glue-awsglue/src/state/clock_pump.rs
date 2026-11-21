@@ -8,12 +8,16 @@
 //!
 //! Every owed transition this service holds is materialised by whichever later call reads the
 //! record ([`ComAmazonawsGlueAwsglueState::settle_due_job_runs`],
-//! [`ComAmazonawsGlueAwsglueState::settle_due_crawls`]), which is what makes a read report the
+//! [`ComAmazonawsGlueAwsglueState::settle_due_crawls`],
+//! [`ComAmazonawsGlueAwsglueState::settle_due_scheduled_trigger_firings`]), which is what
+//! makes a read report the
 //! state the clock had already reached. That is enough for a client that keeps polling, and
 //! not enough for one that does not: Glue is an event SOURCE, and a client that wires a job
 //! run or a crawl to downstream work through EventBridge makes no further Glue call at all, so
-//! an event published only by the next reader would never be published. The pump is what lets
-//! those events leave with no request waiting on any of them.
+//! an event published only by the next reader would never be published — and a client that
+//! declares a SCHEDULED trigger expects its firings with no call of its own at all. The pump
+//! is what lets those events leave, and those firings happen, with no request waiting on any
+//! of them.
 //!
 //! # What it does and does not decide
 //!
@@ -24,7 +28,8 @@
 //! pump happened to wake up. It performs no work of its own either — no script is run here;
 //! the door that performs a script records what it came to.
 //!
-//! Each wake-up settles both families this store owes transitions to and then drains both
+//! Each wake-up settles every family this store owes transitions to — the firings a schedule
+//! owes first, then the runs and crawls — and then drains both
 //! event queues ([`publish_pending_job_run_events`], [`publish_pending_crawler_events`]), with
 //! NO store guard held across either publication: EventBridge is reached through the
 //! framework's in-process callback, and a target the event sets off may call back into this
@@ -60,7 +65,9 @@ const MAX_CLOCK_WAIT: Duration = Duration::from_secs(5);
 /// handful and a crawl owes one, and the jobs, the runs one job keeps and the crawlers are all
 /// bounded), and every wake-up either materialises a transition or clears the due instant that
 /// woke it. The cap guarantees termination even if a later change left a due instant that
-/// materialising does not clear, and the next call starts a fresh pump.
+/// materialising does not clear — a SCHEDULED trigger is the one record that is owed a FURTHER
+/// firing once the one that fell due has been performed, which is what a schedule IS — and the
+/// next call starts a fresh pump.
 const MAX_CLOCK_WAKE_UPS: usize = 10_000;
 
 impl ComAmazonawsGlueAwsglueState {
@@ -77,10 +84,14 @@ impl ComAmazonawsGlueAwsglueState {
         if self.has_pending_job_run_events() || self.has_pending_crawler_events() {
             return Some(now);
         }
-        let next = [self.next_job_run_due_at(), self.next_crawl_due_at()]
-            .into_iter()
-            .flatten()
-            .min();
+        let next = [
+            self.next_job_run_due_at(),
+            self.next_crawl_due_at(),
+            self.next_scheduled_trigger_firing_due_at(),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         match next {
             Some(due) => Some(due),
             None => {
@@ -167,6 +178,9 @@ pub fn drive_clock(
             {
                 let settled_at = SystemTime::now();
                 let mut store = state.lock();
+                // The firings a schedule owed come FIRST: a trigger's firing begins runs, and
+                // those runs are then given whatever the clock owes them in the same wake-up.
+                store.settle_every_due_scheduled_trigger_firing(settled_at);
                 store.settle_due_job_runs(settled_at);
                 store.settle_due_crawls(settled_at);
             }

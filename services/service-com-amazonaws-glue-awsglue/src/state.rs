@@ -306,6 +306,7 @@ mod schema_definition_canonical;
 mod schema_definition_json;
 mod schema_definition_protobuf;
 mod schema_registry;
+mod scheduled_triggers;
 mod security_configurations;
 mod sessions;
 mod statement_execution;
@@ -359,6 +360,7 @@ pub use schema_definition_canonical::*;
 pub use schema_definition_json::*;
 pub use schema_definition_protobuf::*;
 pub use schema_registry::*;
+pub use scheduled_triggers::*;
 pub use security_configurations::*;
 pub use sessions::*;
 pub use statement_execution::*;
@@ -789,8 +791,10 @@ pub const TRIGGER_STATE_ACTIVATED: &str = "ACTIVATED";
 ///
 /// A stop leaves the trigger in this STEADY state rather than in the enum's
 /// `DEACTIVATING`, exactly as a start leaves it in [`TRIGGER_STATE_ACTIVATED`] rather than
-/// in `ACTIVATING`: nothing in this emulator keeps a trigger's schedule or predicate
-/// running, so the clock owes a stopped trigger no further transition.
+/// in `ACTIVATING`: the state itself is what a stop decides, and the clock owes a stopped
+/// trigger no transition of its own. What it does take away is the trigger's own schedule: a
+/// stopped `SCHEDULED` trigger fires at none of the instants its expression names
+/// ([`TriggerEntry::arm_schedule`]).
 pub const TRIGGER_STATE_DEACTIVATED: &str = "DEACTIVATED";
 
 /// The `TriggerType` of a trigger that fires only when a caller starts it: the one type

@@ -28,6 +28,13 @@
 //! `IdempotentParameterMismatchException` when it submits another one
 //! ([`crate::state::TriggerEntry::matches_create_input`]).
 //!
+//! A create that STARTS a scheduled trigger also puts it on its schedule: the trigger is
+//! armed at the first instant its cron expression names
+//! ([`crate::state::TriggerEntry::arm_schedule`]), and the firing that instant brings is the
+//! clock's own — it begins runs of the trigger's actions, and a run of the workflow it
+//! belongs to, with no caller waiting on any of it
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::settle_due_scheduled_trigger_firings`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -234,8 +241,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A started trigger is waiting to fire; one the create did not start is registered
-        // and idle. Both are steady states: this create registers a definition, so the
-        // clock owes the trigger no later transition.
+        // and idle. Both are steady states as far as the trigger's own `State` goes: this
+        // create registers a definition and moves it no further. What a started SCHEDULED
+        // trigger IS owed from here on is the firings its schedule names, which is a
+        // transition of the runs it begins rather than of the trigger
+        // ([`crate::state::TriggerEntry::arm_schedule`]).
         let trigger_state = if input.start_on_creation {
             crate::state::TRIGGER_STATE_ACTIVATED
         } else {
@@ -243,78 +253,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx.parts());
-        let mut store = state.lock();
-        // A trigger is addressed by name alone, so the name has to be free in THIS Region:
-        // the same name in another Region names another trigger. The name is also this
-        // create's idempotency identifier, so a create under a name already taken is told
-        // which of the two it is: a retry of the create that stored the trigger, or one
-        // request associating that identifier with a second, different trigger.
-        if let Some(stored) = store.trigger(&region, &input.name) {
-            if !stored.matches_create_input(&input) {
+        // Everything this create decides and writes is decided under ONE guard, in a scope of
+        // its own, so no guard is held across the clock pump below.
+        {
+            let mut store = state.lock();
+            // A trigger is addressed by name alone, so the name has to be free in THIS
+            // Region: the same name in another Region names another trigger. The name is also
+            // this create's idempotency identifier, so a create under a name already taken is
+            // told which of the two it is: a retry of the create that stored the trigger, or
+            // one request associating that identifier with a second, different trigger.
+            if let Some(stored) = store.trigger(&region, &input.name) {
+                if !stored.matches_create_input(&input) {
+                    return Err(
+                        CreateTriggerErrorModeled::IdempotentParameterMismatchException(
+                            IdempotentParameterMismatchException {
+                                message: Some(
+                                    crate::state::messages::
+                                        already_submitted_with_different_configuration("Trigger"),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                return Err(CreateTriggerErrorModeled::AlreadyExistsException(
+                    AlreadyExistsException {
+                        message: Some(
+                            crate::state::messages::TRIGGER_ALREADY_EXISTS.to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+            // The entities the trigger belongs to and waits on have to exist for the
+            // definition to resolve: a trigger cannot belong to a workflow nothing created,
+            // nor crawl with a crawler this account does not hold. The JOB an action runs is
+            // resolved when the trigger FIRES, not here, so a dangling job name is stored as
+            // sent.
+            if let Some(missing) = crate::state::missing_trigger_reference(
+                &store,
+                input.workflow_name.as_deref(),
+                &input.actions,
+                input.predicate.as_ref(),
+            ) {
+                return Err(CreateTriggerErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(missing.refusal_message()),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            }
+            // The store is resident memory and this create is reachable by any caller, so the
+            // number of records one process will hold is bounded. Past the ceiling the request
+            // is refused with the operation's own modelled limit error.
+            if !store.can_store_trigger() {
                 return Err(
-                    CreateTriggerErrorModeled::IdempotentParameterMismatchException(
-                        IdempotentParameterMismatchException {
-                            message: Some(
-                                crate::state::messages::
-                                    already_submitted_with_different_configuration("Trigger"),
-                            ),
+                    CreateTriggerErrorModeled::ResourceNumberLimitExceededException(
+                        ResourceNumberLimitExceededException {
+                            message: Some(format!(
+                                "This account already holds the maximum of {} triggers",
+                                crate::state::MAX_TRIGGERS
+                            )),
                         },
                     )
                     .into(),
                 );
             }
-            return Err(CreateTriggerErrorModeled::AlreadyExistsException(
-                AlreadyExistsException {
-                    message: Some(crate::state::messages::TRIGGER_ALREADY_EXISTS.to_string()),
-                },
-            )
-            .into());
-        }
-        // The entities the trigger belongs to and waits on have to exist for the definition
-        // to resolve: a trigger cannot belong to a workflow nothing created, nor crawl with
-        // a crawler this account does not hold. The JOB an action runs is resolved when the
-        // trigger FIRES, not here, so a dangling job name is stored as sent.
-        if let Some(missing) = crate::state::missing_trigger_reference(
-            &store,
-            input.workflow_name.as_deref(),
-            &input.actions,
-            input.predicate.as_ref(),
-        ) {
-            return Err(CreateTriggerErrorModeled::EntityNotFoundException(
-                EntityNotFoundException {
-                    message: Some(missing.refusal_message()),
-                    from_federation_source: None,
-                },
-            )
-            .into());
-        }
-        // The store is resident memory and this create is reachable by any caller, so the
-        // number of records one process will hold is bounded. Past the ceiling the request
-        // is refused with the operation's own modelled limit error.
-        if !store.can_store_trigger() {
-            return Err(
-                CreateTriggerErrorModeled::ResourceNumberLimitExceededException(
-                    ResourceNumberLimitExceededException {
-                        message: Some(format!(
-                            "This account already holds the maximum of {} triggers",
-                            crate::state::MAX_TRIGGERS
-                        )),
-                    },
-                )
-                .into(),
+
+            let mut entry = crate::state::TriggerEntry::from_create_input(&input, trigger_state);
+            // A create that started a scheduled trigger puts it ON its schedule: the first
+            // firing it is owed is the first instant its own expression names after this
+            // create.
+            entry.arm_schedule(::std::time::SystemTime::now());
+            store.insert_trigger(&region, entry);
+            ::tracing::info!(
+                operation = "CreateTrigger",
+                trigger = %input.name,
+                region = %region,
+                trigger_type = %input.r#type,
+                state = %trigger_state,
+                "created a Glue trigger"
             );
         }
 
-        let entry = crate::state::TriggerEntry::from_create_input(&input, trigger_state);
-        store.insert_trigger(&region, entry);
-        ::tracing::info!(
-            operation = "CreateTrigger",
-            trigger = %input.name,
-            region = %region,
-            trigger_type = %input.r#type,
-            state = %trigger_state,
-            "created a Glue trigger"
-        );
+        // A trigger this create armed is owed its firings by the CLOCK, so the store's pump is
+        // started for it: the firings then happen with no request waiting on any of them,
+        // which is what a schedule is. It returns at once, and a store that owes nothing has
+        // the pump stand straight down again.
+        crate::state::drive_clock(ctx.callback(), &state);
 
         Ok(CreateTriggerOutput {
             // "The name of the trigger."

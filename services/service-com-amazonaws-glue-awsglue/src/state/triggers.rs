@@ -66,6 +66,16 @@ pub struct TriggerEntry {
     pub start_on_creation: bool,
     /// The request's `Tags`, which are not part of the `Trigger` shape.
     pub tags: HashMap<String, String>,
+    /// When the CLOCK next owes this trigger a firing of its own schedule, and `None` when
+    /// it is on no schedule ([`Self::runs_on_a_schedule`]).
+    ///
+    /// Server-set and reported by no member of the `Trigger` shape — what a client observes
+    /// of it is the job runs and the workflow run the firing begins. The instant is STORED
+    /// rather than waited for, so nothing sleeps for a schedule: it is written in ONE place
+    /// ([`Self::arm_schedule`]) and materialised by the store's clock pump and by whichever
+    /// call reads what a firing began
+    /// ([`ComAmazonawsGlueAwsglueState::settle_due_scheduled_trigger_firings`]).
+    pub scheduled_firing_due_at: Option<SystemTime>,
 }
 
 impl TriggerEntry {
@@ -91,6 +101,10 @@ impl TriggerEntry {
             batch_window_opened_at: None,
             start_on_creation: input.start_on_creation,
             tags: input.tags.clone().unwrap_or_default(),
+            // The schedule a created trigger is armed on is written by the handler, which
+            // knows the instant the create was served at ([`Self::arm_schedule`]): a trigger
+            // this create did not start is on no schedule either way.
+            scheduled_firing_due_at: None,
         }
     }
 

@@ -195,6 +195,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the trigger exactly as it was.
         let mut updated = stored.clone();
         updated.apply_update(update);
+        // The schedule the trigger fires on is one of the members this update overwrites, so
+        // the firing the clock owes it is re-armed on the replacement definition: the next
+        // firing is the first instant the schedule now in force names, and a replacement
+        // stating none leaves the trigger firing on no schedule at all.
+        updated.arm_schedule(::std::time::SystemTime::now());
 
         // The definition has to be one the service could fire, by the same rule the create
         // enforces on the definition it stores.
@@ -242,6 +247,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         let trigger = updated.to_trigger();
         store.insert_trigger(&region, updated);
+        // The guard is released before the pump is started, because the pump takes it itself.
+        drop(store);
+
+        // An update that left a scheduled trigger armed has it owed its firings by the CLOCK,
+        // so the store's pump is started for it, exactly as the create and the start do: the
+        // firings then happen with no request waiting on any of them. It returns at once, and a
+        // store that owes nothing has the pump stand straight down again.
+        crate::state::drive_clock(ctx.callback(), &state);
 
         Ok(UpdateTriggerOutput {
             trigger: Some(trigger),
