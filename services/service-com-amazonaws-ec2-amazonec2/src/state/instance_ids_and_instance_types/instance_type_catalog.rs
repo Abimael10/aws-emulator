@@ -37,6 +37,7 @@ mod gpu_rows;
 mod intel_nvme_compute_rows;
 mod network_optimized_rows;
 mod previous_generation_rows;
+mod storage_optimized_graviton_rows;
 
 /// The EBS-optimized performance AWS publishes for one instance type: the two bandwidth and
 /// the two IOPS figures of its row in "Amazon EBS optimized instance types".
@@ -4682,9 +4683,10 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
 /// groups — the AMD EPYC families, the accelerated ones, the network optimized ones, the
 /// previous generation ones, the burstable families on Nitro and the one on pre-Nitro
 /// hardware, the dense HDD storage ones, the eighth generation Intel compute optimized ones,
-/// those of them that carry local NVMe devices, and the general purpose families with local
-/// NVMe devices. A row is reached by its instance type alone, so which table it is written in
-/// is nothing but where the figures of one group of families are kept together.
+/// those of them that carry local NVMe devices, the general purpose families with local
+/// NVMe devices, and the storage optimized Graviton ones. A row is reached by its instance type
+/// alone, so which table it is written in is nothing but where the figures of one group of
+/// families are kept together.
 fn published_rows() -> impl Iterator<Item = &'static PublishedInstanceTypeFacts> {
     PUBLISHED_INSTANCE_TYPE_FACTS
         .iter()
@@ -4698,6 +4700,9 @@ fn published_rows() -> impl Iterator<Item = &'static PublishedInstanceTypeFacts>
         .chain(dense_hdd_storage_rows::DENSE_HDD_STORAGE_INSTANCE_TYPE_FACTS)
         .chain(eighth_generation_intel_rows::EIGHTH_GENERATION_INTEL_INSTANCE_TYPE_FACTS)
         .chain(general_purpose_nvme_rows::GENERAL_PURPOSE_NVME_INSTANCE_TYPE_FACTS)
+        .chain(
+            storage_optimized_graviton_rows::STORAGE_OPTIMIZED_GRAVITON_INSTANCE_TYPE_FACTS,
+        )
 }
 
 /// The published facts of `instance_type`, or `None` where the catalog holds no row for it

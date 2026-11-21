@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The published rows of the eighth generation Intel network optimized compute family and of
-//! the Ice Lake high-memory family with local NVMe devices — C8in and X2idn — read through
+//! The published rows of the eighth generation Intel network optimized compute family, of the
+//! Ice Lake high-memory family with local NVMe devices and of the Ice Lake network optimized
+//! general purpose family — C8in, X2idn and M6in — read through
 //! [`super::published_instance_type_facts`] like every other row of the catalog.
 //!
-//! Both carry the `n` capability letter, "network and EBS optimized" (the instance type naming
+//! Each carries the `n` capability letter, "network and EBS optimized" (the instance type naming
 //! conventions), and what it buys is hardware of the family's own: a network share per size
 //! that no general purpose ladder yields, EBS figures of its own rows of "Amazon EBS optimized
 //! instance types", and — on the sizes that hold a whole host — several Elastic Fabric
@@ -20,7 +21,7 @@
 
 use super::*;
 
-/// The published hardware facts of the two families' instance types, one row per type.
+/// The published hardware facts of the three families' instance types, one row per type.
 pub(super) static NETWORK_OPTIMIZED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
     // C8in — compute optimized built for the network, on the 8th generation Intel hardware at
     // a sustained 3.9 GHz, with no local instance store. The family's host carries 600 Gigabit
@@ -278,4 +279,130 @@ pub(super) static NETWORK_OPTIMIZED_INSTANCE_TYPE_FACTS: &[PublishedInstanceType
         .ena_srd(true)
         .boot_modes(LEGACY_BIOS_BOOT_MODE)
         .host_features(false, false),
+    // M6in — general purpose built for the NETWORK, on the same 3rd generation Intel Xeon
+    // Scalable (Ice Lake) host as the C8in family's predecessor and at a sustained 3.5 GHz,
+    // with no local instance store. The host carries 200 Gigabit of network and 100 Gbps of EBS
+    // bandwidth, each size taking its published share of both, so its EBS figures are the `n`
+    // ladder's rows of "Amazon EBS optimized instance types": a baseline the sizes below the
+    // `8xlarge` burst above, up to 25,000 Mbps and 100,000 IOPS, then dedicated bandwidth from
+    // that size up to 100,000 Mbps and 400,000 IOPS. Its EBS volumes come out of the pool
+    // shared with its interfaces and publish 27 attachments at every virtualized size, while
+    // the bare metal size reports the 31 its host's own pool leaves. The adapter takes a
+    // configurable number of ENA queues on its virtualized sizes — changing them being the
+    // hypervisor's to do, which a bare metal instance has none of — ENA Express is offered from
+    // the size that carries the
+    // family's whole dedicated share up, and the Elastic Fabric Adapter only on the two sizes
+    // that hold the whole host — which carry TWO network cards, and so two Elastic Fabric
+    // Adapters and half the family's interface limit per card. The family takes no interface
+    // attachment from a secondary network, so no private address at all is available on one,
+    // and it carries no local PTP hardware clock. Its two largest sizes publish core counts
+    // that go up in twos from four rather than every count up to their default, the sizes below
+    // them and the bare metal one publishing every count. That bare metal size is offered the
+    // legacy BIOS boot mode alone, CloudWatch action based recovery and reboot migration — the
+    // move to another host being the HOST's to make and not the hypervisor's it has none of —
+    // and ENA Express, which its adapter carries whether or not a hypervisor sits under the
+    // guest. The two widest sizes take eight interfaces per card, so the instance's own limit
+    // is the sixteen its two cards take together, and each of those cards carries the whole
+    // instance's published network bandwidth rather than a share of it.
+    PublishedInstanceTypeFacts::of("m6in.large")
+        // The smallest size's published share of its host is 1,562.5 Mbps — 3,125 halves of an
+        // Mbps — which the integer bandwidth member reports as 1,562 while the throughput
+        // member carries the megabytes of the whole figure.
+        .ebs_in_half_mbps(3_125, 6_250, 25_000, 100_000)
+        .ebs_attachments(27)
+        .network_bandwidth(3.125, 25.0)
+        .flexible_ena_queues(true)
+        .efa(0)
+        .ena_srd(false)
+        .processor("Intel", 3.5)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("m6in.xlarge")
+        .ebs(3_125, 12_500, 25_000, 100_000)
+        .ebs_attachments(27)
+        .network_bandwidth(6.25, 30.0)
+        .flexible_ena_queues(true)
+        .efa(0)
+        .ena_srd(false)
+        .processor("Intel", 3.5)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("m6in.2xlarge")
+        .ebs(6_250, 25_000, 25_000, 100_000)
+        .ebs_attachments(27)
+        .network_bandwidth(12.5, 40.0)
+        .flexible_ena_queues(true)
+        .efa(0)
+        .ena_srd(false)
+        .processor("Intel", 3.5)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("m6in.4xlarge")
+        .ebs(12_500, 50_000, 25_000, 100_000)
+        .ebs_attachments(27)
+        .network_bandwidth(25.0, 50.0)
+        .flexible_ena_queues(true)
+        .efa(0)
+        .ena_srd(false)
+        .processor("Intel", 3.5)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("m6in.8xlarge")
+        .ebs(25_000, 100_000, 25_000, 100_000)
+        .ebs_attachments(27)
+        .network_bandwidth(50.0, 50.0)
+        .flexible_ena_queues(true)
+        .efa(0)
+        .ena_srd(true)
+        .processor("Intel", 3.5)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("m6in.12xlarge")
+        .ebs(37_500, 150_000, 37_500, 150_000)
+        .ebs_attachments(27)
+        .network_bandwidth(75.0, 75.0)
+        .flexible_ena_queues(true)
+        .efa(0)
+        .ena_srd(true)
+        .processor("Intel", 3.5)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("m6in.16xlarge")
+        .ebs(50_000, 200_000, 50_000, 200_000)
+        .ebs_attachments(27)
+        .network_bandwidth(100.0, 100.0)
+        .flexible_ena_queues(true)
+        .efa(0)
+        .ena_srd(true)
+        .processor("Intel", 3.5)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("m6in.24xlarge")
+        .cores_in_steps_of(2)
+        .cores_from(4)
+        .ebs(75_000, 300_000, 75_000, 300_000)
+        .ebs_attachments(27)
+        .network_bandwidth(150.0, 150.0)
+        .flexible_ena_queues(true)
+        .efa(0)
+        .ena_srd(true)
+        .processor("Intel", 3.5)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("m6in.32xlarge")
+        .cores_in_steps_of(2)
+        .cores_from(4)
+        .ebs(100_000, 400_000, 100_000, 400_000)
+        .ebs_attachments(27)
+        .network_bandwidth(200.0, 200.0)
+        .flexible_ena_queues(true)
+        .interfaces(16)
+        .efa(2)
+        .ena_srd(true)
+        .processor("Intel", 3.5)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("m6in.metal")
+        .ebs(100_000, 400_000, 100_000, 400_000)
+        .ebs_attachments(31)
+        .network_bandwidth(200.0, 200.0)
+        .interfaces(16)
+        .efa(2)
+        .ena_srd(true)
+        .processor("Intel", 3.5)
+        .auto_recovery(true)
+        .host_features(true, false)
+        .boot_modes(LEGACY_BIOS_BOOT_MODE)
+        .ipv4_per_secondary_interface(0),
 ];

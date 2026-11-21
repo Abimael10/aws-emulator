@@ -282,9 +282,9 @@ async fn an_instance_type_reports_the_members_its_name_yields() {
         TypeCase {
             case: "a two-card type with no published row",
             // A type of the published multi-card list that the catalog holds no per-type row
-            // for, so every member below is the derivation's: `c6in.32xlarge` carries two
+            // for, so every member below is the derivation's: `m6in.32xlarge` carries two
             // cards too, and its row publishes an adapter answer of its own.
-            instance_type: "m6in.32xlarge",
+            instance_type: "r6in.32xlarge",
             cards: 2,
             nitro_clock: "unsupported",
             hypervisor_feature: "supported",

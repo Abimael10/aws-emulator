@@ -2714,14 +2714,16 @@ pub(super) fn supported_boot_modes(architecture: &str, nitro: bool) -> Vec<Strin
 ///
 /// The count is a property of the whole instance rather than of its family's ladder — only
 /// the size that has the whole host's cards carries more than one — so the entries name full
-/// instance types, not families.
-pub(super) const MULTI_NETWORK_CARD_TYPES: [(&str, i32); 17] = [
+/// instance types, not families: the bare metal size of a host whose widest virtualized size
+/// carries two cards IS that whole host, so it carries the same two.
+pub(super) const MULTI_NETWORK_CARD_TYPES: [(&str, i32); 18] = [
     ("c6in.32xlarge", 2),
     ("c6in.metal", 2),
     ("c8gb.48xlarge", 2),
     ("dl1.24xlarge", 4),
     ("m6idn.32xlarge", 2),
     ("m6in.32xlarge", 2),
+    ("m6in.metal", 2),
     ("p4d.24xlarge", 4),
     ("p4de.24xlarge", 4),
     ("p5.48xlarge", 32),
@@ -2839,11 +2841,14 @@ pub(super) fn network_performance(baseline_centi: i64, peak_centi: i64) -> Strin
 /// Adapter on a type that is offered one.
 ///
 /// `published_performance` is the network performance AWS publishes for the type, where the
-/// catalog holds it: a type with ONE card reports that figure on the card too, the single
-/// card carrying the whole instance's network. `published_bandwidth` is the same published
-/// figure in Gbps ([`crate::state::PublishedInstanceTypeFacts::network_bandwidth_gbps`]),
-/// which is what the card's two numeric bandwidth members report — so a card cannot report a
-/// bandwidth the type's own published network performance contradicts.
+/// catalog holds it, and `published_bandwidth` is that same published figure in Gbps
+/// ([`crate::state::PublishedInstanceTypeFacts::network_bandwidth_gbps`]). A card reports the
+/// figures it CARRIES and the text of those same figures, so the two readings of one card
+/// cannot disagree: a card of a type whose row publishes the Gbps figure carries that whole
+/// figure — a card is the instance's network adapter rather than a share of it — and so does
+/// the single card of a type whose row publishes only the text, while a card of a multi-card
+/// type the catalog holds no published figure for carries its share of this size's host and
+/// reports that share both ways.
 pub(super) fn network_cards(
     name: &InstanceTypeName<'_>,
     sixteenths: u32,
@@ -2858,20 +2863,20 @@ pub(super) fn network_cards(
     let per_card_baseline = (baseline / count).max(1);
     let per_card_peak = (peak / count).max(per_card_baseline);
     let interfaces_per_card = (maximum_network_interfaces / cards.max(1)).max(1);
-    // The bandwidth of ONE card: the published figure spread over the cards the instance
-    // carries, where the catalog publishes it, else this size's share of its host.
+    // The bandwidth of ONE card: the figure the catalog publishes for the type, which is what
+    // EACH of its cards carries — a card of a multi-card type is the whole instance's network
+    // adapter rather than a share of it — else this size's share of its host.
     let (per_card_baseline_gbps, per_card_peak_gbps) = match published_bandwidth {
-        Some((baseline_gbps, peak_gbps)) => {
-            let cards = f64::from(cards.max(1));
-            (baseline_gbps / cards, peak_gbps / cards)
-        }
+        Some((baseline_gbps, peak_gbps)) => (baseline_gbps, peak_gbps),
         None => (
             per_card_baseline as f64 / CENTI_GBPS as f64,
             per_card_peak as f64 / CENTI_GBPS as f64,
         ),
     };
+    // And the text of the figures that card just reported: the published column's own text
+    // where the card carries the published figure, else the text of the share it carries.
     let per_card_performance = match published_performance {
-        Some(performance) if cards <= 1 => performance.to_string(),
+        Some(performance) if cards <= 1 || published_bandwidth.is_some() => performance.to_string(),
         _ => network_performance(per_card_baseline, per_card_peak),
     };
     let mut interface_types = vec!["interface".to_string()];

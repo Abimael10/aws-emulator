@@ -398,4 +398,78 @@ pub(super) static AMD_EPYC_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = 
         .processor("AMD", 2.2)
         .dedicated_hosts(false)
         .host_features(false, false),
+    // M5a — general purpose on the same 1st generation AMD EPYC (7571) at a sustained 2.5 GHz,
+    // with no local instance store. Its EBS figures are the family's own rows of "Amazon EBS
+    // optimized instance types": the three sizes below the `4xlarge` publish a baseline they
+    // burst above, up to that size's dedicated 2,880 Mbps and 16,000 IOPS, and from it the
+    // bandwidth is dedicated per size up to 13,750 Mbps and 60,000 IOPS on the size that holds
+    // the whole host — well under the figures the Intel ladder of the same generation reaches,
+    // and with the baseline and the maximum EQUAL from the `4xlarge` up. Its EBS volumes come
+    // out of the pool shared with its interfaces and publish 27 attachments at every size, and
+    // its published network column is one figure for the whole ladder up to the `8xlarge` and
+    // the size's own share of the host above it. The family is NOT offered on a Dedicated Host.
+    // The cores of an EPYC are configured two at a time, so the published core counts of a size
+    // are the even ones — from two up to the `4xlarge`, then from the quarter of its cores each
+    // wider size publishes as its smallest configuration (four at the `8xlarge`, eight at the
+    // `16xlarge`) — except the `12xlarge`, which publishes the multiples of that quarter alone,
+    // and the size that holds the whole host, which takes its cores all at once and so publishes
+    // the one count its default is. The `xlarge`, with two cores, publishes the one count two.
+    PublishedInstanceTypeFacts::of("m5a.large")
+        .cores_in_steps_of(2)
+        .ebs(650, 3_600, 2_880, 16_000)
+        .ebs_attachments(27)
+        .network("Up to 10 Gigabit")
+        .processor("AMD", 2.5)
+        .dedicated_hosts(false),
+    PublishedInstanceTypeFacts::of("m5a.xlarge")
+        .cores_in_steps_of(2)
+        .ebs(1_085, 6_000, 2_880, 16_000)
+        .ebs_attachments(27)
+        .network("Up to 10 Gigabit")
+        .processor("AMD", 2.5)
+        .dedicated_hosts(false),
+    PublishedInstanceTypeFacts::of("m5a.2xlarge")
+        .cores_in_steps_of(2)
+        .ebs(1_580, 8_333, 2_880, 16_000)
+        .ebs_attachments(27)
+        .network("Up to 10 Gigabit")
+        .processor("AMD", 2.5)
+        .dedicated_hosts(false),
+    PublishedInstanceTypeFacts::of("m5a.4xlarge")
+        .cores_in_steps_of(2)
+        .ebs(2_880, 16_000, 2_880, 16_000)
+        .ebs_attachments(27)
+        .network("Up to 10 Gigabit")
+        .processor("AMD", 2.5)
+        .dedicated_hosts(false),
+    PublishedInstanceTypeFacts::of("m5a.8xlarge")
+        .cores_in_steps_of(2)
+        .cores_from(4)
+        .ebs(4_750, 20_000, 4_750, 20_000)
+        .ebs_attachments(27)
+        .network("Up to 10 Gigabit")
+        .processor("AMD", 2.5)
+        .dedicated_hosts(false),
+    PublishedInstanceTypeFacts::of("m5a.12xlarge")
+        .cores_in_steps_of(6)
+        .ebs(6_780, 30_000, 6_780, 30_000)
+        .ebs_attachments(27)
+        .network("10 Gigabit")
+        .processor("AMD", 2.5)
+        .dedicated_hosts(false),
+    PublishedInstanceTypeFacts::of("m5a.16xlarge")
+        .cores_in_steps_of(2)
+        .cores_from(8)
+        .ebs(9_500, 40_000, 9_500, 40_000)
+        .ebs_attachments(27)
+        .network("12 Gigabit")
+        .processor("AMD", 2.5)
+        .dedicated_hosts(false),
+    PublishedInstanceTypeFacts::of("m5a.24xlarge")
+        .cores_all_at_once()
+        .ebs(13_750, 60_000, 13_750, 60_000)
+        .ebs_attachments(27)
+        .network("20 Gigabit")
+        .processor("AMD", 2.5)
+        .dedicated_hosts(false),
 ];
