@@ -195,8 +195,6 @@ pub const KEY_NOT_ENABLED: &str = "kmsKeyId is not enabled";
 struct KeyUse {
     /// The key reference the resource's configuration carries.
     key: String,
-    /// The ARN of the resource whose data the key seals.
-    resource: String,
     /// The encryption context the call presents, one entry naming the resource.
     context: HashMap<String, String>,
 }
@@ -207,7 +205,6 @@ impl KeyUse {
     fn of(key: &str, entry: &str, resource_arn: &str) -> Self {
         Self {
             key: key.to_string(),
-            resource: resource_arn.to_string(),
             context: HashMap::from([(entry.to_string(), resource_arn.to_string())]),
         }
     }
@@ -897,17 +894,10 @@ pub fn state_machine_read_denied<Eng: Send + Sync + 'static>(
 /// policy or API caller does not have the required permissions" — having started
 /// nothing.
 ///
-/// `unassumable` says that IAM ANSWERED that this service cannot act as that role at all
-/// ([`super::task_authorization::unassumable_role`]). Acting as the role comes before
-/// anything the role may then do: credentials the assume never minted seal nothing, so the
-/// mint the start has to make is left to be made as the only identity this service still
-/// has for it — its OWN service principal, on behalf of the state machine
-/// ([`kms_authorization::Caller::service_principal`]) — whose use of the key the KEY'S OWN
-/// POLICY is the only authority over. A key policy that names this service for that state
-/// machine serves the mint; one that does not refuses it, and the start carries the
-/// sentence KMS answered with. It is weighed only for a role this account's IAM HOLDS, the
-/// same evidence [`role_key_denied`] requires: a role no record answers for is the
-/// deploy-time/run-time split this service exposes rather than a role that was refused.
+/// Acting as the role comes before anything the role may then do, so this decision is
+/// taken only for a role this service CAN act as: a role whose assume IAM answered for is
+/// one no identity of the account's holds the key for, which is the run's own failure
+/// ([`run_is_sealed_as_the_execution_role`]) rather than a refusal of this call.
 ///
 /// The KEY STATE is deliberately not decided here: it is a condition of the key rather
 /// than of an identity, and it is decided by the calls that read or write the sealed
@@ -924,7 +914,6 @@ pub fn execution_start_denied<Eng: Send + Sync + 'static>(
     region: &str,
     state_machine_arn: &str,
     role_arn: &str,
-    unassumable: bool,
 ) -> Option<KeyRefusal> {
     let state = super::service_state(engine)?;
     // The guard is released before KMS and IAM are consulted: no store of another
@@ -933,9 +922,6 @@ pub fn execution_start_denied<Eng: Send + Sync + 'static>(
         let store = state.lock();
         state_machine_key(&store, state_machine_arn)?
     };
-    if unassumable && super::task_authorization::iam_holds_role(engine, role_arn) {
-        return service_principal_key_denied(engine, region, &key);
-    }
     role_key_denied(
         engine,
         region,
@@ -945,48 +931,47 @@ pub fn execution_start_denied<Eng: Send + Sync + 'static>(
     )
 }
 
-/// Why the data key `used` needs cannot be minted by this service AS ITSELF, as KMS words
-/// that refusal, or `None` when the key's own policy lets that use through.
+/// Whether an execution of the state machine `state_machine_arn` identifies has its data
+/// sealed AS THE EXECUTION ROLE, so that none of the run's work can be done without
+/// credentials of that role.
 ///
-/// The decision KMS takes for a request another service made as its own service principal
-/// on behalf of one of its resources ([`kms_authorization::Caller::service_principal`]):
-/// such a caller is no principal of the account, so it carries no identity-based documents
-/// and naming the account grants it nothing — the key's own policy is the whole authority
-/// over it, decided against the state machine the call is made for, which is what a
-/// statement scoped by `aws:SourceArn`/`aws:SourceAccount` is written against.
+/// A state machine on a customer managed key has everything its executions retain sealed
+/// under that key, and the mint that sealing makes — "when the period expires, Step
+/// Functions will call `GenerateDataKey`" — is a call the service makes as "the IAM role to
+/// use for this state machine". That mint is the first act of the run, before any state is
+/// entered, so a role this service cannot assume leaves the run no identity to make it as
+/// and nothing of the execution happens, whatever the definition holds.
 ///
-/// `None` for everything that shows nothing, exactly as [`role_key_denied`] reports it: an
-/// engine carrying no KMS store, an identifier naming no key KMS holds, and an Amazon Web
-/// Services managed key, whose policy AWS manages for the service that owns it.
-fn service_principal_key_denied<Eng: Send + Sync + 'static>(
+/// `false` wherever nothing of the kind can be shown, the evidence every decision in this
+/// module requires: a state machine on an Amazon Web Services owned key, an engine carrying
+/// no KMS store, an identifier naming no key KMS holds, and an Amazon Web Services managed
+/// key, whose policy AWS manages for the service that owns it. Call it with no store of
+/// this service locked.
+#[must_use]
+pub fn run_is_sealed_as_the_execution_role<Eng: Send + Sync + 'static>(
     engine: &Eng,
     region: &str,
-    used: &KeyUse,
-) -> Option<KeyRefusal> {
-    let kms = kms_store::service_state(engine)?;
-    let caller = kms_authorization::Caller::service_principal(
-        super::task_authorization::SERVICE_PRINCIPAL,
-        &used.resource,
-    );
-    let via_service = super::task_authorization::regional_service_principal(region);
+    state_machine_arn: &str,
+) -> bool {
+    let Some(state) = super::service_state(engine) else {
+        return false;
+    };
+    // The guard is released before KMS is consulted, as everywhere else here.
+    let used = {
+        let store = state.lock();
+        state_machine_key(&store, state_machine_arn)
+    };
+    let Some(used) = used else {
+        return false;
+    };
+    let Some(kms) = kms_store::service_state(engine) else {
+        return false;
+    };
     let store = kms.lock();
     let kms_store::KeyRef::Found(found) = store.resolve(region, &used.key) else {
-        return None;
+        return false;
     };
-    if found.key_manager != kms_store::KEY_MANAGER_CUSTOMER {
-        return None;
-    }
-    kms_authorization::authorize_use(
-        &caller,
-        &store,
-        region,
-        found,
-        kms_authorization::RequestedUse::through_service(GENERATE_DATA_KEY_OPERATION, &via_service),
-        Some(&used.context),
-        None,
-    )
-    .err()
-    .map(|why| KeyRefusal::AccessDenied(relayed(&why)))
+    found.key_manager == kms_store::KEY_MANAGER_CUSTOMER
 }
 
 /// Why the role `role_arn` cannot have `key` used for `operations`, as KMS words that

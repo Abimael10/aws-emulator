@@ -361,39 +361,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &context.state_machine_arn,
             )
             .await;
-            let acting = crate::state::task_authorization::acting(
-                &self.engine,
+            // The assume is part of the RUN, so a role this service cannot act as is
+            // the re-run's own failure rather than a refusal of this call: the attempt
+            // is recorded — "redriven executions append their event history to the
+            // existing event history" — and the execution fails, exactly as the attempt
+            // a start begins does. ONE reading of that condition, taken here and by
+            // `StartExecution` alike.
+            let unrunnable = crate::state::task_authorization::unrunnable_attempt(
+                &*self.engine,
                 &region,
+                &context.state_machine_arn,
                 &context.role_arn,
-                unassumable,
-                Some(ctx.credential_store()),
+                unassumable.as_ref(),
             );
-            // This attempt CONTINUES the execution, so each Distributed Map state it
-            // re-enters is the Map Run that execution already has: it keeps that ARN,
-            // and the items whose child workflow execution already succeeded are not
-            // run again — "Step Functions preserves the results and execution history
-            // of the successful steps, and doesn't rerun these steps when you redrive
-            // an execution".
-            let acting = crate::state::task_authorization::Acting {
-                map_runs: crate::state::map_runs::resumed(&self.engine, &input.execution_arn),
-                ..acting
-            };
-            crate::state::integration::interpret(ctx, &region, acting, move |tasks| {
-                crate::state::plan_redrive(
-                    &crate::state::RunAttempt {
-                        definition: &definition,
-                        input: &execution_input,
-                        start: now,
-                        context: &context,
-                        opening: crate::state::EVENT_EXECUTION_REDRIVEN,
-                        previous_event_id,
-                    },
-                    redrive_step.as_ref(),
-                    step_entered_at,
-                    tasks,
-                )
-            })
-            .await
+            if let Some(failed) = unrunnable {
+                Ok(crate::state::plan_attempt_that_cannot_run(
+                    now,
+                    crate::state::EVENT_EXECUTION_REDRIVEN,
+                    previous_event_id,
+                    &failed,
+                ))
+            } else {
+                let acting = crate::state::task_authorization::acting(
+                    &self.engine,
+                    &region,
+                    &context.role_arn,
+                    unassumable,
+                    Some(ctx.credential_store()),
+                );
+                // This attempt CONTINUES the execution, so each Distributed Map state it
+                // re-enters is the Map Run that execution already has: it keeps that ARN,
+                // and the items whose child workflow execution already succeeded are not
+                // run again — "Step Functions preserves the results and execution history
+                // of the successful steps, and doesn't rerun these steps when you redrive
+                // an execution".
+                let acting = crate::state::task_authorization::Acting {
+                    map_runs: crate::state::map_runs::resumed(&self.engine, &input.execution_arn),
+                    ..acting
+                };
+                crate::state::integration::interpret(ctx, &region, acting, move |tasks| {
+                    crate::state::plan_redrive(
+                        &crate::state::RunAttempt {
+                            definition: &definition,
+                            input: &execution_input,
+                            start: now,
+                            context: &context,
+                            opening: crate::state::EVENT_EXECUTION_REDRIVEN,
+                            previous_event_id,
+                        },
+                        redrive_step.as_ref(),
+                        step_entered_at,
+                        tasks,
+                    )
+                })
+                .await
+            }
         };
         let Ok(planned) = interpreted else {
             return Err(crate::scaffolded::Scaffolded::validation(

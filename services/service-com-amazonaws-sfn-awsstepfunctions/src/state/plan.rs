@@ -565,6 +565,69 @@ pub fn plan_task_failure(
     }
 }
 
+/// What an attempt that could not be RUN AT ALL leaves for the store to record: the
+/// event the attempt opens with, and the FAILURE `failed` names, owed to the clock one
+/// [`EXECUTION_SETTLE_DELAY`] after the attempt began.
+///
+/// There is no walk to interpret: an execution's work is done with credentials of its
+/// state machine's execution role, so an attempt this service cannot act as that role for
+/// enters not one of the definition's states — nothing of the run happens, and what the
+/// execution ends as is the failure the caller states rather than an outcome a walk
+/// computed. The outcome is owed to the clock exactly as a walked attempt's is, so the
+/// execution reports `RUNNING` until the instant it comes due.
+///
+/// `opening` is the event the attempt opens its history with
+/// ([`EVENT_EXECUTION_STARTED`] for a start, [`EVENT_EXECUTION_REDRIVEN`] for a redrive)
+/// and `previous_event_id` the last id that history already holds, so the two events this
+/// plans continue that numbering exactly as [`plan_from_run`] numbers a walk's.
+pub fn plan_attempt_that_cannot_run(
+    start: SystemTime,
+    opening: &str,
+    previous_event_id: i64,
+    failed: &integration::Failed,
+) -> Planned {
+    let due_at = after(start, EXECUTION_SETTLE_DELAY);
+    let opened = HistoryEvent {
+        id: previous_event_id + 1,
+        previous_event_id,
+        event_type: opening.to_string(),
+        timestamp: start,
+        state_name: None,
+        details: EventDetails::default(),
+    };
+    let details = EventDetails::of_failure(Some(failed.error.clone()), Some(failed.cause.clone()));
+    let ended = HistoryEvent {
+        id: opened.id + 1,
+        // An `ExecutionStarted` is no predecessor, so the event after it reports the
+        // sentinel; a redriven attempt's own opening event IS one ([`follows_event`]).
+        previous_event_id: follows_event(opened.id, opening),
+        event_type: EVENT_EXECUTION_FAILED.to_string(),
+        timestamp: due_at,
+        state_name: None,
+        details,
+    };
+    Planned {
+        opening: vec![opened],
+        pending: Some(PendingOutcome {
+            due_at,
+            status: EXECUTION_STATUS_FAILED.to_string(),
+            output: None,
+            error: Some(failed.error.clone()),
+            cause: Some(failed.cause.clone()),
+            events: vec![ended],
+        }),
+        waiting: None,
+        parked: None,
+        // Nothing was walked, so no job was started and none abandoned, and no Map state
+        // was entered.
+        abandoned: Vec::new(),
+        map_runs: Vec::new(),
+        // No state was entered either, so a later redrive of this execution walks the
+        // definition from its `StartAt` rather than continuing from a step.
+        stopped_at: None,
+    }
+}
+
 /// The id the FIRST history event a walk records will carry, which is what a cause
 /// naming the event a state was entered at reports.
 ///

@@ -298,6 +298,72 @@ fn unassumable_role_cause(role_arn: &str) -> String {
     )
 }
 
+/// The EXCEPTION a failure of the RUN itself names, which is what the service reports when
+/// it could not take the execution role on at all.
+///
+/// Such a failure is not a sentence the service composes: it is the exception the assume
+/// raised, and a cause carrying an exception names its CLASS and then the message it
+/// carries, which is the sentence [`unassumable_role_cause`] words. Fixed text, so a
+/// catcher or a log alarm that matches on the class reads here what it reads from the
+/// service.
+const ASSUME_ROLE_FAILED_EXCEPTION: &str =
+    "com.amazonaws.sfn.invoker.sts.AssumeRoleFailedCacheableException";
+
+/// What an EXECUTION whose own work cannot be done at all without the role `role_arn`
+/// ends as, when this service cannot act as that role ([`unassumable_role`]).
+///
+/// The error is the one the LANGUAGE reserves for a failure of the execution itself
+/// ([`super::asl::RUNTIME_ERROR`]) rather than the one a state's work reports: nothing of
+/// the definition ran, so no state failed — the run had no identity to be performed as.
+/// The cause is the exception that failure carries ([`ASSUME_ROLE_FAILED_EXCEPTION`]) over
+/// the one sentence this condition is worded by ([`unassumable_role_cause`]), so the two
+/// places the condition surfaces cannot word it differently.
+fn unassumable_run_failure(role_arn: &str) -> Failed {
+    Failed {
+        error: super::asl::RUNTIME_ERROR.to_string(),
+        cause: format!(
+            "{ASSUME_ROLE_FAILED_EXCEPTION}: {}",
+            unassumable_role_cause(role_arn)
+        ),
+    }
+}
+
+/// What an attempt at an execution of the state machine `state_machine_arn` identifies
+/// ENDS as, when this service cannot perform that run at all — or `None` when it can.
+///
+/// Acting as the execution role is part of the RUN rather than of the call that begins an
+/// attempt, so a role whose trust IAM answered for is never a refusal of that call: the
+/// attempt is recorded and the EXECUTION fails ([`unassumable_run_failure`]). It fails
+/// outright, with not one state entered, exactly where the run's own data is sealed as
+/// that role ([`super::encryption::run_is_sealed_as_the_execution_role`]): the data key
+/// every payload of the execution goes under is minted as the role before the first state,
+/// so an attempt that cannot be made as it does nothing at all. Where the run asks nothing
+/// of the role before its states do, the walk proceeds and each `Task` of it reports the
+/// same condition as its own failure ([`role_gate`]).
+///
+/// `unassumable` is what [`unassumable_role`] answered for that role, and the decision is
+/// taken only for a role this account's IAM HOLDS — the evidence every decision about a
+/// role here requires: a role no record answers for is the deploy-time/run-time split this
+/// service exposes rather than a role that was refused.
+///
+/// Asked by every operation that begins an attempt, so a start and a redrive cannot read
+/// the condition differently. Call it with no store of this service locked.
+#[must_use]
+pub fn unrunnable_attempt<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    state_machine_arn: &str,
+    role_arn: &str,
+    unassumable: Option<&Failed>,
+) -> Option<Failed> {
+    unassumable?;
+    if !iam_holds_role(engine, role_arn) {
+        return None;
+    }
+    super::encryption::run_is_sealed_as_the_execution_role(engine, region, state_machine_arn)
+        .then(|| unassumable_run_failure(role_arn))
+}
+
 /// The IAM store a state machine's `roleArn` is resolved against.
 ///
 /// It is the IAM service's OWN state struct, reached through the SAME shared engine

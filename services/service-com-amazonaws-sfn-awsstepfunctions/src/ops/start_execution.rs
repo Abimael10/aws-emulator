@@ -465,10 +465,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // sealed under that key, and TWO identities have to be allowed to seal it:
         // the CALLER, whose `input` this call hands the service to keep, and the state
         // machine's EXECUTION ROLE, which is the identity Step Functions does the run's
-        // own cryptographic work as. A key no cryptographic operation can use, either
-        // identity being refused the data key, and a role this service cannot act as at
-        // all, each refuse the start with the modelled `Kms*` error and start nothing.
-        // Both decisions are taken with no store of this service locked, before the walk.
+        // own cryptographic work as. A key no cryptographic operation can use and either
+        // identity being refused the data key each refuse the start with the modelled
+        // `Kms*` error and start nothing. Both decisions are taken with no store of this
+        // service locked, before the walk.
         if let Some(refusal) = crate::state::encryption::state_machine_seal_denied(
             &*self.engine,
             ctx,
@@ -477,14 +477,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(crate::kms_key_refusal!(StartExecutionErrorModeled, refusal).into());
         }
-        if let Some(refusal) = crate::state::encryption::execution_start_denied(
+        // A role this service cannot ACT AS is not one of those refusals: the assume is
+        // part of the RUN rather than of this call, so the start is SERVED and it is the
+        // execution that fails — with not one state entered, where the run's own data is
+        // sealed as that role, and a redrive runs it again once the trust is put back
+        // ([`crate::state::task_authorization::unrunnable_attempt`], the one reading of
+        // that condition every operation that begins an attempt takes).
+        let unrunnable = crate::state::task_authorization::unrunnable_attempt(
             &*self.engine,
             &region,
             &machine_arn,
             &role_arn,
-            unassumable.is_some(),
-        ) {
-            return Err(crate::kms_key_refusal!(StartExecutionErrorModeled, refusal).into());
+            unassumable.as_ref(),
+        );
+        if unrunnable.is_none() {
+            if let Some(refusal) = crate::state::encryption::execution_start_denied(
+                &*self.engine,
+                &region,
+                &machine_arn,
+                &role_arn,
+            ) {
+                return Err(crate::kms_key_refusal!(StartExecutionErrorModeled, refusal).into());
+            }
         }
 
         // Phase 2, OUTSIDE the lock: the definition is INTERPRETED here. The walk is
@@ -531,23 +545,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             unassumable,
             Some(ctx.credential_store()),
         );
-        let interpreted = {
-            let definition = definition.clone();
-            let execution_input = execution_input.clone();
-            crate::state::integration::interpret(ctx, &region, acting, move |tasks| {
-                crate::state::plan_run(
-                    &crate::state::RunAttempt {
-                        definition: &definition,
-                        input: &execution_input,
-                        start: started,
-                        context: &context,
-                        opening: crate::state::EVENT_EXECUTION_STARTED,
-                        previous_event_id: 0,
-                    },
-                    tasks,
-                )
-            })
-            .await
+        let interpreted = match &unrunnable {
+            // Nothing is interpreted for a run that cannot be performed at all: the
+            // attempt opens its history and ends on the failure above.
+            Some(failed) => Ok(crate::state::plan_attempt_that_cannot_run(
+                started,
+                crate::state::EVENT_EXECUTION_STARTED,
+                0,
+                failed,
+            )),
+            None => {
+                let definition = definition.clone();
+                let execution_input = execution_input.clone();
+                crate::state::integration::interpret(ctx, &region, acting, move |tasks| {
+                    crate::state::plan_run(
+                        &crate::state::RunAttempt {
+                            definition: &definition,
+                            input: &execution_input,
+                            start: started,
+                            context: &context,
+                            opening: crate::state::EVENT_EXECUTION_STARTED,
+                            previous_event_id: 0,
+                        },
+                        tasks,
+                    )
+                })
+                .await
+            }
         };
         let Ok(planned) = interpreted else {
             return Err(crate::scaffolded::Scaffolded::validation(

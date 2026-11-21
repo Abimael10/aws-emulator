@@ -16,13 +16,15 @@
 //!    `aws:SourceAccount`, the account that owns it). A statement's `Condition` is part of
 //!    its grant, so a role whose trust is narrowed to another state machine, to another
 //!    account, or to a key the assume carries no value for is a role this service may not
-//!    act as for THIS execution. Nothing that role would have done then happens: a state
-//!    machine on a CUSTOMER MANAGED key starts nothing at all — the data key its execution's
-//!    data goes under is minted as that role, and credentials the assume never minted seal
-//!    nothing, so the mint is left to this service's own principal, which the KEY'S OWN
-//!    POLICY is the only authority over — and a `Task` state of an execution that IS
-//!    started fails rather than having its work done as nobody
-//!    (`tests/all/execution_role_assumption.rs` holds that half of the rule).
+//!    act as for THIS execution. That assume belongs to the RUN rather than to the call
+//!    that starts it, so the start is SERVED and nothing the role would have done then
+//!    happens: an execution of a state machine on a CUSTOMER MANAGED key ends FAILED with
+//!    `States.Runtime` and the service's fixed sentence for a role it cannot act as — the
+//!    data key its data goes under is minted as that role, before any state is entered —
+//!    and a `Task` state of an unencrypted execution fails rather than having its work
+//!    done as nobody (`tests/all/execution_role_assumption.rs` holds that half of the
+//!    rule, and `tests/all/unassumable_role_encrypted_execution.rs` the redrive that
+//!    resumes such an execution once the trust is put back).
 //! 2. **the refusal names the acting identity.** Where it is the KEY that refuses the
 //!    mint, Step Functions relays what KMS answered, and the identity such a refusal
 //!    blames is the SESSION of the role this service assumed —
@@ -49,6 +51,7 @@ use crate::execution_data_encryption::{
     KMS_ACCESS_DENIED_STATUS, SFN,
 };
 use crate::state_machine_lifecycle::{error_code, string, ACCOUNT, HELLO_DEFINITION, REGION};
+use crate::unassumable_role_encrypted_execution::{ended, unassumable_cause};
 
 /// An account that is not the one these resources belong to, for a clause the assume
 /// cannot satisfy.
@@ -165,7 +168,7 @@ struct Row {
     /// The `Condition` element the trust statement carries, built from the ARN of the
     /// state machine the row starts and from the accounts above.
     condition: fn(&str) -> Option<Value>,
-    /// Whether the start is served.
+    /// Whether the execution the start begins is one this service can perform.
     assumable: bool,
 }
 
@@ -268,9 +271,10 @@ fn rows() -> Vec<Row> {
 
 /// `StartExecution` on a state machine encrypted with a customer managed key follows the
 /// trust policy's conditions: a role whose grant covers the assume this start would make
-/// runs, and one whose grant does not is refused with the modelled
-/// `KmsAccessDeniedException`, having started nothing.
-#[tokio::test]
+/// runs, and one whose grant does not leaves the execution FAILED with `States.Runtime`
+/// and the service's fixed sentence for a role it cannot act as — the start itself being
+/// served either way, because the assume belongs to the run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_start_follows_the_conditions_the_trust_policy_narrows_the_assume_to() {
     let chain = Chain::new();
     let key = chain.create_key(&key_policy_with(Vec::new())).await;
@@ -303,55 +307,49 @@ async fn a_start_follows_the_conditions_the_trust_policy_narrows_the_assume_to()
                 &json!({ "stateMachineArn": machine, "name": "run" }),
             )
             .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the start to be served, got {status} {answered:?}"
+        );
+        let execution = string(&answered, "executionArn");
+        // Round trip: the execution the start reports is one this service holds.
+        let described = chain
+            .sfn("DescribeExecution", &json!({ "executionArn": execution }))
+            .await;
+        assert_eq!(
+            described.get("stateMachineArn").and_then(Value::as_str),
+            Some(machine.as_str()),
+            "case {case:?}: expected the execution of that machine, got {described:?}"
+        );
+        assert_eq!(
+            started_count(&chain, &machine).await,
+            1,
+            "case {case:?}: expected the start to have started the execution"
+        );
+
+        let finished = ended(&chain, case, &execution).await;
         if assumable {
             assert_eq!(
-                status, 200,
-                "case {case:?}: expected the start to be served, got {status} {answered:?}"
-            );
-            // Round trip: the execution the start reports is one this service holds.
-            let described = chain
-                .sfn(
-                    "DescribeExecution",
-                    &json!({ "executionArn": string(&answered, "executionArn") }),
-                )
-                .await;
-            assert_eq!(
-                described.get("stateMachineArn").and_then(Value::as_str),
-                Some(machine.as_str()),
-                "case {case:?}: expected the execution of that machine, got {described:?}"
+                finished.get("status").and_then(Value::as_str),
+                Some("SUCCEEDED"),
+                "case {case:?}: expected the execution to run, got {finished:?}"
             );
             continue;
         }
 
-        let code = error_code(&answered);
+        // A role this service cannot act as for THIS state machine leaves the run no
+        // identity to mint the data key its data goes under as, so nothing of the
+        // definition happens and the execution carries the service's fixed sentence for
+        // such a role.
+        let expected = unassumable_cause(&role_arn);
         assert_eq!(
-            (status, code.as_str()),
-            (KMS_ACCESS_DENIED_STATUS, KMS_ACCESS_DENIED),
-            "case {case:?}: expected the modelled KMS refusal, got {status} {code} with \
-             {answered:?}"
-        );
-        // Credentials the assume never minted seal nothing, so the mint is left to be made
-        // as this service's OWN principal, on behalf of the state machine — and the key's
-        // policy, the only authority over such a caller, names no grant for it. The
-        // refusal is the sentence KMS answered that with, relayed with the metadata that
-        // answer carried.
-        let message = answered
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let expected = format!(
-            "User: states.amazonaws.com is not authorized to perform: kms:GenerateDataKey on \
-             resource: {key} because no resource-based policy allows the kms:GenerateDataKey \
-             action (Service: Kms, Status Code: 400, Request ID: "
-        );
-        assert!(
-            message.starts_with(&expected),
-            "case {case:?}: expected {expected:?}, got {message:?}"
-        );
-        assert_eq!(
-            started_count(&chain, &machine).await,
-            0,
-            "case {case:?}: expected a refused start to have started nothing"
+            (
+                finished.get("status").and_then(Value::as_str),
+                finished.get("error").and_then(Value::as_str),
+                finished.get("cause").and_then(Value::as_str),
+            ),
+            (Some("FAILED"), Some("States.Runtime"), Some(expected.as_str())),
+            "case {case:?}: expected the unassumable-role failure, got {finished:?}"
         );
     }
 }
