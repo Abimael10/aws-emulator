@@ -5,7 +5,8 @@
 //! Implemented: mints a snapshot, persists it in [`crate::state`] and answers from the
 //! stored record. `ClientToken` makes the call idempotent; `ParentSnapshotId` seeds the
 //! new snapshot with a copy of the parent's blocks, so the volume the request asks for
-//! must address at least as much as the parent's does.
+//! must address at least as much as the parent's does, and it hands the new snapshot the
+//! parent's encryption unless the request names a key of its own.
 //!
 //! ## Shape of an operation
 //!
@@ -150,11 +151,12 @@ use std::time::SystemTime;
 use crate::state::kms_reference::{self, request_region, KeyReference};
 use crate::state::{
     blocks_in_volume, expiry_from_timeout, fingerprint_hex_sha256, invalid_volume_size_message,
-    is_well_formed_snapshot_id, malformed_snapshot_id_message, snapshot_not_found_message,
-    BlockEntry, Snapshot, SnapshotStatus, SseType, StartSnapshotIdempotencyRecord, StoredTag,
-    CLIENT_TOKEN_CONFLICT_MESSAGE, DEFAULT_SNAPSHOT_TIMEOUT_MINUTES,
-    MAX_STORED_BLOCKS_PER_SNAPSHOT, MAX_STORED_BLOCKS_TOTAL, MAX_STORED_SNAPSHOTS,
-    MAX_VOLUME_SIZE_GIB, PARENT_SNAPSHOT_ID_AND_ENCRYPT_MESSAGE, SNAPSHOT_BLOCK_SIZE_BYTES,
+    is_well_formed_snapshot_id, malformed_snapshot_id_message, snapshot_encryption,
+    snapshot_not_found_message, BlockEntry, Snapshot, SnapshotStatus,
+    StartSnapshotIdempotencyRecord, StoredTag, CLIENT_TOKEN_CONFLICT_MESSAGE,
+    DEFAULT_SNAPSHOT_TIMEOUT_MINUTES, MAX_STORED_BLOCKS_PER_SNAPSHOT, MAX_STORED_BLOCKS_TOTAL,
+    MAX_STORED_SNAPSHOTS, MAX_VOLUME_SIZE_GIB, PARENT_SNAPSHOT_ID_AND_ENCRYPT_MESSAGE,
+    SNAPSHOT_BLOCK_SIZE_BYTES,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -322,7 +324,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // fail are DIFFERENT refusals: an id that resolves to nothing is the snapshot
         // not-found 404, while a snapshot that exists but is still being written is a
         // `ValidationException` naming that state.
-        let (parent_blocks, parent_sse) = match input.parent_snapshot_id.as_deref() {
+        let (parent_blocks, parent_encryption) = match input.parent_snapshot_id.as_deref() {
             Some(parent_id) => {
                 let parent = store.snapshots.get(parent_id).ok_or_else(|| {
                     // A value that is not even shaped like a snapshot id is a malformed
@@ -360,7 +362,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         invalid_volume_size_message(input.volume_size),
                     ));
                 }
-                (Some(parent.blocks.clone()), parent.sse_type)
+                // The parent decides the child's encryption STATUS, not just the type it
+                // reports, so the whole encryption state travels with the blocks.
+                (Some(parent.blocks.clone()), Some(parent.encryption()))
             }
             None => (None, None),
         };
@@ -403,16 +407,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let encrypted = input.encrypted == Some(true) || input.kms_key_arn.is_some();
-        let sse_type = if input.kms_key_arn.is_some() {
-            Some(SseType::SseKms)
-        } else if encrypted {
-            Some(SseType::SseEbs)
-        } else {
-            // An unencrypted request inherits whatever the parent carried, which for an
-            // unencrypted parent is no SSE type at all.
-            parent_sse
-        };
+        // All three of `Encrypted`, `KmsKeyArn` and `ParentSnapshotId` decide the new
+        // snapshot's encryption status, and they decide it as ONE value — see
+        // [`snapshot_encryption`], which states the rule: a request that names a key
+        // encrypts under that key, a snapshot started from a parent otherwise has the
+        // parent's encryption whole, and a request carrying none of the three creates an
+        // unencrypted snapshot.
+        let encryption = snapshot_encryption(
+            input.encrypted,
+            input.kms_key_arn.as_deref(),
+            parent_encryption.as_ref(),
+        );
         let timeout_minutes = input.timeout.unwrap_or(DEFAULT_SNAPSHOT_TIMEOUT_MINUTES);
 
         let snapshot = Snapshot {
@@ -439,9 +444,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .collect(),
             parent_snapshot_id: input.parent_snapshot_id.clone(),
-            kms_key_arn: input.kms_key_arn.clone(),
-            encrypted,
-            sse_type,
+            // Persisted from the one derived value, so the three can never disagree.
+            kms_key_arn: encryption.kms_key_arn,
+            encrypted: encryption.encrypted,
+            sse_type: encryption.sse_type,
             timeout_minutes,
             // "The new snapshot enters the pending state after the request completes": no
             // completion has been accepted for it yet.

@@ -318,7 +318,11 @@ pub(crate) async fn start_snapshot(
 /// `ebs:PutSnapshotBlock` of `payload` at `index`, presenting `supplied` as its checksum and
 /// declaring the full block length — the length is what the request DECLARED, which is not
 /// what decides the integrity refusal.
-async fn put_block(
+///
+/// `pub(crate)` for the reason this module's other wire helpers are: a sibling suite over the
+/// same two services writes a block through THIS request construction rather than keeping a
+/// second copy of it.
+pub(crate) async fn put_block(
     router: &MultiServiceRouter,
     snapshot_id: &str,
     index: i32,

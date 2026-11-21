@@ -23,6 +23,9 @@
 //!    blocks it inherits from a `ParentSnapshotId` included — so a `VolumeSize` that
 //!    could not address the parent's content is refused, and every index a snapshot
 //!    reports is an index it accepts a write at.
+//! 7. A snapshot started from a `ParentSnapshotId` has that parent's ENCRYPTION, whole:
+//!    the SSE type and the key reference that type names are inherited together, unless
+//!    the request names a `KmsKeyArn` of its own.
 //!
 //! The harness below (`router`, `Reply`, the per-operation request helpers) is
 //! `pub(crate)` so the sibling suites in `tests/all/` drive the same wire path instead of
@@ -1788,5 +1791,225 @@ async fn every_index_a_child_reports_is_one_it_also_accepts_a_write_at() {
                 String::from_utf8_lossy(&fetched.body)
             );
         }
+    }
+}
+
+/// Key ARNs a request may name, each satisfying the modelled `KmsKeyArn` pattern
+/// `^arn:aws[a-z\-]*:kms:.*:[0-9]{12}:key/`
+/// (`smithy_query(query="shape",shape="com.amazonaws.ebs#KmsKeyArn")`): two keys of the
+/// commercial partition and one of another, so no assertion below is a property of one
+/// partition, Region or key-id spelling.
+const KEY_ARN_FIRST: &str =
+    "arn:aws:kms:us-east-1:000000000000:key/1a2b3c4d-5e6f-4071-8293-a4b5c6d7e8f9";
+const KEY_ARN_SECOND: &str =
+    "arn:aws:kms:eu-central-1:000000000000:key/F00DCAFE-1111-4222-8333-444455556666";
+const KEY_ARN_OTHER_PARTITION: &str =
+    "arn:aws-us-gov:kms:us-gov-west-1:000000000000:key/9f8e7d6c-5b4a-4938-9706-fedcba987654";
+
+/// A `StartSnapshot` body of `volume_size`, the parent it starts from when it has one, and
+/// whatever encryption members the case asks for.
+fn start_request(
+    volume_size: i64,
+    parent: Option<&str>,
+    encryption: &serde_json::Value,
+) -> serde_json::Value {
+    let mut request = serde_json::json!({ "VolumeSize": volume_size });
+    if let Some(parent) = parent {
+        request["ParentSnapshotId"] = serde_json::json!(parent);
+    }
+    for (member, value) in encryption.as_object().into_iter().flatten() {
+        request[member.as_str()] = value.clone();
+    }
+    request
+}
+
+/// Start a snapshot of `volume_size` from `parent` asking for `encryption`, seal it so it may
+/// itself be used as a `ParentSnapshotId`, and answer `(its id, the create's reply)`.
+///
+/// Beside `changed_blocks_between_snapshots`'s `sealed_snapshot`, which seals a lineage of
+/// snapshots with BLOCKS written into them, because this rule needs the two things that one
+/// neither takes nor answers: the encryption members the request carries, and the create's own
+/// reply, which is where the `SseType` and `KmsKeyArn` under test are reported. Widening that
+/// helper's signature would rewrite every one of its three dozen call sites, none of which is
+/// about encryption.
+async fn sealed_snapshot_with(
+    router: &MultiServiceRouter,
+    case: &str,
+    stage: &str,
+    volume_size: i64,
+    parent: Option<&str>,
+    encryption: &serde_json::Value,
+) -> (String, Reply) {
+    let request = start_request(volume_size, parent, encryption);
+    let reply = start_snapshot(router, &request).await;
+    assert_eq!(
+        reply.status, 201,
+        "case {case:?} ({stage}): StartSnapshot of {request} must answer 201, got {} with body {}",
+        reply.status,
+        String::from_utf8_lossy(&reply.body)
+    );
+    let snapshot_id = member(&reply, "SnapshotId");
+    // Nothing was written into it, so the completion declares no changed block.
+    let sealed = complete_snapshot(router, &snapshot_id, 0).await;
+    assert_eq!(
+        sealed.status, 202,
+        "case {case:?} ({stage}): CompleteSnapshot must seal {snapshot_id}, got {} with body {}",
+        sealed.status,
+        String::from_utf8_lossy(&sealed.body)
+    );
+    (snapshot_id, reply)
+}
+
+/// One row of the inheritance table: the encryption members each of the two requests
+/// carries, and the encryption the child must then report.
+struct EncryptionCase {
+    case: &'static str,
+    /// The encryption members the PARENT's `StartSnapshot` carries.
+    parent: serde_json::Value,
+    /// The encryption members the CHILD's `StartSnapshot` carries.
+    child: serde_json::Value,
+    /// The `SseType` the child must report, or `None` where it must report none.
+    sse_type: Option<&'static str>,
+    /// The `KmsKeyArn` the child must report, or `None` where it must report none.
+    kms_key_arn: Option<&'static str>,
+}
+
+/// The `SseType` and `KmsKeyArn` a reply reports, each `None` where the reply omits it.
+fn reported_encryption(reply: &Reply) -> (Option<String>, Option<String>) {
+    let body = reply.json();
+    let read = |name: &str| {
+        body.get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    (read("SseType"), read("KmsKeyArn"))
+}
+
+/// RULE 7: the encryption of a snapshot started from a `ParentSnapshotId` is the PARENT's,
+/// whole — "The encryption status of the snapshot depends on the values that you specify for
+/// Encrypted, KmsKeyArn, and ParentSnapshotId"
+/// (`smithy_query(query="doc",shape="com.amazonaws.ebs#StartSnapshotRequest",member="Encrypted")`,
+/// repeated on the other two members) — so the SSE type and the key reference that type names
+/// are inherited together, however many generations down the lineage the encryption was
+/// introduced, unless the request names a `KmsKeyArn` of its own, which encrypts the new
+/// snapshot under that key instead.
+#[tokio::test]
+async fn a_snapshot_started_from_a_parent_reports_the_parents_encryption() {
+    // Rows differ along the encryption the parent carries (none, the EBS-managed key, a KMS
+    // key, and a KMS key of another partition), whether the child names a key of its own, and
+    // the volume sizes the two declare. The last two columns are the `SseType` and the
+    // `KmsKeyArn` the child must report, each `None` where it must report none.
+    let cases = [
+        EncryptionCase {
+            case: "an unencrypted parent",
+            parent: serde_json::json!({}),
+            child: serde_json::json!({}),
+            sse_type: None,
+            kms_key_arn: None,
+        },
+        EncryptionCase {
+            case: "a parent encrypted with the EBS-managed key",
+            parent: serde_json::json!({ "Encrypted": true }),
+            child: serde_json::json!({}),
+            sse_type: Some("sse-ebs"),
+            kms_key_arn: None,
+        },
+        EncryptionCase {
+            case: "a parent encrypted with a KMS key",
+            parent: serde_json::json!({ "KmsKeyArn": KEY_ARN_FIRST }),
+            child: serde_json::json!({}),
+            sse_type: Some("sse-kms"),
+            kms_key_arn: Some(KEY_ARN_FIRST),
+        },
+        EncryptionCase {
+            case: "a parent encrypted with a KMS key of another partition",
+            parent: serde_json::json!({ "KmsKeyArn": KEY_ARN_OTHER_PARTITION }),
+            child: serde_json::json!({}),
+            sse_type: Some("sse-kms"),
+            kms_key_arn: Some(KEY_ARN_OTHER_PARTITION),
+        },
+        EncryptionCase {
+            case: "a child naming its own key over an EBS-managed parent",
+            parent: serde_json::json!({ "Encrypted": true }),
+            child: serde_json::json!({ "KmsKeyArn": KEY_ARN_SECOND }),
+            sse_type: Some("sse-kms"),
+            kms_key_arn: Some(KEY_ARN_SECOND),
+        },
+        EncryptionCase {
+            case: "a child re-encrypted under another key than its parent's",
+            parent: serde_json::json!({ "KmsKeyArn": KEY_ARN_FIRST }),
+            child: serde_json::json!({ "KmsKeyArn": KEY_ARN_SECOND }),
+            sse_type: Some("sse-kms"),
+            kms_key_arn: Some(KEY_ARN_SECOND),
+        },
+        EncryptionCase {
+            case: "a child naming a key over an unencrypted parent",
+            parent: serde_json::json!({}),
+            child: serde_json::json!({ "KmsKeyArn": KEY_ARN_FIRST }),
+            sse_type: Some("sse-kms"),
+            kms_key_arn: Some(KEY_ARN_FIRST),
+        },
+    ];
+
+    for (index, row) in cases.iter().enumerate() {
+        let case = row.case;
+        let (expected_sse, expected_key) = (row.sse_type, row.kms_key_arn);
+        let router = router();
+        // The volume grows by one GiB per generation, so each snapshot addresses at least
+        // what the one it starts from does, and the sizes differ from row to row.
+        let volume_size = i64::try_from(index).expect("a row index") + 1;
+        let (parent, _) =
+            sealed_snapshot_with(&router, case, "parent", volume_size, None, &row.parent).await;
+
+        let (child, child_reply) = sealed_snapshot_with(
+            &router,
+            case,
+            "child",
+            volume_size + 1,
+            Some(&parent),
+            &row.child,
+        )
+        .await;
+        let (child_sse, child_key) = reported_encryption(&child_reply);
+        assert_eq!(
+            child_sse.as_deref(),
+            expected_sse,
+            "case {case:?}: expected the child to report SseType {expected_sse:?}, got {}",
+            child_reply.json()
+        );
+        assert_eq!(
+            child_key.as_deref(),
+            expected_key,
+            "case {case:?}: expected the child to report KmsKeyArn {expected_key:?}, got {}",
+            child_reply.json()
+        );
+        // A snapshot encrypted under a KMS key reports that key: an SSE type naming a
+        // caller's key with no key beside it describes no snapshot a caller can read.
+        assert_eq!(
+            child_key.is_some(),
+            child_sse.as_deref() == Some("sse-kms"),
+            "case {case:?}: a key reference belongs with the sse-kms type and only with it, \
+             got {}",
+            child_reply.json()
+        );
+
+        // The STORED record is what the next generation inherits, so a grandchild that asks
+        // for nothing reports exactly the same encryption as the child it starts from.
+        let (_, grandchild_reply) = sealed_snapshot_with(
+            &router,
+            case,
+            "grandchild",
+            volume_size + 2,
+            Some(&child),
+            &serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(
+            reported_encryption(&grandchild_reply),
+            (child_sse, child_key),
+            "case {case:?}: a grandchild asking for nothing must report the encryption its \
+             parent has, got {}",
+            grandchild_reply.json()
+        );
     }
 }

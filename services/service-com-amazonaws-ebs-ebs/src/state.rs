@@ -137,6 +137,94 @@ impl SseType {
     }
 }
 
+/// The server-side encryption ONE snapshot has: whether it is encrypted, the encryption
+/// type it reports and the KMS key it is encrypted under.
+///
+/// The three are one fact, so they travel as one value: a snapshot that is encrypted has an
+/// SSE type, a snapshot encrypted under a caller-named key reports that key beside the
+/// [`SseType::SseKms`] type, and a snapshot that is not encrypted has neither a type nor a
+/// key ([`SseType`] explains why "none" is an absent member rather than a value). Deciding
+/// them one at a time is what let a snapshot be stored as not encrypted beside an SSE type —
+/// a record no reader can interpret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotEncryption {
+    /// Whether the snapshot is encrypted at all.
+    pub encrypted: bool,
+    /// The server-side encryption type, present exactly when the snapshot is encrypted.
+    pub sse_type: Option<SseType>,
+    /// The ARN of the KMS key the snapshot is encrypted under, for a snapshot encrypted
+    /// under a key a caller named.
+    pub kms_key_arn: Option<String>,
+}
+
+impl SnapshotEncryption {
+    /// No server-side encryption at all: no type and no key either.
+    pub const fn unencrypted() -> Self {
+        Self {
+            encrypted: false,
+            sse_type: None,
+            kms_key_arn: None,
+        }
+    }
+
+    /// Encrypted with the EBS-managed key, which is the key a request that asks for
+    /// encryption without naming one gets, and for which there is no caller-visible key
+    /// reference to report.
+    pub const fn ebs_managed() -> Self {
+        Self {
+            encrypted: true,
+            sse_type: Some(SseType::SseEbs),
+            kms_key_arn: None,
+        }
+    }
+
+    /// Encrypted under the KMS key `kms_key_arn`, which the snapshot reports beside its
+    /// type.
+    pub fn kms(kms_key_arn: String) -> Self {
+        Self {
+            encrypted: true,
+            sse_type: Some(SseType::SseKms),
+            kms_key_arn: Some(kms_key_arn),
+        }
+    }
+}
+
+/// The encryption a snapshot `StartSnapshot` creates has, from the request's own
+/// `Encrypted` and `KmsKeyArn` and from the encryption of the parent it is started from.
+///
+/// "The encryption status of the snapshot depends on the values that you specify for
+/// Encrypted, KmsKeyArn, and ParentSnapshotId"
+/// (`smithy_query(query="doc",shape="com.amazonaws.ebs#StartSnapshotRequest",member="Encrypted")`,
+/// repeated verbatim on `KmsKeyArn` and on `ParentSnapshotId`), so all three decide it:
+///
+/// * a request naming its own key encrypts the new snapshot under THAT key, whether or not
+///   it starts from a parent — the child of an encrypted parent is re-encrypted under the
+///   key the request named;
+/// * otherwise a snapshot started from a parent has the parent's encryption WHOLE — whether
+///   it is encrypted, its type and its key together — which is why asking for encryption
+///   beside a parent is refused ([`PARENT_SNAPSHOT_ID_AND_ENCRYPT_MESSAGE`]): the parent
+///   decides it;
+/// * otherwise `Encrypted` asks for the EBS-managed key;
+/// * and a request that carries none of the three creates an unencrypted snapshot: the
+///   account-level "encryption by default" setting the same sentence names is held by
+///   another service's state and is not a fact this service can read, so nothing raises
+///   that snapshot's encryption.
+pub fn snapshot_encryption(
+    encrypted: Option<bool>,
+    kms_key_arn: Option<&str>,
+    parent: Option<&SnapshotEncryption>,
+) -> SnapshotEncryption {
+    if let Some(kms_key_arn) = kms_key_arn {
+        SnapshotEncryption::kms(kms_key_arn.to_string())
+    } else if let Some(parent) = parent {
+        parent.clone()
+    } else if encrypted == Some(true) {
+        SnapshotEncryption::ebs_managed()
+    } else {
+        SnapshotEncryption::unencrypted()
+    }
+}
+
 /// A tag stored on a snapshot. Mirrors the modeled `Tag` shape, whose members are both
 /// optional.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -196,10 +284,19 @@ pub struct Snapshot {
     pub description: Option<String>,
     pub tags: Vec<StoredTag>,
     pub parent_snapshot_id: Option<String>,
+    /// The ARN of the KMS key this snapshot is encrypted under, for a snapshot encrypted
+    /// under a key a caller named. One third of [`Self::encryption`], which is where the
+    /// three encryption members are decided together.
     pub kms_key_arn: Option<String>,
+    /// Whether this snapshot is encrypted. One third of [`Self::encryption`].
     pub encrypted: bool,
     /// The server-side encryption this snapshot has, or `None` when it has none — in
     /// which case `SseType` is omitted from a response rather than reported as `none`.
+    ///
+    /// One third of [`Self::encryption`]: present exactly when
+    /// [`encrypted`](Self::encrypted) is set, because a snapshot either has server-side
+    /// encryption (and then a type, and a key reference when a caller named one) or has
+    /// none of the three.
     pub sse_type: Option<SseType>,
     pub timeout_minutes: i32,
     /// The `ChangedBlocksCount` of the `CompleteSnapshot` this snapshot accepted, or `None`
@@ -216,6 +313,20 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// This snapshot's server-side encryption, as the one value its three encryption
+    /// members hold between them.
+    ///
+    /// What a snapshot started from this one as its `ParentSnapshotId` inherits: the parent
+    /// decides the child's encryption status, so the child takes this whole value rather
+    /// than one member of it ([`snapshot_encryption`]).
+    pub fn encryption(&self) -> SnapshotEncryption {
+        SnapshotEncryption {
+            encrypted: self.encrypted,
+            sse_type: self.sse_type,
+            kms_key_arn: self.kms_key_arn.clone(),
+        }
+    }
+
     /// Whether this snapshot's content is final: `CompleteSnapshot` sealed it.
     ///
     /// "You cannot write new blocks to a snapshot after it has been completed", so this
