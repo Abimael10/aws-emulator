@@ -192,12 +192,16 @@ const COULD_NOT_UNZIP: &str =
     "Could not unzip uploaded file. Please check your file, then try to upload again.";
 
 /// The `message` of a wire error, under either casing the JSON envelopes use.
-fn message(answer: &Answer) -> Option<String> {
+///
+/// `pub(crate)` because every suite reading a refusal of an Amazon S3 location back reads it
+/// this one way (`tests/all/s3_pinned_object_version_refusal.rs`).
+pub(crate) fn message(answer: &Answer) -> Option<String> {
     answer.string("message").or_else(|| answer.string("Message"))
 }
 
-/// A member of a JSON document, by pointer.
-fn member(document: &Value, pointer: &str) -> Option<Value> {
+/// A member of a JSON document, by pointer. `pub(crate)` for the same reason
+/// [`message`] is.
+pub(crate) fn member(document: &Value, pointer: &str) -> Option<Value> {
     document.pointer(pointer).cloned()
 }
 

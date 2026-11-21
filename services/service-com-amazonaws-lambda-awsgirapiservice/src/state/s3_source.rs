@@ -23,7 +23,10 @@
 //! `GetObject` signed with this emulator's own credentials and dispatched in process, so the
 //! bytes a function is frozen to are the ones `PutObject` wrote and nothing here opens a
 //! socket or resolves a host. It is made with no store guard held, because it is a call out
-//! of the handler.
+//! of the handler. A location that PINS a version reads that one stored version instead,
+//! which is a read of a different Amazon S3 API ([`read_call`]) — and the refusal below
+//! reports the API the read was made with, because that is what a caller diagnoses a bad
+//! `S3ObjectVersion` apart from a bad `S3Key` by.
 //!
 //! Nothing is refused on evidence this emulator does not have: an answer that identified no
 //! Amazon S3 refusal at all — no Amazon S3 mounted to ask, a hop that did not complete, a
@@ -53,9 +56,12 @@
 pub enum S3Package {
     /// Amazon S3 handed the object over: the deployment package's own bytes.
     Read(Vec<u8>),
-    /// Amazon S3 ANSWERED that it will not hand the object over: the error code it
-    /// classified that refusal under and the message it worded it with.
+    /// Amazon S3 ANSWERED that it will not hand the object over: the Amazon S3 API the read
+    /// was made with, the error code it classified that refusal under and the message it
+    /// worded it with.
     Refused {
+        /// The Amazon S3 API this read performed ([`read_call`]), which the refusal names.
+        call: &'static str,
         /// Amazon S3's own error code (`NoSuchBucket`, `NoSuchKey`, `AccessDenied`, …).
         code: String,
         /// The sentence Amazon S3 answered with, or its code where it worded none.
@@ -69,19 +75,47 @@ pub enum S3Package {
     Unknown,
 }
 
+/// The Amazon S3 API a read of an UNVERSIONED location performs, which is the whole object's
+/// own read.
+pub const UNVERSIONED_READ_CALL: &str = "GetObject";
+
+/// The Amazon S3 API a read of a location that PINS a version performs: naming a version is
+/// a read of that one stored version ("To retrieve a specific version, you must [...] use the
+/// versionId subresource", `GetObject`), which S3 authorizes and reports as its own API.
+pub const VERSIONED_READ_CALL: &str = "GetObjectVersion";
+
+/// The Amazon S3 API a read of a location performs: the versioned one exactly when the
+/// location pins an object version, and the unversioned one otherwise.
+///
+/// The refusal Lambda words names the API it ACTUALLY called ([`s3_package_message`]), so
+/// this is read from the same location member the read itself is made with and never from
+/// which operation is storing the package.
+#[must_use]
+pub fn read_call(version: Option<&str>) -> &'static str {
+    match version {
+        Some(_) => VERSIONED_READ_CALL,
+        None => UNVERSIONED_READ_CALL,
+    }
+}
+
 /// The sentence Lambda refuses a package it will not store with.
 ///
-/// For an object Amazon S3 would not hand over, fixed text around the two parts AMAZON S3
-/// itself worded — the code it classified the refusal under and the message it answered —
-/// because that refusal is what Lambda reports: the read it made of the deployment package
-/// was not served, and S3 said why. For an object past the package ceiling, the ceiling
-/// itself ([`super::CODE_SIZE_UNZIPPED_LIMIT`]), which is the limit the package was measured
+/// For an object Amazon S3 would not hand over, fixed text around the three parts the read
+/// itself settled — the Amazon S3 API it was made with ([`read_call`]), the code S3
+/// classified the refusal under and the message S3 answered — because that refusal is what
+/// Lambda reports: the read it made of the deployment package was not served, and S3 said
+/// why. For an object past the package ceiling, the ceiling itself
+/// ([`super::CODE_SIZE_UNZIPPED_LIMIT`]), which is the limit the package was measured
 /// against.
 #[must_use]
 pub fn s3_package_message(package: &S3Package) -> Option<String> {
     match package {
-        S3Package::Refused { code, message } => Some(format!(
-            "Error occurred while GetObject. S3 Error Code: {code}. S3 Error Message: {message}"
+        S3Package::Refused {
+            call,
+            code,
+            message,
+        } => Some(format!(
+            "Error occurred while {call}. S3 Error Code: {code}. S3 Error Message: {message}"
         )),
         S3Package::TooLarge => Some(super::unzipped_limit_message()),
         S3Package::Read(_) | S3Package::Unknown => None,
@@ -115,6 +149,9 @@ pub async fn read_s3_package(
                 let code = ::aws_sdk_s3::error::ProvideErrorMetadata::code(service)?;
                 let message = ::aws_sdk_s3::error::ProvideErrorMetadata::message(service);
                 Some(S3Package::Refused {
+                    // The API this very read was made with, so the sentence a client
+                    // diagnoses the location by names the read that was refused.
+                    call: read_call(version),
                     code: code.to_string(),
                     message: message.unwrap_or(code).to_string(),
                 })
@@ -244,7 +281,42 @@ fn client(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_over_the_package_ceiling, s3_package_message, S3Package};
+    use super::{
+        is_over_the_package_ceiling, read_call, s3_package_message, S3Package,
+        UNVERSIONED_READ_CALL, VERSIONED_READ_CALL,
+    };
+
+    /// The Amazon S3 API a read performs is settled by WHAT THE LOCATION NAMES: pinning a
+    /// version reads that one stored version, and naming none reads the object.
+    #[test]
+    fn a_pinned_version_is_read_through_the_versioned_api_and_nothing_else_is() {
+        // (case, the version the location pins, the Amazon S3 API the read performs)
+        let rows: [(&str, Option<&str>, &str); 4] = [
+            ("a location naming no version", None, UNVERSIONED_READ_CALL),
+            (
+                "a location pinning a version",
+                Some("3HL4kqtJlcpXroDTDmjVBH40Nrjfkd"),
+                VERSIONED_READ_CALL,
+            ),
+            (
+                "a location pinning the version a write made before versioning",
+                Some("null"),
+                VERSIONED_READ_CALL,
+            ),
+            (
+                "a location pinning a version id of another shape",
+                Some("an-id-this-store-never-minted"),
+                VERSIONED_READ_CALL,
+            ),
+        ];
+        for (case, version, expected) in rows {
+            let call = read_call(version);
+            assert_eq!(
+                call, expected,
+                "case {case:?}: expected the Amazon S3 API {expected:?}, got {call:?}"
+            );
+        }
+    }
 
     /// The ceiling a deployment package may unzip to, as AWS publishes it ("250 MB
     /// (unzipped)"): a package has to be smaller than it, so the ceiling itself is over it
@@ -270,15 +342,17 @@ mod tests {
         }
     }
 
-    /// The refusal is fixed text around the code and the message AMAZON S3 answered, and a
-    /// resolution that refuses nothing words nothing.
+    /// The refusal is fixed text around the Amazon S3 API the read was made with and the
+    /// code and the message AMAZON S3 answered, and a resolution that refuses nothing words
+    /// nothing.
     #[test]
-    fn the_refusal_reports_the_code_and_message_amazon_s3_answered() {
+    fn the_refusal_reports_the_call_and_the_code_and_message_amazon_s3_answered() {
         // (case, what following the reference established, the sentence it is refused with)
-        let rows: [(&str, S3Package, Option<&str>); 7] = [
+        let rows: [(&str, S3Package, Option<&str>); 9] = [
             (
                 "a bucket Amazon S3 holds no record of",
                 S3Package::Refused {
+                    call: UNVERSIONED_READ_CALL,
                     code: "NoSuchBucket".to_string(),
                     message: "The specified bucket does not exist".to_string(),
                 },
@@ -290,6 +364,7 @@ mod tests {
             (
                 "a key the bucket holds nothing under",
                 S3Package::Refused {
+                    call: UNVERSIONED_READ_CALL,
                     code: "NoSuchKey".to_string(),
                     message: "The specified key does not exist.".to_string(),
                 },
@@ -301,6 +376,7 @@ mod tests {
             (
                 "a read the bucket will not serve",
                 S3Package::Refused {
+                    call: UNVERSIONED_READ_CALL,
                     code: "AccessDenied".to_string(),
                     message: "Access Denied".to_string(),
                 },
@@ -310,8 +386,33 @@ mod tests {
                 ),
             ),
             (
+                "a version the bucket holds none of, for a location that pinned one",
+                S3Package::Refused {
+                    call: VERSIONED_READ_CALL,
+                    code: "NoSuchVersion".to_string(),
+                    message: "The specified version does not exist.".to_string(),
+                },
+                Some(
+                    "Error occurred while GetObjectVersion. S3 Error Code: NoSuchVersion. S3 \
+                     Error Message: The specified version does not exist.",
+                ),
+            ),
+            (
+                "a read of a pinned version the bucket will not serve",
+                S3Package::Refused {
+                    call: VERSIONED_READ_CALL,
+                    code: "AccessDenied".to_string(),
+                    message: "Access Denied".to_string(),
+                },
+                Some(
+                    "Error occurred while GetObjectVersion. S3 Error Code: AccessDenied. S3 \
+                     Error Message: Access Denied",
+                ),
+            ),
+            (
                 "a refusal Amazon S3 worded nothing for, reported as what it did identify",
                 S3Package::Refused {
+                    call: UNVERSIONED_READ_CALL,
                     code: "NoSuchVersion".to_string(),
                     message: "NoSuchVersion".to_string(),
                 },
