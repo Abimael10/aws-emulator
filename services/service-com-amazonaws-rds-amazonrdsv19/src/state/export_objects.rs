@@ -149,6 +149,11 @@ pub fn exported_tables(
             if exported.len() >= MAX_EXPORTED_TABLES {
                 return exported;
             }
+            // Nor is a relation the ENGINE owns inside a customer database: an export writes
+            // the source's own data, and a system catalog is the server's.
+            if is_engine_catalog_relation(wire, &table) {
+                continue;
+            }
             if !export_includes(export_only, wire, &database_name, &schema, &table) {
                 continue;
             }
@@ -179,6 +184,30 @@ pub fn exported_tables(
     }
     exported
 }
+
+/// Whether the relation `table` of a database on the `wire` engine belongs to the ENGINE
+/// rather than to the customer, so an export leaves it out.
+///
+/// An export writes the data of the source — "the data to be exported from the snapshot or
+/// cluster" (`ExportOnly`) — and a server's own system catalog is not that data. On the MySQL
+/// engines it lives in the system DATABASES [`MYSQL_SYSTEM_DATABASES`], which the walk above
+/// skips whole; on the PostgreSQL engines it lives beside the customer's tables INSIDE every
+/// database, under the `pg_` prefix PostgreSQL reserves for it ("Table names beginning with
+/// `pg_` are reserved for system catalogs", System Catalogs, PostgreSQL documentation). So a
+/// relation under that prefix is the server's, whichever database it is read in.
+#[must_use]
+pub fn is_engine_catalog_relation(wire: EngineWire, table: &str) -> bool {
+    match wire {
+        // The MySQL engines keep nothing of their own in a customer's database, where `pg_`
+        // is an ordinary name: a table a client created under it is its own data.
+        EngineWire::MySql => false,
+        EngineWire::Postgres => table.starts_with(POSTGRES_SYSTEM_PREFIX),
+    }
+}
+
+/// The prefix PostgreSQL reserves for the relations its own system catalog is made of — see
+/// [`is_engine_catalog_relation`].
+const POSTGRES_SYSTEM_PREFIX: &str = "pg_";
 
 /// The tables `database_name` holds, in name order, read out of the engine's own catalog —
 /// so a table a client created is exported and one it dropped is not. It is also what the
