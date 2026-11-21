@@ -206,7 +206,12 @@ use serde_json::Value;
 use super::provisioner::{provisioner_for, Provisioner};
 use super::StoredResource;
 
-mod apigateway_rest_api;
+/// The `AWS::ApiGateway::*` types of the REST control plane: created in Amazon API Gateway
+/// itself ([`apigateway_rest_api`]). Visible to the rest of this service's state because two
+/// of those types' own NAMES live here, beside the arms that provision them (the replacement
+/// rules read the properties each record cannot take anew, which are the labels that
+/// service's own calls address one by).
+pub(in crate::state) mod apigateway_rest_api;
 /// The three `AWS::Athena::*` types a stack declares — the workgroup its queries run in, the
 /// data catalog they are routed through and the query it saves in that workgroup: created in
 /// Amazon Athena itself ([`athena_resources`]). Visible to the rest of this service's state
@@ -3710,6 +3715,7 @@ pub async fn reconcile(
         left_alone: NOTHING_LEFT_ALONE,
     };
     let mut deleted = delete_pass(ctx, region, &replacements, &replacement_walk, &mut opened).await;
+    name_no_instance_where_the_identifier_was_kept(&mut deleted.transitions, &outcome.resources);
     if deleted.failure.is_some() {
         // A refusal is the deployment's failure, so the resources the second walk would have
         // taken down are not asked about: their records are kept exactly as the stack held
@@ -3754,6 +3760,41 @@ pub async fn reconcile(
     // ([`super::stabilising`]).
     outcome.stabilising.extend(deleted.removing);
     outcome
+}
+
+/// Report NO instance on the cleanup events of a replaced resource whose identifier the
+/// REPLACEMENT KEPT.
+///
+/// `StackEvent$PhysicalResourceId` is "the name or unique identifier associated with the
+/// physical instance of the resource", so an event names the instance it is ABOUT. A
+/// replacement is created under an identifier of its own, and the cleanup of the resource it
+/// replaced names that resource; where the two carry ONE identifier — a child resource whose
+/// name moved to another parent, a name that is unique only inside one
+/// ([`super::physical_name::scope_of`]) — that identifier now names the resource the stack
+/// RECORDS, so naming it on the old half's event would name another resource's instance.
+/// Such an event names an empty one, exactly as the event that opens a create does
+/// ([`ResourceTransition::creating`]): the member is reported, and what it reports is that
+/// the event names no instance of its own.
+///
+/// Applied to the transitions of the walk that takes down what this deployment REPLACED
+/// ([`Policies::Replaced`]) and to no other, so a removal of a resource the deployment no
+/// longer declares — which the stack records nothing else under — still names what it took
+/// down. `recorded` is what the stack records after the deployment's own changes, which is
+/// the set the identifier would otherwise be read against.
+fn name_no_instance_where_the_identifier_was_kept(
+    transitions: &mut [ResourceTransition],
+    recorded: &[StoredResource],
+) {
+    for transition in transitions {
+        let kept = recorded.iter().any(|resource| {
+            resource.logical_id == transition.logical_id
+                && resource.resource_type == transition.resource_type
+                && Some(&resource.physical_resource_id) == transition.physical_resource_id.as_ref()
+        });
+        if kept {
+            transition.physical_resource_id = Some(String::new());
+        }
+    }
 }
 
 /// Forget the identifier the naming rules computed for a resource whose FIRST create the
@@ -3821,10 +3862,18 @@ fn carry_forward(existing: &StoredResource, resource: &mut StoredResource) {
 /// the deploying record already carries the id that service minted, because
 /// [`super::StoredStack::deploy_template`] carried it forward — nothing here could
 /// recompute it.
+///
+/// For a type whose resource lives INSIDE a parent, the physical name identifies one resource
+/// only together with that parent ([`super::physical_name::scope_of`], which is the scope the
+/// owning service addresses one of its resources in), so two records carrying one name under
+/// DIFFERENT parents are two resources: a declaration that moves such a resource to another
+/// parent asks for one the resource that exists cannot become, which is a resource this
+/// deployment creates rather than a name it asks that service to re-point.
 pub fn is_same_resource(left: &StoredResource, right: &StoredResource) -> bool {
     left.logical_id == right.logical_id
         && left.resource_type == right.resource_type
         && left.physical_resource_id == right.physical_resource_id
+        && super::physical_name::scope_of(left) == super::physical_name::scope_of(right)
 }
 
 /// Whether a record of the set a deployment reconciles against is a resource the stack has

@@ -697,10 +697,11 @@ async fn a_declared_data_protection_policy_masks_what_the_group_ingests() {
 /// The template of the move case: two groups, and one subscription filter on the group
 /// `on_group` of them, delivering to the stream both revisions declare.
 ///
-/// The filter's NAME is left to CloudFormation, which is what makes the move performable: the
-/// replacement the move requires is created under a name of its own
-/// (`crate::custom_named_replacement` is the suite of the refusal a filter the template NAMES
-/// gets instead, and `a_moved_custom_named_filter_is_refused` below pins it for this type).
+/// The filter's NAME is left to CloudFormation here, so the replacement the move requires is
+/// created under a name of its own; a filter the template NAMES is moved just as this one is,
+/// carrying the declared name onto the group now declared
+/// (`a_moved_custom_named_filter_is_created_on_the_group_now_declared` below pins that), since
+/// a filter's name identifies it only inside the group that holds it.
 fn moved_filter_template(on_group: &str) -> String {
     json!({
         "Resources": {
@@ -756,7 +757,8 @@ fn moved_filter_template(on_group: &str) -> String {
     .to_string()
 }
 
-/// The same template with the filter NAMED, which is what makes the same move unperformable.
+/// The same template with the filter NAMED, which is the name its replacement carries onto
+/// the group now declared.
 fn named_filter_template(on_group: &str, filter_name: &str) -> String {
     let mut template: Value = serde_json::from_str(&moved_filter_template(on_group))
         .expect("the move template is JSON");
@@ -855,12 +857,13 @@ async fn pointing_a_subscription_filter_at_another_group_replaces_it() {
     }
 }
 
-/// RULE (the other side of the move above): a filter the template NAMES cannot be moved to
-/// another group, because the replacement that move requires would have to be created under
-/// the name the filter already holds — so the update is refused, the stack rolls back and the
-/// filter stays on the group it was on.
+/// RULE (the same move, with the filter NAMED): a filter's name identifies it inside the log
+/// group that holds it — every call of that service on one takes `logGroupName` beside
+/// `filterName` — so the replacement the move requires is created under a name NOTHING holds
+/// in the group now declared: the update completes, the named filter is on that group, and the
+/// one it replaced is taken off the group it was on.
 #[tokio::test]
-async fn a_moved_custom_named_filter_is_refused() {
+async fn a_moved_custom_named_filter_is_created_on_the_group_now_declared() {
     let router = router();
     let stack = "logs-subscription-named-move";
     let filter_name = "named-moved-subscription";
@@ -888,7 +891,7 @@ async fn a_moved_custom_named_filter_is_refused() {
         failure_reasons(&router, stack).await
     );
 
-    let case = "the revision that would move the named filter";
+    let case = "the revision that moves the named filter";
     let (status, body) = call(
         &router,
         "UpdateStack",
@@ -908,31 +911,35 @@ async fn a_moved_custom_named_filter_is_refused() {
     let (_, body) = describe_stack(&router, stack).await;
     assert_eq!(
         xml_text(&body, "StackStatus").as_deref(),
-        Some("UPDATE_ROLLBACK_COMPLETE"),
-        "case {case:?}: expected the refused move to roll the stack back, got {body} with the \
-         resource failures {:?}",
+        Some("UPDATE_COMPLETE"),
+        "case {case:?}: expected the move to complete, got {body} with the resource \
+         failures {:?}",
         failure_reasons(&router, stack).await
     );
-    let reasons = failure_reasons(&router, stack).await;
-    let wanted = format!(
-        "CloudFormation cannot update a stack when a custom-named resource requires replacing. \
-         Rename {filter_name} and update the stack again."
+    // The name the template states is the name the filter holds, so the replacement carries
+    // it — on the group now declared.
+    assert_eq!(
+        output(&body, "FilterName").as_deref(),
+        Some(filter_name),
+        "case {case:?}: expected the stack to publish the declared name, got {body}"
     );
-    assert!(
-        reasons.contains(&wanted),
-        "case {case:?}: expected the refusal {wanted:?}, got {reasons:?}"
-    );
-    // Nothing was asked of CloudWatch Logs: the filter is where it was.
-    let held = subscription_filters(&router, "moved-filter-first", filter_name).await;
+    let held = subscription_filters(&router, "moved-filter-second", filter_name).await;
     assert_eq!(
         held.len(),
         1,
-        "case {case:?}: expected the filter to stay on the group it was on, got {held:?}"
+        "case {case:?}: expected the named filter on the group now declared, got {held:?}"
     );
-    let moved = subscription_filters(&router, "moved-filter-second", filter_name).await;
+    assert_eq!(
+        held[0].get("logGroupName").and_then(Value::as_str),
+        Some("moved-filter-second"),
+        "case {case:?}: expected the filter to name the group now declared, got {:?}",
+        held[0]
+    );
+    let left_behind = subscription_filters(&router, "moved-filter-first", filter_name).await;
     assert!(
-        moved.is_empty(),
-        "case {case:?}: expected no filter on the group the refused update named, got {moved:?}"
+        left_behind.is_empty(),
+        "case {case:?}: expected the filter to have been taken off the group it was on, got \
+         {left_behind:?}"
     );
 }
 

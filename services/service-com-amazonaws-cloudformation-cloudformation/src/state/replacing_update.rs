@@ -175,14 +175,29 @@ pub(super) fn rename_replacements(
                 // a record whose identity differs from the one the stack holds is one this
                 // deployment creates a new physical resource for.
                 //
+                // A resource whose declaration RESTATES a property it cannot take anew is in
+                // that same position with its identity unmoved: a generated name is derived
+                // from the stack and the logical id, so it stands still while the declaration
+                // asks for a resource the one that exists cannot become — which is the one
+                // question the deployment itself decides that by
+                // ([`super::stack::declares_the_same_replacing_properties`], read here rather
+                // than asked again, so the walk and this pass cannot disagree about what a
+                // replacement is). Such a resource is replaced too, and the replacement is
+                // what carries the new declaration — otherwise the deployment would ask the
+                // owning service to change a value that service fixes when it creates the
+                // resource.
+                //
                 // Only where the GENERATED NAME itself did not move: a declaration whose
                 // change gives the resource another generated name (a queue whose variant
                 // changes the suffix its name carries) already names the replacement something
                 // the resource it replaces does not hold, so there is nothing to make unique.
                 None => {
                     takes_a_name(&resource.resource_type)
-                        && existing.physical_resource_id != resource.physical_resource_id
                         && name_in_force(existing) == name_in_force(resource)
+                        && (existing.physical_resource_id != resource.physical_resource_id
+                            || !super::stack::declares_the_same_replacing_properties(
+                                existing, resource,
+                            ))
                 }
             };
             if !replaced {

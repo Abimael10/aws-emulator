@@ -119,8 +119,12 @@ mod account;
 /// ([`APIGATEWAY_REST_API`], [`APIGATEWAY_RESOURCE`], [`APIGATEWAY_DEPLOYMENT`]), while a
 /// stage's `Ref` is the name its own declaration states and a method publishes no return
 /// value of its own.
-const APIGATEWAY_METHOD: &str = "AWS::ApiGateway::Method";
-const APIGATEWAY_STAGE: &str = "AWS::ApiGateway::Stage";
+///
+/// Visible to the rest of this service's state because the replacement rules read them
+/// ([`crate::state::template::replacement_properties`]): the properties a method and a stage
+/// cannot take anew are the labels API Gateway's own calls address each by.
+pub(in crate::state) const APIGATEWAY_METHOD: &str = "AWS::ApiGateway::Method";
+pub(in crate::state) const APIGATEWAY_STAGE: &str = "AWS::ApiGateway::Stage";
 
 // The error code API Gateway answers for a resource it does not hold
 // (`API_GATEWAY_NOT_FOUND`) is what says a delete has nothing left to remove, and its signing

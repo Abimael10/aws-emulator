@@ -19,13 +19,14 @@
 //!   `BucketName`, an Amazon CloudWatch Logs stream named by `LogStreamName`;
 //! * WHY the replacement is required, which never decides the refusal — the name property
 //!   itself written down for the first time, where CloudFormation had generated the name, and
-//!   another property the resource cannot take a new value for (the log group a stream lives
-//!   in) changed while the name stays;
+//!   another property the resource cannot take a new value for changed while the name stays;
 //! * and the ways a replacement DOES have an identity of its own to be created under, which
 //!   are the rows that must go through: a resource whose identity its owning service mints (a
 //!   named user pool, replaced for a changed create-only property), one the update RENAMES —
-//!   which is the rename the refusal asks for — and an ordinary change the owning service
-//!   applies in place to a resource whose name the template leaves to CloudFormation.
+//!   which is the rename the refusal asks for — a named CHILD resource the update moves to
+//!   another parent, whose name is unique only inside the parent that holds it so nothing
+//!   holds that name under the new one, and an ordinary change the owning service applies in
+//!   place to a resource whose name the template leaves to CloudFormation.
 //!
 //! The second test is the round trip the refusal exists for: the group is read back through
 //! Amazon Cognito's own wire before and after the refused update — same `CreationDate`, same
@@ -215,10 +216,12 @@ fn rows() -> Vec<Row> {
             expected: Expected::Performed,
         },
         Row {
-            // The replacement is required by the SCOPE the resource lives in rather than by
-            // its name — and the replacement would still have to be created under the name
-            // the stream already holds, so it is refused all the same: WHY a replacement is
-            // required never decides this.
+            // A named CHILD resource moved to another parent: a log stream's name identifies
+            // it inside the log group that holds it (`CreateLogStream`, `DeleteLogStream`
+            // and `PutLogEvents` each take `logGroupName` beside `logStreamName`), so the
+            // replacement the move requires is created under a name NOTHING holds in the
+            // group now declared — there is no identity the resource it replaces still holds,
+            // and the move is carried out.
             case: "a named log stream the update moves to another log group",
             stack: "custom-named-stream",
             logical_id: "Stream",
@@ -226,7 +229,7 @@ fn rows() -> Vec<Row> {
             updated: |stack, _| stream_in(stack, "Second"),
             name_in_force: |_, published| published.to_string(),
             published: "StreamRef",
-            expected: Expected::Refused,
+            expected: Expected::Performed,
         },
         Row {
             // The rename the refusal asks for: the replacement has a name of its own, so it

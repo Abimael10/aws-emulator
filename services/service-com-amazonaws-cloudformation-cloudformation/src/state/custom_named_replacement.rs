@@ -27,7 +27,10 @@
 //! Two things are therefore NOT refused, each because the replacement has an identity of its
 //! own to be created under:
 //!
-//! * an update that states a DIFFERENT name, which is the rename the refusal asks for;
+//! * an update that states a DIFFERENT name, which is the rename the refusal asks for — or
+//!   that states the same name under a DIFFERENT PARENT, for a type whose name identifies a
+//!   resource only within one ([`super::template::name_scope`]): nothing holds that name
+//!   there, so the replacement can be created under it;
 //! * a resource whose identity its OWNING SERVICE assigns
 //!   ([`template::identity_is_service_assigned`]), whose declared name is only what the
 //!   resource is called: that service mints the replacement an identifier of its own, and two
@@ -169,6 +172,17 @@ fn refused_change(
             && deployed.resource.resource_type == change.resource_type
     })?;
     if super::provisioner::declared_name(&in_force.resource) != declared_name {
+        return None;
+    }
+    // ...and under the same PARENT. For a type whose resource lives inside one, the name
+    // identifies a resource only together with that parent
+    // ([`template::name_scope`] is the scope the owning service addresses one of its
+    // resources in), so a declaration that states another parent asks for the replacement
+    // under a name nothing holds there: that replacement is performable, and nothing is
+    // refused.
+    if template::name_scope(&change.resource_type, &declared)
+        != super::physical_name::scope_of(&in_force.resource)
+    {
         return None;
     }
     Some(RefusedReplacement {

@@ -4649,7 +4649,13 @@ fn adopt_identities_in_force(
 /// deployment then updates in place. Both revisions' lists are consulted, since the name
 /// property either of them states is read off its own declaration; a type that publishes none
 /// has nothing to compare, so the test is vacuous for it.
-fn declares_the_same_replacing_properties(
+///
+/// Visible to the rest of this service's state because the pass that gives a REPLACEMENT a
+/// physical name of its own asks the same question
+/// ([`super::replacing_update::rename_replacements`]): one predicate, so the record a
+/// re-deploy carries forward and the resource a replacement is created beside cannot disagree
+/// about what asks for a new resource.
+pub(super) fn declares_the_same_replacing_properties(
     existing: &StoredResource,
     resource: &StoredResource,
 ) -> bool {

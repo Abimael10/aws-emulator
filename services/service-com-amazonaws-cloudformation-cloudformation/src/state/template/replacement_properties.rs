@@ -294,6 +294,45 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         // `UpdateEnvironment`, so a declaration restating either asks for a different
         // environment.
         MWAA_ENVIRONMENT => &["EndpointManagement", "KmsKey"],
+        // Each of the records a REST API is built out of is addressed BY the api that holds
+        // it: `restApiId` is an `@httpLabel` of every call API Gateway publishes for a
+        // resource, a method, a deployment and a stage — the create included — and that
+        // service publishes no call that moves one to another api, so a declaration naming
+        // another api asks for a DIFFERENT record, which is what that property's "Update
+        // requires: Replacement" says. The rest of each row is the same reading of those
+        // calls:
+        //
+        // * a RESOURCE is the path segment it adds under its parent, and the type publishes
+        //   `ParentId` and `PathPart` with "Update requires: Replacement" too — every method
+        //   on the resource and every deployment snapshot of the api was taken against the
+        //   path those two make up, so a declaration restating either asks for a different
+        //   resource;
+        // * a METHOD is one verb on one resource: `resourceId` and `httpMethod` are the
+        //   labels `UpdateMethod` addresses it by, and that call takes no new value for
+        //   either;
+        // * a DEPLOYMENT is an immutable snapshot released to one stage, and
+        //   `UpdateDeployment`'s patch surface is its description alone — so the stage it
+        //   releases to and the canary settings it is released with, both `CreateDeployment`
+        //   members, are fixed when the snapshot is taken;
+        // * a STAGE keeps the name `UpdateStage` addresses it by, which that call takes no
+        //   new value for ([`name_is_create_only`] is what reads a stage's name in this
+        //   position, so the row carries the api alone).
+        //
+        // Every other property of these types is one that patch call writes, so stating one
+        // differently is a change to the record the stack already has
+        // ([`crate::state::provisioning::apigateway_rest_api`]).
+        APIGATEWAY_RESOURCE => &["ParentId", "PathPart", "RestApiId"],
+        crate::state::provisioning::apigateway_rest_api::APIGATEWAY_METHOD => {
+            &["HttpMethod", "ResourceId", "RestApiId"]
+        }
+        APIGATEWAY_DEPLOYMENT => &["DeploymentCanarySettings", "RestApiId", "StageName"],
+        crate::state::provisioning::apigateway_rest_api::APIGATEWAY_STAGE => &["RestApiId"],
+        // An api of that control plane is CLONED from another where its declaration names
+        // one: `cloneFrom` is a member of `CreateRestApi` and of no member of the two calls
+        // that change an api that exists — `UpdateRestApi`'s patch surface and `PutRestApi` —
+        // so a declaration naming another api to clone asks for a different api. Everything
+        // else about an api is what those two calls write.
+        APIGATEWAY_REST_API => &["CloneFrom"],
         // An api's PROTOCOL is fixed when API Gateway v2 makes it: `ProtocolType` is a member
         // of `CreateApi` and of no member of `UpdateApi` — and no other call of that service
         // changes an api's protocol — so a declaration stating another protocol asks for a
