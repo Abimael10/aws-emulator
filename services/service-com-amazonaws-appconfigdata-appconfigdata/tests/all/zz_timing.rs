@@ -15,8 +15,12 @@
 //! The companion suite `rollout_percentage_splits_sessions` asserts the gate itself over
 //! a table of percentages; this one asserts that the clock is what moves a deployment
 //! through them, which is why it waits rather than writing a percentage into the store.
+//!
+//! The second test here is the other transition the clock owes the data plane: the refusal
+//! a withdrawn triple owes a session, which a client converges on by looking again rather
+//! than by following the token rotation.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
@@ -112,6 +116,139 @@ async fn the_version_a_session_is_served_follows_the_clock_through_the_rollout()
         NEW,
         "case a rollout whose window has passed: expected the new version, got {:?}",
         String::from_utf8_lossy(&served)
+    );
+}
+
+/// How long a client's poll loop is given to converge on the refusal a withdrawn triple
+/// owes: far more than the span the service records the deadline one of
+/// (`state::WITHDRAWAL_SPAN`), so the test waits for the CONDITION on a host of any speed
+/// and fails only on a chain that never converges at all.
+const CONVERGENCE_DEADLINE: Duration = Duration::from_secs(120);
+
+/// How long the poll loop below pauses between looks. A client polls at the cadence the
+/// response tells it to; this one only has to look often enough to notice the refusal
+/// shortly after it falls due.
+const LOOK_AGAIN_AFTER: Duration = Duration::from_millis(250);
+
+/// RULE: the refusal a withdrawn triple owes a session falls due on the CLOCK, and it is
+/// owed by the whole poll chain — so a client that keeps re-presenting the token it minted
+/// before the deletion, without ever following the rotation, converges on the modelled
+/// `ResourceNotFoundException` naming the resource that is gone. Nothing is written into
+/// either store here: the deletion goes through AppConfig's own operation and the deadline
+/// is reached by waiting for it.
+#[tokio::test]
+async fn a_token_minted_before_a_deletion_converges_on_the_refusal() {
+    let emulator = Emulator::new();
+    let hierarchy = emulator
+        .create_hierarchy("withdrawn-app", "production", "flags")
+        .await;
+    emulator
+        .deploy(
+            &hierarchy,
+            &hierarchy.profile_id,
+            PREVIOUS,
+            "application/json",
+            None,
+        )
+        .await;
+
+    // The token the client holds BEFORE the deletion, and the configuration it is serving.
+    let token = emulator
+        .session_token(
+            &hierarchy.application_id,
+            &hierarchy.environment_id,
+            &hierarchy.profile_id,
+        )
+        .await;
+    let served = emulator.get_latest_configuration(&token).await;
+    assert_eq!(
+        served.status,
+        200,
+        "the poll before the deletion expected 200, got {} body {}",
+        served.status,
+        served.text()
+    );
+    assert_eq!(
+        served.body.as_ref(),
+        PREVIOUS,
+        "the poll before the deletion must serve the deployed bytes, got {:?}",
+        String::from_utf8_lossy(&served.body)
+    );
+
+    let application_id = &hierarchy.application_id;
+    let environment_id = &hierarchy.environment_id;
+    let deleted = emulator
+        .send(
+            "DELETE",
+            &format!("/applications/{application_id}/environments/{environment_id}"),
+            "application/json",
+            &[],
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(
+        deleted.status,
+        204,
+        "DeleteEnvironment expected 204, got {} body {}",
+        deleted.status,
+        deleted.text()
+    );
+
+    // The client re-presents the SAME token, looking again until the refusal has fallen
+    // due rather than waiting a fixed time for it.
+    let give_up_at = Instant::now() + CONVERGENCE_DEADLINE;
+    let refusal = loop {
+        let poll = emulator.get_latest_configuration(&token).await;
+        if poll.status != 200 {
+            break poll;
+        }
+        assert!(
+            Instant::now() < give_up_at,
+            "a configuration token minted before its environment was deleted must stop \
+             serving: the re-presented token was still answered 200 with {:?} for the whole \
+             poll window",
+            String::from_utf8_lossy(&poll.body)
+        );
+        tokio::time::sleep(LOOK_AGAIN_AFTER).await;
+    };
+
+    assert_eq!(
+        refusal.status,
+        404,
+        "the re-presented token expected 404 once the withdrawal had fallen due, got {} \
+         body {}",
+        refusal.status,
+        refusal.text()
+    );
+    assert_eq!(
+        refusal.error_code(),
+        "ResourceNotFoundException",
+        "expected ResourceNotFoundException, got {}",
+        refusal.text()
+    );
+    let body = refusal.json();
+    assert_eq!(
+        body["ResourceType"].as_str(),
+        Some("Environment"),
+        "expected the ResourceType of the level that is gone, got {}",
+        refusal.text()
+    );
+    assert_eq!(
+        body["Message"].as_str(),
+        Some("Environment not found"),
+        "expected the level's fixed not-found sentence, got {}",
+        refusal.text()
+    );
+    assert_eq!(
+        body["ReferencedBy"]["EnvironmentIdentifier"].as_str(),
+        Some(hierarchy.environment_id.as_str()),
+        "expected ReferencedBy to name the environment the session referenced, got {}",
+        refusal.text()
+    );
+    assert!(
+        refusal.header("next-poll-configuration-token").is_none(),
+        "a refused poll serves nothing, so it must rotate no token, got {}",
+        refusal.text()
     );
 }
 

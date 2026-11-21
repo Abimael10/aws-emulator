@@ -18,7 +18,12 @@
 //! makes, so it falls due whether or not anybody polls again — and from then on the poll is
 //! refused with the modelled
 //! `ResourceNotFoundException` for the resource that is gone — at once for a session that
-//! was bound to no configuration at all, which has nothing to serve either way. Every
+//! was bound to no configuration at all, which has nothing to serve either way. That
+//! deadline belongs to the poll CHAIN and not to one of its tokens — it is recorded on, and
+//! cleared from, every token entry the chain has minted
+//! ([`crate::state::ComAmazonawsAppconfigdataAppconfigdataState::withdraw_chain`]) — so a
+//! client re-presenting a token it still holds converges on the refusal exactly like one
+//! following the rotation. Every
 //! answer — the content, the content
 //! type, the version label, the rotated token and the poll interval — is read out of
 //! persisted state: the session out of this service's own store, the configuration out
@@ -512,13 +517,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A poll served from the binding passes on the deadline it found, and the first
             // such poll is the one that sets it — so the withdrawal falls due one span after
             // the triple went, however often the chain is polled in between.
+            //
+            // What was withdrawn is the TRIPLE, which every token of this poll chain
+            // resolves to, so the deadline is recorded on — and cleared from — every entry
+            // of the chain and not only the successor this poll mints: a token is bounded by
+            // time and by nothing else, so the client may re-present one it still holds, and
+            // that poll has to converge on the refusal too
+            // (`crate::state::ComAmazonawsAppconfigdataAppconfigdataState::withdraw_chain`).
             next_session.withdrawal_due_at = match resolution {
-                Resolution::Live(_) => None,
-                Resolution::FromBinding(_) => Some(
-                    session
-                        .withdrawal_due_at
-                        .unwrap_or_else(|| crate::state::withdrawal_deadline(now)),
-                ),
+                Resolution::Live(_) => {
+                    state.restore_chain(&session.chain);
+                    None
+                }
+                Resolution::FromBinding(_) => {
+                    Some(state.withdraw_chain(&session.chain, session.withdrawal_due_at, now))
+                }
             };
             next_session.last_polled_at = Some(now);
             state.store_session(next_session, now)

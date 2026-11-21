@@ -23,6 +23,13 @@
 //! recording a later one, which is what makes the refusal arrive however often the client
 //! polls; a poll whose own resolution held owes no refusal at all.
 //!
+//! That deadline is the POLL CHAIN's: a token is bounded by time and by nothing else, so
+//! every token the chain has minted and not outlived is one the client may present again,
+//! and all of them carry the one deadline the first withdrawn poll recorded (and are
+//! cleared together by a poll that resolves the triple live). The two tests at the end of
+//! this suite are about that half of the rule — re-presenting an older token of the chain
+//! can neither renew the refusal nor escape it.
+//!
 //! The rows differ along what the rule generalises over: WHICH level the control plane
 //! removes (and how many at once), whether the session had already polled when the
 //! removal happened, whether the session spelled its triple by name or by id, and the
@@ -796,5 +803,365 @@ async fn assert_after_removal(emulator: &Emulator, victim: &Hierarchy, case: &Ca
                 poll.text()
             );
         }
+    }
+}
+
+// =============================================================================
+// The withdrawal is the POLL CHAIN's, not one token's
+// =============================================================================
+
+/// One chain whose triple is withdrawn, and which of the tokens the chain minted the
+/// client re-presents afterwards.
+///
+/// A token is bounded by TIME and by nothing else ("to support long poll use cases, the
+/// tokens are valid for up to 24 hours"), so every token a chain has minted and not yet
+/// outlived is one the client may present again — the documented recovery after a poll
+/// whose response it failed to persist. The rows differ along what the rule generalises
+/// over: which level the control plane removes, how many tokens the chain had minted
+/// before the removal, WHICH of them is re-presented, how the session spelled its triple
+/// and the form and content type of the configuration it was serving.
+struct ChainCase {
+    name: &'static str,
+    /// What the control plane removes, in the order it has to.
+    removed: &'static [Removal],
+    /// How many polls the chain makes before the removal, so it holds this many tokens
+    /// beyond the one `StartConfigurationSession` minted.
+    polls_before: usize,
+    /// Which of the chain's tokens the client re-presents after the removal, counted from
+    /// the one the session was started with.
+    re_presented: usize,
+    by_id: bool,
+    content: &'static [u8],
+    content_type: &'static str,
+    withdrawn: Withdrawn,
+}
+
+const CHAIN_CASES: &[ChainCase] = &[
+    ChainCase {
+        name: "the environment is deleted and the session's own initial token is re-presented",
+        removed: &[Removal::Environment],
+        polls_before: 0,
+        re_presented: 0,
+        by_id: true,
+        content: br#"{"flag":"on"}"#,
+        content_type: "application/json",
+        withdrawn: Withdrawn {
+            resource_type: "Environment",
+            referenced_by: Some("EnvironmentIdentifier"),
+        },
+    },
+    ChainCase {
+        name: "the environment is deleted after one poll and the token that poll used is \
+               re-presented",
+        removed: &[Removal::Environment],
+        polls_before: 1,
+        re_presented: 0,
+        by_id: false,
+        content: b"flag: on\n",
+        content_type: "application/x-yaml",
+        withdrawn: Withdrawn {
+            resource_type: "Environment",
+            referenced_by: Some("EnvironmentIdentifier"),
+        },
+    },
+    ChainCase {
+        name: "the configuration profile is deleted after three polls and the chain's first \
+               token is re-presented",
+        removed: &[Removal::HostedVersions, Removal::ConfigurationProfile],
+        polls_before: 3,
+        re_presented: 0,
+        by_id: false,
+        content: &[0x00, 0x9f, 0x92, 0x96, 0xff],
+        content_type: "application/octet-stream",
+        withdrawn: Withdrawn {
+            resource_type: "ConfigurationProfile",
+            referenced_by: Some("ConfigurationProfileIdentifier"),
+        },
+    },
+    ChainCase {
+        name: "the whole hierarchy is deleted after three polls and a middle token of the \
+               chain is re-presented",
+        removed: &[
+            Removal::HostedVersions,
+            Removal::ConfigurationProfile,
+            Removal::Environment,
+            Removal::Application,
+        ],
+        polls_before: 3,
+        re_presented: 2,
+        by_id: true,
+        content: b"on",
+        content_type: "text/plain",
+        withdrawn: Withdrawn {
+            // Resolved outermost first, so the application is the level reported.
+            resource_type: "Application",
+            referenced_by: Some("ApplicationIdentifier"),
+        },
+    },
+    ChainCase {
+        name: "the hosted configuration versions are deleted after two polls and the token \
+               the first poll used is re-presented",
+        removed: &[Removal::HostedVersions],
+        polls_before: 2,
+        re_presented: 1,
+        by_id: false,
+        content: br#"{"feature":"off"}"#,
+        content_type: "application/json",
+        withdrawn: Withdrawn {
+            resource_type: "Configuration",
+            referenced_by: None,
+        },
+    },
+];
+
+/// RULE: what a control-plane removal withdraws is the session's TRIPLE, so the refusal it
+/// owes is owed by the whole poll chain — every token of the chain carries the one deadline
+/// the first poll to find the triple withdrawn recorded, so whichever still-live token the
+/// client presents is served from the binding until that instant and refused with the
+/// modelled `ResourceNotFoundException` from it on. Re-presenting a token the client
+/// already holds is a supported client behaviour, not a way to keep a withdrawn
+/// configuration alive: it can neither renew the deadline nor escape it.
+#[tokio::test]
+async fn the_withdrawal_is_owed_by_every_token_of_the_poll_chain() {
+    for case in CHAIN_CASES {
+        let name = case.name;
+        let emulator = Emulator::new();
+        let victim = emulator
+            .create_hierarchy("ChainApp", "ChainEnvironment", "ChainProfile")
+            .await;
+        emulator
+            .deploy(
+                &victim,
+                &victim.profile_id,
+                case.content,
+                case.content_type,
+                None,
+            )
+            .await;
+        let (application, environment, profile) = spelled(&victim, case.by_id);
+
+        // The chain as the client holds it: the token the session was started with, plus
+        // one for each poll it has made. The client keeps them all, which the token
+        // lifetime invites it to do.
+        let mut chain = vec![emulator.session_token(application, environment, profile).await];
+        for poll in 0..case.polls_before {
+            let holding = chain
+                .last()
+                .expect("the chain always holds the token it was started with")
+                .clone();
+            let served = emulator.get_latest_configuration(&holding).await;
+            assert_eq!(
+                served.status,
+                200,
+                "case {name}: poll {poll} before the removal expected 200, got {} body {}",
+                served.status,
+                served.text()
+            );
+            chain.push(served.next_token());
+        }
+
+        remove(&emulator, &victim, case.removed).await;
+
+        // No poll has found the triple withdrawn yet, so no token of the chain owes a
+        // refusal.
+        for (index, token) in chain.iter().enumerate() {
+            let deadline = emulator.withdrawal_deadline(token);
+            assert_eq!(
+                deadline, None,
+                "case {name}: token {index} of the chain expected no deadline before any poll \
+                 found the triple withdrawn, got {deadline:?}"
+            );
+        }
+
+        // The client re-presents the token the row names — one minted BEFORE the removal —
+        // after being idle for twice the cadence the service told it to poll at.
+        let presented = chain[case.re_presented].clone();
+        emulator.backdate_last_poll(&presented, IDLE_FOR);
+        let served = emulator.get_latest_configuration(&presented).await;
+        assert_eq!(
+            served.status,
+            200,
+            "case {name}: the re-presented token expected the no-change 200 of its binding, \
+             got {} body {}",
+            served.status,
+            served.text()
+        );
+        chain.push(served.next_token());
+
+        // THE RULE: that poll made the refusal due for the CHAIN — the entry the presented
+        // token resolves to carries the deadline, and so does every other token the chain
+        // has minted.
+        let due = emulator
+            .withdrawal_deadline(&presented)
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {name}: the poll that found the triple withdrawn must record when the \
+                     refusal falls due on the token it answered"
+                )
+            });
+        for (index, token) in chain.iter().enumerate() {
+            let deadline = emulator.withdrawal_deadline(token);
+            assert_eq!(
+                deadline,
+                Some(due),
+                "case {name}: token {index} of the chain expected the chain's deadline \
+                 {due:?}, got {deadline:?}"
+            );
+        }
+
+        // Re-presenting the same token again cannot renew that deadline: the poll carries
+        // the instant it found. The window is pushed well out first, so the verdict never
+        // turns on how fast the host ran the poll before it.
+        emulator.postpone_withdrawal_deadline(&presented);
+        let postponed = emulator.withdrawal_deadline(&presented);
+        let served = emulator.get_latest_configuration(&presented).await;
+        assert_eq!(
+            served.status,
+            200,
+            "case {name}: the same token presented again inside the span expected 200, got {} \
+             body {}",
+            served.status,
+            served.text()
+        );
+        chain.push(served.next_token());
+        for (index, token) in chain.iter().enumerate() {
+            let deadline = emulator.withdrawal_deadline(token);
+            assert_eq!(
+                deadline, postponed,
+                "case {name}: token {index} of the chain expected the deadline the poll found \
+                 ({postponed:?}), not a later one, got {deadline:?}"
+            );
+        }
+
+        // THE RULE, second half: once the withdrawal has fallen due, EVERY token of the
+        // chain is refused — an older token is no way back to the withdrawn configuration.
+        for token in &chain {
+            emulator.expire_withdrawal_deadline(token);
+        }
+        for (index, token) in chain.iter().enumerate() {
+            let withdrawn = Withdrawal::read(&emulator, token).await;
+            withdrawn.assert_is(
+                name,
+                &format!("the poll presenting token {index} once the withdrawal had fallen due"),
+                case.withdrawn,
+                application,
+                environment,
+                profile,
+            );
+        }
+    }
+}
+
+/// RULE, the other way round: the deadline a withdrawn poll recorded is the chain's, so a
+/// poll whose OWN resolution of the triple holds clears it from every token of the chain —
+/// a configuration the control plane has in force again is withdrawn from nobody, whichever
+/// of its tokens the client goes on with.
+#[tokio::test]
+async fn a_poll_whose_resolution_holds_clears_the_withdrawal_from_every_token_of_the_chain() {
+    const WITHDRAWN: &[u8] = br#"{"release":"first"}"#;
+    const RESTORED: &[u8] = br#"{"release":"second"}"#;
+
+    let emulator = Emulator::new();
+    let hierarchy = emulator
+        .create_hierarchy("RestoredApp", "RestoredEnvironment", "RestoredProfile")
+        .await;
+    let deployment = emulator
+        .deploy_numbered(
+            &hierarchy,
+            &hierarchy.profile_id,
+            WITHDRAWN,
+            "application/json",
+            None,
+        )
+        .await;
+    let mut chain = vec![
+        emulator
+            .session_token(
+                &hierarchy.application_id,
+                &hierarchy.environment_id,
+                &hierarchy.profile_id,
+            )
+            .await,
+    ];
+    let served = emulator.get_latest_configuration(&chain[0]).await;
+    assert_eq!(
+        served.status,
+        200,
+        "the first poll expected 200, got {} body {}",
+        served.status,
+        served.text()
+    );
+    chain.push(served.next_token());
+
+    // Undoing the deployment leaves the profile with nothing in force in that environment,
+    // which is a triple the poll can no longer re-resolve.
+    emulator.stop_deployment(&hierarchy, deployment).await;
+    let served = emulator
+        .get_latest_configuration(chain.last().expect("the chain holds a token"))
+        .await;
+    assert_eq!(
+        served.status,
+        200,
+        "the poll after the deployment was undone expected the no-change 200 of its \
+         binding, got {} body {}",
+        served.status,
+        served.text()
+    );
+    chain.push(served.next_token());
+    for (index, token) in chain.iter().enumerate() {
+        assert!(
+            emulator.withdrawal_deadline(token).is_some(),
+            "token {index} of the chain expected the chain's withdrawal deadline once a poll \
+             found the triple withdrawn, got None"
+        );
+    }
+
+    // A fresh deployment puts a configuration in force again, so the next poll's own
+    // resolution holds — and it holds for the chain, not for the token that happened to
+    // make it: the poll presents the chain's FIRST token, and every token is cleared.
+    emulator
+        .deploy(
+            &hierarchy,
+            &hierarchy.profile_id,
+            RESTORED,
+            "application/json",
+            None,
+        )
+        .await;
+    let served = emulator.get_latest_configuration(&chain[0]).await;
+    assert_eq!(
+        served.status,
+        200,
+        "the poll after the configuration was deployed again expected 200, got {} body {}",
+        served.status,
+        served.text()
+    );
+    assert_eq!(
+        served.body.as_ref(),
+        RESTORED,
+        "the poll whose resolution held must serve the configuration now in force, got {:?}",
+        String::from_utf8_lossy(&served.body)
+    );
+    chain.push(served.next_token());
+    for (index, token) in chain.iter().enumerate() {
+        let deadline = emulator.withdrawal_deadline(token);
+        assert_eq!(
+            deadline, None,
+            "token {index} of the chain expected no deadline once a poll resolved the triple \
+             live, got {deadline:?}"
+        );
+    }
+
+    // So the tokens an earlier withdrawn poll put a deadline on keep polling: the chain owes
+    // no refusal at all.
+    for (index, token) in chain.clone().iter().enumerate() {
+        let served = emulator.get_latest_configuration(token).await;
+        assert_eq!(
+            served.status,
+            200,
+            "token {index} of a restored chain expected 200, got {} body {}",
+            served.status,
+            served.text()
+        );
     }
 }

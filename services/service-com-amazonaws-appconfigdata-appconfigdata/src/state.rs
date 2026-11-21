@@ -28,6 +28,15 @@
 //! `ResourceNotFoundException` naming the resource that is gone, as is a session that was
 //! bound to no configuration at all ([`Session::binding_in_force`]).
 //!
+//! What is withdrawn is the TRIPLE, so the refusal is owed by the whole poll chain and not
+//! by the one token that happened to find the triple gone: the deadline is written onto
+//! every token entry of the chain
+//! ([`ComAmazonawsAppconfigdataAppconfigdataState::withdraw_chain`]) and cleared from every
+//! one of them by a poll whose own resolution held
+//! ([`ComAmazonawsAppconfigdataAppconfigdataState::restore_chain`]). A client re-presenting
+//! a token it still holds — a token is bounded by TIME and by nothing else — therefore
+//! converges on the refusal just as one following the rotation does.
+//!
 //! The other thing the data plane keeps of its own about that hierarchy is how a NAME
 //! resolves. Every session identifier is "the ID or the name" of its level, and an id
 //! is immutable while a name is not: the control plane may rename a record, which frees
@@ -163,8 +172,21 @@ pub struct Session {
     ///
     /// A poll served from the binding carries the deadline it found on, never a fresh one,
     /// so the withdrawal falls due however often the chain is polled
-    /// ([`Session::binding_in_force`]).
+    /// ([`Session::binding_in_force`]). The instant belongs to the CHAIN rather than to one
+    /// of its tokens: every entry of this session's [`Session::chain`] carries the same
+    /// value, written and cleared together
+    /// ([`ComAmazonawsAppconfigdataAppconfigdataState::withdraw_chain`]), so whichever
+    /// still-live token of the chain the client presents next is answered from the same
+    /// deadline.
     pub withdrawal_due_at: Option<SystemTime>,
+    /// The poll CHAIN this entry belongs to: minted with the session and carried by every
+    /// token its polls rotate, so the entries the tokens of one session resolve to are
+    /// recognisable as answering for the same triple.
+    ///
+    /// What the chain is for is the withdrawal above, which the triple owes and therefore
+    /// owes to all of the chain at once. It is internal to this store — no response carries
+    /// it, and a token is resolved by the map key, never by this.
+    pub chain: String,
     /// Where this session stands in a gradual rollout: the position the control plane
     /// compares against a deployment's `PercentageComplete` when it decides which
     /// deployment is in force for this session
@@ -199,8 +221,9 @@ impl Session {
     ///
     /// `None` from [`Session::withdrawal_due_at`] onwards, and `None` for a session bound
     /// to no configuration at all: in both cases a poll whose triple no longer resolves has
-    /// nothing to serve. A session no poll has yet found withdrawn carries no deadline, so
-    /// what it is bound to is served whenever it next polls, however long it waited.
+    /// nothing to serve. A session whose chain no poll has yet found withdrawn carries no
+    /// deadline, so what it is bound to is served whenever it next polls, however long it
+    /// waited.
     pub fn binding_in_force(&self, now: SystemTime) -> Option<&Arc<ServedConfiguration>> {
         self.bound_configuration
             .as_ref()
@@ -337,6 +360,9 @@ pub struct ComAmazonawsAppconfigdataAppconfigdataState {
     /// How many tokens this store has minted; part of the token material, so no two
     /// tokens are ever derived from the same input.
     tokens_minted: u64,
+    /// How many poll chains this store has minted; part of a chain identifier's material,
+    /// so no two chains are ever derived from the same input ([`Session::chain`]).
+    chains_minted: u64,
 }
 
 impl ComAmazonawsAppconfigdataAppconfigdataState {
@@ -377,6 +403,7 @@ impl ComAmazonawsAppconfigdataAppconfigdataState {
         rollout_bucket: RolloutBucket,
         now: SystemTime,
     ) -> String {
+        let chain = self.mint_chain(now);
         let session = Session {
             application_identifier: application_identifier.to_string(),
             environment_identifier: environment_identifier.to_string(),
@@ -385,6 +412,7 @@ impl ComAmazonawsAppconfigdataAppconfigdataState {
             last_served_version: None,
             bound_configuration,
             withdrawal_due_at: None,
+            chain,
             rollout_bucket,
             created_at: now,
             expires_at: expiry(now),
@@ -392,6 +420,66 @@ impl ComAmazonawsAppconfigdataAppconfigdataState {
             last_used_at: None,
         };
         self.store_session(session, now)
+    }
+
+    /// Record, on every token entry of `chain`, that a poll of it found the session's
+    /// triple withdrawn, and answer the instant the refusal falls due.
+    ///
+    /// What the control plane withdrew is the TRIPLE, which every token of one chain
+    /// resolves to, so the refusal is owed by the chain and not by the token that happened
+    /// to find the triple gone. A token is bounded by TIME and by nothing else, so a client
+    /// may still present any token the chain has minted; recording the deadline on all of
+    /// them is what makes the chain converge on the refusal whichever one it presents next.
+    ///
+    /// The instant recorded is `carried` — the deadline the poll found on the session it
+    /// answered — and only a poll that finds none, the first of its chain to find the
+    /// triple withdrawn, makes a fresh one one [`WITHDRAWAL_SPAN`] out. So polling faster
+    /// cannot postpone the refusal.
+    pub fn withdraw_chain(
+        &mut self,
+        chain: &str,
+        carried: Option<SystemTime>,
+        now: SystemTime,
+    ) -> SystemTime {
+        let due = carried.unwrap_or_else(|| withdrawal_deadline(now));
+        self.write_chain_withdrawal(chain, Some(due));
+        due
+    }
+
+    /// Clear the refusal every token entry of `chain` owes: the poll's own resolution of
+    /// the triple HELD, so the control plane answers for it again and nothing is withdrawn
+    /// from the chain — including from the entries an earlier withdrawn poll put a deadline
+    /// on.
+    pub fn restore_chain(&mut self, chain: &str) {
+        self.write_chain_withdrawal(chain, None);
+    }
+
+    /// Write `due` as the withdrawal deadline of every entry belonging to `chain`.
+    fn write_chain_withdrawal(&mut self, chain: &str, due: Option<SystemTime>) {
+        for session in self.sessions.values_mut() {
+            if session.chain == chain {
+                session.withdrawal_due_at = due;
+            }
+        }
+    }
+
+    /// Mint the identifier of a fresh poll chain, which the session being started and every
+    /// successor its polls rotate carry ([`Session::chain`]).
+    ///
+    /// Derived the way a token is — from a mint counter and the current instant, hashed
+    /// under its own domain tag, so a chain identifier is never equal to a token this store
+    /// also minted and no two chains collide.
+    fn mint_chain(&mut self, now: SystemTime) -> String {
+        self.chains_minted += 1;
+        let nanos = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mut hasher = Sha256::new();
+        hasher.update(b"configuration-session-poll-chain");
+        hasher.update(self.chains_minted.to_be_bytes());
+        hasher.update(nanos.to_be_bytes());
+        hex::encode(hasher.finalize())
     }
 
     /// Mint the position a session being started stands at in a gradual rollout
