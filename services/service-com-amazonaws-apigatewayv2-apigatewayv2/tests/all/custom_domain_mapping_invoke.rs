@@ -64,7 +64,7 @@ const MISDIRECTED: u16 = 421;
 /// How long one request on the published address may take before the case fails: generous for
 /// a loaded machine, and bounded so a case that will never be answered fails instead of
 /// hanging the suite.
-const ANSWER_DEADLINE: Duration = Duration::from_secs(30);
+pub(crate) const ANSWER_DEADLINE: Duration = Duration::from_secs(30);
 
 /// The handler every row is served by: it reports the api, the stage and the path the event
 /// says it was invoked for, which is what tells one stage's answer from another's.
@@ -187,19 +187,19 @@ async fn given_mapping(
 
 /// What one request to the published address was answered with.
 #[derive(Debug)]
-struct Answer {
-    status: u16,
-    body: String,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: String,
 }
 
 impl Answer {
     /// The answer's body as JSON, for a row the function served.
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         serde_json::from_str(&self.body).unwrap_or(Value::Null)
     }
 
     /// The `message` the gateway's own refusals carry.
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         self.json()
             .get("message")
             .and_then(Value::as_str)
@@ -216,7 +216,7 @@ impl Answer {
 ///
 /// `host` is the `Host` the client sends: the published address itself, or the custom DOMAIN
 /// NAME a caller pointed at that address, which is what a real client of the domain sends.
-async fn request_as(case: &str, authority: &str, path: &str, host: &str) -> Answer {
+pub(crate) async fn request_as(case: &str, authority: &str, path: &str, host: &str) -> Answer {
     let port = authority
         .parse::<std::net::SocketAddr>()
         .unwrap_or_else(|error| {

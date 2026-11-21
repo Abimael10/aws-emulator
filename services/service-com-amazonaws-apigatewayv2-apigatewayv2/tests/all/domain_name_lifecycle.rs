@@ -32,6 +32,13 @@
 //!   reader signs for. An ARN carrying an account id never equals the one AWS produces for
 //!   the same domain name, so no IAM resource pattern or cross-service reference a caller
 //!   builds would match it.
+//! * **Every reader of the resource publishes an address this emulator SERVES it on**:
+//!   `DomainNameConfiguration$ApiGatewayDomainName` is "the domain name associated with the
+//!   regional endpoint for this custom domain name" — the value a caller points its own DNS
+//!   record at and a client then DIALS — so what `GetDomainName`, the collection reader and a
+//!   patched record report is one address of this machine, dialled here under the `Host` a
+//!   client of the custom domain sends, and not a name under API Gateway's own zone, which
+//!   resolves to nothing where this emulator runs.
 //! * **`CreateDomainName` answers the tags its own request attached**, and a request that
 //!   attached none answers no `tags` member at all — the member's presence is what a client
 //!   tests to tell a tagged resource from an untagged one — **while every READER of the
@@ -60,6 +67,7 @@ use service_com_amazonaws_apigatewayv2_apigatewayv2::state::{
 use tokio::time::sleep;
 
 use crate::api_lifecycle::{as_str, call_in_region, emulator, error_code};
+use crate::custom_domain_mapping_invoke::request_as;
 
 /// The region every request in this suite is signed for. Deliberately NOT the
 /// emulator's `us-east-1` default, so an ARN or a host built from a hardcoded region
@@ -1260,5 +1268,183 @@ async fn the_create_answers_the_tags_it_attached_and_every_reader_the_collection
             Some(&collection),
             "case {case:?}: expected the patch to report the same collection, got {patched}"
         );
+    }
+}
+
+/// The status and sentence a request to a custom domain name that maps no api is answered
+/// with: API Gateway's refusal for a request that reaches no api of the account.
+const NO_MAPPING: u16 = 403;
+const NO_MAPPING_MESSAGE: &str = "Forbidden";
+
+/// Assert that `arn` names `domain` in `region` with NO account id in it.
+///
+/// Beyond the whole template, the account-id SECTION is weighed on its own: an ARN is six
+/// colon-separated sections and the fifth is the account, which API Gateway leaves empty for
+/// the resources of its own control plane. An ARN carrying an account id never equals the one
+/// AWS produces for the same domain name, so no IAM resource pattern or cross-service
+/// reference a caller builds would match it.
+fn assert_account_less_arn(case: &str, arn: &str, region: &str, domain: &str) {
+    assert_eq!(
+        arn,
+        expected_domain_name_arn(region, domain),
+        "case {case:?}: expected the API Gateway management ARN of {domain:?} in {region:?}, \
+         got {arn:?}"
+    );
+    let sections: Vec<&str> = arn.splitn(6, ':').collect();
+    assert_eq!(
+        sections.len(),
+        6,
+        "case {case:?}: expected an ARN of six sections, got {arn:?}"
+    );
+    assert!(
+        sections[4].is_empty(),
+        "case {case:?}: expected an empty account-id section, got {:?} in {arn:?}",
+        sections[4]
+    );
+    assert!(
+        !arn.contains(engine::emulator_account_id()),
+        "case {case:?}: expected no account id in {arn:?}"
+    );
+}
+
+/// The one `apiGatewayDomainName` every configuration of `body` reports, asserting that the
+/// list is not empty and that its entries agree: one domain name is reached at one address.
+fn published_address(case: &str, body: &Value) -> String {
+    let entries = configurations(body);
+    assert!(
+        !entries.is_empty(),
+        "case {case:?}: expected at least one domainNameConfigurations entry, got {body}"
+    );
+    let hosts: Vec<String> = entries
+        .iter()
+        .map(|entry| as_str(entry, "apiGatewayDomainName"))
+        .collect();
+    for host in &hosts {
+        assert_eq!(
+            host, &hosts[0],
+            "case {case:?}: expected every configuration to report the one address this \
+             domain name is served on, got {hosts:?}"
+        );
+    }
+    hosts[0].clone()
+}
+
+/// Assert that `authority` is an address on this machine and that dialling it as a client of
+/// `domain` reaches THIS emulator.
+///
+/// A domain name that maps no api answers every path with the gateway's own refusal, and the
+/// `Host` a client that resolved the custom domain sends is the DOMAIN NAME — so an answer
+/// here is an answer for that domain name, from a socket this emulator holds, and not from a
+/// name under API Gateway's own zone, where nothing on this machine listens.
+async fn assert_serves_the_domain_name(case: &str, authority: &str, domain: &str) {
+    let address = authority
+        .parse::<std::net::SocketAddr>()
+        .unwrap_or_else(|error| {
+            panic!(
+                "case {case:?}: expected apiGatewayDomainName to be an address a client can \
+                 dial, got {authority:?}: {error}"
+            )
+        });
+    assert!(
+        address.ip().is_loopback(),
+        "case {case:?}: expected an address of this machine, got {authority:?}"
+    );
+    assert_ne!(
+        address.port(),
+        0,
+        "case {case:?}: expected a port a client can dial, got {authority:?}"
+    );
+    let answer = request_as(case, authority, "/nothing-is-mapped-here", domain).await;
+    assert_eq!(
+        answer.status, NO_MAPPING,
+        "case {case:?}: expected {NO_MAPPING} from the address published for {domain:?}, got \
+         {answer:?}"
+    );
+    assert_eq!(
+        answer.message(),
+        NO_MAPPING_MESSAGE,
+        "case {case:?}: expected the gateway's own sentence for a path no mapping answers, got \
+         {answer:?}"
+    );
+}
+
+/// Every READER of a custom domain name reports the account-less ARN of the resource and an
+/// `apiGatewayDomainName` this emulator SERVES that domain name on.
+///
+/// `GetDomainName` is the operation a client of either value goes through, so both halves are
+/// asserted of the read's own answer — and of the collection reader's and of a patched
+/// record's, which have to agree with it — rather than only of what the create answered. The
+/// published host is then DIALLED: the member exists for a caller to point its own DNS record
+/// at, so what is published has to be an address that serves the api.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_reader_reports_an_account_less_arn_and_an_address_this_emulator_serves() {
+    let emulator = emulator();
+
+    for row in representation_cases() {
+        let case = row.case;
+        let created = create_for_representation(&emulator, &row).await;
+        let authority = published_address(case, &created);
+
+        let (status, read) = call_in_region(
+            &emulator,
+            row.region,
+            "GET",
+            &format!("/v2/domainnames/{}", row.domain),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from GetDomainName, got {status} {read}"
+        );
+        assert_account_less_arn(case, &as_str(&read, "domainNameArn"), row.region, row.domain);
+        assert_eq!(
+            published_address(case, &read),
+            authority,
+            "case {case:?}: expected GetDomainName to report the address the create did, got \
+             {read}"
+        );
+        assert_serves_the_domain_name(case, &authority, row.domain).await;
+
+        // The collection reader projects the same records, so it reports the same two values.
+        let (status, listed) =
+            call_in_region(&emulator, row.region, "GET", "/v2/domainnames", None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from GetDomainNames, got {status} {listed}"
+        );
+        let entry = listed_domain_name(case, &listed, row.domain);
+        assert_account_less_arn(case, &as_str(&entry, "domainNameArn"), row.region, row.domain);
+        assert_eq!(
+            published_address(case, &entry),
+            authority,
+            "case {case:?}: expected GetDomainNames to report the same address, got {listed}"
+        );
+
+        // A patch of the record's own members moves neither value, and the address it was
+        // minted with still serves the domain name afterwards.
+        let (status, patched) = update_domain_name(
+            &emulator,
+            row.domain,
+            &json!({ "routingMode": "ROUTING_RULE_THEN_API_MAPPING" }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from UpdateDomainName, got {status} {patched}"
+        );
+        assert_account_less_arn(
+            case,
+            &as_str(&patched, "domainNameArn"),
+            row.region,
+            row.domain,
+        );
+        assert_eq!(
+            published_address(case, &patched),
+            authority,
+            "case {case:?}: expected the patch to leave the published address alone, got \
+             {patched}"
+        );
+        assert_serves_the_domain_name(case, &authority, row.domain).await;
     }
 }
