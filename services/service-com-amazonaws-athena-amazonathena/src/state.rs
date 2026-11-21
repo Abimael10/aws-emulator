@@ -562,13 +562,14 @@ pub fn glue_data_catalog_id() -> String {
     glue_state::resolve_catalog_id(None)
 }
 
-/// The refusal message for an operation whose named data catalog this account does not
-/// hold.
+/// The refusal message a READ OF THE REGISTRY (`GetDataCatalog`) answers with when its
+/// `Name` names no data catalog this account holds.
 ///
-/// The template is the one every Athena resource miss follows — the kind of entity, the
-/// name the request addressed, and "was not found" — which is also how an execution miss
-/// is worded ([`query_execution_not_found`]). ONE sentence for the class, so every
-/// operation that answers a catalog miss words it identically.
+/// The template is the registry read's own: the kind of entity, the name the request
+/// addressed, and "was not found." — the same shape an execution miss is worded with
+/// ([`query_execution_not_found`]). A metadata read that resolves a catalog name states
+/// the metadata plane's sentence instead ([`metadata_catalog_not_found`]), so the two
+/// cannot drift onto one another.
 pub fn data_catalog_not_found(catalog_name: &str) -> String {
     format!("DataCatalog {catalog_name} was not found.")
 }
@@ -885,6 +886,24 @@ pub fn metadata_source(
         Some(catalog_id) => MetadataSource::ForeignGlueCatalog(catalog_id.clone()),
         None => MetadataSource::ExternalMetastore(record.catalog_type.clone()),
     }
+}
+
+/// The refusal message a catalog-metadata READ answers with when the `CatalogName` it
+/// carries names no data catalog this account holds.
+///
+/// Every metadata read resolves that name through ONE step ([`metadata_source`]) before it
+/// reads anything, so the miss belongs to that step rather than to the operation that hit
+/// it, and Athena's metadata plane words it with one sentence: "Cannot find catalog " + the
+/// `CatalogName` the request carried + ".". The model states no message text, so the
+/// wording is recorded behaviour.
+///
+/// This is deliberately NOT the registry's wording ([`data_catalog_not_found`] and its
+/// delete and update counterparts): those word a miss of the catalog RECORD the registry
+/// holds, addressed by `Name`, while this one words a metadata read that found no catalog
+/// to read THROUGH. The two are not interchangeable, and every read that resolves a
+/// catalog name states this one.
+pub fn metadata_catalog_not_found(catalog_name: &str) -> String {
+    format!("Cannot find catalog {catalog_name}.")
 }
 
 /// The refusal message for a metadata read of a registered catalog whose metastore this

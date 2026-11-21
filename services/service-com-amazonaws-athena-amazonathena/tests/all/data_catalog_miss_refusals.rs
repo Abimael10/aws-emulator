@@ -7,9 +7,12 @@
 //! `InvalidRequestException`, HTTP 400, under this service's `INVALID_INPUT` refusal class
 //! — carrying that path's own sentence with the catalog name taken from the request, never
 //! with an error shape the operation does not model. Each path words the miss as Athena
-//! words it, and the wordings are not interchangeable: a read states the name "was not
-//! found.", a delete the same sentence without the closing period, and an update that the
-//! catalog "does not exist."
+//! words it, and the wordings are not interchangeable: a read of the registry states the
+//! name "was not found.", a delete the same sentence without the closing period, an update
+//! that the catalog "does not exist.", and a METADATA read — which resolves the catalog it
+//! would read through rather than the registry record — that it "cannot find" the catalog
+//! (`tests/all/metadata_catalog_lookup_refusal.rs` owns that sentence over every metadata
+//! read).
 //!
 //! Asserted over a TABLE: the rows span the paths that address a catalog by name and the
 //! forms a catalog name takes (one character, the documented punctuation — underscore, at
@@ -20,7 +23,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_athena_amazonathena::state::{
-    DATA_CATALOG_TYPE_GLUE, DATA_CATALOG_TYPE_HIVE, DATA_CATALOG_TYPE_LAMBDA,
+    self, DATA_CATALOG_TYPE_GLUE, DATA_CATALOG_TYPE_HIVE, DATA_CATALOG_TYPE_LAMBDA,
     ERROR_CODE_INVALID_INPUT, MAX_DATA_CATALOG_NAME_CHARS,
 };
 use smithy_server_runtime::MultiServiceRouter;
@@ -84,7 +87,7 @@ fn miss_paths() -> Vec<MissPath> {
                     "TableName": "some_table",
                 })
             },
-            expected: |name| format!("DataCatalog {name} was not found."),
+            expected: |name| state::metadata_catalog_not_found(name),
         },
     ]
 }

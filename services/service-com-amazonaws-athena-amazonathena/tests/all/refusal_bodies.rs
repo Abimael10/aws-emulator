@@ -215,14 +215,14 @@ async fn a_refusal_carries_its_class_code_under_both_names_with_its_own_sentence
                 "TableName": "some_table"
             }),
             ERROR_CODE_INVALID_INPUT,
-            state::data_catalog_not_found("no_such_catalog"),
+            state::metadata_catalog_not_found("no_such_catalog"),
         ),
         (
             "a listing of the tables of a data catalog nothing registered",
             "ListTableMetadata",
             json!({ "CatalogName": "no_such_catalog", "DatabaseName": "some_db" }),
             ERROR_CODE_INVALID_INPUT,
-            state::data_catalog_not_found("no_such_catalog"),
+            state::metadata_catalog_not_found("no_such_catalog"),
         ),
         (
             "a read of an execution no start minted",

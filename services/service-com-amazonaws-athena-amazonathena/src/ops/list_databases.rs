@@ -192,7 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )));
                 }
                 crate::state::MetadataSource::Unregistered => {
-                    return Err(invalid_request(crate::state::data_catalog_not_found(
+                    return Err(invalid_request(crate::state::metadata_catalog_not_found(
                         &input.catalog_name,
                     )));
                 }
