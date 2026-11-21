@@ -49,17 +49,21 @@ pub enum SchemaType {
 }
 
 impl SchemaType {
-    /// The name a refusal states this type by: the type the invoked model declares,
-    /// which is the schema the mocked result is validated against.
+    /// The name a refusal states this type by, with the article it reads with: the
+    /// type the invoked model declares, which is the schema the mocked result is
+    /// validated against.
+    ///
+    /// RECORDED: a member declared as a MAP is stated as "an object", which is the JSON
+    /// a map arrives as — and a `structure` arrives as that same JSON, so the two are
+    /// stated alike.
     pub fn stated(self) -> &'static str {
         match self {
-            Self::String => "string",
-            Self::Integer => "integer",
-            Self::Double => "double",
-            Self::Boolean => "boolean",
-            Self::Map => "map",
-            Self::List => "list",
-            Self::Structure => "structure",
+            Self::String => "a string",
+            Self::Integer => "an integer",
+            Self::Double => "a double",
+            Self::Boolean => "a boolean",
+            Self::Map | Self::Structure => "an object",
+            Self::List => "a list",
         }
     }
 

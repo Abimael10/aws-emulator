@@ -2982,14 +2982,7 @@ impl Interpreter<'_> {
                 0.0,
             )
             .map_err(|failure| failure.at(at))?;
-        let tolerance_declared = [
-            "ToleratedFailureCount",
-            "ToleratedFailureCountPath",
-            "ToleratedFailurePercentage",
-            "ToleratedFailurePercentagePath",
-        ]
-        .iter()
-        .any(|member| state.contains_key(*member));
+        let tolerance_declared = declares_tolerance(state);
 
         // A Distributed Map "starts a Map Run", a resource of its own, so the Map Run
         // this state runs as is resolved AS THE STATE IS ENTERED: its items' own

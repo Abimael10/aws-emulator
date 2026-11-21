@@ -202,6 +202,47 @@ fn invalid_definition_sentence(sentence: &str) -> TestStateError {
 /// asked about.
 const STATE_NOT_FOUND: &str = "State not found in definition";
 
+/// What this operation answers for a `stateConfiguration.errorCausedByState` naming a
+/// state the submitted definition declares none of.
+///
+/// RECORDED text, and the WHOLE message: like [`STATE_NOT_FOUND`], the refusal names
+/// the member that was wrong and not the name it carried, so a client matching on the
+/// text reads one sentence whichever state name it asked about.
+const ERROR_CAUSED_BY_STATE_NOT_FOUND: &str =
+    "The ErrorCausedByState specified was not found in the state definition";
+
+/// Whether the submitted definition declares a state named `name`.
+///
+/// `errorCausedByState` is "the name of the state from which an error originates when
+/// an error is mocked for a Map or Parallel state": such a state is declared INSIDE the
+/// state under test — in the state list of the `ItemProcessor` a `Map` iterates, or of
+/// one of the `Branches` a `Parallel` runs — while a request that names a `stateName`
+/// carries a definition declaring its states at its own top level. Every state list of
+/// the submitted document is therefore where the name is looked for, at whatever depth
+/// the definition nests them, bounded by the nesting one definition may carry
+/// ([`asl::MAX_DEFINITION_DEPTH`]).
+fn declares_state(document: &Value, name: &str, depth: usize) -> bool {
+    if depth > asl::MAX_DEFINITION_DEPTH {
+        return false;
+    }
+    match document {
+        Value::Object(members) => {
+            let declared = members
+                .get("States")
+                .and_then(Value::as_object)
+                .is_some_and(|states| states.contains_key(name));
+            declared
+                || members
+                    .values()
+                    .any(|value| declares_state(value, name, depth + 1))
+        }
+        Value::Array(items) => items
+            .iter()
+            .any(|item| declares_state(item, name, depth + 1)),
+        _ => false,
+    }
+}
+
 /// What this operation answers for a `definition` that is not JSON.
 ///
 /// RECORDED text, and a FIXED sentence: `TestState` names the thing it was given —
@@ -243,6 +284,35 @@ fn mock_unsupported_state_type(state_type: &str) -> String {
 /// specified, the default value is `STRICT`."
 const DEFAULT_FIELD_VALIDATION_MODE: &str = "STRICT";
 
+/// What this operation answers a `mock` that names BOTH a mocked result and a mocked
+/// error output.
+///
+/// RECORDED text, and a FIXED sentence: the mocked outcome of an invocation is a
+/// result or a failure and not both, and the only part of the sentence that looks
+/// variable — the bracketed field list — is the model's own member names
+/// (`MockInput$result`, `MockInput$errorOutput`).
+const MOCK_NAMES_BOTH_OUTCOMES: &str =
+    "A test mock should have only one of the following fields: [result, errorOutput].";
+
+/// What this operation answers a request asking for secrets of an invocation a `mock`
+/// stood in for.
+///
+/// RECORDED text, and a FIXED sentence: the two members are incompatible whatever
+/// either of them carries, so nothing of the request is named in it.
+const REVEAL_SECRETS_WITH_A_MOCK: &str =
+    "TestState does not support RevealSecrets when a mock is specified.";
+
+/// The state type whose own work is an integration call, which is the work this
+/// operation needs a role to make.
+const TASK_STATE_TYPE: &str = "Task";
+
+/// What this operation answers a `Task` state whose integration call it is to MAKE,
+/// tested with no `roleArn`.
+///
+/// RECORDED text, and a FIXED sentence: it names the member that was missing and the
+/// state type it is required for, and nothing of the state it was asked about.
+const ROLE_ARN_FOR_A_TASK_STATE: &str = "RoleArn must be specified when testing a Task state";
+
 /// The modes under which a mocked result's members are judged against the mocked
 /// integration's result schema: "`STRICT`: All required fields must be present, and
 /// all present fields must conform to the API's schema" and "`PRESENT`: All present
@@ -255,9 +325,9 @@ const SCHEMA_VALIDATING_MODES: &[&str] = &["STRICT", "PRESENT"];
 ///
 /// RECORDED text: the fixed sentence with the offending FIELD taken from the submitted
 /// mock and the TYPE from the schema that field is judged against
-/// ([`crate::state::integration::mock_result`]).
+/// ([`crate::state::integration::mock_result`]), which states the article it reads with.
 fn mock_result_schema_error(field: &str, must_be: &str) -> String {
-    format!("Mock result schema validation error: Field '{field}' must be a {must_be}")
+    format!("Mock result schema validation error: Field '{field}' must be {must_be}")
 }
 
 /// The refusal the mocked result in `mock` earns for the state under test, or `None`
@@ -306,9 +376,7 @@ fn read_mock(mock: &MockInput) -> Result<asl::Mock, TestStateError> {
         }
     }
     match (mock.result.as_deref(), mock.error_output.as_ref()) {
-        (Some(_), Some(_)) => Err(refuse(
-            "a mock names either a result or an errorOutput, not both".to_string(),
-        )),
+        (Some(_), Some(_)) => Err(refuse(MOCK_NAMES_BOTH_OUTCOMES.to_string())),
         (Some(result), None) => match serde_json::from_str::<Value>(result) {
             Ok(value) => Ok(asl::Mock::Result(value)),
             Err(error) => Err(refuse(format!(
@@ -419,7 +487,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Functions throws an access denied error" — the decision every call of this
         // service is taken behind, so it is taken once in front of this handler
         // (`crate::service::identity_authorization`) and never twice here.
-        let _ = input.reveal_secrets;
+        //
+        // What it cannot be asked for is secrets of an invocation that was never made:
+        // a MOCKED state's outcome is the request's own, so there is no HTTP request or
+        // response of a connection's for the member to reveal anything of, and the two
+        // members together are refused rather than one being ignored.
+        if input.reveal_secrets && input.mock.is_some() {
+            return Err(refuse(REVEAL_SECRETS_WITH_A_MOCK.to_string()));
+        }
 
         // The modelled lengths (`definition` 1..1048576, `input`/`variables`/`context`
         // 0..262144, `stateName` 1..80, `roleArn` 1..256) and the `InspectionLevel`
@@ -587,6 +662,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let state_type = state.get("Type").and_then(Value::as_str).unwrap_or_default();
 
+        // "The TestState API assumes an IAM role which must contain the required IAM
+        // permissions for the resources your state is accessing": a `Task` state's own
+        // work is an integration call, and that call is made AS the role the request
+        // names — so the member is required for a state of that type, and for no other,
+        // since no other state's work reaches a resource of another service.
+        //
+        // A MOCKED `Task` state is the exception: its outcome is the request's own, so
+        // no call is made and there is nothing for a role to be assumed for.
+        if state_type == TASK_STATE_TYPE && input.mock.is_none() && input.role_arn.is_none() {
+            return Err(refuse(ROLE_ARN_FOR_A_TASK_STATE.to_string()));
+        }
+
         // "Defines a mocked result or error for the state under test. A mock can only
         // be specified for Task, Map, or Parallel states. If it is specified for
         // another state type, an exception will be thrown."
@@ -636,6 +723,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             },
         };
+
+        // "The number of Map state iterations that failed during the Map state
+        // invocation". The modelled range (0..) is refused by the centralized walk
+        // before this handler runs, so a negative figure never reaches here; one that
+        // did would describe no invocation of any state, so it counts as no failed
+        // iteration rather than as a figure of its own. What the count MEANS for the
+        // state under test is decided by that state's own tolerated-failure threshold,
+        // which only the walk that resolves the state's items can weigh it against.
+        let map_iteration_failures = input
+            .state_configuration
+            .as_ref()
+            .and_then(|configuration| configuration.map_iteration_failure_count)
+            .and_then(|count| u64::try_from(count).ok());
+
+        // "The name of the state from which an error originates when an error is
+        // mocked for a Map or Parallel state": the state it names has to be one the
+        // submitted definition declares, so a name no state of it carries is refused
+        // rather than silently standing for no state at all.
+        if let Some(named) = input
+            .state_configuration
+            .as_ref()
+            .and_then(|configuration| configuration.error_caused_by_state.as_deref())
+        {
+            if !declares_state(&document, named, 0) {
+                return Err(refuse(ERROR_CAUSED_BY_STATE_NOT_FOUND.to_string()));
+            }
+        }
 
         let start = crate::state::now();
         // What the context object (`$$`) reports: nothing but what this request fixed.
@@ -692,6 +806,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let state = state.clone();
             let state_input = state_input.clone();
             let mock = mock.clone();
+            // The bytes the request wrote the mocked result in: a document the caller
+            // supplied AS TEXT, so what reports or quotes it reports those bytes.
+            let mock_result = input
+                .mock
+                .as_ref()
+                .and_then(|mock| mock.result.clone());
             let variables = variables.clone();
             let definition_language = document.get("QueryLanguage").cloned();
             crate::state::integration::interpret(ctx, &region, acting, move |tasks| {
@@ -703,6 +823,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     context: &context,
                     context_override: context_override.as_ref(),
                     mock: mock.as_ref(),
+                    mock_result: mock_result.as_deref(),
+                    map_iteration_failures,
                     retries_taken,
                     variables: variables.as_ref(),
                     definition_language: definition_language.as_ref(),
@@ -726,7 +848,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             retry_index,
             retry_backoff_seconds,
             catch_index,
+            refused,
         } = trial;
+        // A member of the request the state under test is what judges — a
+        // failed-iteration count describing more iterations than the state has — is a
+        // defect of the REQUEST, so it is answered as this operation's own refusal
+        // rather than as an outcome of the state.
+        if let Some(refusal) = refused {
+            return Err(refuse(refusal));
+        }
 
         // `inspectionLevel` "determines the values to return when a state is tested",
         // and only the two data-flow levels report the processing stages. The HTTP
@@ -758,6 +888,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .variables
                     .or_else(|| variables.as_ref().map(Value::to_string)),
                 error_details,
+                // The stages and bounds only a `Map` state has: what its `ItemsPath`
+                // selected, the input each of its iterations is handed after its
+                // `ItemSelector`, the batches its `ItemBatcher` grouped them into, and
+                // the concurrency and failure thresholds it declared. Every one of them
+                // is absent for a state of any other type, which has no such stage.
+                after_items_path: inspection.after_items_path,
+                after_item_selector: inspection.after_item_selector,
+                after_item_batcher: inspection.after_item_batcher,
+                max_concurrency: inspection.max_concurrency,
+                tolerated_failure_count: inspection.tolerated_failure_count,
+                tolerated_failure_percentage: inspection.tolerated_failure_percentage,
                 ..InspectionData::default()
             }
         });

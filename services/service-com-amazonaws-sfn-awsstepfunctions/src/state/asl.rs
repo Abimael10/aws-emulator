@@ -287,6 +287,38 @@ pub const PARAMETER_PATH_ERROR: &str = "States.ParameterPathFailure";
 /// its tolerated-failure threshold ("States.ExceedToleratedFailureThreshold").
 pub const TOLERATED_FAILURE_ERROR: &str = "States.ExceedToleratedFailureThreshold";
 
+/// What a `Map` state that went past its tolerated-failure threshold says about it: the
+/// breach of the threshold, in the service's own fixed sentence.
+///
+/// RECORDED text, and the WHOLE cause: what terminated the state is the threshold being
+/// exceeded rather than any one iteration's error, so the sentence names neither the
+/// iterations that failed nor the error they failed with. One sentence for the
+/// threshold wherever it is breached — by the items an execution's `Map` state ran
+/// ([`map_items`]) and by the failed-iteration count a single-state trial is handed
+/// ([`trial`]) — so a client told about the same breach twice is told the same bytes.
+pub const TOLERATED_FAILURE_CAUSE: &str = "The specified tolerated failure threshold was exceeded";
+
+/// The members a `Map` state declares a tolerated-failure threshold through, in both
+/// the member and the reference-path form of each.
+const TOLERANCE_MEMBERS: &[&str] = &[
+    "ToleratedFailureCount",
+    "ToleratedFailureCountPath",
+    "ToleratedFailurePercentage",
+    "ToleratedFailurePercentagePath",
+];
+
+/// Whether `state` declares a tolerated-failure threshold at all.
+///
+/// A `Map` state that declares none tolerates no failed iteration, so there is no
+/// threshold for one to exceed: the iteration's OWN failure is the state's
+/// ([`map_items`]), and only a state that declares a threshold fails with
+/// [`TOLERATED_FAILURE_ERROR`] for going past it.
+pub(super) fn declares_tolerance(state: &Map<String, Value>) -> bool {
+    TOLERANCE_MEMBERS
+        .iter()
+        .any(|member| state.contains_key(*member))
+}
+
 /// The ASL predefined error name for an execution that ran longer than the
 /// `TimeoutSeconds` its definition declares ("States.Timeout").
 pub const TIMEOUT_ERROR: &str = "States.Timeout";
@@ -4324,6 +4356,24 @@ pub struct Inspection {
     /// "The effective result combined with the raw state input after Step Functions
     /// applies the ResultPath filter."
     pub after_result_path: Option<String>,
+    /// "The effective input after the ItemsPath filter is applied. Not populated when
+    /// the QueryLanguage is JSONata."
+    pub after_items_path: Option<String>,
+    /// "An array containing the inputs for each Map iteration, transformed by the
+    /// ItemSelector specified in a Map state."
+    pub after_item_selector: Option<String>,
+    /// "The effective input after the ItemBatcher filter is applied in a Map state",
+    /// for a state that declares one: the batches its iterations are handed.
+    pub after_item_batcher: Option<String>,
+    /// "The max concurrency of the Map state", as the state resolved it, for a state
+    /// that declares the bound.
+    pub max_concurrency: Option<i32>,
+    /// "The tolerated failure threshold for a Map state as defined in number of Map
+    /// state iterations", as the state resolved it, for a state that declares it.
+    pub tolerated_failure_count: Option<i32>,
+    /// "The tolerated failure threshold for a Map state as defined in percentage of
+    /// Map state iterations", as the state resolved it, for a state that declares it.
+    pub tolerated_failure_percentage: Option<f32>,
 }
 
 /// What one state, tested by itself, produced.
@@ -4348,6 +4398,14 @@ pub struct Trial {
     /// The position in `Catch` of the catcher that took a
     /// [`TEST_STATUS_CAUGHT_ERROR`] failure over.
     pub catch_index: Option<i32>,
+    /// The request the trial could not be run for at all, as the sentence the
+    /// operation refuses it with.
+    ///
+    /// A member of the request judged against the STATE under test — a figure that
+    /// describes more iterations than the state has — is a defect of the request
+    /// rather than an outcome of the state, so it is answered as the operation's own
+    /// refusal and nothing of this trial is reported.
+    pub refused: Option<String>,
 }
 
 impl Trial {
@@ -4363,6 +4421,7 @@ impl Trial {
             retry_index: None,
             retry_backoff_seconds: None,
             catch_index: None,
+            refused: None,
         }
     }
 
@@ -4390,6 +4449,16 @@ impl Trial {
             retry_index: None,
             retry_backoff_seconds: None,
             catch_index: None,
+            refused: None,
+        }
+    }
+
+    /// The trial a request the operation REFUSES reports: nothing of the state, and
+    /// the sentence the request is refused with ([`Trial::refused`]).
+    fn refusal(inspection: Inspection, message: String) -> Self {
+        Self {
+            refused: Some(message),
+            ..Self::succeeded(None, None, inspection)
         }
     }
 }

@@ -173,6 +173,19 @@ const EXECUTION_STATUSES: (&[&str], &[&str]) = (
     ],
 );
 
+/// The order this service states the `MockResponseValidationMode` value set in,
+/// paired with the values the model declares.
+///
+/// RECORDED text: the model declares the enum's members in another order
+/// (`smithy_query(query="shape",shape="MockResponseValidationMode")` -> `STRICT |
+/// PRESENT | NONE`), and the order a refusal ADVERTISES is the service's own rather
+/// than the model's declaration order — which is the order the value set reaches this
+/// seam in.
+const MOCK_RESPONSE_VALIDATION_MODES: (&[&str], &[&str]) = (
+    &["STRICT", "PRESENT", "NONE"],
+    &["STRICT", "NONE", "PRESENT"],
+);
+
 /// Every enum value set this service states in an order of its own, as the shared
 /// wording reads such a table
 /// ([`::service_common::validation_message::StatedEnumValueSets`]).
@@ -183,7 +196,11 @@ const EXECUTION_STATUSES: (&[&str], &[&str]) = (
 /// by its declared value SET, so every member targeting one enum — of any operation, at
 /// any depth — advertises that enum's set in the one order.
 const STATED_ENUM_VALUE_SETS: &::service_common::validation_message::StatedEnumValueSets<'_> =
-    &[INSPECTION_LEVELS, EXECUTION_STATUSES];
+    &[
+        INSPECTION_LEVELS,
+        EXECUTION_STATUSES,
+        MOCK_RESPONSE_VALIDATION_MODES,
+    ];
 
 /// `violation` as THIS SERVICE states it: its value in the member's modelled type
 /// ([`in_modelled_type`]) and its enum value set in the order the service advertises

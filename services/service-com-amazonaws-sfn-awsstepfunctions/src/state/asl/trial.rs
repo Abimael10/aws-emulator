@@ -31,6 +31,17 @@ pub struct StateTest<'a> {
     /// the whole `$$` document, which replaces the one built from `context`.
     pub context_override: Option<&'a Value>,
     pub mock: Option<&'a Mock>,
+    /// The bytes the request wrote the mocked RESULT in (`mock.result`: "a JSON string
+    /// containing the mocked result of the state invocation").
+    ///
+    /// The mocked result is a document the caller supplied AS TEXT, exactly as the
+    /// state's input is, so it is reported in those bytes wherever it is reported or
+    /// quoted ([`super::Supplied`]) rather than in a re-encoding of the parsed copy.
+    pub mock_result: Option<&'a str>,
+    /// `stateConfiguration.mapIterationFailureCount`: "The number of Map state
+    /// iterations that failed during the Map state invocation", which is what the
+    /// state's tolerated-failure threshold is weighed against.
+    pub map_iteration_failures: Option<u64>,
     /// `stateConfiguration.retrierRetryCount`: "The number of retry attempts that
     /// have occurred for the state's Retry that applies to the mocked error", which
     /// is what decides whether the state's failure is still RETRIABLE.
@@ -210,6 +221,13 @@ pub fn test_state(test: &StateTest<'_>) -> Trial {
         // not one this walk was given.
         supplied: {
             let mut supplied = Supplied::default();
+            // The mocked result is a caller's document too: it reaches this walk as the
+            // text the request wrote it in, so that text is what reports it. The
+            // request's own INPUT is remembered last, so it decides for a document the
+            // two were written as differently.
+            if let Some(mocked) = test.mock_result {
+                supplied.supplied(mocked);
+            }
             supplied.supplied(test.input);
             supplied
         },
@@ -301,6 +319,45 @@ impl Interpreter<'_> {
                 JSONATA => inspection.after_arguments = Some(self.echo(&after_parameters)),
                 _ => inspection.after_parameters = Some(self.echo(&after_parameters)),
             }
+        }
+
+        // The ITERATION side, which only a `Map` state has: the stages its items pass
+        // through and the bounds it declared ([`Interpreter::map_inspection`]).
+        let bounds = match state_type == MAP_STATE_TYPE {
+            true => self.map_inspection(test, language, &effective, &context, &mut inspection),
+            false => MapBounds::none(),
+        };
+        // "The number of Map state iterations that failed during the Map state
+        // invocation": a figure counting more failed iterations than the state HAS
+        // describes no invocation of this state, so the request is refused rather than
+        // an outcome being computed from it.
+        if let (Some(failures), Some(iterations)) = (test.map_iteration_failures, bounds.iterations)
+        {
+            if failures > iterations as u64 {
+                return Trial::refusal(
+                    inspection,
+                    MAP_ITERATION_FAILURES_PAST_ITERATIONS.to_string(),
+                );
+            }
+        }
+        // And what that count says about the state: a `Map` state whose failed
+        // iterations went past the threshold it declared fails with the BREACH of that
+        // threshold, which supersedes whatever the iterations themselves failed with —
+        // the same rule the items of an execution's `Map` state are judged by
+        // ([`super::map_items`]).
+        if let Some(failure) = bounds.breached(test.map_iteration_failures) {
+            // The state's own error handling is still REPORTED for that error — the
+            // `Retry` entry that answers for it, and the `Catch` entry that would have
+            // taken it over — but the breach of the failure budget is what ENDED the
+            // state, so this trial's own status is FAILED, and a state that failed
+            // puts out no document and transitions nowhere: "if the execution of the
+            // state fails, this field doesn't contain a value"
+            // (`TestStateOutput$nextState`).
+            let mut trial = self.classify(test, language, raw, &context, failure, inspection);
+            trial.status = TEST_STATUS_FAILED;
+            trial.output = None;
+            trial.next_state = None;
+            return trial;
         }
 
         // A `Choice` state's transition is what the state DOES, and the walk decides
@@ -396,6 +453,146 @@ impl Interpreter<'_> {
             None => state.get("Next").and_then(Value::as_str).map(str::to_string),
         };
         Trial::succeeded(Some(self.echo(&output)), next_state, inspection)
+    }
+
+    /// What `TestState` reports about a `Map` state's ITERATION side: the stages its
+    /// items pass through, the bounds it declared, and how many iterations its items
+    /// make.
+    ///
+    /// The items are derived from the state's own definition and input — its
+    /// `ItemsPath` (or its `Items`) selects them, its `ItemSelector` transforms each
+    /// one and its `ItemBatcher` groups them — through the SAME readers an execution's
+    /// `Map` state derives them with ([`Interpreter::map_items`],
+    /// [`Interpreter::batched_items`]), so what the stages report is the documents this
+    /// state's iterations would be handed.
+    ///
+    /// Nothing is RUN for them and nothing fails for them: the iteration itself is the
+    /// invocation the request's `mock` stands in for, so a state whose items are not
+    /// its own input to derive — one whose `ItemReader` names a dataset, one whose
+    /// `ItemsPath` points at no array, one whose template cannot be rendered — reports
+    /// the stages it has and no more, rather than failing for a stage nothing was
+    /// iterated at.
+    ///
+    /// `afterItemsPointer` is reported for none of them: the Amazon States Language
+    /// declares no `ItemsPointer` member, so no filter of a state resolves one.
+    fn map_inspection(
+        &mut self,
+        test: &StateTest<'_>,
+        language: &'static str,
+        effective: &Value,
+        context: &Value,
+        inspection: &mut Inspection,
+    ) -> MapBounds {
+        let state = test.state;
+        // The bounds the state DECLARES are the ones it is reported under: a bound the
+        // definition leaves out names no value for this state, so nothing is reported
+        // for it.
+        let tolerated_count = self.declared_bound(state, language, "ToleratedFailureCount", effective, context);
+        let tolerated_percentage =
+            self.declared_bound(state, language, "ToleratedFailurePercentage", effective, context);
+        inspection.max_concurrency = self
+            .declared_bound(state, language, "MaxConcurrency", effective, context)
+            .map(reported_bound);
+        inspection.tolerated_failure_count = tolerated_count.map(reported_bound);
+        inspection.tolerated_failure_percentage = tolerated_percentage.map(|share| share as f32);
+        let mut bounds = MapBounds {
+            iterations: None,
+            tolerated_count: tolerated_count.unwrap_or(0.0),
+            tolerated_percentage: tolerated_percentage.unwrap_or(0.0),
+            // A state that declares no threshold tolerates no failed iteration, so
+            // there is no threshold for one to exceed; a DISTRIBUTED Map runs under one
+            // either way — the rule its items are judged by ([`super::map_items`]).
+            tolerant: declares_tolerance(state)
+                || map_processor(test.name, state).is_ok_and(|(_, distributed)| distributed),
+        };
+        // "ItemReader — specifies a dataset and its location": a state that declares
+        // one iterates THAT dataset rather than anything its own input carries, and
+        // reading it is part of the invocation the mock stands in for, so no stage of
+        // its items is derived here.
+        if state.contains_key("ItemReader") {
+            return bounds;
+        }
+        let Ok(items) = self.map_items(test.name, state, language, effective, context) else {
+            return bounds;
+        };
+        // "The effective input after the ItemsPath filter is applied. Not populated
+        // when the QueryLanguage is JSONata" — and a state whose items are its own
+        // `Items` member passes them through no such filter at all.
+        if language != JSONATA && !state.contains_key("Items") {
+            inspection.after_items_path = self.listed(&items);
+        }
+        // "An array containing the inputs for each Map iteration, transformed by the
+        // ItemSelector specified in a Map state": one document per iteration, which is
+        // the item itself for a state that declares no such template. Each is rendered
+        // with `$$.Map.Item` set to the item and its position, which is what the
+        // template reads them through ([`super::map_items`]) — and the stage is built as
+        // the TEXT it is reported in, so neither the text nor what is held to build it
+        // grows with how many items a caller's array holds past what the member carries.
+        bounds.iterations = Some(items.len());
+        let selector = state.get("ItemSelector").or_else(|| state.get("Parameters"));
+        let mut iterated = Listed::default();
+        for (index, item) in items.iter().enumerate() {
+            let selected = match selector {
+                None => Ok(item.clone()),
+                Some(template) => {
+                    let map_item = json!({ "Index": index, "Value": item });
+                    let item_context = with_map_item(context, &map_item);
+                    self.render_selector(language, template, effective, &item_context)
+                }
+            };
+            let Ok(value) = selected else {
+                return bounds;
+            };
+            if !iterated.push(&self.echo(&value)) {
+                return bounds;
+            }
+        }
+        inspection.after_item_selector = iterated.reported();
+        // "The effective input after the ItemBatcher filter is applied in a Map state":
+        // a state that declares one hands each iteration a BATCH of its items, so the
+        // batches are what its iterations are, and the selector was already spent on
+        // the items on their way into them.
+        if let Some(batcher) = state.get("ItemBatcher") {
+            let batched = self.batched_items(
+                test.name, state, language, batcher, items, effective, context,
+            );
+            let Ok(batches) = batched else {
+                return bounds;
+            };
+            bounds.iterations = Some(batches.len());
+            inspection.after_item_batcher = self.listed(&batches);
+        }
+        bounds
+    }
+
+    /// A numeric bound a `Map` state DECLARES, resolved from the member itself or from
+    /// its reference-path form; `None` where the state declares neither, and where the
+    /// value it declares is one no figure can be read out of.
+    fn declared_bound(
+        &self,
+        state: &Map<String, Value>,
+        language: &'static str,
+        member: &str,
+        effective: &Value,
+        context: &Value,
+    ) -> Option<f64> {
+        if !state.contains_key(member) && !state.contains_key(&format!("{member}Path")) {
+            return None;
+        }
+        self.number_member(state, language, member, effective, context, 0.0)
+            .ok()
+    }
+
+    /// How an inspection stage whose document is a LIST of documents is reported, for a
+    /// list already held whole ([`Listed`]).
+    fn listed(&self, documents: &[Value]) -> Option<String> {
+        let mut listed = Listed::default();
+        for document in documents {
+            if !listed.push(&self.echo(document)) {
+                return None;
+            }
+        }
+        listed.reported()
     }
 
     /// The variables this walk has assigned, as the one JSON document `TestState`
@@ -639,7 +836,7 @@ impl Interpreter<'_> {
         raw: &Value,
         context: &Value,
         failure: Failure,
-        inspection: Inspection,
+        mut inspection: Inspection,
     ) -> Trial {
         let state = test.state;
         let name = failure.name().to_string();
@@ -700,7 +897,9 @@ impl Interpreter<'_> {
                 // this language too, as it does in the walk
                 // ([`Interpreter::catch_or_fail`]).
                 _ => match self.jsonpath_assign(catcher, &error_output, context) {
-                    Ok(()) => self.place_result(catcher, raw, error_output, context, true),
+                    Ok(()) => {
+                        self.caught_output(catcher, raw, error_output, context, &mut inspection)
+                    }
                     Err(failure) => Err(failure),
                 },
             };
@@ -719,5 +918,168 @@ impl Interpreter<'_> {
             return trial;
         }
         Trial::failed(inspection, failure)
+    }
+
+    /// The output a CATCHER puts out for the failure it took over, recording the
+    /// document that catcher's `ResultPath` placed.
+    ///
+    /// "When a state reports an error and it matches a catcher, the state's output is
+    /// the error output": the error output is the result such a state has, so the
+    /// catcher's own `ResultPath` is the filter that places it — and the document the
+    /// placement produced is "the effective result combined with the raw state input
+    /// after Step Functions applies the ResultPath filter", which is the one
+    /// result-side stage a caught failure has. The catcher's own `Assign` has already
+    /// read the error output by the time this is reached, exactly as it has in the walk.
+    fn caught_output(
+        &self,
+        catcher: &Map<String, Value>,
+        raw: &Value,
+        error_output: Value,
+        context: &Value,
+        inspection: &mut Inspection,
+    ) -> Result<Value, Failure> {
+        let selected = select_result(catcher, error_output, context, true)?;
+        let placed = path_result(catcher, raw, selected)?;
+        inspection.after_result_path = Some(self.echo(&placed));
+        self.output_value(catcher, placed, context)
+    }
+}
+
+/// The state type whose own work is an ITERATION over items, and so the only one with
+/// per-iteration stages and bounds of its own to report.
+const MAP_STATE_TYPE: &str = "Map";
+
+/// What this operation answers a `stateConfiguration.mapIterationFailureCount` that
+/// counts more failed iterations than the state under test has iterations.
+///
+/// RECORDED text, and a FIXED sentence: the figure the request sent and the number of
+/// iterations the state's items make are both the caller's own, so the refusal states
+/// the rule rather than either of them.
+pub(super) const MAP_ITERATION_FAILURES_PAST_ITERATIONS: &str =
+    "Map iteration failure count must be less than or equal to the number of Map iterations";
+
+/// `number` as the modelled 32-bit integer an inspection bound is reported through.
+///
+/// `InspectionData$maxConcurrency` and `$toleratedFailureCount` are integers of a
+/// minimum of zero, while the members they report are figures a definition may write in
+/// any numeric form, so what is reported is the figure held to what that integer
+/// carries.
+fn reported_bound(number: f64) -> i32 {
+    number.clamp(0.0, f64::from(i32::MAX)) as i32
+}
+
+/// The text an inspection stage whose document is a LIST of documents is reported in:
+/// each document as the walk reports it ([`Interpreter::echo`]), between brackets and
+/// separated by `", "`.
+///
+/// RECORDED encoding: the per-iteration stages of a `Map` state report the LIST of
+/// documents its iterations are handed, which is not the encoding one JSON array
+/// holding them has.
+///
+/// It is built document by document, and stops at what the modelled member carries
+/// ([`MAX_PAYLOAD_BYTES`], the `SensitiveData` maximum every stage leaves through): a
+/// stage longer than that is no value of the member, so neither the text nor the work of
+/// building it grows with how many items a caller's array holds past that point.
+#[derive(Debug)]
+struct Listed {
+    reported: String,
+    /// Whether the list is still inside what the member carries.
+    within: bool,
+}
+
+impl Default for Listed {
+    fn default() -> Self {
+        Self {
+            reported: String::from("["),
+            within: true,
+        }
+    }
+}
+
+impl Listed {
+    /// Add one document, as the text it is reported in; `false` once the list has
+    /// reached what the member carries, after which nothing more is held.
+    fn push(&mut self, document: &str) -> bool {
+        if !self.within {
+            return false;
+        }
+        if self.reported.len() > 1 {
+            self.reported.push_str(", ");
+        }
+        self.reported.push_str(document);
+        self.within = self.reported.len() <= MAX_PAYLOAD_BYTES;
+        if !self.within {
+            self.reported = String::new();
+        }
+        self.within
+    }
+
+    /// The whole list, or `None` for one past what the member carries.
+    fn reported(mut self) -> Option<String> {
+        if !self.within {
+            return None;
+        }
+        self.reported.push(']');
+        Some(self.reported)
+    }
+}
+
+/// What bounds the `Map` state under test, and how many iterations its items make.
+///
+/// The two are read together because both are needed to judge the failed-iteration
+/// count the request carries: how many iterations there are at all, and the threshold
+/// the state tolerates among them.
+#[derive(Debug, Clone)]
+struct MapBounds {
+    /// How many iterations the state's items make — batches for a state that declares
+    /// an `ItemBatcher` — or `None` where they are not this state's own input to
+    /// derive.
+    iterations: Option<usize>,
+    /// `ToleratedFailureCount` as the state resolved it.
+    tolerated_count: f64,
+    /// `ToleratedFailurePercentage` as the state resolved it.
+    tolerated_percentage: f64,
+    /// Whether the state has a tolerated-failure threshold at all.
+    tolerant: bool,
+}
+
+impl MapBounds {
+    /// The bounds of a state that is not a `Map`: no iterations, and no threshold.
+    fn none() -> Self {
+        Self {
+            iterations: None,
+            tolerated_count: 0.0,
+            tolerated_percentage: 0.0,
+            tolerant: false,
+        }
+    }
+
+    /// The failure a `Map` state whose `failures` iterations went PAST the threshold it
+    /// declared ends with, or `None` where the threshold still tolerates them.
+    ///
+    /// "ToleratedFailureCount [...] the maximum number of failed items" and
+    /// "ToleratedFailurePercentage [...] the maximum percentage of failed items" are
+    /// weighed exactly as an execution's Map Run weighs them
+    /// ([`super::super::within_tolerated_failures`]), so one `Map` state never reports
+    /// its failure budget two ways.
+    fn breached(&self, failures: Option<u64>) -> Option<Failure> {
+        let failures = failures.filter(|failures| *failures > 0)?;
+        if !self.tolerant {
+            return None;
+        }
+        let total = self.iterations.unwrap_or(0);
+        let within = super::super::within_tolerated_failures(
+            i64::try_from(failures).unwrap_or(i64::MAX),
+            i64::try_from(total).unwrap_or(i64::MAX),
+            self.tolerated_count as i64,
+            self.tolerated_percentage,
+        );
+        match within {
+            true => None,
+            false => Some(named(
+                TOLERATED_FAILURE_ERROR,
+                TOLERATED_FAILURE_CAUSE.to_string(),
+            )),
+        }
     }
 }

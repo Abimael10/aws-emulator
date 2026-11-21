@@ -1015,7 +1015,7 @@ async fn a_mocked_result_must_conform_to_the_mocked_apis_schema() {
             MOCKED_TASK,
             r#"{"StatusCode":"200"}"#,
             None,
-            Some("Mock result schema validation error: Field 'StatusCode' must be a integer"),
+            Some("Mock result schema validation error: Field 'StatusCode' must be an integer"),
         ),
         (
             "the AWS SDK family's spelling of the same operation",

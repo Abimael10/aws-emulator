@@ -298,15 +298,14 @@ impl Interpreter<'_> {
         }
         // A Distributed Map reports its own tolerated-failure error; an inline Map
         // has no threshold to exceed, so the iteration's own failure is the state's.
+        // What terminated the state is the BREACH of the threshold rather than any one
+        // item's error, which is what the service's own sentence for it says
+        // ([`TOLERATED_FAILURE_CAUSE`]).
         if tolerant {
             return (
                 Err(named(
                     TOLERATED_FAILURE_ERROR,
-                    format!(
-                        "{} of {} items failed, more than this 'Map' state tolerates",
-                        tallied.failures,
-                        plan.items.len()
-                    ),
+                    TOLERATED_FAILURE_CAUSE.to_string(),
                 )),
                 at,
             );
