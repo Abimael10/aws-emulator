@@ -12,18 +12,27 @@
 //! line states — and an `ApplicationManaged` endpoint ("your application handles
 //! authorization") refuses nothing of its own.
 //!
+//! RULE, for an AUTHORIZED request: what the client is served is the response THE
+//! REVISION'S OWN CODE produced. "Your code listens on a network port and handles requests
+//! directly" (`LambdaWeb`), so the revision the endpoint routes the request to is run, its
+//! deployment package's server is handed the request, and the status, headers and body that
+//! server answered are what comes back. A revision whose code answered nothing is reported
+//! as that and never as a response nothing produced.
+//!
 //! The published address is read off the wire (`CreateWebFunction` and
-//! `GetWebFunctionEndpoint`), and the decision the core's listener hands every request at
-//! that address is driven directly
-//! (`state::endpoint_plane::serve_request`) — the one decision that listener serves. The
-//! rows span the `authType` values, how a client may present a credential, and the
-//! endpoint's lifecycle state.
+//! `GetWebFunctionEndpoint`), the deployment packages are staged through Amazon S3's own
+//! operations (so the code that runs is the code a client uploaded), and the decision the
+//! core's listener hands every request at that address is driven both directly
+//! (`state::endpoint_plane::serve_request`) and over a real socket. The rows span the
+//! `authType` values, how a client may present a credential, the endpoint's lifecycle
+//! state, and the module form a package ships its server in.
 
 use serde_json::{json, Value};
 
 use service_com_amazonaws_lambdaweb_lambdaweb::state::endpoint_plane::serve_request;
 use service_com_amazonaws_lambdaweb_lambdaweb::state::service_state;
 
+use super::revision_build_outcome::{archive, create_bucket, stage_object, BUCKET};
 use super::web_function_endpoint::poll_until_active;
 use super::web_function_lifecycle::{build_config, role_arn, Emulator};
 
@@ -36,6 +45,78 @@ const SIGNED: &str = "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1
 
 /// The response header every answer a published address names the response it is by.
 pub(crate) const REQUEST_ID_HEADER: &str = "lambda-web-request-id";
+
+/// The key the CommonJS application below is staged under.
+const CJS_KEY: &str = "data-plane-commonjs.zip";
+
+/// The key the ES module application below is staged under.
+const ESM_KEY: &str = "data-plane-esm.zip";
+
+/// The key an application that registers no server is staged under.
+const NO_SERVER_KEY: &str = "data-plane-no-server.zip";
+
+/// A deployment package whose code is a Node.js HTTP server, written as a CommonJS module —
+/// the form a web function's package ships its server in. It answers from the request it
+/// was handed and from its own environment, so what a client reads back could not have been
+/// assembled anywhere but inside that code.
+fn commonjs_application() -> Vec<u8> {
+    archive(&[(
+        "index.js",
+        br#"
+const http = require('http');
+http.createServer((req, res) => {
+  if (req.url.indexOf('/items/') === 0) {
+    res.writeHead(200, { 'content-type': 'application/json', 'x-served-by': 'commonjs' });
+    res.end(JSON.stringify({ item: req.url.slice('/items/'.length), method: req.method }));
+    return;
+  }
+  if (req.url === '/teapot') {
+    res.writeHead(418, { 'content-type': 'text/plain', 'x-served-by': 'commonjs' });
+    res.end('short and stout');
+    return;
+  }
+  res.writeHead(200, { 'content-type': 'text/plain', 'x-served-by': 'commonjs' });
+  res.end('hello from ' + (process.env.GREETING || 'the revision'));
+}).listen(Number(process.env.PORT) || 8080);
+"#,
+    )])
+}
+
+/// The same server shipped as an ES module across two files, which is the other module form
+/// a Node.js package takes.
+fn es_module_application() -> Vec<u8> {
+    archive(&[
+        ("package.json", b"{\"main\": \"src/server.mjs\"}"),
+        (
+            "src/server.mjs",
+            br#"
+import http from 'node:http';
+import { greeting } from './greeting.mjs';
+http.createServer((req, res) => {
+  res.writeHead(201, { 'content-type': 'text/plain', 'x-served-by': 'esm' });
+  res.end(greeting());
+}).listen(8080);
+"#,
+        ),
+        (
+            "src/greeting.mjs",
+            b"export const greeting = () => 'hello from an es module';",
+        ),
+    ])
+}
+
+/// A package whose code runs and registers no server at all, which answers no request.
+fn application_without_a_server() -> Vec<u8> {
+    archive(&[("index.js", b"const held = 1 + 1;")])
+}
+
+/// Stage every package these suites run, through Amazon S3's own operations.
+async fn stage_packages(emulator: &Emulator) {
+    create_bucket(emulator).await;
+    stage_object(emulator, CJS_KEY, commonjs_application()).await;
+    stage_object(emulator, ESM_KEY, es_module_application()).await;
+    stage_object(emulator, NO_SERVER_KEY, application_without_a_server()).await;
+}
 
 /// The `403 Forbidden` page an `IamAuth` endpoint refuses a request presenting no SigV4
 /// credential with, naming the response that served it.
@@ -61,9 +142,15 @@ pub(crate) fn forbidden_page(request_id: &str) -> String {
     .join("\n")
 }
 
-/// Create a function with one endpoint of `auth_type` through the shared harness, and
-/// report the `domainName` the create published for it.
-async fn create_with_endpoint(emulator: &Emulator, name: &str, auth_type: &str) -> String {
+/// Create a function with one endpoint of `auth_type`, serving the package staged under
+/// `key`, and report the `domainName` the create published for it.
+async fn create_serving(
+    emulator: &Emulator,
+    name: &str,
+    auth_type: &str,
+    key: &str,
+    environment: Value,
+) -> String {
     let created = emulator
         .send(
             "PUT",
@@ -72,8 +159,11 @@ async fn create_with_endpoint(emulator: &Emulator, name: &str, auth_type: &str) 
             Some(json!({
                 "functionName": name,
                 "revisionConfig": {
-                    "buildConfig": build_config("nodejs24.x", "demo-bucket", "app.zip", None),
-                    "serviceConfig": { "executionRoleArn": role_arn(name) },
+                    "buildConfig": build_config("nodejs24.x", BUCKET, key, None),
+                    "serviceConfig": {
+                        "executionRoleArn": role_arn(name),
+                        "environmentVariables": environment,
+                    },
                 },
                 "endpointConfig": {
                     "endpointName": "ep",
@@ -96,20 +186,26 @@ async fn create_with_endpoint(emulator: &Emulator, name: &str, auth_type: &str) 
         .to_string()
 }
 
+/// [`create_serving`] for the CommonJS application with no environment variables of its
+/// own.
+async fn create_with_endpoint(emulator: &Emulator, name: &str, auth_type: &str) -> String {
+    create_serving(emulator, name, auth_type, CJS_KEY, json!({})).await
+}
+
 /// One request to a published endpoint, answered by the decision the core's listener
 /// serves at that address — read out of the ONE store the emulator's services share.
-fn request_endpoint(
+async fn request_endpoint(
     emulator: &Emulator,
     function_name: &str,
     endpoint_name: &str,
     uri: &str,
     headers: &[(&str, &str)],
 ) -> ::http::Response<Vec<u8>> {
-    requested(emulator, function_name, endpoint_name, "GET", uri, headers)
+    requested(emulator, function_name, endpoint_name, "GET", uri, headers).await
 }
 
 /// [`request_endpoint`] for a request of any method, which an unsigned request may be.
-fn requested(
+async fn requested(
     emulator: &Emulator,
     function_name: &str,
     endpoint_name: &str,
@@ -123,7 +219,7 @@ fn requested(
     }
     let request = builder.body(Vec::new()).expect("a well-formed request");
     let state = service_state(&**emulator.engine()).expect("this service's store");
-    serve_request(&state, function_name, endpoint_name, &request)
+    serve_request(&state, function_name, endpoint_name, &request).await
 }
 
 /// One row of the request table: the case, the request URI, the headers it carries, and
@@ -154,7 +250,8 @@ fn header_of(response: &::http::Response<Vec<u8>>, name: &str) -> String {
 /// value every reader of the endpoint reports. Two endpoints never publish one address.
 #[tokio::test]
 async fn a_published_domain_name_is_an_address_the_emulator_answers_on() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_object_store();
+    stage_packages(&emulator).await;
     // The rows span the `authType` values, since the address is published for both.
     let mut published = Vec::new();
     for (case, auth_type) in [
@@ -207,12 +304,12 @@ async fn a_published_domain_name_is_an_address_the_emulator_answers_on() {
 /// SigV4 credential with the `403 Forbidden` page, and serves one that presents a
 /// credential; an `ApplicationManaged` endpoint refuses nothing of its own.
 ///
-/// What an authorized request is answered with is the web function's OWN handler response,
-/// and this emulator runs no web function code, so it answers `501` and synthesises
-/// nothing in the handler's name.
+/// What an AUTHORIZED request is answered with is the revision's own handler response, so
+/// every row that is not refused is the `200` the staged package's server produced.
 #[tokio::test]
 async fn the_published_address_applies_the_endpoints_auth_type() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_object_store();
+    stage_packages(&emulator).await;
     for (case, auth_type) in [
         ("iam-authorized", "IamAuth"),
         ("application-managed", "ApplicationManaged"),
@@ -221,7 +318,7 @@ async fn the_published_address_applies_the_endpoints_auth_type() {
         create_with_endpoint(&emulator, &name, auth_type).await;
         // Until the endpoint is serving traffic, nothing is published at its address.
         let pending =
-            request_endpoint(&emulator, &name, "ep", "/", &[("authorization", SIGNED)]);
+            request_endpoint(&emulator, &name, "ep", "/", &[("authorization", SIGNED)]).await;
         assert_eq!(
             pending.status().as_u16(),
             404,
@@ -235,14 +332,14 @@ async fn the_published_address_applies_the_endpoints_auth_type() {
         poll_until_active(&emulator, &name, "ep").await;
 
         // (case, the request URI, its headers, the status the address answers)
-        let unsigned_status = if auth_type == "IamAuth" { 403 } else { 501 };
+        let unsigned_status = if auth_type == "IamAuth" { 403 } else { 200 };
         let rows: &[RequestRow<'_>] = &[
-            ("a signed GET", "/", &[("authorization", SIGNED)], 501),
+            ("a signed GET", "/", &[("authorization", SIGNED)], 200),
             (
                 "a presigned GET",
                 "/?X-Amz-Credential=AKIDEXAMPLE&X-Amz-Signature=deadbeef",
                 &[],
-                501,
+                200,
             ),
             ("an unsigned GET", "/", &[], unsigned_status),
             (
@@ -259,7 +356,7 @@ async fn the_published_address_applies_the_endpoints_auth_type() {
             ),
         ];
         for (request_case, uri, headers, expected) in rows {
-            let answered = request_endpoint(&emulator, &name, "ep", uri, headers);
+            let answered = request_endpoint(&emulator, &name, "ep", uri, headers).await;
             assert_eq!(
                 answered.status().as_u16(),
                 *expected,
@@ -280,8 +377,330 @@ async fn the_published_address_applies_the_endpoints_auth_type() {
                     "case {case:?}/{request_case:?}: expected the Forbidden page naming \
                      {request_id:?}"
                 );
+            } else {
+                assert_eq!(
+                    header_of(&answered, "x-served-by"),
+                    "commonjs",
+                    "case {case:?}/{request_case:?}: expected the revision's own response, \
+                     got {:?}",
+                    body_text(&answered)
+                );
             }
         }
+    }
+}
+
+/// RULE: an authorized request to a published address is answered by the revision's OWN
+/// code — the status, the headers and the body that code produced, computed from the
+/// request it was handed and from the revision's own environment.
+///
+/// The rows span what the one staged application answers: a route it answers as text, a
+/// route it answers as JSON built from the path and the method it was handed, and a route
+/// it answers with a status of its own. Nothing here could be assembled by this emulator:
+/// each value is produced inside the package's code.
+#[tokio::test]
+async fn an_authorized_request_is_answered_by_the_revisions_own_code() {
+    let emulator = Emulator::with_object_store();
+    stage_packages(&emulator).await;
+    let name = "handler-response";
+    create_serving(
+        &emulator,
+        name,
+        "IamAuth",
+        CJS_KEY,
+        json!({ "GREETING": "the staged package" }),
+    )
+    .await;
+    poll_until_active(&emulator, name, "ep").await;
+
+    // (case, the method, the request URI, the status, the content type, the body)
+    let rows: [(&str, &str, &str, u16, &str, &str); 5] = [
+        (
+            "the root route, answered from the revision's environment",
+            "GET",
+            "/",
+            200,
+            "text/plain",
+            "hello from the staged package",
+        ),
+        (
+            "a route the code answers as JSON built from the path",
+            "GET",
+            "/items/42",
+            200,
+            "application/json",
+            "{\"item\":\"42\",\"method\":\"GET\"}",
+        ),
+        (
+            "the same route under another method",
+            "POST",
+            "/items/42",
+            200,
+            "application/json",
+            "{\"item\":\"42\",\"method\":\"POST\"}",
+        ),
+        (
+            "a deeper path the same route serves",
+            "GET",
+            "/items/a/b",
+            200,
+            "application/json",
+            "{\"item\":\"a/b\",\"method\":\"GET\"}",
+        ),
+        (
+            "a route the code answers with a status of its own",
+            "GET",
+            "/teapot",
+            418,
+            "text/plain",
+            "short and stout",
+        ),
+    ];
+    for (case, method, uri, status, content_type, body) in rows {
+        let answered = requested(
+            &emulator,
+            name,
+            "ep",
+            method,
+            uri,
+            &[("authorization", SIGNED)],
+        )
+        .await;
+        assert_eq!(
+            answered.status().as_u16(),
+            status,
+            "case {case:?}: expected {status}, got {} with {:?}",
+            answered.status(),
+            body_text(&answered)
+        );
+        assert_eq!(
+            header_of(&answered, "content-type"),
+            content_type,
+            "case {case:?}: expected the content type the code set, got {:?}",
+            header_of(&answered, "content-type")
+        );
+        assert_eq!(
+            body_text(&answered),
+            body,
+            "case {case:?}: expected the body the code produced, got {:?}",
+            body_text(&answered)
+        );
+        assert_eq!(
+            header_of(&answered, "content-length"),
+            body.len().to_string(),
+            "case {case:?}: expected the length of the body the code produced"
+        );
+        assert!(
+            !header_of(&answered, REQUEST_ID_HEADER).is_empty(),
+            "case {case:?}: every answer names the response it is"
+        );
+    }
+}
+
+/// RULE, over the other module form: a package that ships its server as an ES module — and
+/// imports another file of its own to build the answer — is run the same way, and what the
+/// client reads is what that code answered.
+#[tokio::test]
+async fn a_package_that_ships_an_es_module_is_run_as_one() {
+    let emulator = Emulator::with_object_store();
+    stage_packages(&emulator).await;
+    let name = "esm-handler";
+    create_serving(&emulator, name, "ApplicationManaged", ESM_KEY, json!({})).await;
+    poll_until_active(&emulator, name, "ep").await;
+
+    let answered = request_endpoint(&emulator, name, "ep", "/", &[]).await;
+    assert_eq!(
+        answered.status().as_u16(),
+        201,
+        "expected the status the ES module set, got {} with {:?}",
+        answered.status(),
+        body_text(&answered)
+    );
+    assert_eq!(
+        (
+            body_text(&answered),
+            header_of(&answered, "x-served-by")
+        ),
+        (
+            "hello from an es module".to_string(),
+            "esm".to_string()
+        ),
+        "expected the ES module's own answer, got {:?}",
+        body_text(&answered)
+    );
+}
+
+/// RULE: a request that reached no code produces no response, and that is reported as what
+/// it was rather than as a response nothing produced — a revision whose code registers no
+/// server is a `502`, and a revision whose build never read a package serves nothing at
+/// all.
+#[tokio::test]
+async fn a_revision_that_answers_nothing_is_reported_as_that() {
+    let emulator = Emulator::with_object_store();
+    stage_packages(&emulator).await;
+    // An object that is no archive at all: the build fails, so the revision is never ready
+    // to serve traffic.
+    stage_object(&emulator, "not-an-archive.zip", b"not a zip archive".to_vec()).await;
+
+    // (case, the package the revision is built from, the status the address answers, the
+    // body it answers with)
+    let rows: [(&str, &str, u16, &str); 2] = [
+        (
+            "a package that registers no server",
+            NO_SERVER_KEY,
+            502,
+            "The web function did not produce a response.\n",
+        ),
+        (
+            "a revision whose build failed",
+            "not-an-archive.zip",
+            503,
+            "No web function code is serving this endpoint.\n",
+        ),
+    ];
+    for (index, (case, key, status, body)) in rows.into_iter().enumerate() {
+        let name = format!("no-answer-{index}");
+        create_serving(&emulator, &name, "ApplicationManaged", key, json!({})).await;
+        poll_until_active(&emulator, &name, "ep").await;
+        let answered = request_endpoint(&emulator, &name, "ep", "/", &[]).await;
+        assert_eq!(
+            answered.status().as_u16(),
+            status,
+            "case {case:?}: expected {status}, got {} with {:?}",
+            answered.status(),
+            body_text(&answered)
+        );
+        assert_eq!(
+            body_text(&answered),
+            body,
+            "case {case:?}: expected {body:?}, got {:?}",
+            body_text(&answered)
+        );
+    }
+}
+
+/// RULE: an endpoint whose `autoDeploymentMode` is `LatestRevision` "automatically serves
+/// the newest revision", so once a newer revision has BUILT the code the address runs is
+/// that revision's — and a `Disabled` endpoint keeps running the code it was given.
+#[tokio::test]
+async fn the_code_an_address_runs_is_the_revision_the_endpoint_routes_to() {
+    let emulator = Emulator::with_object_store();
+    stage_packages(&emulator).await;
+
+    // (case, the endpoint's autoDeploymentMode, the body the address serves after a newer
+    // revision has built)
+    let rows: [(&str, &str, &str); 2] = [
+        ("auto-deploying", "LatestRevision", "hello from an es module"),
+        ("fixed", "Disabled", "hello from the first revision"),
+    ];
+    for (case, mode, expected) in rows {
+        let name = format!("routed-{case}");
+        let created = emulator
+            .send(
+                "PUT",
+                "/web-functions",
+                REGION,
+                Some(json!({
+                    "functionName": name,
+                    "revisionConfig": {
+                        "buildConfig": build_config("nodejs24.x", BUCKET, CJS_KEY, None),
+                        "serviceConfig": {
+                            "executionRoleArn": role_arn(&name),
+                            "environmentVariables": { "GREETING": "the first revision" },
+                        },
+                    },
+                    "endpointConfig": {
+                        "endpointName": "ep",
+                        "endpointType": "HomeRegion",
+                        "authType": "ApplicationManaged",
+                        "autoDeploymentMode": mode,
+                    },
+                })),
+            )
+            .await;
+        assert_eq!(
+            created.status, 202,
+            "case {case:?}: CreateWebFunction expected 202, got {} {:?}",
+            created.status, created.body
+        );
+        poll_until_active(&emulator, &name, "ep").await;
+        let first = request_endpoint(&emulator, &name, "ep", "/", &[]).await;
+        assert_eq!(
+            body_text(&first),
+            "hello from the first revision",
+            "case {case:?}: expected the initial revision's own answer, got {:?}",
+            body_text(&first)
+        );
+
+        // A newer revision, built from another package entirely: an auto-deploying endpoint
+        // routes to it once it is ready to serve traffic.
+        let added = emulator
+            .send(
+                "POST",
+                &format!("/web-functions/{name}/revisions"),
+                REGION,
+                Some(json!({
+                    "buildConfig": build_config("nodejs24.x", BUCKET, ESM_KEY, None),
+                    "serviceConfig": { "executionRoleArn": role_arn(&name) },
+                })),
+            )
+            .await;
+        assert_eq!(
+            added.status, 202,
+            "case {case:?}: CreateWebFunctionRevision expected 202, got {} {:?}",
+            added.status, added.body
+        );
+        // The newer revision's build settles on the CLOCK, so the test waits for THAT
+        // condition — the revision reporting `Active`, which is when the switch is owed —
+        // before reading what the address serves. Without this wait a row that expects no
+        // switch would pass before the revision could have taken traffic at all.
+        let revision_id = added
+            .string("revisionId")
+            .unwrap_or_else(|| panic!("case {case:?}: the create reports its revisionId"));
+        poll_until_revision_active(&emulator, &name, &revision_id).await;
+
+        // The switch itself is owed at the same instant, so the test looks again until the
+        // address serves what the rule says it serves, or until a deadline far longer than
+        // the service's own span has passed.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut served = body_text(&request_endpoint(&emulator, &name, "ep", "/", &[]).await);
+        while served != expected && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            served = body_text(&request_endpoint(&emulator, &name, "ep", "/", &[]).await);
+        }
+        assert_eq!(
+            served, expected,
+            "case {case:?}: expected the address to run {expected:?}, got {served:?}"
+        );
+    }
+}
+
+/// Poll `GetWebFunctionRevision` until the revision reports `Active` — the state in which it
+/// is "ready to serve traffic", which is when a switch onto it is owed.
+///
+/// The build settles on the CLOCK, so this waits for the condition rather than for a
+/// duration: it looks again until it holds, or until a deadline far longer than the service's
+/// own span has passed.
+async fn poll_until_revision_active(emulator: &Emulator, name: &str, revision_id: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let read = emulator
+            .send(
+                "GET",
+                &format!("/web-functions/{name}/revisions/{revision_id}"),
+                REGION,
+                None,
+            )
+            .await;
+        if read.string("state").as_deref() == Some("Active") {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the revision {name}/{revision_id} never reached Active, last read {:?}",
+            read.body
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 }
 
@@ -295,7 +714,8 @@ async fn the_published_address_applies_the_endpoints_auth_type() {
 /// SigV4 credential — because the refusal depends on none of them.
 #[tokio::test]
 async fn an_unsigned_request_is_refused_with_the_forbidden_page_naming_that_response() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_object_store();
+    stage_packages(&emulator).await;
     let name = "forbidden-page";
     create_with_endpoint(&emulator, name, "IamAuth").await;
     // The address answers the endpoint's own decisions once the endpoint is `Active`.
@@ -333,7 +753,7 @@ async fn an_unsigned_request_is_refused_with_the_forbidden_page_naming_that_resp
     ];
     let mut named = Vec::new();
     for (case, method, uri, headers) in rows {
-        let answered = requested(&emulator, name, "ep", method, uri, headers);
+        let answered = requested(&emulator, name, "ep", method, uri, headers).await;
         assert_eq!(
             answered.status().as_u16(),
             403,
@@ -372,37 +792,47 @@ async fn an_unsigned_request_is_refused_with_the_forbidden_page_naming_that_resp
 }
 
 /// RULE: the published address is a socket this emulator ANSWERS on — a client that
-/// followed `domainName` and dialled it gets the endpoint's own answer over HTTP.
+/// followed `domainName` and dialled it gets the endpoint's own answer over HTTP, which for
+/// an authorized request is the response the revision's code produced.
 ///
 /// Dialled in the clear, which the address serves beside TLS (the scheme is negotiated
 /// from the connection's first byte), so the test needs no certificate trust store to
 /// prove the socket answers.
 #[tokio::test]
 async fn a_client_that_dials_the_published_address_is_answered_there() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_object_store();
+    stage_packages(&emulator).await;
     let domain_name = create_with_endpoint(&emulator, "dialled-endpoint", "IamAuth").await;
     // The address answers the endpoint's own decisions once the endpoint is `Active`.
     poll_until_active(&emulator, "dialled-endpoint", "ep").await;
 
-    // (case, the request's headers, the status line the address answers with)
-    let rows: [(&str, &str, &str); 2] = [
-        (
-            "an unsigned GET",
-            "",
-            "HTTP/1.1 403 Forbidden",
-        ),
+    // (case, the request's headers, the status line the address answers with, the body it
+    // serves)
+    let rows: [(&str, &str, &str, &str); 2] = [
+        ("an unsigned GET", "", "HTTP/1.1 403 Forbidden", ""),
         (
             "a signed GET",
             &format!("authorization: {SIGNED}\r\n"),
-            "HTTP/1.1 501 Not Implemented",
+            "HTTP/1.1 200 OK",
+            "hello from the revision",
         ),
     ];
-    for (case, headers, expected) in rows {
+    for (case, headers, expected, body) in rows {
         let answered = dial(&domain_name, headers).await;
         assert!(
             answered.starts_with(expected),
             "case {case:?}: expected the address to answer {expected:?}, got {answered:?}"
         );
+        if !body.is_empty() {
+            let served = answered
+                .split_once("\r\n\r\n")
+                .map(|(_, body)| body.to_string())
+                .unwrap_or_default();
+            assert_eq!(
+                served, body,
+                "case {case:?}: expected the code's own body, got {served:?}"
+            );
+        }
     }
 }
 
@@ -459,7 +889,8 @@ fn header_on_the_wire(answered: &str, name: &str) -> String {
 /// dialled it can show the page and correlate the refusal by its id.
 #[tokio::test]
 async fn a_dialled_unsigned_request_is_served_the_page_and_its_id() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_object_store();
+    stage_packages(&emulator).await;
     let name = "dialled-refusal";
     let domain_name = create_with_endpoint(&emulator, name, "IamAuth").await;
     // The address answers the endpoint's own decisions once the endpoint is `Active`.
@@ -505,16 +936,17 @@ async fn a_dialled_unsigned_request_is_served_the_page_and_its_id() {
 /// published there, and the listener it answered on is released.
 #[tokio::test]
 async fn a_deleted_endpoints_address_publishes_nothing() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_object_store();
+    stage_packages(&emulator).await;
     let name = "address-lifetime";
     create_with_endpoint(&emulator, name, "ApplicationManaged").await;
     // The address answers the endpoint's own decisions once the endpoint is `Active`.
     poll_until_active(&emulator, name, "ep").await;
-    let serving = request_endpoint(&emulator, name, "ep", "/", &[]);
+    let serving = request_endpoint(&emulator, name, "ep", "/", &[]).await;
     assert_eq!(
         serving.status().as_u16(),
-        501,
-        "an active endpoint answers at its address, got {}",
+        200,
+        "an active endpoint answers at its address with its code's own response, got {}",
         body_text(&serving)
     );
 
@@ -529,7 +961,8 @@ async fn a_deleted_endpoints_address_publishes_nothing() {
         deleted.status,
         deleted.body
     );
-    let gone = request_endpoint(&emulator, name, "ep", "/", &[("authorization", SIGNED)]);
+    let gone =
+        request_endpoint(&emulator, name, "ep", "/", &[("authorization", SIGNED)]).await;
     assert_eq!(
         gone.status().as_u16(),
         404,

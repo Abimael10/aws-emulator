@@ -14,6 +14,7 @@
 //! slice in [`resource_policies`] and the tag slice in [`tags`].
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
@@ -28,8 +29,12 @@ mod account;
 pub use account::*;
 
 /// The deployment package a revision is built from: the object its `s3Object` names,
-/// and whether the build can read an archive there at all.
+/// whether the build can read an archive there at all, and the modules it holds.
 pub mod code_package;
+
+/// The JavaScript engine a revision's deployment package RUNS in, which is what a
+/// published endpoint's data plane answers a request with.
+pub mod web_runtime;
 
 /// The data plane an endpoint publishes: the listener this emulator answers the
 /// endpoint's own HTTP requests on, and the address it announces.
@@ -236,6 +241,12 @@ pub struct Revision {
     /// `Failed`, so a revision whose code is not an archive the build can read is never
     /// reported as having built.
     pub build_failure: Option<String>,
+    /// The modules the build read out of this revision's deployment package
+    /// ([`code_package::DeploymentPackage`]), or `None` when the build established no
+    /// package at all. It is what an endpoint serving this revision RUNS
+    /// ([`web_runtime`]), so a revision whose code was never read answers for that rather
+    /// than for a response nothing produced.
+    pub package: Option<Arc<code_package::DeploymentPackage>>,
 }
 
 impl Revision {
@@ -430,6 +441,9 @@ pub struct NewRevision {
     /// established it ([`code_package::CodePackage::failure_reason`]), or `None` for a
     /// build that succeeds.
     pub build_failure: Option<String>,
+    /// The modules the build read out of the deployment package, as
+    /// [`code_package::CodePackage::package`] answered for it.
+    pub package: Option<Arc<code_package::DeploymentPackage>>,
 }
 
 /// Per-service state for com-amazonaws-lambdaweb-lambdaweb. A handler reaches it through [`service_state`].
@@ -532,6 +546,7 @@ impl ComAmazonawsLambdawebLambdawebState {
             created_at: now,
             activates_at: Some(now + PROVISIONING_DELAY),
             build_failure: new.build_failure,
+            package: new.package,
         };
         function.revisions.insert(revision_id.clone(), revision);
         function.latest_revision_id = Some(revision_id.clone());

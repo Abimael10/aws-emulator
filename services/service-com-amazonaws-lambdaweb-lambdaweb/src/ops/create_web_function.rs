@@ -314,16 +314,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the deployment package its code object names, fetched from the emulator's own
         // Amazon S3. A package the build cannot read an archive in settles the revision
         // `Failed` rather than `Active` — see `crate::state::code_package`.
-        let build_failure = match &input.revision_config {
-            Some(config) => crate::state::code_package::resolve(
-                ctx,
-                &region,
-                &config.build_config.code_config.s3_object,
-            )
-            .await
-            .failure_reason(),
+        let resolved = match &input.revision_config {
+            Some(config) => Some(
+                crate::state::code_package::resolve(
+                    ctx,
+                    &region,
+                    &config.build_config.code_config.s3_object,
+                )
+                .await,
+            ),
             None => None,
         };
+        let build_failure = resolved
+            .as_ref()
+            .and_then(crate::state::code_package::CodePackage::failure_reason);
+        // The modules the build read, kept with the revision: they are what an endpoint
+        // serving it runs, so the package is read once here rather than per request.
+        let package = resolved
+            .as_ref()
+            .and_then(crate::state::code_package::CodePackage::package);
 
         // The ADDRESS the initial endpoint is published on, opened before anything is
         // stored: the endpoint reports it as its `domainName`, and this emulator answers
@@ -396,6 +405,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     build_config: config.build_config,
                     service_config: config.service_config,
                     build_failure,
+                    package,
                 },
                 now,
             );

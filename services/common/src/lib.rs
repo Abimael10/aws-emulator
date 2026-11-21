@@ -709,6 +709,11 @@ pub mod model_mapping_template;
 /// defined over — read once for the two services whose API takes a template written in it.
 pub mod velocity_template;
 pub mod network;
+/// The JavaScript a Node.js GUEST reaches that is the same for every service running one:
+/// the PURE core modules of Node's standard library, and the module registry that resolves
+/// and loads a package's own files by Node's documented rule — held once here rather than
+/// per service, so two services cannot answer a guest differently about the same behaviour.
+pub mod node_guest_modules;
 /// The framing of a response that carries no content: a success whose modelled output has
 /// no member answers 204 with no body, not the empty JSON object a serializer renders.
 pub mod no_content_responses;

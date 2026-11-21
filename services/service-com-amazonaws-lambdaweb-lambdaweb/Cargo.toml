@@ -18,7 +18,7 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "sync"] }
+tokio = { workspace = true, features = ["io-util", "sync", "time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 # Speaks HTTP/1.1 on the connections a published endpoint's own listener accepts
@@ -40,9 +40,38 @@ sha2 = { workspace = true }
 # the generated client is needed — the emulator supplies the transport.
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 # Reads a fetched deployment package as the .zip archive it has to be, so a revision whose
-# code object is no archive settles its build `Failed`. `deflate` alone: no other
-# compression method and no encryption support is needed to open an archive.
+# code object is no archive settles its build `Failed`, and reads the modules of an archive
+# that opens, which is what a published endpoint RUNS. `deflate` alone: no other
+# compression method and no encryption support is needed to open an archive. Every entry is
+# read in memory, bounded by `src/state/code_package.rs`, and nothing is extracted to a
+# host path.
 zip = { version = "9", default-features = false, features = ["deflate"] }
+# `rquickjs` is the QuickJS JavaScript engine, embedded in this process: it is the
+# EXECUTION SUBSTRATE that RUNS the code a web function revision's deployment package
+# ships, so the response a client reads at an endpoint's published address is the one that
+# code produced (`src/state/web_runtime.rs`).
+#
+# * the "dyn-load" feature is NOT enabled, so QuickJS registers no dynamic host-library
+#   loader; "loader" IS enabled, because a package's entry module may be an ES module, and
+#   the resolver and loader installed with it are this crate's own: they answer only with a
+#   file of the package being run or one of the core modules this crate implements, so no
+#   host path is ever a module;
+# * plain QuickJS registers no filesystem, process, environment, socket or thread API, and
+#   this crate adds none: there is no `fs`, `net`, `child_process`, `worker_threads` or
+#   `vm` module to require, the `process` a run reads carries the revision's own
+#   environment variables and nothing of the process this emulator runs in, and the run's
+#   only host functions are this crate's response sink and log writer, both removed from
+#   the global object before any of the package's code is compiled;
+# * every bound on a run — its wall clock, its step budget, its memory and stack ceilings,
+#   its response and log caps, and how many runs this process holds at once — lives in host
+#   code the run cannot reach (`src/state/web_runtime.rs`);
+# * it is also a NATIVE component: `rquickjs-sys` compiles the QuickJS C sources with `cc`
+#   at build time and the bindings are `unsafe`. That is accepted because the engine is
+#   what makes a web function's code run at all, and it is the engine six other service
+#   crates of this workspace already embed for the same purpose;
+# * no advisory is open against the 0.14 line (`cargo_audit` at the merge gate reads the
+#   locked tree).
+rquickjs = { version = "0.14", features = ["loader"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

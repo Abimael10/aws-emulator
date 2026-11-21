@@ -202,13 +202,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Amazon S3. A package the build cannot read an archive in settles the revision
         // `Failed` rather than `Active` — see `crate::state::code_package`.
         let region = crate::state::request_region(ctx.parts());
-        let build_failure = crate::state::code_package::resolve(
+        let resolved = crate::state::code_package::resolve(
             ctx,
             &region,
             &input.build_config.code_config.s3_object,
         )
-        .await
-        .failure_reason();
+        .await;
+        let build_failure = resolved.failure_reason();
+        // The modules the build read, kept with the revision: they are what an endpoint
+        // serving it runs, so the package is read once here rather than per request.
+        let package = resolved.package();
 
         let mut state = state.lock();
         let now = ::std::time::SystemTime::now();
@@ -259,6 +262,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     build_config: input.build_config,
                     service_config: input.service_config,
                     build_failure,
+                    package,
                 },
                 now,
             )

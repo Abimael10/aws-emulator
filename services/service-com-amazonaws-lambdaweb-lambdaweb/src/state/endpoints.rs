@@ -200,6 +200,44 @@ impl Endpoint {
             .collect()
     }
 
+    /// The revision ONE request to this endpoint routes to, chosen by the weights the
+    /// endpoint serves its revisions with, with `pick` the request's own draw.
+    ///
+    /// `RevisionWeight$weight` is `@range(1..100)` and an endpoint carries one entry per
+    /// revision it serves, so the weights are the shares of the traffic: a request falls in
+    /// the share whose cumulative weight its draw lands in. `pick` is the DRAW — a value of
+    /// the request's own, never a counter this store keeps — so serving a request changes
+    /// nothing a later caller sees, and an endpoint serving one revision routes every
+    /// request to it whatever the draw.
+    ///
+    /// `None` for an endpoint serving no revision, which has nothing to route to.
+    #[must_use]
+    pub fn routed_revision(&self, pick: u64) -> Option<&str> {
+        let total: u64 = self
+            .revision_weights
+            .iter()
+            .map(|weight| u64::try_from(weight.weight).unwrap_or_default())
+            .sum();
+        if total == 0 {
+            // Every share is empty (or there are none), so there is no revision this
+            // endpoint serves a share of its traffic.
+            return None;
+        }
+        let mut landed = pick % total;
+        for weight in &self.revision_weights {
+            let share = u64::try_from(weight.weight).unwrap_or_default();
+            if landed < share {
+                return Some(&weight.revision_id);
+            }
+            landed -= share;
+        }
+        // The draw is below the total, so some share always holds it; the last share is the
+        // one that does if the arithmetic above ever left none.
+        self.revision_weights
+            .last()
+            .map(|weight| weight.revision_id.as_str())
+    }
+
     /// Apply the `Pending -> Active` transition if the clock has already made it
     /// due. Owed at [`Self::activates_at`] whether or not anybody called, so
     /// materialising it on a read reports what was already true. `updated_at` moves
@@ -399,5 +437,125 @@ impl ComAmazonawsLambdawebLambdawebState {
         function.endpoints.insert(endpoint_name.clone(), endpoint);
         function.updated_at = now;
         Some(endpoint_name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An endpoint serving `weights`, for the rows below: only the member the rule under
+    /// test reads differs between them.
+    fn serving(weights: &[(&str, i32)]) -> Endpoint {
+        let now = SystemTime::UNIX_EPOCH;
+        Endpoint {
+            endpoint_arn: "arn:aws:lambda:us-east-1:000000000000:web-function/f/endpoint/ep"
+                .to_string(),
+            endpoint_name: "ep".to_string(),
+            description: None,
+            regions: BTreeMap::new(),
+            endpoint_type: ENDPOINT_TYPE_HOME_REGION.to_string(),
+            domain_name: "127.0.0.1:8080".to_string(),
+            auth_type: AUTH_TYPE_IAM.to_string(),
+            auto_deployment_mode: DEFAULT_AUTO_DEPLOYMENT_MODE.to_string(),
+            revision_weights: weights
+                .iter()
+                .map(|(revision_id, weight)| RevisionWeight {
+                    revision_id: (*revision_id).to_string(),
+                    weight: *weight,
+                })
+                .collect(),
+            scaling_config: None,
+            throttle_config: None,
+            state: EndpointState::Active,
+            state_reason: ENDPOINT_ACTIVE_REASON.to_string(),
+            update_status: None,
+            update_status_reason: None,
+            created_at: now,
+            updated_at: now,
+            activates_at: None,
+        }
+    }
+
+    /// One row of the routing table: the case, the endpoint's weights, and the revision
+    /// each draw routes to.
+    type WeightRow<'a> = (&'a str, Vec<(&'a str, i32)>, Vec<(u64, Option<&'a str>)>);
+
+    /// RULE: a request routes to the revision whose SHARE of the endpoint's traffic its own
+    /// draw lands in — the shares being the `weight` of each entry in `revisionWeights`
+    /// (`@range(1..100)`) — so an endpoint serving one revision routes every request to it,
+    /// and an endpoint serving none routes nowhere.
+    ///
+    /// The rows span the weightings an endpoint can carry: one revision, an even split, an
+    /// uneven split, the smallest and largest weights the model allows, and no revision at
+    /// all. Each is read at the boundaries of every share and one past each, so which share
+    /// a draw lands in is pinned rather than sampled.
+    #[test]
+    fn a_request_routes_to_the_revision_whose_share_its_draw_lands_in() {
+        // (case, the weights, the revision each draw routes to)
+        let rows: Vec<WeightRow<'_>> = vec![
+            (
+                "one revision with all of the traffic",
+                vec![("r-one", FULL_WEIGHT)],
+                vec![(0, Some("r-one")), (99, Some("r-one")), (100, Some("r-one")), (7, Some("r-one"))],
+            ),
+            (
+                "an even split",
+                vec![("r-a", 50), ("r-b", 50)],
+                vec![
+                    (0, Some("r-a")),
+                    (49, Some("r-a")),
+                    (50, Some("r-b")),
+                    (99, Some("r-b")),
+                    (100, Some("r-a")),
+                ],
+            ),
+            (
+                "an uneven split",
+                vec![("r-a", 90), ("r-b", 10)],
+                vec![
+                    (0, Some("r-a")),
+                    (89, Some("r-a")),
+                    (90, Some("r-b")),
+                    (99, Some("r-b")),
+                ],
+            ),
+            (
+                "the smallest and largest weights the model allows",
+                vec![("r-small", 1), ("r-large", 100)],
+                vec![
+                    (0, Some("r-small")),
+                    (1, Some("r-large")),
+                    (100, Some("r-large")),
+                    (101, Some("r-small")),
+                ],
+            ),
+            (
+                "three shares",
+                vec![("r-a", 20), ("r-b", 30), ("r-c", 50)],
+                vec![
+                    (19, Some("r-a")),
+                    (20, Some("r-b")),
+                    (49, Some("r-b")),
+                    (50, Some("r-c")),
+                    (99, Some("r-c")),
+                ],
+            ),
+            (
+                "an endpoint serving no revision",
+                vec![],
+                vec![(0, None), (1, None), (u64::MAX, None)],
+            ),
+        ];
+        for (case, weights, draws) in rows {
+            let endpoint = serving(&weights);
+            for (draw, expected) in draws {
+                let routed = endpoint.routed_revision(draw);
+                assert_eq!(
+                    routed, expected,
+                    "case {case:?}: a draw of {draw} must route to {expected:?}, got {routed:?}"
+                );
+            }
+        }
     }
 }

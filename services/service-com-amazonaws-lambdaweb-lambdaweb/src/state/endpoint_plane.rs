@@ -41,10 +41,12 @@
 //!   parameters of a presigned URL); verifying a signature is the emulator's own concern
 //!   and no service does it, so nothing here claims to. An `ApplicationManaged` endpoint
 //!   ("Your application handles authorization") refuses nothing here;
-//! * an authorized request — the web function's OWN handler response belongs here, and this
-//!   emulator runs no web function code (the revision's deployment package is JavaScript
-//!   for a Node.js runtime, and no execution engine is mounted in this crate), so the
-//!   honest answer is `501`. Nothing is synthesised in the handler's name.
+//! * an authorized request — the web function's OWN handler response: the revision the
+//!   endpoint routes the request to is RUN ([`super::web_runtime`]), its deployment
+//!   package's code is handed the request, and the status, headers and body that code
+//!   answered are what the client is served. Nothing is synthesised in the handler's name —
+//!   a revision whose code answered nothing, was stopped by one of the engine's bounds, or
+//!   was never read at all is reported as that rather than as a response.
 //!
 //! Every answer the ENDPOINT's own decision serves ([`serve_request`], the three above)
 //! NAMES THE RESPONSE IT IS, in the [`REQUEST_ID_HEADER`] response header: an id minted for
@@ -56,15 +58,19 @@
 //! predicates, decided before an endpoint is resolved, and carry what a core HTTP listener
 //! carries.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
 use ::emulator_server::{ListenerConn, ResourceListener, TlsUpgrader};
+use ::sha2::{Digest as _, Sha256};
 use ::tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use super::{ComAmazonawsLambdawebLambdawebState as ServiceState, EndpointState};
+use super::code_package::DeploymentPackage;
+use super::web_runtime::{self, HandlerOutcome, HandlerRequest};
+use super::{ComAmazonawsLambdawebLambdawebState as ServiceState, EndpointState, RevisionState};
 
 /// How many endpoint request BODIES this service reads at once, across every published
 /// address: the core's own HTTP in-flight cap, one permit per request, taken before a byte
@@ -117,11 +123,26 @@ fn forbidden_document(request_id: &str) -> String {
     )
 }
 
-/// What the address answers an AUTHORIZED request: the handler's own response belongs
-/// there, and no handler ran — see this module's header.
-const NO_WEB_FUNCTION_HANDLER: &str = "This web function endpoint is not implemented: the \
-                                       emulator runs no web function code, so the handler's \
-                                       own response cannot be served.\n";
+/// What the address answers an AUTHORIZED request that reached a revision whose code this
+/// emulator holds nothing to run: the endpoint serves no revision, the revision it routed
+/// to is not ready to serve traffic, or the build never established the revision's package.
+/// The sentence carries nothing from the request or from the revision's own code.
+const NO_CODE_TO_SERVE: &str = "No web function code is serving this endpoint.\n";
+
+/// What it answers a request whose run produced no response of its own: the code raised, it
+/// registered no server, or it ended without answering. What the run came to is LOGGED; the
+/// client is served this one sentence, so nothing the guest's own code worded reaches it.
+const NO_HANDLER_RESPONSE: &str = "The web function did not produce a response.\n";
+
+/// What it answers a request whose run was stopped by one of the engine's bounds.
+const HANDLER_TIMED_OUT: &str = "The web function did not answer within its timeout.\n";
+
+/// The status a request whose run produced no response of its own earns: the endpoint
+/// reached the web function and the function answered nothing.
+const BAD_GATEWAY: u16 = 502;
+
+/// The status a request whose run was stopped by a bound earns.
+const GATEWAY_TIMEOUT: u16 = 504;
 
 /// What it answers a request that arrived while this service was already reading as many
 /// endpoint bodies as it reads at once.
@@ -310,12 +331,7 @@ async fn answer(
         return served(plain(false, PAYLOAD_TOO_LARGE, BODY_TOO_LARGE));
     };
     let buffered = ::http::Request::from_parts(parts, collected.to_bytes().to_vec());
-    served(serve_request(
-        &state,
-        &function_name,
-        &endpoint_name,
-        &buffered,
-    ))
+    served(serve_request(&state, &function_name, &endpoint_name, &buffered).await)
 }
 
 /// One answer of [`serve_request`] as the connection writes it.
@@ -426,12 +442,14 @@ const BODY_TOO_LARGE: &str = "This request is larger than this address accepts.\
 ///
 /// The endpoint is resolved FIRST and the authorization second, which is the order the real
 /// address works in: only an address that publishes an endpoint answers at all, and then
-/// the endpoint's `authType` decides. Every answer names the response it is
-/// ([`REQUEST_ID_HEADER`]), minted once here and used in both the header and the
-/// `Forbidden` page, so the two cannot disagree. The one write is the clock's own
+/// the endpoint's `authType` decides. An authorized request is answered by the web
+/// function's own code: the revision the endpoint routes it to is run
+/// ([`super::web_runtime`]) and what that code answered is served. Every answer names the
+/// response it is ([`REQUEST_ID_HEADER`]), minted once here and used in both the header and
+/// the `Forbidden` page, so the two cannot disagree. The one write is the clock's own
 /// ([`ServiceState::materialise_due_transitions`]), owed at this instant whether or not
 /// anybody connected, so reaching an endpoint changes nothing a later caller sees.
-pub fn serve_request(
+pub async fn serve_request(
     state: &::engine::ServiceState<ServiceState>,
     function_name: &str,
     endpoint_name: &str,
@@ -444,21 +462,15 @@ pub fn serve_request(
     // or reporting a refusal correlates on.
     let request_id = ::service_common::query_error_envelope::new_request_id();
 
-    let mut store = state.lock();
-    store.materialise_due_transitions(SystemTime::now());
-    let Some(endpoint) = store
-        .functions
-        .get(function_name)
-        .and_then(|function| function.endpoints.get(endpoint_name))
-        .filter(|endpoint| endpoint.state == EndpointState::Active)
-    else {
+    // What the STORE says about this request, taken under the guard and released before any
+    // of the revision's code runs: the endpoint's own decision, and the revision one
+    // request routes to.
+    let addressed = addressed(state, function_name, endpoint_name, &request_id);
+    let Some(addressed) = addressed else {
         return attributed(plain(head, 404, NO_ENDPOINT_AT_THIS_ADDRESS), &request_id);
     };
-    let auth_type = endpoint.auth_type.clone();
-    let endpoint_arn = endpoint.endpoint_arn.clone();
-    drop(store);
 
-    if auth_type == super::AUTH_TYPE_IAM && !presented {
+    if addressed.auth_type == super::AUTH_TYPE_IAM && !presented {
         // Every attempt on a published endpoint is attributable: the endpoint addressed, the
         // outcome, and the id the client was answered under, so a refusal a client reports
         // is the refusal this log line records. Nothing the client sent is logged — not the
@@ -467,7 +479,7 @@ pub fn serve_request(
             audit = true,
             operation = "WebFunctionEndpointRequest",
             outcome = "refused",
-            endpoint_arn = %endpoint_arn,
+            endpoint_arn = %addressed.endpoint_arn,
             request_id = %request_id,
             "web function endpoint request presenting no SigV4 credential"
         );
@@ -476,7 +488,233 @@ pub fn serve_request(
             &request_id,
         );
     }
-    attributed(plain(head, 501, NO_WEB_FUNCTION_HANDLER), &request_id)
+
+    let Some(serving) = addressed.serving else {
+        ::tracing::info!(
+            audit = true,
+            operation = "WebFunctionEndpointRequest",
+            outcome = "no-code",
+            endpoint_arn = %addressed.endpoint_arn,
+            request_id = %request_id,
+            "web function endpoint request reached no revision whose code this emulator holds"
+        );
+        return attributed(
+            plain(head, SERVICE_UNAVAILABLE, NO_CODE_TO_SERVE),
+            &request_id,
+        );
+    };
+
+    // The revision's OWN code answers from here on: it is handed the request the client
+    // sent and run under the engine's own bounds, with no store guard held.
+    let outcome = web_runtime::serve_handler(
+        serving.package,
+        serving.environment,
+        serving.timeout_seconds,
+        serving.runtime,
+        handler_request(req),
+    )
+    .await;
+    let answer = match outcome {
+        HandlerOutcome::Answered(answer) => {
+            ::tracing::info!(
+                audit = true,
+                operation = "WebFunctionEndpointRequest",
+                outcome = "served",
+                endpoint_arn = %addressed.endpoint_arn,
+                revision_id = %serving.revision_id,
+                status = answer.status,
+                request_id = %request_id,
+                "web function endpoint request answered by the revision's code"
+            );
+            handler_answer(head, &answer)
+        }
+        HandlerOutcome::NoResponse(reason) => {
+            // What the RUN came to, in its escaped form so a message the guest's code
+            // worded cannot forge a log line of this emulator's. The client is served this
+            // module's own sentence instead, so nothing of the code's own wording reaches
+            // it.
+            ::tracing::info!(
+                audit = true,
+                operation = "WebFunctionEndpointRequest",
+                outcome = "no-response",
+                endpoint_arn = %addressed.endpoint_arn,
+                revision_id = %serving.revision_id,
+                reason = ?reason,
+                request_id = %request_id,
+                "web function endpoint request produced no response"
+            );
+            plain(head, BAD_GATEWAY, NO_HANDLER_RESPONSE)
+        }
+        HandlerOutcome::Stopped(reason) => {
+            ::tracing::info!(
+                audit = true,
+                operation = "WebFunctionEndpointRequest",
+                outcome = "stopped",
+                endpoint_arn = %addressed.endpoint_arn,
+                revision_id = %serving.revision_id,
+                reason = ?reason,
+                request_id = %request_id,
+                "web function endpoint request was stopped by one of the run's bounds"
+            );
+            plain(head, GATEWAY_TIMEOUT, HANDLER_TIMED_OUT)
+        }
+        HandlerOutcome::Unavailable(reason) => {
+            ::tracing::warn!(
+                audit = true,
+                operation = "WebFunctionEndpointRequest",
+                outcome = "unavailable",
+                endpoint_arn = %addressed.endpoint_arn,
+                revision_id = %serving.revision_id,
+                reason = ?reason,
+                request_id = %request_id,
+                "web function endpoint request reached no run at all"
+            );
+            plain(head, SERVICE_UNAVAILABLE, NO_CODE_TO_SERVE)
+        }
+    };
+    attributed(answer, &request_id)
+}
+
+/// One request as the revision's code is handed it: the method, the path and query, the
+/// headers lowercased as a Node server reports them, and the body as text.
+///
+/// The body reaches the code as TEXT, which is what this layer carries (see
+/// [`super::web_runtime`]): the bytes of a request body that is not UTF-8 are not carried
+/// through to the code.
+fn handler_request(req: &::http::Request<Vec<u8>>) -> HandlerRequest {
+    let url = req
+        .uri()
+        .path_and_query()
+        .map_or_else(|| req.uri().path().to_string(), ToString::to_string);
+    let headers = req
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_lowercase(), value.to_string()))
+        })
+        .collect();
+    HandlerRequest {
+        method: req.method().as_str().to_string(),
+        url,
+        headers,
+        // The body as the TEXT the code reads. A request this address accepts is already
+        // bounded by the core's per-connection ceiling before it reaches here.
+        body: String::from_utf8_lossy(req.body()).to_string(),
+    }
+}
+
+/// The response a run answered with, as the connection writes it: the status, the headers
+/// and the body the code produced, with the length of what a `GET` would carry reported on
+/// a `HEAD` as well.
+fn handler_answer(head: bool, answer: &web_runtime::HandlerResponse) -> ::http::Response<Vec<u8>> {
+    let mut builder = ::http::Response::builder().status(answer.status);
+    let mut stated_length = false;
+    for (name, value) in &answer.headers {
+        if name.eq_ignore_ascii_case("content-length") {
+            stated_length = true;
+        }
+        builder = builder.header(name, value);
+    }
+    if !stated_length {
+        builder = builder.header("content-length", answer.body.len().to_string());
+    }
+    let body = if head { Vec::new() } else { answer.body.clone() };
+    builder.body(body).unwrap_or_else(|_| {
+        // A status or a header the code produced that cannot be written is reported as the
+        // run producing no response the connection can serve, rather than by failing the
+        // answer the client is owed.
+        plain(head, BAD_GATEWAY, NO_HANDLER_RESPONSE)
+    })
+}
+
+/// What one request's own endpoint says about it, read under the store guard.
+struct Addressed {
+    /// The endpoint's `authType`, which decides what an unsigned request earns.
+    auth_type: String,
+    /// The endpoint's ARN, which every log line of this request names it by.
+    endpoint_arn: String,
+    /// The revision this request routes to, and everything running it needs — `None` when
+    /// the endpoint serves no revision whose code this emulator holds.
+    serving: Option<Serving>,
+}
+
+/// The revision one request routes to, copied out of the store so the run holds no guard.
+struct Serving {
+    /// The revision's id, which the log line of this request names.
+    revision_id: String,
+    /// The modules its build read out of its deployment package.
+    package: Arc<DeploymentPackage>,
+    /// The environment variables its service configuration published to the code: "a map of
+    /// environment variable key-value pairs available to the web function at runtime"
+    /// (`ServiceConfig$environmentVariables`).
+    environment: BTreeMap<String, String>,
+    /// Its configured `timeoutSeconds`.
+    timeout_seconds: i32,
+    /// The runtime identifier its build configuration names.
+    runtime: String,
+}
+
+/// Resolve the endpoint this address publishes and the revision this request routes to, and
+/// `None` when nothing is published here.
+///
+/// The one write is the clock's own, owed at this instant whether or not anybody connected.
+fn addressed(
+    state: &::engine::ServiceState<ServiceState>,
+    function_name: &str,
+    endpoint_name: &str,
+    request_id: &str,
+) -> Option<Addressed> {
+    let mut store = state.lock();
+    store.materialise_due_transitions(SystemTime::now());
+    let function = store.functions.get(function_name)?;
+    let endpoint = function
+        .endpoints
+        .get(endpoint_name)
+        .filter(|endpoint| endpoint.state == EndpointState::Active)?;
+    // Which revision's share of the traffic this request falls in, drawn from the id of the
+    // response it will be answered under: a value of THIS request's own, so no counter is
+    // bumped by serving it.
+    let serving = endpoint
+        .routed_revision(draw(request_id))
+        .and_then(|revision_id| function.revisions.get(revision_id))
+        // "Active: the revision is ready to serve traffic" (`RevisionState`), so a revision
+        // that is still building or whose build failed takes none.
+        .filter(|revision| revision.state == RevisionState::Active)
+        .and_then(|revision| {
+            Some(Serving {
+                revision_id: revision.revision_id.clone(),
+                package: revision.package.clone()?,
+                environment: revision
+                    .service_config
+                    .environment_variables
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
+                timeout_seconds: revision.service_config.timeout_seconds,
+                runtime: revision.build_config.runtime_config.runtime.clone(),
+            })
+        });
+    Some(Addressed {
+        auth_type: endpoint.auth_type.clone(),
+        endpoint_arn: endpoint.endpoint_arn.clone(),
+        serving,
+    })
+}
+
+/// One request's draw on the endpoint's revision weights: the first 8 bytes of SHA-256 over
+/// the id of the response it is answered under.
+///
+/// A value of the REQUEST's own, so two requests to one endpoint can fall in two different
+/// shares and serving one changes nothing a later caller sees.
+fn draw(request_id: &str) -> u64 {
+    let digest = Sha256::digest(request_id.as_bytes());
+    let mut head = [0u8; 8];
+    head.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(head)
 }
 
 /// `response` with the id of the response it is named on it ([`REQUEST_ID_HEADER`]).
@@ -690,14 +928,14 @@ mod tests {
     #[test]
     fn a_head_answers_the_metadata_of_the_get() {
         for (case, head, expected_len) in [
-            ("a GET", false, NO_WEB_FUNCTION_HANDLER.len()),
+            ("a GET", false, NO_HANDLER_RESPONSE.len()),
             ("a HEAD", true, 0),
         ] {
-            let answered = plain(head, 501, NO_WEB_FUNCTION_HANDLER);
+            let answered = plain(head, BAD_GATEWAY, NO_HANDLER_RESPONSE);
             assert_eq!(
                 answered.status().as_u16(),
-                501,
-                "case {case:?}: expected 501, got {}",
+                BAD_GATEWAY,
+                "case {case:?}: expected {BAD_GATEWAY}, got {}",
                 answered.status()
             );
             assert_eq!(
@@ -705,7 +943,7 @@ mod tests {
                     .headers()
                     .get("content-length")
                     .and_then(|value| value.to_str().ok()),
-                Some(NO_WEB_FUNCTION_HANDLER.len().to_string().as_str()),
+                Some(NO_HANDLER_RESPONSE.len().to_string().as_str()),
                 "case {case:?}: expected the length of the GET's body"
             );
             assert_eq!(
@@ -713,6 +951,59 @@ mod tests {
                 expected_len,
                 "case {case:?}: expected a body of {expected_len} bytes, got {}",
                 answered.body().len()
+            );
+        }
+    }
+
+    /// RULE: the response a client is served at a published address is the one the
+    /// revision's code produced — its status, its headers and its body — and a `HEAD`
+    /// carries that answer's metadata without its body.
+    #[test]
+    fn a_runs_answer_is_served_as_the_code_produced_it() {
+        let answer = web_runtime::HandlerResponse {
+            status: 201,
+            headers: vec![
+                ("content-type".to_string(), "application/json".to_string()),
+                ("x-served-by".to_string(), "the handler".to_string()),
+            ],
+            body: b"{\"ok\":true}".to_vec(),
+        };
+        for (case, head, expected_len) in [("a GET", false, answer.body.len()), ("a HEAD", true, 0)]
+        {
+            let served = handler_answer(head, &answer);
+            let header = |name: &str| {
+                served
+                    .headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            assert_eq!(
+                served.status().as_u16(),
+                201,
+                "case {case:?}: expected the status the code set, got {}",
+                served.status()
+            );
+            assert_eq!(
+                (header("content-type"), header("x-served-by")),
+                (
+                    "application/json".to_string(),
+                    "the handler".to_string()
+                ),
+                "case {case:?}: expected the headers the code set, got {:?}",
+                served.headers()
+            );
+            assert_eq!(
+                header("content-length"),
+                answer.body.len().to_string(),
+                "case {case:?}: expected the length of what a GET would carry"
+            );
+            assert_eq!(
+                served.body().len(),
+                expected_len,
+                "case {case:?}: expected a body of {expected_len} bytes, got {}",
+                served.body().len()
             );
         }
     }

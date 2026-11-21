@@ -1610,8 +1610,11 @@ async fn a_create_past_the_endpoint_quota_is_refused() {
 /// refuses nothing of its own.
 ///
 /// What an authorized request is answered with is the web function's own handler
-/// response, and this emulator runs no web function code, so it answers `501` and
-/// synthesises nothing in the handler's name.
+/// response, which this harness mounts no object store for: the build of the revision
+/// this endpoint serves established no deployment package, so no code serves the
+/// endpoint and the address says so rather than synthesising a response. What an
+/// endpoint serving a revision whose package WAS read answers is the sibling suite's
+/// (`endpoint_data_plane`).
 #[tokio::test]
 async fn an_endpoint_created_on_a_stored_function_serves_its_own_address() {
     let emulator = Emulator::new();
@@ -1651,7 +1654,8 @@ async fn an_endpoint_created_on_a_stored_function_serves_its_own_address() {
             &endpoint_name,
             "/",
             &[("authorization", SIGNED_AUTHORIZATION)],
-        );
+        )
+        .await;
         assert_eq!(
             pending.status().as_u16(),
             404,
@@ -1667,25 +1671,27 @@ async fn an_endpoint_created_on_a_stored_function_serves_its_own_address() {
         );
 
         // (request case, the request's URI, its headers, the status the address answers)
-        let unsigned = if auth_type == "IamAuth" { 403 } else { 501 };
+        let authorized = 503;
+        let unsigned = if auth_type == "IamAuth" { 403 } else { authorized };
         let rows: &[AddressRow<'_>] = &[
             (
                 "a signed GET",
                 "/",
                 &[("authorization", SIGNED_AUTHORIZATION)],
-                501,
+                authorized,
             ),
             (
                 "a presigned GET",
                 "/?X-Amz-Credential=AKIDEXAMPLE&X-Amz-Signature=deadbeef",
                 &[],
-                501,
+                authorized,
             ),
             ("an unsigned GET", "/", &[], unsigned),
             ("an unsigned GET deeper in the path", "/items/42", &[], unsigned),
         ];
         for (request_case, uri, headers, expected) in rows {
-            let answered = request_endpoint(&emulator, function_name, &endpoint_name, uri, headers);
+            let answered =
+                request_endpoint(&emulator, function_name, &endpoint_name, uri, headers).await;
             assert_eq!(
                 answered.status().as_u16(),
                 *expected,
@@ -1729,7 +1735,7 @@ const SIGNED_AUTHORIZATION: &str = "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/2026
 
 /// One request to a published endpoint's address, answered by the decision the core's
 /// listener serves there — read out of the ONE store this service's handlers write.
-fn request_endpoint(
+async fn request_endpoint(
     emulator: &Emulator,
     function_name: &str,
     endpoint_name: &str,
@@ -1742,6 +1748,5 @@ fn request_endpoint(
     }
     let request = builder.body(Vec::new()).expect("a well-formed request");
     let state = service_state(&**emulator.engine()).expect("this service's store");
-    serve_request(&state, function_name, endpoint_name, &request)
+    serve_request(&state, function_name, endpoint_name, &request).await
 }
-
